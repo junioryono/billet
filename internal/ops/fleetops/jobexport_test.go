@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -147,8 +148,9 @@ func TestJobsExportWritesTheTraceAndTheFleet(t *testing.T) {
 		t.Errorf("the fleet's hosts are %+v; want epyc-1 as it registered", fleet.Hosts)
 	}
 
-	if len(fleet.Tiers) != 1 || fleet.Tiers[0] != (jobtrace.Tier{Label: "billet-2vcpu", VCPU: 2,
-		Memory: 8 * config.GiB, Node: "epyc-1"}) || fleet.MaxVCPU != 8 || fleet.MaxMemory != 32*config.GiB ||
+	if len(fleet.Tiers) != 1 || !reflect.DeepEqual(fleet.Tiers[0], jobtrace.Tier{Label: "billet-2vcpu", VCPU: 2,
+		Memory: 8 * config.GiB, Node: "epyc-1", Providers: []config.ProviderKind{config.ProviderDocker}}) ||
+		fleet.MaxVCPU != 8 || fleet.MaxMemory != 32*config.GiB ||
 		fleet.Placement != config.PlacementSpread || fleet.AdmissionOrder != config.AdmissionFill {
 		t.Errorf("the fleet is %+v; want the configured tier, ceiling, placement and order", fleet)
 	}

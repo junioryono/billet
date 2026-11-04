@@ -51,6 +51,9 @@ type Tier struct {
 	// Node pins the tier to one host, as the tier's own `node` does; empty
 	// places it anywhere.
 	Node string `json:"node,omitempty"`
+	// Providers are the backends the tier runs on, in the configuration's order of
+	// preference; empty says nothing, and any host will do.
+	Providers []config.ProviderKind `json:"providers,omitempty"`
 }
 
 // Validate refuses a fleet document that describes no deployment: no hosts,
