@@ -602,6 +602,7 @@ type windowsBuildFake struct {
 	verifyScript   string
 	builderScript  string
 	builderDisk    string
+	consoleBefore  string
 }
 
 func (b *windowsBuildFake) buildNonce() string {
@@ -661,7 +662,7 @@ func (b *windowsBuildFake) reply(action string, params url.Values) (int, string)
 
 		if params.Get("InstanceId") == "i-builder" {
 			nonce := b.buildNonce()
-			text = buildBegin + " " + nonce + "\nverdict=" + b.verdict + "\nstep=" + b.step() +
+			text = b.consoleBefore + buildBegin + " " + nonce + "\nverdict=" + b.verdict + "\nstep=" + b.step() +
 				"\ntemplate_step=" + b.templateStep + "\ncomponents=\n" + buildEnd + " " + nonce + "\n"
 			b.builderRead = true
 		} else {

@@ -347,8 +347,9 @@ func windowsBuildFailure(id string, report map[string]string) error {
 	if where == bootstrapStep {
 		return fmt.Errorf("ec2: the builder %s reported that its build failed in %s, before the "+
 			"build started: its root had too little free space, the payload could not be "+
-			"fetched or was not the one staged, its settings named another build, or the "+
-			"machine already records a finished billet build", id, where)
+			"fetched or was not the one staged, its settings named another build, the machine "+
+			"already records a finished billet build, or the task that started it could not be "+
+			"removed", id, where)
 	}
 
 	return fmt.Errorf("ec2: the builder %s reported that its build failed in %s; the end of the "+
@@ -362,19 +363,24 @@ func windowsBuildFailure(id string, report map[string]string) error {
 func (p *Provider) logWindowsBuildTail(id, console string) {
 	const prefix = "billet-build-log "
 
-	const most = 80
+	// mostLines holds both of the driver's logs at its 40 lines each, and longest what it
+	// cuts a line to.
+	const (
+		mostLines = 80
+		longest   = 240
+	)
 
 	var lines []string
 
 	for _, line := range strings.Split(console, "\n") {
 		text, ok := strings.CutPrefix(strings.TrimRight(line, "\r"), prefix)
-		if ok && printableASCII(text) && len(text) <= maxReportValue+len(prefix) {
+		if ok && printableASCII(text) && len(text) <= longest {
 			lines = append(lines, text)
 		}
 	}
 
-	if len(lines) > most {
-		lines = lines[len(lines)-most:]
+	if len(lines) > mostLines {
+		lines = lines[len(lines)-mostLines:]
 	}
 
 	for _, text := range lines {

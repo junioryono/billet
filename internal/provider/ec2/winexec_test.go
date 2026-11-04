@@ -51,8 +51,14 @@ function Get-Acl { $a = [pscustomobject]@{}; $a | Add-Member ScriptMethod AddAcc
 function Set-Acl { Note 'set-acl' }
 function Set-LocalUser { Note 'set-password' }
 function New-ScheduledTaskAction { }
-function New-ScheduledTaskSettingsSet { Note "settings $args" }
-function Register-ScheduledTask { Note 'register' }
+function New-ScheduledTaskSettingsSet {
+	param($Priority, $ExecutionTimeLimit, [switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries)
+	"priority-$Priority"
+}
+function Register-ScheduledTask {
+	param($TaskName, $Action, $Trigger, $Settings, $User, $Password, $RunLevel, [switch]$Force)
+	Note "register $TaskName settings=$Settings"
+}
 function Unregister-ScheduledTask { Note 'unregister' }
 function Start-ScheduledTask { Note 'start'; if ($env:STUB_TASK_WRITES) { Copy-Item -LiteralPath $env:STUB_TASK_WRITES -Destination $env:STUB_RESULT } }
 function Get-ScheduledTask { [pscustomobject]@{ State = 'Ready' } }
@@ -263,7 +269,7 @@ func TestTheWindowsVerifierEarnsItsVerdict(t *testing.T) {
 			}
 
 			// A TASK AT NORMAL PRIORITY, or what the check asserts is not what it is asked of.
-			if !tc.damage && !strings.Contains(log, "settings -Priority 4") {
+			if !tc.damage && !strings.Contains(log, "register billet-verify settings=priority-4") {
 				t.Errorf("the verifier's task is not at normal priority:\n%s", log)
 			}
 
@@ -529,6 +535,9 @@ func TestAWindowsFirstBootThatFailsEndsTheMachine(t *testing.T) {
 			if got := strings.Contains(log, "restart"); got == tc.wantStop {
 				t.Errorf("the machine restarted: %v, with a failure %v:\n%s", got, tc.wantStop, log)
 			}
+			if !tc.wantStop && !strings.Contains(log, "settings=priority-4") {
+				t.Errorf("the build's task is not at normal priority:\n%s", log)
+			}
 		})
 	}
 }
@@ -569,9 +578,41 @@ func TestAWindowsBuildFailureLogsWhatTheStepSaid(t *testing.T) {
 		t.Errorf("the log kept the wrong end of a long tail:\n%s", logged.String())
 	}
 
-	if err := windowsBuildFailure("i-1", map[string]string{reportStepKey: "layer"}); err == nil ||
-		strings.Contains(err.Error(), "the step said why") {
-		t.Errorf("the error says %v", err)
+	// THE LONGEST LINE THE DRIVER WRITES IS LOGGED, and one past it is not its.
+	logged.Reset()
+	p.logWindowsBuildTail("i-1", "billet-build-log "+strings.Repeat("a", 240)+"\nbillet-build-log "+strings.Repeat("b", 241)+"\n")
+
+	if !strings.Contains(logged.String(), strings.Repeat("a", 240)) || strings.Contains(logged.String(), "bbb") {
+		t.Errorf("the log held the wrong lines to the driver's length:\n%s", logged.String())
+	}
+}
+
+// THROUGH THE BUILD ITSELF: a failure's verdict logs what the step said, and the error, which
+// outlives the log in somebody's report, does not carry it.
+func TestAWindowsBuildThatFailsLogsTheTailAndKeepsItOutOfTheError(t *testing.T) {
+	t.Parallel()
+
+	const said = "distinctive guest text"
+
+	var logged bytes.Buffer
+
+	b := &windowsBuildFake{verdict: verdictFail, templateStep: "1", consoleBefore: "billet-build-log " + said + "\n"}
+	f := newFakeEC2(t)
+	b.server = f
+	f.respond = b.reply
+
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	_, err := p.BuildImage(t.Context(), testWindowsBuild())
+	if err == nil {
+		t.Fatal("a build that failed was answered with no error")
+	}
+	if strings.Contains(err.Error(), said) {
+		t.Errorf("the error quotes the guest: %v", err)
+	}
+	if !strings.Contains(logged.String(), said) {
+		t.Errorf("what the step said was not logged:\n%s", logged.String())
 	}
 }
 

@@ -1411,8 +1411,15 @@ function Set-Acl { }
 function Set-Content { }
 function Set-LocalUser { }
 function New-ScheduledTaskAction { }
-function New-ScheduledTaskSettingsSet { }
-function Register-ScheduledTask { }
+function New-ScheduledTaskSettingsSet {
+	param($ExecutionTimeLimit, [switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, $MultipleInstances, $Priority)
+	"priority-$Priority"
+}
+# A TASK'S DEFAULT IS BELOW NORMAL, which every process of every job would inherit.
+function Register-ScheduledTask {
+	param($TaskName, $Action, $Settings, $User, $Password, $RunLevel, [switch]$Force)
+	if ($Settings -cne 'priority-4') { throw "the runner's task is registered at $Settings" }
+}
 function Start-ScheduledTask { }
 function Start-Sleep { }
 function New-Object {
@@ -1467,24 +1474,12 @@ function Get-ScheduledTaskInfo {
 			if tc.wantFail != (err != nil) {
 				t.Fatalf("the entry point answered %v, want a failure %v:\n%s", err, tc.wantFail, out)
 			}
-			if tc.wantFail && !strings.Contains(string(out), "billet-runner: the runner's task") {
+			if tc.wantFail && !strings.Contains(string(out), "billet-runner: the runner's task ") {
 				t.Errorf("it failed for another reason:\n%s", out)
 			}
+			if tc.wantFail && strings.Contains(string(out), "is registered at") {
+				t.Errorf("the runner's task is not at normal priority:\n%s", out)
+			}
 		})
-	}
-}
-
-// THE RUNNER'S TASK IS AT NORMAL PRIORITY. A task's default is below normal, which every
-// process of every job would inherit, and the verifier's task is its own: this is the one
-// place that says the runner's is too.
-func TestTheWindowsRunnerTaskIsAtNormalPriority(t *testing.T) {
-	t.Parallel()
-
-	raw, err := os.ReadFile(filepath.Join("windows", "billet-runner.ps1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !regexp.MustCompile(`(?m)New-ScheduledTaskSettingsSet[^\n]*\n?[^\n]*-Priority 4\s*$`).Match(raw) {
-		t.Error("the runner's task does not ask for priority 4")
 	}
 }
