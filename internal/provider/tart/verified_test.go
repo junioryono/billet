@@ -3785,3 +3785,51 @@ func TestAnUnpromoteDuringAVerificationsPreparationIsNotUndone(t *testing.T) {
 
 	assertNoBases(t, p)
 }
+
+// A VERIFICATION THAT COULD NOT READ THE RECORD AT ALL GOES NO FURTHER: it has no epoch to hold itself
+// to, and one read later would count an unpromote since then as having come first.
+func TestAVerificationThatCouldNotReadTheRecordStops(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+
+	if err := os.WriteFile(filepath.Join(p.stateDir, verifiedFile), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p.beforeCleanup = func() { t.Error("it went on to clean up") }
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err == nil {
+		t.Fatal("verified over a record it could not read")
+	}
+}
+
+// A WRITE THAT FAILED, HAVING READ THE RECORD, DOES GO ON: the epoch is held, and the cleanup can be
+// what makes the write possible.
+func TestAVerificationThatReadTheRecordGoesOnToItsCleanup(t *testing.T) {
+	t.Parallel()
+
+	_, p := verifiedStub(t)
+
+	cleaned := false
+	p.beforeCleanup = func() { cleaned = true }
+
+	failed := false
+	p.installer.Rename = func(from, to string) error {
+		if !failed {
+			failed = true
+
+			return errors.New("no space left on device")
+		}
+
+		return os.Rename(from, to)
+	}
+
+	if _, err := p.Verify(t.Context(), verifyOpts()); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	if !cleaned {
+		t.Fatal("it never reached its cleanup")
+	}
+}

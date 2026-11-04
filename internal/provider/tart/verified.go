@@ -250,6 +250,17 @@ func (p *Provider) verify(ctx context.Context, opts VerifyOptions, attempted *st
 	}
 
 	intentErr := keepIntent()
+
+	// A RECORD THAT COULD NOT EVEN BE READ LEAVES NO EPOCH TO BE HELD TO: reading one later would
+	// count an unpromote since then as having come first. Only a write that failed goes on.
+	if !epochRead {
+		return nil, fmt.Errorf("tart: verify %s: %w", key, intentErr)
+	}
+
+	if p.beforeCleanup != nil {
+		p.beforeCleanup()
+	}
+
 	cleanErr := p.cleanVerification(ctx, key)
 
 	// AGAIN AFTER THE CLEANUP, even one that did not finish, whose reason to exist can be why the

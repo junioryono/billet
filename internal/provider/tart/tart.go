@@ -317,6 +317,9 @@ type Provider struct {
 	// and whether there is a record. A func because the record changes at every
 	// registration, after this provider is built.
 	macOSLimit func() (int, bool, error)
+	// beforeCleanup runs just before a verification's cleanup, and nothing sets it outside
+	// tests, which have no other way to say that a refused verification never got there.
+	beforeCleanup func()
 	// installer installs the records. Its zero value is the real one, and a test fails a
 	// step of it.
 	installer durablefile.Installer
