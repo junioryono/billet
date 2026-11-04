@@ -25,13 +25,10 @@ if [ -e "$out/manifest-aarch64.json" ]; then
 fi
 
 # IT EXPIRES BEFORE TWO WEEKLY BUILDS COULD BE REPLAYED AS CURRENT, which is what makes
-# a pointer on a mutable branch something a fleet can follow unattended.
-published_epoch=$(date -u +%s)
-expires_epoch=$((published_epoch + 10 * 24 * 60 * 60))
-published_at=$(date -u -d "@$published_epoch" +%Y-%m-%dT%H:%M:%SZ)
-expires_at=$(date -u -d "@$expires_epoch" +%Y-%m-%dT%H:%M:%SZ)
-
-jq -cn --arg tag "$tag" --arg published "$published_at" --arg expires "$expires_at" \
-	--argjson architectures "$architectures" \
-	'{schema: 1, tag: $tag, published_at: $published, expires_at: $expires,
+# a pointer on a mutable branch something a fleet can follow unattended. A reader refuses
+# a longer window (imagesource.ParseChannel), so changing this is a change to every node.
+jq -cn --arg tag "$tag" --argjson architectures "$architectures" \
+	'(now | floor) as $published |
+	{schema: 1, tag: $tag, published_at: ($published | todate),
+		expires_at: ($published + 10 * 24 * 60 * 60 | todate),
 		release_immutable: true, architectures: $architectures}' >"$out/current.json"

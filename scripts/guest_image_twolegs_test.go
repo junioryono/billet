@@ -3,7 +3,6 @@ package scripts_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -34,31 +34,40 @@ func twoSetManifest(suffix, arch, contract string) string {
 		arch, contract, suffix, rootfs, digest(rootfs), kernel, digest(kernel))
 }
 
-// addAarch64Set writes into DIR a whole aarch64 set under the names ADR-022 gives it.
-func addAarch64Set(t *testing.T, dir, manifest string) {
+// addAarch64Set writes into DIR a whole aarch64 set under the names ADR-022 gives it,
+// its source in sourceParts parts.
+func addAarch64Set(t *testing.T, dir, manifest string, sourceParts int) {
 	t.Helper()
 
 	// THE SOURCE ARCHIVE'S FIXTURE WRITES THE x86_64 NAMES, in a directory of its own
 	// here, and the set's names are what the publisher holds a part list to.
 	work := t.TempDir()
-	writeSourceArchive(t, work, publishIndex, 0)
+	writeSourceArchive(t, work, publishIndex, sourceParts)
 
-	sum := sha256.Sum256(readBytes(t, filepath.Join(work, "image-sources.tar")))
-	stat, err := os.Stat(filepath.Join(work, "image-sources.tar"))
+	entries, err := os.ReadDir(work)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	for _, entry := range entries {
+		body := readBytes(t, filepath.Join(work, entry.Name()))
+		if entry.Name() == "image-sources.parts" {
+			body = []byte(strings.ReplaceAll(string(body), "image-sources.tar", "image-sources-aarch64.tar"))
+		}
+
+		name := strings.Replace(entry.Name(), "image-sources", "image-sources-aarch64", 1)
+		if err := os.WriteFile(filepath.Join(dir, name), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	for name, body := range map[string][]byte{
-		"manifest-aarch64.json":           []byte(manifest),
-		"manifest-aarch64.sigstore.json":  []byte("{}"),
-		"rootfs-aarch64.img.zst.part000":  []byte("rootfs-aarch64.img.zst.part000"),
-		"vmlinux-billet-aarch64":          []byte("vmlinux-billet-aarch64"),
-		"image-sources-aarch64.tsv":       readBytes(t, filepath.Join(dir, "image-sources.tsv")),
-		"image-sources-aarch64-index.tsv": readBytes(t, filepath.Join(work, "image-sources-index.tsv")),
-		"image-sources-aarch64.tar":       readBytes(t, filepath.Join(work, "image-sources.tar")),
-		"image-sources-aarch64.parts": fmt.Appendf(nil, "image-sources-aarch64.tar %s %d\n",
-			hex.EncodeToString(sum[:]), stat.Size()),
+		"manifest-aarch64.json":          []byte(manifest),
+		"manifest-aarch64.sigstore.json": []byte("{}"),
+		"rootfs-aarch64.img.zst.part000": []byte("rootfs-aarch64.img.zst.part000"),
+		"vmlinux-billet-aarch64":         []byte("vmlinux-billet-aarch64"),
+		"image-sources-aarch64.tsv": []byte("package\tarchitecture\tversion\tsource\tsource_version\torigin\tlicense\n" +
+			"bash\tarm64\t5.2.21-2ubuntu4\tbash\t5.2.21-2ubuntu4\tports.ubuntu.com\tgnu\n"),
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), body, 0o600); err != nil {
 			t.Fatal(err)
@@ -84,10 +93,21 @@ func TestTheGuestReleaseCarriesAWholeAarch64SetOrNothing(t *testing.T) {
 
 	for name, tc := range map[string]struct {
 		manifest string
+		parts    int
 		edit     func(t *testing.T, dir string)
 		says     string
 	}{
-		"a whole set": {manifest: good},
+		"a whole set":           {manifest: good},
+		"a whole set, in parts": {manifest: good, parts: 2},
+		"a source part cut short": {
+			manifest: good,
+			parts:    2,
+			edit: func(t *testing.T, dir string) {
+				t.Helper()
+				writeFile(t, filepath.Join(dir, "image-sources-aarch64.tar.part001"), "cut", 0o600)
+			},
+			says: "image-sources-aarch64.tar.part001 is not the part image-sources-aarch64.parts describes",
+		},
 		"another machine's manifest": {
 			manifest: twoSetManifest("-aarch64", "x86_64", "10"),
 			says:     "does not describe an aarch64 image",
@@ -140,7 +160,7 @@ func TestTheGuestReleaseCarriesAWholeAarch64SetOrNothing(t *testing.T) {
 			t.Parallel()
 
 			dir := x64PublishDir(t)
-			addAarch64Set(t, dir, tc.manifest)
+			addAarch64Set(t, dir, tc.manifest, tc.parts)
 
 			if tc.edit != nil {
 				tc.edit(t, dir)
@@ -168,11 +188,17 @@ func TestTheGuestReleaseCarriesAWholeAarch64SetOrNothing(t *testing.T) {
 				"image-sources.tsv", "image-sources-index.tsv", "image-sources.parts", "image-sources.tar",
 				"manifest-aarch64.json", "manifest-aarch64.sigstore.json", "rootfs-aarch64.img.zst.part000",
 				"vmlinux-billet-aarch64", "image-sources-aarch64.tsv", "image-sources-aarch64-index.tsv",
-				"image-sources-aarch64.parts", "image-sources-aarch64.tar",
+				"image-sources-aarch64.parts", "manifest-aarch64.origin",
 			} {
 				if !strings.Contains(calls, "arg "+filepath.Join(dir, asset)+"\n") {
 					t.Errorf("the release does not carry %s:\n%s", asset, calls)
 				}
+			}
+
+			// A SET NEW IN THIS RELEASE IS RECORDED AS BUILT BY IT, so a later carry can say so.
+			if got, want := string(readBytes(t, filepath.Join(dir, "manifest-aarch64.origin"))),
+				"guest-20260821-000000 "+strings.Repeat("a", 40)+"\n"; got != want {
+				t.Errorf("the set's origin is %q, want %q", got, want)
 			}
 		})
 	}
@@ -190,6 +216,22 @@ func TestTheGuestReleaseWithoutAnAarch64SetIsTheOneItAlwaysWas(t *testing.T) {
 
 	if strings.Contains(calls, "aarch64") {
 		t.Errorf("an x86_64 release names aarch64:\n%s", calls)
+	}
+
+	var uploaded []string
+
+	for line := range strings.SplitSeq(calls, "\n") {
+		// THE NOTES ARE gh's --notes-file, not an asset.
+		if path, isArg := strings.CutPrefix(line, "arg "); isArg && filepath.IsAbs(path) && filepath.Base(path) != "release-notes.md" {
+			uploaded = append(uploaded, filepath.Base(path))
+		}
+	}
+
+	if want := []string{
+		"manifest.json", "manifest.sigstore.json", "image-sources.tsv", "image-sources-index.tsv",
+		"image-sources.parts", "image-sources.tar", "vmlinux-billet", "rootfs.img.zst.part000",
+	}; !slices.Equal(uploaded, want) {
+		t.Errorf("the release uploads %v, want %v", uploaded, want)
 	}
 }
 
@@ -222,30 +264,31 @@ func TestTheGuestChannelListsWhatTheReleaseCarries(t *testing.T) {
 				t.Fatalf("%v\n%s", err, said)
 			}
 
-			var pointer struct {
-				Schema           int      `json:"schema"`
-				Tag              string   `json:"tag"`
-				PublishedAt      string   `json:"published_at"`
-				ExpiresAt        string   `json:"expires_at"`
-				ReleaseImmutable bool     `json:"release_immutable"`
-				Architectures    []string `json:"architectures"`
+			raw := readBytes(t, filepath.Join(out, "current.json"))
+
+			// THE READER'S OWN JUDGEMENT, at the moment it was written and just before it
+			// lapses: its window is one a reader takes, and ten days of it.
+			channel, err := imagesource.ParseChannel(raw, time.Now())
+			if err != nil {
+				t.Fatalf("a reader refuses what the writer wrote: %v\n%s", err, raw)
 			}
 
-			if err := json.Unmarshal(readBytes(t, filepath.Join(out, "current.json")), &pointer); err != nil {
-				t.Fatal(err)
+			if channel.Tag != "guest-20261104-000000" {
+				t.Errorf("the pointer names %q", channel.Tag)
 			}
 
-			if pointer.Schema != 1 || pointer.Tag != "guest-20261104-000000" || !pointer.ReleaseImmutable ||
-				pointer.PublishedAt == "" || pointer.ExpiresAt <= pointer.PublishedAt {
-				t.Errorf("the pointer is not one a reader takes: %+v", pointer)
+			if channel.Architectures == nil || !slices.Equal(*channel.Architectures, tc.want) {
+				t.Errorf("the pointer lists %v, want %v", channel.Architectures, tc.want)
+			} else if err := imagesource.CheckChannelArchitectures(*channel.Architectures); err != nil {
+				t.Errorf("a reader refuses the list the writer wrote: %v", err)
 			}
 
-			if !slices.Equal(pointer.Architectures, tc.want) {
-				t.Errorf("the pointer lists %v, want %v", pointer.Architectures, tc.want)
+			if _, err := imagesource.ParseChannel(raw, time.Now().Add(9*24*time.Hour)); err != nil {
+				t.Errorf("the pointer lapses within nine days: %v", err)
 			}
 
-			if err := imagesource.CheckChannelArchitectures(pointer.Architectures); err != nil {
-				t.Errorf("a reader refuses what the writer wrote: %v", err)
+			if _, err := imagesource.ParseChannel(raw, time.Now().Add(11*24*time.Hour)); err == nil {
+				t.Error("the pointer outlives ten days, which replays a build two weeks old as current")
 			}
 		})
 	}
@@ -303,16 +346,72 @@ func TestTheLegsPublishTheNamesTheReaderAsksFor(t *testing.T) {
 		}
 	}
 
-	publish := workflow.Jobs["publish"].If
-	for _, want := range []string{"always()", "needs.x64.result == 'success'", "needs.resolve.result == 'success'"} {
-		if !strings.Contains(publish, want) {
-			t.Errorf("the publish job's condition %q does not hold %q", publish, want)
+	// THE WHOLE CONDITION, because clauses found in it would pass an `||` between them.
+	// Not always(), which publishes a run a person stopped; x86_64 gates; aarch64's result
+	// is no part of it, because its failure is what this job has a rule for.
+	if got, want := workflow.Jobs["publish"].If, "${{ !cancelled() && needs.resolve.result == 'success' && "+
+		"needs.x64.result == 'success' && github.ref == 'refs/heads/main' && "+
+		"(github.event_name != 'workflow_dispatch' || inputs.publish) && "+
+		"needs.resolve.outputs.source_is_release == 'true' }}"; got != want {
+		t.Errorf("the publish job's condition is\n%s\nwant\n%s", got, want)
+	}
+}
+
+// EACH LEG BUILDS WHAT WAS RESOLVED, and the workflow's own lines say the names it writes:
+// a leg fed the wrong commit builds another tree under this release's name, and these lines
+// are what the real builds ran.
+func TestALegBuildsTheResolvedTreeUnderItsOwnNames(t *testing.T) {
+	t.Parallel()
+
+	var caller struct {
+		Jobs map[string]struct {
+			With map[string]string `yaml:"with"`
+		} `yaml:"jobs"`
+	}
+
+	body, build, _ := guestImageWorkflows(t)
+	if err := yaml.Unmarshal([]byte(body), &caller); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, job := range []string{"x64", "arm64"} {
+		with := caller.Jobs[job].With
+		if with["source_sha"] != "${{ needs.resolve.outputs.source_sha }}" ||
+			with["source_tag"] != "${{ needs.resolve.outputs.source_tag }}" ||
+			with["runner_version"] != "${{ inputs.runner_version }}" {
+			t.Errorf("the %s leg is not given what was resolved: %v", job, with)
 		}
 	}
 
-	// aarch64 FAILING IS WHAT IT HAS A RULE FOR, so its result is no condition of the job.
-	if strings.Contains(publish, "needs.arm64") {
-		t.Errorf("the publish job's condition %q depends on the aarch64 build", publish)
+	for _, want := range []string{
+		"KERNEL: ${{ github.workspace }}/out/vmlinux-billet${{ inputs.suffix }}",
+		"ROOTFS: ${{ github.workspace }}/out/rootfs${{ inputs.suffix }}.img.zst",
+		"SOURCE_TAG: ${{ inputs.source_tag }}",
+		"SOURCE_SHA: ${{ inputs.source_sha }}",
+		"ref: ${{ inputs.source_sha }}",
+		"IMAGE_NAME: ${{ inputs.image_name }}",
+		"SUFFIX: ${{ inputs.suffix }}",
+		"runs-on: ${{ inputs.runs_on }}",
+		"key: guest-kernel-${{ inputs.machine }}-",
+		`scripts/write-image-manifest.sh > "out/manifest$SUFFIX.json"`,
+		`-o "out/rootfs$SUFFIX.img.zst" "$WORK/$IMAGE_NAME.ext4"`,
+		`cp out/vmlinux-billet "out/vmlinux-billet$SUFFIX"`,
+		`printf 'image-sources%s.tar %s %s\n' "$SUFFIX"`,
+		"name: guest-image${{ inputs.suffix }}",
+		"out/manifest${{ inputs.suffix }}.json",
+		"out/rootfs${{ inputs.suffix }}.img.zst*",
+		"out/vmlinux-billet${{ inputs.suffix }}",
+		"out/image-sources${{ inputs.suffix }}.tar*",
+		"out/release-notes${{ inputs.suffix }}.md",
+	} {
+		if !strings.Contains(build, want) {
+			t.Errorf("guest-image-build.yml does not say %s", want)
+		}
+	}
+
+	// NO STEP MAY GO RED AND LEAVE THE LEG GREEN: a gate that does is decoration, in yaml.
+	if strings.Contains(build, "continue-on-error") || strings.Contains(body, "continue-on-error") {
+		t.Error("a guest image workflow carries continue-on-error")
 	}
 }
 
@@ -333,79 +432,147 @@ func TestOnlyAFailedAarch64BuildCarriesAnImage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conditions := map[string]string{}
+	steps := map[string]workflowStep{}
 
 	for _, step := range workflow.Jobs["publish"].Steps {
-		conditions[step.Name] = step.If
+		steps[step.Name] = step
 	}
 
-	for name, want := range map[string]string{
-		"Download the checked image":         "",
-		"Download the checked aarch64 image": "needs.arm64.result == 'success'",
-		"Carry the last good aarch64 image":  "needs.arm64.result != 'success'",
-		"Publish the dated release":          "",
-		"Advance the guest channel":          "",
+	for name, want := range map[string]struct{ cond, run string }{
+		"Download the checked image":         {"", "scripts/fetch-guest-artifact.sh out"},
+		"Download the checked aarch64 image": {"needs.arm64.result == 'success'", "scripts/fetch-guest-artifact.sh out"},
+		"Carry the last good aarch64 image":  {"needs.arm64.result != 'success'", "scripts/carry-guest-set.sh out"},
+		"Publish the dated release":          {"", "scripts/publish-guest-release.sh out"},
 	} {
-		got, ok := conditions[name]
+		got, ok := steps[name]
 		if !ok {
 			t.Errorf("the publish job has no step %q", name)
-		} else if got != want {
-			t.Errorf("step %q runs if %q, want %q", name, got, want)
+
+			continue
+		}
+
+		if got.If != want.cond || strings.TrimSpace(got.Run) != want.run {
+			t.Errorf("step %q runs %q if %q, want %q if %q", name, got.Run, got.If, want.run, want.cond)
+		}
+	}
+
+	// A CARRIED MANIFEST KEEPS THE SIGNATURE IT WAS PUBLISHED WITH: signed again it would
+	// say this run vouches for an image it did not build.
+	sign := steps["Sign the manifest"].Run
+	check := strings.Index(sign, `if [ "$ARM64_RESULT" = success ]; then`)
+	signed := strings.Index(sign, "--bundle out/manifest-aarch64.sigstore.json")
+
+	if check < 0 || signed < check {
+		t.Errorf("the aarch64 manifest is signed whatever its leg did:\n%s", sign)
+	}
+
+	// THE NOTES ARE ONE RELEASE'S, the carried set's origin among them.
+	notes := steps["Write the release notes"].Run
+	for _, want := range []string{"out/release-notes-aarch64.md", "out/release-notes-carried.md"} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("the release's notes leave out %s:\n%s", want, notes)
 		}
 	}
 }
 
-// carryFixture is what carry-guest-set.sh meets: a channel, a previous release and the
-// tools that reach them, each stubbed and each answer chosen by a case.
+// carryFixture is what carry-guest-set.sh meets: a channel, the release it names and the
+// tools that reach them, each stubbed and each failing on a call it does not expect.
 type carryFixture struct {
-	pointer  string // the channel's pointer, or "" for a channel gh cannot read
-	notFound bool   // gh answers the channel with GitHub's 404
-	assets   string // the previous release's asset names, one a line
-	manifest string // its aarch64 manifest
-	verify   int    // what the signature check exits with
-	noAssets bool   // the second download fails
+	lsRemote      int    // what git ls-remote exits with
+	noPointer     bool   // the branch holds no current.json
+	pointer       string // the channel's pointer
+	draft         bool   // the release it names is mutable
+	unset         bool   // the release has no aarch64 set
+	manifest      string // its aarch64 manifest
+	verifyChannel int    // what the pointer's check exits with
+	verifyImage   int    // what the manifest's check exits with
+	noOrigin      bool   // the release's set has no record of what built it
+	origin        string // that record, when it is not the default
+	drop          string // an asset the release has lost
+	failDownload  bool   // the download of the set, after its manifest, fails
 }
 
-// runCarry runs the script against a fixture and returns its output, whether it
-// succeeded, and the directory it worked on.
+const carriedOrigin = "guest-20261012-000000 " + "0123456789abcdef0123456789abcdef01234567" + "\n"
+
+// runCarry runs the script against a fixture and returns its output, whether it succeeded,
+// and the directory it worked on.
 func runCarry(t *testing.T, fx carryFixture) (string, bool, string) {
 	t.Helper()
 
 	dir := t.TempDir()
 	out := filepath.Join(dir, "out")
+	release := filepath.Join(dir, "release")
 	bin := filepath.Join(dir, "bin")
 
-	if err := os.MkdirAll(bin, 0o700); err != nil {
+	for _, path := range []string{bin, release} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A WHOLE x86_64 PUBLICATION, AND THE RELEASE'S REAL aarch64 SET, so what a carry leaves
+	// is what the real publisher goes on to judge.
+	if err := os.CopyFS(out, os.DirFS(x64PublishDir(t))); err != nil {
 		t.Fatal(err)
 	}
 
-	writeFile(t, filepath.Join(out, "manifest.json"), twoSetManifest("", "x86_64", "10"), 0o600)
-	writeFile(t, filepath.Join(dir, "pointer"), fx.pointer, 0o600)
-	writeFile(t, filepath.Join(dir, "assets"), fx.assets, 0o600)
-	writeFile(t, filepath.Join(dir, "aarch64-manifest"), fx.manifest, 0o600)
+	if !fx.unset {
+		addAarch64Set(t, release, fx.manifest, 2)
 
-	apiAnswer := `printf '%s' "$(base64 <"$FAKE/pointer" | tr -d '\n')"`
-
-	switch {
-	case fx.notFound:
-		apiAnswer = `echo 'gh: Not Found (HTTP 404)' >&2; exit 1`
-	case fx.pointer == "":
-		apiAnswer = `echo 'gh: connection reset by peer' >&2; exit 1`
+		switch {
+		case fx.noOrigin:
+		case fx.origin != "":
+			writeFile(t, filepath.Join(release, "manifest-aarch64.origin"), fx.origin, 0o600)
+		default:
+			writeFile(t, filepath.Join(release, "manifest-aarch64.origin"), carriedOrigin, 0o600)
+		}
 	}
 
-	gh := "#!/bin/bash\nprintf '%s\\n' \"$*\" >>\"$FAKE/gh-calls\"\ncase \"$1 $2\" in\n" +
-		"'api '*) " + apiAnswer + " ;;\n" +
-		"'release view') cat \"$FAKE/assets\" ;;\n" +
-		"'release download')\n" +
-		"  while [ $# -gt 0 ]; do [ \"$1\" = --dir ] && d=$2; shift; done\n" +
-		"  case \"$d\" in\n" +
-		"  */out)\n" +
-		fmt.Sprintf("    [ %t = false ] || exit 1\n", fx.noAssets) +
-		"    for f in rootfs-aarch64.img.zst.part000 vmlinux-billet-aarch64 image-sources-aarch64.tsv; do echo x >\"$d/$f\"; done ;;\n" +
-		"  *) cp \"$FAKE/aarch64-manifest\" \"$d/manifest-aarch64.json\"; echo '{}' >\"$d/manifest-aarch64.sigstore.json\" ;;\n" +
-		"  esac ;;\nesac\n"
+	if fx.drop != "" {
+		removeAll(t, filepath.Join(release, fx.drop))
+	}
+
+	writeFile(t, filepath.Join(dir, "pointer"), fx.pointer, 0o600)
+
+	git := "#!/bin/bash\n[ \"$1\" = -C ] && shift 2\ncase \"$1 $2\" in\n" +
+		fmt.Sprintf("'ls-remote --exit-code') exit %d ;;\n", fx.lsRemote) +
+		"'fetch --quiet') exit 0 ;;\n"
+	if fx.noPointer {
+		git += "'show FETCH_HEAD:current.json') exit 128 ;;\n"
+	} else {
+		git += "'show FETCH_HEAD:current.json') cat \"$FAKE/pointer\" ;;\n" +
+			"'show FETCH_HEAD:current.sigstore.json') echo '{}' ;;\n"
+	}
+
+	git += "*) echo \"unexpected git $*\" >&2; exit 99 ;;\nesac\n"
+	writeFile(t, filepath.Join(bin, "git"), git, 0o700)
+
+	// EVERY CALL IS ONE THE SCRIPT IS EXPECTED TO MAKE, of the release the pointer names; a
+	// download honours its patterns, and a pattern matching nothing is silent, as gh's is.
+	gh := "#!/bin/bash\nprintf '%s\\n' \"$*\" >>\"$FAKE/gh-calls\"\n" +
+		"case \"$*\" in *'--repo junioryono/billet'*) ;; *) echo 'unexpected repository' >&2; exit 99 ;; esac\n" +
+		"case \"$1 $2 $3\" in\n" +
+		"'release view guest-20261026-000000')\n" +
+		fmt.Sprintf("  immutable=%t\n", !fx.draft) +
+		"  names=$(cd \"$FAKE/release\" && ls | jq -R '{name: .}' | jq -s .)\n" +
+		"  jq -n --argjson a \"$names\" --argjson i \"$immutable\" '{assets: $a, isDraft: false, isImmutable: $i}' ;;\n" +
+		"'release download guest-20261026-000000')\n" +
+		fmt.Sprintf("  case \"$*\" in *image-sources-aarch64*) [ %t = false ] || exit 1 ;; esac\n", fx.failDownload) +
+		"  shift 3\n  patterns=()\n  while [ $# -gt 0 ]; do\n" +
+		"    case \"$1\" in --dir) d=$2 ;; --pattern) patterns+=(\"$2\") ;; esac\n    shift\n  done\n" +
+		"  for f in \"$FAKE\"/release/*; do\n    for p in \"${patterns[@]}\"; do\n" +
+		"      case \"${f##*/}\" in $p) cp \"$f\" \"$d/\" ;; esac\n    done\n  done ;;\n" +
+		"*) echo \"unexpected gh $*\" >&2; exit 99 ;;\nesac\n"
 	writeFile(t, filepath.Join(bin, "gh"), gh, 0o700)
-	writeFile(t, filepath.Join(bin, "go"), fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >\"$FAKE/go-call\"\nexit %d\n", fx.verify), 0o700)
+
+	// WHAT WAS VERIFIED IS KEPT, to hold it to what is left in the release.
+	goStub := "#!/bin/bash\nprintf '%s\\n' \"$*\" >>\"$FAKE/go-calls\"\n" +
+		"[ \"$1 $3 $4\" = '-C run ./scripts/verifyguestset' ] || { echo \"unexpected go $*\" >&2; exit 99; }\n" +
+		"case \"$5\" in\n" +
+		fmt.Sprintf("channel) cp \"$6\" \"$FAKE/verified-pointer\"; exit %d ;;\n", fx.verifyChannel) +
+		fmt.Sprintf("manifest) [ \"$6\" = aarch64 ] || exit 98; cp \"$7\" \"$FAKE/verified-manifest\"; cp \"$8\" \"$FAKE/verified-bundle\"; exit %d ;;\n", fx.verifyImage) +
+		"*) echo \"unexpected verification $5\" >&2; exit 99 ;;\nesac\n"
+	writeFile(t, filepath.Join(bin, "go"), goStub, 0o700)
 
 	cmd := exec.CommandContext(t.Context(), "bash", "carry-guest-set.sh", out)
 	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE="+dir,
@@ -425,47 +592,65 @@ func TestALastGoodImageIsCarriedOnlyWhenItIsProved(t *testing.T) {
 
 	const pointer = `{"schema":1,"tag":"guest-20261026-000000","architectures":["x86_64","aarch64"]}`
 
-	const set = "manifest.json\nmanifest-aarch64.json\nmanifest-aarch64.sigstore.json\n"
-
 	good := twoSetManifest("-aarch64", "aarch64", "10")
 
 	for name, tc := range map[string]struct {
-		fx        carryFixture
-		ok        bool
-		carried   bool
-		says      string
-		noDownset bool
+		fx      carryFixture
+		ok      bool
+		carried bool
+		says    string
 	}{
 		"a proved set of this contract": {
-			fx: carryFixture{pointer: pointer, assets: set, manifest: good},
+			fx: carryFixture{pointer: pointer, manifest: good},
 			ok: true, carried: true, says: "carried the aarch64 set of guest-20261026-000000",
 		},
-		"no channel yet": {
-			fx: carryFixture{notFound: true},
-			ok: true, says: "does not exist yet",
+		"a channel never published": {
+			fx: carryFixture{lsRemote: 2},
+			ok: true, says: "has never been published",
 		},
-		"a channel it could not read": {
-			fx:   carryFixture{},
-			says: "could not read the guest channel",
+		// A BRANCH THAT IS THERE WITH NO POINTER ON IT IS DAMAGE, not a channel never published.
+		"a channel with no pointer": {
+			fx:   carryFixture{noPointer: true},
+			says: "holds no current.json",
+		},
+		"a channel it could not ask about": {
+			fx:   carryFixture{lsRemote: 128},
+			says: "could not ask whether the guest channel exists",
+		},
+		"a pointer the policy refuses": {
+			fx:   carryFixture{pointer: pointer, manifest: good, verifyChannel: 1},
+			says: "the guest channel's pointer is not one",
+		},
+		"a release that is not locked": {
+			fx:   carryFixture{pointer: pointer, manifest: good, draft: true},
+			says: "not an immutable, published release",
 		},
 		"a release with no aarch64 set": {
-			fx: carryFixture{pointer: pointer, assets: "manifest.json\n"},
+			fx: carryFixture{pointer: pointer, unset: true},
 			ok: true, says: "carries no aarch64 set",
 		},
 		"another contract": {
-			fx: carryFixture{pointer: pointer, assets: set, manifest: twoSetManifest("-aarch64", "aarch64", "9")},
+			fx: carryFixture{pointer: pointer, manifest: twoSetManifest("-aarch64", "aarch64", "9")},
 			ok: true, says: "speaks guest contract 9",
 		},
-		"a signature the policy refuses": {
-			fx:   carryFixture{pointer: pointer, assets: set, manifest: good, verify: 1},
-			says: "not one billet's own signing policy accepts",
+		"a manifest the policy refuses": {
+			fx:   carryFixture{pointer: pointer, manifest: good, verifyImage: 1},
+			says: "the aarch64 manifest of guest-20261026-000000 is not one",
+		},
+		"a set with no record of what built it": {
+			fx:   carryFixture{pointer: pointer, manifest: good, noOrigin: true},
+			says: "no manifest-aarch64.origin",
+		},
+		"a record that names nothing": {
+			fx:   carryFixture{pointer: pointer, manifest: good, origin: "not a record\n"},
+			says: "does not name a release and a commit",
 		},
 		"a set that will not download": {
-			fx:   carryFixture{pointer: pointer, assets: set, manifest: good, noAssets: true},
+			fx:   carryFixture{pointer: pointer, manifest: good, failDownload: true},
 			says: "could not download the aarch64 set",
 		},
 		"a channel naming no guest release": {
-			fx:   carryFixture{pointer: `{"tag":"v0.29.0"}`, assets: set},
+			fx:   carryFixture{pointer: `{"tag":"v0.29.0"}`},
 			says: "not a guest release",
 		},
 	} {
@@ -480,7 +665,9 @@ func TestALastGoodImageIsCarriedOnlyWhenItIsProved(t *testing.T) {
 			// THE MANIFEST IN out IS WHAT THE PUBLISHER READS AS A SET THIS RELEASE CARRIES,
 			// and write-guest-channel.sh as a machine it lists, so it is there only when
 			// the whole set is.
-			_, err := os.Stat(filepath.Join(dir, "out", "manifest-aarch64.json"))
+			out := filepath.Join(dir, "out")
+
+			_, err := os.Stat(filepath.Join(out, "manifest-aarch64.json"))
 			if carried := err == nil; carried != tc.carried {
 				t.Errorf("a manifest in the release's directory = %v, want %v:\n%s", carried, tc.carried, said)
 			}
@@ -489,20 +676,62 @@ func TestALastGoodImageIsCarriedOnlyWhenItIsProved(t *testing.T) {
 				return
 			}
 
-			call, err := os.ReadFile(filepath.Join(dir, "go-call"))
-			if err != nil {
-				t.Fatalf("the signature was never checked: %v", err)
+			// WHAT WAS PROVED IS WHAT IS PUBLISHED, byte for byte.
+			if got, want := readBytes(t, filepath.Join(out, "manifest-aarch64.json")), readBytes(t, filepath.Join(dir, "verified-manifest")); string(got) != string(want) {
+				t.Error("the manifest left in the release is not the one that was verified")
 			}
 
-			if !strings.Contains(string(call), "run ./scripts/verifyguestset aarch64 ") {
-				t.Errorf("the check ran as %q", call)
+			if got, want := readBytes(t, filepath.Join(out, "manifest-aarch64.sigstore.json")), readBytes(t, filepath.Join(dir, "verified-bundle")); string(got) != string(want) {
+				t.Error("the bundle left in the release is not the one that was verified")
 			}
 
-			notes := string(readBytes(t, filepath.Join(dir, "out", "release-notes-carried.md")))
-			if !strings.Contains(notes, "carried forward from `guest-20261026-000000`") {
-				t.Errorf("the notes do not name where the set came from:\n%s", notes)
+			if got, want := readBytes(t, filepath.Join(dir, "verified-pointer")), []byte(pointer); string(got) != string(want) {
+				t.Errorf("what was verified of the channel is %q", got)
+			}
+
+			// THE RELEASE IT ORIGINATED IN, NOT THE ONE IT WAS LAST CARRIED BY: that one's tag
+			// points at an x86_64 build's commit.
+			notes := string(readBytes(t, filepath.Join(out, "release-notes-carried.md")))
+			for _, want := range []string{"carried forward from `guest-20261026-000000`", "provenance is", "`guest-20261012-000000`", "0123456789abcdef"} {
+				if !strings.Contains(notes, want) {
+					t.Errorf("the notes do not say %q:\n%s", want, notes)
+				}
+			}
+
+			// AND THE REAL PUBLISHER TAKES THE WHOLE SET, leaving what built it as it was.
+			out2, published, calls := runPublisher(t, out)
+			if !published {
+				t.Fatalf("the publisher refused what was carried:\n%s", out2)
+			}
+
+			for _, asset := range []string{
+				"manifest-aarch64.json", "manifest-aarch64.sigstore.json", "manifest-aarch64.origin",
+				"rootfs-aarch64.img.zst.part000", "vmlinux-billet-aarch64", "image-sources-aarch64.tsv",
+				"image-sources-aarch64-index.tsv", "image-sources-aarch64.parts",
+				"image-sources-aarch64.tar.part000", "image-sources-aarch64.tar.part001",
+			} {
+				if !strings.Contains(calls, "arg "+filepath.Join(out, asset)+"\n") {
+					t.Errorf("the release does not carry %s:\n%s", asset, calls)
+				}
+			}
+
+			if got := string(readBytes(t, filepath.Join(out, "manifest-aarch64.origin"))); got != carriedOrigin {
+				t.Errorf("publishing it rewrote what built it: %q", got)
 			}
 		})
+	}
+
+	// AN ASSET THE RELEASE HAS LOST STOPS THE PUBLICATION, at the publisher: a pattern
+	// matching nothing is silent, so nothing before it can tell.
+	for _, lost := range []string{"vmlinux-billet-aarch64", "image-sources-aarch64.tar.part001"} {
+		said, ok, dir := runCarry(t, carryFixture{pointer: pointer, manifest: good, drop: lost})
+		if !ok {
+			t.Fatalf("the carry itself refused:\n%s", said)
+		}
+
+		if out, published, _ := runPublisher(t, filepath.Join(dir, "out")); published || !strings.Contains(out, lost) {
+			t.Errorf("a set without %s was published:\n%s", lost, out)
+		}
 	}
 }
 

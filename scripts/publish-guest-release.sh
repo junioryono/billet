@@ -275,7 +275,14 @@ if [ -e "$out/manifest-aarch64.json" ]; then
         printf 'manifest-aarch64.json speaks another guest contract than manifest.json, so nothing is tagged or released\n' >&2
         exit 2
     fi
+    # WHAT BUILT IT, written once, when the set is new: the release's tag points at the
+    # commit of its x86_64 build, and a later release may carry this set unchanged. A
+    # carried set arrives with the record of the release that first published it.
+    if [ ! -e "$out/manifest-aarch64.origin" ]; then
+        printf '%s %s\n' "$TAG" "$SOURCE_SHA" >"$out/manifest-aarch64.origin"
+    fi
     check_set -aarch64
+    printf '%s\n' manifest-aarch64.origin >>"$scratch/upload"
 fi
 
 set --

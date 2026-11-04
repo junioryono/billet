@@ -244,8 +244,10 @@ func TestTheAarch64ArtifactIsFetchedByItsName(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !strings.Contains(string(calls), "artifacts?name=guest-image-aarch64") {
-		t.Errorf("the listing did not ask for it by name:\n%s", calls)
+	for _, want := range []string{"artifacts?name=guest-image-aarch64", "/actions/artifacts/42/zip"} {
+		if !strings.Contains(string(calls), want) {
+			t.Errorf("the fetch did not ask for %s:\n%s", want, calls)
+		}
 	}
 
 	// THE ID IS THE LEG'S, AND A LISTING OF THE OTHER NAME DOES NOT ANSWER FOR IT. A fresh

@@ -9,8 +9,9 @@
 #
 # THE TREE IT CHECKS OUT IS THE RELEASE THE STABLE CHANNEL NAMES, resolved by the caller,
 # so this file drives scripts from an older tree. The seam between them is frozen by a
-# test. A leg on a tree from before the arm64 build fails on its first check, and the
-# run goes on as it does for any failed arm64 build.
+# test. A leg on a tree from before the arm64 build fails, at the latest when that tree's
+# image build refuses the machine, and the run goes on as it does for any failed arm64
+# build.
 name: Guest image build
 
 on:
@@ -406,8 +407,8 @@ jobs:
       # uploaded.
 
       # THE BUILD JOB CANNOT PUBLISH. Its one handoff is an ordinary workflow
-      # artifact; the privileged job below consumes it only when this exact run is
-      # main and publication was requested. Manual inspection uses the same bytes.
+      # artifact; the privileged job in guest-image.yml consumes it only when this exact
+      # run is main and publication was requested. Manual inspection uses the same bytes.
       - name: Upload the checked image
         id: upload
         # always() SO A FAILED GATE STILL HANDS OVER THE ARTIFACT. Without it, the

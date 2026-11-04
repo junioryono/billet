@@ -218,9 +218,30 @@ func (c *Client) Resolve(ctx context.Context) error {
 		}
 	}
 
-	// ARCHITECTURES IS OPTIONAL, and schema 1 is unchanged by it (ADR-022): a
-	// reader before it ignores the member, and a pointer before it says nothing,
-	// which leaves the reader to try the manifest named for its machine.
+	channel, err := ParseChannel(body, time.Now())
+	if err != nil {
+		return err
+	}
+
+	return c.adoptChannel(channel.Tag, channel.Architectures)
+}
+
+// Channel is what a guest channel pointer names.
+type Channel struct {
+	Tag string
+	// Architectures is nil for a pointer that says nothing of them.
+	Architectures *[]string
+}
+
+// ParseChannel reads a channel pointer whose signature was already proved, and refuses
+// one a reader cannot take at now: everything but its list of architectures, which
+// CheckChannelArchitectures judges. It is exported for what writes a pointer, which a test
+// holds to it, because a pointer every reader refuses stops every node of every machine.
+//
+// ARCHITECTURES IS OPTIONAL, and schema 1 is unchanged by it (ADR-022): a
+// reader before it ignores the member, and a pointer before it says nothing,
+// which leaves the reader to try the manifest named for its machine.
+func ParseChannel(body []byte, now time.Time) (Channel, error) {
 	var channel struct {
 		Schema           int       `json:"schema"`
 		Tag              string    `json:"tag"`
@@ -230,34 +251,33 @@ func (c *Client) Resolve(ctx context.Context) error {
 		Architectures    *[]string `json:"architectures"`
 	}
 	if err := json.Unmarshal(body, &channel); err != nil {
-		return fmt.Errorf("imagesource: the guest-image channel is invalid: %w", err)
+		return Channel{}, fmt.Errorf("imagesource: the guest-image channel is invalid: %w", err)
 	}
 	if channel.Schema != channelSchema {
-		return fmt.Errorf("imagesource: the guest-image channel uses schema %d, want %d",
+		return Channel{}, fmt.Errorf("imagesource: the guest-image channel uses schema %d, want %d",
 			channel.Schema, channelSchema)
 	}
 	if !guestReleasePattern.MatchString(channel.Tag) {
-		return fmt.Errorf("imagesource: the guest-image channel names invalid release %q", channel.Tag)
+		return Channel{}, fmt.Errorf("imagesource: the guest-image channel names invalid release %q", channel.Tag)
 	}
 	if !channel.ReleaseImmutable {
-		return fmt.Errorf("imagesource: the guest-image channel does not attest that release %s is immutable", channel.Tag)
+		return Channel{}, fmt.Errorf("imagesource: the guest-image channel does not attest that release %s is immutable", channel.Tag)
 	}
 	if channel.PublishedAt.IsZero() || channel.ExpiresAt.IsZero() ||
 		!channel.ExpiresAt.After(channel.PublishedAt) ||
 		channel.ExpiresAt.Sub(channel.PublishedAt) > maxChannelLifetime {
-		return fmt.Errorf("imagesource: the guest-image channel has an invalid validity window")
+		return Channel{}, errors.New("imagesource: the guest-image channel has an invalid validity window")
 	}
-	now := time.Now()
 	if channel.PublishedAt.After(now.Add(channelClockSkew)) {
-		return fmt.Errorf("imagesource: the guest-image channel claims a future publication time %s",
+		return Channel{}, fmt.Errorf("imagesource: the guest-image channel claims a future publication time %s",
 			channel.PublishedAt.Format(time.RFC3339))
 	}
 	if !now.Before(channel.ExpiresAt) {
-		return fmt.Errorf("imagesource: the guest-image channel expired at %s; refusing a replayed pointer",
+		return Channel{}, fmt.Errorf("imagesource: the guest-image channel expired at %s; refusing a replayed pointer",
 			channel.ExpiresAt.Format(time.RFC3339))
 	}
 
-	return c.adoptChannel(channel.Tag, channel.Architectures)
+	return Channel{Tag: channel.Tag, Architectures: channel.Architectures}, nil
 }
 
 // adoptChannel moves the client onto the release the channel names, with the

@@ -191,9 +191,11 @@ jobs:
     # build scripts; what the channel points every deployment at is a tree a
     # person promoted.
     #
-    # always() BECAUSE A NEED THAT FAILED SKIPS A JOB OTHERWISE, and aarch64 failing is
-    # the case this job has a rule for. x86_64 failing publishes nothing.
-    if: always() && needs.resolve.result == 'success' && needs.x64.result == 'success' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish) && needs.resolve.outputs.source_is_release == 'true'
+    # !cancelled() BECAUSE A NEED THAT FAILED SKIPS A JOB OTHERWISE, and aarch64 failing is
+    # the case this job has a rule for; and not always(), which publishes a run a person
+    # stopped, and which GitHub will not cancel once it is running. x86_64 failing
+    # publishes nothing.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.x64.result == 'success' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish) && needs.resolve.outputs.source_is_release == 'true' }}
     runs-on: ubuntu-24.04
 
     permissions:

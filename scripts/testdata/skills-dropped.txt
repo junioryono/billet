@@ -196,3 +196,7 @@ de2880c55834 BILLET_TC_ARCH went with install-toolcache.sh (ADR-022); the build'
 f9290014add1 The provisioning script became the AMI build (ADR-022); the related-skills line says so.
 4e1cc90afe54 #688 adds `targets` to the tier keys; the sentence now lists it with its expansion, beside `sizes`.
 f8453d8ae0f0 #689 moves the helper's local cache into the go command's own GOCACHE and layout; the sentence now says so, with why.
+2c8c4e151553 The build is two legs now (ADR-022); the rule is restated as "The build legs check out the release".
+a3f25894a93d The build is two legs on two tiers (ADR-022); image-build.md restates it with both.
+c45561b93a34 The pointer lives on the guest-channel branch, which imagesource reads; `release-channel` holds the binaries' channel, so the sentence named the wrong branch.
+e9d725ea9eeb A resolve job now reads the channel and both legs build what it resolved; image-build.md restates it.
