@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -41,6 +42,7 @@ func exerciseUsageMigration(t *testing.T, open func(context.Context) (*DB, error
 			`DROP INDEX job_history_usage_unnumbered`,
 			`DROP TABLE usage_sequence`,
 			`ALTER TABLE job_history DROP COLUMN usage_seq`,
+			`ALTER TABLE job_history DROP COLUMN usage_mark`,
 			`ALTER TABLE job_history DROP COLUMN github_target`,
 			`DELETE FROM schema_migrations WHERE version = 71`,
 			`INSERT INTO job_history (lease_id, tier, queued_at, finished_at) VALUES
@@ -102,7 +104,7 @@ func exerciseUsageMigration(t *testing.T, open func(context.Context) (*DB, error
 	for _, seq := range []int64{1, 2} {
 		if err := db.Tx(ctx, func(tx *sql.Tx) error {
 			return WriteQueries(tx).ArchiveJobHistory(ctx, ledgerdb.ArchiveJobHistoryParams{
-				LeaseID: "running", Tier: "small", QueuedAt: "t", UsageSeq: seq,
+				LeaseID: "running", Tier: "small", QueuedAt: "t", UsageSeq: seq, UsageMark: fmt.Sprintf("mark-%d", seq),
 				FinishedAt: sql.NullString{String: "2026-01-04T00:00:00.000000000Z", Valid: true},
 			})
 		}); err != nil {
@@ -111,8 +113,8 @@ func exerciseUsageMigration(t *testing.T, open func(context.Context) (*DB, error
 	}
 
 	closed, err := db.UsageRecordAt(ctx, 1)
-	if err != nil || closed.LeaseID != "running" {
-		t.Fatalf("UsageRecordAt(1) = %+v, %v; a second archive moved the lease's number", closed, err)
+	if err != nil || closed.LeaseID != "running" || closed.Mark != "mark-1" {
+		t.Fatalf("UsageRecordAt(1) = %+v, %v; a second archive moved the lease's number or its mark", closed, err)
 	}
 }
 
@@ -151,12 +153,37 @@ func TestTheUsageCounterWaitsForTheFirstClose(t *testing.T) {
 	}
 }
 
-// THE COUNTER'S OWN LOCK ORDERS TWO TAKERS, with nothing else serializing them: a
-// second transaction asking for a number waits until the first has committed, sees
-// what it committed, and a transaction rolled back gives its number back. A
-// PostgreSQL sequence, which hands numbers out beside the transaction, fails each.
-func TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits(t *testing.T) {
+// THE COUNTER'S OWN LOCK ORDERS TWO TAKERS, with nothing else serializing them, and a
+// run of numbers holds it as one number does: a second transaction asking waits until
+// the first has committed and sees what it committed, and a transaction rolled back
+// gives its numbers back. A PostgreSQL sequence, which hands numbers out beside the
+// transaction, fails each.
+func TestTheUsageCounterHoldsASecondTaker(t *testing.T) {
 	t.Parallel()
+
+	one := func(ctx context.Context, tx *sql.Tx) (int64, error) { return WriteQueries(tx).NextUsageSeq(ctx) }
+	run := func(ctx context.Context, tx *sql.Tx) (int64, error) { return WriteQueries(tx).TakeUsageSeqs(ctx, 500) }
+
+	for name, tc := range map[string]struct {
+		first, second         func(context.Context, *sql.Tx) (int64, error)
+		wantFirst, wantSecond int64
+	}{
+		"oneone": {one, one, 1, 2},
+		"runone": {run, one, 500, 501},
+		"onerun": {one, run, 1, 501},
+		"runrun": {run, run, 500, 1000},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			exerciseUsageCounterLock(t, tc.first, tc.second, tc.wantFirst, tc.wantSecond)
+		})
+	}
+}
+
+func exerciseUsageCounterLock(
+	t *testing.T, takeFirst, takeSecond func(context.Context, *sql.Tx) (int64, error), wantFirst, wantSecond int64,
+) {
+	t.Helper()
 
 	dsn := requirePostgres(t)
 
@@ -167,7 +194,7 @@ func TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	// RAW CONNECTIONS, because a DB.Tx takes the writers' advisory lock first, and
-	// that is what this leaves out.
+	// that is what this leaves out. The statements are the generated ones.
 	raw, err := sql.Open("pgx", string(dsn))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -176,9 +203,6 @@ func TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-
-	const take = `INSERT INTO usage_sequence (id, last) VALUES (1, 1)
-		ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + 1 RETURNING last`
 
 	begin := func() *sql.Tx {
 		t.Helper()
@@ -192,28 +216,17 @@ func TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits(t *testing.T) {
 		return tx
 	}
 
-	number := func(tx *sql.Tx) int64 {
-		t.Helper()
-
-		var n int64
-		if err := tx.QueryRowContext(ctx, take).Scan(&n); err != nil {
-			t.Fatalf("take a number: %v", err)
-		}
-
-		return n
-	}
-
 	abandoned := begin()
-	if got := number(abandoned); got != 1 {
-		t.Fatalf("the first number is %d, want 1", got)
+	if got, err := takeFirst(ctx, abandoned); err != nil || got != wantFirst {
+		t.Fatalf("the first take answered %d, %v; want %d", got, err, wantFirst)
 	}
 	if err := abandoned.Rollback(); err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
 
 	first := begin()
-	if got := number(first); got != 1 {
-		t.Fatalf("after a rollback the number is %d, want the 1 it gave back", got)
+	if got, err := takeFirst(ctx, first); err != nil || got != wantFirst {
+		t.Fatalf("after a rollback the take answered %d, %v; want the %d it gave back", got, err, wantFirst)
 	}
 
 	second := begin()
@@ -226,9 +239,7 @@ func TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits(t *testing.T) {
 	answer := make(chan taken, 1)
 
 	go func() {
-		var n int64
-
-		err := second.QueryRowContext(ctx, take).Scan(&n)
+		n, err := takeSecond(ctx, second)
 		answer <- taken{n, err}
 	}()
 
@@ -239,8 +250,8 @@ func TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits(t *testing.T) {
 	for {
 		var waiting int
 		if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM pg_stat_activity
-			WHERE query LIKE 'INSERT INTO usage_sequence%' AND wait_event_type = 'Lock'
-			  AND datname = current_database()`).Scan(&waiting); err != nil {
+			WHERE query LIKE '%INSERT INTO usage_sequence%' AND wait_event_type = 'Lock'
+			  AND datname = current_database() AND pid != pg_backend_pid()`).Scan(&waiting); err != nil {
 			t.Fatalf("read the server's locks: %v", err)
 		}
 
@@ -266,7 +277,7 @@ func TestTheUsageCounterHoldsASecondTakerUntilTheFirstCommits(t *testing.T) {
 	}
 
 	got := <-answer
-	if got.err != nil || got.n != 2 {
-		t.Fatalf("the second taker answered %d, %v; want 2, once the first committed", got.n, got.err)
+	if got.err != nil || got.n != wantSecond {
+		t.Fatalf("the second taker answered %d, %v; want %d, once the first committed", got.n, got.err, wantSecond)
 	}
 }

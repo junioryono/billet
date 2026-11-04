@@ -13,19 +13,20 @@ import (
 // Every empty string and zero is "not recorded", which the reader decides how to
 // say; nothing here is defaulted.
 type UsageRow struct {
-	Sequence                                    int64
-	LeaseID, Tier, Target, Repository           string
-	Provider, InstanceType, Site                string
-	VCPU, Memory, PriceMicrosPerHour            int64
-	BoughtAt, StartedAt, FinishedAt             string
-	Result, ResultAt, Conclusion string
+	Sequence                          int64
+	Mark                              string
+	LeaseID, Tier, Target, Repository string
+	Provider, InstanceType, Site      string
+	VCPU, Memory, PriceMicrosPerHour  int64
+	BoughtAt, StartedAt, FinishedAt   string
+	Result, ResultAt, Conclusion      string
 }
 
 // ErrNoUsageRecord means the ledger holds no finished lease at a sequence number.
 var ErrNoUsageRecord = errors.New("state: no finished lease has that usage sequence number")
 
-// UsageSince reads up to limit finished leases past a sequence number, in the
-// order they finished.
+// UsageSince reads up to limit finished leases past a sequence number, in the order
+// they were numbered.
 func (db *DB) UsageSince(ctx context.Context, after int64, limit int) ([]UsageRow, error) {
 	var out []UsageRow
 
@@ -41,7 +42,7 @@ func (db *DB) UsageSince(ctx context.Context, after int64, limit int) ([]UsageRo
 		for i := range rows {
 			r := &rows[i]
 			out = append(out, UsageRow{
-				Sequence: r.UsageSeq, LeaseID: r.LeaseID, Tier: r.Tier, Target: r.GithubTarget,
+				Sequence: r.UsageSeq, Mark: r.UsageMark, LeaseID: r.LeaseID, Tier: r.Tier, Target: r.GithubTarget,
 				Repository: r.Repo, Provider: r.ChosenProvider, InstanceType: r.InstanceType,
 				Site: r.Site, VCPU: r.Vcpu, Memory: r.Memory, PriceMicrosPerHour: r.PriceMicrosPerHour,
 				BoughtAt: r.BoughtAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
@@ -55,16 +56,17 @@ func (db *DB) UsageSince(ctx context.Context, after int64, limit int) ([]UsageRo
 	return out, err
 }
 
-// UsageClose is one lease's close: which lease took a number, and when.
-type UsageClose struct {
-	LeaseID, FinishedAt string
+// UsagePlace is what took one place in the order: the lease, and the mark drawn when it
+// was numbered.
+type UsagePlace struct {
+	LeaseID, Mark string
 }
 
-// UsageRecordAt reads the close at a sequence number, which is how a resuming
-// exporter proves its cursor still means something on this ledger. ErrNoUsageRecord
-// is a definite answer; any other error is one the ledger could not give.
-func (db *DB) UsageRecordAt(ctx context.Context, sequence int64) (UsageClose, error) {
-	var out UsageClose
+// UsageRecordAt reads what took a sequence number, which is how a resuming exporter
+// proves its cursor still means something on this ledger. ErrNoUsageRecord is a
+// definite answer; any other error is one the ledger could not give.
+func (db *DB) UsageRecordAt(ctx context.Context, sequence int64) (UsagePlace, error) {
+	var out UsagePlace
 
 	err := db.View(ctx, func(tx Querier) error {
 		row, err := ReadQueries(tx).ReadUsageRecord(ctx, sequence)
@@ -75,7 +77,7 @@ func (db *DB) UsageRecordAt(ctx context.Context, sequence int64) (UsageClose, er
 			return fmt.Errorf("state: read usage record %d: %w", sequence, err)
 		}
 
-		out = UsageClose{LeaseID: row.LeaseID, FinishedAt: row.FinishedAt}
+		out = UsagePlace{LeaseID: row.LeaseID, Mark: row.UsageMark}
 
 		return nil
 	})

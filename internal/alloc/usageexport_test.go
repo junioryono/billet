@@ -84,8 +84,14 @@ func TestAClosingLeaseTakesItsUsageNumberAndKeepsItsOwner(t *testing.T) {
 	}
 
 	closed, err := db.UsageRecordAt(t.Context(), 2)
-	if err != nil || closed.LeaseID != second.ID || closed.FinishedAt != rows[0].FinishedAt {
-		t.Fatalf("UsageRecordAt(2) = %+v, %v; want %s closed at %s", closed, err, second.ID, rows[0].FinishedAt)
+	if err != nil || closed.LeaseID != second.ID || closed.Mark == "" || closed.Mark != rows[0].Mark {
+		t.Fatalf("UsageRecordAt(2) = %+v, %v; want %s marked %q", closed, err, second.ID, rows[0].Mark)
+	}
+
+	earlier, err := db.UsageRecordAt(t.Context(), 1)
+	if err != nil || earlier.Mark == "" || earlier.Mark == closed.Mark {
+		t.Fatalf("UsageRecordAt(1) = %+v, %v; each close draws a mark of its own, and this one's is %q",
+			earlier, err, closed.Mark)
 	}
 
 	if _, err := db.UsageRecordAt(t.Context(), 3); !errors.Is(err, state.ErrNoUsageRecord) {

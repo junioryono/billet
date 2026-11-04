@@ -151,6 +151,11 @@ func (a *Allocator) NumberUsage(ctx context.Context, leaseIDs []string) (int, er
 		return 0, err
 	}
 
+	mark, err := newUsageMark()
+	if err != nil {
+		return 0, err
+	}
+
 	numbered := 0
 
 	err = a.db.Tx(ctx, func(tx *sql.Tx) error {
@@ -162,7 +167,7 @@ func (a *Allocator) NumberUsage(ctx context.Context, leaseIDs []string) (int, er
 		}
 
 		rows, err := q.NumberUsage(ctx, ledgerdb.NumberUsageParams{
-			Packed: packed, Base: last - int64(len(leaseIDs)),
+			Packed: packed, Base: last - int64(len(leaseIDs)), Mark: mark,
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: number %d leases' usage: %w", len(leaseIDs), err)

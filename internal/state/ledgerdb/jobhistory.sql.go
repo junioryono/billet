@@ -16,17 +16,19 @@ INSERT INTO job_history
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
       sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, holder_incarnation, queued_at,
-      finished_at, usage_seq, github_target, bought_at)
+      finished_at, usage_seq, usage_mark, github_target, bought_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10, $11, $12, $13,
         $14, $15, $16, $17,
         $18, $19, $20, $21, $22, $23,
-        $24, $25, $26, $27,
+        $24, $25, $26, $27, $28,
         COALESCE((SELECT github_target FROM leases WHERE id = $1), ''),
         COALESCE((SELECT created_at FROM leases WHERE id = $1), ''))
 ON CONFLICT (lease_id) DO UPDATE SET
   usage_seq      = CASE WHEN job_history.usage_seq = 0
                         THEN excluded.usage_seq ELSE job_history.usage_seq END,
+  usage_mark     = CASE WHEN job_history.usage_seq = 0
+                        THEN excluded.usage_mark ELSE job_history.usage_mark END,
   github_target  = CASE WHEN excluded.github_target != ''
                         THEN excluded.github_target ELSE job_history.github_target END,
   bought_at      = CASE WHEN job_history.bought_at = ''
@@ -96,6 +98,7 @@ type ArchiveJobHistoryParams struct {
 	QueuedAt           string
 	FinishedAt         sql.NullString
 	UsageSeq           int64
+	UsageMark          string
 }
 
 // Close the history row when the lease terminalizes.
@@ -159,6 +162,7 @@ func (q *Queries) ArchiveJobHistory(ctx context.Context, arg ArchiveJobHistoryPa
 		arg.QueuedAt,
 		arg.FinishedAt,
 		arg.UsageSeq,
+		arg.UsageMark,
 	)
 	return err
 }
@@ -683,7 +687,7 @@ func (q *Queries) ListUnnumberedUsage(ctx context.Context, maxRows int64) ([]str
 }
 
 const listUsageSince = `-- name: ListUsageSince :many
-SELECT usage_seq, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
+SELECT usage_seq, usage_mark, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
        chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
        bought_at, COALESCE(started_at, '') AS started_at,
        COALESCE(finished_at, '') AS finished_at, result, result_at,
@@ -701,6 +705,7 @@ type ListUsageSinceParams struct {
 
 type ListUsageSinceRow struct {
 	UsageSeq           int64
+	UsageMark          string
 	LeaseID            string
 	Tier               string
 	GithubTarget       string
@@ -737,6 +742,7 @@ func (q *Queries) ListUsageSince(ctx context.Context, arg ListUsageSinceParams) 
 		var i ListUsageSinceRow
 		if err := rows.Scan(
 			&i.UsageSeq,
+			&i.UsageMark,
 			&i.LeaseID,
 			&i.Tier,
 			&i.GithubTarget,
@@ -787,29 +793,30 @@ func (q *Queries) NextUsageSeq(ctx context.Context) (int64, error) {
 
 const numberUsage = `-- name: NumberUsage :execrows
 WITH RECURSIVE ids (id, rest, n) AS (
-    SELECT SUBSTR(CAST($2 AS TEXT), 1, 32), SUBSTR(CAST($2 AS TEXT), 33), CAST(1 AS BIGINT)
+    SELECT SUBSTR(CAST($3 AS TEXT), 1, 32), SUBSTR(CAST($3 AS TEXT), 33), CAST(1 AS BIGINT)
     UNION ALL
     SELECT SUBSTR(rest, 1, 32), SUBSTR(rest, 33), n + 1 FROM ids WHERE rest != ''
 )
 UPDATE job_history
-   SET usage_seq = CAST($1 AS BIGINT) + ids.n
+   SET usage_seq = CAST($1 AS BIGINT) + ids.n, usage_mark = CAST($2 AS TEXT)
   FROM ids
  WHERE job_history.lease_id = ids.id AND job_history.usage_seq = 0
 `
 
 type NumberUsageParams struct {
 	Base   int64
+	Mark   string
 	Packed string
 }
 
-// Give each lease a read listed its number, in the order it was listed: the caller
-// packs the lease ids end to end, as MarkJobDetailRetired's does, and takes a run of
-// numbers above base in the same transaction.
+// Give each lease a read listed its number, in the order it was listed, and the batch's
+// mark: the caller packs the lease ids end to end, as MarkJobDetailRetired's does, and
+// takes a run of numbers above base in the same transaction.
 //
 // A NUMBER ALREADY WRITTEN STAYS, so a lease never moves; the row's own filter is what
 // says so, in the statement.
 func (q *Queries) NumberUsage(ctx context.Context, arg NumberUsageParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, numberUsage, arg.Base, arg.Packed)
+	result, err := q.db.ExecContext(ctx, numberUsage, arg.Base, arg.Mark, arg.Packed)
 	if err != nil {
 		return 0, err
 	}
@@ -1110,22 +1117,22 @@ func (q *Queries) ReadJobWait(ctx context.Context, leaseID string) (ReadJobWaitR
 }
 
 const readUsageRecord = `-- name: ReadUsageRecord :one
-SELECT lease_id, COALESCE(finished_at, '') AS finished_at
+SELECT lease_id, usage_mark
   FROM job_history WHERE usage_seq = $1 AND usage_seq > 0
 `
 
 type ReadUsageRecordRow struct {
-	LeaseID    string
-	FinishedAt string
+	LeaseID   string
+	UsageMark string
 }
 
-// The close at one place in that order, which proves a cursor still means
-// something on this ledger: the lease alone is not enough, because a ledger
-// restored from a backup can close the same lease again at the same number.
+// What took one place in that order, which proves a cursor still means something on
+// this ledger: the lease alone is not enough, because a ledger restored from a backup
+// can give the same lease the same number again. The mark is drawn afresh each time.
 func (q *Queries) ReadUsageRecord(ctx context.Context, usageSeq int64) (ReadUsageRecordRow, error) {
 	row := q.db.QueryRowContext(ctx, readUsageRecord, usageSeq)
 	var i ReadUsageRecordRow
-	err := row.Scan(&i.LeaseID, &i.FinishedAt)
+	err := row.Scan(&i.LeaseID, &i.UsageMark)
 	return i, err
 }
 
