@@ -41,6 +41,38 @@ func TestTheReaderPoolIsTheSizeTheOpenAskedFor(t *testing.T) {
 	}
 }
 
+// A BURST'S READERS ARE KEPT FOR THE NEXT ONE until they have sat idle, which is why the
+// idle time is a separate test's and a long one here.
+func TestAReaderJustReturnedIsKept(t *testing.T) {
+	t.Parallel()
+
+	db, err := Open(t.Context(), t.TempDir(), withReaderIdleTime(time.Hour))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	conns := make([]*sql.Conn, 0, defaultReaderConns)
+	for range defaultReaderConns {
+		conn, err := db.r.Conn(t.Context())
+		if err != nil {
+			t.Fatalf("borrow a reader: %v", err)
+		}
+		conns = append(conns, conn)
+	}
+
+	for _, conn := range conns {
+		if err := conn.Close(); err != nil {
+			t.Fatalf("return a reader: %v", err)
+		}
+	}
+
+	if got := db.r.Stats().OpenConnections; got != defaultReaderConns {
+		t.Fatalf("%d readers open right after a burst of %d; the pool must keep them for the next one",
+			got, defaultReaderConns)
+	}
+}
+
 // AN IDLE DEPLOYMENT GIVES ITS READERS BACK. Every reader a burst opened closes
 // once nothing has borrowed it for the idle time, which is what brings a packed
 // server's connection count down when its deployments go quiet.
@@ -66,11 +98,6 @@ func TestAReaderNothingBorrowsIsClosed(t *testing.T) {
 		if err := conn.Close(); err != nil {
 			t.Fatalf("return a reader: %v", err)
 		}
-	}
-
-	if got := db.r.Stats().OpenConnections; got != defaultReaderConns {
-		t.Fatalf("%d readers open right after a burst of %d; the pool must keep them for the next one",
-			got, defaultReaderConns)
 	}
 
 	deadline := time.Now().Add(30 * time.Second)

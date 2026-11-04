@@ -28,11 +28,11 @@ A cursor is opaque: it names the deployment, the number, the lease and a random 
 
 **A resume refuses what it cannot honour, and prints nothing.** It refuses a cursor from another deployment, and a cursor whose number is missing, or holds another lease or another mark, on this ledger. The second means the ledger was restored from a backup older than the cursor: its next leases take numbers the exporter already read past, possibly giving the same lease the same number again, and reading past them would skip leases in silence. Reconcile what was exported after the backup, then start from the last cursor the restored ledger still holds.
 
-Records carry what was known **when the lease closed and when the record is read**: a late GitHub result fills a row that was missing one, so a second read of an old record can say more than the first, and an operator correcting a provisional verdict can change `conclusion`. A number, a lease and an interval that were known do not change.
+Records carry what was known **when the lease closed and when the record is read**, and reading a lease once is not the same as having its final numbers. A late GitHub result fills a row that was missing one, so **a record with a `null` `billed_minutes` can gain one later, under the same number**: nothing moves it past your cursor, so keep such a lease and read it again from a cursor older than it. A redelivered completion can likewise turn `job_clock: billet` into `github`, with the interval it reads. An operator correcting a provisional verdict can change `conclusion`. A number and a lease do not change, and a `billed_minutes` read on `job_clock: github` does not.
 
 ## The record
 
-Times are RFC 3339 on billet's clock, and durations are seconds to the millisecond.
+Times are RFC 3339, on billet's clock except where a field says otherwise, and durations are seconds to the millisecond.
 
 | Field | Meaning |
 |---|---|
@@ -50,7 +50,7 @@ Times are RFC 3339 on billet's clock, and durations are seconds to the milliseco
 | `vcpu`, `memory_bytes` | the shape the lease was charged |
 | `held` | `from` when the lease was bought, `to` when it closed, and `seconds` between: how long it held its capacity, launch and teardown included |
 | `job` | `from` when GitHub gave the job a runner, `to` when GitHub says it finished, and `seconds` between |
-| `job_clock` | whose times `job` holds. `github`: GitHub's own, from the messages, both ends on one clock. `billet`: GitHub's were not both carried, so these are when billet received the two messages, which can read shorter than the job ran: a real `JobStarted` arrived 46 and 47 s after its job started, and a job of 243 s read as 197 (2026-11-04) |
+| `job_clock` | whose times `job` holds. `github`: GitHub's own, from the messages, both ends on one clock. `billet`: GitHub's were not both carried, so these are when billet received the two messages, which can read shorter than the job ran: a real `JobStarted` arrived 46 and 47 s after its job started, and a job of 243 s read as 197 (2026-11-04). It can also read longer, by the length of an outage, for a completion written after a restart |
 | `billed_minutes` | the job's time rounded up to a whole minute per lease, the way GitHub bills a hosted job |
 | `minute_weight` | what one of those minutes counts as, in minutes of a 2 vCPU Linux runner |
 | `weight_source` | `tier` when the tier sets `minute_weight`, `charged_vcpu` when it is the vCPU charged over two |
@@ -72,13 +72,14 @@ tiers:
     minute_weight: 10
 ```
 
-The weight is read from the config at export time. A tier the config no longer declares falls back to the vCPU charged, and `weight_source` says so. Weights report and decide nothing: no code that admits, places or schedules reads one.
+The weight is read from the config when the record is read, so editing a weight changes what a re-read says of leases already closed: take the number when you first read it. A tier that declares none reads `weight_source: charged_vcpu`. A tier the config no longer declares falls back to the same arithmetic and reads `charged_vcpu_undeclared_tier`, because it may have named a weight this config cannot show. `minute_weight` is refused beside `sizes`, which would give every size one weight. Weights report and decide nothing: no code that admits, places or schedules reads one.
 
 ## Unknown stays unknown
 
 A value the ledger does not know is `null` or empty, and `unknown` names it with the reason. It is never zero, because a billing system summing a column of zeros has quietly given minutes away. The cases, none of which is an error:
 
-- **A lease that ran no job** bills a known `billed_minutes: 0`, and `job` is empty with the reason. Its `held` is still there: it held capacity.
+- **A lease that ran no job** and finished cleanly bills a known `billed_minutes: 0`, and `job` is empty with the reason. Its `held` is still there: it held capacity.
+- **A lease that failed or was disrupted with no start recorded** has an unknown `billed_minutes`. A `JobStarted` arrives tens of seconds late, so a lease that ended this way may have been running a job, and GitHub can still report one.
 - **A job with no result yet**, which ended with the lease before GitHub reported one: `billed_minutes` is unknown and `held` says how long the lease lasted. What to charge is the consumer's decision, and billet does not guess one.
 - **A result with no start**: GitHub reported a result and billet never saw the job start, so it has no length.
 - **A clock that stepped** so that an end precedes its start: the length is unknown, not negative.

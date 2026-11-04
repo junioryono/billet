@@ -126,8 +126,10 @@ func TestUsageExportReportsAJobTheStackRan(t *testing.T) {
 	if record["vcpu"] != float64(2) {
 		t.Errorf("vcpu = %v, want the 2 charged", record["vcpu"])
 	}
-	if record["minute_weight"] != float64(1) || record["weight_source"] != "charged_vcpu" {
-		t.Errorf("weight = %v from %v, want 1 from the vCPU charged", record["minute_weight"], record["weight_source"])
+	// THE OPERATOR'S FILE HERE DECLARES NO TIER, so this is the stand-in, saying so.
+	if record["minute_weight"] != float64(1) || record["weight_source"] != "charged_vcpu_undeclared_tier" {
+		t.Errorf("weight = %v from %v, want 1 from the vCPU charged, for a tier this config does not declare",
+			record["minute_weight"], record["weight_source"])
 	}
 
 	// GITHUB'S 150 SECONDS, whatever this run's timing, rounded up to three minutes: both

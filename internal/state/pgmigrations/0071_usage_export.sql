@@ -27,6 +27,14 @@ ALTER TABLE job_history ADD COLUMN github_finished_at text NOT NULL DEFAULT '';
 -- +billet:end
 
 -- +billet:statement
+ALTER TABLE pending_completions ADD COLUMN job_runner_assigned_at text NOT NULL DEFAULT '';
+-- +billet:end
+
+-- +billet:statement
+ALTER TABLE pending_completions ADD COLUMN job_finished_at text NOT NULL DEFAULT '';
+-- +billet:end
+
+-- +billet:statement
 CREATE TABLE usage_sequence (
     id bigint PRIMARY KEY CHECK (id = 1),
     last bigint NOT NULL CHECK (last >= 0)
