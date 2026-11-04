@@ -59,6 +59,25 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 		t.Fatalf("with one healthy store: %q", got)
 	}
 
+	// A HOST WHOSE CLOCK IS AHEAD HAS NOT BEEN OPEN FOR LESS THAN NOTHING.
+	if err := a.RecordCacheStoreState(t.Context(), "quiet", alloc.CacheStoreReport{
+		Store: "ceph", State: alloc.CacheStoreOpen, Since: since.Add(time.Hour), Failures: 3,
+		Reason: alloc.CacheStoreTimeout,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := render(); strings.Contains(got, "-55m") || !strings.Contains(got, "OPEN for 0s") {
+		t.Fatalf("a host whose clock is ahead: %q", got)
+	}
+	if err := a.RecordCacheStoreState(t.Context(), "quiet", alloc.CacheStoreReport{
+		Store: "ceph", State: alloc.CacheStoreClosed, Since: since,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := render(); !strings.Contains(got, "cache     2 host(s) using") {
+		t.Fatalf("with two healthy stores: %q", got)
+	}
+
 	if err := a.RecordCacheStoreState(t.Context(), "sick", alloc.CacheStoreReport{
 		Store: "ceph", State: alloc.CacheStoreOpen, Since: since, Failures: 3, Reason: "timeout",
 	}); err != nil {
@@ -67,7 +86,7 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 	got := render()
 	for _, want := range []string{
 		"cache     sick: ceph breaker OPEN for 5m0s (3 timeout failures); its new jobs start cold",
-		"cache     1 host(s) using their site's store",
+		"cache     2 host(s) using their site's store",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("status does not say %q:\n%s", want, got)
@@ -81,5 +100,27 @@ func TestStatusSaysWhichHostsAreSkippingTheirStore(t *testing.T) {
 	}
 	if got := render(); !strings.Contains(got, "cache     sick: ceph breaker on probation for 5m0s") {
 		t.Errorf("on probation: %q", got)
+	}
+
+	// A HOST THAT HAS LEFT IS NOT COUNTED AS USING ANYTHING.
+	epoch, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "gone", Provider: config.ProviderDocker, VCPU: 2, Memory: 8 * config.GiB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RecordCacheStoreState(t.Context(), "gone", alloc.CacheStoreReport{
+		Store: "ceph", State: alloc.CacheStoreClosed, Since: since,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := render(); !strings.Contains(got, "cache     3 host(s) using") {
+		t.Fatalf("with a third healthy store: %q", got)
+	}
+	if err := a.NodeWithdrawn(t.Context(), "gone", epoch, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := render(); !strings.Contains(got, "cache     2 host(s) using") {
+		t.Errorf("a host that left was counted: %q", got)
 	}
 }

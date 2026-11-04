@@ -380,7 +380,9 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/recover", h.forOwnLease(h.recoverRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
-	mux.HandleFunc("POST /v1/nodes/{node}/cache-store", h.forNode(h.cacheStore))
+	// forNewWork, BECAUSE THE ROW IS READ UNDER THE REGISTRATION IN FORCE: a superseded
+	// process's word on its store would be taken as its replacement's.
+	mux.HandleFunc("POST /v1/nodes/{node}/cache-store", h.forNewWork(h.cacheStore))
 
 	return mux
 }

@@ -87,7 +87,7 @@ Everything above is what that tier gets with no `cache` block at all. [Configura
 
 A cache beside the compute shares its failure domain, and a store that fails often hangs rather than refuses. Each node keeps a breaker for its site's store (Ceph or ebs-s3), so that when the store stops answering, jobs stop asking it.
 
-**What opens it.** Three failures within five minutes of what a job waits on: a clone, a fresh volume, a lookup, a publication that times out, or the first byte of a content-addressed read. Past its own limit a call counts as a timeout while it is still waiting, so a store stuck where nothing can cancel the call counts all the same. A miss and a conflict are the store answering, and do not count. Neither does a discard, a renewal, eviction or the trash purge, which fail for reasons of their own while clones work. Nor does a publication the store refuses: a candidate whose filesystem is not clean is that job's problem and not the store's.
+**What opens it.** Three different jobs failing within five minutes, with no volume handed over between them, on what a job waits on: a clone, a fresh volume, a lookup, a publication that times out, or the first byte of a content-addressed read. One job counts once, whatever it does, so no job can turn the cache off for the others. Past its own limit a call counts as a timeout while it is still waiting, so a store stuck where nothing can cancel the call counts all the same. A miss and a conflict are the store answering, and do not count. Neither does a discard, a renewal, eviction or the trash purge, which fail for reasons of their own while clones work. Nor does a publication the store refuses: a candidate whose filesystem is not clean is that job's problem and not the store's.
 
 **While it is open, nothing asks the store.**
 
@@ -97,19 +97,20 @@ A cache beside the compute shares its failure domain, and a store that fails oft
 | Sticky disk | the step goes on without the disk | `bypassed` |
 | Go and Bazel | a miss, so the build goes on with its local cache | `bypassed` |
 | Actions cache | a lookup or a save goes to GitHub; a save already reserved here fails, which the client reports as a warning | `bypassed` |
-| Publication | nothing is published, and what the job wrote is discarded with its session | |
+| Publication | a job's own commit answers that nothing was published, and what it wrote is discarded with its session; a publication deferred past the job waits for the next pass, inside its window | |
 
 The Git mirrors and the npm cache live on the node's own disk and go on as before.
 
 **The deadline.** A job waits at most 60 seconds on Ceph, or 30 on ebs-s3, for the store to hand over a volume. Past that it starts cold, which counts against the breaker, and the call goes on without it: a clone cut short can leave a volume behind, so the node holds what it comes back with in the session's durable record and discards it, off the job's path. So the first three jobs of an outage each wait a deadline, and the rest wait nothing.
 
-**How it comes back.** While it is open the node asks the store once every 30 seconds, bounded at 10. A store that answers is on probation: jobs ask it again, the first answer closes the breaker, and the first failure opens it again at once, because what the probe reads is not everything a job needs.
+**How it comes back.** While it is open the node asks the store once every 30 seconds, bounded at 10. A store that answers is on probation, because what the probe reads is not everything a job needs: one job at a time asks it for a volume, a volume handed over closes the breaker, and a failure opens it again at once. Every other job goes on cold meanwhile, and a job that goes away without an answer lets the next one try after a deadline. A site with no jobs stays on probation until it has one, with nothing lost by it, and the metric below reads 0.
 
 **What it does not do.** A breaker decides only whether a job uses a cache. It never touches capacity, custody or teardown, a timeout is never read as a volume being gone, and no published generation is lost. A writer lease that will not publish is released as it always is. Three things it cannot help with:
 
 - **A guest's mounted volume.** A job already using a volume whose OSDs have gone waits on its own disk's IO, in the guest's kernel. A new job's root disk is an RBD clone too, so with no monitors at all a Firecracker node launches nothing, cache or not.
 - **A call already waiting.** A sticky disk or Go request that started before the breaker opened ends at its own limit, or at the deadline if it was asking for a volume.
-- **A store that fails for one job.** Fewer than three failures in five minutes open nothing.
+- **A store that fails for one job.** Fewer than three jobs failing in five minutes open nothing.
+- **A save that straddles the store's recovery.** A save that began at GitHub while the breaker was open and finishes after it closed fails, and the client reports a warning.
 
 `billet status` names each host whose breaker is open or on probation, and `billet_cache_breaker_open{store}` is the same fact for a dashboard. A restart closes the breaker, because a verdict kept across one could cost every job its cache until a probe ran.
 

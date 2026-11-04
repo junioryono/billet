@@ -260,29 +260,33 @@ func volumeCeiling(setting config.CacheSetting) int64 {
 	return int64(setting.MaxSize)
 }
 
+// cloneOrCreate is the volume a job asked for: a clone of key's newest generation no
+// larger than ceiling, or a fresh volume of size, which it also answers cold for.
+func (s *CacheService) cloneOrCreate(
+	ctx context.Context, session, key string, ceiling, size int64,
+) (storecontract.Volume, bool, error) {
+	volume, cold, err := s.cloneWithin(ctx, session, key, ceiling)
+	if cold {
+		volume, err = s.handOver(session, "a new volume", func() (storecontract.Volume, error) {
+			return s.store.Create(ctx, key, size)
+		})
+	}
+
+	return volume, cold, err
+}
+
 // cloneWithin clones a key's current generation, or reports a cold cache.
 //
 // A GENERATION LARGER THAN THE CEILING IS NOT HANDED OUT: its clone is
 // discarded and the job starts cold at its own size, so lowering a tier's
 // max_size re-seeds its caches rather than leaving them at the old size. A store
 // that cannot say how large a clone is keeps it.
-// cloneOrCreate is the volume a job asked for: a clone of key's newest generation no
-// larger than ceiling, or a fresh volume of size, which it also answers cold for.
-func (s *CacheService) cloneOrCreate(
-	ctx context.Context, key string, ceiling, size int64,
-) (storecontract.Volume, bool, error) {
-	volume, cold, err := s.cloneWithin(ctx, key, ceiling)
-	if cold {
-		volume, err = s.store.Create(ctx, key, size)
-	}
-
-	return volume, cold, err
-}
-
 func (s *CacheService) cloneWithin(
-	ctx context.Context, key string, ceiling int64,
+	ctx context.Context, session, key string, ceiling int64,
 ) (storecontract.Volume, bool, error) {
-	volume, err := s.store.Clone(ctx, key, "")
+	volume, err := s.handOver(session, "a clone", func() (storecontract.Volume, error) {
+		return s.store.Clone(ctx, key, "")
+	})
 	if errors.Is(err, storecontract.ErrMiss) {
 		return storecontract.Volume{}, true, nil
 	}

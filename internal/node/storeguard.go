@@ -38,7 +38,7 @@ type CacheStoreReporter interface {
 func (s *CacheService) GuardStore(store string, deadline time.Duration) {
 	s.storeChanged = make(chan struct{}, 1)
 	s.storeDeadline = deadline
-	s.breaker = newStoreBreaker(store, s.log, s.signalStoreChange)
+	s.breaker = newStoreBreaker(store, deadline, s.log, s.signalStoreChange)
 }
 
 func (s *CacheService) signalStoreChange() {
@@ -110,14 +110,16 @@ func (s *CacheService) reportStoreState(ctx context.Context, reporter CacheStore
 		}
 
 		report := s.breaker.report()
-		if settled && report == sent && !s.storeResend.Swap(false) {
+		resend := s.storeResend.Swap(false)
+		if settled && report == sent && !resend {
 			continue
 		}
 		reportCtx, cancel := context.WithTimeout(ctx, storeReportLimit)
 		err := reporter.ReportCacheStore(reportCtx, report)
 		cancel()
 		if err != nil {
-			if ctx.Err() == nil {
+			// A STORE IN USE IS NOT NEWS, and a node not yet registered says so every time.
+			if ctx.Err() == nil && report.State != lease.CacheStoreClosed {
 				s.log.Warn("could not tell the control plane what the site's store is doing; "+
 					"will retry", "store", report.Store, "state", report.State, "error", err)
 			}
@@ -131,14 +133,16 @@ func (s *CacheService) reportStoreState(ctx context.Context, reporter CacheStore
 
 // asked runs one question that may be cancelled, under the store's deadline when it
 // has one, and counts what it came to.
-func (s *CacheService) asked(ctx context.Context, op string, question func(context.Context) error) error {
+func (s *CacheService) asked(
+	ctx context.Context, session *cacheSession, op string, question func(context.Context) error,
+) error {
 	if s.breaker == nil {
 		return question(ctx)
 	}
 	askCtx, cancel := context.WithTimeout(ctx, s.storeDeadline)
 	defer cancel()
 
-	done := s.breaker.watch(op, s.storeDeadline)
+	done := s.breaker.watch(storeCall{op: op, who: session.instance}, s.storeDeadline)
 	err := question(askCtx)
 	done(err)
 
@@ -161,10 +165,15 @@ type storeAcquired struct {
 // behind, so nothing cancels it before limit. What it comes to is settled off the
 // request's path by finishLateAcquisition, and the session cannot finish until it has.
 //
-// limit bounds the whole call, inside whatever the request has left. Past the deadline
-// the breaker counts a timeout, and the job's request ends.
+// limit bounds the whole call, inside whatever the request has left. What the breaker
+// hears is the store's own calls inside acquire (handOver), so nothing else the call
+// does counts against the store.
+//
+// ONE CALL OUT PER SESSION: a guest that hangs up on each request would otherwise start
+// as many detached calls as it can send requests, each holding a place in the store's
+// queue that no job is waiting on.
 func (s *CacheService) acquireVolume(
-	parent context.Context, session *cacheSession, op string, limit time.Duration,
+	parent context.Context, session *cacheSession, limit time.Duration,
 	acquire func(context.Context) (storecontract.Volume, bool, error),
 ) (storecontract.Volume, bool, error) {
 	if s.breaker == nil {
@@ -172,6 +181,9 @@ func (s *CacheService) acquireVolume(
 		defer cancel()
 
 		return acquire(ctx)
+	}
+	if session.acquiring > 0 {
+		return storecontract.Volume{}, false, errStoreLate
 	}
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), limit)
@@ -181,13 +193,11 @@ func (s *CacheService) acquireVolume(
 			earliest(deadline, time.Now().Add(limit)))
 	}
 
-	done := s.breaker.watch(op, s.storeDeadline)
 	result := make(chan storeAcquired, 1)
 	go func() {
 		defer cancel()
 
 		volume, cold, err := acquire(ctx)
-		done(err)
 		result <- storeAcquired{volume: volume, cold: cold, err: err}
 	}()
 
@@ -283,12 +293,24 @@ func (session *cacheSession) forgetLateVolume(volume storecontract.Volume) bool 
 	return false
 }
 
+// handOver asks the store for one volume a job is waiting on, counting what it comes
+// to from the deadline on while it still waits. A success is what ends a probation.
+func (s *CacheService) handOver(
+	session string, op string, question func() (storecontract.Volume, error),
+) (storecontract.Volume, error) {
+	done := s.breaker.watch(storeCall{op: op, who: session, decides: true}, s.storeDeadline)
+	volume, err := question()
+	done(err)
+
+	return volume, err
+}
+
 // countedPublication counts one publication step. ONLY A TIMEOUT AGAINST THE STORE: a
 // refusal here is as likely about the candidate as the store (a filesystem that is not
 // clean, a key another writer holds), and sending every job cold over one job's bad
 // write would make a bad build everyone's outage.
-func (s *CacheService) countedPublication(op string, err error) {
-	if errors.Is(err, context.DeadlineExceeded) || err == nil {
-		s.breaker.outcome(op, err)
+func (s *CacheService) countedPublication(session, op string, err error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		s.breaker.outcome(storeCall{op: op, who: session}, err)
 	}
 }

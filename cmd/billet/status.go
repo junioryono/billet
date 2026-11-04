@@ -318,15 +318,21 @@ func printCacheStores(ctx context.Context, env cli.Env, a *alloc.Allocator, now 
 	closed := 0
 	for i := range stores {
 		store := &stores[i]
+		// A HOST'S CLOCK IS ITS OWN, and one ahead of this one has not been open for less
+		// than nothing.
+		held := max(now.Sub(store.Since), 0).Round(time.Second)
 		switch store.State {
 		case alloc.CacheStoreOpen:
 			fmt.Fprintf(env.Stdout, "cache     %s: %s breaker OPEN for %s (%d %s failures); its new jobs start cold\n",
-				store.Node, store.Store, now.Sub(store.Since).Round(time.Second), store.Failures, store.Reason)
+				store.Node, store.Store, held, store.Failures, store.Reason)
 		case alloc.CacheStoreProbation:
 			fmt.Fprintf(env.Stdout, "cache     %s: %s breaker on probation for %s; it answered a probe, and "+
-				"the next job's cache decides\n", store.Node, store.Store, now.Sub(store.Since).Round(time.Second))
+				"the next job's cache decides\n", store.Node, store.Store, held)
 		case alloc.CacheStoreClosed:
-			closed++
+			// A HOST THIS DEPLOYMENT CANNOT REACH IS USING NOTHING AS FAR AS ANYONE HERE KNOWS.
+			if store.Live {
+				closed++
+			}
 		default:
 			// A WORD THIS BINARY DOES NOT KNOW IS A NEWER BINARY'S, shown rather than dropped.
 			fmt.Fprintf(env.Stdout, "cache     %s: %s breaker says %q\n", store.Node, store.Store, store.State)

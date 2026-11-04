@@ -262,17 +262,29 @@ func (s *CacheService) actionsResponse(
 		return nil, false, nil
 	}
 	// A STORE THAT HAS STOPPED ANSWERING IS NOT ASKED. A lookup or a reservation goes to
-	// GitHub, as one the store failed to answer does, without waiting for it to fail;
-	// a finalize is bound to a reservation only this node holds, so it fails here, as
-	// one the store failed does, and a save's failure is the client's warning.
-	if !s.breaker.allow() {
-		switch req.URL.Path {
-		case actionsCreatePath, actionsDownloadPath:
+	// GitHub, as one the store failed to answer does, without waiting for it to fail.
+	// A finalize and a blob are bound to a volume only this node holds, so they fail
+	// here, as one the store failed does: a blob's read or write waits in the kernel on
+	// that volume, holding what its cleanup needs, and a save's failure is the client's
+	// warning. A URL billet did not sign is not billet's to answer.
+	switch req.URL.Path {
+	case actionsCreatePath, actionsDownloadPath:
+		if !s.breaker.admit() {
 			s.observeActions(req.Context(), session, alloc.ActionsCacheBypassed)
 
 			return nil, false, nil
-		case actionsFinalizePath:
+		}
+	case actionsFinalizePath:
+		if !s.breaker.allow() {
 			return nil, true, errStoreOpen
+		}
+	default:
+		if !s.breaker.allow() {
+			if s.ownsActionsBlob(req, session) {
+				return nil, true, errStoreOpen
+			}
+
+			return nil, false, nil
 		}
 	}
 	// A CALL THAT IS ANSWERED HERE IS NOT OBSERVED HERE. Whether the guest was
@@ -761,7 +773,7 @@ func (s *CacheService) createActionsCache(
 			})
 		}
 	}
-	if err := s.asked(ctx, "an Actions cache lookup", func(askCtx context.Context) error {
+	if err := s.asked(ctx, session, "an Actions cache lookup", func(askCtx context.Context) error {
 		_, err := s.store.Current(askCtx, storeKey)
 
 		return err
@@ -781,9 +793,12 @@ func (s *CacheService) createActionsCache(
 	if err != nil {
 		return nil, err
 	}
-	volume, _, err := s.acquireVolume(ctx, session, "an Actions cache reservation", cacheWorkLimit,
+	volume, _, err := s.acquireVolume(ctx, session, cacheWorkLimit,
 		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
-			created, err := s.store.Create(acquireCtx, storeKey, actionsVolumeSize)
+			created, err := s.handOver(session.instance, "an Actions cache reservation",
+				func() (storecontract.Volume, error) {
+					return s.store.Create(acquireCtx, storeKey, actionsVolumeSize)
+				})
 
 			return created, false, err
 		})
@@ -1001,6 +1016,7 @@ func (s *CacheService) finalizeActionsCache(
 	}
 	lease, fence, err := s.store.AcquireWriter(ctx, archive.StoreKey,
 		session.instance+"/actions/"+archive.ID, cacheWriterTTL)
+	s.countedPublication(session.instance, "an Actions cache writer", err)
 	if err != nil {
 		return nil, err
 	}
@@ -1021,6 +1037,7 @@ func (s *CacheService) finalizeActionsCache(
 		}
 	}
 	candidate, err := s.store.Snapshot(ctx, archive.Volume)
+	s.countedPublication(session.instance, "an Actions cache snapshot", err)
 	if err != nil {
 		return nil, abandon(err)
 	}
@@ -1068,6 +1085,7 @@ func (s *CacheService) publishActionsReceipt(
 	for attempt := range 2 {
 		err = s.store.PublishCAS(ctx, receipt.StoreKey, "", receipt.Candidate,
 			receipt.Lease, receipt.Fence)
+		s.countedPublication(session.instance, "an Actions cache publication", err)
 		if !errors.Is(err, storecontract.ErrConflict) {
 			if err != nil {
 				return nil, err
@@ -1210,7 +1228,7 @@ func (s *CacheService) findActionsCache(
 			restore[index] = candidate + key
 		}
 		var found, foundGeneration string
-		err := s.asked(ctx, "an Actions cache lookup", func(askCtx context.Context) error {
+		err := s.asked(ctx, session, "an Actions cache lookup", func(askCtx context.Context) error {
 			var err error
 			found, foundGeneration, err = matcher.Match(askCtx, candidate+request.Key, restore)
 
@@ -1233,9 +1251,12 @@ func (s *CacheService) findActionsCache(
 	if !ok || !validActionsCacheField(matchedKey) {
 		return nil, errors.New("site cache returned a key outside the Actions namespace")
 	}
-	volume, _, err := s.acquireVolume(ctx, session, "an Actions cache restore", cacheWorkLimit,
+	volume, _, err := s.acquireVolume(ctx, session, cacheWorkLimit,
 		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
-			cloned, err := s.store.Clone(acquireCtx, matched, generation)
+			cloned, err := s.handOver(session.instance, "an Actions cache restore",
+				func() (storecontract.Volume, error) {
+					return s.store.Clone(acquireCtx, matched, generation)
+				})
 
 			return cloned, false, err
 		})

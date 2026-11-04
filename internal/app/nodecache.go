@@ -238,6 +238,9 @@ func startNodeCache(
 		})
 	}
 
+	// THE STORE'S BREAKER PROBES AND REPORTS UNTIL THE NODE STOPS, off every job's path.
+	go service.RunStoreGuard(ctx, cachePolicy)
+
 	// Eviction is intentionally best effort. A cache outage may slow a job, but it
 	// must never change that job's result or stop the node from serving compute.
 	//
@@ -247,9 +250,6 @@ func startNodeCache(
 	// after the first renewal, so a restarted node's live clones are renewed before
 	// any eviction pass reads their records.
 	//
-	// THE STORE'S BREAKER PROBES AND REPORTS UNTIL THE NODE STOPS, off every job's path.
-	go service.RunStoreGuard(ctx, cachePolicy)
-
 	// ON A CONTEXT THE STOP CANCELS, and the stop waits for a kernel-mapping sweep
 	// in flight (sweeping): an unmap the process exits under is killed with the
 	// unit's cgroup, and one cut short leaves the image's lock with the host's one

@@ -16,19 +16,32 @@ import (
 
 var errStoreGone = errors.New("rbd: exit status 110")
 
+const testTrial = time.Minute
+
 func testBreaker() (*storeBreaker, *atomic.Int32) {
 	changes := new(atomic.Int32)
 
-	return newStoreBreaker("ceph", slog.New(slog.DiscardHandler),
+	return newStoreBreaker("ceph", testTrial, slog.New(slog.DiscardHandler),
 		func() { changes.Add(1) }), changes
 }
 
-func TestThreeFailuresWithinTheWindowOpenTheBreakerAndTwoDoNot(t *testing.T) {
+// aClone is one job asking for a volume, and aLookup one asking what is there.
+func aClone(who string) storeCall  { return storeCall{op: "clone", who: who, decides: true} }
+func aLookup(who string) storeCall { return storeCall{op: "lookup", who: who} }
+
+// failThree is three different jobs failing, what it takes to open a breaker.
+func failThree(b *storeBreaker) {
+	for i := range breakerFailures {
+		b.outcome(aClone(fmt.Sprintf("job-%d", i)), errStoreGone)
+	}
+}
+
+func TestThreeJobsFailingWithinTheWindowOpenTheBreakerAndTwoDoNot(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		b, changes := testBreaker()
 
-		b.outcome("clone", errStoreGone)
-		b.outcome("clone", errStoreGone)
+		b.outcome(aClone("one"), errStoreGone)
+		b.outcome(aClone("two"), errStoreGone)
 		if !b.allow() {
 			t.Fatal("two failures opened the breaker")
 		}
@@ -36,7 +49,7 @@ func TestThreeFailuresWithinTheWindowOpenTheBreakerAndTwoDoNot(t *testing.T) {
 			t.Fatal("two failures reported a change")
 		}
 
-		b.outcome("clone", errStoreGone)
+		b.outcome(aClone("three"), errStoreGone)
 		if b.allow() {
 			t.Fatal("three failures left the breaker closed")
 		}
@@ -50,22 +63,77 @@ func TestThreeFailuresWithinTheWindowOpenTheBreakerAndTwoDoNot(t *testing.T) {
 	})
 }
 
+// ONE JOB CAN MAKE THE STORE REFUSE IT AS OFTEN AS IT LIKES, and must not be able to turn
+// every other job's caches off by doing so.
+func TestOneJobFailingOverAndOverIsOneFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, _ := testBreaker()
+
+		for range 10 * breakerFailures {
+			b.outcome(aClone("one"), errStoreGone)
+		}
+		b.outcome(aClone("two"), errStoreGone)
+		if !b.allow() {
+			t.Fatal("one job's failures counted as more than one")
+		}
+
+		// ITS LATEST FAILURE IS THE ONE THAT DATES IT.
+		time.Sleep(breakerWindow - time.Second)
+		b.outcome(aClone("one"), errStoreGone)
+		time.Sleep(time.Second)
+		b.outcome(aClone("three"), errStoreGone)
+		if !b.allow() {
+			t.Fatal("a failure past the window still counted")
+		}
+		b.outcome(aClone("four"), errStoreGone)
+		if b.allow() {
+			t.Fatal("three jobs failing within the window left it closed")
+		}
+	})
+}
+
 func TestAFailureOutsideTheWindowDoesNotCount(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		b, _ := testBreaker()
 
-		b.outcome("clone", errStoreGone)
-		b.outcome("clone", errStoreGone)
+		b.outcome(aClone("one"), errStoreGone)
+		b.outcome(aClone("two"), errStoreGone)
 		time.Sleep(breakerWindow)
-		b.outcome("clone", errStoreGone)
+		b.outcome(aClone("three"), errStoreGone)
 		if !b.allow() {
 			t.Fatal("failures a window apart opened the breaker")
 		}
 		time.Sleep(time.Second)
-		b.outcome("clone", errStoreGone)
-		b.outcome("clone", errStoreGone)
+		b.outcome(aClone("four"), errStoreGone)
+		b.outcome(aClone("five"), errStoreGone)
 		if b.allow() {
 			t.Fatal("three failures within the window left it closed")
+		}
+	})
+}
+
+// A VOLUME HANDED OVER SAYS THE FAILURES SO FAR WERE NOT THE STORE; an answer to a lookup
+// does not, because the store can give one with what a job needs out of reach.
+func TestOnlyAVolumeHandedOverClearsTheCount(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, _ := testBreaker()
+
+		b.outcome(aClone("one"), errStoreGone)
+		b.outcome(aClone("two"), errStoreGone)
+		b.outcome(aLookup("ok"), nil)
+		b.outcome(aClone("miss"), storecontract.ErrMiss)
+		b.outcome(aClone("three"), errStoreGone)
+		if b.allow() {
+			t.Fatal("an answer that hands over no volume cleared the count")
+		}
+
+		b, _ = testBreaker()
+		b.outcome(aClone("one"), errStoreGone)
+		b.outcome(aClone("two"), errStoreGone)
+		b.outcome(aClone("ok"), nil)
+		b.outcome(aClone("three"), errStoreGone)
+		if !b.allow() {
+			t.Fatal("a volume handed over left the count standing")
 		}
 	})
 }
@@ -81,8 +149,8 @@ func TestWhatTheStoreAnsweredIsNotAFailure(t *testing.T) {
 			fmt.Errorf("wrapped: %w", context.Canceled),
 		} {
 			b, _ := testBreaker()
-			for range breakerFailures {
-				b.outcome("clone", err)
+			for i := range breakerFailures {
+				b.outcome(aClone(fmt.Sprintf("job-%d", i)), err)
 			}
 			if !b.allow() {
 				t.Errorf("%v opened the breaker", err)
@@ -98,8 +166,8 @@ func TestADeadlineCountsAsATimeoutAndAnythingElseAsAnError(t *testing.T) {
 			lease.CacheStoreError:   errStoreGone,
 		} {
 			b, _ := testBreaker()
-			for range breakerFailures {
-				b.outcome("clone", err)
+			for i := range breakerFailures {
+				b.outcome(aClone(fmt.Sprintf("job-%d", i)), err)
 			}
 			if got := b.report().Reason; got != want {
 				t.Errorf("%v: reason = %q, want %q", err, got, want)
@@ -114,8 +182,8 @@ func TestACallThatNeverReturnsCountsAtItsLimit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		b, _ := testBreaker()
 
-		for range breakerFailures {
-			b.watch("clone", time.Minute)
+		for i := range breakerFailures {
+			b.watch(aClone(fmt.Sprintf("job-%d", i)), time.Minute)
 		}
 		time.Sleep(time.Minute - time.Second)
 		synctest.Wait()
@@ -139,8 +207,8 @@ func TestAWatchedCallCountsOnce(t *testing.T) {
 		// Returned in time, with an answer: nothing counts, and the timer does not
 		// count it later.
 		b, _ := testBreaker()
-		for range breakerFailures {
-			b.watch("clone", time.Minute)(nil)
+		for i := range breakerFailures {
+			b.watch(aClone(fmt.Sprintf("job-%d", i)), time.Minute)(nil)
 		}
 		time.Sleep(2 * time.Minute)
 		synctest.Wait()
@@ -150,14 +218,25 @@ func TestAWatchedCallCountsOnce(t *testing.T) {
 
 		// Past its limit and then failed: one failure, not two.
 		b, _ = testBreaker()
-		done := b.watch("clone", time.Second)
+		done := b.watch(aClone("one"), time.Second)
 		time.Sleep(2 * time.Second)
 		synctest.Wait()
 		done(errStoreGone)
-		done2 := b.watch("clone", time.Second)
-		done2(errStoreGone)
+		b.watch(aClone("two"), time.Second)(errStoreGone)
 		if !b.allow() {
 			t.Fatal("two calls counted as three failures")
+		}
+
+		// Past its limit and then handed a volume over: that late, it clears nothing.
+		b, _ = testBreaker()
+		b.outcome(aClone("one"), errStoreGone)
+		late := b.watch(aClone("two"), time.Second)
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		late(nil)
+		b.outcome(aClone("three"), errStoreGone)
+		if b.allow() {
+			t.Fatal("a call counted as a timeout then cleared the count")
 		}
 	})
 }
@@ -178,6 +257,7 @@ func TestAnOpenBreakerIsProbedAndOnlyAnAnswerMovesIt(t *testing.T) {
 			if deadline, ok := probeCtx.Deadline(); !ok || time.Until(deadline) != breakerProbeLimit {
 				t.Errorf("the probe's bound = %v, %v", deadline, ok)
 			}
+
 			return *answer.Load()
 		})
 
@@ -188,16 +268,14 @@ func TestAnOpenBreakerIsProbedAndOnlyAnAnswerMovesIt(t *testing.T) {
 			t.Fatalf("a closed breaker was probed %d times", asked.Load())
 		}
 
-		for range breakerFailures {
-			b.outcome("clone", errStoreGone)
-		}
+		failThree(b)
 		before := changes.Load()
 
 		// COULD NOT TELL LEAVES IT OPEN.
 		time.Sleep(breakerProbeEvery)
 		synctest.Wait()
-		if asked.Load() != 1 || b.allow() {
-			t.Fatalf("after a failed probe: asked %d, allowed %v", asked.Load(), b.allow())
+		if asked.Load() != 1 || b.admit() {
+			t.Fatalf("after a failed probe: asked %d, admitted %v", asked.Load(), b.admit())
 		}
 		if changes.Load() != before {
 			t.Fatal("a failed probe reported a change")
@@ -208,38 +286,96 @@ func TestAnOpenBreakerIsProbedAndOnlyAnAnswerMovesIt(t *testing.T) {
 		answer.Store(&miss)
 		time.Sleep(breakerProbeEvery)
 		synctest.Wait()
-		if !b.allow() {
-			t.Fatal("an answered probe left jobs skipping the store")
-		}
 		if got := b.report().State; got != lease.CacheStoreProbation {
 			t.Fatalf("state = %q, want probation", got)
 		}
+		if b.isOpen() {
+			t.Fatal("the gauge would say open on probation")
+		}
+
+		// A PUBLICATION WAITS FOR THE VERDICT; ONE JOB ASKS.
+		if b.allow() {
+			t.Fatal("probation let a publication ask")
+		}
+		if !b.admit() {
+			t.Fatal("probation let no job try the store")
+		}
+		if b.admit() {
+			t.Fatal("probation let a second job try while the first was out")
+		}
 
 		// ONE FAILURE ON PROBATION REOPENS IT AT ONCE.
-		b.outcome("clone", errStoreGone)
-		if b.allow() {
-			t.Fatal("a failure on probation left it allowed")
+		b.outcome(aClone("trial"), errStoreGone)
+		if got := b.report(); got.State != lease.CacheStoreOpen || got.Failures != 1 {
+			t.Fatalf("after a failure on probation: %+v", got)
 		}
 
-		// AN ANSWER LATE FROM BEFORE IS NOT A PROBE.
-		b.outcome("clone", nil)
-		if b.allow() {
-			t.Fatal("a call's answer closed an open breaker")
+		// A VOLUME LATE FROM BEFORE IS NOT A PROBE.
+		b.outcome(aClone("late"), nil)
+		if got := b.report().State; got != lease.CacheStoreOpen {
+			t.Fatalf("a call's answer moved an open breaker to %q", got)
 		}
 
-		// AND ONE ANSWER ON PROBATION CLOSES IT.
+		// THE NEXT PROBATION HAS A TRIAL OF ITS OWN.
 		time.Sleep(breakerProbeEvery)
 		synctest.Wait()
-		b.outcome("clone", nil)
+		if !b.admit() {
+			t.Fatal("a new probation held the last one's trial")
+		}
+
+		// NOTHING BUT A VOLUME ENDS IT: A LOOKUP AND A CLONE'S MISS BOTH CAN BE ANSWERED
+		// WITH WHAT A JOB NEEDS OUT OF REACH.
+		b.outcome(aLookup("trial"), nil)
+		b.outcome(aClone("trial"), storecontract.ErrMiss)
+		if got := b.report().State; got != lease.CacheStoreProbation {
+			t.Fatalf("an answer that handed over no volume moved probation to %q", got)
+		}
+
+		// AND ONE HANDED OVER CLOSES IT.
+		b.outcome(aClone("trial"), nil)
 		if got := b.report(); got.State != lease.CacheStoreClosed || got.Failures != 0 || got.Reason != "" {
 			t.Fatalf("report = %+v, want closed with nothing carried", got)
 		}
+		if !b.allow() || !b.admit() || !b.admit() {
+			t.Fatal("a closed breaker refused someone")
+		}
 
 		// CLOSED AGAIN, IT STARTS COUNTING FROM NOTHING.
-		b.outcome("clone", errStoreGone)
-		b.outcome("clone", errStoreGone)
+		b.outcome(aClone("one"), errStoreGone)
+		b.outcome(aClone("two"), errStoreGone)
 		if !b.allow() {
 			t.Fatal("failures before the close were still counted")
+		}
+
+		cancel()
+		synctest.Wait()
+	})
+}
+
+// A JOB THAT WENT AWAY, OR NEVER NEEDED A VOLUME, SAYS NOTHING, and must not hold the
+// store's recovery: the next job may try once its time is up.
+func TestATrialThatNeverAnswersLetsTheNextJobTry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		b, _ := testBreaker()
+		go b.run(ctx, func(context.Context) error { return nil })
+		failThree(b)
+		time.Sleep(breakerProbeEvery)
+		synctest.Wait()
+
+		if !b.admit() {
+			t.Fatal("probation let no job try the store")
+		}
+		b.outcome(aClone("trial"), context.Canceled)
+		time.Sleep(testTrial - time.Second)
+		if b.admit() {
+			t.Fatal("a second job tried inside the first's time")
+		}
+		time.Sleep(time.Second)
+		if !b.admit() {
+			t.Fatal("a trial that never answered held probation past its time")
 		}
 
 		cancel()
@@ -251,9 +387,9 @@ func TestANilBreakerAllowsEverythingAndCountsNothing(t *testing.T) {
 	t.Parallel()
 
 	var b *storeBreaker
-	if !b.allow() {
+	if !b.allow() || !b.admit() {
 		t.Error("a store nobody guards was refused")
 	}
-	b.outcome("clone", errStoreGone)
-	b.watch("clone", time.Hour)(errStoreGone)
+	b.outcome(aClone("one"), errStoreGone)
+	b.watch(aClone("one"), time.Hour)(errStoreGone)
 }

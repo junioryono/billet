@@ -108,3 +108,32 @@ func TestTheRouteKeepsAStoreReportAndRefusesWhatItCouldNotKeep(t *testing.T) {
 		}
 	}
 }
+
+// A SUPERSEDED PROCESS'S WORD WOULD BE TAKEN AS ITS REPLACEMENT'S, because the row is read
+// under the registration in force.
+func TestAStoreReportFromASupersededProcessIsRefused(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{}
+	post := planeAt(t, store, nodeapi.VersionCacheBreaker)
+	report := nodeapi.CacheStoreRequest{
+		Store: "ceph", State: "closed", Since: "2026-11-04T00:00:00Z",
+	}
+	if got := post("/v1/register", nodeapi.RegisterRequest{
+		MinVersion: nodeapi.MinVersion, Version: nodeapi.VersionCacheBreaker, Incarnation: "replacement",
+		Node: "n1", Provider: config.ProviderDocker, GuestOS: []config.GuestOS{config.GuestLinux},
+		Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory,
+	}); got != http.StatusOK {
+		t.Fatalf("the replacement's registration: status %d", got)
+	}
+	// post still speaks as the first process.
+	if got := post("/v1/nodes/n1/cache-store", report); got != http.StatusConflict {
+		t.Fatalf("a superseded process's report: status %d, want %d", got, http.StatusConflict)
+	}
+	store.mu.Lock()
+	kept := len(store.storeReports)
+	store.mu.Unlock()
+	if kept != 0 {
+		t.Fatalf("a superseded process's report was kept: %d", kept)
+	}
+}

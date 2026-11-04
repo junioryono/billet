@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node"
+	"github.com/junioryono/billet/internal/provider"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -571,4 +574,63 @@ func namesSelector(expr ast.Expr, pkg, name string) bool {
 	ident, ok := selector.X.(*ast.Ident)
 
 	return ok && ident.Name == pkg
+}
+
+// EVERY NODE WHOSE STORE STANDS BETWEEN A JOB AND ITS START HAS A BREAKER, under the
+// deadline its measurement set, and no other does.
+func TestAStoreBetweenAJobAndItsStartIsGuarded(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		provider config.ProviderKind
+		store    string
+	}{
+		{config.ProviderFirecracker, "ceph"},
+		{config.ProviderEC2, "ebs-s3"},
+		{config.ProviderDocker, ""},
+	} {
+		t.Run(string(tc.provider), func(t *testing.T) {
+			t.Parallel()
+
+			service, err := node.NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+				struct{ storecontract.Store }{}, struct{ provider.VolumeAttacher }{}, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("NewCacheService: %v", err)
+			}
+			guardNodeStore(&config.Config{Node: &config.NodeConfig{Provider: tc.provider}}, service)
+			store, open, known := service.StoreBreakerOpen()
+			if store != tc.store || known != (tc.store != "") || open {
+				t.Fatalf("StoreBreakerOpen = %q, %v, %v, want %q", store, open, known, tc.store)
+			}
+		})
+	}
+}
+
+// PROVED USED, NOT ONLY SHOWN TO WORK: a breaker nothing probes never closes, and one nothing
+// tells at a registration leaves a new control plane without its row.
+func TestTheNodeRunsItsStoreGuardAndResendsAtRegistration(t *testing.T) {
+	t.Parallel()
+
+	for file, want := range map[string]string{
+		"nodecache.go": "RunStoreGuard",
+		"node.go":      "ResendStoreState",
+	} {
+		parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		called := false
+		ast.Inspect(parsed, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == want {
+					called = true
+				}
+			}
+
+			return true
+		})
+		if !called {
+			t.Errorf("%s no longer calls %s", file, want)
+		}
+	}
 }

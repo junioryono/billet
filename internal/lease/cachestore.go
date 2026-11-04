@@ -55,23 +55,23 @@ func (r CacheStoreReport) Validate() error {
 	switch r.Store {
 	case "ceph", "ebs-s3":
 	default:
-		return fmt.Errorf("alloc: %s is not a site store billet records", strconv.Quote(r.Store))
+		return fmt.Errorf("lease: %s is not a site store billet records", strconv.Quote(r.Store))
 	}
 	switch r.State {
 	case CacheStoreClosed, CacheStoreOpen, CacheStoreProbation:
 	default:
-		return fmt.Errorf("alloc: %s is not a store state billet records", strconv.Quote(string(r.State)))
+		return fmt.Errorf("lease: %s is not a store state billet records", strconv.Quote(string(r.State)))
 	}
 	switch r.Reason {
 	case "", CacheStoreTimeout, CacheStoreError:
 	default:
-		return fmt.Errorf("alloc: %s is not a store failure billet records", strconv.Quote(string(r.Reason)))
+		return fmt.Errorf("lease: %s is not a store failure billet records", strconv.Quote(string(r.Reason)))
 	}
 	if r.Since.IsZero() {
-		return errors.New("alloc: a store's state must say when it began")
+		return errors.New("lease: a store's state must say when it began")
 	}
 	if r.Failures < 0 {
-		return fmt.Errorf("alloc: a store cannot have failed %d times", r.Failures)
+		return fmt.Errorf("lease: a store cannot have failed %d times", r.Failures)
 	}
 
 	return nil

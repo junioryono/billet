@@ -156,9 +156,9 @@ func (s *CacheService) casVolume(
 
 	ceiling := volumeCeiling(setting)
 	key := s.cacheKeyFor(session, kind, "", "")
-	volume, cold, err := s.acquireVolume(ctx, session, "a content-addressed cache", cacheWorkLimit,
+	volume, cold, err := s.acquireVolume(ctx, session, cacheWorkLimit,
 		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
-			return s.cloneOrCreate(acquireCtx, key, ceiling, ceiling)
+			return s.cloneOrCreate(acquireCtx, session.instance, key, ceiling, ceiling)
 		})
 	if err != nil {
 		backOff()
@@ -434,7 +434,13 @@ func (s *CacheService) openCASHandle(
 	// A STORE THAT HAS STOPPED ANSWERING IS NOT READ EITHER, whether or not this
 	// session has its volume yet: a read of a volume whose OSDs are gone waits in the
 	// kernel, so nothing here could end it, and the guest's helper reads this as a miss.
-	if enabled && !s.breaker.allow() {
+	// One still to get its volume may be the job a probation is waiting for; one that
+	// has it would decide nothing by reading it.
+	asking := s.breaker.allow
+	if session.hosts[kind] == nil {
+		asking = s.breaker.admit
+	}
+	if enabled && !asking() {
 		noteBuildCache(session, kind, alloc.BuildCacheBypassed)
 		session.mu.Unlock()
 		admitted()
@@ -519,7 +525,7 @@ func (h *casHandle) Open(table reapi.Table, digest string) (*os.File, error) {
 	// THE OPEN AND ITS FIRST BYTE ARE WHAT THE BREAKER HEARS OF A READ, which it counts
 	// as a timeout from casReadLimit on if the kernel is still waiting on the store.
 	// What is not there is the store answering.
-	done := h.s.breaker.watch("a content-addressed read", casReadLimit)
+	done := h.s.breaker.watch(storeCall{op: "a content-addressed read", who: h.session.instance}, casReadLimit)
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) {
