@@ -455,8 +455,13 @@ func (r *usageRecord) setIntervals(row *state.UsageRow) {
 
 // endedCleanly reports whether a lease reached its terminal phase with nothing having
 // gone wrong: the only ending under which a missing start means no job ran.
+//
+// CUSTODY IS NOT CLEAN, whatever it ended as: a node holding a guest across a control
+// plane's restart can finish with `done` while the JobStarted that restart delayed is
+// still to come.
 func endedCleanly(row *state.UsageRow) bool {
-	return row.Conclusion == string(alloc.PhaseDone) && row.FailureReason == "" && row.Disruption == ""
+	return row.Conclusion == string(alloc.PhaseDone) && row.FailureReason == "" && row.Disruption == "" &&
+		row.CustodyAt == ""
 }
 
 // setWeight is what one of those minutes counts as, from the tier if it names a
