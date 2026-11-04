@@ -227,7 +227,7 @@ func Undecided(err error) bool {
 		return false
 	}
 
-	if errors.Is(err, ErrAppUnverifiable) || errors.Is(err, errNoAnswer) {
+	if errors.Is(err, ErrAppUnverifiable) || errors.Is(err, errNoAnswer) || errors.Is(err, ErrTokenUnavailable) {
 		return true
 	}
 
