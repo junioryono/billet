@@ -43,12 +43,6 @@ The readers get what the writer and the claim leave, up to four, so unset is six
 
 An operator running many deployments under one GitHub App would otherwise put its one key on every control plane, and a compromise of any of them could mint tokens for every installation of that App. A broker holds the key instead, and a deployment on one holds none. [ADR-023](../reference/decisions/adr-023-installation-tokens-from-a-broker.md) says why it is shaped this way.
 
-**On the machine holding the keys,** write the broker's file ([Configuration](../reference/configuration.md#the-token-brokers-file)) and run it. It reads the keys under the rules a `private_key_path` always had, and needs nothing else of billet's:
-
-```bash
-billet broker serve --config /etc/billet-broker/broker.yaml
-```
-
 **On each control-plane host,** add the block, name no key on any target, and make the key this host proves its deployment with:
 
 ```yaml
@@ -64,6 +58,14 @@ billet broker client-key --config /etc/billet/billet.yaml --new-deployment
 ```
 
 The key's directory has to exist already, where the service account can enter it. The command prints the deployment, the key's fingerprint and the stanza to add to the broker's file. Compare them on a channel you trust, as you would an enrollment: the registry is the trust decision. `--new-deployment` says this host is starting one, and mints its identity: without it the command refuses a host that holds none, so a replacement host cannot mint an identity that stops the restore it is about to run. An active-passive pair runs this on each host and registers both, and a restored host runs it after `billet local restore`, with no flag, because this key belongs to the host and travels in no archive. The Ansible collection neither installs nor asks for this key: run the command once on each host and register what it prints.
+
+**On the machine holding the keys,** write the broker's file ([Configuration](../reference/configuration.md#the-token-brokers-file)) with those stanzas, and run it. It reads the keys under the rules a `private_key_path` always had, and needs nothing else of billet's. **It reads the file once, so restart it after adding a deployment or a host's key:** until then that host is refused in the handshake.
+
+```bash
+billet broker serve --config /etc/billet-broker/broker.yaml
+```
+
+Then run `billet check` on each control-plane host, which asks the broker for a token, before starting it.
 
 **What a deployment may ask for is exactly what its stanza names**, and a token reaches what that deployment needs and nothing else: billet's permissions for the target, and for a repository target that repository alone. An installation registered as a whole organization belongs to one deployment, because its token reaches every repository the installation does.
 
