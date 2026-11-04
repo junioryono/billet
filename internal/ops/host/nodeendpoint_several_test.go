@@ -3,6 +3,7 @@ package host
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -77,40 +78,45 @@ func TestTheDecisionComparesWhatTheProcessDials(t *testing.T) {
 		dials     []string
 		rendered  func(f *endpointFixture) string
 		planned   bool
-		lists     bool
+		from, to  []string
 	}{
 		"both, and both wanted": {
 			installed: "both", on: canonicalA, dials: both,
-			rendered: func(f *endpointFixture) string { return f.several(endpointA, endpointB) }, lists: true,
+			rendered: func(f *endpointFixture) string { return f.several(endpointA, endpointB) }, from: both, to: both,
 		},
 		"both, on the second, and both wanted": {
 			installed: "both", on: canonicalB, dials: both,
-			rendered: func(f *endpointFixture) string { return f.several(endpointA, endpointB) }, lists: true,
+			rendered: func(f *endpointFixture) string { return f.several(endpointA, endpointB) }, from: both, to: both,
 		},
 		"both, wanted in another order": {
 			installed: "both", on: canonicalA, dials: both,
-			rendered: func(f *endpointFixture) string { return f.several(endpointB, endpointA) }, lists: true,
+			rendered: func(f *endpointFixture) string { return f.several(endpointB, endpointA) }, from: both,
+			to: []string{canonicalB, canonicalA},
 		},
 		// THE CASE THE LIST IN THE RECORD EXISTS FOR: the node is on a controller
 		// the rendering still names, and its process knows no other.
 		"one, on a controller the rendering still names": {
 			installed: "one", on: canonicalA,
-			rendered: func(f *endpointFixture) string { return f.several(endpointA, endpointB) }, planned: true, lists: true,
+			rendered: func(f *endpointFixture) string { return f.several(endpointA, endpointB) }, planned: true,
+			from: []string{canonicalA}, to: both,
 		},
 		// AND WITH NOTHING ELSE TO GIVE IT AWAY: the render has already happened, so
 		// the two configurations agree, and only the record says the process is
 		// behind them.
 		"one, with both installed and both wanted": {
 			installed: "both", on: canonicalA,
-			rendered: func(f *endpointFixture) string { return f.several(endpointA, endpointB) }, planned: true, lists: true,
+			rendered: func(f *endpointFixture) string { return f.several(endpointA, endpointB) }, planned: true,
+			from: []string{canonicalA}, to: both,
 		},
 		"both, and the first alone wanted": {
 			installed: "both", on: canonicalA, dials: both,
-			rendered: func(f *endpointFixture) string { return f.rendering(endpointA) }, planned: true, lists: true,
+			rendered: func(f *endpointFixture) string { return f.rendering(endpointA) }, planned: true,
+			from: both, to: []string{canonicalA},
 		},
 		"both, and a list of one wanted": {
 			installed: "both", on: canonicalA, dials: both,
-			rendered: func(f *endpointFixture) string { return f.several(endpointA) }, planned: true, lists: true,
+			rendered: func(f *endpointFixture) string { return f.several(endpointA) }, planned: true,
+			from: both, to: []string{canonicalA},
 		},
 		"one, and a list of that one wanted": {
 			installed: "one", on: canonicalA,
@@ -144,11 +150,15 @@ func TestTheDecisionComparesWhatTheProcessDials(t *testing.T) {
 			// ONLY A NODE NAMING SEVERAL CARRIES A LIST: one with one controller
 			// answers what it always did, which the role's parser holds to the
 			// member.
-			_, hasFrom := o.doc["from_endpoints"]
-			_, hasTo := o.doc["to_endpoints"]
+			for member, want := range map[string][]string{"from_endpoints": tc.from, "to_endpoints": tc.to} {
+				value, present := o.doc[member]
+				if present != (want != nil) {
+					t.Fatalf("%s present: %v, want %v: %s", member, present, want != nil, o.raw)
+				}
 
-			if hasFrom != tc.lists || hasTo != tc.lists {
-				t.Fatalf("from_endpoints %v and to_endpoints %v, want both %v: %s", hasFrom, hasTo, tc.lists, o.raw)
+				if present && !slices.Equal(asStrings(t, value), want) {
+					t.Fatalf("%s = %v, want %v", member, value, want)
+				}
 			}
 		})
 	}
@@ -281,6 +291,9 @@ func TestTheReceiptNamesTheListAndFollowsAFailover(t *testing.T) {
 	if got := f.receiptOnDisk(t); got.EffectiveEndpoint != canonicalB {
 		t.Fatalf("after the failover the receipt says the node is on %s", got.EffectiveEndpoint)
 	}
+
+	// A RENDERING IN ANOTHER ORDER WAS NOT INSTALLED, though the process need not move.
+	mustEndpointRefusal(t, f.refresh(t, f.several(endpointB, endpointA)), outcomeRefused, endpointReasonDesired)
 
 	// A PROCESS THAT DOES NOT KNOW THE LIST owes a migration, on a listed controller.
 	f.writeRecord(t, f.dialling(canonicalA, newInvocation, newIncarnation))
@@ -454,20 +467,23 @@ func TestARecordsAndAReceiptsSchemasAreExact(t *testing.T) {
 	both := []any{canonicalA, canonicalB}
 	f := newEndpointFixture(t)
 
-	for name, over := range map[string]map[string]any{
-		"a list under schema 1":       {"endpoints": both},
-		"schema 2 without a list":     {"schema": 2},
-		"a list of one":               {"schema": 2, "endpoints": []any{canonicalA}},
-		"a list without its endpoint": {"schema": 2, "endpoint": "http://127.0.0.1:7720", "endpoints": both},
-		"one controller twice":        {"schema": 2, "endpoints": []any{canonicalA, canonicalA}},
-		"a spelling not canonical":    {"schema": 2, "endpoints": []any{canonicalA, "127.0.0.1:7719"}},
-		"a list of something else":    {"schema": 2, "endpoints": []any{1, 2}},
-		"a list that is null":         {"schema": 2, "endpoints": nil},
-		"a schema from later":         {"schema": 3, "endpoints": both},
+	for name, tc := range map[string]struct {
+		over map[string]any
+		want string
+	}{
+		"a list under schema 1":       {map[string]any{"endpoints": both}, `"endpoints" is not one the node writes`},
+		"schema 2 without a list":     {map[string]any{"schema": 2}, `"endpoints" is missing`},
+		"a list of one":               {map[string]any{"schema": 2, "endpoints": []any{canonicalA}}, "names 1 controllers"},
+		"a list without its endpoint": {map[string]any{"schema": 2, "endpoint": "http://127.0.0.1:7720", "endpoints": both}, "does not name"},
+		"one controller twice":        {map[string]any{"schema": 2, "endpoints": []any{canonicalA, canonicalA}}, "named twice"},
+		"a spelling not canonical":    {map[string]any{"schema": 2, "endpoints": []any{canonicalA, "127.0.0.1:7719"}}, "endpoints: "},
+		"a list of something else":    {map[string]any{"schema": 2, "endpoints": []any{1, 2}}, "not a list of strings"},
+		"a list that is null":         {map[string]any{"schema": 2, "endpoints": nil}, "not a list of strings"},
+		"a schema from later":         {map[string]any{"schema": 3, "endpoints": both}, "schema is 3"},
 	} {
 		t.Run("the record: "+name, func(t *testing.T) {
 			rec := f.record(map[string]any{"endpoint": canonicalA})
-			for k, v := range over {
+			for k, v := range tc.over {
 				rec[k] = v
 			}
 
@@ -476,8 +492,8 @@ func TestARecordsAndAReceiptsSchemasAreExact(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if _, err := decodeRegistrationRecord(body); err == nil {
-				t.Fatalf("a record was admitted: %s", body)
+			if _, err := decodeRegistrationRecord(body); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%s: %v, want %q", body, err, tc.want)
 			}
 		})
 	}
@@ -522,18 +538,22 @@ func TestARecordsAndAReceiptsSchemasAreExact(t *testing.T) {
 		t.Fatalf("a schema 2 receipt = %+v, %v", got, err)
 	}
 
-	for name, over := range map[string]map[string]any{
-		"schema 1 with a list":        {"schema": 1},
-		"both forms":                  {"installed_endpoint": canonicalA},
-		"no list":                     {"installed_endpoints": nil},
-		"a list of one":               {"installed_endpoints": []any{canonicalA}},
-		"the effective one not in it": {"effective_endpoint": "http://127.0.0.1:7720"},
-		"one controller twice":        {"installed_endpoints": []any{canonicalA, canonicalA}},
-		"a schema from later":         {"schema": 3},
+	for name, tc := range map[string]struct {
+		over map[string]any
+		want string
+	}{
+		"schema 1 with a list":        {map[string]any{"schema": 1}, `"installed_endpoint" is missing`},
+		"schema 1 with both forms":    {map[string]any{"schema": 1, "installed_endpoint": canonicalA}, `"installed_endpoints" is not one billet writes`},
+		"schema 2 with both forms":    {map[string]any{"installed_endpoint": canonicalA}, `"installed_endpoint" is not one billet writes`},
+		"no list":                     {map[string]any{"installed_endpoints": nil}, `"installed_endpoints" is missing`},
+		"a list of one":               {map[string]any{"installed_endpoints": []any{canonicalA}}, "names 1 controllers"},
+		"the effective one not in it": {map[string]any{"effective_endpoint": "http://127.0.0.1:7720"}, "does not name"},
+		"one controller twice":        {map[string]any{"installed_endpoints": []any{canonicalA, canonicalA}}, "named twice"},
+		"a schema from later":         {map[string]any{"schema": 3}, "schema is 3"},
 	} {
 		t.Run("the receipt: "+name, func(t *testing.T) {
-			if got, err := decodeEndpointReceipt(receipt(over)); err == nil {
-				t.Fatalf("a receipt was admitted: %+v", got)
+			if got, err := decodeEndpointReceipt(receipt(tc.over)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%+v: %v, want %q", got, err, tc.want)
 			}
 		})
 	}
@@ -552,11 +572,28 @@ func TestAControllerNamedTwiceUnderTwoSpellingsIsRefused(t *testing.T) {
 // A RETIREMENT LEAVES ONE CONTROLLER, so a node naming several is refused at the
 // request, naming what to do, before the chain that follows one endpoint is read.
 func TestARetirementRefusesANodeNamingSeveralControllers(t *testing.T) {
-	doc, err := decodeReport([]byte(`{"config_binding": true, "host": {"installed_endpoint": {"unknown": "several"},
-		"installed_endpoints": ["http://10.0.0.4:7717", "http://10.0.0.5:7717"]}}`))
+	inspected := nodeTLSFixture(t, true)
+
+	config1, err := os.ReadFile(inspected.configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	inspected.writeConfig(t, strings.Replace(string(config1), "  server_addr: 10.0.0.5:7717\n",
+		"  server_addrs: [10.0.0.5:7717, 10.0.0.6:7717]\n", 1))
+
+	body, err := json.Marshal(inspected.report(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := decodeReport(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// THE BINDING IS THE RELEASE'S TO SAY AND NOT WHAT THIS IS ABOUT.
+	doc.m["config_binding"] = true
 
 	_, r := judgeNodeChain(retireMode{}, &retireInput{}, &retireEnvelope{Host: "node-1", inspect: doc}, "node-1", "",
 		rollout.Registration{}, nil, nil, nil)

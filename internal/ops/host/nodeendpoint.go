@@ -385,8 +385,8 @@ func (s controllerSet) contains(e endpoint.Endpoint) bool {
 }
 
 // sameControllers says whether two sets name the same controllers in any order:
-// the order a process tries them in matters only when it starts, so a reorder
-// is not a process that has to restart.
+// the order a process tries them in matters only when it starts, so a reorder is
+// no migration. The ordinary restart a changed node section takes applies it.
 func (s controllerSet) sameControllers(o controllerSet) bool {
 	if len(s) != len(o) {
 		return false

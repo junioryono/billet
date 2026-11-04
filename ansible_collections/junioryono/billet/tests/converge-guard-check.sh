@@ -3140,16 +3140,28 @@ ep_case e2-several
 expect_allowed e2-several
 expect_fact e2-several planned True
 expect_fact e2-several from "http://127.0.0.1:7717"
-expect_fact e2-several to "http://127.0.0.1:7717, http://127.0.0.1:7719"
+# A FACT NAMING A LIST HOLDS A SPACE, which `fact` splits on, so the whole line is read.
+facts e2-several | grep -qF 'to=http://127.0.0.1:7717, http://127.0.0.1:7719 ' || fail "e2-several: the decision's facts do not name the list: $(facts e2-several)" "$work/cases/e2-several/out"
 expect_fact e2-several migrated True
 expect_state e2-several tempfiles 0
 grep -q "was migrated from http://127.0.0.1:7717 to http://127.0.0.1:7717, http://127.0.0.1:7719" "$work/cases/e2-several/out" || fail "e2-several: the migration report does not name the list" "$work/cases/e2-several/out"
 echo "ok   E2-several: a move onto both controllers is decided, performed, confirmed, receipted under schema 2 and refreshed"
 
+# E2-leaving. A node moved off a pair onto one controller: the list is the side it
+# leaves, the report names it, and the receipt is schema 1 again.
+ep_plant_ordinary e2-leaving $EP_A $EP_B
+e e2-leaving "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e2-leaving node-migrate-endpoint reported-leaving-several.json);migrate-endpoint:2:$(ep_fixture e2-leaving node-migrate-endpoint migrated-leaving-several.json);registration:1:$(ep_fixture e2-leaving rollout-registration confirmed.json incarnation=$EP_INC);receipt:1:$(ep_fixture e2-leaving node-receipt written.json receipt.run=h1);receipt:2:$(ep_fixture e2-leaving node-receipt current.json receipt.run=h1)"
+ep_case e2-leaving
+expect_allowed e2-leaving
+expect_fact e2-leaving planned True
+facts e2-leaving | grep -qF 'from=http://127.0.0.1:7717, http://127.0.0.1:7719 ' || fail "e2-leaving: the decision's facts do not name the list: $(facts e2-leaving)" "$work/cases/e2-leaving/out"
+grep -q "was migrated from http://127.0.0.1:7717, http://127.0.0.1:7719 to http://127.0.0.1:7719" "$work/cases/e2-leaving/out" || fail "e2-leaving: the migration report does not name the list" "$work/cases/e2-leaving/out"
+echo "ok   E2-leaving: a move off a pair onto one controller names the list it leaves"
+
 # E1-several. Nothing to do for a node that dials both: the unchanged answer's list
 # is read, and the refresh's schema 2 receipt is current.
 ep_plant_ordinary e1-several $EP_A $EP_A
-e e1-several "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e1-several node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture e1-several node-migrate-endpoint unchanged-several.json);receipt:1:$(ep_fixture e1-several node-receipt current-several.json receipt.run=h0)"
+e e1-several "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e1-several node-migrate-endpoint reported-unplanned-several.json);migrate-endpoint:2:$(ep_fixture e1-several node-migrate-endpoint unchanged-several.json);receipt:1:$(ep_fixture e1-several node-receipt current-several.json receipt.run=h0)"
 ep_case e1-several
 expect_allowed e1-several
 expect_fact e1-several migrated False
@@ -3183,7 +3195,7 @@ ep_corrupt_lists e8s-text to_endpoints '"http://127.0.0.1:7717"'
 ep_corrupt_lists e8s-none-several to_endpoints '["http://127.0.0.1:7717"]'
 # And a receipt's, on the same terms.
 ep_corrupt_receipt_list() { # name json
-  local name=$1 value=$2 f
+  local name=$1 value=$2 f items
   ep_plant_ordinary "$name" $EP_A $EP_A
   f=$(ep_fixture "$name" node-receipt current-several.json receipt.run=h0)
   "$python" - "$f" "$value" <<'PY'
@@ -3198,12 +3210,29 @@ PY
   e "$name" "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture "$name" node-migrate-endpoint reported-unplanned.json);migrate-endpoint:2:$(ep_fixture "$name" node-migrate-endpoint unchanged-several.json);receipt:1:$f"
   ep_case "$name"
   expect_refused "$name" "Judge the receipt's answer" "answered with a member this role cannot read: receipt_endpoints"
+  items=$(grep -c '^failed: \[localhost\] (item=' "$work/cases/$name/out" || true)
+  [ "$items" -eq 1 ] || fail "$name: $items failed items of the parser, want exactly one" "$work/cases/$name/out"
 }
 ep_corrupt_receipt_list e8s-receipt-number '["http://127.0.0.1:7719", 17]'
 ep_corrupt_receipt_list e8s-receipt-twice '["http://127.0.0.1:7719", "http://127.0.0.1:7719"]'
 ep_corrupt_receipt_list e8s-receipt-nested '[["http://127.0.0.1:7719"], ["http://127.0.0.1:7717"]]'
 ep_corrupt_receipt_list e8s-receipt-one '["http://127.0.0.1:7719"]'
 ep_corrupt_receipt_list e8s-receipt-not-effective '["http://127.0.0.1:7717", "http://127.0.0.1:7720"]'
+# And an unchanged answer's, the action's own call, which names several or none.
+ep_corrupt_unchanged() { # name json
+  local name=$1 value=$2 f items
+  ep_plant_ordinary "$name" $EP_A $EP_A
+  f=$(ep_fixture "$name" node-migrate-endpoint unchanged-several.json)
+  ep_corrupt "$f" endpoints "$value"
+  e "$name" "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture "$name" node-migrate-endpoint reported-unplanned-several.json);migrate-endpoint:2:$f"
+  ep_case "$name"
+  expect_refused "$name" "Judge the migration's answer" "answered with a member this role cannot read: endpoint_lists"
+  items=$(grep -c '^failed: \[localhost\] (item=' "$work/cases/$name/out" || true)
+  [ "$items" -eq 1 ] || fail "$name: $items failed items of the parser, want exactly one" "$work/cases/$name/out"
+}
+ep_corrupt_unchanged e8s-unchanged-one '["http://127.0.0.1:7719"]'
+ep_corrupt_unchanged e8s-unchanged-nested '[["http://127.0.0.1:7717"], ["http://127.0.0.1:7719"]]'
+ep_corrupt_unchanged e8s-unchanged-not-endpoint '["http://127.0.0.1:7717", "http://127.0.0.1:7720"]'
 echo "ok   E8-several: a list the command never writes is refused by name and alone, in an answer and in a receipt"
 
 # E2b. The controller's environment file, exactly when its

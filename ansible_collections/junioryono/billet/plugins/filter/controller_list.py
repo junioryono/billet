@@ -15,7 +15,7 @@ __metaclass__ = type
 
 
 def controller_list(value, member=None):
-    if not isinstance(value, (list, tuple)) or not value:
+    if not isinstance(value, (list, tuple)):
         return False
     if any(not isinstance(item, str) or not item for item in value):
         return False

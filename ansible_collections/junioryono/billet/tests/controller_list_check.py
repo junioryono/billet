@@ -22,7 +22,7 @@ ROWS = [
     ("a list without its member", [B], A, False),
     ("no member to hold", [A, B], None, False),
     ("a null", None, A, False),
-    ("a string, whose characters are not controllers", A, A, False),
+    ("a string, whose characters are not controllers", "abc", "b", False),
     ("a mapping", {A: B}, A, False),
     ("an empty list", [], A, False),
     ("a nested list", [[A], [B]], A, False),

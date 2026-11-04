@@ -148,6 +148,16 @@ def main():
         else:
             fail("%s: compared, want a refusal" % name)
 
+    # NOT MERELY REFUSED: a string walked as a list of controllers is refused too,
+    # for naming something that is no address.
+    try:
+        mod.compare(node(addrs="127.0.0.1:7717"), node(addr="127.0.0.1:7717"))
+    except mod.Refusal as err:
+        if "no list" not in str(err):
+            fail("a list that is not a list was refused as: %s" % err)
+    else:
+        fail("a list that is not a list compared")
+
     if failures:
         print("%d failures" % len(failures))
         sys.exit(1)
