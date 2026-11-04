@@ -12,6 +12,11 @@ import (
 // ErrMiss means a site has no published generation for a cache key.
 var ErrMiss = errors.New("store: cache miss")
 
+// ErrVolumeGone means a volume is no longer mapped on this host, so nothing can
+// be read from it and a snapshot of it can never succeed: a failed snapshot took
+// it, or the host restarted. A caller stops asking and discards what is left.
+var ErrVolumeGone = errors.New("store: the volume is no longer mapped on this host")
+
 // ErrConflict means the expected generation or fencing token is no longer current.
 var ErrConflict = errors.New("store: publication conflict")
 
@@ -169,6 +174,17 @@ type Store interface {
 	// Evict removes inactive generations and abandoned candidates while preserving
 	// every generation protected by a live active-clone lease.
 	Evict(ctx context.Context, olderThan time.Duration) error
+}
+
+// DeviceProver names the device a volume is mapped to now.
+//
+// A RECORDED DEVICE IS NOT PROOF. A kernel reuses a device's number as soon as it
+// is unmapped, so a number kept across a failure or a restart may name another
+// job's disk. It answers ErrVolumeGone for a volume nothing maps, and any other
+// error for could not tell. Optional: a store whose device is the volume's own
+// name has nothing to prove.
+type DeviceProver interface {
+	MappedDevice(ctx context.Context, volume Volume) (string, error)
 }
 
 // VolumeSizer reports how large a mapped volume is, so a caller can refuse a

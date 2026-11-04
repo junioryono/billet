@@ -37,7 +37,10 @@ const (
 	cacheCompactionLimit = 10 * time.Minute
 )
 
-var _ storecontract.Store = (*Client)(nil)
+var (
+	_ storecontract.Store        = (*Client)(nil)
+	_ storecontract.DeviceProver = (*Client)(nil)
+)
 
 type filesystemVerifier func(context.Context, string) (storecontract.Filesystem, error)
 
@@ -590,7 +593,19 @@ func (c *Client) snapshotAt(
 		return storecontract.Candidate{}, errors.New("ceph: a candidate must come from a mapped cache volume")
 	}
 
-	filesystem, err := c.verify(ctx, volume.Device)
+	// THE DEVICE IS PROVED BEFORE IT IS READ OR UNMAPPED. A failed snapshot unmaps
+	// and discards its volume, and a retry from the recorded number then checked
+	// whatever the kernel had given that number since: on 2026-11-04 another job's
+	// running root disk, called "not clean" for that job's writes, with an unmap of
+	// it next had it looked clean. In the seven days before, 2,132 such retries
+	// followed 153 real failures, each until the publication's window ended.
+	device, err := c.MappedDevice(ctx, volume)
+	if err != nil {
+		return storecontract.Candidate{}, fmt.Errorf("ceph: find the device of cache %q before "+
+			"publication: %w", volume.Key, err)
+	}
+
+	filesystem, err := c.verify(ctx, device)
 	if err != nil {
 		return storecontract.Candidate{}, fmt.Errorf("ceph: verify cache %q before publication: %w",
 			volume.Key, err)
@@ -612,7 +627,7 @@ func (c *Client) snapshotAt(
 	}); err != nil {
 		return storecontract.Candidate{}, err
 	}
-	if err := c.unmapDevice(ctx, volume.Device, volume.Handle); err != nil {
+	if err := c.unmapDevice(ctx, device, volume.Handle); err != nil {
 		return storecontract.Candidate{}, err
 	}
 

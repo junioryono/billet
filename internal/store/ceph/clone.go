@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 // ErrNoSuchImage is returned when a golden image or its snapshot is not there.
@@ -433,6 +435,35 @@ type mappedDevice struct {
 
 // mappedDevices lists the host devices a cache-pool image is mapped to.
 func (c *Client) mappedDevices(ctx context.Context, name string) ([]string, error) {
+	return c.mappedDevicesWhere(ctx, func(d mappedDevice) bool { return d.Name == name })
+}
+
+// MappedDevice names the device the kernel has a writable cache volume's head
+// mapped to now, from the kernel's table and by the image's name.
+func (c *Client) MappedDevice(ctx context.Context, volume storecontract.Volume) (string, error) {
+	name := strings.TrimPrefix(volume.Handle, c.cfg.CachePool+"/")
+	devices, err := c.mappedDevicesWhere(ctx, func(d mappedDevice) bool {
+		return d.Name == name && (d.Snap == "" || d.Snap == "-")
+	})
+	switch {
+	case err != nil:
+		return "", err
+	case len(devices) == 0:
+		return "", fmt.Errorf("%w: nothing maps %s, recorded on %s", storecontract.ErrVolumeGone,
+			volume.Handle, bounded(volume.Device))
+	case slices.Contains(devices, volume.Device):
+		return volume.Device, nil
+	case len(devices) == 1:
+		return devices[0], nil
+	}
+
+	return "", fmt.Errorf("ceph: %s is mapped to %v, none of them the recorded %s", volume.Handle,
+		devices, bounded(volume.Device))
+}
+
+// mappedDevicesWhere lists the host devices of the cache pool's mappings match
+// accepts.
+func (c *Client) mappedDevicesWhere(ctx context.Context, match func(mappedDevice) bool) ([]string, error) {
 	out, err := c.rbdCmd(ctx, true, "device", "list")
 	if err != nil {
 		return nil, fmt.Errorf("ceph: list the mapped rbd devices: %w", err)
@@ -450,7 +481,7 @@ func (c *Client) mappedDevices(ctx context.Context, name string) ([]string, erro
 	var found []string
 
 	for _, d := range devices {
-		if d.Pool == c.cfg.CachePool && d.Name == name && d.Device != "" {
+		if d.Pool == c.cfg.CachePool && d.Device != "" && match(d) {
 			found = append(found, d.Device)
 		}
 	}

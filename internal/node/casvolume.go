@@ -828,7 +828,11 @@ func (s *CacheService) mergeCASVolume(
 	}
 	source := s.casMountPath(session, hv.Kind) + ".source"
 	target := s.casMountPath(session, hv.Kind) + ".merge"
-	if err := s.actionIO.MountReadOnly(ctx, hv.Volume.Device, source); err != nil {
+	device, err := s.provenDevice(ctx, hv.Volume)
+	if err != nil {
+		return "", false, release(err)
+	}
+	if err := s.actionIO.MountReadOnly(ctx, device, source); err != nil {
 		return "", false, release(err)
 	}
 	if err := s.actionIO.MountWritable(ctx, latest.Device, target); err != nil {

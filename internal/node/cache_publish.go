@@ -125,11 +125,17 @@ func (s *CacheService) publishDeferred(
 			return false, err
 		}
 		candidate, err := s.store.Snapshot(ctx, attachment.Volume)
+		if errors.Is(err, storecontract.ErrVolumeGone) {
+			// NOTHING IS LEFT TO RETRY: an earlier attempt's failure took the clone,
+			// and that failure is what was logged. Asking again until the window
+			// ended held the session open for it, and for nothing else.
+			return abandon("the volume is gone after an earlier failed snapshot")
+		}
 		if err != nil {
 			// RETRIED ON THE NEXT PASS. A failed Snapshot leaves the pointer
-			// unchanged, which is all the contract promises; if it also consumed
-			// the clone, the retry fails the same way and the window's end
-			// abandons it, and the discard that follows is idempotent.
+			// unchanged, which is all the contract promises. If it also took the
+			// clone, the retry says so with ErrVolumeGone, and the discard that
+			// follows is idempotent.
 			journal.Phase = ""
 			journal.Attempts++
 
