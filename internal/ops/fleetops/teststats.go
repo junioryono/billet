@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -188,10 +189,14 @@ type seenIn struct {
 	suiteTests int64
 }
 
-// flakySightings bounds the attempts a test's failures and passes each keep on one
-// commit, one sighting to an attempt: two distinct ones are all a pair needs, so more
-// are only for a failure whose suite counted another number of tests.
-const flakySightings = 16
+// A test's sightings on one commit. Two distinct attempts are all a pair needs: at least
+// one of two differs from any other, so a list keeps two. A failure is matched to a clean
+// suite by what its suite counted, so each count keeps its own two, and flakyCounts
+// bounds the counts a job can make it hold.
+const (
+	flakySightings = 2
+	flakyCounts    = 16
+)
 
 // testTally is what was seen of one test.
 type testTally struct {
@@ -206,6 +211,8 @@ type testTally struct {
 type flakyTally struct {
 	failures      int64
 	fails, passes []seenIn
+	// failsByCount is the failures by what their suite counted.
+	failsByCount map[int64][]seenIn
 	// lastFail and lastPass are the jobs its latest failure and pass were in, and sameJob
 	// is a job that did both: jobs arrive one at a time, so the two are adjacent.
 	lastFail, lastPass string
@@ -218,7 +225,7 @@ func addSeen(list []seenIn, s seenIn) []seenIn {
 		return list
 	}
 	for i := range list {
-		if list[i].attempt == s.attempt && list[i].suiteTests == s.suiteTests {
+		if list[i].attempt == s.attempt {
 			return list
 		}
 	}
@@ -232,10 +239,6 @@ type cleanKey struct {
 	suite suiteKey
 	tests int64
 }
-
-// cleanSightings bounds the attempts a clean suite keeps. Two are enough, since at least
-// one of two differs from any failure's.
-const cleanSightings = 2
 
 // testStatsBuilder folds jobs' results, newest job first.
 type testStatsBuilder struct {
@@ -363,10 +366,7 @@ func (b *testStatsBuilder) addCleanSuite(key cleanKey, seen seenIn) {
 
 		return
 	}
-	if len(list) == cleanSightings || (len(list) == 1 && list[0].attempt == seen.attempt) {
-		return
-	}
-	b.cleanSuite[key] = append(list, seen)
+	b.cleanSuite[key] = addSeen(list, seen)
 }
 
 // addCase folds one case, the newest of its test first because jobs arrive newest
@@ -423,6 +423,7 @@ func (b *testStatsBuilder) addCase(rec *alloc.RecordedTestResults, job jobKey, i
 		f.failures++
 		f.fails = addSeen(f.fails, seen)
 		f.lastFail = rec.LeaseID
+		b.addFailCount(f, seen)
 	} else {
 		f.passes = addSeen(f.passes, seen)
 		f.lastPass = rec.LeaseID
@@ -430,6 +431,20 @@ func (b *testStatsBuilder) addCase(rec *alloc.RecordedTestResults, job jobKey, i
 	if f.sameJob == "" && f.lastFail == f.lastPass {
 		f.sameJob = rec.LeaseID
 	}
+}
+
+// addFailCount keeps a failure by what its suite counted, saying so when a job has made
+// more counts of one test than the bound keeps.
+func (b *testStatsBuilder) addFailCount(f *flakyTally, seen seenIn) {
+	if f.failsByCount == nil {
+		f.failsByCount = map[int64][]seenIn{}
+	}
+	if _, known := f.failsByCount[seen.suiteTests]; !known && len(f.failsByCount) >= flakyCounts {
+		b.out.Partial = true
+
+		return
+	}
+	f.failsByCount[seen.suiteTests] = addSeen(f.failsByCount[seen.suiteTests], seen)
 }
 
 // flakyPair is the evidence that one test failed and passed with nothing changed: a pass
@@ -446,10 +461,12 @@ func (b *testStatsBuilder) flakyPair(key flakyKey, f *flakyTally) (fail, pass, e
 				}
 			}
 		}
-		for _, failed := range f.fails {
-			for _, clean := range b.cleanSuite[cleanKey{suiteKey{key.job, key.suite}, failed.suiteTests}] {
-				if failed.attempt != clean.attempt {
-					return failed.lease, clean.lease, "suite"
+		for _, count := range slices.Sorted(maps.Keys(f.failsByCount)) {
+			for _, failed := range f.failsByCount[count] {
+				for _, clean := range b.cleanSuite[cleanKey{suiteKey{key.job, key.suite}, count}] {
+					if failed.attempt != clean.attempt {
+						return failed.lease, clean.lease, "suite"
+					}
 				}
 			}
 		}

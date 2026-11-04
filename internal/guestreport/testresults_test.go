@@ -388,3 +388,21 @@ func TestDropsAloneAreResults(t *testing.T) {
 		t.Errorf("got %+v, %t", got, ok)
 	}
 }
+
+// AN ADD PAST THE BOUND STOPS AT IT, from a count well below it too, which is the one the
+// shedding of results makes.
+func TestAnAddStopsAtTheBound(t *testing.T) {
+	t.Parallel()
+
+	d := DroppedCases{Suites: MaxValue - 1, Cases: MaxValue}
+	d.Add(5, 1)
+	if d != (DroppedCases{Suites: MaxValue, Cases: MaxValue}) {
+		t.Errorf("past the bound: %+v", d)
+	}
+
+	d = DroppedCases{}
+	d.Add(2, 3)
+	if d != (DroppedCases{Suites: 2, Cases: 3}) {
+		t.Errorf("below the bound: %+v", d)
+	}
+}

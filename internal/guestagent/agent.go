@@ -481,7 +481,7 @@ func (a *agent) final(ctx context.Context) {
 	//
 	// NEITHER FIELD OF SCHEMA 2, the count included: a node that does not know them
 	// refuses a batch for naming either, and with no cases there is no row to count for.
-	if (v == refused || v == stop) && len(b.batch.Cases) > 0 {
+	if (v == refused || v == stop) && namesSchemaCases(&b.batch) {
 		b.batch.Cases, b.batch.CasesDropped = nil, guestreport.DroppedCases{}
 
 		if body, err := fit(&b.batch, a.lim.maxBody, time.Time{}); err == nil {
@@ -546,6 +546,12 @@ func fit(b *guestreport.Batch, limit int, casesBy time.Time) ([]byte, error) {
 			return nil, errors.New("larger than the node takes")
 		}
 	}
+}
+
+// namesSchemaCases says b names a field of guestreport.SchemaCases, which fit can leave
+// it doing with no case left: a count of what it gave up is one.
+func namesSchemaCases(b *guestreport.Batch) bool {
+	return len(b.Cases) > 0 || b.CasesDropped != (guestreport.DroppedCases{})
 }
 
 // dropCases gives up every case b holds, counted, for the batch without them.

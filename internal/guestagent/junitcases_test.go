@@ -419,3 +419,24 @@ func TestWhatASuiteShedsWhileReadIsCounted(t *testing.T) {
 		t.Error("two names read as one once cleaned")
 	}
 }
+
+// A BATCH LEFT WITH ONLY A COUNT STILL NAMES SCHEMA 2, which a node rolled back since the
+// hello refuses, so it is resent as well; one naming neither would be refused the same.
+func TestABatchNamingEitherFieldOfSchemaTwoIsResendable(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		b    guestreport.Batch
+		want bool
+	}{
+		{"neither", guestreport.Batch{}, false},
+		{"cases", guestreport.Batch{Cases: []guestreport.SuiteCases{{Name: "s"}}}, true},
+		{"only a count of suites", guestreport.Batch{CasesDropped: guestreport.DroppedCases{Suites: 1}}, true},
+		{"only a count of cases", guestreport.Batch{CasesDropped: guestreport.DroppedCases{Cases: 1}}, true},
+	} {
+		if got := namesSchemaCases(&tc.b); got != tc.want {
+			t.Errorf("%s: %t, want %t", tc.name, got, tc.want)
+		}
+	}
+}

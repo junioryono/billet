@@ -215,7 +215,8 @@ func TestAPassAndAFailInOneJobIsFlaky(t *testing.T) {
 	t.Parallel()
 
 	// IN EITHER ORDER, since nothing says a retry is written after the failure it retried.
-	if got := statsOf(aJobRow(t, "l1", "same", aWholeSuite(passed("T", 1), failed("T", "m")))); len(got.Flaky) != 1 {
+	if got := statsOf(aJobRow(t, "l1", "same", aWholeSuite(passed("T", 1), failed("T", "m")))); len(got.Flaky) != 1 ||
+		got.Flaky[0].Evidence != "same job" || got.Flaky[0].FailLease != "l1" {
 		t.Errorf("a pass before a failure in one job: flaky are %+v", got.Flaky)
 	}
 
@@ -509,5 +510,29 @@ func TestTheBoundsKeepWhatDecides(t *testing.T) {
 	)
 	if len(got.Flaky) != 1 || got.Flaky[0].PassLease != "l1" || got.Flaky[0].Evidence != "suite" {
 		t.Errorf("a clean suite of the same count was hidden: %+v", got.Flaky)
+	}
+
+	// A FAILURE'S COUNT IS KEPT PAST ANY NUMBER OF OTHERS, or the failure a clean suite
+	// matches is the one thrown away.
+	jobs = nil
+	for i := range 2 * flakySightings {
+		small := aWholeSuite(failed("T", "m"))
+		jobs = append(jobs, row(fmt.Sprintf("f%d", i), int64(200+i), small))
+	}
+	jobs = append(jobs, row("big", 300, failing), row("clean", 301, clean(100)))
+	if got := statsOf(jobs...); len(got.Flaky) != 1 || got.Flaky[0].FailLease != "big" ||
+		got.Flaky[0].PassLease != "clean" {
+		t.Errorf("a failure past the bound on sightings was lost: %+v", got.Flaky)
+	}
+
+	// PAST THE BOUND ON COUNTS IT SAYS SO, rather than quietly finding nothing.
+	jobs = nil
+	for i := range flakyCounts + 1 {
+		s := aWholeSuite(failed("T", "m"))
+		s.Tests, s.Complete = int64(100+i), false
+		jobs = append(jobs, row(fmt.Sprintf("c%d", i), int64(400+i), s))
+	}
+	if got := statsOf(jobs...); !got.Partial {
+		t.Error("a test of more counts than the bound keeps reads as complete")
 	}
 }
