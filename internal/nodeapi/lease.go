@@ -155,9 +155,7 @@ type ClaimCustodyRequest struct {
 }
 
 // ClaimCustodyResponse is what the claim established: the leases this process holds
-// on this controller now, and those the node's current process has adopted, which
-// this one may let go of without destroying them. A lease named in neither is asked
-// about again.
+// on this controller now. A lease it does not name is asked about again.
 //
 // Version is the newest wire this controller speaks. The process reached it without
 // registering, so this is the only negotiation the two have: what it sends here from
@@ -165,7 +163,6 @@ type ClaimCustodyRequest struct {
 type ClaimCustodyResponse struct {
 	Version int      `json:"version"`
 	Held    []string `json:"held,omitempty"`
-	Adopted []string `json:"adopted,omitempty"`
 }
 
 // ErrorResponse is how a refusal crosses the wire.

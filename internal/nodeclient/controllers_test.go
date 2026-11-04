@@ -604,8 +604,13 @@ func TestARecoverySupersededBeforeADrainStopsAsking(t *testing.T) {
 
 	const launched = "/v1/nodes/n1/launched"
 
+	// THE ORDINARY LOOP'S RECOVERY FAILS UNTIL THE STOP, whose own recovery is the one
+	// superseded: one superseded before the stop drains from the ordinary loop.
+	var stopped atomic.Bool
+
 	a.mu.Lock()
-	a.supersede = func(path string, _ int) bool { return path == launched }
+	a.unavailable = func(path string, _ int) bool { return path == launched && !stopped.Load() }
+	a.supersede = func(path string, _ int) bool { return path == launched && stopped.Load() }
 	a.mu.Unlock()
 
 	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
@@ -617,6 +622,7 @@ func TestARecoverySupersededBeforeADrainStopsAsking(t *testing.T) {
 
 	waitFor(t, func() bool { return a.sent(launched) >= 2 })
 	cancel()
+	stopped.Store(true)
 
 	select {
 	case err := <-done:
@@ -657,8 +663,13 @@ func TestAStopSupersededBeforeItsDrainNeverRegistersAgain(t *testing.T) {
 
 	const launched = "/v1/nodes/n1/launched"
 
+	// THE ORDINARY LOOP'S RECOVERY FAILS UNTIL THE STOP, whose own recovery is the one
+	// superseded: one superseded before the stop drains from the ordinary loop.
+	var stopped atomic.Bool
+
 	a.mu.Lock()
-	a.supersede = func(path string, _ int) bool { return path == launched }
+	a.unavailable = func(path string, _ int) bool { return path == launched && !stopped.Load() }
+	a.supersede = func(path string, _ int) bool { return path == launched && stopped.Load() }
 	a.mu.Unlock()
 
 	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
@@ -678,6 +689,7 @@ func TestAStopSupersededBeforeItsDrainNeverRegistersAgain(t *testing.T) {
 
 	polls := a.sent("/v1/nodes/n1/poll")
 	cancel()
+	stopped.Store(true)
 
 	// THE DRAIN'S WORKER RETURNS WHILE WHAT RUNS HERE IS STILL HELD, which it
 	// does only when it serves nothing: one that served would return only when

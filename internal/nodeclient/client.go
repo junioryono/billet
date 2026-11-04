@@ -1083,18 +1083,18 @@ func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) err
 }
 
 // ClaimCustody says, for a superseded process, which leases it holds, to the
-// controller that serves, and answers those the node's current process has adopted.
+// controller that serves, and answers those it holds there now.
 // It tries every controller from the one it has; the first that answers is where
 // this process's lease calls go from now on, WITHOUT A REGISTRATION: only a
 // registration takes the name, and this process has lost it. The wire moves with
 // the controller, as a registration moves them, and comes back if an "unregistered"
 // answer cleared it. An answer other than success is that controller's word, and
 // leaves the current one where it is.
+//
+// NOT GATED ON THE WIRE, which is the last controller's: a process superseded below
+// this version is exactly one whose controller may since have been upgraded, and it
+// cannot register to learn so. An older plane answers a bare 404, which changes nothing.
 func (c *Client) ClaimCustody(ctx context.Context, leaseIDs []string) ([]string, error) {
-	if wire := c.WireVersion(); wire != 0 && wire < nodeapi.VersionCustodyClaim {
-		return nil, nil
-	}
-
 	start := int(c.current.Load())
 
 	var errs []error
@@ -1116,7 +1116,7 @@ func (c *Client) ClaimCustody(ctx context.Context, leaseIDs []string) ([]string,
 
 			c.regMu.Unlock()
 
-			return res.Adopted, nil
+			return res.Held, nil
 		}
 
 		if !errors.Is(err, errNoAnswer) {

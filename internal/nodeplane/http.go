@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1583,11 +1584,20 @@ func (h *handler) claimCustody(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	held, adopted := h.plane.ClaimCustody(node, incarnation, claims)
+	held, added := h.plane.ClaimCustody(node, incarnation, claims)
 
-	writeJSON(w, http.StatusOK, nodeapi.ClaimCustodyResponse{
-		Version: nodeapi.Version, Held: held, Adopted: adopted,
-	})
+	// A LEASE THAT ENDED WHILE THIS CLAIM WAS IN HAND has been forgotten already, and
+	// nothing else would ever name the record just written. Asked after the write, so a
+	// release is either seen here or forgets the record itself. A store that could not
+	// answer keeps it: could-not-tell is not an end, and the process may still hold it.
+	for _, id := range added {
+		if _, err := h.store.Lease(r.Context(), id); errors.Is(err, alloc.ErrLeaseNotFound) {
+			h.plane.ForgetLease(node, id)
+			held = slices.DeleteFunc(held, func(heldID string) bool { return heldID == id })
+		}
+	}
+
+	writeJSON(w, http.StatusOK, nodeapi.ClaimCustodyResponse{Version: nodeapi.Version, Held: held})
 }
 
 func (h *handler) markFailure(w http.ResponseWriter, r *http.Request) {

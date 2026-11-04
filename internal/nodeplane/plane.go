@@ -410,11 +410,6 @@ type leaseOwner struct {
 	// an ordinary job can end its ownership too. That destroy is the only signal
 	// the wire gets: the lease itself is released in-process by the listener.
 	requestID int64
-	// claimed says this record came from a claim (Plane.ClaimCustody), where a request
-	// id otherwise means this plane delivered the launch. A claim gives way to what the
-	// current process reports, and is answered the same way when it is asked again
-	// because the answer was lost; a delivery does neither.
-	claimed bool
 }
 
 // Option configures a Plane.
@@ -1929,25 +1924,21 @@ type CustodyClaim struct {
 // ClaimCustody records that a superseded process holds these leases, restoring on
 // this plane what the plane that gave them to it knew (#685). OWNERSHIP DOES NOT
 // SURVIVE A CONTROLLER: a promoted or restarted plane either has no owner for a
-// lease, or has as its owner whichever process reached it first, adopted from the
-// ledger's launched set, and would refuse the process that actually runs the compute
-// its own lease. A claim takes nothing another process was given:
+// lease, or has as its owner the node's current process, adopted from the ledger's
+// launched set at its registration, and would refuse the process that runs the
+// compute its own lease. An adoption is a guess from the ledger, and the claim is the
+// word of a process that holds the compute, so the claim wins; the current process
+// may hold the compute too, on a shared machine or a remote backend, and goes on
+// being admitted to it as the node's current process, which is the state a
+// supersession on the plane before left them in.
 //
-//   - delivered, on this plane, to the claimant: it stays so. To another process: not
-//     granted, as a launch this plane sent is the one fact here that is not a guess.
-//   - another host's: not granted.
-//   - in the current process's own report: that process has the compute, whichever of
-//     the two reached this plane first. It is the current process's, and is answered
-//     as adopted, so the claimant lets it go.
-//   - no owner, the claimant's by an earlier claim or its own adoption, or the current
-//     process's by adoption alone when its complete report leaves the lease out: it
-//     is the claimant's, with its request, so a destroy finds it.
-//   - anything else: not granted, and asked again. An inventory not yet reported, or
-//     another process's adoption, is not the claimant's to take, and could-not-tell is
-//     not permission.
+// A claim takes nothing another process was given. A launch this plane delivered
+// stays with the process it went to, an earlier claim or adoption by a process that
+// is not current stays with it, and another host's lease stays that host's. Each is
+// not granted, and asked again.
 //
-// It answers what the claimant now holds and what the current process has adopted.
-func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) (held, adopted []string) {
+// It answers what the claimant now holds, and which of those this call recorded.
+func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) (held, added []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1956,32 +1947,38 @@ func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) (h
 	}
 
 	current := p.nodes[node]
-	reportedBy := func(id string) bool {
-		return current != nil && current.incarnation != incarnation && current.inventoryKnown && current.inventory[id]
-	}
 
 	for _, claim := range claims {
 		id := claim.LeaseID
 		owner, taken := p.owners[id]
-		delivered := taken && owner.requestID != 0 && !owner.claimed
 
 		switch {
-		case taken && owner.node != node:
-		case delivered:
-			if owner.incarnation == incarnation {
-				held = append(held, id)
+		case !taken:
+		case owner.node != node:
+			continue
+		case owner.incarnation == incarnation:
+			// ITS OWN ADOPTION CARRIES NO REQUEST, from a registration it made before it
+			// learned it was superseded, and a destroy cannot find it without one.
+			if owner.requestID == 0 {
+				owner.requestID = claim.RequestID
+				p.owners[id] = owner
 			}
-		case reportedBy(id):
-			p.owners[id] = leaseOwner{node: node, incarnation: current.incarnation, requestID: claim.RequestID, claimed: true}
-			adopted = append(adopted, id)
-		case !taken, owner.incarnation == incarnation,
-			current != nil && current.incarnation == owner.incarnation && current.inventoryKnown:
-			p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: claim.RequestID, claimed: true}
+
 			held = append(held, id)
+
+			continue
+		case owner.requestID != 0:
+			continue
+		case current == nil || current.incarnation != owner.incarnation:
+			continue
 		}
+
+		p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: claim.RequestID}
+		held = append(held, id)
+		added = append(added, id)
 	}
 
-	return held, adopted
+	return held, added
 }
 
 // MayMutateLease reports whether this process may change a lease's fate.

@@ -78,13 +78,11 @@ type HandingOver interface {
 	HandOver(ctx context.Context)
 }
 
-// CustodyFollower says which leases a superseded process holds in custody, and
-// lets go of those the node's current process has adopted. Optional: compute that
-// cannot say keeps what it holds on the controller it knew, and waits as a
-// superseded process always did when that controller goes.
+// CustodyFollower says which leases a superseded process holds compute for. Optional:
+// compute that cannot say keeps what it holds on the controller it knew, and waits as
+// a superseded process always did when that controller goes.
 type CustodyFollower interface {
 	CustodyLeases() []string
-	LetGo(leaseIDs []string)
 }
 
 // upgradableCompute can replace this node's own billet.
@@ -496,6 +494,14 @@ func register(
 		startJanitor()
 
 		if err := compute.Recover(ctx); err != nil {
+			// SUPERSEDED WHILE RECOVERING IS STILL SUPERSEDED, and going round again would
+			// register, which takes the name back from the process that holds it.
+			if errors.Is(err, ErrSuperseded) {
+				drain(ctx, c, compute, log, opts)
+
+				return fmt.Errorf("this node has been superseded: %w", err)
+			}
+
 			log.Error("could not reconcile with what is already running; not taking work "+
 				"until this succeeds, because starting fresh work while the previous "+
 				"incarnation's containers are unaccounted for double-counts the host",
@@ -662,9 +668,8 @@ const custodyClaimEvery = 10 * time.Second
 // serves, for as long as the wait lasts (#685). A controller's ownership record
 // does not survive it, so a promoted or restarted one would refuse this process
 // its own leases, and it must not register: that would take the name back from the
-// process that holds it. So it says what it holds on a route that takes nothing,
-// from whichever controller answers, and lets go of what the current process
-// reports having adopted.
+// process that holds it. So it says what it holds on a route that takes no name, to
+// whichever controller answers.
 //
 // BEST EFFORT, as custody's other calls are: a claim that fails is asked again, and
 // what it leaves is the wait a superseded process always had.
@@ -683,7 +688,7 @@ func followCustody(ctx context.Context, c *Client, compute Compute, log *slog.Lo
 
 	for ctx.Err() == nil {
 		if leases := follower.CustodyLeases(); len(leases) > 0 {
-			adopted, err := c.ClaimCustody(ctx, leases)
+			_, err := c.ClaimCustody(ctx, leases)
 
 			switch {
 			case ctx.Err() != nil:
@@ -699,12 +704,6 @@ func followCustody(ctx context.Context, c *Client, compute Compute, log *slog.Lo
 				failing = true
 			default:
 				failing = false
-
-				if len(adopted) > 0 {
-					log.Info("the node's current process has adopted compute this superseded process held; "+
-						"letting go of it without destroying it", "leases", adopted)
-					follower.LetGo(adopted)
-				}
 			}
 		}
 

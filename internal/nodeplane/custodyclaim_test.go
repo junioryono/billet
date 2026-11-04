@@ -8,8 +8,9 @@ import (
 
 // A CONTROLLER THAT REPLACED ANOTHER KNOWS NOTHING OF WHO HOLDS WHAT (#685), so a
 // superseded process says, and the claim takes only what no process was given: an
-// adoption from the ledger gives way to the process that has the compute, a delivery
-// never does, and what the current process reported holding is that process's.
+// adoption from the ledger by the current process gives way to the process that holds
+// the compute, whether or not the current one can see it too, and a delivery never
+// does.
 func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 	t.Parallel()
 
@@ -18,10 +19,7 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 		request = int64(7)
 	)
 
-	delivered := leaseOwner{node: "n1", incarnation: "p1", requestID: request}
-	claimant := leaseOwner{node: "n1", incarnation: "p1", requestID: request, claimed: true}
-	yielded := leaseOwner{node: "n1", incarnation: "p2", requestID: request, claimed: true}
-	adoption := leaseOwner{node: "n1", incarnation: "p2"}
+	claimant := leaseOwner{node: "n1", incarnation: "p1", requestID: request}
 
 	seed := func(p *Plane, owner leaseOwner) {
 		p.mu.Lock()
@@ -35,40 +33,18 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 	}
 
 	for name, tc := range map[string]struct {
-		setup   func(t *testing.T, p *Plane)
-		held    bool
-		adopted bool
-		owner   leaseOwner
+		setup func(t *testing.T, p *Plane)
+		held  bool
+		added bool
+		owner leaseOwner
 	}{
 		"no owner": {
 			setup: func(*testing.T, *Plane) {},
-			held:  true, owner: claimant,
+			held:  true, added: true, owner: claimant,
 		},
 		"delivered to the claimant": {
-			setup: func(_ *testing.T, p *Plane) { seed(p, delivered) },
-			held:  true, owner: delivered,
-		},
-		// A DELIVERY IS THE ONE FACT THAT OUTRANKS A REPORT: both processes hold the
-		// compute, and the one given the launch finishes it, as it always did.
-		"delivered to the claimant, and in the current process's report": {
-			setup: func(_ *testing.T, p *Plane) {
-				seed(p, delivered)
-				p.AdoptOwnershipWithInventory("n1", "p2", []string{lease}, true)
-			},
-			held: true, owner: delivered,
-		},
-		"claimed before": {
 			setup: func(_ *testing.T, p *Plane) { seed(p, claimant) },
 			held:  true, owner: claimant,
-		},
-		// THE ANSWER DOES NOT DEPEND ON WHO REACHED THE NEW CONTROLLER FIRST: the claim
-		// came before the current process's report, and gives way to it.
-		"claimed before, and in the current process's report since": {
-			setup: func(_ *testing.T, p *Plane) {
-				seed(p, claimant)
-				p.AdoptOwnershipWithInventory("n1", "p2", []string{lease}, true)
-			},
-			adopted: true, owner: yielded,
 		},
 		// A PROCESS THAT REACHED THE NEW CONTROLLER BEFORE IT LEARNED IT WAS SUPERSEDED
 		// adopted its own lease, with no request; a destroy then cannot find it.
@@ -77,63 +53,47 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 			held:  true, owner: claimant,
 		},
 		// THE ONE THE ISSUE IS ABOUT: the registration filled the gap from the ledger,
-		// and the process it filled it for says it has no such compute.
-		"adopted by the current process, whose inventory leaves it out": {
+		// and the process it filled it for has no such compute.
+		"adopted by the current process, whose report leaves it out": {
 			setup: func(_ *testing.T, p *Plane) {
 				p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
 				p.AdoptOwnership("n1", "p2", []string{lease})
 			},
-			held: true, owner: claimant,
+			held: true, added: true, owner: claimant,
 		},
-		"adopted by the current process, whose inventory holds it": {
+		// A REPORT IS NOT AN ADOPTION: the current process may have seen a guest it has
+		// not taken on, so the process that holds the compute goes on holding it, as it
+		// did on the plane before.
+		"adopted by the current process, whose report names it": {
 			setup: func(_ *testing.T, p *Plane) {
 				p.AdoptOwnershipWithInventory("n1", "p2", []string{lease}, true)
-				p.AdoptOwnership("n1", "p2", []string{lease})
 			},
-			adopted: true, owner: yielded,
+			held: true, added: true, owner: claimant,
 		},
-		"adopted by the current process, whose inventory is unknown": {
+		"adopted by the current process, whose report is unknown": {
 			setup: func(_ *testing.T, p *Plane) { p.AdoptOwnership("n1", "p2", []string{lease}) },
-			owner: adoption,
-		},
-		"adopted by the current process, whose next registration is under way": {
-			setup: func(t *testing.T, p *Plane) {
-				p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
-				p.AdoptOwnership("n1", "p2", []string{lease})
-
-				intent := p.beginRegistration("n1")
-				t.Cleanup(func() { p.finishRegistration("n1", intent) })
-			},
-			owner: adoption,
+			held:  true, added: true, owner: claimant,
 		},
 		"delivered to the current process": {
 			setup: func(_ *testing.T, p *Plane) {
-				p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
 				seed(p, leaseOwner{node: "n1", incarnation: "p2", requestID: request})
 			},
 			owner: leaseOwner{node: "n1", incarnation: "p2", requestID: request},
 		},
-		"adopted by a process that is no longer current": {
+		"delivered to a process that is no longer current": {
 			setup: func(_ *testing.T, p *Plane) {
-				p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
-				seed(p, leaseOwner{node: "n1", incarnation: "p0"})
+				seed(p, leaseOwner{node: "n1", incarnation: "p0", requestID: request})
 			},
+			owner: leaseOwner{node: "n1", incarnation: "p0", requestID: request},
+		},
+		// TWO SUPERSEDED PROCESSES DO NOT TAKE IT IN TURNS, refusing each the other's
+		// renewal on every claim.
+		"adopted by a process that is no longer current": {
+			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n1", incarnation: "p0"}) },
 			owner: leaseOwner{node: "n1", incarnation: "p0"},
 		},
 		"another host's": {
-			setup: func(_ *testing.T, p *Plane) {
-				p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
-				seed(p, leaseOwner{node: "n2", incarnation: "p9"})
-			},
-			owner: leaseOwner{node: "n2", incarnation: "p9"},
-		},
-		// AN INVENTORY IS NOT PERMISSION TO CLAIM ANOTHER NODE'S LEASE, not even as
-		// the answer to a claim.
-		"another host's, and in the current process's report": {
-			setup: func(_ *testing.T, p *Plane) {
-				seed(p, leaseOwner{node: "n2", incarnation: "p9"})
-				p.AdoptOwnershipWithInventory("n1", "p2", []string{lease}, true)
-			},
+			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n2", incarnation: "p9"}) },
 			owner: leaseOwner{node: "n2", incarnation: "p9"},
 		},
 	} {
@@ -145,14 +105,14 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 			registerAs(t, p, "p2")
 			tc.setup(t, p)
 
-			held, adopted := p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: lease, RequestID: request}})
+			held, added := p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: lease, RequestID: request}})
 
 			if got := slices.Contains(held, lease); got != tc.held {
 				t.Errorf("held = %v, want the lease held: %v", held, tc.held)
 			}
 
-			if got := slices.Contains(adopted, lease); got != tc.adopted {
-				t.Errorf("adopted = %v, want the lease adopted: %v", adopted, tc.adopted)
+			if got := slices.Contains(added, lease); got != tc.added {
+				t.Errorf("added = %v, want the lease added: %v", added, tc.added)
 			}
 
 			if owner, ok := ownerOf(p, lease); !ok || owner != tc.owner {
@@ -168,6 +128,13 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 
 			if !tc.held && !errors.Is(err, ErrSuperseded) {
 				t.Errorf("a process that does not hold the lease is admitted: byOwner=%v err=%v", byOwner, err)
+			}
+
+			// AND THE CURRENT PROCESS IS NOT LOCKED OUT: it may hold the compute too.
+			if tc.owner.node == "n1" {
+				if _, err := p.AuthorizeLease("n1", "p2", lease); err != nil {
+					t.Errorf("the current process is refused the lease: %v", err)
+				}
 			}
 		})
 	}
@@ -197,7 +164,7 @@ func TestAClaimedLeaseAnswersForItsRequest(t *testing.T) {
 }
 
 // A REGISTRATION ONLY FILLS GAPS, so a claim made before the current process reaches
-// this controller stays with the claimant.
+// this controller stays with the claimant, as it does after.
 func TestAClaimSurvivesTheRegistrationThatFollowsIt(t *testing.T) {
 	t.Parallel()
 
@@ -206,32 +173,10 @@ func TestAClaimSurvivesTheRegistrationThatFollowsIt(t *testing.T) {
 	p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}})
 
 	registerAs(t, p, "p2")
-	p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
+	p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
 	p.AdoptOwnership("n1", "p2", []string{"l9"})
 
 	if owner, ok := ownerOf(p, "l9"); !ok || owner.incarnation != "p1" || owner.requestID != 7 {
 		t.Fatalf("the owner is %+v (ok=%v), want the claimant", owner, ok)
-	}
-}
-
-// THE ANSWER CAN BE LOST, and the process asks again: it hears the same thing, or it
-// waits for ever on a lease it is refused and the current process has.
-func TestAnAdoptionIsAnsweredAgainWhenTheProcessAsksAgain(t *testing.T) {
-	t.Parallel()
-
-	p := testPlane(t, WithRegistrar(newLedger()))
-	registerAs(t, p, "p1")
-	registerAs(t, p, "p2")
-	p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
-	p.AdoptOwnership("n1", "p2", []string{"l9"})
-
-	for attempt := 1; attempt <= 2; attempt++ {
-		if _, adopted := p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}}); !slices.Equal(adopted, []string{"l9"}) {
-			t.Fatalf("attempt %d: adopted = %v", attempt, adopted)
-		}
-	}
-
-	if owner, known := p.OwnerOfRequest(7); !known || owner.Incarnation != "p2" {
-		t.Fatalf("the request's owner is %+v (known=%v), want the process with the compute", owner, known)
 	}
 }

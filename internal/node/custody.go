@@ -1121,41 +1121,6 @@ func (r *Runner) HoldsInCustodyForTest(leaseID string) bool {
 	return held
 }
 
-// LetGo drops what the node's current process has adopted from this superseded
-// process's custody, destroying nothing and releasing nothing: the current process
-// reported the compute, so it is that process's to renew and to finish, and this
-// one's waiting on it would only keep it stopping for nothing.
-//
-// A launch still under way is left to finish, since this process is what is
-// starting it.
-//
-// SERIALIZED WITH TEND, which works on an entry between reads and would otherwise
-// finish one this has just let go of.
-func (r *Runner) LetGo(leaseIDs []string) {
-	r.tending.Lock()
-	defer r.tending.Unlock()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for _, id := range leaseIDs {
-		delete(r.custody, id)
-
-		for requestID, lease := range r.runningLease {
-			if lease.ID != id {
-				continue
-			}
-
-			if inst := r.running[requestID]; inst != nil {
-				r.forgetRunningLocked(inst.Name)
-			}
-
-			delete(r.running, requestID)
-			delete(r.runningLease, requestID)
-		}
-	}
-}
-
 // Superseded moves everything this node is running into custody.
 //
 // AFTER SUPERSESSION, EVERYTHING HERE IS UNACCOUNTED FOR — which is the

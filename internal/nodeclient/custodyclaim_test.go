@@ -16,7 +16,10 @@ import (
 	"github.com/junioryono/billet/internal/nodeending"
 )
 
-const custodyRoute = "/v1/nodes/n1/custody"
+const (
+	custodyRoute = "/v1/nodes/n1/custody"
+	pollRoute    = "/v1/nodes/n1/poll"
+)
 
 func registerClient(t *testing.T, c *nodeclient.Client) {
 	t.Helper()
@@ -29,12 +32,8 @@ func registerClient(t *testing.T, c *nodeclient.Client) {
 	}
 }
 
-// A SUPERSEDED PROCESS FOLLOWS THE DEPLOYMENT WITHOUT TAKING THE NAME. It passes over
-// the controller that went to the one that answers, and its lease calls go there from
-// then on, and it never registers: a registration would take the name back from the
-// process that holds it.
-func TestACustodyClaimFollowsTheControllerThatAnswersWithoutRegistering(t *testing.T) {
-	t.Parallel()
+func twoControllers(t *testing.T) (*controller, *controller, *nodeclient.Client) {
+	t.Helper()
 
 	a, b := newController(t), newController(t)
 
@@ -47,10 +46,26 @@ func TestACustodyClaimFollowsTheControllerThatAnswersWithoutRegistering(t *testi
 
 	registerClient(t, c)
 
-	wire := c.WireVersion()
+	return a, b, c
+}
 
+func goAway(a *controller) {
 	a.srv.CloseClientConnections()
 	a.srv.Close()
+}
+
+// A SUPERSEDED PROCESS FOLLOWS THE DEPLOYMENT WITHOUT TAKING THE NAME. It passes over
+// the controller that went to the one that answers, and its lease calls go there from
+// then on, and it never registers: a registration would take the name back from the
+// process that holds it.
+func TestACustodyClaimFollowsTheControllerThatAnswersWithoutRegistering(t *testing.T) {
+	t.Parallel()
+
+	a, b, c := twoControllers(t)
+
+	wire := c.WireVersion()
+
+	goAway(a)
 
 	if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); err != nil {
 		t.Fatalf("ClaimCustody: %v", err)
@@ -92,26 +107,21 @@ func TestACustodyClaimMovesOnlyOnSilenceAndOnSuccess(t *testing.T) {
 	t.Run("the next controller refuses", func(t *testing.T) {
 		t.Parallel()
 
-		a, b := newController(t), newController(t)
-
-		c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
-			{Base: a.srv.URL}, {Base: b.srv.URL},
-		}})
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
-
-		registerClient(t, c)
+		a, b, c := twoControllers(t)
 
 		b.mu.Lock()
 		b.unavailable = func(path string, _ int) bool { return path == custodyRoute }
 		b.mu.Unlock()
 
-		a.srv.CloseClientConnections()
-		a.srv.Close()
+		goAway(a)
 
-		if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); err == nil {
-			t.Fatal("a controller's refusal was reported as success")
+		_, err := c.ClaimCustody(t.Context(), []string{"l1"})
+		if err == nil || nodeclient.IsNoAnswerForTest(err) {
+			t.Fatalf("ClaimCustody = %v, want B's refusal", err)
+		}
+
+		if n := b.sent(custodyRoute); n != 1 {
+			t.Fatalf("B was asked %d times", n)
 		}
 
 		if got := c.Endpoint().String(); got != endpointOf(t, a.srv.URL) {
@@ -122,23 +132,15 @@ func TestACustodyClaimMovesOnlyOnSilenceAndOnSuccess(t *testing.T) {
 	t.Run("the first controller refuses", func(t *testing.T) {
 		t.Parallel()
 
-		a, b := newController(t), newController(t)
-
-		c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
-			{Base: a.srv.URL}, {Base: b.srv.URL},
-		}})
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
-
-		registerClient(t, c)
+		a, b, c := twoControllers(t)
 
 		a.mu.Lock()
 		a.unavailable = func(path string, _ int) bool { return path == custodyRoute }
 		a.mu.Unlock()
 
-		if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); err == nil {
-			t.Fatal("a controller's refusal was reported as success")
+		_, err := c.ClaimCustody(t.Context(), []string{"l1"})
+		if err == nil || nodeclient.IsNoAnswerForTest(err) {
+			t.Fatalf("ClaimCustody = %v, want A's refusal", err)
 		}
 
 		if n := b.sent(custodyRoute); n != 0 {
@@ -149,24 +151,13 @@ func TestACustodyClaimMovesOnlyOnSilenceAndOnSuccess(t *testing.T) {
 	t.Run("nobody answers", func(t *testing.T) {
 		t.Parallel()
 
-		a, b := newController(t), newController(t)
+		a, b, c := twoControllers(t)
 
-		c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
-			{Base: a.srv.URL}, {Base: b.srv.URL},
-		}})
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
+		goAway(a)
+		goAway(b)
 
-		registerClient(t, c)
-
-		for _, gone := range []*controller{a, b} {
-			gone.srv.CloseClientConnections()
-			gone.srv.Close()
-		}
-
-		if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); err == nil {
-			t.Fatal("silence from every controller was reported as success")
+		if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); !nodeclient.IsNoAnswerForTest(err) {
+			t.Fatalf("ClaimCustody = %v, want no answer", err)
 		}
 
 		if got := c.Endpoint().String(); got != endpointOf(t, a.srv.URL) {
@@ -175,42 +166,69 @@ func TestACustodyClaimMovesOnlyOnSilenceAndOnSuccess(t *testing.T) {
 	})
 }
 
-// BELOW ITS VERSION A CLAIM IS NOT SENT, since the older plane answers a bare 404; a
-// wire of zero is a process whose registration was forgotten, which says nothing about
-// what the controller speaks, so it asks.
-func TestACustodyClaimIsGatedOnTheNegotiatedVersion(t *testing.T) {
+// A CLAIM IS SENT WHATEVER WAS NEGOTIATED. That was with another controller: one that
+// was older when this process registered may have been upgraded since, and this process
+// cannot register to learn so. An older plane's bare 404 is a failed claim and no more.
+func TestACustodyClaimIsSentWhateverWasNegotiated(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		name string
-		wire int
-		want int
-	}{
-		{"the version before", nodeapi.VersionCustodyClaim - 1, 0},
-		{"the version itself", nodeapi.VersionCustodyClaim, 1},
-		{"no registration remembered", 0, 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	for _, wire := range []int{nodeapi.MinVersion, nodeapi.VersionCustodyClaim, 0} {
+		a := newController(t)
 
-			a := newController(t)
+		c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
 
-			c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
-			if err != nil {
-				t.Fatalf("New: %v", err)
-			}
+		nodeclient.SetWireForTest(c, wire)
 
-			nodeclient.SetWireForTest(c, tc.wire)
+		if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); err != nil {
+			t.Fatalf("wire %d: ClaimCustody = %v", wire, err)
+		}
 
-			adopted, err := c.ClaimCustody(t.Context(), []string{"l1"})
-			if err != nil || len(adopted) != 0 {
-				t.Fatalf("ClaimCustody = %v, %v", adopted, err)
-			}
+		if n := a.sent(custodyRoute); n != 1 {
+			t.Fatalf("wire %d: the claim was sent %d times", wire, n)
+		}
 
-			if n := a.sent(custodyRoute); n != tc.want {
-				t.Fatalf("the claim was sent %d times, want %d", n, tc.want)
-			}
-		})
+		if got := c.WireVersion(); got != nodeapi.Version {
+			t.Fatalf("wire %d: the answer left the wire at %d", wire, got)
+		}
+	}
+}
+
+// AN OLDER PLANE ANSWERS A BARE 404, with no body the client can read: that is a claim
+// that failed, not silence and not "unregistered", so the process stays on this
+// controller and keeps the wire it has.
+func TestAnOlderPlanesAnswerToAClaimChangesNothing(t *testing.T) {
+	t.Parallel()
+
+	a, b, c := twoControllers(t)
+
+	a.mu.Lock()
+	a.respond = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != custodyRoute {
+			return false
+		}
+
+		http.NotFound(w, r)
+
+		return true
+	}
+	a.mu.Unlock()
+
+	wire := c.WireVersion()
+
+	_, err := c.ClaimCustody(t.Context(), []string{"l1"})
+	if err == nil || nodeclient.IsNoAnswerForTest(err) || errors.Is(err, nodeclient.ErrUnregistered) {
+		t.Fatalf("ClaimCustody = %v, want a refusal that is neither silence nor unregistered", err)
+	}
+
+	if got := c.WireVersion(); got != wire {
+		t.Fatalf("the wire moved from %d to %d", wire, got)
+	}
+
+	if n := b.sent(custodyRoute); n != 0 {
+		t.Fatalf("an answer from A went on to B %d times", n)
 	}
 }
 
@@ -268,45 +286,29 @@ func TestACustodyClaimSettlesTheWireWithTheControllerThatAnswered(t *testing.T) 
 	}
 }
 
-// followingCompute holds leases a superseded process can claim, and stops holding when
-// it is told to let go of them.
+// followingCompute holds leases a superseded process can claim.
 type followingCompute struct {
 	*askingCompute
 
-	mu     sync.Mutex
 	leases []string
-	letGo  []string
 }
 
-func (f *followingCompute) CustodyLeases() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+func (f *followingCompute) CustodyLeases() []string { return slices.Clone(f.leases) }
 
-	return slices.Clone(f.leases)
-}
-
-func (f *followingCompute) LetGo(ids []string) {
-	f.mu.Lock()
-	f.letGo = append(f.letGo, ids...)
-	f.leases = slices.DeleteFunc(f.leases, func(id string) bool { return slices.Contains(ids, id) })
-	empty := len(f.leases) == 0
-	f.mu.Unlock()
-
-	if empty {
-		f.setHolding(false)
+func newFollowingCompute(c *nodeclient.Client) *followingCompute {
+	return &followingCompute{
+		askingCompute: &askingCompute{fakeCompute: &fakeCompute{holding: true}, c: c},
+		leases:        []string{"l1"},
 	}
 }
 
-func (f *followingCompute) letGoOf() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return slices.Clone(f.letGo)
+// claimsHeard answers every claim and keeps what each one named.
+type claimsHeard struct {
+	mu    sync.Mutex
+	named [][]string
 }
 
-// answerAdopted makes a controller answer every claim that the node's current process
-// has adopted what it names, and counts nothing else differently.
-func answerAdopted(w http.ResponseWriter, r *http.Request) bool {
+func (h *claimsHeard) respond(w http.ResponseWriter, r *http.Request) bool {
 	if r.URL.Path != custodyRoute {
 		return false
 	}
@@ -318,86 +320,98 @@ func answerAdopted(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
+	h.mu.Lock()
+	h.named = append(h.named, req.LeaseIDs)
+	h.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 
-	_ = json.NewEncoder(w).Encode(nodeapi.ClaimCustodyResponse{Adopted: req.LeaseIDs}) //nolint:errcheck // the test's own server
+	_ = json.NewEncoder(w).Encode(nodeapi.ClaimCustodyResponse{Version: nodeapi.Version, Held: req.LeaseIDs}) //nolint:errcheck // the test's own server
 
 	return true
 }
 
-// EVERY WAY A PROCESS LEARNS IT IS SUPERSEDED FOLLOWS ITS CUSTODY. A poll in the
-// ordinary loop, a recovery before a stop's drain, a poll during the drain and a
-// registration during the drain each leave it waiting for what it holds, and that
-// wait has to say so to whichever controller serves: one path missed is a process a
-// new controller refuses its own leases.
+func (h *claimsHeard) first() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if len(h.named) == 0 {
+		return nil
+	}
+
+	return h.named[0]
+}
+
+// EVERY WAY A PROCESS LEARNS IT IS SUPERSEDED FOLLOWS ITS CUSTODY. A recovery or a poll in
+// the ordinary loop, a recovery before a stop's drain, a poll during the drain and a
+// registration during the drain each leave it waiting for what it holds, and that wait
+// has to say so to whichever controller serves: one path missed is a process a new
+// controller refuses its own leases.
 //
 // SERIAL, because the controllers' seam and the loop's hooks are the same as those of
 // the drain tests beside it, and each case waits on a real loop.
 func TestEveryWayOfBeingSupersededFollowsCustody(t *testing.T) {
 	const (
 		launched = "/v1/nodes/n1/launched"
-		poll     = "/v1/nodes/n1/poll"
 		register = "/v1/register"
 	)
 
 	for _, tc := range []struct {
 		name string
-		// stage runs against the controller and the running stop, once it has
-		// registered, and leads to supersession.
-		before func(a *controller)
-		stage  func(t *testing.T, a *controller, cancel func(), when *atomic.Bool)
+		// when is the moment it hears it: the path answers superseded once armed.
+		when string
+		// armed runs once the process has registered, and arms it.
+		armed func(t *testing.T, a *controller, cancel func(), arm func())
+		// stopping is whether Run answers the supersession rather than a stop.
+		superseded bool
 	}{
 		{
-			name: "a poll in the ordinary loop",
-			stage: func(_ *testing.T, _ *controller, _ func(), when *atomic.Bool) {
-				when.Store(true)
-			},
-			before: func(a *controller) {},
+			name: "a poll in the ordinary loop", when: pollRoute, superseded: true,
+			armed: func(_ *testing.T, _ *controller, _ func(), arm func()) { arm() },
 		},
 		{
-			name: "a recovery before the drain",
-			stage: func(t *testing.T, a *controller, cancel func(), _ *atomic.Bool) {
+			name: "a recovery before the drain", when: launched,
+			armed: func(t *testing.T, a *controller, cancel func(), arm func()) {
 				t.Helper()
+
+				// THE ORDINARY LOOP'S RECOVERY FAILS UNTIL THE STOP, whose own recovery is
+				// the one superseded, which the controller says before it says anything else.
 				waitFor(t, func() bool { return a.sent(launched) >= 2 })
 				cancel()
-			},
-			before: func(a *controller) {
-				a.supersede = func(path string, _ int) bool { return path == launched }
+				arm()
 			},
 		},
 		{
-			name: "a poll during the drain",
-			stage: func(t *testing.T, a *controller, cancel func(), when *atomic.Bool) {
+			name: "a poll during the drain", when: pollRoute,
+			armed: func(t *testing.T, a *controller, cancel func(), arm func()) {
 				t.Helper()
-				waitFor(t, func() bool { return a.sent(poll) >= 1 })
+				waitFor(t, func() bool { return a.sent(pollRoute) >= 1 })
 				cancel()
-				when.Store(true)
+				arm()
 			},
-			before: func(a *controller) {},
 		},
 		{
-			name: "a registration during the drain",
-			stage: func(t *testing.T, a *controller, cancel func(), when *atomic.Bool) {
+			name: "a registration during the drain", when: register,
+			armed: func(t *testing.T, a *controller, cancel func(), arm func()) {
 				t.Helper()
-				waitFor(t, func() bool { return a.sent(poll) >= 1 })
+				waitFor(t, func() bool { return a.sent(pollRoute) >= 1 })
 				cancel()
+				arm()
 				a.plane.ForgetForTest("n1")
-				a.mu.Lock()
-				a.supersede = func(path string, _ int) bool { return path == register }
-				a.mu.Unlock()
 			},
-			before: func(a *controller) {},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := newController(t)
 
-			var when atomic.Bool
+			var (
+				armed atomic.Bool
+				heard claimsHeard
+			)
 
 			a.mu.Lock()
-			a.respond = answerAdopted
-			a.supersede = func(path string, _ int) bool { return path == poll && when.Load() }
-			tc.before(a)
+			a.respond = heard.respond
+			a.supersede = func(path string, _ int) bool { return path == tc.when && armed.Load() }
 			a.mu.Unlock()
 
 			c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
@@ -405,32 +419,83 @@ func TestEveryWayOfBeingSupersededFollowsCustody(t *testing.T) {
 				t.Fatalf("New: %v", err)
 			}
 
-			compute := &followingCompute{
-				askingCompute: &askingCompute{fakeCompute: &fakeCompute{holding: true}, c: c},
-				leases:        []string{"l1"},
+			compute := newFollowingCompute(c)
+
+			if tc.when == launched {
+				a.mu.Lock()
+				a.unavailable = func(path string, _ int) bool { return path == launched }
+				a.mu.Unlock()
 			}
 
 			cancel, done, _ := runDraining(t, c, compute)
 
 			waitFor(t, func() bool { return a.sent(register) >= 1 })
-			tc.stage(t, a, cancel, &when)
+			tc.armed(t, a, cancel, func() { armed.Store(true) })
 
-			waitFor(t, func() bool { return len(compute.letGoOf()) > 0 })
-
-			if got := compute.letGoOf(); !slices.Equal(got, []string{"l1"}) {
-				t.Fatalf("the process let go of %v", got)
-			}
+			waitFor(t, func() bool { return slices.Equal(heard.first(), []string{"l1"}) })
 
 			if n := compute.supersededCount(); n != 1 {
 				t.Fatalf("what runs here was handed to custody %d times, want once", n)
 			}
 
+			compute.setHolding(false)
+
 			select {
-			case <-done:
+			case err := <-done:
+				if tc.superseded && !errors.Is(err, nodeclient.ErrSuperseded) {
+					t.Fatalf("the process ended with %v", err)
+				}
 			case <-time.After(15 * time.Second):
 				t.Fatal("the process did not stop once it held nothing")
 			}
 		})
+	}
+}
+
+// A RECOVERY THAT HEARS IT WAS SUPERSEDED DOES NOT GO ROUND AGAIN. Another process
+// registered while this one was recovering, and treating that as an outage registers
+// again, which takes the name back from the process that holds it, and that process
+// then does the same.
+func TestARecoverySupersededInTheOrdinaryLoopNeverRegistersAgain(t *testing.T) {
+	a := newController(t)
+
+	const launched = "/v1/nodes/n1/launched"
+
+	var heard claimsHeard
+
+	a.mu.Lock()
+	a.respond = heard.respond
+	a.supersede = func(path string, _ int) bool { return path == launched }
+	a.mu.Unlock()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	compute := newFollowingCompute(c)
+
+	_, done, _ := runDraining(t, c, compute)
+
+	waitFor(t, func() bool { return len(heard.first()) > 0 })
+
+	if n := a.sent("/v1/register"); n != 1 {
+		t.Fatalf("the process registered %d times, want once", n)
+	}
+
+	if n := a.sent(launched); n != 1 {
+		t.Fatalf("the process asked %d times after it heard, want once", n)
+	}
+
+	compute.setHolding(false)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, nodeclient.ErrSuperseded) {
+			t.Fatalf("the process ended with %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the process did not stop once it held nothing")
 	}
 }
 
@@ -440,31 +505,22 @@ func TestEveryWayOfBeingSupersededFollowsCustody(t *testing.T) {
 func TestADrainNobodySupersededClaimsNothing(t *testing.T) {
 	a := newController(t)
 
-	a.mu.Lock()
-	a.respond = answerAdopted
-	a.mu.Unlock()
-
 	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	compute := &followingCompute{
-		askingCompute: &askingCompute{fakeCompute: &fakeCompute{holding: true}, c: c},
-		leases:        []string{"l1"},
-	}
+	compute := newFollowingCompute(c)
 
 	cancel, done, endings := runDraining(t, c, compute)
 
-	const poll = "/v1/nodes/n1/poll"
-
-	waitFor(t, func() bool { return a.sent(poll) >= 1 })
+	waitFor(t, func() bool { return a.sent(pollRoute) >= 1 })
 	cancel()
 
 	// A FEW OF ITS OWN POLLS INTO THE DRAIN, which a claim on the drain's cadence would
 	// have come well within.
-	polled := a.sent(poll)
-	waitFor(t, func() bool { return a.sent(poll) >= polled+3 })
+	polled := a.sent(pollRoute)
+	waitFor(t, func() bool { return a.sent(pollRoute) >= polled+3 })
 
 	if n := a.sent(custodyRoute); n != 0 {
 		t.Fatalf("a process nobody superseded claimed %d times", n)
@@ -483,20 +539,18 @@ func TestADrainNobodySupersededClaimsNothing(t *testing.T) {
 	}
 }
 
-// A CLAIM THAT HOLDS IS ASKED AGAIN AND LETS GO OF NOTHING, and a claim that fails does
-// not end the wait: the controller that does not answer today is the one that may.
+// A CLAIM THAT FAILS DOES NOT END THE WAIT, and one that worked is asked again: the
+// controller that answers today is not the one that may answer tomorrow.
 func TestASupersededProcessGoesOnClaimingUntilItHoldsNothing(t *testing.T) {
 	a := newController(t)
-
-	const poll = "/v1/nodes/n1/poll"
 
 	var failing atomic.Bool
 
 	failing.Store(true)
 
 	a.mu.Lock()
-	a.supersede = func(path string, _ int) bool { return path == poll }
-	a.unavailable = func(path string, n int) bool { return path == custodyRoute && failing.Load() }
+	a.supersede = func(path string, _ int) bool { return path == pollRoute }
+	a.unavailable = func(path string, _ int) bool { return path == custodyRoute && failing.Load() }
 	a.mu.Unlock()
 
 	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
@@ -504,10 +558,7 @@ func TestASupersededProcessGoesOnClaimingUntilItHoldsNothing(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	compute := &followingCompute{
-		askingCompute: &askingCompute{fakeCompute: &fakeCompute{holding: true}, c: c},
-		leases:        []string{"l1"},
-	}
+	compute := newFollowingCompute(c)
 
 	_, done, _ := runDraining(t, c, compute)
 
@@ -517,10 +568,6 @@ func TestASupersededProcessGoesOnClaimingUntilItHoldsNothing(t *testing.T) {
 
 	sent := a.sent(custodyRoute)
 	waitFor(t, func() bool { return a.sent(custodyRoute) >= sent+3 })
-
-	if got := compute.letGoOf(); len(got) != 0 {
-		t.Fatalf("a claim nobody answered as adopted let go of %v", got)
-	}
 
 	select {
 	case err := <-done:
@@ -538,13 +585,69 @@ func TestASupersededProcessGoesOnClaimingUntilItHoldsNothing(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("the process did not stop once it held nothing")
 	}
+}
 
-	// THE FOLLOWING ENDS WITH THE WAIT, and Run joined it.
-	after := a.sent(custodyRoute)
+// pausedFollower holds a process inside asking what it holds.
+type pausedFollower struct {
+	*followingCompute
 
-	time.Sleep(100 * time.Millisecond)
+	entered, gate chan struct{}
+	once          sync.Once
+}
 
-	if n := a.sent(custodyRoute); n != after {
-		t.Fatalf("the process went on claiming after it stopped: %d then %d", after, n)
+func (g *pausedFollower) CustodyLeases() []string {
+	g.once.Do(func() { close(g.entered) })
+	<-g.gate
+
+	return g.followingCompute.CustodyLeases()
+}
+
+// THE FOLLOWING IS JOINED: Run does not return with a claim still to be sent, which
+// would be a process that has stopped still speaking for what it held.
+func TestRunJoinsTheFollowingOfCustody(t *testing.T) {
+	a := newController(t)
+
+	a.mu.Lock()
+	a.supersede = func(path string, _ int) bool { return path == pollRoute }
+	a.mu.Unlock()
+
+	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	compute := &pausedFollower{
+		followingCompute: newFollowingCompute(c),
+		entered:          make(chan struct{}),
+		gate:             make(chan struct{}),
+	}
+
+	var release sync.Once
+
+	t.Cleanup(func() { release.Do(func() { close(compute.gate) }) })
+
+	_, done, _ := runDraining(t, c, compute)
+
+	select {
+	case <-compute.entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the process never asked what it holds")
+	}
+
+	compute.setHolding(false)
+
+	// THE WAIT ENDS WITHIN ITS SWEEP, 10 ms here, and only the join can hold Run past it.
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned with %v while the following was still running", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	release.Do(func() { close(compute.gate) })
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return once the following could end")
 	}
 }

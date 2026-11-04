@@ -2,10 +2,13 @@ package nodeplane_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -23,7 +26,7 @@ func TestACustodyClaimIsHeldToTheLedger(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		store     *fakeStore
-		wantErr   bool
+		wantErr   string
 		wantOwner bool
 		heartbeat error
 	}{
@@ -60,7 +63,7 @@ func TestACustodyClaimIsHeldToTheLedger(t *testing.T) {
 		{
 			name:      "a ledger that could not answer",
 			store:     &fakeStore{leaseErr: errors.New("busy")},
-			wantErr:   true,
+			wantErr:   "busy",
 			heartbeat: nodeclient.ErrSuperseded,
 		},
 	} {
@@ -72,13 +75,17 @@ func TestACustodyClaimIsHeldToTheLedger(t *testing.T) {
 			old := dial(t, base)
 			current := dial(t, base)
 
-			adopted, err := old.ClaimCustody(t.Context(), []string{"l1"})
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("ClaimCustody = %v, want an error: %v", err, tc.wantErr)
+			held, err := old.ClaimCustody(t.Context(), []string{"l1"})
+
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("ClaimCustody: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("ClaimCustody = %v, want %q", err, tc.wantErr)
 			}
 
-			if len(adopted) != 0 {
-				t.Fatalf("a lease %v was called adopted by a process that holds nothing", adopted)
+			if got := len(held) == 1; got != tc.wantOwner {
+				t.Fatalf("the answer says it holds %v, want the lease held: %v", held, tc.wantOwner)
 			}
 
 			if got := p.OwnsForTest("l1", "n1", old.Incarnation()); got != tc.wantOwner {
@@ -104,12 +111,30 @@ func TestACustodyClaimIsHeldToTheLedger(t *testing.T) {
 	}
 }
 
+// readingStore counts the ledger's reads of a lease, and says a lease ended once it has
+// been read openAnswers times.
+type readingStore struct {
+	*fakeStore
+
+	reads       atomic.Int32
+	openAnswers int32
+}
+
+func (s *readingStore) Lease(ctx context.Context, id string) (*alloc.Lease, error) {
+	if n := s.reads.Add(1); s.openAnswers > 0 && n > s.openAnswers {
+		return nil, alloc.ErrLeaseNotFound
+	}
+
+	return s.fakeStore.Lease(ctx, id)
+}
+
 // A CLAIM NAMING MORE THAN A FLEET HOLDS IS REFUSED before the ledger is asked about
 // any of it.
 func TestACustodyClaimIsBounded(t *testing.T) {
 	t.Parallel()
 
-	p, base := serve(t, &fakeStore{lease: &alloc.Lease{ID: "l1", Node: "n1", RequestID: 7}})
+	store := &readingStore{fakeStore: &fakeStore{lease: &alloc.Lease{ID: "l1", Node: "n1", RequestID: 7}}}
+	p, base := serve(t, store)
 	c := dial(t, base)
 
 	many := make([]string, 4097)
@@ -117,8 +142,14 @@ func TestACustodyClaimIsBounded(t *testing.T) {
 		many[i] = fmt.Sprintf("l%d", i)
 	}
 
+	reads := store.reads.Load()
+
 	if _, err := c.ClaimCustody(t.Context(), many); !errors.Is(err, nodeclient.ErrRefused) {
 		t.Fatalf("a claim of %d leases = %v, want a refusal", len(many), err)
+	}
+
+	if got := store.reads.Load(); got != reads {
+		t.Fatalf("a refused claim read the ledger %d times", got-reads)
 	}
 
 	if p.OwnsForTest("l1", "n1", c.Incarnation()) {
@@ -130,12 +161,41 @@ func TestACustodyClaimIsBounded(t *testing.T) {
 	}
 }
 
-// THE ANSWER SAYS WHAT THIS CONTROLLER SPEAKS, since the process reached it without
-// registering and has nothing else to go on.
-func TestACustodyClaimReportsTheControllersVersion(t *testing.T) {
+// A LEASE THAT ENDS WHILE ITS CLAIM IS IN HAND IS NOT LEFT WITH AN OWNER. The ledger said
+// it was open, and the release and its forgetting came before the claim was written: the
+// process has let go of it, so nothing would ever name the record again, and it would
+// answer for its request for as long as the plane ran.
+func TestALeaseThatEndsDuringItsClaimIsForgotten(t *testing.T) {
 	t.Parallel()
 
-	_, base := serve(t, &fakeStore{leaseErr: alloc.ErrLeaseNotFound})
+	store := &readingStore{
+		fakeStore:   &fakeStore{lease: &alloc.Lease{ID: "l1", Node: "n1", RequestID: 7}},
+		openAnswers: 1,
+	}
+	p, base := serve(t, store)
+	c := dial(t, base)
+
+	held, err := c.ClaimCustody(t.Context(), []string{"l1"})
+	if err != nil {
+		t.Fatalf("ClaimCustody: %v", err)
+	}
+
+	if len(held) != 0 {
+		t.Fatalf("the answer says it holds %v, of a lease that ended", held)
+	}
+
+	if p.OwnsForTest("l1", "n1", c.Incarnation()) {
+		t.Fatal("the claim left an owner for a lease that ended")
+	}
+
+	if _, known := p.OwnerOfRequest(7); known {
+		t.Fatal("a lease that ended still answers for its request")
+	}
+}
+
+// claimRaw is a claim the client would not send.
+func claimRaw(t *testing.T, base, incarnation string) *http.Response {
+	t.Helper()
 
 	body, err := json.Marshal(nodeapi.ClaimCustodyRequest{LeaseIDs: []string{"l1"}})
 	if err != nil {
@@ -147,23 +207,18 @@ func TestACustodyClaimReportsTheControllersVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req.Header.Set(nodeapi.HeaderIncarnation, "p1")
+	if incarnation != "" {
+		req.Header.Set(nodeapi.HeaderIncarnation, incarnation)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	defer func() { _ = resp.Body.Close() }()
+	t.Cleanup(func() { _ = resp.Body.Close() })
 
-	var res nodeapi.ClaimCustodyResponse
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		t.Fatal(err)
-	}
-
-	if res.Version != nodeapi.Version {
-		t.Fatalf("the answer says version %d, want %d", res.Version, nodeapi.Version)
-	}
+	return resp
 }
 
 // A CLAIM NAMING NO PROCESS GRANTS NOTHING TO NOBODY: the lease would have an owner
@@ -173,24 +228,7 @@ func TestACustodyClaimNamingNoProcessIsRefused(t *testing.T) {
 
 	p, base := serve(t, &fakeStore{lease: &alloc.Lease{ID: "l1", Node: "n1", RequestID: 7}})
 
-	body, err := json.Marshal(nodeapi.ClaimCustodyRequest{LeaseIDs: []string{"l1"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, base+"/v1/nodes/n1/custody", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusForbidden {
+	if resp := claimRaw(t, base, ""); resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("a claim naming no process answered %s", resp.Status)
 	}
 
@@ -199,28 +237,19 @@ func TestACustodyClaimNamingNoProcessIsRefused(t *testing.T) {
 	}
 }
 
-// THE PROCESS THAT HAS THE COMPUTE LETS GO when the current one reported it: the
-// answer names it, and the lease stays with the current process.
-func TestACustodyClaimSaysWhatTheCurrentProcessAdopted(t *testing.T) {
+// THE ANSWER SAYS WHAT THIS CONTROLLER SPEAKS, since the process reached it without
+// registering and has nothing else to go on.
+func TestACustodyClaimReportsTheControllersVersion(t *testing.T) {
 	t.Parallel()
 
-	p, base := serve(t, &fakeStore{lease: &alloc.Lease{ID: "l1", Node: "n1", RequestID: 7}})
+	_, base := serve(t, &fakeStore{leaseErr: alloc.ErrLeaseNotFound})
 
-	old := dial(t, base)
-	current := dial(t, base)
-
-	p.AdoptOwnershipWithInventory("n1", current.Incarnation(), []string{"l1"}, true)
-
-	adopted, err := old.ClaimCustody(t.Context(), []string{"l1"})
-	if err != nil {
-		t.Fatalf("ClaimCustody: %v", err)
+	var res nodeapi.ClaimCustodyResponse
+	if err := json.NewDecoder(claimRaw(t, base, "p1").Body).Decode(&res); err != nil {
+		t.Fatal(err)
 	}
 
-	if len(adopted) != 1 || adopted[0] != "l1" {
-		t.Fatalf("adopted = %v, want the lease", adopted)
-	}
-
-	if !p.OwnsForTest("l1", "n1", current.Incarnation()) {
-		t.Fatal("the claim moved a lease the current process has the compute of")
+	if res.Version != nodeapi.Version {
+		t.Fatalf("the answer says version %d, want %d", res.Version, nodeapi.Version)
 	}
 }

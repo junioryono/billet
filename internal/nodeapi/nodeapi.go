@@ -518,8 +518,9 @@ const (
 	//
 	// REPORTED, NOT REFUSED. An older plane answers the route with a bare 404, and
 	// what the pairing loses is the failover of a superseded process's custody,
-	// which then waits as it always did; a node that negotiated below this does not
-	// ask. An older node never asks, and the plane needs no gate.
+	// which then waits as it always did. A node asks whatever it negotiated, since
+	// that was with another controller and the answer settles it with this one. An
+	// older node never asks, and the plane needs no gate.
 	VersionCustodyClaim = 38
 )
 

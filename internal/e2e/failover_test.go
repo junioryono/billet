@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -120,20 +121,46 @@ func TestANodeFollowsTheDeploymentToTheControllerServingIt(t *testing.T) {
 	}
 }
 
+// runScheduler runs a controller's scheduler until the function it answers is called,
+// which joins it, and the test's end calls it if nothing has.
+func runScheduler(t *testing.T, c *assembled) func() {
+	t.Helper()
+
+	scheduler := c.schedule(t, app.ScheduleOptions{Hurry: make(chan struct{})})
+	ctx, cancel := context.WithCancel(context.WithoutCancel(t.Context()))
+
+	var running sync.WaitGroup
+
+	running.Go(func() {
+		if err := scheduler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("the scheduler ended with %v", err)
+		}
+	})
+
+	stop := sync.OnceFunc(func() {
+		cancel()
+		running.Wait()
+	})
+	t.Cleanup(stop)
+
+	return stop
+}
+
 // A SUPERSEDED PROCESS KEEPS WHAT IT HOLDS WHEN THE CONTROLLER IS REPLACED (#685). A
-// process holds a running job and another registers under its name on a machine that
-// cannot see it. The controller goes, and the one that replaces it, knowing nothing,
-// fills the ownership gap for the process that registered: the ledger's launched set
-// says the lease is this node's. The superseded process must not register, so what
-// restores its right to renew and release is its claim, on whichever controller
-// answers. Then it finishes the job, as it would have on the controller it knew.
+// process holds a running job and another registers under its name. The controller goes,
+// and the one that replaces it, knowing nothing, fills the ownership gap for the process
+// that registered: the ledger's launched set says the lease is this node's. The
+// superseded process must not register, so what restores its right to renew and release
+// is its claim, on whichever controller answers.
+//
+// THEN GITHUB SAYS THE JOB IS DONE, through the new controller's own listener. A destroy
+// that reached the current process would be answered truthfully that it has nothing to
+// remove, and the lease released under a guest still running. It stays held, until the
+// guest has gone and the process that holds it says so.
 //
 // THE SAME WHETHER THE CONTROLLER MOVED OR ONLY RESTARTED, because a restart at one
-// address loses the record exactly as a failover does.
-//
-// AND WHERE THE PROCESS THAT REGISTERED SHARES THE MACHINE, it reports the compute, and
-// the claim answers that it is that process's: the superseded one lets go without
-// destroying anything, and stops.
+// address loses the record exactly as a failover does. On a shared machine the current
+// process holds the guest too, and either process's proof that it is gone settles it.
 func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -174,8 +201,11 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 				Command: simulated.RunFor(simulatedRunsFor),
 			}}
 			steering := &app.Steering{
-				Owner:  harnessOwner,
-				Server: []server.ControlPlaneOption{server.WithDrainTimeout(200 * time.Millisecond)},
+				Owner: harnessOwner,
+				Server: []server.ControlPlaneOption{
+					server.WithDrainTimeout(200 * time.Millisecond),
+					server.WithCleanupRetry(200*time.Millisecond, time.Second),
+				},
 			}
 
 			first := openAssembled(t, harnessConfig(dir, 8, 16*config.GiB, tiers), targets, steering)
@@ -184,6 +214,8 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 			// THE ADDRESS THE NEXT CONTROLLER SERVES AT, known to the node before it
 			// exists when it is another, as a standby's is.
 			next := first.wire.Addr
+
+			var controllers []string
 
 			if tc.moved {
 				ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
@@ -195,10 +227,7 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 				if err := ln.Close(); err != nil {
 					t.Fatalf("release the second address: %v", err)
 				}
-			}
 
-			var controllers []string
-			if tc.moved {
 				controllers = []string{first.wire.Addr, next}
 			}
 
@@ -232,18 +261,7 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 			holder := start(holderProvider, true)
 			first.awaitRegistered(t, 1)
 
-			schedulerCtx, stopScheduler := context.WithCancel(context.WithoutCancel(t.Context()))
-			defer stopScheduler()
-
-			scheduler := first.schedule(t, app.ScheduleOptions{Hurry: make(chan struct{})})
-
-			var running sync.WaitGroup
-
-			running.Go(func() {
-				if err := scheduler.Run(schedulerCtx); err != nil && !errors.Is(err, context.Canceled) {
-					t.Logf("the first controller's scheduler ended with %v", err)
-				}
-			})
+			stopFirst := runScheduler(t, first)
 
 			p.queue(fakeactions.StatisticsJSON(1, 0), fakeactions.JobJSON("JobAvailable", requestID, "push", testTier))
 			waitUntil(t, "billet to bid for the available job", func() bool { return len(p.acquiredIDs()) > 0 })
@@ -291,8 +309,7 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 			})
 
 			// THE CONTROLLER GOES, and another comes up over the same ledger.
-			stopScheduler()
-			running.Wait()
+			stopFirst()
 			first.close()
 
 			cfg := harnessConfig(dir, 8, 16*config.GiB, tiers)
@@ -300,37 +317,14 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 
 			replaced := openAssembled(t, cfg, targets, steering)
 			plane := replaced.wire.Plane()
+			ledger := replaced.ctl.Allocator()
 
 			waitUntil(t, "the current process to register with the new controller", func() bool {
 				return plane.CurrentIncarnationForTest(host) == current.incarnation
 			})
 
-			if tc.sameMachine {
-				// THE CURRENT PROCESS HAS THE COMPUTE, so the first lets go and stops,
-				// and nothing happens to the job.
-				select {
-				case <-holder.done:
-				case <-time.After(30 * time.Second):
-					t.Fatal("the superseded process did not let go of what the current one adopted")
-				}
-
-				if !plane.OwnsForTest(leaseID, host, current.incarnation) {
-					t.Fatal("the lease left the process that has the compute")
-				}
-
-				if _, found, err := holderProvider.Find(t.Context(), inst.Name); err != nil || !found {
-					t.Fatalf("letting go removed the instance: found=%v err=%v", found, err)
-				}
-
-				if _, err := replaced.ctl.Allocator().Lease(t.Context(), leaseID); err != nil {
-					t.Fatalf("letting go ended the lease: %v", err)
-				}
-
-				return
-			}
-
 			// IT IS THE FIRST PROCESS'S ON THE NEW CONTROLLER, with the request, so a
-			// completion's destroy cannot go to the process that has nothing to remove.
+			// completion's destroy cannot go to a process that has nothing to remove.
 			waitUntil(t, "the superseded process's claim to land", func() bool {
 				return plane.OwnsForTest(leaseID, host, holder.incarnation)
 			})
@@ -344,25 +338,39 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 				t.Fatalf("the claim took the name: the node is %q, want %q", got, current.incarnation)
 			}
 
-			if _, err := replaced.ctl.Allocator().Lease(t.Context(), leaseID); err != nil {
-				t.Fatalf("the lease of a running job ended: %v", err)
-			}
+			runScheduler(t, replaced)
 
-			// THE JOB ENDS, and the process that held it settles it and stops.
-			if _, err := holderProvider.Destroy(t.Context(), inst.ID); err != nil {
-				t.Fatalf("end the job: %v", err)
+			// GITHUB SAYS IT IS DONE, and billet has handled that once it acknowledges.
+			done := fakeactions.JobJSON("JobCompleted", requestID, "push", testTier)
+			done["result"] = "Succeeded"
+			p.queue(fakeactions.StatisticsJSON(0, 0), done)
+
+			waitUntil(t, "billet to handle the completion", func() bool {
+				return slices.Contains(p.ackedIDs(), 3)
+			})
+
+			// ON A SECOND MACHINE NOTHING THAT CAN REACH THE GUEST WAS ASKED, so it runs and
+			// its lease stays held until it ends. ON THE SAME ONE the current process holds
+			// the guest too, and may have removed it, which is the job finishing.
+			if !tc.sameMachine {
+				if _, found, err := holderProvider.Find(t.Context(), inst.Name); err != nil || !found {
+					t.Fatalf("the completion removed an instance only the superseded process has: found=%v err=%v", found, err)
+				}
+
+				if _, err := ledger.Lease(t.Context(), leaseID); err != nil {
+					t.Fatalf("the lease was released under a running job: %v", err)
+				}
+
+				if _, err := holderProvider.Destroy(t.Context(), inst.ID); err != nil {
+					t.Fatalf("end the job: %v", err)
+				}
 			}
 
 			waitUntil(t, "the holder to settle the lease", func() bool {
-				_, err := replaced.ctl.Allocator().Lease(t.Context(), leaseID)
+				_, err := ledger.Lease(t.Context(), leaseID)
 
 				return errors.Is(err, alloc.ErrLeaseNotFound)
 			})
-
-			if outcome, err := replaced.ctl.Allocator().HistoryOutcome(t.Context(), leaseID); err != nil ||
-				outcome != string(alloc.PhaseDone) {
-				t.Fatalf("history outcome = %q err=%v, want done", outcome, err)
-			}
 
 			select {
 			case <-holder.done:
