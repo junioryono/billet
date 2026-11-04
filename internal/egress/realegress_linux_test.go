@@ -596,8 +596,19 @@ func TestRealEgress(t *testing.T) { //nolint:paralleltest // it owns the namespa
 				t.Fatalf("control: an outside resolver over UDP: %v", err)
 			}
 
-			if err := n.connect6(); err != nil {
-				t.Fatalf("control: an IPv6 connect: %v", err)
+			// A FEW TRIES: this says only that the path is there once the network has settled, and
+			// neighbour discovery on freshly made links can lose the first attempt. What the rules do
+			// to it below gets one.
+			var sixErr error
+
+			for range 4 {
+				if sixErr = n.connect6(); sixErr == nil {
+					break
+				}
+			}
+
+			if sixErr != nil {
+				t.Fatalf("control: an IPv6 connect: %v", sixErr)
 			}
 
 			h := realHost(t, t.TempDir())

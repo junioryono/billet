@@ -712,6 +712,11 @@ func (h heldRules) keepsOff(key, iface string, kind Kind, mark uint32) bool {
 		h.nat.rules["prerouting"] > 0 && h.nat.maps["jobs"][number] == "dns_"+key && h.nat.rules["dns_"+key] > 0 &&
 		h.nat.rules["own"] > 0 && h.nat.maps["owners"][number] == "own_"+key && h.nat.rules["own_"+key] > 0
 
+	// EITHER IT WAS CLOSED, OR ITS LIST'S CHAIN STILL ENDS IN A REFUSAL: emptied, what that chain
+	// sends to it falls through to accept.
+	closed := guests.rules["job_"+key] == countRules(closedScript(key, iface, kind))[kind.table()+" job_"+key]
+	held = held && (closed || guests.rules["deny_"+key] > 0)
+
 	if kind != BridgePort {
 		return held
 	}

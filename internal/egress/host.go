@@ -68,6 +68,12 @@ type attached struct {
 	// judged says listed is the kernel's answer for rules this process did not make, kept
 	// because the kernel stops being able to give it as they are removed.
 	judged bool
+	// removalOnly says what is owed here is taking these rules off, since their guest is proved
+	// gone: an inventory taken before that must not read as a guest to serve.
+	removalOnly bool
+	// unknown says nothing could tell whether these rules were a list, so the job's report says
+	// it had one and is incomplete, rather than nothing having been asked of it.
+	unknown bool
 
 	// fwd and rec are nil for rules found with no way to serve them.
 	fwd *forwarder
@@ -80,7 +86,7 @@ type attached struct {
 }
 
 // Host is the node's one handle on its guests' network policy. Safe for
-// concurrent use; several launches attach at once.
+// concurrent use; several launches can ask at once, and are taken one at a time.
 type Host struct {
 	log      *slog.Logger
 	stateDir string
@@ -496,20 +502,27 @@ func (h *Host) settleGone(ctx context.Context, key string) {
 	h.mu.Lock()
 	reserved := h.unrestored[key]
 	orphan, leftover := h.orphanMarks[key]
-	delete(h.orphanMarks, key)
 	h.mu.Unlock()
 
 	if leftover {
+		// THE FILE IS WHAT NAMES THEIR INTERFACE, AND ITS WORD ON WHETHER THEY WERE A LIST OUTLIVES A
+		// REMOVAL THAT STOPPED HALFWAY, so it goes only once they have; the next recovery asks again.
 		file, err := h.readFile(key)
-		if err == nil {
-			h.removeOrKeep(ctx, &attached{Attachment: Attachment{Key: key, Interface: file.Interface,
-				Network: file.Network, Kind: file.Kind}, mark: orphan})
+		if err != nil {
+			h.log.Warn("could not read the policy file of a guest that has gone, so what the kernel holds of it "+
+				"stays until it can be", "guest", key, "error", err)
 
 			return
 		}
 
-		h.log.Warn("could not read the policy file of a guest that has gone, so what the kernel holds of it "+
-			"stays", "guest", key, "error", err)
+		h.removeOrKeep(ctx, &attached{Attachment: Attachment{Key: key, Interface: file.Interface,
+			Network: file.Network, Kind: file.Kind}, mark: orphan, listed: file.Listed, judged: true})
+
+		h.mu.Lock()
+		delete(h.orphanMarks, key)
+		h.mu.Unlock()
+
+		return
 	}
 
 	h.freeMark(reserved)
@@ -971,7 +984,7 @@ func (h *Host) attach(ctx context.Context, a Attachment, p *Policy, reserved uin
 	if _, err := h.nft(ctx, baseScript()+attachScript(guest.binding(local)), "-f", "-"); err != nil {
 		err = fmt.Errorf("egress: install the rules of %s: %w", a.Key, err)
 
-		if settleErr := h.settleFailedInstall(ctx, guest); settleErr != nil {
+		if settleErr := h.settleFailedInstall(ctx, guest, restoring); settleErr != nil {
 			uncertain = true
 
 			return fmt.Errorf("%w: %w: %w", errRulesUncertain, err, settleErr)
@@ -996,7 +1009,7 @@ func (h *Host) attach(ctx context.Context, a Attachment, p *Policy, reserved uin
 // it would have made: a transaction is all or none, so absence is proof of none. If
 // that fails too the guest's rules stay on the books for its unwind, the next guest on
 // its interface and the next recovery.
-func (h *Host) settleFailedInstall(ctx context.Context, a *attached) error {
+func (h *Host) settleFailedInstall(ctx context.Context, a *attached, restoring bool) error {
 	ctx = context.WithoutCancel(ctx)
 
 	_, err := h.nft(ctx, detachScript(a.Key, a.Interface, a.Kind, a.mark, a.listed), "-f", "-")
@@ -1007,18 +1020,22 @@ func (h *Host) settleFailedInstall(ctx context.Context, a *attached) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.foundOnStart[a.Key] = &attached{Attachment: a.Attachment, mark: a.mark}
+	// A LAUNCH THAT FAILED STARTED NOTHING, AND IS OWED ONLY THEIR REMOVAL. A guest being restored
+	// is running, and may have a list.
+	h.foundOnStart[a.Key] = &attached{Attachment: a.Attachment, mark: a.mark, removalOnly: !restoring, unknown: restoring}
 	h.byIface[a.Interface] = a.Key
 
 	return err
 }
 
-// keepForLater puts rules that would not go back on the books, for the next guest on
-// their interface and the next recovery. Unless a guest has taken their interface since,
-// which has cleared them.
+// keepForLater puts rules that would not come off back on the books, for the next guest on
+// their interface and the next recovery, which owe them only their removal. Unless another
+// holds their interface.
 func (h *Host) keepForLater(a *attached) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	a.removalOnly = true
 
 	if holder, held := h.byIface[a.Interface]; held && holder != a.Key {
 		return
@@ -1070,7 +1087,7 @@ func (h *Host) Detach(ctx context.Context, key string) {
 
 	h.mu.Lock()
 	a := h.takeLocked(key)
-	_, unrestored := h.unrestored[key]
+	reserved, unrestored := h.unrestored[key]
 	h.mu.Unlock()
 
 	if a == nil {
@@ -1095,13 +1112,24 @@ func (h *Host) Detach(ctx context.Context, key string) {
 	// A LIST NOTHING COULD SERVE STILL HAS WHAT THE KERNEL COUNTED: a guest whose
 	// adoption failed, or whose file was gone, is reported as a part of the story.
 	listed := h.listedOf(ctx, a)
-	if a.rec == nil && listed {
+	if a.rec == nil && (listed || a.unknown) {
 		a.rec = newRecorder(true, true)
 	}
 
 	var c counts
 	if listed {
 		c = h.readCounts(ctx, a)
+	}
+
+	// WHATEVER WAS HELD FOR IT GOES WITH IT, so a detach asked again finds nothing and leaves the
+	// report this one kept, and a mark the next guest has since been given stays that guest's.
+	h.mu.Lock()
+	delete(h.unrestored, key)
+	delete(h.orphanMarks, key)
+	h.mu.Unlock()
+
+	if reserved != a.mark {
+		h.freeMark(reserved)
 	}
 
 	if a.rec != nil {
@@ -1345,8 +1373,7 @@ func (h *Host) Reconcile(ctx context.Context, running map[string]bool) {
 	h.verify(ctx)
 }
 
-// takeFound takes a guest off the books for judging it, unless a launch reusing its
-// interface or its name already has, in which case it is that launch's.
+// takeFound takes a guest off the books for judging it, unless it has already gone from them.
 func (h *Host) takeFound(a *attached) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1361,6 +1388,14 @@ func (h *Host) takeFound(a *attached) bool {
 }
 
 func (h *Host) reconcileOne(ctx context.Context, a *attached, running bool) {
+	if a.removalOnly {
+		if h.takeFound(a) {
+			h.removeOrKeep(ctx, a)
+		}
+
+		return
+	}
+
 	file, err := h.readFile(a.Key)
 
 	switch {
@@ -1399,6 +1434,9 @@ func (h *Host) reconcileOne(ctx context.Context, a *attached, running bool) {
 		h.log.Error("could not read the policy file of a running guest that has no deny chain, so it may be "+
 			"open or a list that lost its rules; its DNS goes nowhere, and the file is read again at the next "+
 			"recovery", "guest", a.Key, "error", err)
+
+		a.unknown = true
+
 		h.quarantine(ctx, a)
 	}
 }

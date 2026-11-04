@@ -2185,7 +2185,7 @@ func TestAGuestKeptOffIsCheckedInEveryPart(t *testing.T) {
 
 	for _, part := range []string{
 		`"name":"jobs"`, `"name":"owners"`, `"chain":"dns_` + guestKey, `"chain":"own_` + guestKey, `"name":"bridge_ports"`,
-		`"chain":"port_l3"`, `"name":"guests"`, `"chain":"job_` + guestKey,
+		`"chain":"port_l3"`, `"name":"guests"`, `"chain":"job_` + guestKey, `"chain":"deny_` + guestKey,
 	} {
 		if holds(part) {
 			t.Errorf("rules without %s read as keeping it off", part)
@@ -2230,6 +2230,11 @@ func TestAnUnreadableFileBehindNoDenyChainIsKept(t *testing.T) {
 
 	scriptWith(t, f, "delete chain bridge billet_egress job_"+guestKey)
 
+	// AND ITS REPORT SAYS WHAT COULD NOT BE TOLD: nothing at all would read as nothing asked of it.
+	if rec, ok := h.Take(guestKey); !ok || !rec.Listed || !rec.Incomplete {
+		t.Fatalf("record = %+v, %v", rec, ok)
+	}
+
 	if _, held := h.byIface[guestTap]; held {
 		t.Fatal("its interface is still held")
 	}
@@ -2264,6 +2269,136 @@ func TestAGuestThatHasGoneLeavesNoOrphanedRules(t *testing.T) {
 
 	if _, held := h.slots[0xb1e70009]; held {
 		t.Fatal("its mark is still held")
+	}
+}
+
+// WHAT IS LEFT OF A GUEST THAT HAS GONE COMES OFF AS ITS FILE SAYS IT WAS: a removal that stopped
+// halfway took the deny chain the kernel would have answered from, and sets left behind can be found
+// by nothing later. THE FILE GOES ONLY ONCE THEY HAVE: while it cannot be read, what the kernel holds
+// stays named, and is asked about again.
+func TestLeftoversComeOffAsTheirFileSaysTheyWere(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeNft()
+	f.jobs = `{"nftables":[{"map":{"elem":[[` + strconv.FormatUint(0xb1e70009, 10) + `,{"jump":{"target":"dns_` + guestKey + `"}}]]}}]}`
+
+	h := aHost(t, f)
+	path := filepath.Join(h.stateDir, guestKey+recordSuffix)
+	keepFile(t, h, aGuest(), listed(t, "example.com"))
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h.Prepare(t.Context())
+	h.Reconcile(t.Context(), map[string]bool{})
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the file went with what it names still there: %v", err)
+	}
+
+	for _, script := range f.allScripts() {
+		if strings.Contains(script, "delete ") {
+			t.Fatalf("removed with nothing to say what they were:\n%s", script)
+		}
+	}
+
+	if _, held := h.orphanMarks[guestKey]; !held {
+		t.Fatal("what the kernel still holds was forgotten")
+	}
+
+	if err := os.WriteFile(path, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h.Reconcile(t.Context(), map[string]bool{})
+
+	scriptWith(t, f, "delete set bridge billet_egress allow_"+guestKey)
+
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the file stayed: %v", err)
+	}
+}
+
+// A GUEST PROVED GONE IS OWED ITS RULES' REMOVAL, WHATEVER AN OLDER LIST SAYS: a sweep's inventory can
+// predate the destroy, and adopting from it starts a resolver and puts rules back for compute that has
+// gone, which nothing would then take off.
+func TestAnOlderInventoryDoesNotBringBackAGuestProvedGone(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeNft()
+	h := preparedHost(t, f)
+
+	if err := h.Attach(t.Context(), aGuest(), listed(t, "example.com")); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	f.refuse = func(script string, _ []string) error {
+		if strings.Contains(script, "delete ") {
+			return errors.New("Operation not permitted")
+		}
+
+		return nil
+	}
+	f.mu.Unlock()
+
+	h.Detach(t.Context(), guestKey)
+
+	if h.foundOnStart[guestKey] == nil {
+		t.Fatal("rules that would not come off were forgotten")
+	}
+
+	f.mu.Lock()
+	f.refuse = nil
+	f.mu.Unlock()
+
+	before := len(f.allScripts())
+
+	h.Reconcile(t.Context(), map[string]bool{guestKey: true})
+
+	if h.live[guestKey] != nil {
+		t.Fatal("a guest proved gone was adopted from an inventory older than that proof")
+	}
+
+	got := f.allScripts()[before:]
+	if len(got) == 0 || !strings.Contains(got[0], "delete chain bridge billet_egress job_"+guestKey) {
+		t.Fatalf("scripts = %q, want its rules off", got)
+	}
+}
+
+// A DETACH ASKED AGAIN KEEPS THE REPORT THE FIRST KEPT, since a teardown that failed further on is
+// retried, and holds nothing for the guest after the first: a mark freed twice can be the next guest's.
+func TestADetachAskedAgainChangesNothing(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeNft()
+	f.denyHeld = true
+	f.guests = `{"nftables":[{"map":{"elem":[["` + guestTap + `",{"jump":{"target":"job_` + guestKey + `"}}]]}}]}`
+
+	h := aHost(t, f)
+	h.Prepare(t.Context())
+	h.Reconcile(t.Context(), map[string]bool{guestKey: true})
+
+	if _, held := h.unrestored[guestKey]; !held {
+		t.Fatal("no mark was held for it, so this proves nothing")
+	}
+
+	h.Detach(t.Context(), guestKey)
+
+	if _, held := h.unrestored[guestKey]; held {
+		t.Fatal("what was held for it stayed")
+	}
+
+	h.Detach(t.Context(), guestKey)
+
+	if rec, ok := h.Take(guestKey); !ok || rec.DeniedPackets != 3 {
+		t.Fatalf("record = %+v, %v: the second detach replaced what the kernel counted", rec, ok)
 	}
 }
 
