@@ -86,6 +86,11 @@ type ReadOps interface {
 	ListAdmissionRows(ctx context.Context) ([]ledgerdb.Admission, error)
 	ListAppliedMigrations(ctx context.Context) ([]ledgerdb.ListAppliedMigrationsRow, error)
 	ListAttributedFailures(ctx context.Context, arg ledgerdb.ListAttributedFailuresParams) ([]ledgerdb.ListAttributedFailuresRow, error)
+	ListRerunCandidates(ctx context.Context, arg ledgerdb.ListRerunCandidatesParams) ([]ledgerdb.ListRerunCandidatesRow, error)
+	ListRerunDecisions(ctx context.Context, since string) ([]ledgerdb.ListRerunDecisionsRow, error)
+	ReadOpenRerun(ctx context.Context, arg ledgerdb.ReadOpenRerunParams) (ledgerdb.ReadOpenRerunRow, error)
+	ReadRerunOfAttempt(ctx context.Context, arg ledgerdb.ReadRerunOfAttemptParams) (string, error)
+	CountRunReruns(ctx context.Context, arg ledgerdb.CountRunRerunsParams) (int64, error)
 	ListBarrierRuns(ctx context.Context, barrierID string) ([]ledgerdb.ListBarrierRunsRow, error)
 	ListCacheBlocks(ctx context.Context) ([]ledgerdb.CacheBlock, error)
 	ListCodeBuildRegistrationPaths(ctx context.Context, provider string) ([]ledgerdb.ListCodeBuildRegistrationPathsRow, error)
@@ -268,6 +273,12 @@ type WriteOps interface {
 	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
 	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
 	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error
+	InsertRerunIntent(ctx context.Context, arg ledgerdb.InsertRerunIntentParams) error
+	AddRerunTry(ctx context.Context, arg ledgerdb.AddRerunTryParams) error
+	SettleRerun(ctx context.Context, arg ledgerdb.SettleRerunParams) error
+	BindJobToRerun(ctx context.Context, arg ledgerdb.BindJobToRerunParams) error
+	SettleJobsOfRerun(ctx context.Context, arg ledgerdb.SettleJobsOfRerunParams) error
+	RecordJobRerunDecision(ctx context.Context, arg ledgerdb.RecordJobRerunDecisionParams) error
 	RecordJobRunnerID(ctx context.Context, arg ledgerdb.RecordJobRunnerIDParams) error
 	RecordJobUsage(ctx context.Context, arg ledgerdb.RecordJobUsageParams) (int64, error)
 	RecordJobSeries(ctx context.Context, arg ledgerdb.RecordJobSeriesParams) error

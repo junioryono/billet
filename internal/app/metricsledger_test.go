@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/metrics"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
@@ -488,5 +490,96 @@ func TestTheLedgerSourceServesQueueWaits(t *testing.T) {
 	}
 	if n := sampleValue(t, got, `billet_job_queue_wait_negative_total{tier="billet-2vcpu"}`); n != 1 {
 		t.Errorf("the negative counter is %v, want the one queued after it started", n)
+	}
+}
+
+// A JOB'S RE-RUN DECISION IS COUNTED FROM THE LEDGER, with the labels its family
+// declares; a decision outside the day is not, and nothing decided is no sample.
+func TestTheRerunGaugeReadsTheDecisions(t *testing.T) {
+	t.Parallel()
+
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	tier := metricsTestTier()
+	now := time.Now()
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	read := ledgerSnapshot(a, []config.Tier{tier}, func() time.Time { return now })
+
+	snap, err := read(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snap[familyJobReruns]; len(got) != 0 {
+		t.Fatalf("samples with nothing decided: %+v", got)
+	}
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `INSERT INTO job_history (lease_id, tier, queued_at)
+			VALUES ('decided-a', $1, ''), ('decided-b', $1, '')`, tier.Label)
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, lease := range []string{"decided-a", "decided-b"} {
+		if err := a.RecordRerunDecision(t.Context(), lease, alloc.RerunRequested, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snap, err = read(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := snap[familyJobReruns]
+	if len(got) != 1 || got[0].Value != 2 || len(got[0].Labels) != 2 ||
+		got[0].Labels[0] != tier.Label || got[0].Labels[1] != string(alloc.RerunRequested) {
+		t.Errorf("samples = %+v", got)
+	}
+
+	later := ledgerSnapshot(a, []config.Tier{tier}, func() time.Time { return now.Add(jobRerunWindow + time.Hour) })
+
+	snap, err = later(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snap[familyJobReruns]; len(got) != 0 {
+		t.Errorf("past the day = %+v", got)
+	}
+}
+
+// WHAT A TARGET'S APP MUST HOLD IS ONE ANSWER: write where a tier re-runs, which
+// includes the read a cache publication needs, read for that alone, and nothing else.
+func TestActionsAccessOfATarget(t *testing.T) {
+	t.Parallel()
+
+	published := config.Tier{Label: "published", Target: "reads",
+		Cache: &config.TierCache{Publish: config.CachePublishDefaultBranch}}
+	rerun := config.Tier{Label: "rerun", Target: "writes", Retry: &config.TierRetry{Disrupted: 1}}
+	both := config.Tier{Label: "both", Target: "both", Retry: &config.TierRetry{Disrupted: 1},
+		Cache: &config.TierCache{Publish: config.CachePublishDefaultBranch}}
+
+	cfg := &config.Config{
+		Targets: []config.GitHubConfig{{Name: "reads", Org: "a"}, {Name: "writes", Org: "b"}, {Name: "both", Org: "c"},
+			{Name: "neither", Org: "d"}},
+		Tiers: []config.Tier{published, rerun, both},
+	}
+
+	for name, want := range map[string]github.ActionsAccess{
+		"reads": github.ActionsRead, "writes": github.ActionsWrite, "both": github.ActionsWrite, "neither": github.ActionsNone,
+	} {
+		if got := ActionsAccessOf(cfg, name); got != want {
+			t.Errorf("ActionsAccessOf(%q) = %d, want %d", name, got, want)
+		}
 	}
 }

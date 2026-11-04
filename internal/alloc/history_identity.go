@@ -153,6 +153,12 @@ type JobRecord struct {
 	// HolderIncarnation the one that held the compute when the lease ended.
 	LaunchIncarnation string
 	HolderIncarnation string
+	// RerunDecision is what became of the job's chance of a re-run, RerunDecidedAt
+	// when, and RerunAttempt the attempt it was decided against; empty and zero
+	// until decided, and for a tier that does not ask for one.
+	RerunDecision  RerunDecision
+	RerunDecidedAt string
+	RerunAttempt   int64
 }
 
 // Job reads one lease's history row. A lease that was never assigned a job is
@@ -190,6 +196,8 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			LaunchedAt: row.LaunchedAt, RegisteredAt: row.RegisteredAt, RunnerID: row.RunnerID,
 			CustodyAt: row.CustodyAt, TeardownAt: row.TeardownAt, QuarantinedAt: row.QuarantinedAt,
 			LaunchIncarnation: row.LaunchIncarnation, HolderIncarnation: row.HolderIncarnation,
+			RerunDecision: RerunDecision(row.RerunDecision), RerunDecidedAt: row.RerunDecidedAt,
+			RerunAttempt: row.RerunAttempt,
 		}
 		return nil
 	})

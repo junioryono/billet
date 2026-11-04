@@ -43,7 +43,12 @@ const (
 	familyTierWaitingFor = "billet_tier_waiting_seconds"
 	familyTierReportAge  = "billet_tier_report_age_seconds"
 	familyNodes          = "billet_nodes"
+	familyJobReruns      = "billet_job_reruns"
 )
+
+// jobRerunWindow is how far back billet_job_reruns counts. A gauge rather than a
+// counter, read from the ledger, so a restart does not lose or repeat one.
+const jobRerunWindow = 24 * time.Hour
 
 var ledgerFamilies = []metrics.Family{
 	{Name: familyTierLeases, Labels: []string{"tier", "state"},
@@ -65,6 +70,9 @@ var ledgerFamilies = []metrics.Family{
 		Help: "How old the tier listener's last published report is; a stopped listener's report only ages."},
 	{Name: familyNodes, Labels: []string{"state"},
 		Help: "Registered hosts by state: live, offline, or decommissioned."},
+	{Name: familyJobReruns, Labels: []string{"tier", "decision"},
+		Help: "Jobs billet disrupted in the last day, by tier and what was decided about re-running them; " +
+			"failed is a re-run GitHub never accepted. Absent where nothing was decided."},
 }
 
 // LedgerMetrics is the control plane's ledger as metrics: each tier's capacity
@@ -165,6 +173,15 @@ func ledgerSnapshot(a *alloc.Allocator, tiers []config.Tier, now func() time.Tim
 			if since, ok := parseLedgerTime(report.Listener.WaitingSince); ok && report.Listener.Waiting > 0 {
 				add(familyTierWaitingFor, age(since), label)
 			}
+		}
+
+		decisions, err := a.RerunDecisions(ctx, at.Add(-jobRerunWindow))
+		if err != nil {
+			return nil, fmt.Errorf("re-run decisions: %w", err)
+		}
+
+		for _, d := range decisions {
+			add(familyJobReruns, float64(d.Jobs), d.Tier, string(d.Decision))
 		}
 
 		nodes, err := a.RegisteredNodes(ctx)

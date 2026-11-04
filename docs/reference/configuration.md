@@ -152,6 +152,7 @@ The per-sample series a node reports with each job records the wall time of its 
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
 | `intercept` | the deprecated spelling of `cache.actions.enabled`; refused beside `cache.actions` |
 | `max_concurrent`, `reserved` | a ceiling and a floor; a macOS tier's ceiling defaults to what its hosts permit between them |
+| `retry` | `disrupted`, 0 to 5, default 0: how many times billet asks GitHub to re-run a workflow run whose job on this tier it proved its own infrastructure ended. The App must hold `actions: write`. See [Re-running a job billet ended](../operating/status-and-leases.md#re-running-a-job-billet-ended) |
 | `warm_pool` | refused when non-zero; no backend implements it |
 
 ### `tiers[].cache`

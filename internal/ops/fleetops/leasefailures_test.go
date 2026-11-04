@@ -78,14 +78,14 @@ func seedAttributedFailure(t *testing.T, stateDir, result string, requestID int6
 	return lease.ID
 }
 
-// `billet leases failures` HAS TO SAY THAT NOTHING WAS RE-RUN.
+// `billet leases failures` HAS TO SAY WHAT A RE-RUN TAKES.
 //
-// That sentence is the deliverable, not decoration. The rule is explicit that
-// billet must never re-run a job it believes was lost — a re-run is a side effect
-// on somebody's repository — and a report that shows an operator "your build
+// That sentence is the deliverable, not decoration. A re-run is a side effect on
+// somebody's repository, so billet asks for one only for a tier that opts in and on
+// GitHub's own proof (ADR-023), and a report that shows an operator "your build
 // failed because the node went away" without saying what billet did NOT do about
 // it invites them to assume it was handled.
-func TestLeaseFailuresReportsBothFactsAndDisclaimsAnyRerun(t *testing.T) {
+func TestLeaseFailuresReportsBothFactsAndWhatARerunTakes(t *testing.T) {
 	stateDir := t.TempDir()
 	cfg := writeCAConfig(t, stateDir)
 	lease := seedAttributedFailure(t, stateDir, "failed", 77)
@@ -109,7 +109,7 @@ func TestLeaseFailuresReportsBothFactsAndDisclaimsAnyRerun(t *testing.T) {
 		lease,
 		// The two sentences that keep this a report rather than a verdict.
 		"CIRCUMSTANTIAL",
-		"Nothing has been re-run",
+		"only when GitHub's own record",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the report does not mention %q:\n%s", want, out)
@@ -256,5 +256,42 @@ func TestAgoRendersARecordedTimestamp(t *testing.T) {
 	stamp := time.Now().Add(-90 * time.Minute).UTC().Format(time.RFC3339Nano)
 	if got := ago(stamp); !strings.HasSuffix(got, " ago") || strings.HasPrefix(got, "<1m") {
 		t.Errorf("ago(%s) = %q, want an elapsed duration", stamp, got)
+	}
+}
+
+// THE REPORT SAYS WHAT WAS DECIDED ABOUT EACH JOB, a dash for nothing and quoted for
+// a word this binary does not know, which a newer binary may have written.
+func TestRerunColumnSaysWhatWasDecided(t *testing.T) {
+	t.Parallel()
+
+	for decision, want := range map[alloc.RerunDecision]string{
+		"":                    "-",
+		alloc.RerunRequested:  "requested",
+		alloc.RerunUnproven:   "unproven",
+		alloc.RerunMixed:      "mixed",
+		alloc.RerunLimit:      "limit",
+		alloc.RerunSuperseded: "superseded",
+		alloc.RerunExpired:    "expired",
+		alloc.RerunFailed:     "failed",
+		"from-a-newer-billet": `"from-a-newer-billet"`,
+	} {
+		if got := rerunColumn(decision); got != want {
+			t.Errorf("rerunColumn(%q) = %q, want %q", decision, got, want)
+		}
+	}
+}
+
+// `billet jobs show` CARRIES IT TOO, with the attempt it was against.
+func TestDescribeFailureSaysTheRerun(t *testing.T) {
+	t.Parallel()
+
+	got := describeFailure(alloc.JobRecord{Disruption: "reclaimed", RerunDecision: alloc.RerunRequested,
+		RerunAttempt: 2, RerunDecidedAt: "2026-11-04T07:00:00Z"})
+	want := `disrupted by billet: "reclaimed"; re-run: "requested" of attempt 2 at 2026-11-04T07:00:00Z`
+	if got != want {
+		t.Errorf("describeFailure = %q, want %q", got, want)
+	}
+	if got := describeFailure(alloc.JobRecord{}); got != "none recorded" {
+		t.Errorf("a job with nothing recorded = %q", got)
 	}
 }

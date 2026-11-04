@@ -168,10 +168,10 @@ func waitForInstallationAt(ctx context.Context, client *http.Client, base string
 //
 // Results are sorted so the diagnostic is stable across runs — Go randomizes map
 // iteration, and an error message that reorders itself is one nobody can diff.
-func (i *Installation) PermissionMismatches(scope Scope, runEvidence bool) []string {
+func (i *Installation) PermissionMismatches(scope Scope, actions ActionsAccess) []string {
 	var problems []string
 
-	permissions := permissionsFor(scope, runEvidence)
+	permissions := permissionsFor(scope, actions)
 
 	for name, want := range permissions {
 		got, ok := i.Permissions[name]
@@ -195,8 +195,10 @@ func (i *Installation) PermissionMismatches(scope Scope, runEvidence bool) []str
 		}
 		// `actions: read` IS WHAT billet REQUESTS BY DEFAULT, so an App that
 		// holds it is one billet made, not one edited behind its back; it is
-		// required only where a tier publishes from a default branch.
-		if runEvidencePermission[name] == got {
+		// required only where a tier publishes from a default branch. Write is
+		// never a default, so an App holding it where no tier re-runs a job is
+		// refused like any other permission billet did not ask for.
+		if name == actionsPermission && got == actionsReadLevel {
 			continue
 		}
 		problems = append(problems,
@@ -251,18 +253,18 @@ func Undecided(err error) bool {
 // a test fake or a GitHub Enterprise Server deployment passes its own.
 func VerifyAppAt(
 	ctx context.Context, client *http.Client, base string,
-	appID int64, privateKeyPEM []byte, target Target, installationID int64, runEvidence bool,
+	appID int64, privateKeyPEM []byte, target Target, installationID int64, actions ActionsAccess,
 ) (*Installation, error) {
 	if base == "" {
 		base = apiBase
 	}
 
-	return verifyAppAt(ctx, client, base, appID, privateKeyPEM, target, installationID, runEvidence)
+	return verifyAppAt(ctx, client, base, appID, privateKeyPEM, target, installationID, actions)
 }
 
 func verifyAppAt(
 	ctx context.Context, client *http.Client, base string,
-	appID int64, privateKeyPEM []byte, target Target, installationID int64, runEvidence bool,
+	appID int64, privateKeyPEM []byte, target Target, installationID int64, actions ActionsAccess,
 ) (*Installation, error) {
 	inst, err := getInstallationAt(ctx, client, base, appID, privateKeyPEM, target)
 	if err != nil {
@@ -332,7 +334,7 @@ func verifyAppAt(
 			"`billet github-app create`, which fills it in)", target, inst.ID, installationID, inst.ID)
 	}
 
-	if problems := inst.PermissionMismatches(target.Scope(), runEvidence); len(problems) > 0 {
+	if problems := inst.PermissionMismatches(target.Scope(), actions); len(problems) > 0 {
 		// THE OWNER'S KIND COMES FROM THE ANSWER. The installation names the
 		// account it is on, so the review page is the right one for a user's
 		// repository as well as an organization's.

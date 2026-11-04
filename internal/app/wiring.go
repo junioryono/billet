@@ -130,7 +130,24 @@ var (
 	_ server.RunEvidence     = NodeJIT{}
 	_ server.QueueTimes      = Provisioner{}
 	_ server.RESTHeadroom    = Provisioner{}
+	_ server.RunReruns       = Provisioner{}
 )
+
+// LatestAttempt reads the attempt a run is on, and its jobs once it is completed.
+func (p Provisioner) LatestAttempt(ctx context.Context, owner, repository string, runID int64,
+) (server.RunAttempt, error) {
+	return p.Client.LatestAttempt(ctx, owner, repository, runID)
+}
+
+// RerunFailedJobs asks GitHub to run a run's failed jobs again.
+func (p Provisioner) RerunFailedJobs(ctx context.Context, owner, repository string, runID int64) error {
+	return p.Client.RerunFailedJobs(ctx, owner, repository, runID)
+}
+
+// RerunJob asks GitHub to run one job again.
+func (p Provisioner) RerunJob(ctx context.Context, owner, repository string, jobID int64) error {
+	return p.Client.RerunJob(ctx, owner, repository, jobID)
+}
 
 // RESTHeadroom is the target's App installation's REST budget as GitHub last
 // stated it.

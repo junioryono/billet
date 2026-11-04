@@ -18,6 +18,7 @@ shared-node-queue-wait
 ci-capacity
 assignment-protocol
 guest-release-removal
+job-reruns
 cpu-placement
 ```
 

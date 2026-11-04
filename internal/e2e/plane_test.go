@@ -90,6 +90,17 @@ type plane struct {
 	// tier is the label this service's one scale set carries, so a second
 	// fake can stand in for a second target with a tier of its own.
 	tier string
+
+	// rest answers GitHub's REST record of workflow runs, for a test about one.
+	rest http.HandlerFunc
+}
+
+// setREST names what answers GitHub's REST record of workflow runs.
+func (p *plane) setREST(handler http.HandlerFunc) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.rest = handler
 }
 
 const (
@@ -128,6 +139,16 @@ func newPlaneFor(t *testing.T, tier string, setID int) *plane {
 // the shared fake, so everything here is protocol proper.
 func (p *plane) route(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+
+	p.mu.Lock()
+	rest := p.rest
+	p.mu.Unlock()
+
+	if rest != nil && (strings.Contains(path, "/actions/runs/") || strings.Contains(path, "/actions/jobs/")) {
+		rest(w, r)
+
+		return
+	}
 
 	switch {
 	case strings.Contains(path, "runnergroups"):
@@ -515,6 +536,9 @@ type stackConfig struct {
 	// before a second backend existed keeps measuring.
 	kind    config.ProviderKind
 	backend func(t *testing.T, deployment string) provider.Provider
+	// retryDisrupted, when set, gives the stack's tier retry.disrupted, and the
+	// loop a pace a test can wait out.
+	retryDisrupted int
 	// nodeDrainTimeout is the node's `drain_timeout`, which decides when a drain
 	// starts SAYING it is long and nothing else.
 	//
@@ -601,6 +625,10 @@ func withPlane(opts ...nodeplane.Option) stackOpt {
 }
 
 // withReapInterval replaces the harness's reaper tick.
+func withRetryDisrupted(n int) stackOpt {
+	return func(c *stackConfig) { c.retryDisrupted = n }
+}
+
 func withReapInterval(d time.Duration) stackOpt {
 	return func(c *stackConfig) { c.reapEvery = d }
 }
@@ -713,6 +741,9 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		tiers[0].Trust = config.WorkloadUntrusted
 		tiers[0].Workflows = nil
 	}
+	if sc.retryDisrupted > 0 {
+		tiers[0].Retry = &config.TierRetry{Disrupted: sc.retryDisrupted}
+	}
 
 	// THE TARGETS, ASSEMBLED THE WAY THE CLI ASSEMBLES THEM: a client per
 	// target, which internal/app turns into the server's targets and the node
@@ -781,6 +812,9 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 			// short so these scenarios exercise the overrun REPORT rather than
 			// sitting silent, which is all it decides now.
 			server.WithDrainTimeout(200 * time.Millisecond),
+			// A PACE THE RE-RUN TESTS CAN WAIT OUT. Only a tier with retry.disrupted
+			// starts the loop, so the rest of these scenarios never see it.
+			server.WithRerunPacing(100*time.Millisecond, time.Millisecond),
 		},
 	}
 	if sc.now != nil {

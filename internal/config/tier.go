@@ -196,6 +196,33 @@ type Tier struct {
 	// unmet reserved slot away from competing tiers. Reserve for tiers that need a hard
 	// guarantee under contention. Zero is the default.
 	Reserved int `yaml:"reserved,omitempty"`
+
+	// Retry says what billet does about a job of this tier it ended itself.
+	// Absent, nothing: a job that went red stays red until a person re-runs it.
+	Retry *TierRetry `yaml:"retry,omitempty"`
+}
+
+// MaxDisruptedReruns is the most re-runs retry.disrupted may ask for. Billet's
+// own bound, not GitHub's: a run its infrastructure keeps ending is a fleet
+// problem, and more attempts would hide it.
+const MaxDisruptedReruns = 5
+
+// TierRetry is the re-run policy of one tier.
+type TierRetry struct {
+	// Disrupted is how many times billet asks GitHub to re-run a workflow run
+	// whose job on this tier it proved its own infrastructure ended. Zero, the
+	// default, is never. ADR-023 holds what counts as that proof, and the App
+	// must hold `actions: write` for a tier that sets it.
+	Disrupted int `yaml:"disrupted"`
+}
+
+// DisruptedReruns is how many re-runs the tier allows, zero when it says nothing.
+func (t Tier) DisruptedReruns() int {
+	if t.Retry == nil {
+		return 0
+	}
+
+	return t.Retry.Disrupted
 }
 
 // WorkloadTrust is the launch authority shared by a tier's runner pool.
@@ -450,6 +477,19 @@ func (t Tier) ReservationErrors(where string) []error {
 	}
 
 	return errs
+}
+
+// RetryErrors reports everything wrong with a tier's re-run policy.
+//
+// EXPORTED BECAUSE alloc.New CANNOT ASSUME its catalogue came through Load, and
+// a negative count would read as no limit to anything comparing against it.
+func (t Tier) RetryErrors(where string) []error {
+	if n := t.DisruptedReruns(); n < 0 || n > MaxDisruptedReruns {
+		return []error{fmt.Errorf("%s: retry.disrupted %d is not between 0 and %d",
+			where, n, MaxDisruptedReruns)}
+	}
+
+	return nil
 }
 
 // InterceptionErrors reports tiers that could reach a backend without the local
@@ -806,6 +846,7 @@ func (c *Config) validateTiers() []error {
 		errs = append(errs, t.ProviderErrors(where)...)
 		errs = append(errs, t.InterceptionErrors(where)...)
 		errs = append(errs, t.ReservationErrors(where)...)
+		errs = append(errs, t.RetryErrors(where)...)
 		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
 		}

@@ -198,3 +198,5 @@ f9290014add1 The provisioning script became the AMI build (ADR-022); the related
 f8453d8ae0f0 #689 moves the helper's local cache into the go command's own GOCACHE and layout; the sentence now says so, with why.
 14fc6250db7e #694 records a blob leg that fails locally as `unavailable`; the sentence now says which blob legs observe and why.
 188c30ea22f0 #694 lets the Actions half's `unavailable` replace an earlier value in the ledger and the node's record; the sentence now says so, with why.
+40d9aac87d10 ADR-023 (#541): `actions: write` is in billet's set where a tier sets retry.disrupted, so the rule now says what widening it is never the answer to.
+d340aa161466 ADR-023 (#541): a tier can now ask for a re-run, on GitHub's proof of a lost runner; the invariant says so, and the default stays never.

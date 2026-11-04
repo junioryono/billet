@@ -27,6 +27,7 @@ adr-019-guest-image-corresponding-source
 adr-020-npm-registry-interception
 adr-021-tart-images-verified-not-published
 adr-022-every-linux-image-from-githubs-template
+adr-023-rerunning-disrupted-jobs
 ```
 
 | Record | Decides |

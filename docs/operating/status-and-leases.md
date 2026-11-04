@@ -74,7 +74,30 @@ Quarantine resolves itself in the ordinary case: the host destroys the compute a
 
 ## What `leases failures` is and is not
 
-It shows two facts side by side and no verdict between them: GitHub's own result for the job, and what billet's infrastructure was doing at the time (the host stopped answering, the guest went missing from an inventory, the machine was reclaimed by a spot interruption, the job was destroyed under a custody bound). billet cannot tell a broken host from a broken build, and it **does not re-run anything**, because a re-run is a side effect on your repository and a deploy must not happen twice because a machine went away. Every runner in this ecosystem fails-and-stops on a lost runner; what billet owes the person whose build went red is the one thing only billet knows. A restart of billet itself is deliberately not recorded as a disruption, because adopted jobs routinely finish green.
+It shows two facts side by side and no verdict between them: GitHub's own result for the job, and what billet's infrastructure was doing at the time (the host stopped answering, the guest went missing from an inventory, the machine was reclaimed by a spot interruption, the job was destroyed under a custody bound). billet cannot tell a broken host from a broken build from this alone, and it **re-runs nothing here by default**, because a re-run is a side effect on your repository and a deploy must not happen twice because a machine went away. Every runner in this ecosystem fails-and-stops on a lost runner; what billet owes the person whose build went red is the one thing only billet knows. A restart of billet itself is deliberately not recorded as a disruption, because adopted jobs routinely finish green.
+
+## Re-running a job billet ended
+
+A tier can ask for more: `retry: {disrupted: 1}` lets billet ask GitHub to re-run a job it ended, up to that many times for one workflow run. The App needs `actions: write`, which `billet github-app create --actions-write` asks for; on an App that already exists, add the permission on the App's settings page and accept it on the installation, and `billet check` says when it holds what the tiers need. [ADR-023](../reference/decisions/adr-023-rerunning-disrupted-jobs.md) holds the decision.
+
+A job is re-run only when both are true:
+
+- The ledger recorded a disruption from the closed list while the job could still have been running: `held-past-limit`, `reclaimed` or `guest-absent`. Not `node-forgotten`, because a host cut off by a partition goes on running the job. Not an operator's `billet force-destroy`, because a person chose that.
+- GitHub's own record of the job shows its runner was lost: the job concluded `failure`, a step never finished, and no step concluded `failure`. A job that failed on its own never leaves that record, and neither does a runner stopped gracefully, which GitHub records exactly as a job's own failure, so such a job stays red.
+
+The `RE-RUN` column of `billet leases failures`, and the `failure` line of `billet jobs show`, say what was decided:
+
+| Decision | What it means |
+|---|---|
+| `requested` | GitHub accepted a request that covers this job |
+| `unproven` | GitHub's record does not show a lost runner, so the job may have failed on its own |
+| `mixed` | several jobs were proved beside a job that failed on its own, and neither of GitHub's two requests can run them without it |
+| `limit` | the run already had every re-run its tiers allow |
+| `superseded` | the run moved past this job's attempt without billet, usually a person re-running it |
+| `expired` | nothing could be decided within a day of the job's result |
+| `failed` | GitHub did not accept the request in five tries; the log says why |
+
+A dash is nothing decided: a tier that did not ask, or a run that has not finished. A run is decided only once every job of it has finished, because GitHub refuses a re-run of one still going, and a failed request is retried with a backoff and never holds up scheduling. `billet_job_reruns{tier,decision}` counts the last day's decisions.
 
 ## `billet check`
 

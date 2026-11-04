@@ -22,6 +22,21 @@ func GitHubTargetOf(t config.GitHubTarget) github.Target {
 	return github.OrganizationTarget(t.Org)
 }
 
+// ActionsAccessOf is how much of the `actions` permission a target's App must
+// hold under this config, the one answer `billet check` and a startup failure's
+// diagnosis both ask. Re-running a job needs write, which includes the read a
+// cache publication needs.
+func ActionsAccessOf(cfg *config.Config, name string) github.ActionsAccess {
+	switch {
+	case cfg.TargetNeedsActionsWrite(name):
+		return github.ActionsWrite
+	case cfg.TargetNeedsRunEvidence(name):
+		return github.ActionsRead
+	default:
+		return github.ActionsNone
+	}
+}
+
 // describeGitHubTarget names a target the way an operator reads it: its scope and
 // its GitHub path.
 func DescribeGitHubTarget(t config.GitHubTarget) string {

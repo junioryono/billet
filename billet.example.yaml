@@ -1065,6 +1065,20 @@ tiers:
   # before it advertises, so a ladder of three is three slots held before any job
   # arrives, and `billet check` prints how much of the machine that is.
 
+  # RE-RUNNING WHAT BILLET ENDED. GitHub does not requeue a job whose runner
+  # vanished, so by default a job billet's infrastructure ended stays red until a
+  # person re-runs it. A tier can ask billet to do it:
+  #
+  #   retry:
+  #     disrupted: 1   # re-runs per workflow run, 0 to 5; absent or 0 is never
+  #
+  # ONLY ON PROOF. The ledger must have recorded a disruption from a closed list
+  # and GitHub's own record must show a lost runner, so a job that failed on its
+  # own is never re-run. It re-runs what a deploy would have to do twice, so ask
+  # only for a tier whose jobs can bear that. The App needs `actions: write`
+  # (`billet github-app create --actions-write`), and `billet check` refuses an App
+  # holding it where no tier asks. ADR-023.
+  #
   # RESERVING A FLOOR. Every tier shares one budget, and headroom is whatever is
   # left — so a tier with steady demand can hold all of it. The others then
   # advertise zero capacity, their jobs queue at GitHub indefinitely, and nothing

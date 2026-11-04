@@ -311,6 +311,11 @@ type jobJSON struct {
 	FailureReason string `json:"failure_reason"`
 	Disruption    string `json:"disruption"`
 	DisruptedAt   string `json:"disrupted_at"`
+	// RerunDecision is what became of the job's chance of a re-run, with when and
+	// against which attempt; empty and zero until one is decided.
+	RerunDecision  string `json:"rerun_decision"`
+	RerunDecidedAt string `json:"rerun_decided_at"`
+	RerunAttempt   int64  `json:"rerun_attempt"`
 	// Cache is what each cache did for the job, as the node observed it; an
 	// empty token was not observed.
 	Cache cacheJSON `json:"cache"`
@@ -376,6 +381,7 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 		RunnerID: rec.RunnerID, LaunchIncarnation: rec.LaunchIncarnation,
 		HolderIncarnation: rec.HolderIncarnation, FailureReason: rec.FailureReason,
 		Disruption: rec.Disruption, DisruptedAt: rec.DisruptedAt,
+		RerunDecision: string(rec.RerunDecision), RerunDecidedAt: rec.RerunDecidedAt, RerunAttempt: rec.RerunAttempt,
 		Cache: cacheJSON{
 			Image: string(rec.Caches.ImageCache), ImageGeneration: rec.Caches.CacheGeneration,
 			Actions: string(rec.Caches.ActionsCache), Sticky: string(rec.Caches.Sticky),

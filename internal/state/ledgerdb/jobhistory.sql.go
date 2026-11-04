@@ -172,7 +172,7 @@ func (q *Queries) BackfillFailureReason(ctx context.Context, arg BackfillFailure
 
 const listAttributedFailures = `-- name: ListAttributedFailures :many
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
-       result, failure_reason, disruption, disrupted_at, result_at
+       result, failure_reason, disruption, disrupted_at, result_at, rerun_decision, rerun_attempt
   FROM job_history
  WHERE disruption != '' AND result != '' AND result != $1
    AND result_at >= $2
@@ -196,6 +196,8 @@ type ListAttributedFailuresRow struct {
 	Disruption    string
 	DisruptedAt   string
 	ResultAt      string
+	RerunDecision string
+	RerunAttempt  int64
 }
 
 // Jobs that did not succeed while billet's own infrastructure was disrupted.
@@ -233,6 +235,8 @@ func (q *Queries) ListAttributedFailures(ctx context.Context, arg ListAttributed
 			&i.Disruption,
 			&i.DisruptedAt,
 			&i.ResultAt,
+			&i.RerunDecision,
+			&i.RerunAttempt,
 		); err != nil {
 			return nil, err
 		}
@@ -646,7 +650,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
-       holder_incarnation
+       holder_incarnation, rerun_decision, rerun_decided_at, rerun_attempt
   FROM job_history WHERE lease_id = $1
 `
 
@@ -697,6 +701,9 @@ type ReadJobRow struct {
 	QuarantinedAt            string
 	LaunchIncarnation        string
 	HolderIncarnation        string
+	RerunDecision            string
+	RerunDecidedAt           string
+	RerunAttempt             int64
 }
 
 // One job's whole history row, for `billet jobs show`.
@@ -754,6 +761,9 @@ func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, erro
 		&i.QuarantinedAt,
 		&i.LaunchIncarnation,
 		&i.HolderIncarnation,
+		&i.RerunDecision,
+		&i.RerunDecidedAt,
+		&i.RerunAttempt,
 	)
 	return i, err
 }
