@@ -420,6 +420,57 @@ func TestWhatASuiteShedsWhileReadIsCounted(t *testing.T) {
 	}
 }
 
+// A LAST BATCH LEFT WITH ONLY A COUNT IS RESENT AS ONE WITH CASES IS: fitting it can shed every case
+// and keep the count, and the job's suites must not be lost for a field the node refused.
+func TestARefusedFinalBatchWithOnlyACountIsResent(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusBadRequest, http.StatusRequestEntityTooLarge} {
+		node := newFakeNode(t)
+		node.schemas = "[1,2]"
+		node.postScript = []reply{{status: status}, {status: http.StatusNoContent}}
+
+		n, err := newNode("http://172.31.0.1:7718", testToken, node)
+		if err != nil {
+			t.Fatalf("newNode: %v", err)
+		}
+
+		batch := guestreport.Batch{Seq: 7, AgentVersion: "v0.15.0", TicksPerSecond: 100,
+			Tests:        []guestreport.SuiteResult{{Name: "s", Tests: 3}},
+			CasesDropped: guestreport.DroppedCases{Suites: 1, Cases: 3}}
+
+		body, err := fit(&batch, 1<<16, time.Time{})
+		if err != nil {
+			t.Fatalf("fit: %v", err)
+		}
+
+		log, _ := discardLog()
+		a := &agent{node: n, log: log, lim: &limits{maxBody: 1 << 16, cases: true}}
+
+		a.sendFinal(t.Context(), outgoing{seq: batch.Seq, body: body, batch: batch})
+
+		_, posts := node.snapshot()
+		if len(posts) != 2 {
+			t.Fatalf("answered %d: the node was sent %d batches, want a refused and a resent", status, len(posts))
+		}
+
+		refused, resent := posts[0], posts[1]
+		if refused.batch.CasesDropped == (guestreport.DroppedCases{}) {
+			t.Errorf("answered %d: the first batch carried no count, so this proves nothing", status)
+		}
+		if !resent.final || resent.batch.Seq != refused.batch.Seq {
+			t.Errorf("answered %d: resent %t #%d, want the final batch under #%d", status, resent.final,
+				resent.batch.Seq, refused.batch.Seq)
+		}
+		if resent.batch.CasesDropped != (guestreport.DroppedCases{}) || len(resent.batch.Cases) != 0 {
+			t.Errorf("answered %d: the resent batch still names schema 2: %+v", status, resent.batch.CasesDropped)
+		}
+		if len(resent.batch.Tests) != 1 || resent.batch.Tests[0].Tests != 3 {
+			t.Errorf("answered %d: the resent batch's suites are %+v", status, resent.batch.Tests)
+		}
+	}
+}
+
 // A BATCH LEFT WITH ONLY A COUNT STILL NAMES SCHEMA 2, which a node rolled back since the
 // hello refuses, so it is resent as well; one naming neither would be refused the same.
 func TestABatchNamingEitherFieldOfSchemaTwoIsResendable(t *testing.T) {

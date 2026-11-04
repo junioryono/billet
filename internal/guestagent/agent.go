@@ -472,6 +472,11 @@ func (a *agent) final(ctx context.Context) {
 		return
 	}
 
+	a.sendFinal(fctx, b)
+}
+
+// sendFinal sends the last batch, and once more without its cases if the node refuses it.
+func (a *agent) sendFinal(fctx context.Context, b outgoing) {
 	v, _ := a.node.report(fctx, b.body, true)
 
 	// A NODE THAT REFUSES THE BATCH MAY REFUSE ONLY ITS CASES: its budget for this job
