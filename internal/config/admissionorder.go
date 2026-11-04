@@ -30,14 +30,15 @@ const (
 	// busy and accepts that its largest shape may wait indefinitely.
 	AdmissionFill AdmissionOrder = "fill"
 
-	// AdmissionHold starts anything that fits, and holds one host for a shape that
-	// fits on none, chosen by when its running work is predicted to end.
+	// AdmissionHold holds one host for a shape that fits on none, chosen by when its
+	// running work is predicted to end, and starts anything else that fits elsewhere.
 	//
 	// Where fair holds freed room on every host a wide waiter could use, this holds
 	// one, so every other host stays open to every tier; where fill lets a wide
 	// shape wait without bound, the held host empties. A wrong prediction picks a
-	// worse host and never a wrong outcome. Chosen rather than the default, because
-	// a deployment with one host holds all of it.
+	// worse host, and a job that runs far past its kind puts the waiter back in the
+	// line as under fair, so neither is a wrong outcome. Chosen rather than the
+	// default, because a deployment with one host holds all of it.
 	AdmissionHold AdmissionOrder = "hold"
 )
 

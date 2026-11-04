@@ -19,8 +19,8 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `identity.backend` | no | `file` (default) or `aws-ssm` |
 | `identity.aws_ssm` | for `aws-ssm` | `region`, `prefix` (isolates one deployment in an account), `kms_key_id` |
 | `max_vcpu`, `max_memory` | yes, positive | the deployment ceiling across every tier |
-| `placement` | no | `pack` (default) or `spread` |
-| `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
+| `placement` | no | `pack` (default), `spread` or `tightest` (the host left with the least free room, whatever the tier) |
+| `admission_order` | no | `fair` (default), `fill` or `hold`; which waiting tier takes the room a finished job leaves. [Admission orders on replay](records/replay-policies.md) measures all three |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
 | `job_detail_retention` | no | how long the ledger keeps a finished job's per-sample series, destinations and guest report (default `72h`, at least `1h`); past it they are deleted and `billet jobs show` says the job's detail was retired. The usage summary is kept |
 | `metrics.listen` | with `metrics` | the control plane's Prometheus endpoint (`/metrics`); absent block, no endpoint. A literal loopback address (`127.0.0.1` or `[::1]`, not `localhost`) unless `metrics.allow_remote`; may not share a socket with any other listener in the file, however it is spelled. See [Metrics](../operating/metrics.md) |

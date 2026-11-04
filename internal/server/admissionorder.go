@@ -239,14 +239,19 @@ func (q *admissionQueue) holds() bool {
 }
 
 // blocks requires q.mu. It reports whether a waiter holds a buyer at where back. Under
-// hold, see HOLD HOLDS ONE HOST above. A shape that could not be read is at least as wide
-// as anything, because an unknown is not a licence to bypass the order.
+// hold, see HOLD HOLDS ONE HOST above.
 func (q *admissionQueue) blocks(where alloc.TierAdmission, waiter waitingTier) bool {
 	if !competes(where, waiter.where) {
 		return false
 	}
 
 	if q.policy != config.AdmissionHold {
+		return true
+	}
+
+	// AN ADMISSION THAT COULD NOT BE READ HOLDS THE LINE, on either side and before
+	// anything else, because it does not say what the rest of this rests on.
+	if where.VCPU == 0 || waiter.where.VCPU == 0 {
 		return true
 	}
 
@@ -266,7 +271,7 @@ func (q *admissionQueue) blocks(where alloc.TierAdmission, waiter waitingTier) b
 		return false
 	}
 
-	if !waiter.behindAsLarge || where.VCPU == 0 || waiter.where.VCPU == 0 {
+	if !waiter.behindAsLarge {
 		return true
 	}
 
@@ -716,11 +721,11 @@ func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, t
 // below its floor, and the holds, so that whether it may buy, whom it leaves room for and
 // what it avoids are read from one plan.
 func (q *admissionQueue) refreshBuyer(tier string, where alloc.TierAdmission) {
-	if q.policy != config.AdmissionHold || (where.Target == "" && len(where.Nodes) == 0) {
+	if q.policy != config.AdmissionHold {
 		return
 	}
 
-	if waiter, ok := q.waiting[tier]; ok {
+	if waiter, ok := q.waiting[tier]; ok && where.VCPU != 0 {
 		waiter.where = where
 		waiter.where.Nodes = slices.Clone(where.Nodes)
 		q.waiting[tier] = waiter

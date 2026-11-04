@@ -51,7 +51,7 @@ func holdQueue(waiters ...wantsHosts) *admissionQueue {
 	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
 
 	for _, w := range waiters {
-		q.waiting[w.label] = waitingTier{since: at, where: on("a", "b", "c"), progress: at, candidates: candidatesOn(w.hosts...)}
+		q.waiting[w.label] = waitingTier{since: at, where: sized(2, "a", "b", "c"), progress: at, candidates: candidatesOn(w.hosts...)}
 		at = at.Add(time.Second)
 	}
 
@@ -179,16 +179,16 @@ func TestAHeldHostIsAvoidedByEveryoneButItsOwner(t *testing.T) {
 		t.Errorf("a buyer with no wait avoids %v; want the held host", got)
 	}
 
-	if !q.mayBuy("waiter", on("a", "b", "c")) {
+	if !q.mayBuy("waiter", sized(2, "a", "b", "c")) {
 		t.Error("a waiter sharing a host with an older one that has a host was held back")
 	}
 
 	// Under fair the same waiters hold each other, and nothing is held.
 	fair := newAdmissionQueue(config.AdmissionFair)
-	waitingInOrder(fair, waiterAt{"older", on("a")}, waiterAt{"younger", on("a")})
+	waitingInOrder(fair, waiterAt{"older", sized(2, "a")}, waiterAt{"younger", sized(2, "a")})
 	fair.mayHold("older", candidatesOn("a"))
 
-	if fair.mayBuy("younger", on("a")) {
+	if fair.mayBuy("younger", sized(2, "a")) {
 		t.Error("under fair the younger waiter passed the older")
 	}
 
@@ -199,7 +199,7 @@ func TestAHeldHostIsAvoidedByEveryoneButItsOwner(t *testing.T) {
 
 // sized is an admission of a shape on these hosts.
 func sized(vcpu int, hosts ...string) alloc.TierAdmission {
-	where := on(hosts...)
+	where := alloc.TierAdmission{CanGrow: true, Nodes: hosts}
 	where.VCPU, where.Memory = vcpu, config.ByteSize(vcpu)*config.GiB
 
 	return where
@@ -211,26 +211,40 @@ func sized(vcpu int, hosts ...string) alloc.TierAdmission {
 func TestAWaiterWithAHostOrACandidateHoldsNobodyBack(t *testing.T) {
 	t.Parallel()
 
+	// AN ADMISSION THAT COULD NOT BE READ HOLDS THE LINE ON EITHER SIDE, with a host or not:
+	// it does not say the target whose pot a buyer would take from, nor the shape.
 	q := newAdmissionQueue(config.AdmissionHold)
 	waitingInOrder(q, waiterAt{"waiter", on("host")})
+	q.mayHold("waiter", candidatesOn("host"))
 
-	if q.mayBuy("buyer", on("host")) {
+	if q.mayBuy("buyer", sized(2, "host")) {
 		t.Error("a buyer passed a waiter whose admission could not be read")
 	}
 
-	if got := q.ahead("buyer", on("host")); !slices.Equal(got, []string{"waiter"}) {
+	q = newAdmissionQueue(config.AdmissionHold)
+	waitingInOrder(q, waiterAt{"waiter", sized(2, "host")})
+
+	if q.mayBuy("buyer", sized(2, "host")) {
+		t.Error("a buyer passed a waiter with no candidates")
+	}
+
+	if got := q.ahead("buyer", sized(2, "host")); !slices.Equal(got, []string{"waiter"}) {
 		t.Errorf("ahead of the buyer: %v", got)
 	}
 
 	q.mayHold("waiter", candidatesOn("host"))
 
-	if !q.mayBuy("buyer", on("host")) {
+	if q.mayBuy("unread", on("host")) {
+		t.Error("a buyer whose admission could not be read passed a waiter with a host")
+	}
+
+	if !q.mayBuy("buyer", sized(2, "host")) {
 		t.Error("a waiter with a host still held the line")
 	}
 
 	q = holdQueue(wantsHosts{"owner", []string{"a"}}, wantsHosts{"next", []string{"a"}})
 
-	if !q.mayBuy("buyer", on("a", "b", "c")) {
+	if !q.mayBuy("buyer", sized(2, "a", "b", "c")) {
 		t.Error("a waiter with a candidate and no host held the line")
 	}
 
@@ -1383,7 +1397,7 @@ func TestAHoldChangesNoAdvertisement(t *testing.T) {
 	_, held := wiredListeners(t, catalogue(), 120)
 
 	q := newAdmissionQueue(config.AdmissionHold)
-	q.waits("t-64vcpu", on("host"))
+	q.waits("t-64vcpu", sized(2, "host"))
 	q.mayHold("t-64vcpu", candidatesOn("host"))
 
 	for _, l := range held {

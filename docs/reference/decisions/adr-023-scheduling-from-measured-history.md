@@ -35,8 +35,20 @@ Predicting a job's runtime from the history of the same job is well studied in b
 
 **A weight under `fill` is refused,** because `fill` ranks no waiters and an operator who wrote one would believe a division the control plane never makes. Under GHES's offers no tier is recorded waiting (#686), so there it does nothing until that is fixed.
 
+## Holding one host for a wide shape (#527)
+
+**A shape that fits nowhere is given one host, the one its running work is predicted to free soonest, and nothing behind it places there.** `fair` gives a wide shape its turn by holding freed room on every host it shares, which every other shape pays for; `fill` starves it. Holding one host and letting everything else run on the rest is backfilling with a reservation: EASY (D. Lifka, "The ANL/IBM SP Scheduling System", JSSPP 1995) reserves for the first job in the queue and lets others run if they do not delay it; Mu'alem and Feitelson (IEEE TPDS 12(6), 2001) compare that with a reservation for every job. Slurm and Maui offer both. billet's jobs have no user estimates to be wrong about, because the runtimes are learned, and its reservation is a whole host and not a time window, because a runner cannot be preempted and a lease's end cannot be promised.
+
+**The prediction chooses the host and nothing else.** A wrong one picks a worse host. Nothing in the purchase transaction reads one, and a hold releases, destroys and promises nothing: it only narrows which hosts a purchase may use, which the transaction still decides.
+
+**A hold stays on its host, and a waiter holds back only what could keep it waiting.** Both came from replay, and each simpler rule measured worse. Letting every waiter out of the line starved a shape as large as what the hosts run; keeping every waiter with no host in the line cost the small shapes more than `fair` did; moving a hold when its host receded threw away the room it had accumulated and cost the widest shape its turn. So a waiter with a host holds nobody back, a waiter behind a lease as large on every host it could use holds back only a buyer as wide, and any other waiter with no candidate holds the line as under `fair`. What a stay can cost is one job's overrun, so past six times its kind's median the owner also holds the line as under `fair`. `billet-capacity/references/admission.md` has the rule in full and [Admission orders on replay](../records/replay-policies.md) the measurements.
+
+**`tightest` is a best fit across tiers** (the old rule of the same name for memory allocation), offered as a placement and not the default, because on replay it did not reliably beat `pack`. Placing a job beside others predicted to end at the same time, so a host empties all at once, was built behind the replay and measured no gain, so it did not ship.
+
+**`hold` is opt-in whatever replay shows,** because a deployment with one host holds all of it, and because it gives the widest shape a longer wait than `fair` for the sake of everything else, which is the operator's to choose.
+
 ## Consequences
 
 - No migration: everything is read from columns the ledger already keeps. A row from before migration 56 has no repository, workflow or name, and is learned and predicted under its tier alone.
-- The first reader is #527's choice of the host to hold. Until then the controller builds no snapshot, because nothing asks.
+- The one reader is `admission_order: hold`'s choice of a host. Under any other order the controller builds no snapshot, because nothing asks.
 - A tier whose jobs vary widely (a monorepo's matrix behind one label) predicts poorly at the tier level, so the job and name levels are where a prediction is useful. On the reference deployment's fortnight to 2026-10-25, 99.4% of 30,253 jobs were predicted from the job's own runs and 78% ran within 2x of the prediction, the busy 8 and 16 vCPU tiers 84% to 96% (`docs/reference/records/runtime-predictions.md`).
