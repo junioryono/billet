@@ -118,6 +118,10 @@ type NodeWire struct {
 	// hand. Refusing the registration would break the rollback the coordinator
 	// infers from exactly that re-registration.
 	HighestRelease string
+	// Decommissioned is when an operator recorded this host as gone, or empty;
+	// read in the same statement as the wire, so a host that registered again in
+	// between is never judged by a stale mark.
+	Decommissioned string
 }
 
 // NodeWireVersions reports which wire version every known host is on.
@@ -144,6 +148,7 @@ func (a *Allocator) NodeWireVersions(ctx context.Context) ([]NodeWire, error) {
 				Digest:         row.NodeDigest,
 				Epoch:          row.Epoch,
 				HighestRelease: row.HighestRelease,
+				Decommissioned: row.DecommissionedAt,
 			})
 		}
 

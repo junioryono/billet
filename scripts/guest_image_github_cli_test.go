@@ -107,15 +107,11 @@ func planInstalls(t *testing.T, installer string) {
 		t.Fatalf("GitHub's plan has no %s step, so the guest image does not install what it does", installer)
 	}
 
-	differences, err := os.ReadFile(filepath.Join(runnerImagesDir, "differences.tsv"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for line := range strings.Lines(string(differences)) {
-		if fields := strings.Split(strings.TrimSuffix(line, "\n"), "\t"); len(fields) == 3 &&
-			fields[0] == "skip" && fields[1] == installer {
-			t.Errorf("differences.tsv skips %s, so the guest image lacks what it installs", installer)
+	// EVERY TARGET CARRIES WHAT IT INSTALLS: a skip for any of them would leave
+	// that image without the GitHub CLI.
+	for _, sc := range runnerImagesScopes {
+		if _, skipped := scopedDifferences(t, sc.name); skipped[installer] != "" {
+			t.Errorf("differences.tsv skips %s for %s, so that image lacks what it installs", installer, sc.name)
 		}
 	}
 }

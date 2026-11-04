@@ -46,13 +46,16 @@ const MaxImageBytes = 1 << 40
 // snapshots OF one head image, so a pull that imported to a fresh image would
 // publish a generation of something else, which no tier could name and no clone
 // could descend from.
+//
+// machine is what the image was built for, as its manifest spells it, and is
+// recorded on the generation (ArchKey).
 func (c *Client) ImportGeneration(
 	ctx context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract string,
 	now time.Time,
 ) (string, error) {
-	return c.ImportCompletedGeneration(ctx, image, rawPath, runnerVersion, kernel, guestContract,
-		nil, now)
+	return c.ImportCompletedGeneration(ctx, image, rawPath, machine, runnerVersion, kernel,
+		guestContract, nil, now)
 }
 
 // ImportCompletedGeneration is ImportGeneration for an image that left components
@@ -61,11 +64,11 @@ func (c *Client) ImportGeneration(
 // that left nothing out, and records nothing.
 func (c *Client) ImportCompletedGeneration(
 	ctx context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract string,
 	components *GenerationComponents,
 	now time.Time,
 ) (string, error) {
-	return c.importSnapshot(ctx, GenerationPrefix, image, rawPath, runnerVersion, kernel,
+	return c.importSnapshot(ctx, GenerationPrefix, image, rawPath, machine, runnerVersion, kernel,
 		guestContract, components, "", now)
 }
 
@@ -75,14 +78,14 @@ func (c *Client) ImportCompletedGeneration(
 // kernel and contract a launch reads and owner, the node that may remove it.
 func (c *Client) ImportCompletionRoot(
 	ctx context.Context,
-	image, rawPath, runnerVersion, kernel, guestContract, owner string,
+	image, rawPath, machine, runnerVersion, kernel, guestContract, owner string,
 	now time.Time,
 ) (string, error) {
 	if strings.TrimSpace(owner) == "" {
 		return "", fmt.Errorf("ceph: a completion root needs an owner, or no pull could remove it")
 	}
 
-	return c.importSnapshot(ctx, CompletionRootPrefix, image, rawPath, runnerVersion, kernel,
+	return c.importSnapshot(ctx, CompletionRootPrefix, image, rawPath, machine, runnerVersion, kernel,
 		guestContract, nil, owner, now)
 }
 
@@ -113,8 +116,25 @@ func (c *Client) reserveCompletionRoot(ctx context.Context, image, name string) 
 	for snap := range owners {
 		if !slices.Contains(names, snap) {
 			c.removeGenerationMetadata(ctx, image, snap,
-				KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
+				ArchKey, KernelKey, RunnerVersionKey, GuestContractKey, CompletionRootOwnerKey)
 		}
+	}
+
+	return nil
+}
+
+// reserveGeneration refuses a generation name a snapshot already holds. Called
+// under the publish lock, so no snapshot of that name appears between the check
+// and the create.
+func (c *Client) reserveGeneration(ctx context.Context, image, name string) error {
+	names, err := c.snapshotNames(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	if slices.Contains(names, name) {
+		return fmt.Errorf("ceph: %s@%s is already taken; a generation is named for the second it "+
+			"is made, so try again", image, name)
 	}
 
 	return nil
@@ -124,11 +144,16 @@ func (c *Client) reserveCompletionRoot(ctx context.Context, image, name string) 
 // with its metadata, inside the publish lock.
 func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap reports through the return value; a local set inside a defer is read after the return value has already been computed, which is the dead-code bug this shape replaced
 	ctx context.Context,
-	prefix, image, rawPath, runnerVersion, kernel, guestContract string,
+	prefix, image, rawPath, machine, runnerVersion, kernel, guestContract string,
 	components *GenerationComponents,
 	owner string,
 	now time.Time,
 ) (generation string, err error) {
+	if strings.TrimSpace(machine) == "" {
+		return "", fmt.Errorf("ceph: an import into %s needs the machine its image was built for, "+
+			"or the generation could not be held to the hosts that may boot it", image)
+	}
+
 	if components != nil {
 		if err := components.validate(); err != nil {
 			return "", err
@@ -197,14 +222,22 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 	}()
 
 	// THE NAME IS RESERVED BEFORE THE HEAD IS TOUCHED, under the publish lock this
-	// holds: names are to the second, and a second root of the same name would
-	// overwrite the first's owner before its own create failed, and then take it
-	// away. Refused here, it costs no transfer and leaves the head as it was.
+	// holds: names are to the second, and a second snapshot of the same name would
+	// overwrite the first's owner or architecture before its own create failed, and
+	// then take it away. Refused here, it costs no transfer and leaves the head as
+	// it was.
 	generation = prefix + now.UTC().Format(GenerationLayout)
 	if owner != "" {
 		if err := c.reserveCompletionRoot(ctx, image, generation); err != nil {
 			return "", err
 		}
+	} else if err := c.reserveGeneration(ctx, image, generation); err != nil {
+		return "", err
+	}
+
+	// ONE ARCHITECTURE AN IMAGE, judged under the lock, before the head is touched.
+	if err := c.checkImportArch(ctx, image, machine, true); err != nil {
+		return "", err
 	}
 
 	if err := c.ensureHead(ctx, image, wantMB); err != nil {
@@ -282,47 +315,62 @@ func (c *Client) importSnapshot( //nolint:nonamedreturns // the deferred unmap r
 
 	unmapped = true
 
-	// A COMPLETION ROOT'S OWNER IS RECORDED BEFORE THE SNAPSHOT EXISTS. A root is
-	// reclaimed only by the node that owns it, so one made without an owner, by a
-	// crash between the two, would hold its data forever; an owner recorded for a
-	// snapshot never made is a few bytes of metadata, which nothing reclaims and
-	// nothing needs to.
+	// WHAT A SNAPSHOT MUST NEVER EXIST WITHOUT IS RECORDED BEFORE IT EXISTS, under
+	// the name reserved above. A completion root is reclaimed only by the node that
+	// owns it, so one made without an owner, by a crash between the two, would hold
+	// its data forever; and a generation without its architecture resolves on a
+	// host of either, so one made without it by a crash would boot on the wrong
+	// machine until a pull learned it. Either recorded for a snapshot never made is
+	// a few bytes of metadata describing nothing.
+	var recorded []string
+
 	if owner != "" {
 		if err := c.setGenerationMeta(ctx, CompletionRootOwnerKey, image, generation, owner); err != nil {
 			return "", fmt.Errorf("ceph: %s@%s was not made, because its owner could not be "+
 				"recorded: %w", image, generation, err)
 		}
+
+		recorded = append(recorded, CompletionRootOwnerKey)
 	}
+
+	if err := c.SetArch(ctx, image, generation, machine); err != nil {
+		// THE WRITE MAY HAVE COMMITTED before its client saw the error, and nothing
+		// was made for it to describe.
+		c.removeGenerationMetadata(context.WithoutCancel(ctx), image, generation,
+			append(recorded, ArchKey)...)
+
+		return "", fmt.Errorf("ceph: %s@%s was not made, because its architecture could not be "+
+			"recorded: %w", image, generation, err)
+	}
+
+	recorded = append(recorded, ArchKey)
 
 	if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "create",
 		image+"@"+generation); err != nil {
-		if owner != "" {
-			// A FAILED CREATE MAY STILL HAVE MADE THE SNAPSHOT, since rbd can commit
-			// before its client sees the error. Its owner goes only once the
-			// snapshot is proved absent, and stays when that cannot be told.
-			cleanupCtx := context.WithoutCancel(ctx)
-			names, listErr := c.snapshotNames(cleanupCtx, image)
-			switch {
-			case listErr != nil:
-				return "", fmt.Errorf("ceph: could not publish %s@%s (%w), and whether it was "+
-					"made could not be read, so its owner is kept: %w", image, generation, err, listErr)
-			case slices.Contains(names, generation):
-				if rmErr := c.withdrawGeneration(ctx, image, generation,
-					[]string{CompletionRootOwnerKey}); rmErr != nil {
-					return "", fmt.Errorf("ceph: %s@%s was made though its create failed (%w), and "+
-						"it could not be withdrawn (%w)", image, generation, err, rmErr)
-				}
-			default:
-				c.removeGenerationMetadata(cleanupCtx, image, generation, CompletionRootOwnerKey)
+		// A FAILED CREATE MAY STILL HAVE MADE THE SNAPSHOT, since rbd can commit
+		// before its client sees the error. What was recorded for it goes only once
+		// the snapshot is proved absent, and stays when that cannot be told; one
+		// that was made is withdrawn, since nothing else describing it was written.
+		cleanupCtx := context.WithoutCancel(ctx)
+		names, listErr := c.snapshotNames(cleanupCtx, image)
+		switch {
+		case listErr != nil:
+			return "", fmt.Errorf("ceph: could not publish %s@%s (%w), and whether it was "+
+				"made could not be read, so what was recorded for it is kept: %w", image, generation,
+				err, listErr)
+		case slices.Contains(names, generation):
+			if rmErr := c.withdrawGeneration(ctx, image, generation, recorded); rmErr != nil {
+				return "", fmt.Errorf("ceph: %s@%s was made though its create failed (%w), and "+
+					"it could not be withdrawn (%w)", image, generation, err, rmErr)
 			}
+		default:
+			c.removeGenerationMetadata(cleanupCtx, image, generation, recorded...)
 		}
 
 		return "", fmt.Errorf("ceph: could not publish %s@%s: %w", image, generation, err)
 	}
-	attemptedMetadata := make([]string, 0, 5)
-	if owner != "" {
-		attemptedMetadata = append(attemptedMetadata, CompletionRootOwnerKey)
-	}
+
+	attemptedMetadata := append(make([]string, 0, 6), recorded...)
 
 	// RECORDED PER GENERATION, because a tier boots a generation rather than the
 	// head. A single head-level key describes the LAST import, which is not what

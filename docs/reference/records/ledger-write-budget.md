@@ -2,7 +2,7 @@
 
 What a lease renewal, a purchase and a placement cost against the ledger's single writer slot. Measured twice:
 - **2026-10-08,** on a laptop, which decided that billet did not batch heartbeats and found placement growing with the fleet squared;
-- **2026-10-25,** at the target fleet [ADR-021](../decisions/adr-021-fleet-envelope.md) commits to, on server hardware with SQLite and with a PostgreSQL on its own machine, each on network block storage and on NVMe ([below](#the-target-fleet-on-server-hardware-2026-10-25)). It reversed the first decision for the listener's renewals and closed the placement finding.
+- **2026-10-25,** at the target fleet [ADR-023](../decisions/adr-023-fleet-envelope.md) commits to, on server hardware with SQLite and with a PostgreSQL on its own machine, each on network block storage and on NVMe ([below](#the-target-fleet-on-server-hardware-2026-10-25)). It reversed the first decision for the listener's renewals and closed the placement finding.
 
 ## Why it was measured
 
@@ -81,7 +81,7 @@ Closed: the one-pass count landed the same day for a tier whose candidates all c
 
 ### Why it was measured again
 
-Issue #528 asked what fleet one control plane must schedule, and for that target to be measured on server hardware, with PostgreSQL on its own machine rather than in Docker on a laptop. [ADR-021](../decisions/adr-021-fleet-envelope.md) sets the target: 256 hosts and 4,096 open leases, 14 purchases a second sustained, a 256-job matrix started within ten seconds, six writes in each job's life after its purchase, and 137 renewals a second. It also sets what each may take of the writer slot. A laptop could not answer that, because macOS's `fsync` does not wait for the disk, so a commit there costs almost nothing. On the server hardware below, a commit is most of what a write costs.
+Issue #528 asked what fleet one control plane must schedule, and for that target to be measured on server hardware, with PostgreSQL on its own machine rather than in Docker on a laptop. [ADR-023](../decisions/adr-023-fleet-envelope.md) sets the target: 256 hosts and 4,096 open leases, 14 purchases a second sustained, a 256-job matrix started within ten seconds, six writes in each job's life after its purchase, and 137 renewals a second. It also sets what each may take of the writer slot. A laptop could not answer that, because macOS's `fsync` does not wait for the disk, so a commit there costs almost nothing. On the server hardware below, a commit is most of what a write costs.
 
 ### How
 
@@ -152,7 +152,7 @@ The share of the writer slot each kind of write takes at the target: 13.7 purcha
 | PostgreSQL gp3, after | 8.2% | 41.7% | 0.5% | **50.4%** | **16.2 s** |
 | PostgreSQL NVMe, after | 5.7% | 17.3% | 0.4% | 23.4% | 4.9 s |
 
-Against the budget ADR-021 set before these were measured:
+Against the budget ADR-023 set before these were measured:
 - **Renewals within a quarter of the slot:** met everywhere, at under 1%.
 - **A purchase within 10 ms on average:** met on every configuration, for the target, a tier falling back to ec2, and two floors outstanding. The slowest mean is 9.3 ms, with floors on SQLite on gp3. A benchmark reports a mean, not a distribution of single purchases.
 - **The steady state within half the slot:** met everywhere except PostgreSQL on gp3, at 50.4% (the three runs of a job's writes put it between 49.9% and 50.6%). Four fifths of that is a job's own six commits, at a network round trip and a gp3 `fdatasync` each. Storage that commits faster is what brings it down: on NVMe the same PostgreSQL is at 23%.

@@ -114,7 +114,7 @@ func benchFleetOf(
 	return a, ts, obs
 }
 
-// The target fleet of ADR-021: 256 hosts holding 4,096 open leases, sixteen a
+// The target fleet of ADR-023: 256 hosts holding 4,096 open leases, sixteen a
 // host, across four tiers.
 const (
 	targetHosts         = 256
@@ -384,7 +384,7 @@ func BenchmarkPlacement(b *testing.B) {
 }
 
 // BenchmarkPlacementTarget is one purchase on the target fleet: 256 hosts and
-// 4,096 open leases (ADR-021).
+// 4,096 open leases (ADR-023).
 func BenchmarkPlacementTarget(b *testing.B) {
 	a, tiers, _, obs := targetFleet(b, targetTierSet(), nil)
 

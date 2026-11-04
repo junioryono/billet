@@ -178,8 +178,9 @@ type HybridParams struct {
 	LocalAnsibleUser string
 	// LocalImage is the guest generation every tier boots on the Firecracker
 	// host. Empty is DefaultFirecrackerImage, the x64 generation billet
-	// publishes; an operator with another architecture or their own signed
-	// generation names it, because the generator cannot see that machine.
+	// publishes; an operator with an arm64 host names DefaultFirecrackerARM64Image,
+	// and one with their own signed generation names it, because the generator
+	// cannot see that machine.
 	LocalImage string
 
 	// Cache turns on the EBS+S3 site cache for the cloud half: the module

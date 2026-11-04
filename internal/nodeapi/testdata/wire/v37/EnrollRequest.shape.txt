@@ -1,0 +1,3 @@
+EnrollRequest.node string
+EnrollRequest.csr_pem string
+EnrollRequest.join_token string

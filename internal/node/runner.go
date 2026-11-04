@@ -551,6 +551,7 @@ func (r *Runner) Launch(
 		VCPU:         lease.RequestedVCPU,
 		Memory:       lease.RequestedMemory,
 		InstanceType: lease.InstanceType,
+		Arch:         tier.Arch,
 		AuthorizeShape: func(ctx context.Context, instanceType string, vcpu int,
 			memory config.ByteSize,
 		) (bool, error) {

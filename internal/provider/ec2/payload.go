@@ -18,23 +18,18 @@ import (
 
 	"github.com/junioryono/billet/internal/awsjson"
 	"github.com/junioryono/billet/internal/awssig"
+	"github.com/junioryono/billet/internal/guestassets"
 	"github.com/junioryono/billet/internal/runnerimages"
+	"github.com/junioryono/billet/scripts"
 )
 
-// THE PROVISIONING SCRIPT OUTGREW EC2's USER DATA, and this is where the rest of
-// it travels.
+// THE BUILD IS FAR PAST EC2's USER DATA, and this is where it travels.
 //
-// EC2 caps user data at 16384 bytes and billet gzips to fit. That held while the
-// script was the runner plus a docker daemon; it stopped holding when the shared
-// installers reached six toolcache runtimes and the compiler sections, at which
-// point the installer file alone was 59% of the compressed budget and every
-// addition pushed something else out. The bound on the CA bundle had already been
-// cut three times to make room, and its own comment says a fourth cut is the wrong
-// answer.
-//
-// SO THE BIG PAYLOAD IS STAGED IN S3 AND FETCHED BY A BOOTSTRAP. What remains in
-// user data is a URL, a digest and four lines of shell, which does not grow when
-// the installers do.
+// EC2 caps user data at 16384 bytes. The provisioning script outgrew that when the
+// toolcache installers joined it; GitHub's template, the runner that drives it and
+// billet's layer are hundreds of kilobytes. So the build is staged in S3 and
+// fetched by a bootstrap: what remains in user data is a URL, a digest and a few
+// lines of shell, which does not grow when the template does.
 const (
 	// payloadService is what the signature is scoped to.
 	payloadService = "s3"
@@ -224,37 +219,95 @@ func (p payloadStager) remove(ctx context.Context, key string) error {
 	return nil
 }
 
-// payloadArchive is the shared installers and the declaration, as one tarball.
+// payloadArchive is the build as one tarball, laid out from / on the builder:
+// billet's tree under amiRepoDir at the paths it has in the repository, where
+// build-ami.sh and the template runner find each other, the build unit, the
+// build's settings and billet's EC2 layer.
 //
-// A TARBALL RATHER THAN TWO OBJECTS, so the bootstrap is one fetch and one digest
-// check. Two would mean two URLs, two checks, and a window where a builder holds
-// one half of a matched pair.
-func payloadArchive() ([]byte, string, error) {
-	projected, err := runnerimages.InstallerToolset()
+// A TARBALL RATHER THAN SEVERAL OBJECTS, so the bootstrap is one fetch and one
+// digest check, and a builder never holds one half of a matched set.
+//
+// OWNED BY ROOT, WITH THE MODES THE TREE GIVES, because the builder extracts it as
+// root and runs what it marks executable; build.env, which names the build's
+// nonce, is root's alone.
+func payloadArchive(spec BuildSpec, layer string) ([]byte, string, error) {
+	env, err := buildEnvFile(spec)
 	if err != nil {
 		return nil, "", err
 	}
 
-	files := []struct {
-		name string
-		body []byte
-	}{
-		// STRIPPED THE SAME WAY IT WAS WHEN EMBEDDED. The comments are the reason
-		// the file is readable and no reason for a builder to download them.
-		{toolcacheAssetPath, []byte(stripShellComments(runnerimages.InstallToolcacheScript))},
-		{toolsetPath, projected},
+	tree, err := scripts.AMIBuild()
+	if err != nil {
+		return nil, "", fmt.Errorf("ec2: read the build's scripts: %w", err)
 	}
+
+	type member struct {
+		name string
+		mode int64
+		body []byte
+	}
+
+	var files []member
+
+	for _, f := range tree {
+		mode := int64(0o644)
+		if f.Executable {
+			mode = 0o755
+		}
+
+		name := amiRepoDir + "/scripts/" + f.Path
+		if f.Path == scripts.AMIBuildService {
+			name = amiUnitPath
+		}
+
+		files = append(files, member{name, mode, f.Body})
+	}
+
+	for _, arch := range []string{runnerimages.ArchX64, runnerimages.ArchArm64} {
+		body, err := runnerimages.ToolsetBytesFor(arch)
+		if err != nil {
+			return nil, "", fmt.Errorf("ec2: %w", err)
+		}
+
+		file, err := runnerimages.ToolsetFileFor(arch)
+		if err != nil {
+			return nil, "", fmt.Errorf("ec2: %w", err)
+		}
+
+		files = append(files, member{amiRepoDir + "/internal/runnerimages/" + file, 0o644, body})
+	}
+
+	files = append(files,
+		member{amiRepoDir + "/internal/runnerimages/pinned.txt", 0o644, runnerimages.PinnedFile()},
+		member{amiRepoDir + "/internal/guestassets/docker-daemon.json", 0o644,
+			[]byte(guestassets.DockerDaemonJSON)},
+		member{amiBuildEnv, 0o600, []byte(env)},
+		member{amiLayerPath, 0o755, []byte(layer)},
+	)
 
 	var raw bytes.Buffer
 
 	zw := gzip.NewWriter(&raw)
 	tw := tar.NewWriter(zw)
 
+	// THE BUILD'S DIRECTORY FIRST, root's alone: tar creates it with this mode
+	// before anything is unpacked into it.
+	if err := tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeDir,
+		Name:     strings.TrimPrefix(amiBuildDir, "/") + "/",
+		Mode:     0o700,
+		ModTime:  payloadModTime,
+	}); err != nil {
+		return nil, "", fmt.Errorf("ec2: build the payload archive: %w", err)
+	}
+
 	for _, f := range files {
 		hdr := &tar.Header{
-			Name: strings.TrimPrefix(f.name, "/"),
-			Mode: 0o644,
-			Size: int64(len(f.body)),
+			Typeflag: tar.TypeReg,
+			Name:     strings.TrimPrefix(f.name, "/"),
+			Mode:     f.mode,
+			Size:     int64(len(f.body)),
+			ModTime:  payloadModTime,
 		}
 
 		if err := tw.WriteHeader(hdr); err != nil {
@@ -279,7 +332,12 @@ func payloadArchive() ([]byte, string, error) {
 	return raw.Bytes(), hex.EncodeToString(sum[:]), nil
 }
 
-// stagePayload uploads the archive and records where the builder can fetch it.
+// payloadModTime is every member's modification time, so an archive is a function
+// of its contents.
+var payloadModTime = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// stagePayload uploads the archive, with layer as billet's EC2 layer, and records
+// where the builder can fetch it.
 //
 // THE KEY CARRIES THE DIGEST AND A NONCE, and the nonce is the load-bearing half.
 //
@@ -287,12 +345,14 @@ func payloadArchive() ([]byte, string, error) {
 // and it made two concurrent builds share one object, which is a bug: each build
 // deletes that key when it finishes, so a build that ends while a second builder is
 // still fetching deletes the archive out from under it and the second build fails
-// on something it did nothing wrong to cause. Two copies of a hundred-kilobyte
-// object cost nothing next to that. The digest stays because a leftover object
+// on something it did nothing wrong to cause. Two copies of a few hundred kilobytes
+// cost nothing next to that. The digest stays because a leftover object
 // should still say what it is rather than being a mystery with a timestamp; the key
 // is not a secret either way, since the presigned URL is what grants access.
-func (p *Provider) stagePayload(ctx context.Context, spec *BuildSpec) (string, func() error, error) {
-	body, digest, err := payloadArchive()
+func (p *Provider) stagePayload(
+	ctx context.Context, spec *BuildSpec, layer string,
+) (string, func() error, error) {
+	body, digest, err := payloadArchive(*spec, layer)
 	if err != nil {
 		return "", nil, err
 	}

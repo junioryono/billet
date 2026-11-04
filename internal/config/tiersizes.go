@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // DefaultMemoryPerVCPU is the proportion a `sizes` ladder is shaped to when the
@@ -133,6 +134,9 @@ func expandOne(t Tier) ([]Tier, error) {
 		sized.Providers = slices.Clone(t.Providers)
 		sized.Command = slices.Clone(t.Command)
 		sized.Launch = cloneLaunch(t.Launch)
+		if t.WritesTargets() {
+			sized.Declaration = t.Label
+		}
 
 		out = append(out, sized)
 	}
@@ -174,7 +178,10 @@ func refuseDuplicateLabels(tiers []Tier, fromLadder map[string]bool) error {
 
 	for i := range tiers {
 		label := tiers[i].Label
-		if seen[label] && fromLadder[label] {
+		// A LABEL STILL CARRYING THE TARGET PLACEHOLDER is judged after targets
+		// expand it: two ladders for disjoint targets share one here and none
+		// after.
+		if seen[label] && fromLadder[label] && !strings.Contains(label, TargetPlaceholder) {
 			return fmt.Errorf("tier %q is defined more than once after `sizes` expansion; a "+
 				"ladder writes <label>-<n>vcpu, so it collides with a tier already spelled "+
 				"that way", label)

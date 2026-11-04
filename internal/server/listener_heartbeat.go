@@ -291,7 +291,7 @@ func (l *Listener) pruneConfirmed() {
 //
 // ONE CALL FOR THE PASS, because a renewal's cost is its commit, and one
 // transaction a lease committed once for every lease the listener holds every
-// pass: at the target fleet of ADR-021, 4,096 leases, that held the ledger's
+// pass: at the target fleet of ADR-023, 4,096 leases, that held the ledger's
 // writer slot half the time on storage whose commit waits for the network
 // (docs/reference/records/ledger-write-budget.md). The allocator answers each
 // lease exactly as its own renewal would, so what each answer means here does
