@@ -462,6 +462,9 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"internal/e2e/restore_test.go", families(append([]string{"postgres"}, application...)...)},
 		{"internal/e2e/lifecycle_test.go", families(application...)},
 		{"deploy/billet-server.service", families(append([]string{"replay"}, application...)...)},
+		// The one package of scripts/ the harness builds, not its tests.
+		{"scripts/amibuild.go", families("lint", "postgres", "replay")},
+		{"scripts/amibuild_test.go", families("lint")},
 		// The collection and the retirement shard checker.
 		{"ansible_collections/junioryono/billet/roles/host/tasks/main.yml",
 			families("host_lifecycle", "postgres_command", "postgres_retirement")},
