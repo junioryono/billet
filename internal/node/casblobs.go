@@ -44,8 +44,9 @@ const (
 	closedSessionUploads = 8
 	// closedSessionAdmit is how long a pass goes on taking sessions that close while it
 	// runs. It has to return, because renewal runs after it on the same loop: this plus
-	// a publication's window is far inside what a lease has left when it comes due.
-	closedSessionAdmit = 5 * time.Minute
+	// a publication's window is far inside the cacheRenewWithin a lease has left when it
+	// comes due.
+	closedSessionAdmit = time.Hour
 	// casIndexRetry is how soon a listing that failed is tried again; a build asks by
 	// the thousand, and each would otherwise be a listing.
 	casIndexRetry = time.Minute
@@ -118,29 +119,32 @@ func (s *CacheService) attachBlobVolume(
 	return hv, nil
 }
 
-// blobIndexOf is what the store holds for a volume's key, listed on first use and
-// outside session.mu: a listing of a large cache takes seconds. An error is
-// could-not-tell, which is a miss for the one read that asked.
-func (s *CacheService) blobIndexOf(
-	ctx context.Context, hv *hostVolume,
-) (map[storecontract.BlobRef]int64, error) {
+// listedSize is what the store's listing says of one entry of a volume's key, listed on
+// first use and outside session.mu: a listing of a large cache takes seconds. An error
+// is could-not-tell, which is a miss for the one read that asked.
+//
+// THE LISTING DOES NOT LEAVE THE LOCK, because a read that finds an entry gone takes it
+// out, and transfers run side by side: a map read beside that write ends the process.
+func (s *CacheService) listedSize(
+	ctx context.Context, hv *hostVolume, ref storecontract.BlobRef,
+) (int64, bool, error) {
 	hv.index.mu.Lock()
 	defer hv.index.mu.Unlock()
-	if hv.index.refs != nil {
-		return hv.index.refs, nil
-	}
-	if s.now().Before(hv.index.retry) {
-		return nil, errCASBackoff
-	}
-	refs, err := s.blobStore().ListBlobs(ctx, hv.Volume.Key)
-	if err != nil {
-		hv.index.retry = s.now().Add(casIndexRetry)
+	if hv.index.refs == nil {
+		if s.now().Before(hv.index.retry) {
+			return 0, false, errCASBackoff
+		}
+		refs, err := s.blobStore().ListBlobs(ctx, hv.Volume.Key)
+		if err != nil {
+			hv.index.retry = s.now().Add(casIndexRetry)
 
-		return nil, err
+			return 0, false, err
+		}
+		hv.index.refs = refs
 	}
-	hv.index.refs = refs
+	size, ok := hv.index.refs[ref]
 
-	return refs, nil
+	return size, ok, nil
 }
 
 // casCachePath is where the read cache keeps one entry of a key. The key's digest,
@@ -157,7 +161,7 @@ func (s *CacheService) casCachePath(key string, table reapi.Table, digest string
 // build.
 func (h *casHandle) listedBlob(table reapi.Table, digest string) (storecontract.BlobRef, int64, bool) {
 	ref := storecontract.BlobRef{Table: storecontract.BlobTable(table), Digest: digest}
-	refs, err := h.s.blobIndexOf(h.ctx, h.hv)
+	size, ok, err := h.s.listedSize(h.ctx, h.hv, ref)
 	if err != nil {
 		if !errors.Is(err, errCASBackoff) {
 			h.s.log.Warn("could not list a content-addressed cache; its reads are misses for now",
@@ -166,7 +170,6 @@ func (h *casHandle) listedBlob(table reapi.Table, digest string) (storecontract.
 
 		return ref, 0, false
 	}
-	size, ok := refs[ref]
 
 	return ref, size, ok
 }
@@ -438,7 +441,9 @@ func (s *CacheService) writtenBytes(root string) int64 {
 		if err != nil {
 			return err
 		}
-		if !entry.Type().IsRegular() {
+		// NOT A DOTTED NAME, which a crash left and no upload will take: a whole object
+		// never installed must not spend what the job has left.
+		if !entry.Type().IsRegular() || strings.HasPrefix(entry.Name(), ".") {
 			return nil
 		}
 		info, err := entry.Info()
@@ -528,63 +533,84 @@ feed:
 }
 
 // retryClosedSideBySide is RetryClosed on a store of objects: up to closedSessionUploads
-// sessions at once, and it goes on taking those that close while it runs. A pass over the
-// ones closed when it began would leave a job that ended a minute later waiting out the
-// longest upload ahead of it, with its window counting.
+// sessions at once, and while any runs it goes on taking those that close and trying
+// again those not finished. A pass over the ones closed when it began would leave a job
+// that ended a minute later waiting out the longest upload ahead of it, with its window
+// counting, and one whose upload failed once waiting past that window for its next try.
 func (s *CacheService) retryClosedSideBySide(ctx context.Context) error {
+	type outcome struct {
+		session *cacheSession
+		err     error
+	}
 	var (
-		failures []error
-		queue    []*cacheSession
-		running  int
-		missed   bool
+		queue   []*cacheSession
+		running int
+		missed  bool
 	)
-	seen := make(map[*cacheSession]bool)
+	failures := make(map[*cacheSession]error)
+	active := make(map[*cacheSession]bool)
 	admit := func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		for _, session := range s.byToken {
-			if session.closing.Load() && !seen[session] {
-				seen[session] = true
+			if session.closing.Load() && !active[session] {
+				active[session] = true
 				queue = append(queue, session)
 			}
 		}
 	}
 	admit()
 
-	done := make(chan error)
+	done := make(chan outcome)
 	closed := s.closed
+	ticker := time.NewTicker(s.closedSessionRetry)
+	defer ticker.Stop()
+	retry := ticker.C
 	admitUntil := s.now().Add(closedSessionAdmit)
 	for {
 		for running < closedSessionUploads && len(queue) > 0 && ctx.Err() == nil {
 			session := queue[0]
 			queue = queue[1:]
 			running++
-			go func() { done <- s.cleanupSession(ctx, session, false, true) }()
+			go func() { done <- outcome{session, s.cleanupSession(ctx, session, false, true)} }()
 		}
 		if running == 0 {
 			break
 		}
 		select {
-		case err := <-done:
+		case finished := <-done:
 			running--
-			if err != nil {
-				failures = append(failures, err)
+			delete(active, finished.session)
+			delete(failures, finished.session)
+			if finished.err != nil {
+				failures[finished.session] = finished.err
+			}
+		case <-retry:
+			if s.now().Before(admitUntil) {
+				admit()
+			} else {
+				retry = nil
 			}
 		case <-closed:
 			if s.now().Before(admitUntil) {
 				admit()
-
-				continue
+			} else {
+				// LEFT FOR THE NEXT PASS, which this signal is what wakes.
+				closed, missed = nil, true
 			}
-			// LEFT FOR THE NEXT PASS, which this signal is what wakes.
-			closed, missed = nil, true
 		}
 	}
 	if missed {
 		s.signalClosed()
 	}
 
-	return errors.Join(failures...)
+	// THE LAST WORD ON EACH: one that failed and then finished has nothing to report.
+	joined := make([]error, 0, len(failures))
+	for _, err := range failures {
+		joined = append(joined, err)
+	}
+
+	return errors.Join(joined...)
 }
 
 func putBlobFile(
@@ -645,8 +671,7 @@ func reapCASEntries(ctx context.Context, root string, toFree int64) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// NOT WHAT A FILL IS STILL WRITING, whose rename would then fail.
-		if !d.Type().IsRegular() || strings.HasPrefix(d.Name(), ".") {
+		if !d.Type().IsRegular() {
 			return nil
 		}
 		info, err := d.Info()
@@ -655,6 +680,11 @@ func reapCASEntries(ctx context.Context, root string, toFree int64) error {
 		}
 		if err != nil {
 			return err
+		}
+		// NOT WHAT A FILL IS STILL WRITING, whose rename would then fail. One older than
+		// any transfer can last is what a crash left, which nothing else will take.
+		if strings.HasPrefix(d.Name(), ".") && time.Since(info.ModTime()) < casRequestLife {
+			return nil
 		}
 		entries = append(entries, entry{path: path, used: info.ModTime(), size: info.Size()})
 

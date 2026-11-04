@@ -46,9 +46,12 @@ type objectStore struct {
 	commitGate chan struct{}
 	commits    int
 	// putHold, when set, holds every PutBlob until it is closed or its context ends,
-	// saying so on putHeld.
-	putHold chan struct{}
-	putHeld chan struct{}
+	// saying so on putHeld. holdOnly, when set, is the one key it holds.
+	putHold  chan struct{}
+	putHeld  chan struct{}
+	holdOnly string
+	// putFailures fails that many PutBlobs before any of them is held.
+	putFailures int
 	// putTogether, when set, holds each PutBlob until that many are in flight.
 	putTogether int
 	putArrived  chan struct{}
@@ -218,6 +221,15 @@ func (s *objectStore) PutBlob(
 	}
 	s.mu.Lock()
 	together, arrived, hold, held := s.putTogether, s.putArrived, s.putHold, s.putHeld
+	if s.putFailures > 0 {
+		s.putFailures--
+		s.mu.Unlock()
+
+		return errors.New("s3 went away for a moment")
+	}
+	if s.holdOnly != "" && s.holdOnly != string(data) {
+		hold = nil
+	}
 	s.mu.Unlock()
 	if hold != nil {
 		held <- struct{}{}
@@ -1362,6 +1374,182 @@ func TestASessionThatClosesDuringAPassIsTakenByIt(t *testing.T) {
 	}
 }
 
+// waitHeld returns once an upload has reached the store and is being held.
+func waitHeld(t *testing.T, held chan struct{}) {
+	t.Helper()
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	select {
+	case <-held:
+	case <-guard.C:
+		t.Fatal("no upload reached the store")
+	}
+}
+
+// waitPuts returns once the store has taken that many entries.
+func waitPuts(t *testing.T, storage *objectStore, want int) {
+	t.Helper()
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	for {
+		storage.mu.Lock()
+		got := len(storage.puts)
+		storage.mu.Unlock()
+		if got >= want {
+			return
+		}
+		select {
+		case <-guard.C:
+			t.Fatalf("the store took %d entries, want %d", got, want)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// A FAILED UPLOAD IS TRIED AGAIN WHILE ANOTHER JOB'S RUNS, not when it is done: that one can
+// last until this one's window has gone, and what the job wrote with it. Having finished,
+// it has nothing to report for the failure before.
+func TestAFailedUploadIsTriedAgainDuringThePass(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	service.closedSessionRetry = 5 * time.Millisecond
+	long, short := objectCAS(t, service, "long"), objectCAS(t, service, "short")
+	if code := putObject(t, service, long, "the long upload"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	finish(t, service, provider.InstanceName("long"))
+	hold, held := make(chan struct{}), make(chan struct{}, 1)
+	storage.mu.Lock()
+	storage.putHold, storage.putHeld, storage.holdOnly = hold, held, "the long upload"
+	storage.mu.Unlock()
+	var release sync.Once
+	open := func() { release.Do(func() { close(hold) }) }
+	defer open()
+	pass := make(chan error, 1)
+	go func() { pass <- service.RetryClosed(t.Context()) }()
+	waitHeld(t, held)
+
+	if code := putObject(t, service, short, "the short upload"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	storage.mu.Lock()
+	storage.putFailures = 1
+	storage.mu.Unlock()
+	finish(t, service, provider.InstanceName("short"))
+
+	waitPuts(t, storage, 1)
+	open()
+	if err := <-pass; err != nil {
+		t.Fatalf("RetryClosed = %v; what failed and then finished has nothing to report", err)
+	}
+}
+
+// A PASS HAS TO RETURN, because renewal runs after it on the same loop. Past its bound it
+// takes no more, and what closed meanwhile is signalled for the next.
+func TestAPassStopsTakingSessionsAtItsBound(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	now := time.Now()
+	var clock sync.Mutex
+	service.now = func() time.Time {
+		clock.Lock()
+		defer clock.Unlock()
+
+		return now
+	}
+	first, second := objectCAS(t, service, "first"), objectCAS(t, service, "second")
+	for _, token := range []string{first, second} {
+		if code := putObject(t, service, token, "from "+token); code != http.StatusOK {
+			t.Fatalf("PUT = %d", code)
+		}
+	}
+	finish(t, service, provider.InstanceName("first"))
+	hold, held := make(chan struct{}), make(chan struct{}, 2)
+	storage.mu.Lock()
+	storage.putHold, storage.putHeld = hold, held
+	storage.mu.Unlock()
+	pass := make(chan error, 1)
+	go func() { pass <- service.RetryClosed(t.Context()) }()
+	waitHeld(t, held)
+
+	clock.Lock()
+	now = now.Add(closedSessionAdmit)
+	clock.Unlock()
+	finish(t, service, provider.InstanceName("second"))
+	// The window of the first upload still has to outlast the clock's move, so what is
+	// held is released by the test, and the bound is all that is being asked about.
+	time.Sleep(50 * time.Millisecond)
+	close(hold)
+
+	guard := time.NewTimer(30 * time.Second)
+	defer guard.Stop()
+	select {
+	case err := <-pass:
+		if err != nil {
+			t.Fatalf("RetryClosed: %v", err)
+		}
+	case <-guard.C:
+		t.Fatal("the pass did not return")
+	}
+	if service.sessionOf(provider.InstanceName("second")) == nil {
+		t.Fatal("a session that closed past the bound was taken by the pass")
+	}
+	select {
+	case <-service.ClosedSessions():
+	default:
+		t.Fatal("the next pass was not told about the session left for it")
+	}
+}
+
+// A READ THAT FINDS AN ENTRY GONE TAKES IT OUT OF THE LISTING WHILE OTHERS READ IT, and a map
+// read beside that write ends the process, with every guest's cache and renewal on it.
+func TestAnEntryForgottenBesideReadersIsNotARace(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	token := objectCAS(t, service, scopedLease)
+	bodies := make([]string, 64)
+	for i := range bodies {
+		bodies[i] = "entry " + strconv.Itoa(i)
+		if code := putObject(t, service, token, bodies[i]); code != http.StatusOK {
+			t.Fatalf("PUT = %d", code)
+		}
+	}
+	finish(t, service, provider.InstanceName(scopedLease))
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	objectCAS(t, service, "asker")
+	handle, err := service.openCASHandle(t.Context(), service.sessionOf(provider.InstanceName("asker")), config.CacheGo, false)
+	if err != nil {
+		t.Fatalf("openCASHandle: %v", err)
+	}
+	defer handle.Close()
+	if _, err := handle.Size(reapi.TableCAS, digestOf(bodies[0])); err != nil {
+		t.Fatalf("Size: %v", err)
+	}
+	storage.mu.Lock()
+	clear(storage.blobs)
+	storage.mu.Unlock()
+
+	var readers sync.WaitGroup
+	for _, body := range bodies {
+		readers.Go(func() {
+			if file, err := handle.Open(reapi.TableCAS, digestOf(body)); err == nil {
+				file.Close()
+			}
+		})
+		readers.Go(func() {
+			for range 64 {
+				if _, err := handle.Size(reapi.TableCAS, digestOf(bodies[0])); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("Size: %v", err)
+				}
+			}
+		})
+	}
+	readers.Wait()
+}
+
 // ONE JOB'S UPLOAD MUST NOT SPEND THE NEXT JOB'S WINDOW: a window counts from the job's
 // completion, whatever the sessions ahead of it are doing.
 func TestClosedSessionsUploadSideBySide(t *testing.T) {
@@ -1913,6 +2101,22 @@ func TestARestartKeepsWhatAJobHasSpent(t *testing.T) {
 	}
 }
 
+// WHAT A CRASH LEFT BESIDE THE ENTRIES IS NOT WHAT THE JOB SPENT: no upload will ever take it.
+func TestWhatACrashLeftIsNotCountedAgainstTheJob(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "entry"), []byte("counted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".held-1"), []byte("not counted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := service.writtenBytes(root); got != int64(len("counted")) {
+		t.Fatalf("writtenBytes = %d", got)
+	}
+}
+
 // A FILL STILL WRITING IS NOT AN ENTRY: reaped, its rename fails, and a read that was going to
 // succeed costs a miss and a warning.
 func TestTheReadCacheLeavesWhatAFillIsWriting(t *testing.T) {
@@ -1926,11 +2130,23 @@ func TestTheReadCacheLeavesWhatAFillIsWriting(t *testing.T) {
 	if err := os.WriteFile(filling, []byte("entry"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	crashed := filepath.Join(root, ".put-456")
+	if err := os.WriteFile(crashed, []byte("entry"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-casRequestLife - time.Minute)
+	if err := os.Chtimes(crashed, time.Time{}, old); err != nil {
+		t.Fatal(err)
+	}
 	if err := reapCASEntries(t.Context(), filepath.Join(service.rootState, casCacheDirectory), 1<<20); err != nil {
 		t.Fatalf("reapCASEntries: %v", err)
 	}
 	if _, err := os.Stat(filling); err != nil {
 		t.Fatalf("a fill in progress was reaped: %v", err)
+	}
+	// OLDER THAN ANY TRANSFER CAN LAST, it is what a crash left, and nothing else takes it.
+	if _, err := os.Stat(crashed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("what a crash left = %v, want it gone", err)
 	}
 }
 

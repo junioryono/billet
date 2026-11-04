@@ -309,6 +309,14 @@ func (l *dropFirstListener) Accept() (net.Conn, error) {
 		if l.dropped.Swap(true) {
 			return conn, nil
 		}
+		// THE HELLO READ FIRST, so the close is an end of stream: with bytes unread the
+		// kernel sends a reset instead, which is not the case this is about.
+		if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			return nil, err
+		}
+		if _, err := conn.Read(make([]byte, 16<<10)); err != nil {
+			return nil, err
+		}
 		if err := conn.Close(); err != nil {
 			return nil, err
 		}
