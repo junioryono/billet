@@ -66,6 +66,9 @@ type Tier struct {
 	// Target is the target the tier belongs to, one Targets names; empty for a
 	// fleet that lists none.
 	Target string `json:"target,omitempty"`
+	// Providers are the backends the tier runs on, in the configuration's order of
+	// preference; empty says nothing, and any host will do.
+	Providers []config.ProviderKind `json:"providers,omitempty"`
 }
 
 // Validate refuses a fleet document that describes no deployment: no hosts,
