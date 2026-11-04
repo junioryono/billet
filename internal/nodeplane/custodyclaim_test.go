@@ -376,3 +376,41 @@ func TestADestroyForgetsOnlyTheRecordOfTheProcessThatAnswered(t *testing.T) {
 		})
 	}
 }
+
+// WHICHEVER COMES FIRST, THE CLAIM STANDS. A destroy's answer forgets the process's own
+// record and a claim replaces it, so each order leaves the claimant owning the lease; a
+// comparison and a forgetting under two holds of the mutex let a claim land between them
+// and be the thing forgotten.
+func TestAClaimAndADestroysForgettingNeverLoseTheClaim(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	registerAs(t, p, "p2")
+
+	for attempt := range 20000 {
+		p.AdoptOwnership("n1", "p2", []string{"l9"})
+
+		start := make(chan struct{})
+
+		var racing sync.WaitGroup
+
+		racing.Go(func() {
+			<-start
+			p.forgetOwnedBy("n1", "l9", "p2")
+		})
+		racing.Go(func() {
+			<-start
+			p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}})
+		})
+
+		close(start)
+		racing.Wait()
+
+		owner, ok := ownerOf(p, "l9")
+		if !ok || owner.incarnation != "p1" {
+			t.Fatalf("attempt %d: the owner is %+v (ok=%v), want the claimant", attempt, owner, ok)
+		}
+
+		p.ForgetLease("n1", "l9")
+	}
+}
