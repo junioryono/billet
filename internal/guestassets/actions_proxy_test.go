@@ -298,7 +298,6 @@ func TestGuestResultsPassthroughWaitsOutANodeThatDoesNotAnswer(t *testing.T) {
 	}
 	probe := `
 import importlib.util
-import os
 import select
 import socket
 import subprocess
@@ -451,13 +450,14 @@ def through_main(*args):
             pass
     threading.Thread(target=serve, daemon=True).start()
     listener = socket.create_server(("127.0.0.1", 0))
-    def hand_over():
-        os.dup2(listener.fileno(), proxy.SD_LISTEN_FDS_START)
-        os.environ["LISTEN_PID"] = str(os.getpid())
-        os.environ["LISTEN_FDS"] = "1"
-    process = subprocess.Popen([sys.executable, sys.argv[1], "--systemd-socket",
-        "--upstream", "http://x:y@127.0.0.1:%d" % node.getsockname()[1], *args],
-        preexec_fn=hand_over, close_fds=False)
+    # A launcher rather than a preexec_fn, which is not safe with threads running. An
+    # exec keeps the pid, so LISTEN_PID goes on naming the proxy.
+    launcher = ("import os, sys; os.dup2(int(sys.argv[1]), %d); os.environ['LISTEN_PID'] = str(os.getpid()); "
+        "os.environ['LISTEN_FDS'] = '1'; os.execv(sys.executable, [sys.executable] + sys.argv[2:])"
+        % proxy.SD_LISTEN_FDS_START)
+    process = subprocess.Popen([sys.executable, "-c", launcher, str(listener.fileno()), sys.argv[1],
+        "--systemd-socket", "--upstream", "http://x:y@127.0.0.1:%d" % node.getsockname()[1], *args],
+        pass_fds=(listener.fileno(),))
     try:
         client = socket.create_connection(listener.getsockname(), 10)
         # A hang guard, past any wait this could mistake for an answer.

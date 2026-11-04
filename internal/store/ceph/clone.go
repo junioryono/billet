@@ -540,25 +540,20 @@ func (c *Client) MappedDevice(ctx context.Context, volume storecontract.Volume) 
 		volume.Handle, bounded(volume.Device))
 }
 
-// imageExists reports whether an image is listed, as opposed to removed or in the
-// trash.
+// imageExists reports whether the cache pool lists an image, which a removed or
+// trashed one it does not.
 //
-// ENOENT IS ALSO A POOL THAT WOULD NOT OPEN (rbd's Utils.cc, Ceph 20.2.3), and a pool
-// renamed for an hour still holds what its images wrote, so the pool has to open
-// before that answer says anything about the image.
+// FROM THE POOL'S LISTING AND NOT AN ENOENT. `rbd status` answers ENOENT for a pool
+// that will not open and for an image whose parent is missing (Ceph 20.2.3, Utils.cc
+// and RefreshRequest.cc), and both of those can still hold a volume's writes. A
+// listing that fails says nothing.
 func (c *Client) imageExists(ctx context.Context, handle string) (bool, error) {
-	_, err := c.rbdCmd(ctx, true, "status", handle)
-	if err == nil {
-		return true, nil
-	}
-	if !isNoSuchFile(err) {
-		return false, fmt.Errorf("ceph: ask whether %s exists: %w", handle, err)
-	}
-	if _, err := c.rbdCmd(ctx, true, "ls", c.cfg.CachePool); err != nil {
-		return false, fmt.Errorf("ceph: ask whether %s exists: its pool would not open: %w", handle, err)
+	names, err := c.cacheImages(ctx)
+	if err != nil {
+		return false, err
 	}
 
-	return false, nil
+	return slices.Contains(names, strings.TrimPrefix(handle, c.cfg.CachePool+"/")), nil
 }
 
 // checkCloneName refuses a clone name billet cannot address.

@@ -245,36 +245,41 @@ func TestAMappingTableThatProvesNothingIsNotAnAnswer(t *testing.T) {
 	}
 }
 
-// A MISSING ROW IS NOT GONE WHILE THE IMAGE EXISTS. rbd's device list skips a device
-// it could not read and still succeeds, and gone is what has a job's writes thrown
-// away, so only the image no longer existing says so.
-func TestGoneMeansTheImageIs(t *testing.T) {
+// A MISSING ROW IS NOT GONE WHILE THE POOL LISTS THE IMAGE. rbd's device list skips a
+// device it could not read and still succeeds, and gone is what has a job's writes
+// thrown away, so only the pool's own listing without it says so. rbd status is no
+// witness: it answers ENOENT for a pool that will not open and for an image whose
+// parent is missing, and either can still hold those writes.
+func TestGoneMeansThePoolDoesNotListTheImage(t *testing.T) {
 	t.Parallel()
 
 	for name, tc := range map[string]struct {
 		removed  bool
-		failing  bool
-		noPool   bool
+		listErr  error
 		wantGone bool
 	}{
-		"no row and the image is listed":       {},
-		"no row and the status cannot be read": {failing: true},
-		"no row and no image":                  {removed: true, wantGone: true},
-		// A POOL THAT WILL NOT OPEN ANSWERS ENOENT AS AN IMAGE DOES, and a renamed
-		// one still holds the volume.
-		"no row and the pool will not open": {removed: true, noPool: true},
+		"no row and the image is listed": {},
+		"no row and no image":            {removed: true, wantGone: true},
+		"no row and the listing fails": {
+			removed: true,
+			listErr: errors.New("exit status 1: rbd: the monitors did not answer"),
+		},
+		"no row and the pool will not open": {
+			removed: true,
+			listErr: errors.New("rbd: error opening pool 'billet-cache': (2) No such file or directory"),
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			f := newCacheFake()
-			failing, noPool := false, false
+			var listErr error
 			run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
-				if failing && slices.Contains(args, "status") {
-					return nil, errors.New("exit status 1: rbd: the monitors did not answer")
+				if slices.Contains(args, "status") {
+					return nil, errors.New("rbd: error opening image: (2) No such file or directory")
 				}
-				if noPool && slices.Contains(args, "ls") {
-					return nil, errors.New("rbd: error opening pool 'billet-cache': (2) No such file or directory")
+				if listErr != nil && slices.Contains(args, "ls") {
+					return nil, listErr
 				}
 
 				return f.run(ctx, bin, args)
@@ -284,7 +289,7 @@ func TestGoneMeansTheImageIs(t *testing.T) {
 			if tc.removed {
 				delete(f.images, volume.Handle)
 			}
-			failing, noPool = tc.failing, tc.noPool
+			listErr = tc.listErr
 
 			device, err := c.MappedDevice(t.Context(), volume)
 			if tc.wantGone {
