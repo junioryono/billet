@@ -673,6 +673,80 @@ func TestAFailureIsAnsweredFromMemoryAndThenAskedAgain(t *testing.T) {
 	}
 }
 
+// A STALLED GITHUB DOES NOT KEEP A HELD TOKEN FROM ITS CALLER. A proof falls due at the hour
+// with most of a token's life left, and a lookup that hangs past what a client waits would
+// otherwise time out every request, for as long as GitHub stalls, with the token in hand.
+func TestAStalledProofDoesNotStarveAHeldToken(t *testing.T) {
+	t.Parallel()
+
+	var lookups atomic.Int64
+
+	stalled := make(chan struct{})
+	t.Cleanup(func() { close(stalled) })
+
+	gh := newFakeGitHub(t)
+	cert, fingerprint := testClient(t)
+
+	broker := newTestBroker(t, gh, []config.BrokerDeployment{
+		{ID: deploymentA, Clients: []string{fingerprint}, Installations: []config.BrokerInstallation{org(22)}},
+	})
+
+	now := time.Now()
+
+	var clock sync.Mutex
+
+	broker.server.now = func() time.Time {
+		clock.Lock()
+		defer clock.Unlock()
+
+		return now
+	}
+
+	source := func() github.TokenSource {
+		return broker.client(t, cert, nil).Tokens(github.OrganizationTarget("acme"), appID, 22)
+	}
+
+	if _, err := source().InstallationToken(t.Context()); err != nil {
+		t.Fatalf("the first token: %v", err)
+	}
+
+	broker.server.proofBound = 50 * time.Millisecond
+	gh.lookup = func(_ http.ResponseWriter, r *http.Request) {
+		lookups.Add(1)
+
+		select {
+		case <-stalled:
+		case <-r.Context().Done():
+		}
+	}
+
+	clock.Lock()
+	now = now.Add(verifyEvery + time.Minute)
+	clock.Unlock()
+
+	for range 3 {
+		if _, err := source().InstallationToken(t.Context()); err != nil {
+			t.Fatalf("a held token did not reach its caller while GitHub stalled: %v", err)
+		}
+	}
+
+	if got := lookups.Load(); got != 1 {
+		t.Errorf("GitHub was asked to prove it %d times in one retry period", got)
+	}
+
+	clock.Lock()
+	now = now.Add(proofRetry + time.Second)
+	clock.Unlock()
+
+	if _, err := source().InstallationToken(t.Context()); err != nil {
+		t.Fatalf("after the retry period: %v", err)
+	}
+
+	if got := lookups.Load(); got != 2 {
+		t.Errorf("the overdue proof was asked for %d times, want it tried again after its retry period", got)
+	}
+}
+
 // A BURST PASSES THE MEMORY ONE AT A TIME. Together they would each find nothing remembered
 // and each ask GitHub, which is the spending the memory exists to stop.
 func TestABurstAgainstAFailingInstallationAsksOnce(t *testing.T) {

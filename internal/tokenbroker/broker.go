@@ -75,6 +75,15 @@ const mintFresh = 10 * time.Minute
 // stands. Minting needs the check only rarely, and GitHub's own refusal covers the rest.
 const verifyEvery = time.Hour
 
+const (
+	// proofBound is the longest one proof may take, well inside what a client waits for an
+	// answer: a held token must reach its caller while GitHub is stalled.
+	proofBound = 10 * time.Second
+	// proofRetry is how long an overdue proof that GitHub could not answer waits before
+	// being asked again, so that a stall is not paid for by every request.
+	proofRetry = 5 * time.Minute
+)
+
 // installation is one registered (deployment, app, installation, target).
 type installation struct {
 	// gate lets one request at a time through the failure memory, the proof, the mint and
@@ -98,6 +107,8 @@ type installation struct {
 
 	mu       sync.Mutex
 	verified time.Time
+	// proofRetryAt is when an overdue proof GitHub could not answer is next asked for.
+	proofRetryAt time.Time
 }
 
 // Server is the broker's handler. It holds the keys and the registry, and is what
@@ -107,6 +118,7 @@ type Server struct {
 	installations map[installationKey]*installation
 	log           *slog.Logger
 	now           func() time.Time
+	proofBound    time.Duration
 	// verify proves an installation is the registered target's, a field so a test
 	// counts it; production is github.VerifyAppAt.
 	verify func(r *http.Request, inst *installation) error
@@ -147,6 +159,7 @@ func NewServer(cfg *config.BrokerConfig, log *slog.Logger) (*Server, error) {
 		installations: map[installationKey]*installation{},
 		log:           log,
 		now:           time.Now,
+		proofBound:    proofBound,
 		verify:        verifyInstallation,
 	}
 
@@ -393,26 +406,34 @@ func (s *Server) proved(r *http.Request, inst *installation) (int, string, strin
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
 
-	if !inst.verified.IsZero() && s.now().Sub(inst.verified) < verifyEvery {
+	if !inst.verified.IsZero() && (s.now().Sub(inst.verified) < verifyEvery || s.now().Before(inst.proofRetryAt)) {
 		return 0, "", ""
 	}
 
-	err := s.verify(r, inst)
+	// ITS OWN BOUND, because this answers a caller that waits a limited time for a token this
+	// broker may already hold, and a stalled GitHub must not take that wait.
+	ctx, cancel := context.WithTimeout(r.Context(), s.proofBound)
+	defer cancel()
+
+	err := s.verify(r.WithContext(ctx), inst)
 
 	switch {
 	case err == nil:
-		inst.verified = s.now()
+		inst.verified, inst.proofRetryAt = s.now(), time.Time{}
 
 		return 0, "", ""
 	// THE CALLER WENT AWAY, which says nothing about the installation, and must not
 	// erase a proof a later outage would need.
-	case r.Context().Err() != nil, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	case r.Context().Err() != nil:
 		return http.StatusServiceUnavailable, codeUnavailable, "the installation could not be checked just now"
-	case errors.Is(err, github.ErrAppUnverifiable), github.Undecided(err):
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, github.ErrAppUnverifiable), github.Undecided(err):
 		s.log.Warn("could not prove an installation is the one registered", "deployment", inst.deployment,
 			"installation", inst.installationID, "error", err)
 
 		if !inst.verified.IsZero() {
+			inst.proofRetryAt = s.now().Add(proofRetry)
+
 			return 0, "", ""
 		}
 

@@ -16,7 +16,7 @@ Every control plane held its targets' GitHub App private keys and minted install
 
 **The broker mints only what a deployment's registration names**, scoped to what that deployment needs: exactly billet's permissions for the target, and for a repository target that repository alone. It refuses anything else in the same words whether it is another deployment's or no one's, so an answer says nothing about who else it serves, and it never asks GitHub for a caller it refused. An installation registered as a whole organization may belong to one deployment only, because its token reaches every repository the installation does; two deployments may share an installation by repository.
 
-**The broker proves an installation before minting**, at most hourly: a registry names ids an operator typed, and a wrong one would mint another owner's token for this caller. It uses `github.VerifyAppAt`, the check `billet check` runs on a key it holds.
+**The broker proves an installation before minting**, hourly, and an overdue proof GitHub could not answer within 10 s keeps the last one and is asked for again five minutes later, so a stall never keeps a held token from its caller: a registry names ids an operator typed, and a wrong one would mint another owner's token for this caller. It uses `github.VerifyAppAt`, the check `billet check` runs on a key it holds.
 
 **Could-not-tell is not no.** A broker that cannot answer, or GitHub not answering the broker, is `github.ErrTokenUnavailable`, which `github.Undecided` reads as could-not-tell. Only GitHub's own word says the App is not installed. A held token rides out silence until its last usable minute; a definite refusal is reported at once.
 
