@@ -178,35 +178,47 @@ func TestATargetsLongPollsShareOneConnection(t *testing.T) {
 		proto string
 		err   error
 	}
-	first := make(chan answer, 1)
-	go func() {
-		proto, err := get()
-		first <- answer{proto, err}
-	}()
-	<-entered
+	// EVERY WAIT IS ALSO A WAIT ON A POLL FAILING, which never reaches the handler
+	// and would otherwise hang here with nothing saying why.
+	guard := time.NewTimer(time.Minute)
+	defer guard.Stop()
 
-	answers := make(chan answer, polls-1)
+	answers := make(chan answer, polls)
+	awaitEntry := func() {
+		t.Helper()
+
+		select {
+		case <-entered:
+		case a := <-answers:
+			t.Fatalf("a poll ended before reaching the server: %q, %v", a.proto, a.err)
+		case <-guard.C:
+			t.Fatal("the polls did not all reach the server within a minute")
+		}
+	}
+
+	poll := func() {
+		proto, err := get()
+		answers <- answer{proto, err}
+	}
+
+	go poll()
+	awaitEntry()
+
 	for range polls - 1 {
-		go func() {
-			proto, err := get()
-			answers <- answer{proto, err}
-		}()
+		go poll()
 	}
 	for range polls - 1 {
-		<-entered
+		awaitEntry()
 	}
 
 	// Every poll is inside the handler at once, so none reused a socket another
 	// had finished with.
 	close(release)
 
-	for range polls - 1 {
+	for range polls {
 		if a := <-answers; a.err != nil || a.proto != "HTTP/2.0" {
 			t.Fatalf("a poll answered %q, %v; want HTTP/2.0", a.proto, a.err)
 		}
-	}
-	if a := <-first; a.err != nil || a.proto != "HTTP/2.0" {
-		t.Fatalf("the first poll answered %q, %v; want HTTP/2.0", a.proto, a.err)
 	}
 
 	if n := proxy.dialed.Load(); n != 1 {

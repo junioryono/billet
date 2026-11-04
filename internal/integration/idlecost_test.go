@@ -70,6 +70,7 @@ type idleSet struct {
 	group  string
 	labels []string
 	opened time.Time
+	polls  int
 }
 
 // idleFake is the GitHub a measurement's control planes talk to. pipelines and
@@ -85,7 +86,6 @@ type idleFake struct {
 	mu         sync.Mutex
 	sets       map[int]*idleSet
 	nextSet    int
-	polls      int
 	unexpected map[string]int
 }
 
@@ -316,15 +316,25 @@ func (f *idleFake) queue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f.mu.Lock()
-	f.polls++
-	f.mu.Unlock()
-
 	timer := time.NewTimer(f.park)
 	defer timer.Stop()
 
 	select {
 	case <-timer.C:
+		// Counted only when a poll runs its course: a client stuck inside one, or
+		// one that gave up on it, is not progress.
+		id, err := strconv.Atoi(idleQueueRoute.FindStringSubmatch(r.URL.Path)[1])
+		if err != nil {
+			f.refuse(w, r)
+
+			return
+		}
+
+		f.mu.Lock()
+		if s := f.sets[id]; s != nil {
+			s.polls++
+		}
+		f.mu.Unlock()
 	case <-r.Context().Done():
 	}
 
@@ -332,9 +342,10 @@ func (f *idleFake) queue(w http.ResponseWriter, r *http.Request) {
 }
 
 // idleReport is what the driver reads from the fake: when each organization's
-// sessions last opened, and every request it could not answer.
+// sessions last opened, how many of its polls have been answered, and every
+// request it could not answer.
 type idleReport struct {
-	Polls      int                    `json:"polls"`
+	Polled     map[string]int         `json:"polled"`
 	Opened     map[string][]time.Time `json:"opened"`
 	Unexpected map[string]int         `json:"unexpected"`
 }
@@ -343,8 +354,9 @@ func (f *idleFake) report(w http.ResponseWriter, _ *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	out := idleReport{Polls: f.polls, Opened: map[string][]time.Time{}, Unexpected: f.unexpected}
+	out := idleReport{Polled: map[string]int{}, Opened: map[string][]time.Time{}, Unexpected: f.unexpected}
 	for _, s := range f.sets {
+		out.Polled[s.org] += s.polls
 		if !s.opened.IsZero() {
 			out.Opened[s.org] = append(out.Opened[s.org], s.opened)
 		}
@@ -523,5 +535,9 @@ func TestTheIdleFakeHoldsARealClientIdle(t *testing.T) {
 
 	if fake.sets[set.ID].opened.IsZero() {
 		t.Fatal("the session opened and the fake recorded no time for it")
+	}
+
+	if fake.sets[set.ID].polls != 1 {
+		t.Fatalf("one answered poll was counted %d times", fake.sets[set.ID].polls)
 	}
 }
