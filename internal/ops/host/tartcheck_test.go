@@ -1,0 +1,273 @@
+package host
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/provider/tart"
+	"github.com/junioryono/billet/internal/state"
+)
+
+// A VERIFIED TART IMAGE IS WRITTEN ONLY ONCE EVERY HOST READS IT (ADR-021): a Mac's own
+// image commands hand the reference to tart as a name.
+func TestAVerifiedTartImageIsRefusedWhileARegisteredHostPredatesIt(t *testing.T) {
+	t.Parallel()
+
+	tier := func(image string, provider config.ProviderKind) []config.Tier {
+		return []config.Tier{{Label: "a", Provider: provider, Image: image}}
+	}
+
+	named := &config.Config{Tiers: tier("ghcr.io/a/b:1@verified", config.ProviderTart)}
+	unnamed := &config.Config{Tiers: tier("ghcr.io/a/b:1", config.ProviderTart)}
+	firecracker := &config.Config{Tiers: tier("ubuntu-2404-x64@verified", config.ProviderFirecracker)}
+
+	current := alloc.NodeWire{Name: "new-1", Max: nodeapi.VersionTartVerified}
+	older := alloc.NodeWire{Name: "old-1", Release: "v0.29.0", Max: nodeapi.VersionTartVerified - 1}
+	unsaid := alloc.NodeWire{Name: "unsaid-1"}
+	gone := alloc.NodeWire{Name: "gone-1", Max: 1, Decommissioned: "2026-10-26T00:00:00Z"}
+
+	for _, tc := range []struct {
+		name  string
+		cfg   *config.Config
+		hosts []alloc.NodeWire
+		want  string
+	}{
+		{name: "every host current", cfg: named, hosts: []alloc.NodeWire{current}},
+		{name: "an older host", cfg: named, hosts: []alloc.NodeWire{current, older}, want: "old-1 (v0.29.0)"},
+		{name: "a host that cannot say", cfg: named, hosts: []alloc.NodeWire{unsaid}, want: "unsaid-1"},
+		{name: "an older host decommissioned", cfg: named, hosts: []alloc.NodeWire{current, gone}},
+		{name: "no tier names it", cfg: unnamed, hosts: []alloc.NodeWire{older}},
+		{name: "another backend's spelling", cfg: firecracker, hosts: []alloc.NodeWire{older}},
+	} {
+		err := tartVerifiedBeforeEveryHost(tc.cfg, tc.hosts)
+
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("%s: refused: %v", tc.name, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("%s: answered %v, want %q", tc.name, err, tc.want)
+		}
+	}
+}
+
+func TestACheckNamesEveryTartTierNobodyVerified(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+
+	reportUnverifiedTartTiers(cli.Env{Stdout: &out}, &config.Config{Tiers: []config.Tier{
+		{Label: "plain", Provider: config.ProviderTart, Image: "ghcr.io/a/b:1"},
+		{Label: "checked", Provider: config.ProviderTart, Image: "ghcr.io/a/c:1@verified"},
+		{Label: "elsewhere", Provider: config.ProviderFirecracker, Image: "ubuntu-2404-x64@g1"},
+	}})
+
+	if !strings.Contains(out.String(), "tier plain boots ghcr.io/a/b:1, which nobody verified") {
+		t.Errorf("said %s", out.String())
+	}
+
+	for _, label := range []string{"checked", "elsewhere"} {
+		if strings.Contains(out.String(), label) {
+			t.Errorf("named %s: %s", label, out.String())
+		}
+	}
+}
+
+// fakeReporter answers for the host.
+type fakeReporter struct {
+	images []tart.VerifiedImage
+	slots  tart.SlotReport
+	free   uint64
+	size   int64
+}
+
+func (f fakeReporter) VerifiedImages(context.Context) ([]tart.VerifiedImage, error) {
+	return f.images, nil
+}
+
+func (fakeReporter) RefreshDeadlines(context.Context, tart.RunnerWindow) ([]string, error) {
+	return nil, nil
+}
+func (f fakeReporter) Slots(context.Context) (tart.SlotReport, error) { return f.slots, nil }
+func (f fakeReporter) StoreSpace(tart.VerifiedRecord) (uint64, int64, error) {
+	return f.free, f.size, nil
+}
+
+func TestACheckSaysWhatEachVerifiedImageHolds(t *testing.T) {
+	t.Parallel()
+
+	const key = "ghcr.io/a/b:1"
+
+	record := tart.VerifiedRecord{Image: key, Base: "base-1", Runner: "2.337.0", GuestOS: "darwin", VerifiedAt: time.Now()}
+	past := time.Now().Add(-time.Hour)
+
+	for _, tc := range []struct {
+		name  string
+		image tart.VerifiedImage
+		free  uint64
+		want  []string
+	}{
+		{name: "no record", image: tart.VerifiedImage{}, want: []string{"NOT verified", "billet images verify " + key}},
+		{
+			name: "only an invalid record", want: []string{"NOT verified"},
+			image: tart.VerifiedImage{Records: []tart.VerifiedRecord{func() tart.VerifiedRecord {
+				bad := record
+				bad.Invalid = "changed"
+
+				return bad
+			}()}},
+		},
+		{
+			name: "only a withdrawn digest", want: []string{"NOT verified"},
+			image: tart.VerifiedImage{Withdrawn: []string{"sha256:0"}, Records: []tart.VerifiedRecord{func() tart.VerifiedRecord {
+				bad := record
+				bad.Digest = "sha256:0"
+
+				return bad
+			}()}},
+		},
+		{
+			name: "a good one", free: 1 << 40,
+			image: tart.VerifiedImage{Records: []tart.VerifiedRecord{record}},
+			want:  []string{"as base-1, runner 2.337.0", "two bases of this macOS image"},
+		},
+		{
+			name: "past its window", free: 1 << 40,
+			image: tart.VerifiedImage{
+				Records: []tart.VerifiedRecord{record}, Deadlines: map[string]time.Time{"2.337.0": past},
+			},
+			want: []string{"went past GitHub's window"},
+		},
+		{
+			name: "keeps yielding", free: 1 << 40,
+			image: tart.VerifiedImage{Records: []tart.VerifiedRecord{record}, Yields: 3},
+			want:  []string{"last 3 verification(s) yielded", "local down --node", "--no-yield"},
+		},
+		{
+			name: "no room", free: 1 << 30,
+			image: tart.VerifiedImage{Records: []tart.VerifiedRecord{record}},
+			want:  []string{"only 1 GiB free and its base is 80 GiB"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var out bytes.Buffer
+
+			reportTartImage(cli.Env{Stdout: &out}, fakeReporter{free: tc.free, size: 80 << 30}, key, tc.image, nil)
+
+			for _, want := range tc.want {
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("said %q, want %q", out.String(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestACheckNamesAWindowItCouldNotAsk(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+
+	reportTartImage(cli.Env{Stdout: &out}, fakeReporter{free: 1 << 40}, "k", tart.VerifiedImage{
+		Records: []tart.VerifiedRecord{{Base: "b", Runner: "2.337.0"}},
+	}, []string{"2.337.0"})
+
+	if !strings.Contains(out.String(), "its window is UNKNOWN") {
+		t.Fatalf("said %s", out.String())
+	}
+}
+
+func TestACheckNamesASlotCountThatDiffersAndGuestsItCannotAccountFor(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+
+	reportTartSlots(t.Context(), cli.Env{Stdout: &out}, fakeReporter{slots: tart.SlotReport{
+		Recorded: 2, Held: 1, Limits: map[string]int{"abc": 3, "def": 2},
+		Uncounted: []string{"pid 7, someone"},
+	}})
+
+	for _, want := range []string{"1 of 2 macOS guest slots held", "deployment abc names a limit of 3", "pid 7, someone"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("said %q, want %q", out.String(), want)
+		}
+	}
+
+	if strings.Contains(out.String(), "deployment def") {
+		t.Errorf("named a deployment that agrees: %s", out.String())
+	}
+}
+
+// --node STOPS THE NODE ALONE: no seal, the server left running, and the deployment
+// keeps admitting work, which a plain `down` on a Mac running both roles does not.
+func TestDownOfTheNodeAloneLeavesTheServerAndAdmission(t *testing.T) {
+	asLinux(t)
+
+	cfgPath, stateDir := downConfig(t, true)
+	db := openLedger(t, stateDir)
+
+	f := stageDown(t, &fakeConverger{}, deploy.NodeUnitName)
+
+	out := capture(t, func() {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath, nodeOnly: true}); err != nil {
+			t.Errorf("refused: %v", err)
+		}
+	})
+
+	want := []string{"lock", "stop " + deploy.NodeUnitName, "disable " + deploy.NodeUnitName}
+	if strings.Join(f.trace, " → ") != strings.Join(want, " → ") {
+		t.Errorf("down did:\n  %s\nwant:\n  %s", strings.Join(f.trace, " → "), strings.Join(want, " → "))
+	}
+
+	if got := admissionNow(t, db); got.Mode == state.AdmissionSealed {
+		t.Errorf("the deployment was sealed: %+v", got)
+	}
+
+	if !strings.Contains(out, "SKIPPED by --node") {
+		t.Errorf("the report does not say what it left alone:\n%s", out)
+	}
+}
+
+func TestDownOfTheNodeAloneNeedsANode(t *testing.T) {
+	asLinux(t)
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "billet.yaml")
+
+	body := `server:
+  listen: 127.0.0.1:7717
+  state_dir: ` + filepath.Join(dir, "server-state") + `
+  max_vcpu: 8
+  max_memory: 32GiB
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: ` + filepath.Join(dir, "key.pem") + `
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath, nodeOnly: true})
+	if err == nil || !strings.Contains(err.Error(), "declares no node") {
+		t.Fatalf("answered %v", err)
+	}
+}

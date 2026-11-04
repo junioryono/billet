@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -619,6 +620,18 @@ func PullTartImages(ctx context.Context, env cli.Env, cfg *config.Config, only s
 			"names one")
 	}
 
+	// A VERIFIED IMAGE IS NEVER PULLED INTO THE SHARED STORE, where tart could replace a
+	// digest another deployment pins (ADR-021). Its verification pulls it in a store of
+	// its own.
+	images = slices.DeleteFunc(images, func(image string) bool {
+		_, verified := config.TartVerifiedImage(image)
+		if verified {
+			fmt.Fprintf(env.Stdout, "image    %-56s not pulled here; `billet images verify` fetches it\n", image)
+		}
+
+		return verified
+	})
+
 	for _, image := range images {
 		// ALREADY PRESENT IS NOT AN ERROR AND NOT A RE-FETCH. These are tens of
 		// gigabytes; re-pulling one an operator already has because a second tier
@@ -685,6 +698,11 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	diskFlag := fs.String("disk", "",
 		"grow the probe's root disk to this size before boot (default: the largest disk a "+
 			"firecracker tier asks for, else "+verifyDiskFallback.String()+")")
+	noYield := fs.Bool("no-yield", false,
+		"on a Mac, keep a macOS probe's slot when a job asks for it; refused while the node runs")
+	digest := fs.String("digest", "",
+		"on a Mac, pull this digest rather than what the tag names now, which also takes back "+
+			"one that was unpromoted")
 
 	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
@@ -693,6 +711,16 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 
 	if rest == "" {
 		return errors.New("usage: billet images <pull|refresh|compatible|verify|due|list|reap|promote|unpromote>")
+	}
+
+	// A TART IMAGE NAMES NO GENERATION: its reference is what a tier names, and the
+	// verification makes the record. An unreadable file is the load's to report below.
+	if cfg, err := config.Load(*cfgPath); err == nil && cfg.Node != nil && cfg.Node.Provider == config.ProviderTart {
+		return cmdImagesVerifyTart(ctx, env, cfg, rest, *digest, *noYield)
+	}
+
+	if *noYield || *digest != "" {
+		return errors.New("billet images verify: --no-yield and --digest are for a tart node's images")
 	}
 
 	// THE GENERATION IS REQUIRED, not defaulted, for the same reason the provider
@@ -1580,6 +1608,15 @@ func cmdImagesPromote(ctx context.Context, env cli.Env, args []string, verified 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
+	}
+
+	if cfg.Node != nil && cfg.Node.Provider == config.ProviderTart {
+		if verified {
+			return errors.New(name + ": on a tart node, `billet images verify` makes the record a " +
+				"launch resolves, since only a boot can")
+		}
+
+		return cmdImagesUnpromoteTart(ctx, env, cfg, rest)
 	}
 
 	if cfg.Node == nil || cfg.Node.Ceph == nil {

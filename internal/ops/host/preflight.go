@@ -803,6 +803,13 @@ func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
 	}
 
 	for _, image := range tierImages {
+		// A verified image is in no shared cache; reportTartVerified says what it is.
+		if _, verified := config.TartVerifiedImage(image); verified {
+			continue
+		}
+
+		fmt.Fprintf(env.Stdout, "image    %-56s boots what the tag names, which nobody verified\n", image)
+
 		if p.Pulled(ctx, image) {
 			fmt.Fprintf(env.Stdout, "image    %-56s pulled\n", image)
 
@@ -818,12 +825,14 @@ func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
 		fmt.Fprintf(env.Stdout, "         fetch them with `billet images pull` (each is tens of GB)\n")
 	}
 
+	reportTartVerified(ctx, env, cfg, tierImages)
+
 	// SAID, BECAUSE THE CHECK IS STILL NARROWER THAN IT LOOKS: a pulled image is
 	// not proof that its guest carries the tart guest agent the registration
 	// delivery needs, nor that a macOS guest slot is free under Apple's two-guest
 	// licence. Both surface at launch, not here.
-	fmt.Fprintf(env.Stdout, "         (read only — launching also needs the tart guest agent inside the "+
-		"image and a free macOS guest slot under Apple's two-VM licence)\n")
+	fmt.Fprintf(env.Stdout, "         (read only — an image nobody verified also needs the tart guest "+
+		"agent inside it, and every macOS start a free guest slot under Apple's two-VM licence)\n")
 
 	return nil
 }

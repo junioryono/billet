@@ -77,6 +77,43 @@ Both commands in that order, always: `chown` clears the setuid bit (measured), a
 
 softnet blocks the private address space, which includes the guest's DHCP resolver, so egress keeps working while name resolution dies and every job fails to clone. billet configures a public resolver in the guest before delivering the registration and proves resolution before the job starts; `node.tart.untrusted_dns` chooses the resolver.
 
+## Boot only what billet verified
+
+A Tart tier boots whatever reference it names, and nothing boots that image before a job does. Add `@verified` and the tier boots only a copy of what billet booted on that Mac ([ADR-021](../reference/decisions/adr-021-tart-images-verified-not-published.md)):
+
+```yaml
+image: ghcr.io/cirruslabs/macos-tahoe-xcode:26@verified   # a registry reference
+image: macos-26@verified                                  # or a VM you built on this Mac
+```
+
+```bash
+billet images verify ghcr.io/cirruslabs/macos-tahoe-xcode:26 --config "$CFG"
+```
+
+A verification pulls a remote image by digest into a tart store of its own, so nothing in the store your other images live in moves. It keeps the result as a local VM named `billetbase-…`, which `tart list` shows and a job never runs, boots a clone of it with the network its tiers use, and asks the guest for its runner's version and for Docker, Buildx and Compose on Linux or `xcodebuild` on macOS. It records the base only when the guest answered and the clone is proved gone. A job then clones that base: locally, with no network, and with no fallback to the registry. Nothing the guest printed is quoted back, and the image's bytes stay on the Mac, two bases of each image, whatever happens to a tag.
+
+The daily refresh verifies a remote `@verified` reference again when its tag names a new digest, and asks GitHub about each recorded runner's window whatever `release.automatic` says. A job refuses to launch, naming the command that fixes it, when the base is gone, its files changed since it was probed, or its runner is past GitHub's window. A VM you built yourself is verified again only when you ask. `billet images unpromote <image>@<base>` takes a base back: its digest stays withdrawn, so a tag that still names it does not bring it back, and `billet images verify <image> --digest <digest>` is how you clear that.
+
+`billet images verify` needs `node.state_dir` on the same filesystem as `TART_HOME`, and room for one more copy of the image while its private store exists. An image published with a stacked disk is refused, since its layers would stay behind in the store that is deleted. A `@verified` launch's clone runs with tart's automatic pruning off, so a full disk fails the launch rather than evicting another tier's cached image.
+
+What billet asserts is what it can prove from inside a booted guest: the runner, its window, and the toolchain entry points a job uses. It does not assert parity with GitHub's own images. A reference without `@verified` keeps working, and `billet check` names every tier that boots an image nobody verified. How many stopped copies of macOS a Mac may hold is your own position under the macOS licence, whose section 2B(iii) speaks of installing as well as running copies: a verified macOS image means two bases, a private copy while a verification runs, and a clone per running job. If you read it as counting stopped copies, do not name a macOS image `@verified`.
+
+### macOS slots
+
+Apple's grant allows two macOS guests per Mac. Every macOS guest billet starts, a job's or a probe's, holds one of `nodes[].macos_vm_limit` slots for exactly as long as its process lives, through billet's own death or restart, and no elapsed time releases one. Every Linux guest billet starts carries a token instead. A start also counts each running `tart run` and `tart create --from-ipsw` that holds neither as a macOS guest, an operator's Linux VM included, and refuses past the limit or when it cannot read the host's processes. A Linux guest started by a billet from before this change carries no token, so expect it to count as macOS until its job ends after you upgrade.
+
+A job that needs a slot a probe holds asks the probe to yield and waits about a minute, and the verification ends as "yielded to a job"; the next refresh, or you, runs it again. A probe whose verifier died is removed by the next job that needs its slot. A probe cannot start until the node has registered, because the control plane is what tells it the limit, nor while the limit is used up.
+
+If a Mac's slots are always busy, a probe may yield every time, and `billet check` reports an image that keeps yielding beside its runner's deadline. The path that always finishes is to stop every node on that store, run `billet images verify <image> --no-yield`, and start them again:
+
+```bash
+billet local down --node --config "$CFG"     # drains this node's jobs and exits; admission is untouched
+billet images verify <image> --no-yield --config "$CFG"
+billet local up --config "$CFG"
+```
+
+Not a plain `billet local down`, which on a Mac that also runs the control plane stops both roles and seals the deployment, and not `billet drain`, which seals the whole deployment. Deployments sharing a store must name one limit, and `billet check` says which does not. The slots cover one store, which is how billet installs a Mac node: a VM another account starts on the same Mac is invisible to them, as it already is to `macos_vm_limit`.
+
 ## What the agents are
 
 `billet local up` writes `sh.billet.node.plist` and `sh.billet.server.plist` as launch agents, clears any disabled override, bootstraps them and proves each held its process. Two settings inside them were measured: a launch agent does not inherit your shell's `PATH` (launchd's default has no Homebrew prefix, so an agent without it registers and then refuses all work with `exec: "tart": executable file not found`), and launchd's default `ExitTimeOut` is five seconds, not the twenty the man page says, so the plists set 88200 to match the Linux unit, because the node answers SIGTERM by draining for as long as its jobs run. Never set it to zero; launchd reads zero as infinity.

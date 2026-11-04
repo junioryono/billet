@@ -36,6 +36,8 @@ type downOptions struct {
 	// concurrent `up` bootstraps the node whose definition is about to be
 	// deleted.
 	locked bool
+	// nodeOnly stops this host's node alone and seals nothing.
+	nodeOnly bool
 
 	configPath string
 	reason     string
@@ -77,6 +79,9 @@ func cmdLocalDown(ctx context.Context, env cli.Env, args []string) error {
 	withoutProof := fs.Bool("without-compute-proof", false,
 		"stop once the LEDGER is quiet, without asking each host what it is actually "+
 			"running (faster, and it cannot see compute whose lease has already gone)")
+	nodeOnly := fs.Bool("node", false,
+		"stop this host's node alone, which drains its own jobs and exits, and leave the control "+
+			"plane and the deployment's admission as they are")
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -89,7 +94,7 @@ func cmdLocalDown(ctx context.Context, env cli.Env, args []string) error {
 
 	return runLocalDown(ctx, env, downOptions{
 		configPath: *cfgPath, reason: *reason, timeout: *timeout,
-		dryRun: *dryRun, force: *force, withoutProof: *withoutProof,
+		dryRun: *dryRun, force: *force, withoutProof: *withoutProof, nodeOnly: *nodeOnly,
 	})
 }
 
@@ -99,9 +104,16 @@ func runLocalDown(ctx context.Context, env cli.Env, o downOptions) error {
 		return err
 	}
 
+	// A MAC THAT ALSO RUNS THE CONTROL PLANE IS WHY THIS EXISTS: a plain `down` stops both
+	// roles and seals the deployment, and all an operator wanted was this node stopped so
+	// nothing is placed here while a macOS image is verified (ADR-021).
+	if o.nodeOnly && cfg.Node == nil {
+		return fmt.Errorf("%s declares no node, so --node has nothing to stop", o.configPath)
+	}
+
 	req := lifeops.UpRequest{
 		ConfigPath: o.configPath,
-		WantServer: cfg.Server != nil,
+		WantServer: cfg.Server != nil && !o.nodeOnly,
 		WantNode:   cfg.Node != nil,
 	}
 	req.KeyPaths = app.KeyFilePaths(cfg)
@@ -235,6 +247,15 @@ func refuseForeignBuilds(services []lifeops.RunningFacts, force bool) error {
 func sealForShutdown(ctx context.Context, env cli.Env, c converger, cfg *config.Config, req lifeops.UpRequest,
 	running []lifeops.RunningFacts, o downOptions,
 ) (int64, bool, error) {
+	if o.nodeOnly {
+		fmt.Fprintf(env.Stdout, "seal     SKIPPED by --node: the deployment keeps admitting work, and no\n")
+		fmt.Fprintf(env.Stdout, "         control plane places anything on a node that has stopped. Stopping\n")
+		fmt.Fprintf(env.Stdout, "         it below drains the jobs already on it; `billet local up` starts it\n")
+		fmt.Fprintf(env.Stdout, "         again.\n\n")
+
+		return 0, false, nil
+	}
+
 	if !req.WantServer {
 		fmt.Fprintf(env.Stdout, "seal     SKIPPED: this host runs a node and no control plane, so it has\n")
 		fmt.Fprintf(env.Stdout, "         no admission ledger to seal. Stopping the node below drains the\n")
