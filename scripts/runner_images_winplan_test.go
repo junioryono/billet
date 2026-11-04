@@ -1382,7 +1382,93 @@ func TestTheWindowsDriverRestoresPagingBeforeItsVerdict(t *testing.T) {
 	if restore < 0 || managed < 0 || verdict < 0 || restore > verdict || managed > verdict {
 		t.Fatalf("paging is not restored before the verdict: %d, %d, %d", restore, managed, verdict)
 	}
-	if strings.Index(driver, "a page file appeared during the build") > restore {
-		t.Error("the driver does not refuse a file before it restores paging")
+	refuse := strings.Index(driver, "if (Test-Path -LiteralPath 'C:\\pagefile.sys') {\n\t\t\tthrow 'a page file appeared during the build")
+	if refuse < 0 || refuse > restore {
+		t.Errorf("the driver does not refuse a file before it restores paging: %d, %d", refuse, restore)
+	}
+}
+
+// THE TASK CAN START BETWEEN THE ENTRY POINT'S TWO READS OF IT, and a machine whose runner
+// has just started must not be stopped for that. One that ended, by both reads, is refused.
+func TestTheWindowsEntryJudgesItsTaskByBothReads(t *testing.T) {
+	t.Parallel()
+
+	pwsh, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("no pwsh on this machine, so nothing here can run the entry point")
+	}
+
+	entry, err := filepath.Abs(filepath.Join("windows", "billet-runner.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// EVERYTHING ELSE IT TOUCHES IS WINDOWS'S, and shadowed: a function wins over a cmdlet.
+	const stubs = `$global:states = @($env:STUB_STATES -split ',')
+$global:results = @($env:STUB_RESULTS -split ',')
+function New-Item { }
+function Set-Acl { }
+function Set-Content { }
+function Set-LocalUser { }
+function New-ScheduledTaskAction { }
+function New-ScheduledTaskSettingsSet { }
+function Register-ScheduledTask { }
+function Start-ScheduledTask { }
+function Start-Sleep { }
+function New-Object {
+	if ($args[0] -like 'Security.AccessControl.*') {
+		$a = [pscustomobject]@{}
+		$a | Add-Member ScriptMethod SetAccessRuleProtection { param($p, $q) }
+		$a | Add-Member ScriptMethod AddAccessRule { param($r) }
+		return $a
+	}
+	Microsoft.PowerShell.Utility\New-Object @args
+}
+function Get-ScheduledTask {
+	$state = $global:states[0]
+	if ($global:states.Count -gt 1) { $global:states = $global:states[1..($global:states.Count - 1)] }
+	[pscustomobject]@{ State = $state }
+}
+function Get-ScheduledTaskInfo {
+	$result = $global:results[0]
+	if ($global:results.Count -gt 1) { $global:results = $global:results[1..($global:results.Count - 1)] }
+	[pscustomobject]@{ LastTaskResult = [int]$result }
+}
+& $env:STUB_ENTRY
+`
+
+	for name, tc := range map[string]struct {
+		states, results string
+		wantFail        bool
+	}{
+		"running at the first read":     {states: "Running", results: "267011"},
+		"not yet run, then running":     {states: "Ready,Running", results: "267011"},
+		"started between the two reads": {states: "Ready,Running", results: "267009"},
+		"queued, then running":          {states: "Queued,Running", results: "267045"},
+		"a result, and running by then": {states: "Ready,Running", results: "0"},
+		"ended, by both reads":          {states: "Ready,Ready", results: "1", wantFail: true},
+		"never left not yet run":        {states: "Ready", results: "267011", wantFail: true},
+		"ended cleanly, by both reads":  {states: "Ready,Ready", results: "0", wantFail: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			harness := filepath.Join(t.TempDir(), "harness.ps1")
+			if err := os.WriteFile(harness, []byte(stubs), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.CommandContext(t.Context(), pwsh, "-NoProfile", "-NonInteractive", "-File", harness)
+			cmd.Env = append(os.Environ(), "STUB_ENTRY="+entry, "STUB_STATES="+tc.states, "STUB_RESULTS="+tc.results,
+				"ACTIONS_RUNNER_INPUT_JITCONFIG=registration")
+
+			out, err := cmd.CombinedOutput()
+			if tc.wantFail != (err != nil) {
+				t.Fatalf("the entry point answered %v, want a failure %v:\n%s", err, tc.wantFail, out)
+			}
+			if tc.wantFail && !strings.Contains(string(out), "billet-runner: the runner's task") {
+				t.Errorf("it failed for another reason:\n%s", out)
+			}
+		})
 	}
 }

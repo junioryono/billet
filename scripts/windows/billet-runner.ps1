@@ -84,13 +84,22 @@ Register-ScheduledTask -TaskName $task -Action $action -Settings $settings -User
 Start-ScheduledTask -TaskName $task
 
 # STARTING IT SAYS NOTHING OF WHETHER THE LOGON WORKED, and this script is the last thing
-# that can still end the machine for a task that never ran. 267011 is "has not yet run".
+# that can still end the machine for a task that never ran. 267009 is "is running", 267011
+# "has not yet run" and 267045 "is queued".
+#
+# THE STATE AND THE RESULT ARE TWO READS, and a task can start between them. So a result
+# that says it ended is believed only once the state, read after it, says so too: otherwise
+# this stops a machine whose runner has just started.
 for ($i = 0; $i -lt 60; $i++) {
 	if ((Get-ScheduledTask -TaskName $task).State -eq 'Running') {
 		return
 	}
 
-	if ((Get-ScheduledTaskInfo -TaskName $task).LastTaskResult -ne 267011) {
+	if (@(267009, 267011, 267045) -notcontains (Get-ScheduledTaskInfo -TaskName $task).LastTaskResult) {
+		if ((Get-ScheduledTask -TaskName $task).State -eq 'Running') {
+			return
+		}
+
 		throw "billet-runner: the runner's task ended at once"
 	}
 
