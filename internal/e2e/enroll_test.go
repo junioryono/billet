@@ -342,6 +342,7 @@ var operationalRoutes = []struct {
 	{http.MethodPost, "/v1/nodes/epyc-1/result"},
 	{http.MethodPost, "/v1/nodes/epyc-1/jit"},
 	{http.MethodPost, "/v1/nodes/epyc-1/renew"},
+	{http.MethodPost, "/v1/nodes/epyc-1/custody"},
 	{http.MethodGet, "/v1/nodes/epyc-1/launched"},
 	{http.MethodPost, "/v1/nodes/epyc-1/leases/l1/bind"},
 }

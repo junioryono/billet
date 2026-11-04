@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -118,7 +119,7 @@ func TestACustodyClaimMovesOnlyOnSilenceAndOnSuccess(t *testing.T) {
 		goAway(a)
 
 		_, err := c.ClaimCustody(t.Context(), []string{"l1"})
-		if err == nil || nodeclient.IsNoAnswerForTest(err) {
+		if err == nil || nodeclient.IsNoAnswerForTest(err) || !strings.Contains(err.Error(), "503") {
 			t.Fatalf("ClaimCustody = %v, want B's refusal", err)
 		}
 
@@ -141,7 +142,7 @@ func TestACustodyClaimMovesOnlyOnSilenceAndOnSuccess(t *testing.T) {
 		a.mu.Unlock()
 
 		_, err := c.ClaimCustody(t.Context(), []string{"l1"})
-		if err == nil || nodeclient.IsNoAnswerForTest(err) {
+		if err == nil || nodeclient.IsNoAnswerForTest(err) || !strings.Contains(err.Error(), "503") {
 			t.Fatalf("ClaimCustody = %v, want A's refusal", err)
 		}
 
@@ -166,6 +167,55 @@ func TestACustodyClaimMovesOnlyOnSilenceAndOnSuccess(t *testing.T) {
 			t.Fatalf("an unanswered claim moved the process to %s", got)
 		}
 	})
+}
+
+// A CLAIM STARTS FROM THE CONTROLLER IT LAST REACHED, and goes round from there: asking
+// the first one named each time would hold every claim behind a controller that has gone.
+func TestACustodyClaimStartsFromTheControllerItLastReached(t *testing.T) {
+	t.Parallel()
+
+	a, b, c := twoControllers(t)
+
+	silent := func(path string, _ int) bool { return path == custodyRoute }
+
+	a.mu.Lock()
+	a.drop = silent
+	a.mu.Unlock()
+
+	if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); err != nil {
+		t.Fatalf("the claim that passes over A: %v", err)
+	}
+
+	asked := a.sent(custodyRoute)
+
+	a.mu.Lock()
+	a.drop = nil
+	a.mu.Unlock()
+
+	if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); err != nil {
+		t.Fatalf("the next claim: %v", err)
+	}
+
+	if n := a.sent(custodyRoute); n != asked {
+		t.Fatalf("a claim from B asked A %d more times", n-asked)
+	}
+
+	if n := b.sent(custodyRoute); n != 2 {
+		t.Fatalf("B was asked %d times, want both", n)
+	}
+
+	// AND ROUND AGAIN, past the last one named.
+	b.mu.Lock()
+	b.drop = silent
+	b.mu.Unlock()
+
+	if _, err := c.ClaimCustody(t.Context(), []string{"l1"}); err != nil {
+		t.Fatalf("the claim that passes over B: %v", err)
+	}
+
+	if got := c.Endpoint().String(); got != endpointOf(t, a.srv.URL) {
+		t.Fatalf("the process is on %s, want A", got)
+	}
 }
 
 // A CLAIM IS SENT WHATEVER WAS NEGOTIATED. That was with another controller: one that
@@ -485,13 +535,19 @@ func TestARecoverySupersededInTheOrdinaryLoopNeverRegistersAgain(t *testing.T) {
 
 	done := make(chan error, 1)
 
-	go func() {
+	var running sync.WaitGroup
+
+	running.Go(func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
 			VCPU: testNodeVCPU, Memory: testNodeMemory, Provider: config.ProviderDocker, Deployment: deployment,
 			Log: slog.New(slog.DiscardHandler), Backoff: 20 * time.Millisecond, SweepEvery: 10 * time.Millisecond,
 			DrainTimeout: time.Hour, Ready: func() { ready.Store(true) },
 		})
-	}()
+	})
+	t.Cleanup(func() {
+		cancel()
+		running.Wait()
+	})
 
 	waitFor(t, func() bool { return len(heard.first()) > 0 })
 
@@ -622,9 +678,110 @@ func (g *pausedFollower) CustodyLeases() []string {
 	return g.followingCompute.CustodyLeases()
 }
 
-// THE FOLLOWING IS JOINED: Run does not return with a claim still to be sent, which
-// would be a process that has stopped still speaking for what it held.
+// THE FOLLOWING IS JOINED, from a superseded loop and from a stop's drain: Run does not
+// return with a claim still to be sent, which would be a process that has stopped still
+// speaking for what it held.
 func TestRunJoinsTheFollowingOfCustody(t *testing.T) {
+	const launched = "/v1/nodes/n1/launched"
+
+	for _, tc := range []struct {
+		name string
+		// stage leads to the supersession, with the running stop's cancel.
+		before func(a *controller, stopped *atomic.Bool)
+		stage  func(t *testing.T, a *controller, cancel func(), stopped *atomic.Bool)
+	}{
+		{
+			name: "a superseded loop",
+			before: func(a *controller, _ *atomic.Bool) {
+				a.supersede = func(path string, _ int) bool { return path == pollRoute }
+			},
+			stage: func(*testing.T, *controller, func(), *atomic.Bool) {},
+		},
+		{
+			name: "a stop's drain",
+			before: func(a *controller, stopped *atomic.Bool) {
+				a.unavailable = func(path string, _ int) bool { return path == launched }
+				a.supersede = func(path string, _ int) bool { return path == launched && stopped.Load() }
+			},
+			stage: func(t *testing.T, a *controller, cancel func(), stopped *atomic.Bool) {
+				t.Helper()
+				waitFor(t, func() bool { return a.sent(launched) >= 2 })
+				cancel()
+				stopped.Store(true)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newController(t)
+
+			var stopped atomic.Bool
+
+			a.mu.Lock()
+			tc.before(a, &stopped)
+			a.mu.Unlock()
+
+			c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			compute := &pausedFollower{
+				followingCompute: newFollowingCompute(c),
+				entered:          make(chan struct{}),
+				gate:             make(chan struct{}),
+			}
+
+			var release sync.Once
+
+			t.Cleanup(func() { release.Do(func() { close(compute.gate) }) })
+
+			cancel, done, _ := runDraining(t, c, compute)
+
+			tc.stage(t, a, cancel, &stopped)
+
+			select {
+			case <-compute.entered:
+			case <-time.After(15 * time.Second):
+				t.Fatal("the process never asked what it holds")
+			}
+
+			compute.setHolding(false)
+
+			// THE WAIT ENDS WITHIN ITS SWEEP, 10 ms here, and only the join can hold Run
+			// past it.
+			select {
+			case err := <-done:
+				t.Fatalf("Run returned with %v while the following was still running", err)
+			case <-time.After(500 * time.Millisecond):
+			}
+
+			release.Do(func() { close(compute.gate) })
+
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				t.Fatal("Run did not return once the following could end")
+			}
+		})
+	}
+}
+
+// countingFollower holds nothing it can name.
+type countingFollower struct {
+	*followingCompute
+
+	asked atomic.Int32
+}
+
+func (f *countingFollower) CustodyLeases() []string {
+	f.asked.Add(1)
+
+	return nil
+}
+
+// A PROCESS NAMING NOTHING SENDS NOTHING: its claim would be a ledger's reads of nothing,
+// and an answer that could move it off the controller its lease calls are on.
+func TestAProcessNamingNothingClaimsNothing(t *testing.T) {
 	a := newController(t)
 
 	a.mu.Lock()
@@ -636,38 +793,21 @@ func TestRunJoinsTheFollowingOfCustody(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	compute := &pausedFollower{
-		followingCompute: newFollowingCompute(c),
-		entered:          make(chan struct{}),
-		gate:             make(chan struct{}),
-	}
-
-	var release sync.Once
-
-	t.Cleanup(func() { release.Do(func() { close(compute.gate) }) })
+	compute := &countingFollower{followingCompute: newFollowingCompute(c)}
 
 	_, done, _ := runDraining(t, c, compute)
 
-	select {
-	case <-compute.entered:
-	case <-time.After(15 * time.Second):
-		t.Fatal("the process never asked what it holds")
+	waitFor(t, func() bool { return compute.asked.Load() >= 3 })
+
+	if n := a.sent(custodyRoute); n != 0 {
+		t.Fatalf("a process naming nothing claimed %d times", n)
 	}
 
 	compute.setHolding(false)
 
-	// THE WAIT ENDS WITHIN ITS SWEEP, 10 ms here, and only the join can hold Run past it.
-	select {
-	case err := <-done:
-		t.Fatalf("Run returned with %v while the following was still running", err)
-	case <-time.After(500 * time.Millisecond):
-	}
-
-	release.Do(func() { close(compute.gate) })
-
 	select {
 	case <-done:
 	case <-time.After(15 * time.Second):
-		t.Fatal("Run did not return once the following could end")
+		t.Fatal("the process did not stop once it held nothing")
 	}
 }

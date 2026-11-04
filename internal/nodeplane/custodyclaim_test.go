@@ -26,6 +26,8 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 	)
 
 	claimant := leaseOwner{node: "n1", incarnation: "p1", requestID: request}
+	// ANOTHER REQUEST, so a delivery that a claim wrote over would show.
+	delivered := leaseOwner{node: "n1", incarnation: "p1", requestID: request - 1}
 
 	seed := func(p *Plane, owner leaseOwner) {
 		p.mu.Lock()
@@ -49,8 +51,8 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 			held:  true, added: true, owner: claimant,
 		},
 		"delivered to the claimant": {
-			setup: func(_ *testing.T, p *Plane) { seed(p, claimant) },
-			held:  true, owner: claimant,
+			setup: func(_ *testing.T, p *Plane) { seed(p, delivered) },
+			held:  true, owner: delivered,
 		},
 		// A PROCESS THAT REACHED THE NEW CONTROLLER BEFORE IT LEARNED IT WAS SUPERSEDED
 		// adopted its own lease, with no request; a destroy then cannot find it.
@@ -156,6 +158,24 @@ func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
 	}
 }
 
+// WITH NO CURRENT PROCESS NOTHING SAYS AN ADOPTION IS THE CURRENT ONE'S, so it stands.
+func TestAClaimOnANodeWithNoCurrentProcessTakesNoAdoption(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	registerAs(t, p, "p2")
+	p.AdoptOwnership("n1", "p2", []string{"l9"})
+	p.ForgetForTest("n1")
+
+	if held, _ := p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}}); len(held) != 0 {
+		t.Fatalf("held = %v", held)
+	}
+
+	if owner, ok := ownerOf(p, "l9"); !ok || owner.incarnation != "p2" {
+		t.Fatalf("the owner is %+v (ok=%v), want the adoption standing", owner, ok)
+	}
+}
+
 // THE REQUEST COMES WITH THE LEASE, so a completion's destroy finds the process that
 // holds the compute. Without it the plane's only other answer is to broadcast to the
 // current process, which truthfully has nothing to remove, and the lease is released
@@ -233,6 +253,15 @@ func TestARestoredCompletionWaitsForAClaimOnAProcessThatDoesNotReportTheLease(t 
 			p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
 			p.AdoptOwnership("n1", "p2", []string{"l9"})
 		}, custodyClaimWindow, true},
+		// A DELIVERY IS NO GUESS: this plane sent the launch, so it asks that process.
+		{"delivered, not reported, inside the window", func(p *Plane) {
+			p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
+
+			p.mu.Lock()
+			defer p.mu.Unlock()
+
+			p.owners = map[string]leaseOwner{"l9": {node: "n1", incarnation: "p2", requestID: 7}}
+		}, 0, true},
 		{"reported, inside the window", func(p *Plane) {
 			p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
 		}, 0, true},
@@ -262,8 +291,10 @@ func TestARestoredCompletionWaitsForAClaimOnAProcessThatDoesNotReportTheLease(t 
 			now = now.Add(tc.sinceStart)
 			mu.Unlock()
 
-			// STILL THE NODE'S CURRENT PROCESS at the later clock, which silence would end.
-			p.Seen("n1", "p2")
+			// REGISTERED AGAIN AT THE LATER CLOCK: the window is the plane's first
+			// registration's, and a later one does not open it again.
+			registerAs(t, p, "p2")
+			tc.report(p)
 
 			done := make(chan error, 1)
 			go func() {

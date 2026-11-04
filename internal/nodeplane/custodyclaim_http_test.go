@@ -121,11 +121,17 @@ type readingStore struct {
 	openAnswers int32
 	// onOpen runs as the last open answer is given, with that read's context.
 	onOpen func(ctx context.Context)
+	// afterOpen is what a read past the open answers says; "ended" when nil.
+	afterOpen error
 }
 
 func (s *readingStore) Lease(ctx context.Context, id string) (*alloc.Lease, error) {
 	n := s.reads.Add(1)
 	if s.openAnswers > 0 && n > s.openAnswers {
+		if s.afterOpen != nil {
+			return nil, s.afterOpen
+		}
+
 		return nil, alloc.ErrLeaseNotFound
 	}
 
@@ -263,6 +269,29 @@ func TestALeaseThatEndsDuringACancelledClaimIsForgotten(t *testing.T) {
 		}
 
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// A STORE THAT COULD NOT ANSWER THE READ BACK KEEPS THE RECORD: could-not-tell is not an
+// end, and the process may still hold the compute it just claimed.
+func TestAClaimWhoseReadBackCouldNotBeAnsweredStands(t *testing.T) {
+	t.Parallel()
+
+	store := &readingStore{
+		fakeStore:   &fakeStore{lease: &alloc.Lease{ID: "l1", Node: "n1", RequestID: 7}},
+		openAnswers: 1,
+		afterOpen:   errors.New("busy"),
+	}
+	p, base := serve(t, store)
+	c := dial(t, base)
+
+	held, err := c.ClaimCustody(t.Context(), []string{"l1"})
+	if err != nil || len(held) != 1 {
+		t.Fatalf("ClaimCustody = %v, %v, want the lease held", held, err)
+	}
+
+	if !p.OwnsForTest("l1", "n1", c.Incarnation()) {
+		t.Fatal("a read that could not answer took the lease from the process that holds it")
 	}
 }
 

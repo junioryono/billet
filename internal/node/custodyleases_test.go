@@ -89,3 +89,19 @@ func (m *leaseMaker) launch(t *testing.T, r *Runner) {
 		t.Fatalf("Launch: %v", err)
 	}
 }
+
+// IN ONE ORDER, so a claim names the same thing each time and a log line can be compared.
+func TestAProcessNamesItsLeasesInOrder(t *testing.T) {
+	t.Parallel()
+
+	r := newLeaseMaker(t).runner
+
+	for _, id := range []string{"lease-h", "lease-b", "lease-f", "lease-a", "lease-g", "lease-c", "lease-e", "lease-d"} {
+		t.Cleanup(r.holdWhileLaunching(&alloc.Lease{ID: id}, "billet-"+id))
+	}
+
+	got := r.CustodyLeases()
+	if len(got) != 8 || !slices.IsSorted(got) {
+		t.Fatalf("the process names %v, want all eight in order", got)
+	}
+}
