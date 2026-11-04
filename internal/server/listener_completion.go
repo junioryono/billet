@@ -988,10 +988,12 @@ func (l *Listener) complete(ctx context.Context, job dispatch.Job) {
 }
 
 // deregisterCompleted withdraws a runner's GitHub registration and stops counting its
-// lease as a runner GitHub could still route a job to.
-func (l *Listener) deregisterCompleted(ctx context.Context, job dispatch.Job, lease *alloc.Lease) error {
+// lease as a runner GitHub could still route a job to. It reports whether both are done:
+// a mark that failed is no error, since it only leaves the lease counted, but it is not
+// finished either, and a later attempt has to write it.
+func (l *Listener) deregisterCompleted(ctx context.Context, job dispatch.Job, lease *alloc.Lease) (bool, error) {
 	if l.registry == nil {
-		return nil
+		return true, nil
 	}
 
 	var binding alloc.PoolRunner
@@ -1002,7 +1004,7 @@ func (l *Listener) deregisterCompleted(ctx context.Context, job dispatch.Job, le
 		binding, err = l.alloc.PoolRunnerByName(ctx, job.RunnerName)
 	}
 	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
-		return fmt.Errorf("server: resolve runner registration before teardown: %w", err)
+		return false, fmt.Errorf("server: resolve runner registration before teardown: %w", err)
 	}
 	if errors.Is(err, alloc.ErrLeaseNotFound) && lease != nil && lease.ID != "" {
 		binding.RunnerName = provider.InstanceName(lease.ID)
@@ -1029,7 +1031,7 @@ func (l *Listener) deregisterCompleted(ctx context.Context, job dispatch.Job, le
 	}
 	if err == nil && (removeID > 0 || removeName != "") {
 		if err := l.registry.RemoveRunner(ctx, removeID, removeName); err != nil {
-			return fmt.Errorf("server: remove runner %q before teardown: %w", removeName, err)
+			return false, fmt.Errorf("server: remove runner %q before teardown: %w", removeName, err)
 		}
 		// The runner is gone from GitHub. Stop counting this lease as a live
 		// runner even if the compute-destroy below retries, so a lingering
@@ -1041,11 +1043,13 @@ func (l *Listener) deregisterCompleted(ctx context.Context, job dispatch.Job, le
 			if err := l.alloc.MarkDeregistered(ctx, lease.ID); err != nil {
 				l.log.Warn("could not record runner deregistration; the lease stays counted until it terminalizes",
 					"tier", l.tier, "lease", lease.ID, "error", err)
+
+				return false, nil
 			}
 		}
 	}
 
-	return nil
+	return true, nil
 }
 
 func (l *Listener) destroyCompleted(
@@ -1055,7 +1059,7 @@ func (l *Listener) destroyCompleted(
 	outcome alloc.Phase,
 ) error {
 	if !l.deregisteredWhenParked(job) {
-		if err := l.deregisterCompleted(ctx, job, lease); err != nil {
+		if _, err := l.deregisterCompleted(ctx, job, lease); err != nil {
 			return err
 		}
 	}

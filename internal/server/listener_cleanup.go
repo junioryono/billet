@@ -189,10 +189,20 @@ func (l *Listener) startAttempts(ctx context.Context, pending []dispatch.Job) {
 //
 // WHAT IT RELEASED IS ROOM, and a tier waiting for it buys now rather than on its next
 // poll, which is up to a long poll away. The cleanup loop is woken only for what found no
-// room: an attempt that failed has its own backoff, and waking on that would spin.
+// room.
+//
+// ONE THAT LEFT ITS OBLIGATION DUE IS PUT BACK, however it failed. Most failures set their
+// own backoff, and a tombstone or a retirement that could not be written sets none, so
+// with every place taken each end would wake the next attempt at the same failure, at
+// the speed the ledger refuses it.
 func (l *Listener) endAttempt(requestID int64) {
 	l.mu.Lock()
 	delete(l.attempting, requestID)
+
+	if entry, pending := l.cleanup[requestID]; pending && entry.due(time.Now()) {
+		entry.failed(time.Now(), l.retryFirst, l.retryMax)
+	}
+
 	waiting := l.attemptsWaiting
 	l.attemptsWaiting = false
 	l.mu.Unlock()
@@ -235,6 +245,14 @@ func (l *Listener) attempt(ctx context.Context, job dispatch.Job) {
 
 	entry, pending := l.cleanup[job.RequestID]
 	if !pending {
+		l.mu.Unlock()
+
+		return
+	}
+
+	// A FORCE ON A LIVE LISTENER CLAIMS WHAT IT DESTROYS, and two destroys of one request
+	// would race for the node's command slot, and either's end would clear the other's mark.
+	if l.destroying[job.RequestID] {
 		l.mu.Unlock()
 
 		return

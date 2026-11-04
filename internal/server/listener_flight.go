@@ -222,14 +222,15 @@ func (l *Listener) deregisterBeforeParking(ctx context.Context, job dispatch.Job
 
 	lease, _, _ := l.completionRelease(job.RequestID)
 
-	if err := l.deregisterCompleted(ctx, job, lease); err != nil {
+	deregistered, err := l.deregisterCompleted(ctx, job, lease)
+	if err != nil {
 		l.log.Warn("could not withdraw a finished runner's registration; its lease stays counted and "+
 			"the cleanup loop asks again", "tier", l.tier, "request", job.RequestID, "error", err)
 
 		return false
 	}
 
-	return true
+	return deregistered
 }
 
 // deregisteredWhenParked says whether this delivery's registration was already withdrawn

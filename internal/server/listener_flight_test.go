@@ -1052,6 +1052,11 @@ func TestADestroyDoesNotStopTheNextMessage(t *testing.T) {
 				n := delivered
 				mu.Unlock()
 
+				// The launch runs beside the poll, so the runner may not be there yet.
+				for runner.launched() < 1 {
+					time.Sleep(time.Millisecond)
+				}
+
 				job := dispatch.Job{RunnerID: 41, RunID: 3, JobID: "job-3"}
 
 				switch n {
@@ -1420,4 +1425,105 @@ func (c *countingCompletions) AcknowledgePendingCompletion(context.Context, stri
 
 func (c *countingCompletions) PendingCompletions(context.Context, string) ([]state.PendingCompletion, error) {
 	return nil, nil
+}
+
+// removingCancels is a registry whose removal succeeds and whose caller's context then
+// ends, so the ledger refuses the mark that follows it.
+type removingCancels struct {
+	fakeRunnerRegistry
+
+	cancel context.CancelFunc
+}
+
+func (r *removingCancels) RemoveRunner(ctx context.Context, id int64, name string) error {
+	defer r.cancel()
+
+	return r.fakeRunnerRegistry.RemoveRunner(ctx, id, name)
+}
+
+// A MARK THAT FAILED IS NOT DONE. The lease stays counted, so the cleanup loop has to write
+// it again: told the removal was finished it never would, however long the destroy took,
+// and the finished runner would make a live one look surplus for all that time.
+func TestAFailedDeregistrationMarkIsAskedAgain(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("a-work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+
+	leases, err := a.Escrow(t.Context(), tiers[0].Label, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lease := leases[0]
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	registry := &removingCancels{cancel: cancel}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithBackgroundLaunches(), WithRunnerRegistry(registry))
+	l.running[7] = lease
+
+	job := dispatch.Job{RequestID: 7, Result: "succeeded"}
+
+	if !l.parkCompletion(ctx, job) {
+		t.Fatal("a completion with a running lease was not parked")
+	}
+	if len(registry.names) != 1 {
+		t.Fatalf("removed %v before parking, want the one removal", registry.names)
+	}
+	if l.deregisteredWhenParked(job) {
+		t.Fatal("a mark the ledger refused was recorded as done, so nothing would write it again")
+	}
+}
+
+// AN ATTEMPT THAT LEFT ITS OBLIGATION DUE WAITS ITS TURN, however it failed. With every
+// place taken each end wakes the next attempt, and one that set no backoff of its own
+// would go round at the speed the ledger refuses it.
+func TestAnAttemptThatLeftItsObligationDueBacksOff(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("a-work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithBackgroundLaunches(),
+		WithCleanupRetryPacing(time.Minute, time.Hour))
+
+	entry := &pendingCleanup{job: dispatch.Job{RequestID: 7}, retireOnly: true}
+	l.cleanup = map[int64]*pendingCleanup{7: entry}
+	l.attempting[7] = true
+
+	l.endAttempt(7)
+
+	if entry.due(time.Now()) {
+		t.Fatal("an obligation an attempt left due can be retried at once")
+	}
+	if l.attempting[7] {
+		t.Fatal("the attempt kept its place")
+	}
+}
+
+// A REQUEST A FORCE HAS CLAIMED IS NOT ALSO DESTROYED BY A RETRY: both would race for the
+// node's one command slot, and either's end would clear the other's claim.
+func TestAnAttemptLeavesARequestAForceClaimed(t *testing.T) {
+	t.Parallel()
+
+	destroys := 0
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		destroys++
+
+		return nil
+	}}
+
+	l := NewListener(nil, "a-work", &fakeSession{}, WithRunner(runner), WithBackgroundLaunches())
+	l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
+	l.destroying[7] = true
+
+	l.attempt(t.Context(), dispatch.Job{RequestID: 7})
+
+	if destroys != 0 {
+		t.Fatalf("destroyed %d times a request a force had claimed", destroys)
+	}
+	if !l.destroying[7] {
+		t.Fatal("the attempt cleared the force's claim")
+	}
 }
