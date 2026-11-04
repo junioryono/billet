@@ -1978,7 +1978,7 @@ type CustodyClaim struct {
 // not granted, and asked again.
 //
 // It answers what the claimant now holds, and which of those this call recorded.
-func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) (held, added []string) {
+func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) ([]string, []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1987,6 +1987,9 @@ func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) (h
 	}
 
 	current := p.nodes[node]
+
+	held := make([]string, 0, len(claims))
+	added := make([]string, 0, len(claims))
 
 	for _, claim := range claims {
 		id := claim.LeaseID

@@ -378,7 +378,9 @@ func (h *claimsHeard) respond(w http.ResponseWriter, r *http.Request) bool {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	_ = json.NewEncoder(w).Encode(nodeapi.ClaimCustodyResponse{Version: nodeapi.Version, Held: req.LeaseIDs}) //nolint:errcheck // the test's own server
+	if err := json.NewEncoder(w).Encode(nodeapi.ClaimCustodyResponse{Version: nodeapi.Version, Held: req.LeaseIDs}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 
 	return true
 }

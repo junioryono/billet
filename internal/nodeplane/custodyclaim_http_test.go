@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -323,8 +324,8 @@ func TestAProcessIsToldALeaseIsOverWithNoProcessRegistered(t *testing.T) {
 	}
 }
 
-// claimRaw is a claim the client would not send.
-func claimRaw(t *testing.T, base, incarnation string) *http.Response {
+// claimRaw is a claim the client would not send, and its status and body.
+func claimRaw(t *testing.T, base, incarnation string) (int, []byte) {
 	t.Helper()
 
 	body, err := json.Marshal(nodeapi.ClaimCustodyRequest{LeaseIDs: []string{"l1"}})
@@ -346,9 +347,14 @@ func claimRaw(t *testing.T, base, incarnation string) *http.Response {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { _ = resp.Body.Close() })
+	defer func() { _ = resp.Body.Close() }()
 
-	return resp
+	answer, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return resp.StatusCode, answer
 }
 
 // A CLAIM NAMING NO PROCESS GRANTS NOTHING TO NOBODY: the lease would have an owner
@@ -358,8 +364,8 @@ func TestACustodyClaimNamingNoProcessIsRefused(t *testing.T) {
 
 	p, base := serve(t, &fakeStore{lease: &alloc.Lease{ID: "l1", Node: "n1", RequestID: 7}})
 
-	if resp := claimRaw(t, base, ""); resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("a claim naming no process answered %s", resp.Status)
+	if status, _ := claimRaw(t, base, ""); status != http.StatusForbidden {
+		t.Fatalf("a claim naming no process answered %d", status)
 	}
 
 	if p.OwnsForTest("l1", "n1", "") {
@@ -374,8 +380,10 @@ func TestACustodyClaimReportsTheControllersVersion(t *testing.T) {
 
 	_, base := serve(t, &fakeStore{leaseErr: alloc.ErrLeaseNotFound})
 
+	_, answer := claimRaw(t, base, "p1")
+
 	var res nodeapi.ClaimCustodyResponse
-	if err := json.NewDecoder(claimRaw(t, base, "p1").Body).Decode(&res); err != nil {
+	if err := json.Unmarshal(answer, &res); err != nil {
 		t.Fatal(err)
 	}
 
