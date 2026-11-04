@@ -115,6 +115,13 @@ NODE_RELAY_RETRY = 1
 # every descriptor inside select()'s range. A connection past it is closed at
 # once, which is what the node's own listener would have done.
 NODE_RELAY_LIMIT = 64
+# How long the results passthrough goes on asking for a tunnel the node does not
+# answer before failing open. It cannot see a request inside the TLS it relays, so
+# a blob URL billet signed reaches GitHub if it fails open, and GitHub's "404 page
+# not found" ends the toolkit's upload where a wait would have saved it (#694). A
+# node's ordinary restart is shorter; a node gone for good costs each connection
+# this much, and the rest of what shares the origin then still works.
+RESULTS_NODE_WAIT = 30
 # How long the adapter waits for an answer that has not started arriving. It
 # begins once the request body is written -- every read and write before that is
 # bounded per operation by RELAY_TIMEOUT -- and every byte received resets it, so
@@ -181,6 +188,10 @@ WOULD_BLOCK = (BlockingIOError,) if ssl is None else (
     BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError)
 
 
+class NodeRefused(ConnectionError):
+    """The node answered and will not tunnel this session: nothing to wait out."""
+
+
 def read_headers(connection):
     data = bytearray()
     while b"\r\n\r\n" not in data:
@@ -219,19 +230,40 @@ def node_tunnel(upstream, authority=RESULTS_AUTHORITY):
         response, remainder = read_headers(connection)
         status = response.split(b"\r\n", 1)[0].split()
         if len(status) < 2 or status[1] != b"200":
-            raise ConnectionError("the Billet node refused the cache tunnel")
+            raise NodeRefused("the Billet node refused the cache tunnel")
         return connection, remainder
     except Exception:
         connection.close()
         raise
 
 
+def patient_tunnel(client, upstream, authority, wait, retry=None, now=time.monotonic,
+                   sleep=time.sleep):
+    """node_tunnel, asked again while the node does not answer, until wait is spent.
+
+    A refusal is an answer and is not asked again, and a client that has gone is
+    not waited for. The client is mid-TLS with whichever peer this reaches, so it
+    is told nothing until one exists.
+    """
+    retry = NODE_RELAY_RETRY if retry is None else retry
+    deadline = now() + wait
+    while True:
+        try:
+            return node_tunnel(upstream, authority)
+        except NodeRefused:
+            raise
+        except OSError:  # ConnectionError and a timeout among them
+            if now() + retry >= deadline or client_gone(client):
+                raise
+            sleep(retry)
+
+
 def direct_tunnel(addresses):
     """Connect straight to the real results origin, bypassing the node.
 
-    This is the fail-open path. If the node cannot take the tunnel -- it is
-    restarting, unreachable, or refuses the session -- the client's TLS still
-    reaches GitHub directly, so its cache call degrades to an ordinary miss while
+    This is the fail-open path. If the node cannot take the tunnel -- it has been
+    away for all of RESULTS_NODE_WAIT, or refuses the session -- the client's TLS
+    still reaches GitHub directly, so its cache call degrades to an ordinary miss while
     the artifact, log-archive, step-update and live-log traffic that shares this
     origin keeps working. The client trusts GitHub's real certificate through the
     distribution roots in its bundle, exactly as it trusts the node's leaf through
@@ -617,8 +649,12 @@ def handle_adapter(client, upstream, fallback, ca_file, origin):
             refuse(client, 403, "this endpoint serves Billet's Actions cache only")
 
             return
+        # A BLOB URL IS BILLET'S OWN, and GitHub answers one it never signed with a
+        # 404 the toolkit treats as final (#694). This adapter can see the path, so
+        # it says the node is unreachable instead, which the client retries.
+        blob = head.split(None, 2)[1].startswith(ADAPTER_PATHS[1].encode())
         try:
-            peer = adapter_peer(upstream, fallback, ca_file)
+            peer = adapter_peer(upstream, [] if blob else fallback, ca_file)
         except (ConnectionError, OSError, UnicodeError, ValueError):
             refuse(client, 502, "Billet's Actions cache is unreachable")
 
@@ -763,7 +799,7 @@ def guest_process(client, proc="/proc", now=time.monotonic):
     return False, "uid %d, holder not found" % uid
 
 
-def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY, admit=None):
+def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY, admit=None, node_wait=0):
     peer = None
     try:
         # WAIT FOR THE CLIENT'S FIRST BYTE before spending a tunnel. A bare connect
@@ -793,7 +829,7 @@ def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY, admit=None):
         # available outcome, degrading the cache call to its ordinary miss.
         if trusted:
             try:
-                peer, buffered = node_tunnel(upstream, authority)
+                peer, buffered = patient_tunnel(client, upstream, authority, node_wait)
             except (ConnectionError, OSError, UnicodeError, ValueError):
                 if not fallback:
                     raise
@@ -1058,7 +1094,8 @@ def main():
             worker, arguments = handle_node_relay, (client, node_address, slots)
         else:
             worker, arguments = handle, (client, args.upstream, fallback, authority,
-                                         guest_process if args.guest_processes_only else None)
+                                         guest_process if args.guest_processes_only else None,
+                                         RESULTS_NODE_WAIT if args.origin == RESULTS_HOST else 0)
         # A THREAD THAT CANNOT START CLOSES ITS CONNECTION, never the process: every
         # other connection this listener carries is still worth finishing.
         try:

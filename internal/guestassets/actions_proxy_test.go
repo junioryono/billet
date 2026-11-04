@@ -279,6 +279,169 @@ gate.close()
 	}
 }
 
+// THE RESULTS PASSTHROUGH WAITS OUT A NODE THAT DOES NOT ANSWER BEFORE IT FAILS OPEN.
+// It relays TLS end to end, so it cannot tell a blob URL billet signed from a call
+// GitHub can answer, and a blob URL failed open during a node's restart is a 404 the
+// toolkit treats as final (#694). A refusal is an answer, and a client that has gone
+// is not waited for. Run through main as well, because that is what chooses the wait
+// for this origin and none for another.
+func TestGuestResultsPassthroughWaitsOutANodeThatDoesNotAnswer(t *testing.T) {
+	t.Parallel()
+
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is not installed on this development host")
+	}
+	path := filepath.Join(t.TempDir(), "actions_proxy.py")
+	if err := os.WriteFile(path, []byte(ActionsProxyScript), 0o600); err != nil {
+		t.Fatalf("write proxy: %v", err)
+	}
+	probe := `
+import importlib.util
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+spec = importlib.util.spec_from_file_location("billet_actions_proxy", sys.argv[1])
+proxy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(proxy)
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+# A node that listens on port once start has passed and tunnels whoever asks.
+def node_after(port, start, status=b"HTTP/1.1 200 Connection Established\r\n\r\n"):
+    seen = {}
+    def serve():
+        time.sleep(start)
+        server = socket.create_server(("127.0.0.1", port))
+        conn, _ = server.accept()
+        data = b""
+        while b"\r\n\r\n" not in data:
+            data += conn.recv(4096)
+        seen["connect"] = data
+        conn.sendall(status)
+        if status.startswith(b"HTTP/1.1 200"):
+            seen["hello"] = conn.recv(64)
+            conn.sendall(b"from-the-node")
+        conn.close()
+        server.close()
+    threading.Thread(target=serve, daemon=True).start()
+    return seen
+
+def github():
+    server = socket.create_server(("127.0.0.1", 0))
+    seen = {}
+    def serve():
+        conn, _ = server.accept()
+        seen["hello"] = conn.recv(64)
+        conn.sendall(b"from-github")
+        conn.close()
+    threading.Thread(target=serve, daemon=True).start()
+    return server.getsockname()[1], seen
+
+def drive(node_port, wait):
+    a, b = socket.socketpair()
+    worker = threading.Thread(target=proxy.handle,
+        args=(a, "http://x:y@127.0.0.1:%d" % node_port, ["127.0.0.1"], proxy.RESULTS_AUTHORITY, None, wait),
+        daemon=True)
+    b.settimeout(20)
+    began = time.monotonic()
+    worker.start()
+    b.sendall(b"clienthello")
+    answer = b.recv(64)
+    took = time.monotonic() - began
+    b.close()
+    worker.join(10)
+    assert not worker.is_alive(), "the handler did not return"
+    return answer, took
+
+# A node back inside the wait gets the connection, and GitHub never sees it.
+proxy.RESULTS_PORT, seen_github = github()
+port = free_port()
+seen_node = node_after(port, 1.5)
+answer, _ = drive(port, 10)
+assert answer == b"from-the-node", answer
+assert seen_node.get("hello") == b"clienthello", seen_node
+assert "hello" not in seen_github, "GitHub was reached although the node came back: %r" % seen_github
+
+# A node gone for the whole wait fails open once it is spent, not before.
+proxy.RESULTS_PORT, seen_github = github()
+answer, took = drive(free_port(), 2.5)
+assert answer == b"from-github", answer
+assert took >= 1.5, "failed open after %.2fs of a 2.5s wait" % took
+
+# A refusal is an answer: no wait, however long the wait is.
+proxy.RESULTS_PORT, seen_github = github()
+port = free_port()
+node_after(port, 0, b"HTTP/1.1 403 Forbidden\r\n\r\n")
+time.sleep(0.2)
+answer, took = drive(port, 30)
+assert answer == b"from-github", answer
+assert took < 5, "a refusal was waited on for %.2fs" % took
+
+# No wait at all is the origin any other passthrough carries.
+proxy.RESULTS_PORT, seen_github = github()
+answer, took = drive(free_port(), 0)
+assert answer == b"from-github", answer
+assert took < 1, "no wait took %.2fs" % took
+
+# A client that has gone stops the wait.
+a, b = socket.socketpair()
+dead = free_port()
+worker = threading.Thread(target=proxy.handle,
+    args=(a, "http://x:y@127.0.0.1:%d" % dead, [], proxy.RESULTS_AUTHORITY, None, 30), daemon=True)
+worker.start()
+b.sendall(b"clienthello")
+time.sleep(0.3)
+b.close()
+worker.join(8)
+assert not worker.is_alive(), "the wait went on for a client that had gone"
+
+# MAIN GIVES THE RESULTS ORIGIN THE WAIT AND ANOTHER ORIGIN NONE. Port 443 on the
+# loopback answers nothing here, so failing open closes the client.
+def through_main(*args):
+    node = free_port()
+    listen = free_port()
+    seen = node_after(node, 1.5)
+    process = subprocess.Popen([sys.executable, sys.argv[1], "--listen", "127.0.0.1:%d" % listen,
+        "--upstream", "http://x:y@127.0.0.1:%d" % node, "--fallback-addr", "127.0.0.1", *args])
+    try:
+        for _ in range(100):
+            try:
+                client = socket.create_connection(("127.0.0.1", listen), 1)
+                break
+            except OSError:
+                time.sleep(0.05)
+        client.settimeout(10)
+        client.sendall(b"clienthello")
+        try:
+            answer = client.recv(64)
+        except OSError:
+            answer = b""
+        client.close()
+        return answer, seen
+    finally:
+        process.terminate()
+        process.wait(5)
+
+answer, seen = through_main()
+assert answer == b"from-the-node", "the results origin did not wait for its node: %r" % answer
+answer, seen = through_main("--origin", "registry.npmjs.org")
+assert answer != b"from-the-node", "another origin waited for its node: %r" % answer
+`
+	run := exec.CommandContext(t.Context(), python, "-c", probe, path)
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("guest passthrough probe: %v\n%s", err, output)
+	}
+}
+
 // The passthrough is launched under systemd socket activation: PID 1 owns the
 // listening socket (so it survives a service crash and needs no privileged bind
 // capability) and hands it over as fd 3, and Type=notify means the service is
@@ -720,6 +883,16 @@ answer = drive(dead_port, request)
 assert answer.startswith(b"HTTP/1.1 502 "), answer
 assert b"unreachable" in answer, answer
 assert b"X-Billet-Cache-Adapter: refused" in answer, answer
+
+# ...AND A BLOB URL IS NEVER FAILED OPEN, though there is somewhere to go: billet
+# signed it, GitHub would answer a 404 the toolkit takes as final, and a 502 is
+# one it retries (#694).
+record = {}
+proxy.RESULTS_PORT = results_endpoint(record, connect=False)
+blob = b"PUT /_billet/actions-cache/abc?sig=s&comp=block&blockid=YQ HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"
+answer = drive(dead_port, blob, fallback=["127.0.0.1"])
+assert answer.startswith(b"HTTP/1.1 502 "), answer
+assert "head" not in record, "a blob URL billet signed was sent to the real origin: %r" % record
 `
 	run := exec.CommandContext(t.Context(), python, "-c", probe,
 		files.script, files.bundle, files.nodeCert, files.nodeKey, files.publicCert, files.publicKey)
