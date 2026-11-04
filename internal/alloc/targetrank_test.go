@@ -98,12 +98,20 @@ func TestNewRefusesAWeightOutOfRange(t *testing.T) {
 	}
 }
 
-// A TIER BELOW ITS FLOOR SAYS SO, counted as the floor is, and one at it does not.
+// A TIER BELOW ITS FLOOR SAYS SO, counted as the floor is: a lease on a draining
+// host meets it, or a tier whose floor was backed there would stand first for
+// more leases elsewhere, with no room held for them. Only under ranks.
 func TestATierBelowItsFloorSaysSo(t *testing.T) {
 	reserved := tier("reserved", 2, 4*config.GiB)
+	reserved.Provider = config.ProviderDocker
 	reserved.Reserved = 1
 
-	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 32 * config.GiB}, []config.Tier{reserved})
+	limits := Limits{MaxVCPU: 16, MaxMemory: 32 * config.GiB, Weights: map[string]int{config.DefaultTargetName: 1}}
+	a := newBareAllocator(t, limits, []config.Tier{reserved})
+
+	_, epoch := mustRegister(t, a, NodeRegistration{
+		Name: "only", Provider: config.ProviderDocker, VCPU: 16, Memory: 32 * config.GiB, Incarnation: "p1",
+	})
 
 	if !admissionOf(t, a, "reserved").BelowFloor {
 		t.Error("a tier holding nothing of a floor of one is not below it")
@@ -113,5 +121,20 @@ func TestATierBelowItsFloorSaysSo(t *testing.T) {
 
 	if admissionOf(t, a, "reserved").BelowFloor {
 		t.Error("a tier holding its floor is still below it")
+	}
+
+	if err := a.NodeDraining(t.Context(), "only", epoch, "p1"); err != nil {
+		t.Fatalf("NodeDraining: %v", err)
+	}
+
+	if admissionOf(t, a, "reserved").BelowFloor {
+		t.Error("a floor met by a lease on a draining host was read as unmet")
+	}
+
+	limits.Weights = nil
+
+	unweighted := newAllocator(t, limits, []config.Tier{reserved})
+	if admissionOf(t, unweighted, "reserved").BelowFloor {
+		t.Error("with no weight the floor was read, for nothing")
 	}
 }

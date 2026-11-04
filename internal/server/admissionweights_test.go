@@ -492,10 +492,11 @@ func TestAWaiterPastItsPatienceStandsAboveEveryRank(t *testing.T) {
 	}
 }
 
-// A TIER WHOSE LAUNCHES FAIL STEPS ASIDE WHILE RANKS APPLY: its leases hand back at
-// once, so its rank stays the lowest however often it buys. With no ranks it rotates
-// away by buying, as it always did, so nothing changes there.
-func TestATierWhoseLaunchesFailStepsAside(t *testing.T) {
+// A TIER WHOSE LAUNCH FAILED STEPS ASIDE FOR A WHILE, WHILE RANKS APPLY: its leases
+// hand back at once, so its rank stays the lowest however often it buys. For a
+// while, or a wide tier stepped aside would never accumulate the room to try again.
+// With no ranks it rotates away by buying, as it always did.
+func TestATierWhoseLaunchFailedStepsAsideForAWhile(t *testing.T) {
 	t.Parallel()
 
 	ranks := map[string]float64{"failing": 0.1, "healthy": 0.5}
@@ -504,37 +505,80 @@ func TestATierWhoseLaunchesFailStepsAside(t *testing.T) {
 	waitingInOrder(q, waiterAt{"broken", ranked("failing", ranks)}, waiterAt{"working", ranked("healthy", ranks)})
 
 	if q.mayBuy("working", ranked("healthy", ranks)) {
-		t.Error("a healthy waiter passed one further behind with no launch failing")
+		t.Error("a healthy waiter passed one further behind with no launch failed")
 	}
 
-	q.launchFailing("broken", true)
+	failedAt := q.now()
+	q.launchResult("broken", true)
 
 	if !q.mayBuy("working", ranked("healthy", ranks)) {
-		t.Error("a waiter was held back by a tier whose launches are failing")
+		t.Error("a waiter was held back by a tier whose launch just failed")
 	}
 
 	if got := q.ahead("working", ranked("healthy", ranks)); len(got) != 0 {
-		t.Errorf("a tier whose launches are failing is listed ahead: %v", got)
+		t.Errorf("a tier whose launch just failed is listed ahead: %v", got)
 	}
 
 	// It keeps its place, and may still try: nobody holds it back but those ahead.
 	if !q.mayBuy("broken", ranked("failing", ranks)) {
-		t.Error("a tier whose launches are failing lost its own turn")
+		t.Error("a tier whose launch failed lost its own turn")
 	}
 
-	q.launchFailing("broken", false)
+	// THE BACKOFF ENDS, with no launch having succeeded, and it may accumulate the
+	// room to try again; another failure renews it.
+	progress := func(at time.Time) {
+		q.now = func() time.Time { return at }
+
+		for label, w := range q.waiting {
+			w.progress = at
+			q.waiting[label] = w
+		}
+	}
+
+	progress(failedAt.Add(LaunchBackoff - time.Second))
+
+	if !q.mayBuy("working", ranked("healthy", ranks)) {
+		t.Error("the backoff ended early")
+	}
+
+	progress(failedAt.Add(LaunchBackoff))
+
+	if q.mayBuy("working", ranked("healthy", ranks)) {
+		t.Error("the backoff never ended, so a recovered tier cannot accumulate room")
+	}
+
+	q.launchResult("broken", true)
+
+	if !q.mayBuy("working", ranked("healthy", ranks)) {
+		t.Error("another failure did not renew the backoff")
+	}
+
+	// A launch that succeeds ends it at once.
+	q.launchResult("broken", false)
 
 	if q.mayBuy("working", ranked("healthy", ranks)) {
 		t.Error("a launch succeeding did not put the waiter back ahead")
 	}
 
-	// With no ranks the flag means nothing: the older waiter holds the line.
+	// A FAILURE BEFORE THE FIRST REFUSAL COUNTS: a pool's first launch comes before
+	// it is ever recorded waiting.
+	first := newAdmissionQueue(config.AdmissionFair)
+	waitingInOrder(first, waiterAt{"working", ranked("healthy", ranks)})
+	first.launchResult("broken", true)
+
+	first.waiting["broken"] = waitingTier{since: first.now(), where: ranked("failing", ranks), progress: first.now()}
+
+	if !first.mayBuy("working", ranked("healthy", ranks)) {
+		t.Error("a failure before the first refusal was lost")
+	}
+
+	// With no ranks the failure means nothing: the older waiter holds the line.
 	plain := newAdmissionQueue(config.AdmissionFair)
 	waitingInOrder(plain, waiterAt{"broken", on("host")}, waiterAt{"working", on("host")})
-	plain.launchFailing("broken", true)
+	plain.launchResult("broken", true)
 
 	if plain.mayBuy("working", on("host")) {
-		t.Error("with no weights a failing launch changed the order")
+		t.Error("with no weights a failed launch changed the order")
 	}
 }
 
@@ -618,8 +662,7 @@ func TestAListenerTellsTheOrderItsLaunchFailedAndWhyItIsHeld(t *testing.T) {
 	a, _, listeners := orderedListeners(t, contenders(), 8, config.AdmissionFair)
 	l := listeners[0]
 
-	l.order.waits(l.tier, on("host"))
-
+	// NOT WAITING: a pool's first launch comes before its first refusal.
 	launch := func(runner dispatch.Runner, request int64) {
 		t.Helper()
 
@@ -635,13 +678,13 @@ func TestAListenerTellsTheOrderItsLaunchFailedAndWhyItIsHeld(t *testing.T) {
 
 	launch(&failingRunner{}, 1)
 
-	if !l.order.waiting[l.tier].launchFailing {
+	if _, failed := l.order.launchFailed[l.tier]; !failed {
 		t.Error("a failed launch did not reach the order")
 	}
 
 	launch(&launchLog{}, 2)
 
-	if l.order.waiting[l.tier].launchFailing {
+	if _, failed := l.order.launchFailed[l.tier]; failed {
 		t.Error("a launch that succeeded did not clear the failure")
 	}
 

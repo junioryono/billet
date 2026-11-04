@@ -89,8 +89,9 @@ type TierAdmission struct {
 	// between the tiers of one view, and never written after it is read.
 	TargetRank map[string]float64
 	// BelowFloor reports that this tier holds fewer leases than its `reserved`
-	// floor, counted as the floor is. Room is already held for it from every other
-	// tier, so under ranks it goes first: it takes nothing a waiter could buy.
+	// floor, counted as the floor is, so a lease on a draining host meets it. Room
+	// is already held for it from every other tier, so under ranks it goes first:
+	// it takes nothing a waiter could buy. Read only when TargetRank is.
 	BelowFloor bool
 }
 
@@ -112,18 +113,21 @@ func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission
 			return err
 		}
 
-		ranks, err := a.targetRanks(ctx, tx)
+		ranks, floors, err := a.rankReads(ctx, tx)
 		if err != nil {
 			return err
 		}
 
 		for _, label := range a.sortedLabels() {
-			if out[label], err = a.admissionIn(ctx, tx, a.tiers[label], nodes, held); err != nil {
+			t := a.tiers[label]
+
+			entry, err := a.admissionIn(ctx, tx, t, nodes, held)
+			if err != nil {
 				return err
 			}
 
-			entry := out[label]
 			entry.TargetRank = ranks
+			entry.BelowFloor = ranks != nil && t.Reserved > floors[label]
 			out[label] = entry
 		}
 
@@ -150,13 +154,14 @@ func (a *Allocator) AdmissionFor(ctx context.Context, tier string) (TierAdmissio
 			return err
 		}
 
-		ranks, err := a.targetRanks(ctx, tx)
+		ranks, floors, err := a.rankReads(ctx, tx)
 		if err != nil {
 			return err
 		}
 
 		out, err = a.admissionIn(ctx, tx, t, nodes, held)
 		out.TargetRank = ranks
+		out.BelowFloor = ranks != nil && t.Reserved > floors[t.Label]
 
 		return err
 	})
@@ -183,6 +188,23 @@ func (a *Allocator) admissionReads(ctx context.Context, tx querier) ([]nodeRow, 
 	}
 
 	return nodes, held, nil
+}
+
+// rankReads is what the order needs only when some target has a weight: the
+// targets' ranks, and what each tier holds as its floor counts it. Both are nil
+// otherwise, and a deployment with no weight pays for neither.
+func (a *Allocator) rankReads(ctx context.Context, tx querier) (map[string]float64, map[string]int, error) {
+	ranks, err := a.targetRanks(ctx, tx)
+	if err != nil || ranks == nil {
+		return nil, nil, err
+	}
+
+	floors, err := a.countFloorLeasesPerTier(ctx, tx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return ranks, floors, nil
 }
 
 // admissionIn is one tier's TierAdmission inside the caller's snapshot.
@@ -234,7 +256,6 @@ func (a *Allocator) admissionIn(ctx context.Context, tx querier, t config.Tier, 
 	return TierAdmission{
 		CanGrow: grow, Nodes: p.nodes, CeilingBound: bound.ceiling,
 		Target: config.ShareTarget(t), TargetShared: hasShare, ShareBound: bound.share,
-		BelowFloor: t.Reserved > held[t.Label],
 	}, nil
 }
 

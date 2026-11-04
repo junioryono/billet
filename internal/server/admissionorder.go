@@ -94,10 +94,11 @@ import (
 // behind every rival, whose tier those rivals would otherwise outrank for as long
 // as they have work, waits no longer than it would with no weights.
 //
-// A TIER WHOSE LAUNCHES FAIL STEPS ASIDE, while ranks apply. Its leases hand back
-// at once, so its rank stays the lowest however often it buys, where oldest first
-// would rotate it away after each purchase; it would hold a lease's room idle for
-// as long as its launches failed.
+// A TIER WHOSE LAUNCH FAILED STEPS ASIDE FOR A WHILE, while ranks apply. Its leases
+// hand back at once, so its rank stays the lowest however often it buys, where
+// oldest first would rotate it away after each purchase; it would hold a lease's
+// room idle for as long as its launches failed. For a while and not until one
+// succeeds: a wide tier stepped aside never accumulates the room to try again.
 type admissionQueue struct {
 	policy config.AdmissionOrder
 	now    func() time.Time
@@ -109,6 +110,9 @@ type admissionQueue struct {
 	// status report judges every waiter by, so it never says each of two waiters
 	// holds the other from reads taken at different times.
 	lastRanks map[string]float64
+	// launchFailed is when each tier's last launch failed, kept apart from waiting
+	// because a pool's first launch comes before its first refusal.
+	launchFailed map[string]time.Time
 }
 
 // WaiterAllowance is how long a waiter keeps holding back other tiers without
@@ -124,6 +128,12 @@ const WaiterAllowance = 3 * time.Minute
 // target whose jobs turn over in minutes is ranked throughout, and short against
 // what a job can wait now, so a weight shapes who goes next and cannot starve.
 const WeightPatience = 15 * time.Minute
+
+// LaunchBackoff is how long a tier whose launch failed holds nobody back while ranks
+// apply: as long as WaiterAllowance, the longest a silent listener may hold others,
+// so a failing launch holds them no longer than a silent one, and then it may
+// accumulate the room to try again.
+const LaunchBackoff = WaiterAllowance
 
 // waitingTier is one tier's place in the order and where its room could come
 // from.
@@ -152,18 +162,16 @@ type waitingTier struct {
 	// it keeps the line until it buys, whatever the ranks do. Only under ranks;
 	// without them nothing but buying moves a waiter anyway.
 	head bool
-	// launchFailing is a last launch that failed; under ranks the waiter steps
-	// aside until one succeeds.
-	launchFailing bool
 }
 
 // newAdmissionQueue builds the queue every listener of one control plane shares.
 func newAdmissionQueue(policy config.AdmissionOrder) *admissionQueue {
 	return &admissionQueue{
-		policy:  policy.Or(),
-		now:     time.Now,
-		log:     slog.Default(),
-		waiting: map[string]waitingTier{},
+		policy:       policy.Or(),
+		now:          time.Now,
+		log:          slog.Default(),
+		waiting:      map[string]waitingTier{},
+		launchFailed: map[string]time.Time{},
 	}
 }
 
@@ -278,10 +286,19 @@ func (p place) before(other place) bool {
 // rank, whatever the clock says.
 var notWaiting = time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC)
 
-// steppedAside reports a waiter that holds nobody back for now and keeps its place:
-// one whose listener stalled, or, under ranks, whose launches are failing.
-func steppedAside(waiter waitingTier, ranks map[string]float64, now time.Time) bool {
-	return !holdsTheLine(waiter, now) || (ranks != nil && waiter.launchFailing)
+// steppedAside requires q.mu. It reports a waiter that holds nobody back for now and
+// keeps its place: one whose listener stalled, or, under ranks, whose launch just
+// failed.
+func (q *admissionQueue) steppedAside(label string, waiter waitingTier, ranks map[string]float64,
+	now time.Time,
+) bool {
+	if !holdsTheLine(waiter, now) {
+		return true
+	}
+
+	failed, failing := q.launchFailed[label]
+
+	return ranks != nil && failing && now.Sub(failed) < LaunchBackoff
 }
 
 // ranksFor requires q.mu. It is the ranks a buyer at where is judged by, nil when
@@ -387,7 +404,7 @@ func (q *admissionQueue) head(tier string, where alloc.TierAdmission) (string, t
 
 		// A STALLED WAITER STEPS ASIDE BUT KEEPS ITS PLACE. Its own record is never
 		// skipped, so a tier is not let past itself.
-		if label != tier && steppedAside(waiter, ranks, now) {
+		if label != tier && q.steppedAside(label, waiter, ranks, now) {
 			stalled = append(stalled, label)
 
 			continue
@@ -517,7 +534,7 @@ func (q *admissionQueue) ahead(tier string, where alloc.TierAdmission) []string 
 
 	var out []string
 	for label, waiter := range q.waiting {
-		if label == tier || !competes(where, waiter.where) || steppedAside(waiter, ranks, now) {
+		if label == tier || !competes(where, waiter.where) || q.steppedAside(label, waiter, ranks, now) {
 			continue
 		}
 
@@ -551,7 +568,7 @@ func (q *admissionQueue) letPast(tier string, where alloc.TierAdmission, stalled
 		q.log.Warn("letting a tier past a waiter whose listener has made no admission progress, or whose "+
 			"launches are failing; it keeps its place and holds the line again when that ends",
 			"tier", tier, "waiter", label, "waiting_since", waiter.since,
-			"last_progress", waiter.progress, "allowance", WaiterAllowance, "launch_failing", waiter.launchFailing)
+			"last_progress", waiter.progress, "allowance", WaiterAllowance)
 	}
 }
 
@@ -620,8 +637,9 @@ func (q *admissionQueue) launchBegins(tier string) { q.launchMark(tier) }
 
 func (q *admissionQueue) launchEnds(tier string) { q.launchMark(tier) }
 
-// launchFailing records whether this tier's last launch failed.
-func (q *admissionQueue) launchFailing(tier string, failed bool) {
+// launchResult records how this tier's last launch went. A failure that left
+// compute in the runner's custody counts too: nothing is running for the job.
+func (q *admissionQueue) launchResult(tier string, failed bool) {
 	if q == nil {
 		return
 	}
@@ -629,9 +647,10 @@ func (q *admissionQueue) launchFailing(tier string, failed bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if waiter, ok := q.waiting[tier]; ok {
-		waiter.launchFailing = failed
-		q.waiting[tier] = waiter
+	if failed {
+		q.launchFailed[tier] = q.now()
+	} else {
+		delete(q.launchFailed, tier)
 	}
 }
 
