@@ -140,10 +140,17 @@ func (l *Listener) wakeLoop() {
 // and never waits on a node, so it stays here, and a failed one leaves the lease counted
 // and the cleanup loop asking again, as a failed one always did.
 //
+// THE LEASE GOES WITH IT. A renewal that fails drops a lease from `running`, leaving an
+// entry with nothing to release, and a parked completion can wait long enough to meet
+// one: its destroy would then succeed and its capacity stay charged with nothing naming
+// it. It stays in `running` too, because the compute is alive and is renewed until gone.
+//
 // IT REPORTS WHETHER IT PARKED, and it does not for a completion this listener holds
 // nothing for, by complete's own rule: an entry whose retry can accomplish nothing would
-// only grow the map. Nor with no registry, where only the release ends the count. Such a
-// job's destroy stays on the caller.
+// only grow the map. Nor with no registry, where only the release ends the count. Nor for
+// a job only promised: the promise's lease stays where the next pool pass can take it for
+// another job, so a destroy out beside that pass could release a lease with new compute
+// on it. Such a job's destroy stays on the caller.
 func (l *Listener) parkCompletion(ctx context.Context, job dispatch.Job) bool {
 	if l.registry == nil {
 		return false
@@ -151,7 +158,7 @@ func (l *Listener) parkCompletion(ctx context.Context, job dispatch.Job) bool {
 
 	l.mu.Lock()
 	entry, parked := l.cleanup[job.RequestID]
-	_, held := l.running[job.RequestID]
+	lease, held := l.running[job.RequestID]
 	_, promised := l.acquiring[job.RequestID]
 	// PAST THE REMOVAL ALREADY, or a redelivery that repeats it could address a runner a
 	// reused request id has since been given. complete takes these paths for the same reason.
@@ -159,7 +166,7 @@ func (l *Listener) parkCompletion(ctx context.Context, job dispatch.Job) bool {
 		entry.lease != nil || (entry.deregistered && entry.job.CompletionID == job.CompletionID)))
 	l.mu.Unlock()
 
-	if !parked && !held && !promised && (l.completionStore == nil || job.Result == "") {
+	if promised || (!parked && !held && (l.completionStore == nil || job.Result == "")) {
 		return false
 	}
 
@@ -181,18 +188,18 @@ func (l *Listener) parkCompletion(ctx context.Context, job dispatch.Job) bool {
 		if !pastRemoval {
 			entry.deregistered = deregistered
 		}
+		if entry.lease == nil {
+			entry.lease = lease
+		}
 	} else {
 		if l.cleanup == nil {
 			l.cleanup = make(map[int64]*pendingCleanup)
 		}
 
-		l.cleanup[job.RequestID] = &pendingCleanup{job: job, deregistered: deregistered}
+		l.cleanup[job.RequestID] = &pendingCleanup{job: job, lease: lease, deregistered: deregistered}
 	}
 
-	select {
-	case l.cleanupWake <- struct{}{}:
-	default:
-	}
+	l.wakeCleanup()
 
 	return true
 }

@@ -79,8 +79,24 @@ func (p *pendingCleanup) failed(now time.Time, first, ceiling time.Duration) {
 	p.at = now.Add(p.wait)
 }
 
+// cleanupConcurrency is how many cleanup attempts one tier has out at once while its
+// launches run beside the loop. A node runs a destroy only after the launches in flight,
+// and its commands in the order they arrive. Sent one at a time, each destroy waits behind
+// whichever launches started since the last returned, so a tier's finished guests clear
+// at one per batch of launches: 30 of them would take about 20 minutes at the 30 to 65
+// seconds a batch took on a busy node (2026-10-03). Sent together, they clear behind the
+// same launches. Bounded because a node command's timeout starts when it is queued, and a
+// destroy takes seconds: this many fit well inside the 10-minute bound, and one that does
+// not is retried like any other.
+const cleanupConcurrency = 16
+
 // cleanupLoop retries cleanup obligations on its own clock.
+//
+// EVERY ATTEMPT RETURNS BEFORE THIS DOES, because joining this loop is how a teardown
+// knows no retry is still inside a destroy.
 func (l *Listener) cleanupLoop(ctx context.Context) {
+	defer l.attempts.Wait()
+
 	ticker := time.NewTicker(l.heartbeatInterval())
 	defer ticker.Stop()
 
@@ -121,13 +137,19 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 	// an hour would push the one that just recovered behind them.
 	pending := make([]dispatch.Job, 0, len(l.cleanup))
 
-	for _, entry := range l.cleanup {
-		if entry.due(now) {
+	for id, entry := range l.cleanup {
+		if entry.due(now) && !l.attempting[id] {
 			pending = append(pending, entry.job)
 		}
 	}
 
 	l.mu.Unlock()
+
+	if l.backgroundLaunches {
+		l.startAttempts(ctx, pending)
+
+		return
+	}
 
 	// NO ERROR BRANCH, because attempt has none to give. A failure records its
 	// own obligation and its own backoff before returning — the pacing lives with
@@ -136,11 +158,57 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 	for i := range pending {
 		l.attempt(ctx, pending[i])
 	}
+}
 
-	// WHAT THOSE RELEASED IS ROOM, and a tier waiting for it buys now rather than on its
-	// next poll, which is up to a long poll away.
-	if len(pending) > 0 {
-		l.wakeLoop()
+// startAttempts runs each due attempt beside the cleanup loop, up to cleanupConcurrency,
+// so a destroy waiting on a node holds up neither the others nor a completion parked
+// after it. What finds no room is taken up when an attempt ends.
+func (l *Listener) startAttempts(ctx context.Context, pending []dispatch.Job) {
+	for i := range pending {
+		job := pending[i]
+
+		l.mu.Lock()
+		if len(l.attempting) >= cleanupConcurrency {
+			l.attemptsWaiting = true
+			l.mu.Unlock()
+
+			return
+		}
+		l.attempting[job.RequestID] = true
+		l.mu.Unlock()
+
+		l.attempts.Go(func() {
+			defer l.endAttempt(job.RequestID)
+
+			l.attempt(ctx, job)
+		})
+	}
+}
+
+// endAttempt frees an attempt's place.
+//
+// WHAT IT RELEASED IS ROOM, and a tier waiting for it buys now rather than on its next
+// poll, which is up to a long poll away. The cleanup loop is woken only for what found no
+// room: an attempt that failed has its own backoff, and waking on that would spin.
+func (l *Listener) endAttempt(requestID int64) {
+	l.mu.Lock()
+	delete(l.attempting, requestID)
+	waiting := l.attemptsWaiting
+	l.attemptsWaiting = false
+	l.mu.Unlock()
+
+	if waiting {
+		l.wakeCleanup()
+	}
+
+	l.wakeLoop()
+}
+
+// wakeCleanup asks the cleanup loop to look again without waiting for its tick.
+func (l *Listener) wakeCleanup() {
+	select {
+	case l.cleanupWake <- struct{}{}:
+	default:
 	}
 }
 

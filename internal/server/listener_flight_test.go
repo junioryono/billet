@@ -15,6 +15,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // heldLaunches holds every launch open until release closes, as a busy node does.
@@ -1231,4 +1232,192 @@ func TestWithNoRegistryACompletionIsNotParked(t *testing.T) {
 	if _, parked := l.cleanup[7]; parked {
 		t.Fatal("it left a cleanup obligation behind")
 	}
+}
+
+// A DESTROY DOES NOT WAIT FOR ANOTHER, up to the bound (#708). A node runs a destroy behind
+// the launches in flight, and one sent only after the last returned waits behind whichever
+// started since. What finds no room starts as soon as there is some, not on the next tick.
+func TestDestroysRunTogetherUpToTheBound(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		const parked = cleanupConcurrency + 2
+
+		var (
+			mu        sync.Mutex
+			out, done int
+		)
+
+		release := make(chan struct{})
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			mu.Lock()
+			out++
+			mu.Unlock()
+
+			<-release
+
+			mu.Lock()
+			out--
+			done++
+			mu.Unlock()
+
+			return nil
+		}}
+		counts := func() (int, int) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			return out, done
+		}
+
+		a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB},
+			[]config.Tier{tier("a-work")}, alloc.WithLeaseTTL(24*time.Hour))
+		l := NewListener(a, "a-work", &fakeSession{}, WithRunner(runner), WithBackgroundLaunches())
+		l.cleanup = make(map[int64]*pendingCleanup, parked)
+
+		for id := int64(1); id <= parked; id++ {
+			l.cleanup[id] = &pendingCleanup{job: dispatch.Job{RequestID: id}}
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		finished := make(chan struct{})
+
+		go func() {
+			defer close(finished)
+
+			l.cleanupLoop(ctx)
+		}()
+
+		l.wakeCleanup()
+		synctest.Wait()
+
+		if running, _ := counts(); running != cleanupConcurrency {
+			t.Fatalf("%d destroys out with %d parked, want %d", running, parked, cleanupConcurrency)
+		}
+
+		release <- struct{}{}
+		synctest.Wait()
+
+		if running, ended := counts(); running != cleanupConcurrency || ended != 1 {
+			t.Fatalf("%d destroys out and %d ended after one returned, want %d and 1 with no tick",
+				running, ended, cleanupConcurrency)
+		}
+
+		close(release)
+		synctest.Wait()
+
+		if _, ended := counts(); ended != parked {
+			t.Fatalf("%d destroys ended, want each of the %d once", ended, parked)
+		}
+		if remaining := len(l.cleanup); remaining != 0 {
+			t.Fatalf("%d obligations left after every destroy succeeded", remaining)
+		}
+
+		cancel()
+		<-finished
+	})
+}
+
+// A JOB ONLY PROMISED IS NOT PARKED: its lease stays where the next pool pass can take it
+// for another job, and a destroy out beside that pass could release it from under the
+// compute that job started.
+func TestACompletedPromiseIsNotParked(t *testing.T) {
+	t.Parallel()
+
+	l := NewListener(newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB},
+		[]config.Tier{tier("a-work")}), "a-work", &fakeSession{}, WithBackgroundLaunches(),
+		WithRunnerRegistry(&fakeRunnerRegistry{}))
+	l.acquiring[7] = &promise{lease: &alloc.Lease{ID: "lease-7"}}
+
+	if l.parkCompletion(t.Context(), dispatch.Job{RequestID: 7, Result: "cancelled"}) {
+		t.Fatal("a completion was parked while the next pool pass could still take its lease")
+	}
+	if _, parked := l.cleanup[7]; parked {
+		t.Fatal("it left a cleanup obligation behind")
+	}
+}
+
+// A PARKED COMPLETION KEEPS ITS LEASE WHEN A FAILED RENEWAL DROPS IT FROM `running`. Its
+// destroy succeeds later and nothing else would name the capacity to release, which stays
+// charged with its durable completion retired.
+func TestAParkedCompletionKeepsItsLeaseWhenARenewalDropsIt(t *testing.T) {
+	t.Parallel()
+
+	registry := &fakeRunnerRegistry{}
+	l := NewListener(newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB},
+		[]config.Tier{tier("a-work")}), "a-work", &fakeSession{}, WithBackgroundLaunches(),
+		WithRunnerRegistry(registry))
+	lease := &alloc.Lease{ID: "lease-7"}
+	l.running[7] = lease
+
+	if !l.parkCompletion(t.Context(), dispatch.Job{RequestID: 7, Result: "succeeded"}) {
+		t.Fatal("a completion with a running lease was not parked")
+	}
+	if _, stillRenewed := l.running[7]; !stillRenewed {
+		t.Fatal("parking stopped renewing a lease whose compute is still alive")
+	}
+
+	delete(l.running, 7)
+
+	if got, _, _ := l.completionRelease(7); got != lease {
+		t.Fatalf("after a renewal dropped it the completion releases %v, want its lease", got)
+	}
+}
+
+// A PARKED LEASE IS RELEASED ONCE AT SHUTDOWN. It is in `running` and on the entry, so
+// handling both would ask the ledger to release it and write its completion twice.
+func TestAParkedLeaseStillInRunningIsDecidedOnce(t *testing.T) {
+	t.Parallel()
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB},
+		[]config.Tier{tier("a-work")})
+
+	leases, err := a.Escrow(t.Context(), "a-work", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lease := leases[0]
+
+	store := &countingCompletions{}
+	l := NewListener(a, "a-work", &fakeSession{}, WithBackgroundLaunches())
+	l.completionStore = store
+	job := dispatch.Job{RequestID: 7, Result: "succeeded", CompletionID: 3}
+	l.running[7] = lease
+	l.cleanup = map[int64]*pendingCleanup{7: {job: job, lease: lease}}
+
+	l.releaseAll(t.Context(), map[int64]bool{7: true})
+
+	if store.puts != 0 {
+		t.Fatalf("%d completions written after `running` had already decided this lease, want none", store.puts)
+	}
+	if store.retired != 1 {
+		t.Fatalf("its completion was retired %d times, want once", store.retired)
+	}
+}
+
+// countingCompletions counts what a release writes.
+type countingCompletions struct {
+	puts, retired int
+}
+
+func (c *countingCompletions) PutPendingCompletion(_ context.Context, _ state.PendingCompletion,
+) (state.PendingCompletionDisposition, error) {
+	c.puts++
+
+	return state.PendingCompletionActionable, nil
+}
+
+func (c *countingCompletions) RetirePendingCompletion(context.Context, string, int64, int64) error {
+	c.retired++
+
+	return nil
+}
+
+func (c *countingCompletions) AcknowledgePendingCompletion(context.Context, string, int64, int64) error {
+	return nil
+}
+
+func (c *countingCompletions) PendingCompletions(context.Context, string) ([]state.PendingCompletion, error) {
+	return nil, nil
 }

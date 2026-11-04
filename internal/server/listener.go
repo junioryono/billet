@@ -347,6 +347,11 @@ type Listener struct {
 	// Requests a cleanup retry is inside a Destroy for right now. The shutdown
 	// pass skips them rather than spending its budget on work already happening.
 	destroying map[int64]bool
+	// attempting is each cleanup attempt out beside the cleanup loop, attemptsWaiting
+	// that one due found no room among them, and attempts joins them all.
+	attempting      map[int64]bool
+	attemptsWaiting bool
+	attempts        sync.WaitGroup
 
 	// Stops the cleanup loop starting anything new. Set under l.mu before the loop
 	// is cancelled, so "no new attempts" and "what is in flight" are one decision.
@@ -480,6 +485,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		acquiring:     make(map[int64]*promise),
 		cleanup:       make(map[int64]*pendingCleanup),
 		destroying:    make(map[int64]bool),
+		attempting:    make(map[int64]bool),
 		configErrs:    make(map[string]error),
 		confirmed:     make(map[string]time.Time),
 		heldOrder:     make(map[string]uint64),
