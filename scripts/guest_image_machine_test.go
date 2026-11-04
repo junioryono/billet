@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -400,50 +399,60 @@ func TestAManualPublishIsHeldToTheImagesMachine(t *testing.T) {
 
 	const snaps = `[{"name":"g20261001000000"},{"name":"g20261002000000"},{"name":"a-note"}]`
 
-	// table is `image-meta list` as rbd prints it, as measured on a real image 2026-11-04,
-	// with the key a hand-run publish left there, which holds a raw newline. Its JSON is
-	// what jq cannot read, and these rows must not stop anything.
-	table := func(rows ...string) string {
-		return fmt.Sprintf("There are %d metadata on this image:\n\nKey  Value\n", len(rows)+1) +
-			"billet.runner_version.    kernel_image: /home/junior/fc-smoke/vmlinux-billet\ng20260814061844  2.320.0\n" +
-			strings.Join(rows, "\n") + "\n"
-	}
-
 	for name, tc := range map[string]struct {
-		snaps, meta string
-		failSnap    bool
-		failMeta    bool
-		says        string
+		snaps    string
+		keys     map[string]string
+		failSnap bool
+		failGet  bool
+		says     string
 	}{
-		"every generation its own":             {snaps: snaps, meta: table("billet.arch.g20261001000000  aarch64", "billet.arch.g20261002000000  aarch64")},
-		"an image with none":                   {snaps: "[]", meta: ""},
-		"another machine's":                    {snaps: snaps, meta: table("billet.arch.g20261001000000  aarch64", "billet.arch.g20261002000000  x86_64"), says: "is x86_64's and this build is aarch64's"},
-		"one with no record":                   {snaps: snaps, meta: table("billet.arch.g20261001000000  aarch64"), says: "g20261002000000 records no machine"},
-		"none with a record":                   {snaps: snaps, meta: "", says: "records no machine"},
-		"a key that only begins with the name": {snaps: `[{"name":"g20261001000000"}]`, meta: table("billet.arch.g20261001000000.old  aarch64"), says: "g20261001000000 records no machine"},
-		"generations unreadable":               {snaps: snaps, failSnap: true, says: "could not list the generations"},
-		"metadata unreadable":                  {snaps: snaps, failMeta: true, says: "could not read what"},
-		"a fraction of a second, which ceph.ParseGeneration takes": {snaps: `[{"name":"g20261001000000.5"}]`, meta: table("billet.arch.g20261001000000.5  x86_64"), says: "is x86_64's and this build is aarch64's"},
-		"a listing that is no list":                                {snaps: `{"oops":1}`, meta: "", says: "could not read the generations"},
+		"every generation its own": {snaps: snaps, keys: map[string]string{"g20261001000000": "aarch64", "g20261002000000": "aarch64"}},
+		"an image with none":       {snaps: "[]"},
+		"another machine's":        {snaps: snaps, keys: map[string]string{"g20261001000000": "aarch64", "g20261002000000": "x86_64"}, says: "is x86_64's and this build is aarch64's"},
+		"one with no record":       {snaps: snaps, keys: map[string]string{"g20261001000000": "aarch64"}, says: "g20261002000000 records no machine"},
+		"none with a record":       {snaps: snaps, says: "records no machine"},
+		// THE WHOLE VALUE: a first word of this machine's name is not this machine.
+		"a value of several words":                                 {snaps: snaps, keys: map[string]string{"g20261001000000": "aarch64 extra", "g20261002000000": "aarch64"}, says: "is aarch64 extra's"},
+		"generations unreadable":                                   {snaps: snaps, failSnap: true, says: "could not list the generations"},
+		"a record it could not ask":                                {snaps: snaps, failGet: true, says: "could not read what"},
+		"a fraction of a second, which ceph.ParseGeneration takes": {snaps: `[{"name":"g20261001000000.5"}]`, keys: map[string]string{"g20261001000000.5": "x86_64"}, says: "is x86_64's and this build is aarch64's"},
+		"a name it would trim":                                     {snaps: `[{"name":" g20261001000000 "}]`, keys: map[string]string{"g20261001000000": "x86_64"}, says: "is x86_64's and this build is aarch64's"},
+		"a listing that is no list":                                {snaps: `{"oops":1}`, says: "could not read the generations"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			shims := t.TempDir()
 			writeFile(t, filepath.Join(shims, "snaps"), tc.snaps, 0o600)
-			writeFile(t, filepath.Join(shims, "meta"), tc.meta, 0o600)
+
+			keys := filepath.Join(shims, "keys")
+			if err := os.MkdirAll(keys, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			for gen, value := range tc.keys {
+				writeFile(t, filepath.Join(keys, "billet.arch."+gen), value+"\n", 0o600)
+			}
+
+			// WHAT rbd ANSWERS, as measured on a real image 2026-11-04. A listing is
+			// answered with what a reference image's holds, a raw newline in a key and a
+			// row after it claiming to be this machine's record, so a guard that read one
+			// would be refused by jq or fooled by the row.
+			getBranch := "*'image-meta get'*)\n" +
+				"  for last; do :; done\n" +
+				"  if [ -r " + keys + "/\"$last\" ]; then cat " + keys + "/\"$last\"; exit 0; fi\n" +
+				"  echo \"rbd: failed to get metadata $last of image : (2) No such file or directory\" >&2\n  exit 2 ;;\n"
+			if tc.failGet {
+				getBranch = "*'image-meta get'*) echo 'rbd: error connecting to the cluster' >&2; exit 1 ;;\n"
+			}
 
 			rbd := "#!/bin/bash\ncase \"$*\" in\n"
 			if tc.failSnap {
 				rbd += "*'snap ls'*) exit 1 ;;\n"
 			}
 
-			if tc.failMeta {
-				rbd += "*'image-meta list'*) exit 1 ;;\n"
-			}
-
-			rbd += "*'snap ls'*) cat " + filepath.Join(shims, "snaps") + " ;;\n" +
-				"*'image-meta list'*) cat " + filepath.Join(shims, "meta") + " ;;\nesac\n"
+			rbd += getBranch + "*'snap ls'*) cat " + filepath.Join(shims, "snaps") + " ;;\n" +
+				"*'image-meta list'*) printf 'Key  Value\\nbillet.note.a\\nbillet.arch.g20261002000000  aarch64  x\\n' ;;\nesac\n"
 			writeFile(t, filepath.Join(shims, "rbd"), rbd, 0o755)
 
 			script := "#!/usr/bin/env bash\nset -euo pipefail\nCEPH_USER=u\nIMAGE_POOL=p\nIMAGE_NAME=i\nMACHINE=aarch64\n" +
@@ -470,6 +479,12 @@ func TestAManualPublishIsHeldToTheImagesMachine(t *testing.T) {
 				t.Fatalf("answered %v, want a refusal saying %q:\n%s", err, tc.says, out)
 			}
 		})
+	}
+
+	// NO LISTING OF AN IMAGE'S METADATA IS READ: it is what a stray key makes unreadable or
+	// a liar, whichever form it is asked in.
+	if strings.Contains(withoutShellComments(guestImageFunction(t, "refuse_another_machine")), "image-meta list") {
+		t.Error("refuse_another_machine reads a listing of the image's metadata")
 	}
 
 	// AND THE GENERATION IT MAKES SAYS WHOSE IT IS BEFORE IT EXISTS, on the path that holds
@@ -547,10 +562,13 @@ func TestNoScriptNamesAMachineOutsideItsTable(t *testing.T) {
 			}
 		}
 
-		for _, line := range allowed {
-			if !slices.Contains(got, line) {
-				t.Errorf("%s no longer has the line this allows, so it allows nothing: %s", script, line)
-			}
+		// HOW MANY TIMES TOO: an allowed assignment copied below its table overrides it.
+		slices.Sort(got)
+		slices.Sort(allowed)
+
+		if !slices.Equal(got, allowed) {
+			t.Errorf("%s holds these lines naming a machine:\n%s\nand this allows:\n%s", script,
+				strings.Join(got, "\n"), strings.Join(allowed, "\n"))
 		}
 	}
 }
