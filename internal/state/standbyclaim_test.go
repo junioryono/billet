@@ -3,6 +3,7 @@ package state
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 // A STANDBY ASKS ON ONE SESSION, for as long as it waits. A connection per attempt would
@@ -52,9 +53,21 @@ func TestAWaitingStandbyKeepsOneSession(t *testing.T) {
 		t.Fatalf("close the holder: %v", err)
 	}
 
-	// THE SESSION THAT WAITED IS THE ONE THAT TAKES IT.
-	if err := backend.claimController(t.Context(), standby); err != nil {
-		t.Fatalf("take the claim the holder let go: %v", err)
+	// THE SESSION THAT WAITED IS THE ONE THAT TAKES IT, asking as a standby asks: the server
+	// ends the holder's session a moment after its client closes.
+	deadline := time.Now().Add(30 * time.Second)
+
+	for {
+		err := backend.claimController(t.Context(), standby)
+		if err == nil {
+			break
+		}
+
+		if !errors.Is(err, ErrControllerHeld) || time.Now().After(deadline) {
+			t.Fatalf("take the claim the holder let go: %v", err)
+		}
+
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	if backend.claim == nil || backend.claimAttempt != nil {
