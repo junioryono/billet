@@ -426,7 +426,7 @@ var ErrLogIndexAbsent = errors.New("state: this host holds no log index")
 // SearchLogIndex runs a search over the index under dir, and says whether its bound
 // stopped it. It opens each file for reading only, without taking anything the writer
 // needs, so it runs beside a control plane or after one has stopped.
-func SearchLogIndex(ctx context.Context, dir string, s LogSearch) (partial bool, err error) {
+func SearchLogIndex(ctx context.Context, dir string, s LogSearch) (bool, error) {
 	days, err := logIndexDays(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, ErrLogIndexAbsent
@@ -472,54 +472,59 @@ type logChunkRow struct {
 
 // logDaySchema is how many tables a day's file holds and how many of them are the one a search
 // reads, from one statement, so both describe one moment.
-func logDaySchema(ctx context.Context, db *sql.DB) (tables, lines int, err error) {
+func logDaySchema(ctx context.Context, db *sql.DB) (int, int, error) {
+	var tables, lines int
+
 	row := logIndexQueryRow(ctx, db, `SELECT count(*), count(CASE WHEN name = 'lines' THEN 1 END) FROM sqlite_master`)
-	err = row.Scan(&tables, &lines)
+	err := row.Scan(&tables, &lines)
 
 	return tables, lines, err
 }
 
-// matchLogDay runs a search of one day, and answers its rows, or no rows and no error for a day with
-// nothing in it: removed by the retention since its name was read, or created a moment ago with its
-// schema not yet committed. Neither held a line, so neither ends a search of the other days.
+// matchLogDay runs a search of one day, and answers its rows and true, or false and no error for a day
+// with nothing in it: removed by the retention since its name was read, or created a moment ago with its
+// schema not yet committed. Neither held a line, so neither ends a search of the other days. schema
+// answers how many tables the day holds and how many are the search's.
 //
 // WHAT A FAILED MATCH MET IS DECIDED FROM ONE LOOK. createLogDay is one transaction, so a look finds
 // no tables, or all of them, or a damaged day with only some, which may have held lines and is the
 // failure it is. A schema committing after the match failed is why finding it whole means matching
 // again rather than reporting the error.
 func matchLogDay(path string, match func() (*sql.Rows, error),
-	schema func() (tables, lines int, err error),
-) (*sql.Rows, error) {
+	schema func() (int, int, error),
+) (*sql.Rows, bool, error) {
 	rows, err := match()
 	if err == nil {
-		return rows, nil
+		return rows, true, nil
 	}
 
 	if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	if !strings.Contains(err.Error(), "no such table") {
-		return nil, err
+		return nil, false, err
 	}
 
 	tables, lines, schemaErr := schema()
 
 	switch {
 	case schemaErr != nil:
-		return nil, err
+		return nil, false, err
 	case tables == 0:
-		return nil, nil
+		return nil, false, nil
 	case lines > 0:
-		return match()
+		rows, err := match()
+
+		return rows, err == nil, err
 	default:
-		return nil, err
+		return nil, false, err
 	}
 }
 
-// searchLogDay searches one file. stopped says the search is over, and more whether its
-// bound is what ended it, as against the caller's Visit.
-func searchLogDay(ctx context.Context, path string, s LogSearch, scanned *int) (more, stopped bool, err error) {
+// searchLogDay searches one file. It answers whether its bound is what ended the search, as against
+// the caller's Visit, and whether the search is over.
+func searchLogDay(ctx context.Context, path string, s LogSearch, scanned *int) (bool, bool, error) {
 	// mode=ro, OR A MISSING FILE IS CREATED: a retention removing this day while the search
 	// reached it would leave an empty file behind, which no later pass would remove.
 	db, err := sql.Open("sqlite", dsnWith(path, map[string]string{"mode": "ro"}, "busy_timeout(5000)", "query_only(ON)"))
@@ -536,12 +541,12 @@ func searchLogDay(ctx context.Context, path string, s LogSearch, scanned *int) (
 		return db.QueryContext(ctx, `SELECT rowid FROM lines WHERE lines MATCH ? ORDER BY rowid DESC`, s.Match) //billet:ignore rawsql // the log index is not the ledger, and sqlc has no catalogue entry for a virtual table
 	}
 
-	rows, err := matchLogDay(path, match, func() (int, int, error) { return logDaySchema(ctx, db) })
+	rows, found, err := matchLogDay(path, match, func() (int, int, error) { return logDaySchema(ctx, db) })
 	if err != nil {
 		return false, false, fmt.Errorf("state: search a day of the log index: %w", err)
 	}
 
-	if rows == nil {
+	if !found {
 		return false, false, nil
 	}
 	defer rows.Close()

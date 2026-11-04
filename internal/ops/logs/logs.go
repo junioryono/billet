@@ -208,7 +208,9 @@ func splitQuery(args []string) (string, []string) {
 // ParseQuery reads a person's query: whitespace separates terms, double quotes make a
 // phrase, and a leading minus excludes. An unclosed quote is refused rather than guessed,
 // because the answer would look like an answer.
-func ParseQuery(query string) (must, mustNot []string, err error) {
+func ParseQuery(query string) ([]string, []string, error) {
+	var must, mustNot []string
+
 	for i := 0; i < len(query); {
 		switch query[i] {
 		case ' ', '\t':

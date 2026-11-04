@@ -346,7 +346,7 @@ func TestAFailedMatchIsDecidedFromOneLook(t *testing.T) {
 			return nil, tc.matches[calls-1]
 		}
 
-		_, err := matchLogDay(path, match, func() (int, int, error) { return tc.tables, tc.lines, tc.schemaErr })
+		_, _, err := matchLogDay(path, match, func() (int, int, error) { return tc.tables, tc.lines, tc.schemaErr })
 		if (err != nil) != tc.wantErr {
 			t.Errorf("%s: %v, want an error: %t", name, err, tc.wantErr)
 		}

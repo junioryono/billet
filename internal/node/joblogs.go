@@ -233,7 +233,7 @@ func chunkName(firstLine int64, seq uint64, lines int64) string {
 }
 
 // parseChunkName reverses chunkName, false for any other name.
-func parseChunkName(name string) (firstLine int64, seq uint64, lines int64, ok bool) {
+func parseChunkName(name string) (int64, uint64, int64, bool) {
 	stem, found := strings.CutSuffix(name, jobLogSuffix)
 	if !found {
 		return 0, 0, 0, false
