@@ -3,7 +3,9 @@ package ceph
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	storecontract "github.com/junioryono/billet/internal/store"
@@ -127,8 +129,8 @@ func TestASnapshotWhoseMappingsCannotBeReadIsNotGone(t *testing.T) {
 
 	_, err := c.Snapshot(t.Context(), volume)
 
-	if err == nil || errors.Is(err, storecontract.ErrVolumeGone) {
-		t.Fatalf("Snapshot = %v, want an error that is not ErrVolumeGone", err)
+	if !errors.Is(err, storecontract.ErrDeviceUnknown) || errors.Is(err, storecontract.ErrVolumeGone) {
+		t.Fatalf("Snapshot = %v, want ErrDeviceUnknown", err)
 	}
 	if len(*read) != 0 {
 		t.Errorf("the check read %v without knowing whose device it was", *read)
@@ -173,7 +175,120 @@ func TestAVolumeMappedTwiceIsAnsweredByARecordThatIsOneOfThem(t *testing.T) {
 	unknown := volume
 	unknown.Device = "/dev/rbd99"
 	device, err = c.MappedDevice(t.Context(), unknown)
-	if err == nil || errors.Is(err, storecontract.ErrVolumeGone) {
-		t.Fatalf("MappedDevice = %q, %v, want a refusal that is not ErrVolumeGone", device, err)
+	if !errors.Is(err, storecontract.ErrDeviceUnknown) {
+		t.Fatalf("MappedDevice = %q, %v, want ErrDeviceUnknown", device, err)
+	}
+}
+
+// A ROW THAT DOES NOT SAY WHOSE IT IS, OR IN ANOTHER NAMESPACE, PROVES NOTHING: the
+// first could be this volume's, so it is could-not-tell and never gone, and the
+// second is a different image of the same name.
+func TestAMappingTableThatProvesNothingIsNotAnAnswer(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		rows     string
+		wantGone bool
+	}{
+		"a null row":               {rows: `[null]`},
+		"a row without its pool":   {rows: `[{"name":"%[1]s","snap":"-","device":"/dev/rbd5"}]`},
+		"a row without its image":  {rows: `[{"pool":"billet-cache","snap":"-","device":"/dev/rbd5"}]`},
+		"a row without a snapshot": {rows: `[{"pool":"billet-cache","name":"%[1]s","device":"/dev/rbd5"}]`},
+		"a row without its device": {rows: `[{"pool":"billet-cache","name":"%[1]s","snap":"-"}]`},
+		"null instead of a table":  {rows: `null`},
+		"another namespace's image": {
+			rows:     `[{"pool":"billet-cache","namespace":"other","name":"%[1]s","snap":"-","device":"/dev/rbd5"}]`,
+			wantGone: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newCacheFake()
+			var rows []byte
+			run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+				if rows != nil && slices.Contains(args, "device") && slices.Contains(args, "list") {
+					return rows, nil
+				}
+
+				return f.run(ctx, bin, args)
+			}
+			c, volume, _, _ := provenDeviceClient(t, f, run)
+			image := strings.TrimPrefix(volume.Handle, "billet-cache/")
+			if strings.Contains(tc.rows, "%[1]s") {
+				rows = fmt.Appendf(nil, tc.rows, image)
+			} else {
+				rows = []byte(tc.rows)
+			}
+			delete(f.mappings, volume.Device)
+
+			device, err := c.MappedDevice(t.Context(), volume)
+			if tc.wantGone {
+				if !errors.Is(err, storecontract.ErrVolumeGone) {
+					t.Fatalf("MappedDevice = %q, %v, want ErrVolumeGone", device, err)
+				}
+
+				return
+			}
+			if !errors.Is(err, storecontract.ErrDeviceUnknown) || errors.Is(err, storecontract.ErrVolumeGone) {
+				t.Fatalf("MappedDevice = %q, %v, want ErrDeviceUnknown", device, err)
+			}
+		})
+	}
+}
+
+// A MISSING ROW IS NOT GONE WHILE THE CLUSTER SAYS OTHERWISE. rbd's device list
+// skips a device it could not read and still succeeds, and gone is what has a job's
+// writes thrown away, so a watcher on the image, or a status that cannot be read,
+// is could-not-tell. An image that no longer exists is gone without a table.
+func TestGoneTakesTheClusterAgreeing(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		prepare  func(f *cacheFake, image string)
+		failing  bool
+		wantGone bool
+	}{
+		"no row and no watcher": {wantGone: true},
+		"no row and a watcher": {prepare: func(f *cacheFake, image string) {
+			f.watchers[image] = 1
+		}},
+		"no row and the status cannot be read": {failing: true},
+		"no row and no image": {
+			prepare:  func(f *cacheFake, image string) { delete(f.images, image) },
+			wantGone: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newCacheFake()
+			failing := false
+			run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+				if failing && slices.Contains(args, "status") {
+					return nil, errors.New("exit status 1: rbd: the monitors did not answer")
+				}
+
+				return f.run(ctx, bin, args)
+			}
+			c, volume, _, _ := provenDeviceClient(t, f, run)
+			delete(f.mappings, volume.Device)
+			if tc.prepare != nil {
+				tc.prepare(f, volume.Handle)
+			}
+			failing = tc.failing
+
+			device, err := c.MappedDevice(t.Context(), volume)
+			if tc.wantGone {
+				if !errors.Is(err, storecontract.ErrVolumeGone) {
+					t.Fatalf("MappedDevice = %q, %v, want ErrVolumeGone", device, err)
+				}
+
+				return
+			}
+			if !errors.Is(err, storecontract.ErrDeviceUnknown) {
+				t.Fatalf("MappedDevice = %q, %v, want ErrDeviceUnknown", device, err)
+			}
+		})
 	}
 }

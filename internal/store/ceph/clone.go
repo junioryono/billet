@@ -435,58 +435,129 @@ type mappedDevice struct {
 
 // mappedDevices lists the host devices a cache-pool image is mapped to.
 func (c *Client) mappedDevices(ctx context.Context, name string) ([]string, error) {
-	return c.mappedDevicesWhere(ctx, func(d mappedDevice) bool { return d.Name == name })
-}
-
-// MappedDevice names the device the kernel has a writable cache volume's head
-// mapped to now, from the kernel's table and by the image's name.
-func (c *Client) MappedDevice(ctx context.Context, volume storecontract.Volume) (string, error) {
-	name := strings.TrimPrefix(volume.Handle, c.cfg.CachePool+"/")
-	devices, err := c.mappedDevicesWhere(ctx, func(d mappedDevice) bool {
-		return d.Name == name && (d.Snap == "" || d.Snap == "-")
-	})
-	switch {
-	case err != nil:
-		return "", err
-	case len(devices) == 0:
-		return "", fmt.Errorf("%w: nothing maps %s, recorded on %s", storecontract.ErrVolumeGone,
-			volume.Handle, bounded(volume.Device))
-	case slices.Contains(devices, volume.Device):
-		return volume.Device, nil
-	case len(devices) == 1:
-		return devices[0], nil
+	rows, _, err := c.cacheMappings(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	var found []string
+	for _, row := range rows {
+		if row.Device != "" {
+			found = append(found, row.Device)
+		}
 	}
 
-	return "", fmt.Errorf("ceph: %s is mapped to %v, none of them the recorded %s", volume.Handle,
-		devices, bounded(volume.Device))
+	return found, nil
 }
 
-// mappedDevicesWhere lists the host devices of the cache pool's mappings match
-// accepts.
-func (c *Client) mappedDevicesWhere(ctx context.Context, match func(mappedDevice) bool) ([]string, error) {
+// cacheMappings lists the kernel's mappings of a cache-pool image, in the pool's
+// default namespace, the only one `pool/name` addresses. incomplete says a row did
+// not say whose it is, so it could have been this image's.
+func (c *Client) cacheMappings(ctx context.Context, name string) ([]mappedDevice, bool, error) {
 	out, err := c.rbdCmd(ctx, true, "device", "list")
 	if err != nil {
-		return nil, fmt.Errorf("ceph: list the mapped rbd devices: %w", err)
+		return nil, false, fmt.Errorf("ceph: list the mapped rbd devices: %w", err)
 	}
 
 	// A `null` UNMARSHALS INTO A SLICE HAPPILY and would read as "nothing is
 	// mapped" — which here means "skip the unmap and remove an image the kernel is
 	// still holding". An empty table is `[]`, so nil is not a shape rbd produces.
-	var devices []mappedDevice
+	var devices []*mappedDevice
 	if err := json.Unmarshal(trimSpace(out), &devices); err != nil || devices == nil {
-		return nil, fmt.Errorf("ceph: %s did not answer with a json device list; is it the rbd "+
+		return nil, false, fmt.Errorf("ceph: %s did not answer with a json device list; is it the rbd "+
 			"command?", c.bin)
 	}
 
-	var found []string
+	var found []mappedDevice
+	incomplete := false
 
 	for _, d := range devices {
-		if d.Pool == c.cfg.CachePool && d.Device != "" && match(d) {
-			found = append(found, d.Device)
+		if d == nil || d.Pool == "" || d.Name == "" {
+			incomplete = true
+
+			continue
+		}
+		if d.Pool == c.cfg.CachePool && d.Namespace == "" && d.Name == name {
+			found = append(found, *d)
 		}
 	}
 
-	return found, nil
+	return found, incomplete, nil
+}
+
+// MappedDevice names the device the kernel has a writable cache volume's head
+// mapped to now, from the kernel's table and by the image's name.
+//
+// GONE TAKES TWO WITNESSES. `rbd device list` skips a device whose attributes it
+// could not read and still succeeds (Ceph 20.2.3, krbd.cc's dump_one_image), so a
+// missing row alone does not say the volume is unmapped, and this answer is what
+// has its writes thrown away. The cluster has to agree: no image, or one with no
+// watcher, which a kernel mapping holds for as long as it exists.
+func (c *Client) MappedDevice(ctx context.Context, volume storecontract.Volume) (string, error) {
+	unknown := func(err error) error { return fmt.Errorf("%w: %w", storecontract.ErrDeviceUnknown, err) }
+
+	name := strings.TrimPrefix(volume.Handle, c.cfg.CachePool+"/")
+	rows, incomplete, err := c.cacheMappings(ctx, name)
+	if err != nil {
+		return "", unknown(err)
+	}
+	if incomplete {
+		return "", unknown(fmt.Errorf("ceph: %s listed a mapped device without its pool and image", c.bin))
+	}
+
+	var devices []string
+	for _, row := range rows {
+		switch {
+		case row.Snap == "" || row.Device == "":
+			return "", unknown(fmt.Errorf("ceph: %s listed %s without its snapshot and device",
+				c.bin, volume.Handle))
+		case row.Snap == "-":
+			devices = append(devices, row.Device)
+		}
+	}
+
+	switch {
+	case slices.Contains(devices, volume.Device):
+		return volume.Device, nil
+	case len(devices) == 1:
+		return devices[0], nil
+	case len(devices) > 1:
+		return "", unknown(fmt.Errorf("ceph: %s is mapped to %v, none of them the recorded %s",
+			volume.Handle, devices, bounded(volume.Device)))
+	}
+
+	watched, err := c.imageWatched(ctx, volume.Handle)
+	if err != nil {
+		return "", unknown(err)
+	}
+	if watched {
+		return "", unknown(fmt.Errorf("ceph: the device list has no row for %s, and something still "+
+			"watches it", volume.Handle))
+	}
+
+	return "", fmt.Errorf("%w: nothing maps %s, recorded on %s", storecontract.ErrVolumeGone,
+		volume.Handle, bounded(volume.Device))
+}
+
+// imageWatched reports whether anything holds a watch on an image. An image that
+// does not exist has none.
+func (c *Client) imageWatched(ctx context.Context, handle string) (bool, error) {
+	out, err := c.rbdCmd(ctx, true, "status", handle)
+	if err != nil {
+		if isNoSuchFile(err) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("ceph: read the watchers of %s: %w", handle, err)
+	}
+
+	var status struct {
+		Watchers *[]json.RawMessage `json:"watchers"`
+	}
+	if err := json.Unmarshal(out, &status); err != nil || status.Watchers == nil {
+		return false, fmt.Errorf("ceph: %s did not name the watchers of %s", c.bin, handle)
+	}
+
+	return len(*status.Watchers) > 0, nil
 }
 
 // checkCloneName refuses a clone name billet cannot address.

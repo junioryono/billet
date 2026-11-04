@@ -713,6 +713,15 @@ func (s *CacheService) releaseCASVolume(
 
 		return false, s.persistSession(session)
 	}
+	// NOR IS A DEVICE THAT COULD NOT BE PROVED A REASON TO LOSE WHAT THE VOLUME
+	// HOLDS: nothing was done to it, and the store's next answer may be better.
+	if errors.Is(err, storecontract.ErrDeviceUnknown) {
+		journal.Phase = ""
+		s.log.Warn("could not yet publish a content-addressed cache a job wrote; will retry",
+			"instance", session.instance, "kind", hv.Kind, "error", err)
+
+		return false, s.persistSession(session)
+	}
 	if err != nil {
 		return abandon("the merge failed: " + err.Error())
 	}
@@ -818,6 +827,12 @@ func (s *CacheService) mergeCASVolume(
 		return candidate.Generation, true, nil
 	}
 
+	// BEFORE THE CLONE, so a device that cannot be proved yet leaves nothing behind
+	// for the retry to replace.
+	device, err := s.provenDevice(ctx, hv.Volume)
+	if err != nil {
+		return "", false, release(err)
+	}
 	latest, err := s.store.Clone(ctx, key, current)
 	if err != nil {
 		return "", false, release(fmt.Errorf("clone the newest generation: %w", err))
@@ -828,10 +843,6 @@ func (s *CacheService) mergeCASVolume(
 	}
 	source := s.casMountPath(session, hv.Kind) + ".source"
 	target := s.casMountPath(session, hv.Kind) + ".merge"
-	device, err := s.provenDevice(ctx, hv.Volume)
-	if err != nil {
-		return "", false, release(err)
-	}
 	if err := s.actionIO.MountReadOnly(ctx, device, source); err != nil {
 		return "", false, release(err)
 	}
@@ -874,7 +885,9 @@ func (s *CacheService) mergeCASVolume(
 	}
 	candidate, err := s.store.Snapshot(ctx, latest)
 	if err != nil {
-		return "", false, release(fmt.Errorf("snapshot: %w", err))
+		// %v: THE CLONE IS RECORDED AND MERGED INTO, so this ends the publication
+		// whatever the reason, and is not asked again from the top.
+		return "", false, release(fmt.Errorf("snapshot: %v", err)) //nolint:errorlint // see above
 	}
 	if err := publish(current, candidate); err != nil {
 		return "", false, err

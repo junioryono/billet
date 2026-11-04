@@ -286,11 +286,20 @@ func (s *CacheService) cloneWithin(
 	}
 	// A CLONE THAT CANNOT BE DISCARDED IS KEPT AND USED, oversized, rather than
 	// dropped: nothing has recorded it yet, so returning without it would lose
-	// the only handle anything has on it.
+	// the only handle anything has on it. A discard unmaps first and may fail after
+	// that, though, so its device is proved again before anything is given it: the
+	// number may already be another job's disk. One that cannot be is not used, and
+	// the store's eviction collects it once its lease runs out unrenewed.
 	if err := s.store.Discard(ctx, volume); err != nil {
+		device, proveErr := s.provenDevice(ctx, volume)
+		if proveErr != nil {
+			return storecontract.Volume{}, false, errors.Join(
+				fmt.Errorf("discard a cache generation larger than its tier allows: %w", err), proveErr)
+		}
 		s.log.Warn("could not discard a cache generation larger than its tier allows; using it",
 			"key", key, "generation", volume.Generation, "size", size, "ceiling", ceiling,
 			"error", err)
+		volume.Device = device
 
 		return volume, false, nil
 	}

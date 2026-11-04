@@ -17,6 +17,11 @@ var ErrMiss = errors.New("store: cache miss")
 // it, or the host restarted. A caller stops asking and discards what is left.
 var ErrVolumeGone = errors.New("store: the volume is no longer mapped on this host")
 
+// ErrDeviceUnknown means where a volume is mapped could not be told. Nothing was
+// done to the volume, and it may be intact: a caller asks again rather than giving
+// up on what it holds.
+var ErrDeviceUnknown = errors.New("store: could not tell where the volume is mapped")
+
 // ErrConflict means the expected generation or fencing token is no longer current.
 var ErrConflict = errors.New("store: publication conflict")
 
@@ -180,9 +185,9 @@ type Store interface {
 //
 // A RECORDED DEVICE IS NOT PROOF. A kernel reuses a device's number as soon as it
 // is unmapped, so a number kept across a failure or a restart may name another
-// job's disk. It answers ErrVolumeGone for a volume nothing maps, and any other
-// error for could not tell. Optional: a store whose device is the volume's own
-// name has nothing to prove.
+// job's disk. It answers ErrVolumeGone for a volume nothing maps, and
+// ErrDeviceUnknown for could not tell. Optional: a store whose device is the
+// volume's own name has nothing to prove.
 type DeviceProver interface {
 	MappedDevice(ctx context.Context, volume Volume) (string, error)
 }

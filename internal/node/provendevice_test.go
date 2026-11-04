@@ -22,10 +22,15 @@ type provingStore struct {
 
 	device string
 	err    error
+	size   int64
 }
 
 func (p *provingStore) MappedDevice(context.Context, storecontract.Volume) (string, error) {
 	return p.device, p.err
+}
+
+func (p *provingStore) SizeOf(context.Context, storecontract.Volume) (int64, error) {
+	return p.size, nil
 }
 
 // A VOLUME THAT IS GONE ENDS ITS PUBLICATION AT ONCE, and is discarded: an earlier
@@ -45,7 +50,7 @@ func TestASnapshotOfAVolumeThatIsGoneEndsThePublication(t *testing.T) {
 			wantSnapshots: 1, wantDiscarded: 1,
 		},
 		"could not tell": {
-			err:           errors.New("ceph: list the mapped rbd devices: the monitors did not answer"),
+			err:           fmt.Errorf("ceph: find the device: %w", storecontract.ErrDeviceUnknown),
 			wantSnapshots: 2, wantOpen: true,
 		},
 	} {
@@ -98,7 +103,7 @@ func TestARecoveredVolumeIsMountedFromWhereItIsMappedNow(t *testing.T) {
 	}{
 		"its number moved": {device: "/dev/rbd-moved", wantMount: true},
 		"nothing maps it":  {err: storecontract.ErrVolumeGone},
-		"could not tell":   {err: errors.New("the monitors did not answer")},
+		"could not tell":   {err: storecontract.ErrDeviceUnknown},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -152,30 +157,151 @@ func TestARecoveredVolumeIsMountedFromWhereItIsMappedNow(t *testing.T) {
 	}
 }
 
-// THE SOURCE OF A MERGE IS PROVED BEFORE IT IS MOUNTED. Its objects are copied
-// into a generation this repository publishes, so a number that had gone to
+// THE SOURCE OF A MERGE IS PROVED BEFORE ANYTHING IS DONE WITH IT. Its objects are
+// copied into a generation this repository publishes, so a number that had gone to
 // another job's volume would carry that job's objects across.
-func TestAMergeDoesNotMountASourceItCannotProve(t *testing.T) {
+func TestAMergeDoesNotUseASourceItCannotProve(t *testing.T) {
 	t.Parallel()
 
-	storage := &fakeCacheStore{}
-	service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+	for name, tc := range map[string]struct {
+		err           error
+		wantDiscarded int
+	}{
+		"gone ends the publication": {err: storecontract.ErrVolumeGone, wantDiscarded: 1},
+		"could not tell keeps it":   {err: storecontract.ErrDeviceUnknown},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			storage := &fakeCacheStore{}
+			service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+			if code := putObject(t, service, token, "ours"); code != http.StatusOK {
+				t.Fatalf("PUT = %d", code)
+			}
+			storage.current = "theirs"
+			cloned := storage.cloned
+			service.store = &provingStore{fakeCacheStore: storage, err: tc.err}
+			finish(t, service, instance)
+			// Could not tell keeps the session, which reports that as an error.
+			if err := service.RetryClosed(t.Context()); err != nil && tc.wantDiscarded != 0 {
+				t.Fatalf("RetryClosed: %v", err)
+			}
+
+			if slices.ContainsFunc(volumes.targets, func(target string) bool {
+				return strings.HasSuffix(target, ".source")
+			}) {
+				t.Errorf("mounted a merge's source from an unproved device: %v", volumes.targets)
+			}
+			if storage.cloned != cloned {
+				t.Errorf("cloned the newest generation %d times before the source was proved", storage.cloned-cloned)
+			}
+			if storage.published != 0 || storage.discarded != tc.wantDiscarded {
+				t.Errorf("published/discarded = %d/%d, want 0/%d", storage.published, storage.discarded, tc.wantDiscarded)
+			}
+		})
+	}
+}
+
+// A DEVICE THAT COULD NOT BE TOLD LOSES NOTHING: the publication is asked for again
+// and succeeds once the store can answer, with the job's writes intact, by either
+// way a volume reaches a publication.
+func TestACASPublicationComesBackFromADeviceItCouldNotProve(t *testing.T) {
+	t.Parallel()
+
+	for name, merge := range map[string]bool{"snapshotting its own volume": false, "merging": true} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			storage := &fakeCacheStore{}
+			service, _, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+			if code := putObject(t, service, token, "ours"); code != http.StatusOK {
+				t.Fatalf("PUT = %d", code)
+			}
+			if merge {
+				storage.current = "theirs"
+				service.store = &provingStore{fakeCacheStore: storage, err: storecontract.ErrDeviceUnknown}
+			} else {
+				storage.snapshotErr = fmt.Errorf("ceph: %w", storecontract.ErrDeviceUnknown)
+			}
+			finish(t, service, instance)
+			if err := service.RetryClosed(t.Context()); err != nil {
+				t.Fatalf("RetryClosed while the device could not be told: %v", err)
+			}
+			if storage.published != 0 || storage.discarded != 0 {
+				t.Fatalf("published/discarded = %d/%d while the device could not be told, want 0/0",
+					storage.published, storage.discarded)
+			}
+
+			storage.snapshotErr = nil
+			service.store = storage
+			if err := service.RetryClosed(t.Context()); err != nil {
+				t.Fatalf("RetryClosed once it could be told: %v", err)
+			}
+			if storage.published != 1 {
+				t.Fatalf("published %d once the device could be told, want 1", storage.published)
+			}
+		})
+	}
+}
+
+// A SNAPSHOT OF A MERGE ENDS THE PUBLICATION WHATEVER STOPPED IT. The clone is
+// recorded and merged into, so asking again from the top would clone another and
+// lose track of this one.
+func TestAMergedCloneThatCannotBeSnapshottedIsNotAskedAgain(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{snapshotErr: fmt.Errorf("ceph: %w", storecontract.ErrDeviceUnknown)}
+	service, _, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
 	if code := putObject(t, service, token, "ours"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
 	storage.current = "theirs"
-	service.store = &provingStore{fakeCacheStore: storage, err: storecontract.ErrVolumeGone}
 	finish(t, service, instance)
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatalf("RetryClosed: %v", err)
 	}
-
-	if slices.ContainsFunc(volumes.targets, func(target string) bool {
-		return strings.HasSuffix(target, ".source")
-	}) {
-		t.Errorf("mounted a merge's source from an unproved device: %v", volumes.targets)
+	if storage.discarded != 2 || storage.published != 0 {
+		t.Fatalf("published/discarded = %d/%d, want the merge clone and the job's own discarded", storage.published, storage.discarded)
 	}
-	if storage.published != 0 || storage.current != "theirs" {
-		t.Errorf("published %d with current %q, want nothing published", storage.published, storage.current)
+}
+
+// A CLONE WHOSE DISCARD FAILED IS USED ONLY FROM A DEVICE PROVED AGAIN. A discard
+// unmaps first and can fail after that, and the recorded number may then already
+// be another job's disk, which this would have given to a guest.
+func TestAnOversizedCloneThatCouldNotBeDiscardedIsProvedBeforeItIsUsed(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		device  string
+		err     error
+		wantErr bool
+	}{
+		"still mapped": {device: "/dev/rbd-proved"},
+		"unmapped":     {err: storecontract.ErrVolumeGone, wantErr: true},
+		"unknown":      {err: storecontract.ErrDeviceUnknown, wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			storage := &fakeCacheStore{current: "g1", discardFailures: 1}
+			service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+				&provingStore{fakeCacheStore: storage, device: tc.device, err: tc.err, size: 2 << 30},
+				&fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("NewCacheService: %v", err)
+			}
+
+			volume, cold, err := service.cloneWithin(t.Context(), "acme/api/go", 1<<30)
+			if tc.wantErr {
+				if err == nil || !errors.Is(err, tc.err) {
+					t.Fatalf("cloneWithin = %+v, %v, want %v", volume, err, tc.err)
+				}
+
+				return
+			}
+			if err != nil || cold || volume.Device != tc.device {
+				t.Fatalf("cloneWithin = device %q cold=%t, %v, want the proved %s", volume.Device, cold, err, tc.device)
+			}
+		})
 	}
 }
