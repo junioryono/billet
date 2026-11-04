@@ -9,10 +9,13 @@
 -- THE FIRST OBSERVATION IS KEPT, and the guard is in the statement rather than in
 -- a branch above it: each column is written only while it is empty, so a repeat
 -- from a node retrying a lost response changes nothing and a later, different
--- observation cannot replace what the guest first saw. The generation moves with
--- the image-cache token so a report never shows a generation with nothing to
--- attribute it to. TestBothCacheObservationStatementsKeepTheFirst pins the guard
--- on both statements.
+-- observation cannot replace what the guest first saw. The one exception is the
+-- Actions half's 'unavailable', a call billet failed locally, which replaces what
+-- came before it: a save lost after a served restore was otherwise recorded as
+-- served (#694). The generation moves with the image-cache token so a report
+-- never shows a generation with nothing to attribute it to.
+-- TestBothCacheObservationStatementsKeepTheFirst pins the guard on both
+-- statements.
 
 -- name: RecordLeaseCacheObservation :exec
 -- Write the observation onto the live lease, fenced on its epoch.
@@ -21,7 +24,8 @@ UPDATE leases
                                ELSE image_cache END,
        cache_generation = CASE WHEN image_cache = '' THEN CAST(@cache_generation AS TEXT)
                                ELSE cache_generation END,
-       actions_cache    = CASE WHEN actions_cache = '' THEN CAST(@actions_cache AS TEXT)
+       actions_cache    = CASE WHEN actions_cache = '' OR CAST(@actions_cache AS TEXT) = 'unavailable'
+                               THEN CAST(@actions_cache AS TEXT)
                                ELSE actions_cache END,
        sticky_cache     = CASE WHEN sticky_cache = '' THEN CAST(@sticky_cache AS TEXT)
                                ELSE sticky_cache END,
@@ -49,7 +53,8 @@ UPDATE job_history
                                ELSE image_cache END,
        cache_generation = CASE WHEN image_cache = '' THEN CAST(@cache_generation AS TEXT)
                                ELSE cache_generation END,
-       actions_cache    = CASE WHEN actions_cache = '' THEN CAST(@actions_cache AS TEXT)
+       actions_cache    = CASE WHEN actions_cache = '' OR CAST(@actions_cache AS TEXT) = 'unavailable'
+                               THEN CAST(@actions_cache AS TEXT)
                                ELSE actions_cache END,
        sticky_cache     = CASE WHEN sticky_cache = '' THEN CAST(@sticky_cache AS TEXT)
                                ELSE sticky_cache END,

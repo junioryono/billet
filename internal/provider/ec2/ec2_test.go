@@ -40,6 +40,23 @@ type fakeEC2 struct {
 	// auth is the Authorization header of the last request, so a test can read
 	// the credential scope billet actually signed with.
 	auth string
+	// staged is every payload a build uploaded, and removed how many it deleted.
+	staged  [][]byte
+	removed int
+}
+
+// stagedPayload is the one payload a build uploaded.
+func (f *fakeEC2) stagedPayload(t *testing.T) []byte {
+	t.Helper()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(f.staged) != 1 {
+		t.Fatalf("the build staged %d payloads, want 1", len(f.staged))
+	}
+
+	return f.staged[0]
 }
 
 func (f *fakeEC2) lastAuthorization() string {
@@ -58,6 +75,22 @@ func newFakeEC2(t *testing.T) *fakeEC2 {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read request body: %v", err)
+
+			return
+		}
+
+		// S3, NOT THE QUERY API: a build stages its payload with a PUT and removes
+		// it with a DELETE, through a client redirected here (newBuildProvider).
+		if r.Method == http.MethodPut || r.Method == http.MethodDelete {
+			f.mu.Lock()
+			if r.Method == http.MethodPut {
+				f.staged = append(f.staged, body)
+			} else {
+				f.removed++
+			}
+			f.mu.Unlock()
+
+			w.WriteHeader(http.StatusOK)
 
 			return
 		}
@@ -366,8 +399,13 @@ func newTestProvider(t *testing.T, f *fakeEC2, mutate func(*config.EC2Config)) *
 		mutate(&cfg)
 	}
 
+	// S3 TO THE FAKE, so a build's staging lands where the test can read it; every
+	// other host is the configured endpoint's, which a test may point elsewhere.
 	p, err := New("dep-1", cfg,
-		WithHTTPClient(f.Client()),
+		WithHTTPClient(&http.Client{Transport: s3To{
+			s3:   redirectTo(f.URL, f.Client().Transport),
+			rest: f.Client().Transport,
+		}}),
 		WithCredentials(awscreds.Static{AccessKeyID: "AKID", SecretAccessKey: "secret"}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -383,6 +421,19 @@ func newTestProvider(t *testing.T, f *fakeEC2, mutate func(*config.EC2Config)) *
 	}
 
 	return p
+}
+
+// s3To sends a request for an S3 host one way and every other request another.
+type s3To struct {
+	s3, rest http.RoundTripper
+}
+
+func (r s3To) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Host, ".s3.") {
+		return r.s3.RoundTrip(req)
+	}
+
+	return r.rest.RoundTrip(req)
 }
 
 // validSpec is a launch that should succeed.

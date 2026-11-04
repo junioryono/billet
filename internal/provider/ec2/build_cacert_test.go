@@ -170,19 +170,13 @@ func lineOf(t *testing.T, lines []string, substr string) int {
 }
 
 // GIVEN A CA, THE IMAGE TRUSTS IT — the exact certificate, in the host store, in
-// the right order, and still under EC2's user-data limit.
-func TestProvisionScriptInstallsTheCACert(t *testing.T) {
+// the right order.
+func TestTheLayerInstallsTheCACert(t *testing.T) {
 	t.Parallel()
 
 	ca := mintCert(t, true)
 
-	// STAGED, WHICH IS THE SHAPE A PARITY BUILD ACTUALLY HAS. The pinned
-	// declaration no longer compresses into EC2's 16384 bytes with the installers
-	// embedded -- measured at 16453 -- so a build without a payload bucket is
-	// refused, by name, and TestTheEmbeddedPathRefusesWhenItCannotFit is what
-	// covers that. What this test is about is the CA ordering, so it must not also
-	// be the one test standing on a delivery shape parity has outgrown.
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	script, err := layerScript(BuildSpec{
 		RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0",
 		Arch:      "x64",
 		CACertPEM: ca,
@@ -191,18 +185,8 @@ func TestProvisionScriptInstallsTheCACert(t *testing.T) {
 		t.Fatalf("provisionScript: %v", err)
 	}
 
-	// DELIVERABLE, NOT PLAIN. This asserted `len(script) <= maxUserData`, which was
-	// the right property under the old contract and is the wrong one now: a script
-	// over the plain budget is compressed and delivered, so the plain assertion
-	// would fail on a correct build the moment parity pushes past 16 KiB. What must
-	// hold is that the script can be CARRIED -- which is what packUserData answers.
-	if _, err := packUserData(script); err != nil {
-		t.Fatalf("the script with a CA cannot be delivered as user data: %v", err)
-	}
-
-	// THE COMPLETE ORDERING, by line. Each step depends on the one before: the apt
-	// transaction provides ca-certificates and therefore update-ca-certificates,
-	// the anchor must exist before the refresh reads it, the refresh must be proved
+	// THE COMPLETE ORDERING, by line. Each step depends on the one before: the
+	// anchor must exist before the refresh reads it, the refresh must be proved
 	// to have taken, and the whole thing must land before the runner so a first
 	// job's cache request already trusts the endpoint. The CA-specific lines are
 	// unique (lineOf enforces it); the runner entry point recurs, so its FIRST line
@@ -213,7 +197,6 @@ func TestProvisionScriptInstallsTheCACert(t *testing.T) {
 	// leaves a file nothing reads, so the paths are part of the contract rather
 	// than an incidental spelling.
 	lines := strings.Split(script, "\n")
-	firstInstall := firstLineOf(t, lines, "apt-get -o DPkg::Lock::Timeout=600 install")
 	anchor := lineOf(t, lines, "base64 -d > /usr/local/share/ca-certificates/billet-cache-ca.crt")
 	extract := lineOf(t, lines, "update-ca-certificates")
 	// THE ORDERING ONLY. Whether this check can actually fail is decided by
@@ -237,7 +220,6 @@ func TestProvisionScriptInstallsTheCACert(t *testing.T) {
 		name string
 		at   int
 	}{
-		{"apt install", firstInstall},
 		{"anchor write", anchor},
 		{"update-ca-certificates", extract},
 		{"proof the anchor took", proof},
@@ -386,11 +368,11 @@ func TestAnOversizedCACertIsRefusedBeforeAnyLaunch(t *testing.T) {
 	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
 
 	f := newFakeEC2(t)
-	f.respond = b.reply
+	f.respond = b.serve(f)
 
 	p := newTestProvider(t, f, nil)
 
-	_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+	_, err := p.BuildImage(t.Context(), BuildSpec{PayloadBucket: testPayloadBucket,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
 		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 		CACertPEM: bundle,

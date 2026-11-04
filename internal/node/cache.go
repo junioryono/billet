@@ -93,6 +93,8 @@ type CacheService struct {
 	// npmSettleWait is defaultNpmSettleWait, a field so a test can reach its
 	// bound without waiting it out.
 	npmSettleWait time.Duration
+	// answerCloseWait is defaultAnswerCloseWait, a field for the same reason.
+	answerCloseWait time.Duration
 	// closed wakes whatever runs RetryClosed when a session is closed with its
 	// volumes still to discard.
 	closed chan struct{}
@@ -171,6 +173,10 @@ type cacheSession struct {
 	// answered.
 	inflight int
 	closed   bool
+	// actionsFailed says a call or a blob leg billet owned failed locally, set
+	// without the session lock so a busy lock cannot lose it; absorbActionsFailure
+	// moves it into observed.
+	actionsFailed atomic.Bool
 	// closing mirrors closed without the session lock, which RetryClosed holds
 	// for the whole of a discard. Closing an already closed session must not
 	// wait on storage.
@@ -249,8 +255,8 @@ type CacheObserver interface {
 // DURABLE WITH THE SESSION, because the report is best effort at the moment of
 // observation and is resent when the compute ends; a restart in between must
 // not forget what the guest saw. The first observation of each half is kept,
-// which is the same rule the ledger applies, so the two cannot disagree about
-// which observation was first.
+// except that the Actions half's `unavailable` replaces whatever came before it,
+// which is the same rule the ledger applies, so the two cannot disagree.
 type cacheObserved struct {
 	ImageCache      string `json:"image_cache,omitempty"`
 	CacheGeneration string `json:"cache_generation,omitempty"`
@@ -343,6 +349,7 @@ func NewCacheService(
 	service.git = newGitProxy(filepath.Join(stateDir, gitMirrorsDirectory))
 	service.casFill = casFillDefault
 	service.npmSettleWait = defaultNpmSettleWait
+	service.answerCloseWait = defaultAnswerCloseWait
 	if err := service.loadSessions(); err != nil {
 		return nil, err
 	}
@@ -387,7 +394,7 @@ func (s *CacheService) SetCacheObserver(observer CacheObserver) { s.observer = o
 // costs nothing and a later, different observation cannot replace what the
 // guest first saw.
 func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs alloc.CacheObservation) {
-	changed := false
+	changed := absorbActionsFailure(session)
 
 	if obs.ImageCache != "" && session.observed.ImageCache == "" {
 		session.observed.ImageCache = string(obs.ImageCache)
@@ -395,6 +402,8 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 		changed = true
 	}
 
+	// A local failure has already replaced the Actions half above, whatever came
+	// before it: observeActions marks it on the session (#694).
 	if obs.ActionsCache != "" && session.observed.ActionsCache == "" {
 		session.observed.ActionsCache = string(obs.ActionsCache)
 		session.observed.ActionsPending = false
@@ -529,13 +538,28 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 
 	obs.BuildCaches = settledBuildCaches(session)
 
-	if obs != (alloc.CacheObservation{}) {
+	if obs != (alloc.CacheObservation{}) || session.actionsFailed.Load() {
 		s.observe(ctx, session, obs)
 
 		return
 	}
 
 	s.report(ctx, session)
+}
+
+// absorbActionsFailure records a local Actions failure observeActions could not
+// write under the lock, and says whether the record changed. Called with
+// session.mu held.
+func absorbActionsFailure(session *cacheSession) bool {
+	if !session.actionsFailed.Load() ||
+		session.observed.ActionsCache == string(alloc.ActionsCacheUnavailable) {
+		return false
+	}
+	session.observed.ActionsCache = string(alloc.ActionsCacheUnavailable)
+	session.observed.ActionsPending = false
+	session.observed.Reported = false
+
+	return true
 }
 
 // buildCacheRank orders what a build cache did by how much it says: a cache
@@ -1118,12 +1142,18 @@ func (s *CacheService) cleanupSession(
 				session.instance, slot, err)
 		}
 	}
+	// A VOLUME NOT DONE KEEPS THE SESSION OPEN, with or without an error: one
+	// waiting its turn to publish answers not done and no error, and a session
+	// finished around it would forget the volume and never publish it.
+	pending := false
 	for kind, hv := range session.hosts {
 		done, err := s.releaseCASVolume(ctx, session, hv)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("%s cache: %w", kind, err))
 		}
 		if !done {
+			pending = true
+
 			continue
 		}
 		delete(session.hosts, kind)
@@ -1132,10 +1162,16 @@ func (s *CacheService) cleanupSession(
 		}
 	}
 	for id, archive := range session.actions {
-		if err := lockCacheMutex(ctx, &archive.mu); err != nil {
+		if err := archive.lockExclusive(ctx); err != nil {
 			failures = append(failures, fmt.Errorf("actions cache %s wait for archive: %w", id, err))
 
 			break
+		}
+		// A finalization takes its archive out of the session, so one still here
+		// was reserved and never finalized: the job's save published nothing.
+		if archive.Mode == actionsModeUpload {
+			s.log.Warn("an Actions cache save was reserved and never finalized; nothing was published",
+				"instance", session.instance, "key", archive.CacheKey, "version", archive.Version)
 		}
 		if !archive.Unmounted {
 			if err := s.actionIO.Unmount(ctx, s.actionsMountPath(session, archive)); err != nil {
@@ -1161,6 +1197,21 @@ func (s *CacheService) cleanupSession(
 
 	if err := errors.Join(failures...); err != nil {
 		return fmt.Errorf("node: discard cache volumes of %s: %w", session.instance, err)
+	}
+	if pending {
+		return nil
+	}
+	// A FAILURE MARKED AFTER SETTLEMENT IS REPORTED BEFORE THE RECORD GOES: a
+	// download read, or an observation that waited out this cleanup's hold, was
+	// written by the discards above and would otherwise be deleted unreported.
+	// Twice, because the report's own write of the record takes up a failure
+	// marked while the plane was being told. Best effort: a plane that refuses
+	// the report, as it does once the lease has ended, is not waited for.
+	for range 2 {
+		if !absorbActionsFailure(session) && session.observed.Reported {
+			break
+		}
+		s.report(ctx, session)
 	}
 	if err := s.finishSession(session); err != nil {
 		return fmt.Errorf("node: finish cache cleanup of %s: %w", session.instance, err)
@@ -1921,13 +1972,18 @@ func lockCacheSession(ctx context.Context, session *cacheSession) error {
 	return lockCacheMutex(ctx, &session.mu)
 }
 
-func lockCacheMutex(ctx context.Context, mutex *sync.Mutex) error {
+func lockCacheMutex(ctx context.Context, mutex interface{ TryLock() bool }) error {
+	return pollCacheLock(ctx, mutex.TryLock)
+}
+
+// pollCacheLock takes a lock through try until ctx ends.
+func pollCacheLock(ctx context.Context, try func() bool) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
-	for !mutex.TryLock() {
+	for !try() {
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():

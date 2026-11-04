@@ -2,6 +2,7 @@ package ec2
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -16,7 +17,6 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/guestassets"
-	"github.com/junioryono/billet/internal/runnerimages"
 	"github.com/junioryono/billet/internal/runnerrelease"
 	"github.com/junioryono/billet/internal/version"
 )
@@ -40,31 +40,28 @@ import (
 // 3: and the runner is launched through billet-exec-env, so its registration and
 // the cache bearer reach it in no process's argument list (#352).
 //
+// 4: and the image is GitHub's own template build for its architecture, run on
+// the builder with billet's EC2 layer after it (ADR-022), carrying exactly the
+// components images.accept named that the template offers, recorded in
+// /etc/billet-image-components and in the components tag.
+//
 // THE TAG IS A PROMOTION, NOT A CREATE-TIME CLAIM, and that is the whole content
 // of the number now. CreateImage stamps who owns the image and which billet made
 // it; the contract tag is added afterwards, by CreateTags, once billet has BOOTED
 // the image and proved the properties on the artifact. So an unstamped image is
 // one nothing has verified — which both readers already treat as "no answer,
 // rebuild" — rather than a claim nobody checked.
-const AMIContract = 3
+const AMIContract = 4
 
 // contractFor is the contract a build of this architecture actually meets.
 //
-// BOTH ARCHITECTURES MEET IT NOW. The shared installers name every vendor's arch
-// spelling from one variable -- node and Python use the tool-cache name, go and
-// temurin use dpkg's, pypy calls arm64 `aarch64`, and ruby-builder suffixes arm64
-// while leaving x64 bare -- so an arm64 image carries the same toolcache an x64
-// one does, under `<version>/arm64` with the marker tool-cache stats.
-//
-// CodeQL IS THE ONE EXCEPTION AND IT IS RECORDED RATHER THAN SILENT. codeql-action
-// publishes no arm64 bundle at all, so an arm64 build writes that line into the
-// unpublished record, which both gates accept only for a line named there exactly.
-// That is the same mechanism Ruby 4.0 uses on x64, and it is why this can return
-// the constant without the stamp becoming a claim the image does not meet.
+// BOTH ARCHITECTURES MEET IT: GitHub publishes a template for each, and each image
+// is that architecture's template build. Parity on arm64 is parity with GitHub's
+// arm64 image, which carries no Android SDK, CodeQL or PyPy.
 //
 // This function is kept rather than inlined because the stamp is what `billet
 // check` reads INSTEAD of looking at the image: if a future architecture arrives
-// that the installers cannot serve, the lie has to be preventable here.
+// that has no template, the lie has to be preventable here.
 func contractFor(arch string) int {
 	if arch == "x64" || arch == "arm64" {
 		return AMIContract
@@ -74,8 +71,9 @@ func contractFor(arch string) int {
 }
 
 const (
-	amiContractTag = "sh.billet.ami-contract"
-	amiBuiltByTag  = "sh.billet.built-by"
+	amiContractTag   = "sh.billet.ami-contract"
+	amiBuiltByTag    = "sh.billet.built-by"
+	amiComponentsTag = "sh.billet.components"
 )
 
 // DefaultBuilderDiskGiB is the root volume a build gets when nobody says.
@@ -83,88 +81,48 @@ const (
 // Exported because `billet ami build` prints it in --builder-disk's help, and a
 // default a flag describes must be the default the code uses.
 //
-// NOT A ROUND NUMBER SOMEBODY LIKED. Canonical's noble images declare an 8GiB
-// root and GitHub's declared package set is most of it, so the previous
-// behaviour -- writing no Ebs.VolumeSize at all and inheriting whatever the base
-// image said -- left provisioning to die on ENOSPC. Under `set -e` that aborts
-// before the poweroff that signals success, so it produced no image rather than
-// a broken one; what it cost was a paid builder and a failure that reads as an
-// apt problem.
+// IT IS ALSO EVERY JOB'S ROOT. CreateImage snapshots this volume, and the job path
+// clamps a job's root up to the image's, so what is left after the image is what a
+// job has to build in.
 //
-// MEASURED ON THE PRODUCED IMAGE, not derived, and re-measured when parity grew.
-// Read by `billet ami verify` from a machine booted off the AMI:
+// MEASURED ON REAL BUILDERS, 2026-10-25 and 26, running GitHub's whole template
+// (ADR-022): a prototype on a 200 GiB root used at most 42 GiB on x64 (c7i.4xlarge,
+// before the template's reboot) and 35 GiB on arm64 (c7g.4xlarge); the images
+// `billet ami build` then made on this default hold 51 GiB on x64 with the Android
+// SDK, Firefox and billet's layer, 54 with all five components (2026-10-26),
+// leaving 61 available to a job by df, and 33 on arm64. GitHub's hosted runner
+// leaves a job tens of gigabytes; 80, the default for billet's own installers,
+// would have left a job under 25.
 //
-//	26.8GiB used of 76.4GiB usable, 49.6GiB free   (root_used_kib=28106956)
-//	/opt/hostedtoolcache: 5.2GiB                   (toolcache_kib=5435176)
-//
-// THE OLD FIGURE WAS 7GiB AND 30 WAS ENOUGH FOR IT. Parity took the content to
-// 26.8GiB -- the six-runtime toolcache, five JDKs, three .NET SDKs, PowerShell and
-// its four modules, and the Android SDK with three NDKs -- so a 30GiB volume now
-// leaves about a gigabyte free against a floor the provisioning script itself sets
-// at ten, and every build would be refused before it started.
-//
-// 80 BECAUSE 80 IS WHAT WAS MEASURED, AND NOTHING ELSE HAS BEEN.
-//
-// This was briefly 60, derived as "26.8 measured plus headroom", and that is the
-// derivation this constant has now been wrong about twice. A review put the
-// arithmetic plainly: 60GiB is about 57.3 usable, leaving 30.5 after the image --
-// and the number that matters is not what the finished image occupies but the PEAK
-// during the build, because the installers unpack archives onto this same
-// filesystem and delete them as they go. That peak is unmeasured. The preflight
-// free-space check cannot see it either: it runs once, before provisioning, so a
-// transient high-water mark fails later with ENOSPC on a volume that passed.
-//
-// So the default is the size a real build actually completed on. Erring high costs
-// a few cents of EBS for the life of one builder; erring low costs the build, and
-// the failure arrives forty minutes in as an out-of-space error inside whichever
-// install step happened to be running.
-const DefaultBuilderDiskGiB = 80
+// The figure this replaced was 80 for an image of 26.8 GiB, and its comment's
+// lesson stands: the number that matters is the PEAK during the build, which the
+// bootstrap's one free-space check cannot see, so the default is a size real
+// builds completed on with room, not the image's size plus a guess.
+const DefaultBuilderDiskGiB = 120
 
-// minBuilderFreeGiB is what the provisioning script insists on before it starts,
-// and minBuilderDiskGiB is what a build must be given so that is reachable.
+// minBuilderFreeGiB is what the bootstrap insists on before the build starts, and
+// minBuilderDiskGiB is what a build must be given so that is reachable.
 //
 // TWO NUMBERS BECAUSE THEY MEASURE DIFFERENT THINGS. A volume's size is not its
-// free space: the base image's own filesystem is already on it. So the script
+// free space: the base image's own filesystem is already on it. So the bootstrap
 // checks what it can actually use, and the flag is checked against a figure with
 // the base image's footprint added back.
 //
-// Both are confirmed against a real build, and both moved when parity did. The
-// finished image reports 26.8GiB used of 76.4GiB usable, so the 10GiB floor is met
-// with room on a 60GiB volume and is unreachable on the 30GiB one that used to be
-// the default.
-//
-// 50 IS A FLOOR ON THE FLAG, AND IT IS DELIBERATELY NOT THE ARITHMETIC MINIMUM.
-//
-// The arithmetic minimum is about 40: 26.8 measured, 10 required free, and roughly
-// 4.5% of a volume lost to the filesystem. But a build admitted at exactly that
-// passes the preflight check with about 1.4GiB to spare and then meets an
-// unmeasured peak, which is a build that fails late for a reason its own guard
-// said was fine. The floor sits above the arithmetic so that passing preflight
-// means something.
-//
-// It is still a floor rather than a recommendation: 80 is the only size a build has
-// actually completed on, and anything between these two numbers is an operator
-// saying they know their own content is smaller.
+// 65 FREE BECAUSE A FINISHED x64 IMAGE WITH ALL FIVE COMPONENTS HOLDS 54
+// (measured 2026-10-26, the base image's own two gigabytes in it), so a build
+// admitted at the floor ends 13 above its finished image; the peak with all five
+// was not measured and is higher, so the spare at the high-water mark is less. 75
+// for the flag adds the base image and the filesystem's own share of a volume. It
+// is a floor rather than a recommendation: the default is what leaves a job room.
 const (
-	minBuilderFreeGiB = 10
-	minBuilderDiskGiB = 50
+	minBuilderFreeGiB = 65
+	minBuilderDiskGiB = 75
 	// maxBuilderDiskGiB is a typo bound rather than a technical one. EBS goes far
 	// higher; what makes this worth capping is that CreateImage snapshots the
 	// builder's root, so the number is inherited by the AMI and, through the job
 	// path's clamp, by every job launched from it.
 	maxBuilderDiskGiB = 1000
 )
-
-// aptPackageName is what this build will pass to apt.
-//
-// CHECKED EVEN THOUGH THE NAMES COME FROM A DIGEST-PINNED FILE. The digest proves
-// the declaration is the one GitHub published; it says nothing about whether its
-// strings are safe to interpolate into a script that runs as root on a machine
-// billet pays for. Debian policy already restricts a package name to lowercase
-// alphanumerics with `+`, `-` and `.`, so nothing legitimate is refused by
-// insisting on it -- and a name carrying a space, a semicolon or a glob would
-// otherwise be word-split or expanded by the shell that installs it.
-var aptPackageName = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
 
 // runnerVersionPattern is what may be interpolated into the release URL.
 //
@@ -293,35 +251,40 @@ type BuildSpec struct {
 	// not inherit it, which is correct: the cache client runs on the host.
 	CACertPEM string
 
-	// PayloadBucket is where the shared installers are staged when they will not
-	// fit in user data.
-	//
-	// EMPTY MEANS EMBED, WHICH IS WHAT EVERY BUILD DID UNTIL THE SCRIPT OUTGREW
-	// 16384 BYTES. A build whose script still fits needs no bucket and no new
-	// permission; one whose script does not is refused with the name of this
-	// field rather than by EC2 with a parameter error.
+	// Accept is the components the image is completed with, from images.accept
+	// (config.ImageComponents' names). The builder installs each one GitHub's
+	// template for Arch offers and leaves out, and says so, each one it does not.
+	Accept []string
+
+	// PayloadBucket is where the build's payload is staged: GitHub's template, the
+	// scripts that run it and billet's EC2 layer, far past EC2's 16384 bytes of
+	// user data. Required.
 	PayloadBucket string
 
 	// payloadURL and payloadSHA256 are set by BuildImage after staging, and are
-	// what the bootstrap in user data fetches and verifies.
+	// what the bootstrap in user data fetches and verifies; nonce is the build's
+	// identity, which its verdict on the console carries.
 	payloadURL    string
 	payloadSHA256 string
+	nonce         string
+	// owed is the accepted components spec.Arch's template installs, which the
+	// build's verdict must name exactly.
+	owed []string
 }
 
-// BuildImage produces an AMI containing the GitHub Actions runner and Docker.
+// BuildImage produces an AMI from GitHub's template for the spec's architecture,
+// with billet's EC2 layer after it (ADR-022).
 //
-// WHY BILLET DRIVES THIS ITSELF rather than shipping a Packer template: the
-// contract between billet and an image is six lines of shell, and a build tool
-// that has to be kept in sync with those six lines is a second place for them to
-// be wrong. billet already speaks four EC2 actions; this adds one.
+// WHY BILLET DRIVES THIS ITSELF rather than shipping a Packer template: GitHub's
+// template is a Packer template, and the guest build already runs its steps in
+// order from a plan billet derives from it (run-runner-images.sh). The builder
+// runs the same runner against itself, so both backends' images are one build.
 //
-// HOW IT KNOWS PROVISIONING FINISHED, without SSH, an agent, or any IAM the
-// builder does not already have: the provisioning script ends in `poweroff`. A
-// successful build is an instance that STOPPED ITSELF, which billet can see with
-// the DescribeInstances it already makes. A failed one never reaches that line, so
-// it stays running and the wait below times out against a machine still holding
-// its console log — which is the state you want to debug from, rather than an
-// image made from a half-provisioned disk.
+// HOW IT KNOWS THE BUILD FINISHED, without SSH, an agent, or any IAM the builder
+// does not already have: the build prints a verdict carrying this build's nonce
+// to the serial console, again and again, and on success then powers off. billet
+// images the builder only when it has read the success verdict and the instance
+// then stopped itself; a failure verdict ends the wait at once, naming the step.
 //
 // THE BUILDER IS TERMINATED ON EVERY FAILURE PATH THAT HAS AN ID, which is not the
 // same as always, and the difference is worth stating because this is the one
@@ -338,27 +301,61 @@ type BuildSpec struct {
 // one. That behaviour is not assumed — a live run measured EC2 refusing a reused
 // token with IdempotentParameterMismatch, which is the same machinery.
 func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, error) {
-	// STAGED BEFORE THE SCRIPT IS RENDERED, because the script is a bootstrap that
-	// names the URL and the digest. Nothing is launched until the payload is
-	// readable, so a builder never boots to fetch something that is not there.
-	if spec.PayloadBucket != "" {
-		key, cleanup, err := p.stagePayload(ctx, &spec)
-		if err != nil {
-			return "", err
-		}
-
-		// REMOVED WHETHER THE BUILD SUCCEEDS OR NOT. The object outlives its URL
-		// otherwise, and it is billed and is one more copy of the payload.
-		defer func() {
-			if err := cleanup(); err != nil {
-				p.log.ErrorContext(ctx, "the staged build payload could not be removed and "+
-					"is still costing money; delete it by hand",
-					"bucket", spec.PayloadBucket, "key", key, "error", err)
-			}
-		}()
+	if spec.PayloadBucket == "" {
+		return "", fmt.Errorf("ec2: a build needs a payload bucket: GitHub's template and the " +
+			"scripts that run it are far past EC2's 16384 bytes of user data, so they are " +
+			"staged in S3 and fetched by a bootstrap")
 	}
 
-	script, err := provisionScript(spec)
+	accept, err := checkAccept(spec.Accept)
+	if err != nil {
+		return "", err
+	}
+
+	spec.Accept = accept
+
+	// WHAT THE BUILD OWES, decided before anything is bought: a component billet
+	// cannot place in the template is refused now rather than after hours.
+	owed, err := offeredComponents(spec.Arch, accept)
+	if err != nil {
+		return "", err
+	}
+
+	spec.owed = owed
+
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("ec2: invent a build nonce: %w", err)
+	}
+
+	spec.nonce = hex.EncodeToString(raw)
+
+	// THE LAYER IS RENDERED BEFORE ANYTHING IS STAGED OR BOUGHT, so a spec it
+	// refuses (a runner version, a digest, a CA bundle) costs nothing.
+	layer, err := layerScript(spec)
+	if err != nil {
+		return "", err
+	}
+
+	// STAGED BEFORE THE BOOTSTRAP IS RENDERED, because the bootstrap names the URL
+	// and the digest. Nothing is launched until the payload is readable, so a
+	// builder never boots to fetch something that is not there.
+	key, cleanup, err := p.stagePayload(ctx, &spec, layer)
+	if err != nil {
+		return "", err
+	}
+
+	// REMOVED WHETHER THE BUILD SUCCEEDS OR NOT. The object outlives its URL
+	// otherwise, and it is billed and is one more copy of the payload.
+	defer func() {
+		if err := cleanup(); err != nil {
+			p.log.ErrorContext(ctx, "the staged build payload could not be removed and "+
+				"is still costing money; delete it by hand",
+				"bucket", spec.PayloadBucket, "key", key, "error", err)
+		}
+	}()
+
+	script, err := bootstrapScript(spec)
 	if err != nil {
 		return "", err
 	}
@@ -381,9 +378,11 @@ func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, erro
 		}
 	}()
 
-	p.log.Info("provisioning the image", "instance", id, "runner", spec.RunnerVersion)
+	p.log.Info("building the image from GitHub's template", "instance", id,
+		"arch", spec.Arch, "runner", spec.RunnerVersion, "accept", strings.Join(spec.Accept, ","))
 
-	if err := p.awaitStopped(ctx, id); err != nil {
+	components, err := p.awaitBuild(ctx, id, spec)
+	if err != nil {
 		return "", err
 	}
 
@@ -423,6 +422,7 @@ func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, erro
 			Image:        image,
 			InstanceType: spec.VerifyInstanceType,
 			Name:         spec.Name,
+			Components:   &components,
 		}); err != nil {
 			// WHICH OF THE TWO THINGS HAPPENED, because they need different actions.
 			// A verification that failed leaves an image with no contract tag; a
@@ -472,6 +472,16 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 	layout, err := p.imageLayout(ctx, spec.BaseImage)
 	if err != nil {
 		return "", err
+	}
+
+	// NOT AN IMAGE BILLET BUILT, which its bootstrap would refuse only after a
+	// builder was bought: GitHub's template runs once per machine. The tags are
+	// what is read here and an operator can remove them, so the bootstrap's own
+	// refusal stays the rule and this one only saves the launch.
+	if layout.billet {
+		return "", fmt.Errorf("ec2: the base image %s is an image billet built, and a build "+
+			"runs GitHub's template on a machine once; pass Canonical's Ubuntu 24.04 image as "+
+			"--base-image instead", spec.BaseImage)
 	}
 
 	rootDevice := layout.root
@@ -639,50 +649,6 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 	}
 
 	return out.Instances[0].InstanceID, nil
-}
-
-// awaitStopped waits for the builder to shut itself down, which is how the
-// provisioning script reports success.
-func (p *Provider) awaitStopped(ctx context.Context, id string) error {
-	for {
-		out, err := p.describeRaw(ctx, id)
-		if err != nil {
-			return err
-		}
-
-		switch out.state {
-		case "stopped":
-			// STOPPED BY WHOM. The signal this build relies on is the guest powering
-			// ITSELF off at the end of provisioning — and "stopped" alone does not
-			// say that. A cost scheduler calling StopInstances on a tag, or a host
-			// failure, stops a half-provisioned builder just as convincingly, and
-			// imaging that is the exact outcome this design exists to prevent.
-			// EXACT EQUALITY, INCLUDING REJECTING EMPTY. AWS marks the reason code
-			// optional, so "" is not "the guest did it" — it is "nobody said". The
-			// first version of this accepted it, which left the whole door open that
-			// the check was added to close.
-			if out.reason != "Client.InstanceInitiatedShutdown" {
-				return fmt.Errorf("ec2: the builder %s stopped for reason %q rather than "+
-					"Client.InstanceInitiatedShutdown, so this is not its provisioning script "+
-					"finishing and whatever is on its disk is not a finished image",
-					id, out.reason)
-			}
-
-			return nil
-
-		case "terminated", "shutting-down":
-			// SOMETHING ELSE KILLED IT. Imaging is impossible and the reason is not
-			// in the console log of a machine that no longer exists.
-			return fmt.Errorf("ec2: the builder %s was terminated before it finished "+
-				"provisioning, so no image was made", id)
-		}
-
-		if err := sleepFor(ctx, 10*time.Second); err != nil {
-			return fmt.Errorf("ec2: the builder %s never stopped itself, which is how the "+
-				"provisioning script reports success — it is still running, and its console "+
-				"output is where the failure is: %w", id, err)
-		}
-	}
 }
 
 // builderState is what an instance is doing, and who made it do that.
@@ -980,21 +946,30 @@ exit 0
 `
 }
 
-// provisionScript is what the builder runs, and it is the whole definition of
-// what a billet runner image contains.
+// maxCACertPEM bounds the trust bundle a build will bake into an image.
 //
-// MINIMAL ON PURPOSE. The runner, Docker, and the two things a workflow cannot
-// install for itself. Language toolchains are NOT here: actions/setup-go,
-// setup-node and setup-python download what they need at runtime and work on any
-// runner, costing a few seconds rather than failing. A workflow that assumes a
-// toolchain is already on PATH will fail loudly, which is the right failure — and
-// the sticky-disk work is what makes those downloads free later.
+// BOUNDED ON ITS OWN TERMS: a trust store is worth bounding because it is a trust
+// store, and every certificate in it is an authority every job on that machine will
+// believe. The bound was once set by the provisioning script's share of EC2's 16384
+// bytes of user data; the layer travels in the staged payload now, so the
+// transport no longer decides it.
+//
+// WHAT 2 KiB ADMITS, MEASURED WITH openssl RATHER THAN ASSERTED. A PEM
+// RSA-2048 self-signed root is 1115 bytes and an RSA-4096 root is 1822, so either
+// fits. An RSA-2048 root AND intermediate concatenated is 2181, and is refused.
+//
+// REFUSING THE CHAIN IS CORRECT. A trust store needs the ROOT: an intermediate is
+// presented by the endpoint during the handshake and a client that has the root
+// will build the path. Baking the intermediate in adds an authority every job on
+// the machine believes, for nothing.
+const maxCACertPEM = 2 << 10
+
 // canonicalizeCACert validates a --ca-cert bundle and returns billet's own
 // re-encoding of it, or an error. Empty in, empty out: the CA is optional.
 //
 // IT NEVER RETURNS THE OPERATOR'S BYTES. Each certificate is parsed and
 // re-emitted from its parsed DER (cert.Raw), so the string that reaches the
-// provisioning script is standard PEM billet produced — not attacker text. That
+// layer is standard PEM billet produced — not attacker text. That
 // is what closes the injection: the raw input could carry a heredoc delimiter, a
 // `poweroff`, or a secret in bytes that pem.Decode skips, and none of it survives
 // canonicalization. Trailing bytes that are not a certificate are refused rather
@@ -1006,61 +981,6 @@ exit 0
 // must never enter a machine image), a bundle with no CA at all, or non-PEM bytes
 // are refused before a paid builder launches. A CA accompanied by leaf
 // certificates is allowed: what matters is that at least one anchor is a CA.
-// maxCACertPEM bounds the trust bundle a build will bake into an image.
-//
-// BOUNDED ON ITS OWN TERMS, NOT BY THE TRANSPORT. This used to be caught only
-// because an absurd bundle pushed the provisioning script past EC2's user-data
-// limit — a side effect, and one that stopped firing the moment the script began
-// to be compressed, since a bundle of one certificate repeated sixty times is
-// exactly what gzip erases. A trust store is worth bounding because it is a trust
-// store: every certificate in it is an authority every job on that machine will
-// believe.
-//
-// AND IT HAS TO BE A BOUND THE BUILD CAN HONOUR, which 32 KiB stopped being.
-// That figure was chosen when the script was 11.6KB; with the toolcache it is
-// past 40KB plain, and measured, a 32652-byte bundle took the payload to 24239
-// compressed against a 16384 limit -- so the bound promised something every such
-// build would refuse. A bound that cannot be delivered is not a bound.
-//
-// 2 KiB, AND THE TREND MATTERS MORE THAN THE NUMBER. This is the second time the
-// bound has moved because the script grew -- 32 KiB when the script was 11.6KB,
-// 4 KiB when the toolcache landed, 2 KiB now that PyPy, Ruby and CodeQL joined it.
-// The CA and the toolcache compete for ONE 16384-byte budget and the toolcache
-// keeps winning, because it is what the image is for.
-//
-// WHAT 2 KiB ADMITS, MEASURED WITH openssl RATHER THAN ASSERTED. A PEM
-// RSA-2048 self-signed root is 1115 bytes and an RSA-4096 root is 1822, so either
-// fits. An RSA-2048 root AND intermediate concatenated is 2181 -- REFUSED, by 133
-// bytes. An earlier version of this comment claimed a chain "still fits with
-// room", which was written from the shape of the problem rather than from a
-// certificate; the deliverability test could not contradict it because it mints
-// ECDSA P-256, at 558 bytes the smallest certificate that exists.
-//
-// REFUSING THE CHAIN IS CORRECT, WHICH IS WHY THE ANSWER IS NOT A BIGGER BOUND.
-// A trust store needs the ROOT: an intermediate is presented by the endpoint
-// during the handshake and a client that has the root will build the path. Baking
-// the intermediate in adds an authority every job on the machine believes, for
-// nothing. So the bound admits what a private cache CA actually requires and
-// refuses what it does not.
-//
-// If it has to move again the answer is probably not a smaller bound: it is that
-// the script has outgrown user data and wants a different delivery.
-//
-// THE MARGIN IS THE POINT. Measured with the toolcache present, a
-// certificate costs about 575 bytes of the compressed budget: none leaves 5662
-// spare, one leaves 4518, two leave 3943. 8 KiB was the first answer and it is a
-// knife edge -- roughly a kilobyte of headroom, so the next line added to this
-// script turns the size test red and reads as "the CA bound is wrong" when the
-// cause is elsewhere. 4 KiB is three or four certificates, still far past a
-// private cache CA (one self-signed root, sometimes a root and an intermediate),
-// and leaves the script room to grow.
-//
-// packUserData REMAINS THE REAL GATE. Deliverability is not knowable from the CA
-// alone -- it depends on everything else in the script -- so this is the
-// trust-store bound and that is the size bound, and the two are not the same
-// question.
-const maxCACertPEM = 2 << 10
-
 func canonicalizeCACert(pemData string) (string, error) {
 	if pemData == "" {
 		return "", nil
@@ -1138,7 +1058,19 @@ func canonicalizeCACert(pemData string) (string, error) {
 	return out.String(), nil
 }
 
-func provisionScript(spec BuildSpec) (string, error) {
+// layerScript is billet's EC2 layer: what build-ami.sh runs on the builder after
+// GitHub's template and the components, as the last thing before the image is
+// cleaned and the builder powers off.
+//
+// THE TEMPLATE IS THE IMAGE; THIS IS WHAT MAKES IT A BILLET RUNNER. The runner
+// release billet pins, checked against its digest, the cache issuer in the host
+// trust store, the entry point a tier names and the helpers it runs, and proof
+// that the runner executes the way a job's will and that Docker keeps its images
+// where the cache attaches. Everything a workflow finds otherwise is GitHub's.
+//
+// IT RUNS UNDER bash FROM build-ami.sh, whose verdict carries its failure: a
+// failure here is `step=layer`, under `set -e`.
+func layerScript(spec BuildSpec) (string, error) {
 	if spec.RunnerVersion == "" {
 		return "", fmt.Errorf("ec2: a build needs a runner version to install")
 	}
@@ -1157,15 +1089,15 @@ func provisionScript(spec BuildSpec) (string, error) {
 	}
 
 	// REFUSED BEFORE A BUILDER EXISTS. An empty digest would render a check that
-	// sha256sum rejects as malformed, so the build would fail closed, forty
-	// minutes and one paid builder later, naming nothing an operator set.
+	// sha256sum rejects as malformed, so the build would fail closed, hours and one
+	// paid builder later, naming nothing an operator set.
 	if !runnerDigestPattern.MatchString(spec.RunnerSHA256) {
 		return "", fmt.Errorf("ec2: the runner's sha256 %q is not 64 lowercase hex digits; the "+
 			"build checks the actions/runner tarball against it before unpacking, and "+
 			"refuses to install a runner it cannot check", spec.RunnerSHA256)
 	}
 
-	// VALIDATED AND RE-ENCODED BEFORE A PAID BUILDER EXISTS. provisionScript runs
+	// VALIDATED AND RE-ENCODED BEFORE A PAID BUILDER EXISTS. layerScript runs
 	// before launchBuilder, so a bundle that is not a CA — a private key pasted by
 	// mistake, a leaf certificate, PEM that does not parse, or trailing shell after
 	// a real certificate — is refused here rather than baked into an image that
@@ -1179,131 +1111,9 @@ func provisionScript(spec BuildSpec) (string, error) {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\nset -eux\n")
 
-	// A HOME, BECAUSE CLOUD-INIT GIVES USER DATA NONE and the shared installers are
-	// written for a root shell, which the guest build always runs them from.
-	// Composer's installer refuses to run without HOME or COMPOSER_HOME, and since
-	// it joined the hosted tools every AMI build died there, before the runner was
-	// fetched (measured on a real builder, 2026-10-17).
+	// A HOME, BECAUSE A SYSTEM UNIT GIVES ITS SERVICE NONE, and the runner's own
+	// tooling, run below as root, assumes one.
 	b.WriteString("export HOME=/root\n")
-
-	// THE DISK IS THERE BEFORE ANYTHING TRIES TO USE IT.
-	//
-	// billet asks for a larger root than the base image declares, and growing an
-	// EBS volume does not grow the filesystem on it. On Ubuntu cloud images
-	// cloud-init's growpart and resizefs modules do that in the `init` stage,
-	// before user data runs in `final` -- but that is an ordering somebody else
-	// owns, and this script cannot see whether it happened except by looking.
-	//
-	// WITHOUT THIS THE FAILURE IS AN apt ERROR. Provisioning would run until some
-	// package or tarball hit ENOSPC, which aborts the build under `set -e` and so
-	// produces no image -- correct, and unreadable: the operator sees dpkg
-	// complaining about disk space and nothing naming the volume or growpart.
-	//
-	// df -P FOR THE POSIX FORMAT, because the default wraps a long device name
-	// onto its own line and `NR==2` would then read the wrong record. An `if`
-	// with an explicit exit rather than a negated pipeline, because `set -e` is
-	// ignored for one preceded by `!`.
-	b.WriteString("billet_free_kib=$(df -Pk / | awk 'NR == 2 { print $4 }')\n")
-
-	// A VALUE THAT IS NOT A NUMBER MUST FAIL, NOT PASS. `[ "$x" -lt N ]` exits 2
-	// on garbage, and `set -e` is suppressed for an `if` CONDITION -- so the arm
-	// is not taken and the build proceeds onto a disk it never measured. Measured,
-	// not read: with billet_free_kib=not-a-number the script exits 0. Same family
-	// as the `!`-pipeline rule, and the reason a `case` comes first.
-	b.WriteString("case \"${billet_free_kib:-}\" in\n")
-	b.WriteString("  ''|*[!0-9]*)\n")
-	b.WriteString("    echo \"df reported '${billet_free_kib:-}' free on the builder root, " +
-		"which is not a number; billet cannot tell whether this image fits\" >&2\n")
-	b.WriteString("    exit 1 ;;\n")
-	b.WriteString("esac\n")
-
-	b.WriteString("if [ \"$billet_free_kib\" -lt " +
-		strconv.Itoa(minBuilderFreeGiB*1024*1024) + " ]; then\n")
-	b.WriteString("  echo \"the builder root has ${billet_free_kib}KiB free and this image " +
-		"needs " + strconv.Itoa(minBuilderFreeGiB) + "GiB; the volume was requested larger, so " +
-		"either cloud-init did not grow the filesystem onto it (growpart, resizefs) or " +
-		"--builder-disk is too small\" >&2\n")
-	b.WriteString("  exit 1\n")
-	b.WriteString("fi\n")
-
-	// APT, NOT dnf, AND THE PACKAGE SET COMES FROM GITHUB'S OWN DECLARATION.
-	//
-	// Two lists, and the split is the same one the guest image makes. The first is
-	// what the BACKEND needs: Docker, git, and the tools billet's own scripts run.
-	// The second is what a WORKFLOW is entitled to find, read from the pinned
-	// toolset that `internal/runnerimages` vendors -- so a package added for the
-	// microVM backend cannot silently miss this one, which is the whole reason
-	// that file is read by both.
-	//
-	// noninteractive AND A LOCK WAIT. cloud-init's own apt work can still hold the
-	// dpkg lock when this runs, and without the wait the first apt-get here dies
-	// on a lock rather than on anything about the packages.
-	b.WriteString("export DEBIAN_FRONTEND=noninteractive\n")
-	b.WriteString("apt-get -o DPkg::Lock::Timeout=600 update\n")
-
-	ts, err := runnerimages.Load()
-	if err != nil {
-		return "", fmt.Errorf("ec2: %w", err)
-	}
-
-	backendPackages := []string{
-		"ca-certificates", "curl", "git", "jq", "tar",
-		"docker.io", "docker-buildx", "docker-compose-v2",
-		"e2fsprogs", "util-linux", "libicu74",
-		// mawk BY NAME, NOT `awk`. The anchor proof below is an awk program, and
-		// nothing in either list named an awk -- it was relying on the base image
-		// having one. It always does (mawk is Priority: required on Ubuntu), and
-		// the failure if it did not would be loud rather than silent, since a
-		// missing command exits 127 and `if !` turns that into a refused build.
-		// Naming it costs one package and removes the assumption.
-		//
-		// `awk` IS A VIRTUAL PACKAGE WITH THREE PROVIDERS, and apt refuses a
-		// virtual package that more than one real package provides -- the same
-		// thing that killed a guest-image build on `netcat`. So the provider is
-		// named, and mawk is the one Ubuntu ships by default.
-		"mawk",
-		// gh IS ON GITHUB'S IMAGE AND IN NO DECLARATION: GitHub installs it with a
-		// script of its own, so the toolset never names it and a workflow's first
-		// `gh` call failed with 127 on the fleet (2026-09-22). Ubuntu's package,
-		// for the reason compose and buildx come from the archive below, and older
-		// than the release GitHub installs; ADR-005 records that difference.
-		"gh",
-	}
-
-	declared := ts.AptPackages()
-	if len(declared) == 0 {
-		return "", fmt.Errorf("ec2: the pinned toolset declares no apt packages; refusing to " +
-			"build an image that would carry only billet's own dependencies")
-	}
-
-	// DEDUPLICATED, KEEPING FIRST-SEEN ORDER. curl, jq and tar are things billet
-	// needs AND things github declares, and asking apt to install a package twice
-	// makes a long command longer while making a diff of it read as though
-	// something changed.
-	//
-	// EVERY NAME IS CHECKED BEFORE IT REACHES A SHELL. These come from a vendored
-	// file rather than from a caller, but they are interpolated into a script that
-	// runs as root on a machine billet pays for -- and the digest that protects the
-	// file proves provenance, not that its strings are safe shell syntax.
-	seen := make(map[string]struct{}, len(backendPackages)+len(declared))
-	all := make([]string, 0, len(backendPackages)+len(declared))
-
-	for _, pkg := range append(append([]string{}, backendPackages...), declared...) {
-		if !aptPackageName.MatchString(pkg) {
-			return "", fmt.Errorf("ec2: %q is not a package name this build will pass to apt", pkg)
-		}
-
-		if _, dup := seen[pkg]; dup {
-			continue
-		}
-
-		seen[pkg] = struct{}{}
-
-		all = append(all, pkg)
-	}
-
-	b.WriteString("apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends \\\n")
-	b.WriteString("  " + strings.Join(all, " ") + "\n")
 
 	// THE CACHE ISSUER IN THE HOST TRUST STORE, if one was given. The cache client
 	// runs on the host and speaks HTTPS to a privately-signed endpoint, so its
@@ -1354,7 +1164,7 @@ func provisionScript(spec BuildSpec) (string, error) {
 		//
 		// `! grep ... | grep -q .` NEVER ABORTS. POSIX says the -e setting is
 		// IGNORED for a pipeline preceded by `!`, so it computes the right answer
-		// and lets the build run on to poweroff. Measured on /bin/sh.
+		// and lets the build run on to its success verdict. Measured on /bin/sh.
 		//
 		// `if grep ... | grep -q .` FAILS OPEN ON A READ ERROR. Without pipefail
 		// the pipeline's status is the LAST command's, so an unreadable or missing
@@ -1445,93 +1255,22 @@ func provisionScript(spec BuildSpec) (string, error) {
 		b.WriteString("  exit 1\n")
 		b.WriteString("fi\n")
 	}
-	// Docker 29 defaults fresh installations to image content under
-	// /var/lib/containerd. The cache attaches one fenced filesystem at
-	// /var/lib/docker, so select the supported classic store before the daemon is
-	// enabled. Otherwise the cache publishes successfully without the images.
-	b.WriteString("install -d /etc/docker\n")
-	b.WriteString("cat > /etc/docker/daemon.json <<'BILLETDOCKERDAEMON'\n")
-	b.WriteString("{\n")
-	b.WriteString("  \"features\": {\n")
-	b.WriteString("    \"containerd-snapshotter\": false\n")
-	b.WriteString("  },\n")
-	b.WriteString("  \"storage-driver\": \"overlay2\"\n")
-	b.WriteString("}\n")
-	b.WriteString("BILLETDOCKERDAEMON\n")
-	// COMPOSE AND BUILDX COME FROM THE ARCHIVE NOW. Amazon Linux packaged neither,
-	// so this downloaded a pinned release and checked its digest by hand; Ubuntu
-	// ships docker-compose-v2 and docker-buildx, signed by the same archive key as
-	// everything else installed above and pulled in the apt transaction. A
-	// hand-pinned binary is a second thing to bump and a second digest to keep
-	// true, for a plugin the distribution already maintains.
+	// GITHUB'S DOCKER, WITH BILLET'S daemon.json. The template's install-docker.sh
+	// installs the engine, buildx and compose, and the docker-daemon difference
+	// writes the classic image store's configuration before the script first starts
+	// the daemon. The two plugins are executed so an image without them stops here,
+	// because the cache's own actions drive both.
 	b.WriteString("docker buildx version\n")
 	b.WriteString("docker compose version\n")
-	// EXECUTED, like the plugins above, so an image whose apt transaction dropped
-	// it stops here under `set -e` rather than at a workflow's first `gh` call.
-	b.WriteString("gh --version\n")
 	b.WriteString("systemctl enable docker\n")
-
-	// THE RUNNER'S OWN DEPENDENCY IS STILL NAMED RATHER THAN SCRIPTED, and the
-	// reason changed with the distribution.
-	//
-	// On Amazon Linux, actions/runner's bin/installdependencies.sh could not be
-	// used at all: it read /etc/os-release, found ID_LIKE="fedora", printed "Can't
-	// detect current OS type" and exited non-zero, ending the build before the
-	// poweroff that signals success. That was measured on a real build, from the
-	// console log of the builder it left running.
-	//
-	// On Ubuntu that script DOES work -- and it is still not called. It runs its
-	// own apt-get update and install for a set it decides, which would sit beside
-	// the pinned declaration above as a second, unversioned source of packages for
-	// the same image. What the runner actually needs is ICU, which is in the
-	// backend list as libicu74 and installed in the one transaction with everything
-	// else. Without it the runner starts and dies on globalization; the version
-	// check below is where that surfaces, rather than at registration.
 
 	// A NON-ROOT USER, because the runner refuses to run as root without an
 	// override and running untrusted jobs as root would give away the only
-	// isolation this backend has above the instance boundary.
+	// isolation this backend has above the instance boundary. The template's
+	// build-user difference has already made it, so its home holds what GitHub's
+	// steps put in /etc/skel after it; this only states the property.
 	b.WriteString("id runner || useradd -m -s /bin/bash runner\n")
 	b.WriteString("usermod -aG docker runner\n")
-
-	// THE TOOLCACHE DIRECTORY AND ITS VARIABLES LAND TOGETHER, and that is not
-	// tidiness.
-	//
-	// Exporting RUNNER_TOOL_CACHE without creating the directory is WORSE than
-	// exporting neither: it points every setup-* action at a path under root-owned
-	// /opt that the unprivileged runner cannot create, so an action that would
-	// otherwise have fallen back to its own location now fails outright. A review
-	// of the plan caught that, and it was going to be a separate commit.
-	//
-	// 0777 IS THE GUEST'S VALUE, for the guest's reason: this is read AND WRITTEN
-	// by every job, which runs as the unprivileged runner account, and a setup
-	// action's whole job is to add versions to it.
-	b.WriteString("install -d -m 0777 " + toolcacheDir + "\n")
-
-	// WHAT THE IMAGE SAYS IT IS, in the same file and the same format the
-	// firecracker guest uses (/etc/billet-image-env, KEY=VALUE per line). One
-	// contract, so the runner entry points on both backends read the same thing
-	// and the toolcache install can append to it from either.
-	//
-	// ImageOS IS SET BECAUSE THIRD-PARTY ACTIONS BRANCH ON IT, and NOT because of
-	// the setup-python folklore: that action shells out to `lsb_release -i -r -s`
-	// and falls back to /etc/os-release, so it never reads this.
-	//
-	// AGENT_TOOLSDIRECTORY BESIDE RUNNER_TOOL_CACHE because the actions read only
-	// the latter while the runner itself also honours the former, and an image
-	// that sets one is an image where half the tooling looks somewhere else.
-	b.WriteString("cat > " + imageEnvFile + " <<'BILLETIMAGEENV'\n")
-	b.WriteString("ImageOS=ubuntu24\n")
-	b.WriteString("ImageVersion=billet\n")
-	b.WriteString("RUNNER_TOOL_CACHE=" + toolcacheDir + "\n")
-	b.WriteString("AGENT_TOOLSDIRECTORY=" + toolcacheDir + "\n")
-	b.WriteString("BILLETIMAGEENV\n")
-	b.WriteString("chmod 0644 " + imageEnvFile + "\n")
-
-	if err := writeToolcacheInstall(&b, spec.Arch, spec.payloadURL,
-		spec.payloadSHA256); err != nil {
-		return "", err
-	}
 
 	b.WriteString("mkdir -p /opt/actions-runner\n")
 	b.WriteString("cd /opt/actions-runner\n")
@@ -1546,8 +1285,8 @@ func provisionScript(spec BuildSpec) (string, error) {
 	//
 	// AN `if` WITH ITS OWN `exit 1`, NOT AN `&&` CHAIN. Under `set -e` a failing
 	// `&&` list does not stop the script, so `curl && check && tar` would fail
-	// its check and carry on to the next line and eventually to poweroff, which
-	// billet reads as a finished build. This holds with or without `set -e`, and
+	// its check and carry on to the next line and eventually to the success verdict,
+	// which billet reads as a finished build. This holds with or without `set -e`, and
 	// a download that failed has no file for the check to accept.
 	b.WriteString("if ! printf '%s  %s\\n' '" + spec.RunnerSHA256 + "' runner.tar.gz | " +
 		"sha256sum -c -; then\n")
@@ -1697,21 +1436,8 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// with the root in the message.
 	b.WriteString("test \"$(docker info -f '{{.Driver}}')\" = overlay2\n")
 
-	// THE SUCCESS SIGNAL. Reaching this line is the only thing that tells billet
-	// the image is worth making; set -e means a failure anywhere above never
-	// arrives here — including the version check.
-	//
-	// What awaitStopped can prove from it is that the GUEST powered itself off,
-	// which is not quite "the script finished": a base image whose own policy
-	// powers the machine off after a failure produces the same stop reason. billet
-	// takes the base image from the caller, so this rests on that image being
-	// trusted — stated rather than papered over. Closing it needs a positive signal
-	// out of the guest, and the only channel is the serial console, which would add
-	// an ec2:GetConsoleOutput grant to every operator and a poll against output
-	// that lags minutes. Not worth it against a hostile base image the operator
-	// chose; worth revisiting if billet ever reads the console for another reason.
-	b.WriteString("poweroff\n")
-
+	// NO poweroff: build-ami.sh cleans the image and announces the verdict after
+	// this, and only then powers the builder off.
 	return b.String(), nil
 }
 

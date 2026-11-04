@@ -127,6 +127,10 @@ type Spec struct {
 	// InstanceType is the EC2 shape selected and charged at escrow. Empty for
 	// host-backed providers.
 	InstanceType string
+	// Arch is the architecture the tier's jobs run on, or empty for a tier that
+	// names none (ADR-022). A backend that can tell what a shape or an image runs
+	// on refuses another.
+	Arch config.Arch
 	// AuthorizeShape atomically changes that charge before EC2 attempts a
 	// fallback. ok=false means the shape would exceed a budget; err means the
 	// ledger could not make the decision and the launch must stop.

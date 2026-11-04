@@ -37,6 +37,9 @@ type resolvedJob struct {
 	// unbound says the runner launched for a detached completion's job is bound
 	// to no job, so the pool, not the completion, decides what becomes of it.
 	unbound bool
+	// launched is that runner, for an unbound cancellation: the one the
+	// listener withdraws at once (withdrawCancelledRunner).
+	launched *alloc.PoolRunner
 }
 
 type jobResolution int
@@ -336,15 +339,18 @@ func (l *Listener) resolveActualJob(ctx context.Context, job dispatch.Job, mode 
 				// GitHub may already have given it another whose JobStarted has not
 				// arrived (2026-10-20, 04:43 to 04:47Z, 20 runners on one pool).
 				// Settled, it took the cancelled job's identity and result, refused
-				// the late JobStarted and then its real result. Left to the pool, it
-				// is retired as surplus if GitHub will delete it, and reinstated busy
-				// if GitHub refuses because it is running a job. Only a cancellation
+				// the late JobStarted and then its real result. It is withdrawn at
+				// once instead (withdrawCancelledRunner), which GitHub refuses if it
+				// is running a job, and otherwise the pool retires it as surplus or
+				// reinstates it busy, as before. Only a cancellation
 				// is known to name no runner for a job none took; any other result
 				// keeps settling its launch runner.
 				if (launched.Status == alloc.PoolRunnerIdle || launched.Status == alloc.PoolRunnerRetiring) &&
 					launched.ActualRequestID == 0 && job.RunnerID == 0 &&
 					strings.EqualFold(job.Result, resultCanceled) {
 					out.detached, out.unbound = true, true
+					runner := launched
+					out.launched = &runner
 				}
 			case !errors.Is(err, alloc.ErrLeaseNotFound):
 				return out, fmt.Errorf("%w: cannot resolve the runner launched for %s request %d: %w",

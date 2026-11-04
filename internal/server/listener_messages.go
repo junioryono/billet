@@ -88,6 +88,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// after a completion has retired or been superseded by a newer delivery.
 	finished := make([]actualJobIdentity, 0, len(resolved.completed))
 	completed := make([]dispatch.Job, 0, len(resolved.completed))
+	var cancelled []alloc.PoolRunner
 	for i := range resolved.completed {
 		entry := &resolved.completed[i]
 		if containsActual(resolved.held, entry.actual) {
@@ -97,10 +98,13 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			// Still finished, so a redelivered offer for it is not acquired.
 			finished = append(finished, entry.actual)
 			if entry.unbound {
-				l.log.Info("a job was cancelled before any runner took it; the runner launched for it is "+
-					"left to the pool, which retires it only if GitHub will delete it",
+				l.log.Info("a job was cancelled before any runner took it; withdrawing the runner "+
+					"launched for it, which GitHub refuses if it took another job",
 					"tier", l.tier, "request", entry.cleanup.RequestID, "job", entry.job.JobID,
 					"result", entry.job.Result)
+				if entry.launched != nil {
+					cancelled = append(cancelled, *entry.launched)
+				}
 				continue
 			}
 			l.log.Info("a job completed before any runner took it; the runner launched for it is running another job and is left to finish it",
@@ -116,6 +120,25 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		finished = append(finished, entry.actual)
 		completed = append(completed, entry.cleanup)
 	}
+
+	// BEFORE THE ACQUISITIONS AND THE POOL'S RECONCILE, so the room a cancelled
+	// job's runner held is the next job's in this same message. BOUNDED, because
+	// it runs on the message path: a burst past the budget is left to the
+	// offline watch, which every cancelled job's runner waited for before.
+	// ONE DEADLINE FOR THE WHOLE BATCH, so no withdrawal begun near its end runs
+	// past it.
+	batch, endBatch := context.WithTimeout(ctx, cancelledWithdrawBudget)
+	for i := range cancelled {
+		if batch.Err() != nil {
+			l.log.Info("left the runners of the rest of a burst of cancelled jobs to the pool's "+
+				"offline watch, past this message's withdrawal budget",
+				"tier", l.tier, "left", len(cancelled)-i)
+
+			break
+		}
+		l.withdrawCancelledRunner(ctx, batch, cancelled[i])
+	}
+	endBatch()
 
 	handled := *msg
 	handled.Completed = completed

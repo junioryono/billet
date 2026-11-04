@@ -37,13 +37,9 @@ func cmdCacheGoCacheProg(ctx context.Context, env cli.Env, args []string) error 
 	if len(args) != 0 {
 		return errors.New("usage: billet cache gocacheprog (run by the go command as GOCACHEPROG)")
 	}
-	dir := env.Getenv(envGoCacheDir)
-	if dir == "" {
-		base, err := os.UserCacheDir()
-		if err != nil {
-			return fmt.Errorf("no %s and no user cache directory: %w", envGoCacheDir, err)
-		}
-		dir = filepath.Join(base, "billet", "go-build")
+	dir, err := goCacheDir(env.Getenv)
+	if err != nil {
+		return err
 	}
 
 	return gocacheprog.Run(ctx, gocacheprog.Config{
@@ -52,6 +48,28 @@ func cmdCacheGoCacheProg(ctx context.Context, env cli.Env, args []string) error 
 		Token:    env.Getenv(envCacheToken),
 		Log:      env.Stderr,
 	}, env.Stdin, env.Stdout)
+}
+
+// goCacheDir is where the helper keeps its local cache: BILLET_GOCACHE_DIR, or
+// the directory the go command itself would use, so a build cache the workflow
+// restored (with actions/cache, say) is the one the helper serves from. That is
+// GOCACHE when it names a directory, and otherwise the go command's default,
+// <user cache dir>/go-build; GOCACHE=off, which the go command refuses beside
+// GOCACHEPROG anyway, and a relative GOCACHE, which it also refuses, fall back
+// to that default.
+func goCacheDir(getenv func(string) string) (string, error) {
+	if dir := getenv(envGoCacheDir); dir != "" {
+		return dir, nil
+	}
+	if dir := getenv("GOCACHE"); dir != "" && dir != "off" && filepath.IsAbs(dir) {
+		return dir, nil
+	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("no %s, no GOCACHE and no user cache directory: %w", envGoCacheDir, err)
+	}
+
+	return filepath.Join(base, "go-build"), nil
 }
 
 // credentialRequest and credentialResponse are Bazel's credential helper

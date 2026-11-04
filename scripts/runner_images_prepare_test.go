@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -421,35 +422,27 @@ func stepText(t *testing.T, step planStep) string {
 func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
 	t.Parallel()
 
-	differences, err := os.ReadFile(filepath.Join(runnerImagesDir, "differences.tsv"))
-	if err != nil {
-		t.Fatal(err)
+	for _, sc := range runnerImagesScopes {
+		preparesInPlace(t, sc.name, sc.template)
 	}
-	preparedOn := map[string]map[string]bool{}
-	for _, line := range strings.Split(string(differences), "\n") {
-		fields := strings.Split(line, "\t")
-		if len(fields) != 3 || !strings.HasPrefix(fields[0], "prepare:") {
-			continue
-		}
-		name := strings.TrimPrefix(fields[0], "prepare:")
-		if preparedOn[name] == nil {
-			preparedOn[name] = map[string]bool{}
-		}
-		preparedOn[name][fields[1]] = true
-	}
-	skipped := map[string]bool{}
-	for _, line := range strings.Split(string(differences), "\n") {
-		if fields := strings.Split(line, "\t"); len(fields) == 3 && fields[0] == "skip" {
-			skipped[fields[1]] = true
-		}
-	}
+}
+
+// preparesInPlace checks the prepares of one target against its plan. The guest's
+// own prepares (GRUB's absence and the system tests that assume Azure's disks and
+// kernel command line) are a guest's only; the CodeQL test filter is x64's, the one
+// architecture whose template installs CodeQL.
+func preparesInPlace(t *testing.T, scope, template string) {
+	t.Helper()
+
+	preparedOn, skipped := scopedDifferences(t, scope)
+	guest := strings.HasPrefix(scope, "guest-")
 
 	// A SKIPPED STEP RUNS NOTHING, so it is not the first step that can run a file.
-	plan := readTemplatePlan(t, vendoredTemplate(t))
+	plan := readTemplatePlan(t, vendoredTemplateNamed(t, template))
 	texts := make([]string, len(plan))
-	for i, step := range plan {
-		if step.Kind == "shell" && !step.Reboots && !skipped[step.ID] {
-			texts[i] = stepText(t, step)
+	for i := range plan {
+		if step := &plan[i]; step.Kind == "shell" && !step.Reboots && skipped[step.ID] == "" {
+			texts[i] = stepText(t, *step)
 		}
 	}
 
@@ -457,29 +450,40 @@ func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
 	// separator, so text that only names update-grub cannot keep a stale prepare.
 	grubCall := regexp.MustCompile(`(?m)(^|[;&|])[ \t]*(sudo[ \t]+)?update-grub([ \t;&|]|$)`)
 	calls := 0
-	for i, step := range plan {
+	for i := range plan {
 		if !grubCall.MatchString(texts[i]) {
 			continue
 		}
 		calls++
-		if !preparedOn["grub-absent"][step.ID] {
-			t.Errorf("step %s calls update-grub and has no prepare:grub-absent", step.ID)
+		if id := plan[i].ID; guest != preparedOn["grub-absent"][id] {
+			t.Errorf("%s: step %s calls update-grub and prepare:grub-absent is %v there; a guest "+
+				"has no GRUB and the AMI boots through it", scope, id, preparedOn["grub-absent"][id])
 		}
 	}
 	if calls == 0 {
-		t.Error("no step calls update-grub any more; retire prepare:grub-absent and this check")
+		t.Errorf("%s: no step calls update-grub any more; retire prepare:grub-absent and this check", scope)
 	}
 
-	for _, need := range []struct{ prepare, file string }{
-		{"apt-tests-two-mirrors", "Apt"},
-		{"system-tests-virtio", "System"},
-		{"system-tests-rootflags", "System"},
-		{"codeql-per-deployment", "Toolset"},
-		{"components-per-deployment", "Browsers"},
-		{"components-per-deployment", "Android"},
-		{"components-per-deployment", "Generate-SoftwareReport"},
+	for _, need := range []struct {
+		prepare, file string
+		applies       bool
+	}{
+		{"apt-tests-two-mirrors", "Apt", true},
+		{"system-tests-virtio", "System", guest},
+		{"system-tests-rootflags", "System", guest},
+		{"codeql-per-deployment", "Toolset", strings.HasSuffix(scope, "-x64")},
+		{"components-per-deployment", "Browsers", true},
+		{"components-per-deployment", "Android", true},
+		{"components-per-deployment", "Generate-SoftwareReport", true},
 	} {
 		prepare, file := need.prepare, need.file
+		if !need.applies {
+			if len(preparedOn[prepare]) != 0 {
+				t.Errorf("%s: prepare:%s applies here, and it is only for the targets that need it", scope, prepare)
+			}
+
+			continue
+		}
 		runs := regexp.MustCompile(`(?m)^[^#\n]*(invoke_tests[ \t]+["']?` + file + `["']?([ \t;&|]|$)|Invoke-PesterTests[ \t]+-TestFile[ \t]+["']?` + file + `["']?|RunAll-Tests\.ps1)`)
 		if file == "Generate-SoftwareReport" {
 			runs = regexp.MustCompile(`(?m)^[^#\n]*Generate-SoftwareReport\.ps1`)
@@ -493,7 +497,7 @@ func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
 			}
 		}
 		if first < 0 {
-			t.Errorf("no step runs the %s tests, so prepare:%s skips nothing", file, prepare)
+			t.Errorf("%s: no step runs the %s tests, so prepare:%s skips nothing", scope, file, prepare)
 
 			continue
 		}
@@ -502,8 +506,44 @@ func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
 			placed = placed || preparedOn[prepare][plan[i].ID]
 		}
 		if !placed {
-			t.Errorf("prepare:%s is not on or before %s, the first step that runs the %s tests",
-				prepare, plan[first].ID, file)
+			t.Errorf("%s: prepare:%s is not on or before %s, the first step that runs the %s tests",
+				scope, prepare, plan[first].ID, file)
+		}
+
+		// AND NOT BEFORE THE FILE IT EDITS EXISTS: the tests arrive with the upload
+		// of scripts/tests, and the report only once docs-gen is moved to
+		// SoftwareReport, so a prepare placed on an earlier step finds nothing to
+		// edit and stops the build.
+		arrives := uploadOf(t, plan, file)
+		for i := 0; i <= arrives; i++ {
+			if preparedOn[prepare][plan[i].ID] {
+				t.Errorf("%s: prepare:%s is on %s, before %s puts the %s file it edits in place",
+					scope, prepare, plan[i].ID, plan[arrives].ID, file)
+			}
 		}
 	}
+}
+
+// uploadOf is the index of the step after which file is in place in the target:
+// the upload of the template's tests for a test file, and the move of docs-gen
+// to SoftwareReport for the report.
+func uploadOf(t *testing.T, plan []planStep, file string) int {
+	t.Helper()
+
+	for i := range plan {
+		step := &plan[i]
+		if file == "Generate-SoftwareReport" {
+			if strings.Contains(strings.Join(step.Inline, "\n"), "mv /imagegeneration/docs-gen /imagegeneration/SoftwareReport") {
+				return i
+			}
+
+			continue
+		}
+		if step.Kind == "file" && !step.Download && slices.Contains(step.Sources, "images/ubuntu/scripts/tests") {
+			return i
+		}
+	}
+	t.Fatalf("no step puts the %s file in place", file)
+
+	return -1
 }
