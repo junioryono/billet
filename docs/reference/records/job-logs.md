@@ -21,9 +21,23 @@ So the agent reads the step records and skips the job's, which gives it each lin
 
 ## Whether a line is masked
 
-Read in actions/runner v2.338.1's source, not measured: `ExecutionContext.Write` calls `HostContext.SecretMasker.MaskSecrets` and only then `_logger.Write`, for both the step's logger and the job's, and `PagingLogger` writes what it is handed to these files. So a masked value is `***` here as it is in GitHub's log.
+In actions/runner v2.338.1's source, `ExecutionContext.Write` calls `HostContext.SecretMasker.MaskSecrets` and only then `_logger.Write`, for both the step's logger and the job's, and `PagingLogger` writes what it is handed to these files.
 
-**A live check is owed before this is relied on:** a workflow that masks a value and echoes it, with these files read. The test repository's one workflow only sleeps, so this needs a change to it.
+Measured on 2026-11-04 on a real job on runner 2.337.0, with this branch's agent beside the runner and this branch's node service keeping what it sent. A step echoed a repository secret and a value it had masked with `::add-mask::`, and both were `***` in the kept lines: `secret-line *** end` and `masked-line *** end`. Neither value appeared anywhere in what the node kept. The secret also reads `***` in the step's own `env:` header.
+
+## A step's name
+
+Also measured on that job. The runner's marks in its Worker log have whole seconds, and four of the job's seven steps began in one second, in the same second as the runner's own setup, which is a page with no step and no mark. So a page is named after the first waiting mark of its own second, and the first page takes no mark at all. Naming each page after the latest mark at or before its first line put every name one step off.
+
+A configured job-started hook is a step of its own, `Set up runner`, with its own mark and page. The hook's lines reach the job's log, `RUNNER_NAME` is set for it, and it runs under `bash --noprofile --norc -e -o pipefail`.
+
+## Reading beside the writer
+
+Also measured on that job. With the control plane's writer holding a day's file open in WAL mode, a search opening it `mode=ro` found the lines from the same account, as root and as `nobody`, an account that cannot write to the directory.
+
+## Real JUnit files
+
+Also measured on that job, through the agent and the node's service to the encoded test results. pytest's `--junitxml` and `gotestsum --junitfile` each gave a suite with the right counts, every case's status (`passed`, `failed`, `errored`, `skipped`) and every case's duration.
 
 ## What the index does
 
