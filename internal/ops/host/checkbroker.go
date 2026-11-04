@@ -80,8 +80,8 @@ func checkBrokerTokens(ctx context.Context, env cli.Env, cfg *config.Config, tar
 		return githubFailed, err
 	}
 
-	fmt.Fprintf(env.Stdout, "github   verified: the broker minted a token for %s, permissions exactly as requested "+
-		"for a %s; the broker proves the installation itself, with the key it holds\n", target.Path(), target.Scope())
+	fmt.Fprintf(env.Stdout, "github   verified: the broker issued a token for %s, with exactly the permissions "+
+		"requested for that %s; the broker proves the installation itself, with the key it holds\n", target.Path(), target.Scope())
 
 	return githubVerified, nil
 }

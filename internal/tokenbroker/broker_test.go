@@ -523,7 +523,7 @@ func TestABrokerLogsNoCredential(t *testing.T) {
 	}
 
 	logged := broker.logged.String()
-	if !strings.Contains(logged, "minted an installation token") {
+	if !strings.Contains(logged, "served an installation token") {
 		t.Fatalf("the broker logged nothing about the mint, so this proves nothing:\n%s", logged)
 	}
 
