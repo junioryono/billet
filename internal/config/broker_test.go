@@ -117,3 +117,74 @@ func TestTwoDeploymentsMayShareAnInstallationByRepository(t *testing.T) {
 		t.Fatalf("two deployments on one installation by repository: %v", err)
 	}
 }
+
+// ONE REPOSITORY IS ONE REPOSITORY, whichever App reaches it: a second App installed on the
+// same owner does not make what it reaches anyone else's.
+func TestARegistryComparesWhatATokenReachesAcrossApps(t *testing.T) {
+	t.Parallel()
+
+	const (
+		a = "0123456789abcdef0123456789abcdef"
+		b = "fedcba9876543210fedcba9876543210"
+	)
+
+	fingerprint := func(c byte) string { return "SHA256:" + strings.Repeat(string(c), 43) }
+
+	load := func(t *testing.T, first, second BrokerInstallation) error {
+		t.Helper()
+
+		dir := t.TempDir()
+		cfg := &BrokerConfig{
+			Listen: "127.0.0.1:8443", CertFile: filepath.Join(dir, "c"), KeyFile: filepath.Join(dir, "k"),
+			Apps: []BrokerApp{
+				{AppID: 1, PrivateKeyPath: filepath.Join(dir, "a1")},
+				{AppID: 2, PrivateKeyPath: filepath.Join(dir, "a2")},
+			},
+			Deployments: []BrokerDeployment{
+				{ID: a, Clients: []string{fingerprint('A')}, Installations: []BrokerInstallation{first}},
+				{ID: b, Clients: []string{fingerprint('B')}, Installations: []BrokerInstallation{second}},
+			},
+		}
+
+		return cfg.Validate()
+	}
+
+	for name, tc := range map[string]struct {
+		first, second BrokerInstallation
+		want          string
+	}{
+		"a repository under two Apps": {
+			BrokerInstallation{AppID: 1, InstallationID: 10, Target: "acme/api"},
+			BrokerInstallation{AppID: 2, InstallationID: 20, Target: "ACME/api"}, "already registered",
+		},
+		"an organization, and a repository of it under another App": {
+			BrokerInstallation{AppID: 1, InstallationID: 10, Target: "acme"},
+			BrokerInstallation{AppID: 2, InstallationID: 20, Target: "acme/api"}, "whole organization",
+		},
+		"two repositories of one owner": {
+			BrokerInstallation{AppID: 1, InstallationID: 10, Target: "acme/api"},
+			BrokerInstallation{AppID: 1, InstallationID: 10, Target: "acme/web"}, "",
+		},
+		"two owners": {
+			BrokerInstallation{AppID: 1, InstallationID: 10, Target: "acme"},
+			BrokerInstallation{AppID: 2, InstallationID: 20, Target: "other"}, "",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			err := load(t, tc.first, tc.second)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}

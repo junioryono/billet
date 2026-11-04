@@ -145,15 +145,15 @@ type PostgresStateConfig struct {
 	// MaxConnections is the most PostgreSQL connections one process of this
 	// deployment may hold: the writer, the controller claim's session, and the
 	// reader pool, which gets what those two leave, up to
-	// DefaultLedgerReaderConnections. Zero leaves the reader pool at that default.
-	// A value that leaves no reader is refused, because a control plane cannot
-	// run on fewer; see LedgerConnections for the count a deployment holds.
+	// DefaultLedgerReaderConnections. Absent leaves the reader pool at that default.
+	// A value that leaves no reader is refused, zero included, because a control plane
+	// cannot run on fewer; see LedgerConnections for the count a deployment holds.
 	//
 	// THE CLAIM AND THE SESSION SETTINGS CANNOT GO THROUGH A TRANSACTION-MODE
 	// POOLER: the claim is a session advisory lock, the writer's lock_timeout and
 	// the readers' read-only default are session settings, and a pooler would
 	// hand each of them to whoever came next.
-	MaxConnections int `yaml:"max_connections,omitempty"`
+	MaxConnections *int `yaml:"max_connections,omitempty"`
 }
 
 const (
@@ -614,11 +614,11 @@ func (s *ServerConfig) validatePostgresState() []error {
 		errs = append(errs, fmt.Errorf("server.state.postgres.dsn_env: %w", err))
 	}
 
-	if pg.MaxConnections != 0 && pg.MaxConnections <= postgresFixedConnections {
+	if pg.MaxConnections != nil && *pg.MaxConnections <= postgresFixedConnections {
 		errs = append(errs, fmt.Errorf(
 			"server.state.postgres.max_connections is %d, and a control plane needs at least %d: "+
 				"the writer, the controller claim's session and one reader",
-			pg.MaxConnections, postgresFixedConnections+1))
+			*pg.MaxConnections, postgresFixedConnections+1))
 	}
 
 	return errs
@@ -629,11 +629,11 @@ func (s *ServerConfig) validatePostgresState() []error {
 // default, which is all a control plane's reads were ever given.
 func (s *ServerConfig) LedgerReaderConnections() int {
 	if s.LedgerBackend() != StatePostgres || s.State == nil || s.State.Postgres == nil ||
-		s.State.Postgres.MaxConnections == 0 {
+		s.State.Postgres.MaxConnections == nil {
 		return DefaultLedgerReaderConnections
 	}
 
-	return min(DefaultLedgerReaderConnections, s.State.Postgres.MaxConnections-postgresFixedConnections)
+	return min(DefaultLedgerReaderConnections, *s.State.Postgres.MaxConnections-postgresFixedConnections)
 }
 
 // LedgerConnections is the most PostgreSQL connections one process of this

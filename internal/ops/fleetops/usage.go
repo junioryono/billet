@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
@@ -56,15 +57,10 @@ func Usage(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	_, db, closeDB, err := ControlPlaneStores(ctx, *cfgPath)
-	if err != nil {
-		return err
-	}
-	defer closeDB()
-
 	// PEEKED, NEVER MINTED, and refused when absent. Reporting a bound ledger's
 	// history under an identity this command just made would label another
-	// deployment's records as a new one's.
+	// deployment's records as a new one's. BEFORE ANYTHING OPENS: a host that has never
+	// run a control plane is told so, and is left with no ledger this command created.
 	deployment, found, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
 		return err
@@ -74,6 +70,12 @@ func Usage(ctx context.Context, env cli.Env, args []string) error {
 			"say these records are whose. A control plane mints one the first time it starts",
 			cfg.Server.IdentityDir)
 	}
+
+	_, db, closeDB, err := ControlPlaneStores(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
 
 	after, err := resumeUsage(ctx, db, deployment, *since)
 	if err != nil {
@@ -217,8 +219,8 @@ func resumeUsage(ctx context.Context, ledger usageLedger, deployment, since stri
 	return cursor.sequence, nil
 }
 
-// usageInterval is a stretch of time on billet's clock. A nil end or length is
-// not known, and the record's Unknown says why.
+// usageInterval is a stretch of time. A nil end or length is not known, and the
+// record's Unknown says why.
 type usageInterval struct {
 	From    string       `json:"from"`
 	To      string       `json:"to"`
@@ -282,6 +284,9 @@ const (
 
 	weightFromTier = "tier"
 	weightFromVCPU = "charged_vcpu"
+	// weightFromVCPUTierGone is that same arithmetic for a tier the config no longer
+	// declares, which may have named a weight this billet cannot see.
+	weightFromVCPUTierGone = "charged_vcpu_undeclared_tier"
 )
 
 func newUsageRecord(cfg *config.Config, deployment string, row *state.UsageRow) usageRecord {
@@ -392,9 +397,20 @@ func (r *usageRecord) setIntervals(row *state.UsageRow) {
 	}
 
 	switch {
+	case jobFrom == "" && jobTo == "" && !endedCleanly(row):
+		// NOT A KNOWN ZERO: a JobStarted arrives tens of seconds late, so a lease failed or
+		// force-destroyed before it arrived may have been running a job, and GitHub can
+		// still say so. An absence proves nothing about a lease that ended this way.
+		r.Unknown["job.from"] = "the lease ended without a clean finish and no job's start was recorded, " +
+			"which does not prove no job ran"
+		r.Unknown["job.to"] = r.Unknown["job.from"]
+		r.Unknown["job.seconds"] = r.Unknown["job.from"]
+		r.Unknown["billed_minutes"] = r.Unknown["job.from"]
+		r.Unknown["result"] = r.Unknown["job.from"]
+		r.Unknown["job_clock"] = r.Unknown["job.from"]
 	case jobFrom == "" && jobTo == "":
-		// KNOWN, not unknown: the ledger keeps the start at its first value from the
-		// moment the lease is busy, and nothing started here.
+		// KNOWN, not unknown: the lease finished cleanly and GitHub never said a job
+		// started on it, so the ledger's empty start is the fact.
 		r.BilledMinutes = new(int64(0))
 		r.Unknown["job.from"] = "no job started on this lease"
 		r.Unknown["job.to"] = r.Unknown["job.from"]
@@ -426,11 +442,22 @@ func (r *usageRecord) setIntervals(row *state.UsageRow) {
 		r.Job.Seconds = jsonSeconds(seconds)
 		r.BilledMinutes = new(wholeMinutes(seconds))
 	}
+
+	if row.Result == "" && r.Unknown["result"] == "" {
+		r.Unknown["result"] = "GitHub's conclusion for this job was not recorded"
+	}
+}
+
+// endedCleanly reports whether a lease reached its terminal phase with nothing having
+// gone wrong: the only ending under which a missing start means no job ran.
+func endedCleanly(row *state.UsageRow) bool {
+	return row.Conclusion == string(alloc.PhaseDone) && row.FailureReason == "" && row.Disruption == ""
 }
 
 // setWeight is what one of those minutes counts as, from the tier if it names a
-// weight and otherwise from the vCPU the lease was charged. A tier the config no
-// longer declares falls to the charged vCPU, and the source says so.
+// weight and otherwise from the vCPU the lease was charged, read when the record is
+// read. A tier the config no longer declares falls to the charged vCPU, under a source
+// of its own, because that tier may have named a weight.
 func (r *usageRecord) setWeight(cfg *config.Config, row *state.UsageRow) {
 	var thousandths int64
 
@@ -444,6 +471,10 @@ func (r *usageRecord) setWeight(cfg *config.Config, row *state.UsageRow) {
 		// NORMALISED TO A 2 VCPU RUNNER: a 4 vCPU runner counts double.
 		thousandths = row.VCPU * 500
 		r.WeightSource = weightFromVCPU
+
+		if !declared {
+			r.WeightSource = weightFromVCPUTierGone
+		}
 	default:
 		r.Unknown["minute_weight"] = "the tier names no weight and no usable shape was recorded for this lease"
 		r.Unknown["weight_source"] = r.Unknown["minute_weight"]

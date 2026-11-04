@@ -35,6 +35,11 @@
 -- job's completion: a job GitHub ran for 243 seconds read as 197. Those two pairs are
 -- not interchangeable, so a usage record says which it read.
 --
+-- pending_completions keeps those two times beside the rest of what a completion said,
+-- because a controller that dies between recording the delivery and recording its result
+-- writes that result on its next start, and result_at is then the restart: a two-minute
+-- job would read as however long the controller was down.
+--
 -- github_target is the GitHub path of the owner whose runner the lease held,
 -- copied from the lease as it closes. Migration 64 put it on the lease only, and
 -- the row that outlives the lease had nothing but a tier label, which an operator
@@ -71,6 +76,14 @@ ALTER TABLE job_history ADD COLUMN usage_mark TEXT NOT NULL DEFAULT ''
 
 -- +billet:statement
 ALTER TABLE job_history ADD COLUMN github_finished_at TEXT NOT NULL DEFAULT ''
+-- +billet:end
+
+-- +billet:statement
+ALTER TABLE pending_completions ADD COLUMN job_runner_assigned_at TEXT NOT NULL DEFAULT ''
+-- +billet:end
+
+-- +billet:statement
+ALTER TABLE pending_completions ADD COLUMN job_finished_at TEXT NOT NULL DEFAULT ''
 -- +billet:end
 
 -- +billet:statement

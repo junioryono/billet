@@ -70,6 +70,13 @@ func ExpandTierSizes(tiers []Tier) ([]Tier, error) {
 func expandOne(t Tier) ([]Tier, error) {
 	where := tierWhere(t)
 
+	// ONE WEIGHT ACROSS A LADDER would count a 2 vCPU and an 8 vCPU runner's minutes the
+	// same, where leaving it unset scales with the vCPU charged. A weight is per tier.
+	if len(t.Sizes) > 0 && t.MinuteWeight != 0 {
+		return nil, fmt.Errorf("%s: `minute_weight` cannot sit beside `sizes`, which would give every size "+
+			"one weight; leave it unset to weigh each by its vCPU, or write the tiers out", where)
+	}
+
 	if len(t.Sizes) == 0 {
 		// MEANINGLESS WITHOUT SIZES, AND REFUSED RATHER THAN IGNORED. A tier
 		// carrying a memory-per-vCPU proportion and an explicit memory is somebody

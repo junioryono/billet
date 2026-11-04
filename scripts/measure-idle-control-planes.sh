@@ -64,6 +64,11 @@ prepare() {
     [ -x "$1" ] || die "no billet binary at $1"
     [ -x "$2" ] || die "no fake GitHub binary at $2"
 
+    # BEFORE THE BINARIES ARE REPLACED, because a process is recognised by the path of
+    # its executable: left running, an earlier run's fake would answer for the new one.
+    stop_all
+    stop_fake
+
     install -d "${MEASURE_ROOT}" "${MEASURE_ROOT}/bin" "${MEASURE_ROOT}/planes" "${MEASURE_ROOT}/results"
     install -m 0755 "$1" "${MEASURE_ROOT}/bin/billet"
     install -m 0755 "$2" "${MEASURE_ROOT}/bin/integration.test"
@@ -93,6 +98,23 @@ prepare() {
     done
 
     start_fake
+}
+
+stop_fake() {
+    local pid deadline
+    [ -f "${MEASURE_ROOT}/fake.pid" ] || return 0
+    pid=$(cat "${MEASURE_ROOT}/fake.pid")
+
+    if [ "$(readlink "/proc/${pid}/exe" 2>/dev/null)" = "${MEASURE_ROOT}/bin/integration.test" ]; then
+        kill -KILL "${pid}"
+        deadline=$(($(date +%s) + 30))
+        while [ -e "/proc/${pid}" ]; do
+            [ "$(date +%s)" -lt "${deadline}" ] || die "the fake GitHub, pid ${pid}, did not go after SIGKILL"
+            sleep 0.1
+        done
+    fi
+
+    rm -f "${MEASURE_ROOT}/fake.pid"
 }
 
 start_fake() {
@@ -525,6 +547,7 @@ restart_config() {
     local label=$1 how=$2 out n
     out=${MEASURE_ROOT}/results/${label}
     install -d "${out}"
+    [ ! -e "${out}/restart-${how}.tsv" ] || die "${label} already has a ${how} restart; use another label"
 
     # ONE AT A TIME, while the others stay up.
     for n in $(planes | head -n "${MEASURE_RESTART_SINGLES}"); do

@@ -21,9 +21,9 @@ server:
 
 The readers get what the writer and the claim leave, up to four, so unset is six. Three is the least a control plane can run on, and a value under it is refused with the arithmetic. `billet check` states what the deployment can hold. A reader nothing has borrowed for a minute closes, so a quiet deployment holds fewer than its limit.
 
-**Beyond that number:** a standby in an active-passive pair is a process of its own and holds its own. An operator command run beside the server opens its own too, for as long as it runs, under the same limit; so does a backup, whose `pg_dump` is one more.
+**Beyond that number:** a standby in an active-passive pair is a process of its own and holds its own, one session while it waits for the claim. An operator command run beside the server opens its own too, for as long as it runs, under the same limit, except the tail of `billet server retire`, which finds the ledger from its journal with no config to read a limit from, and reads one row at a time. A backup's `pg_dump` is one more.
 
-**A transaction-mode pooler cannot carry these.** The claim is a session advisory lock, and the writer's `lock_timeout` and the readers' read-only default are session settings, so a pooler handing a server connection to whoever comes next silently drops the exclusion. Point the DSN at the server, or at a session-mode pool.
+**A transaction-mode pooler cannot carry these.** The claim is a session advisory lock, and the writer's `lock_timeout` and the readers' read-only default are session settings, so a pooler handing a server connection to whoever comes next silently drops the exclusion. Point the DSN at the server. billet has not been measured behind a session-mode pooler either: these settings travel as startup parameters, which a pooler may refuse or drop, so measure one before relying on it.
 
 ## Memory on a packed host
 
@@ -50,16 +50,18 @@ server:
 ```
 
 ```bash
-billet broker client-key --config /etc/billet/billet.yaml
+billet broker client-key --config /etc/billet/billet.yaml --new-deployment
 ```
 
-It prints the deployment, the key's fingerprint and the stanza to add to the broker's file. Compare them on a channel you trust, as you would an enrollment: the registry is the trust decision. An active-passive pair runs this on each host and registers both, and a restored host makes and registers its own, because this key belongs to the host and travels in no archive.
+It prints the deployment, the key's fingerprint and the stanza to add to the broker's file. Compare them on a channel you trust, as you would an enrollment: the registry is the trust decision. `--new-deployment` says this host is starting one, and mints its identity: without it the command refuses a host that holds none, so a replacement host cannot mint an identity that stops the restore it is about to run. An active-passive pair runs this on each host and registers both, and a restored host runs it after `billet local restore`, with no flag, because this key belongs to the host and travels in no archive. The Ansible collection neither installs nor asks for this key: run the command once on each host and register what it prints.
 
 **What a deployment may ask for is exactly what its stanza names**, and a token reaches what that deployment needs and nothing else: billet's permissions for the target, and for a repository target that repository alone. An installation registered as a whole organization belongs to one deployment, because its token reaches every repository the installation does.
 
 **`billet check` says which it is using,** and what a check without the key cannot prove: whether the App is installed and not suspended is the broker's to check, which it does before it mints.
 
-**A broker that is down costs little.** A deployment's long polls carry the Actions service's own token and do not ask, and a held token rides out silence until its last minute, so an outage shows only when a refresh falls due, and reads as could-not-tell rather than as the installation being gone.
+**A broker that is down costs little, while the control plane stays up.** A deployment's long polls carry the Actions service's own token and do not ask, and a held token rides out silence until its last minute, so an outage shows only when a refresh falls due, and reads as could-not-tell rather than as the installation being gone. Held tokens live in memory, though: **a control plane that restarts during an outage cannot provision its scale sets, and does not start until the broker answers.** Do not upgrade the two together.
+
+**The broker has one budget for everyone it serves.** A deployment holds only what it is registered for, and a failure is answered from memory for 30 s rather than spending the App's budget at GitHub again, but connections are not limited per deployment: a compromised control plane can use up the broker's 4096. Limit the port in front if your deployments do not trust one another's availability.
 
 ## Many deployments behind one address
 

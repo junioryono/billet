@@ -77,6 +77,10 @@ const verifyEvery = time.Hour
 
 // installation is one registered (deployment, app, installation, target).
 type installation struct {
+	// failed and failedUntil are the failure this installation is answering with, under mu.
+	failed      failure
+	failedUntil time.Time
+
 	deployment     string
 	appID          int64
 	installationID int64
@@ -263,7 +267,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A FAILURE IS ANSWERED ONCE AND THEN REMEMBERED BRIEFLY. Nothing else stands between
+	// one deployment's retries and the App's budget at GitHub, which every deployment on
+	// that App shares.
+	if failed, held := s.recentFailure(inst); held {
+		s.refuse(w, failed.status, failed.code, failed.message)
+
+		return
+	}
+
 	if status, code, message := s.proved(r, inst); status != 0 {
+		s.noteFailure(r, inst, failure{status, code, message})
 		s.refuse(w, status, code, message)
 
 		return
@@ -274,13 +288,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("could not mint an installation token", "deployment", deployment, "app", req.AppID,
 			"installation", req.InstallationID, "error", err)
 
-		if errors.Is(err, github.ErrNotInstalled) {
-			s.refuse(w, http.StatusNotFound, codeNotInstalled, "the App is not installed there")
-
-			return
+		failed := mintFailure(err)
+		if failed.status != http.StatusServiceUnavailable {
+			s.forgetProof(inst)
 		}
 
-		s.refuse(w, http.StatusServiceUnavailable, codeUnavailable, "a token could not be minted just now")
+		s.noteFailure(r, inst, failed)
+		s.refuse(w, failed.status, failed.code, failed.message)
 
 		return
 	}
@@ -296,6 +310,64 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Permissions: maps.Clone(token.Permissions()),
 	}); err != nil {
 		s.log.Warn("could not write a token to its caller", "deployment", deployment, "error", err)
+	}
+}
+
+// failureMemory is how long a broker repeats a failure rather than asking GitHub again.
+// Short, because the next answer may be different and a control plane's refresh waits
+// on it; a held token rides this out.
+const failureMemory = 30 * time.Second
+
+// failure is a refusal as a caller reads it.
+type failure struct {
+	status        int
+	code, message string
+}
+
+func (s *Server) recentFailure(inst *installation) (failure, bool) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+
+	if inst.failedUntil.IsZero() || !s.now().Before(inst.failedUntil) {
+		return failure{}, false
+	}
+
+	return inst.failed, true
+}
+
+// noteFailure remembers one, unless the caller going away is what caused it: that says
+// nothing about the installation.
+func (s *Server) noteFailure(r *http.Request, inst *installation, failed failure) {
+	if r.Context().Err() != nil {
+		return
+	}
+
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+
+	inst.failed, inst.failedUntil = failed, s.now().Add(failureMemory)
+}
+
+func (s *Server) forgetProof(inst *installation) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+
+	inst.verified = time.Time{}
+}
+
+// mintFailure reads why GitHub would not mint. ONLY GITHUB'S OWN DEFINITE WORD IS A
+// REFUSAL: its 5xx, a throttle and a failure to reach it are could-not-tell, and so is
+// anything that is not GitHub's answer at all.
+func mintFailure(err error) failure {
+	api, answered := errors.AsType[*github.APIError](err)
+
+	switch {
+	case !answered, github.Undecided(err):
+		return failure{http.StatusServiceUnavailable, codeUnavailable, "a token could not be minted just now"}
+	case api.Status == http.StatusNotFound:
+		return failure{http.StatusNotFound, codeNotInstalled, "the App is not installed there"}
+	default:
+		return failure{http.StatusForbidden, codeMismatch, "GitHub refused this App a token for that installation"}
 	}
 }
 

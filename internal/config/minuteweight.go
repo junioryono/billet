@@ -11,6 +11,8 @@ import (
 // MinuteWeight is what one minute of a tier counts as, in minutes of a 2 vCPU
 // Linux runner, stored as thousandths so that a sum of minutes never depends on
 // a float's rounding. Zero means the tier names none.
+//
+//nolint:recvcheck // UnmarshalYAML must take a pointer to assign; the rest read a value, so a field marshals.
 type MinuteWeight int64
 
 const (

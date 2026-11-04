@@ -691,7 +691,8 @@ SELECT usage_seq, usage_mark, lease_id, tier, github_target, COALESCE(repo, '') 
        chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
        bought_at, COALESCE(started_at, '') AS started_at,
        COALESCE(finished_at, '') AS finished_at, result, result_at,
-       COALESCE(conclusion, '') AS conclusion, github_runner_assigned_at, github_finished_at
+       COALESCE(conclusion, '') AS conclusion, github_runner_assigned_at, github_finished_at,
+       failure_reason, disruption
   FROM job_history
  WHERE usage_seq > $1 AND usage_seq > 0
  ORDER BY usage_seq
@@ -724,9 +725,11 @@ type ListUsageSinceRow struct {
 	Conclusion             string
 	GithubRunnerAssignedAt string
 	GithubFinishedAt       string
+	FailureReason          string
+	Disruption             string
 }
 
-// Finished leases past a place in the order they finished in, bounded.
+// Finished leases past a place in the order they were numbered in, bounded.
 //
 // FILTERED ON usage_seq ALONE, never on a time: a lease that closed with an
 // earlier clock than one already read must still be seen. The second term is the
@@ -763,6 +766,8 @@ func (q *Queries) ListUsageSince(ctx context.Context, arg ListUsageSinceParams) 
 			&i.Conclusion,
 			&i.GithubRunnerAssignedAt,
 			&i.GithubFinishedAt,
+			&i.FailureReason,
+			&i.Disruption,
 		); err != nil {
 			return nil, err
 		}
@@ -783,7 +788,7 @@ ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + 1
 RETURNING last
 `
 
-// Take the next place in the order leases finished in.
+// Take the next place in the order leases were numbered in.
 //
 // THE ROW'S LOCK IS THE POINT, held until this transaction commits, so numbers
 // become visible in the order they were handed out on both engines; migration 71

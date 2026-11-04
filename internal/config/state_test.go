@@ -262,7 +262,7 @@ func TestAPostgresConnectionBudgetSizesTheReaderPool(t *testing.T) {
 		})
 	}
 
-	for _, budget := range []string{"2", "1", "-1"} {
+	for _, budget := range []string{"0", "2", "1", "-1"} {
 		t.Run("refuses "+budget, func(t *testing.T) {
 			_, err := loadServer(t, block("      max_connections: "+budget+"\n"))
 			if err == nil || !strings.Contains(err.Error(), "needs at least 3: the writer, the controller "+
