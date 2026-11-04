@@ -37,7 +37,7 @@ Predicting a job's runtime from the history of the same job is well studied in b
 
 ## Holding one host for a wide shape (#527)
 
-**A shape that fits nowhere is given one host, the one its running work is predicted to free soonest, and nothing behind it places there, a tier below its floor with room nowhere else excepted.** `fair` gives a wide shape its turn by holding freed room on every host it shares, which every other shape pays for; `fill` starves it. Holding one host and letting everything else run on the rest is backfilling with a reservation: EASY (D. Lifka, "The ANL/IBM SP Scheduling System", JSSPP 1995) reserves for the first job in the queue and lets others run if they do not delay it; Mu'alem and Feitelson (IEEE TPDS 12(6), 2001) compare that with a reservation for every job. Slurm and Maui offer both. billet's jobs have no user estimates to be wrong about, because the runtimes are learned, and its reservation is a whole host and not a time window, because a runner cannot be preempted and a lease's end cannot be promised.
+**A shape that fits nowhere is given one host, the one its running work is predicted to free soonest, and nothing behind it takes the room it needs there, a tier below its floor with room nowhere else excepted.** That is all the room until the shape fits and that much after, so a host far wider than the shape sells the rest. `fair` gives a wide shape its turn by holding freed room on every host it shares, which every other shape pays for; `fill` starves it. Holding one host and letting everything else run on the rest is backfilling with a reservation: EASY (D. Lifka, "The ANL/IBM SP Scheduling System", JSSPP 1995) reserves for the first job in the queue and lets others run if they do not delay it; Mu'alem and Feitelson (IEEE TPDS 12(6), 2001) compare that with a reservation for every job. Slurm and Maui offer both. billet's jobs have no user estimates to be wrong about, because the runtimes are learned, and its reservation is room on a host and not a time window, because a runner cannot be preempted and a lease's end cannot be promised.
 
 **The prediction chooses the host and says when a job is late, and nothing else.** A wrong one picks a worse host, or puts a waiter back in the line as under `fair` sooner or later than it should. Nothing in the purchase transaction reads one, and a hold releases, destroys and promises nothing: it only narrows which hosts a purchase may use, which the transaction still decides.
 
@@ -45,7 +45,9 @@ Predicting a job's runtime from the history of the same job is well studied in b
 
 **`tightest` is a best fit across tiers** (the old rule of the same name for memory allocation), offered as a placement and not the default, because on replay it did not reliably beat `pack`. Placing a job beside others predicted to end at the same time, so a host empties all at once, was built behind the replay and measured no gain, so it did not ship.
 
-**`hold` is opt-in whatever replay shows,** because a deployment with one host holds all of it, and because it gives the widest shape a longer wait than `fair` for the sake of everything else, which is the operator's to choose.
+**`hold` does nothing under GHES's offers,** where no tier is recorded waiting (#686), as `fair` and weights do not.
+
+**`hold` is opt-in whatever replay shows,** because on a deployment with one host a waiter's hold closes all of it until the shape fits, as `fair` does, and because it gives the widest shape a longer wait than `fair` for the sake of everything else, which is the operator's to choose.
 
 ## Consequences
 

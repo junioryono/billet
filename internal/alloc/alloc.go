@@ -595,11 +595,12 @@ type Purchase struct {
 	// Protect is the tiers each of which must still be granted one lease
 	// afterwards (EscrowLeaving).
 	Protect []string
-	// Avoid is the hosts each tier places nothing on, held for another (HoldCandidates).
+	// Avoid is the hosts held against each tier, each with its owner (HoldCandidates).
 	// It names this purchase's tier and each it must protect, which is measured the
-	// same way. A tier below its floor uses one only if it has room nowhere else, and
-	// only up to its floor.
-	Avoid map[string][]string
+	// same way, and each may use only the room above what the owner needs. A tier below
+	// its floor uses a host's whole room only if it has room nowhere else, and only up
+	// to its floor.
+	Avoid map[string]map[string]string
 }
 
 // EscrowFor is Escrow under what the admission order asks of this purchase.
@@ -646,7 +647,7 @@ var (
 // errWaiterShortNow or errWaiterLeftShort when it would leave a tier in guarded
 // unable to be granted one.
 func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded []config.Tier,
-	avoid map[string][]string,
+	avoid map[string]map[string]string,
 ) ([]*Lease, error) {
 	if want == 0 {
 		return nil, nil
@@ -723,13 +724,14 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 	return leases, nil
 }
 
-// placerAvoiding is the placer a purchase of up to want leases of t uses, kept off
-// hosts, and how many it may grant. A TIER BELOW ITS FLOOR with room nowhere else uses
-// them, as far as its floor and no further: its room is promised, and its backlog is not.
-func (a *Allocator) placerAvoiding(ctx context.Context, tx querier, t config.Tier, place *placer, hosts []string,
-	want int,
+// placerAvoiding is the placer a purchase of up to want leases of t uses, leaving held
+// hosts what their owners need, and how many it may grant. A TIER BELOW ITS FLOOR with room
+// nowhere else uses them, as far as its floor and no further: its room is promised, and
+// its backlog is not.
+func (a *Allocator) placerAvoiding(ctx context.Context, tx querier, t config.Tier, place *placer,
+	holds map[string]string, want int,
 ) (*placer, int, error) {
-	if len(hosts) == 0 {
+	if len(holds) == 0 {
 		return place, want, nil
 	}
 
@@ -739,7 +741,7 @@ func (a *Allocator) placerAvoiding(ctx context.Context, tx querier, t config.Tie
 	}
 
 	open := place.clone()
-	open.avoid(hosts)
+	open.keepFor(holds, a.tiers)
 
 	if short := t.Reserved - floors[t.Label]; short > 0 && open.total(t) == 0 {
 		return place, min(want, short), nil
@@ -751,7 +753,7 @@ func (a *Allocator) placerAvoiding(ctx context.Context, tx querier, t config.Tie
 // guardedHaveRoom returns short unless every tier in guarded could be granted one
 // lease by an escrow in this transaction now, on a host it may use.
 func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []config.Tier,
-	avoid map[string][]string, short error,
+	avoid map[string]map[string]string, short error,
 ) error {
 	for i := range guarded {
 		room, place, err := a.headroomWithPlacer(ctx, tx, guarded[i])

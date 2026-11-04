@@ -104,8 +104,11 @@ import (
 // HOLD HOLDS ONE HOST, NOT EVERY HOST (#527). Under fair a shape that fits nowhere holds
 // freed room on every host it could use until it fits; under fill it may wait without
 // bound. Under hold such a waiter is given one host, the one its running work is
-// predicted to free soonest (alloc.HoldCandidates), no tier behind it places there, and
-// every other host stays open: a waiter with a host holds nobody back.
+// predicted to free soonest (alloc.HoldCandidates), no tier behind it takes the room it
+// needs there, and every other host stays open: a waiter with a host holds nobody back.
+// THE ROOM IT NEEDS, NOT THE HOST: closed until its shape fits, and past that only that
+// much, because a host far wider than the shape would otherwise idle while its owner is
+// held back, or until its listener next wakes.
 //
 // A HELD HOST ONLY EMPTIES, near enough: what lands on it is a waiter ahead, once, and a
 // floor. So what runs there bounds the wait, and the hold stays through ordinary noise in
@@ -402,8 +405,8 @@ func (q *admissionQueue) heldAgainstLocked(tier string, now time.Time) map[strin
 	return out
 }
 
-// heldAgainst is the hosts this tier places nothing on, each with its owner. Empty
-// unless the order holds hosts.
+// heldAgainst is the hosts held against this tier, each with its owner: it may use only
+// the room above what the owner needs. Empty unless the order holds hosts.
 func (q *admissionQueue) heldAgainst(tier string) map[string]string {
 	if !q.holds() {
 		return nil
@@ -417,15 +420,15 @@ func (q *admissionQueue) heldAgainst(tier string) map[string]string {
 	return q.heldAgainstLocked(tier, q.now())
 }
 
-// avoiding is the hosts a purchase of this tier places nothing on, in a fixed order.
+// avoiding is the hosts held against this tier, in a fixed order.
 func (q *admissionQueue) avoiding(tier string) []string {
 	return slices.Sorted(maps.Keys(q.heldAgainst(tier)))
 }
 
-// avoidedBy is what a purchase of this tier and each tier it leaves room for place
-// nothing on, read once under one plan: a purchase and the room it must leave its
+// avoidedBy is what is held against a purchase of this tier and each tier it leaves room
+// for, read once under one plan: a purchase and the room it must leave its
 // waiters are measured against the same holds.
-func (q *admissionQueue) avoidedBy(tier string, protect []string) map[string][]string {
+func (q *admissionQueue) avoidedBy(tier string, protect []string) map[string]map[string]string {
 	if !q.holds() {
 		return nil
 	}
@@ -436,10 +439,10 @@ func (q *admissionQueue) avoidedBy(tier string, protect []string) map[string][]s
 	q.planHolds()
 
 	now := q.now()
-	out := make(map[string][]string, len(protect)+1)
+	out := make(map[string]map[string]string, len(protect)+1)
 
 	for _, label := range append([]string{tier}, protect...) {
-		out[label] = slices.Sorted(maps.Keys(q.heldAgainstLocked(label, now)))
+		out[label] = q.heldAgainstLocked(label, now)
 	}
 
 	return out

@@ -394,7 +394,7 @@ func (l *Listener) askForAHold(ctx context.Context, admission alloc.TierAdmissio
 		return
 	}
 
-	candidates, behindAsLarge, err := l.alloc.HoldCandidates(ctx, l.tier, l.order.avoiding(l.tier), l.order.ownHold(l.tier))
+	candidates, behindAsLarge, err := l.alloc.HoldCandidates(ctx, l.tier, l.order.heldAgainst(l.tier), l.order.ownHold(l.tier))
 	if err != nil {
 		l.log.Warn("could not read which host to hold for this waiting tier", "tier", l.tier, "error", err)
 	}

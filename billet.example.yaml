@@ -248,7 +248,8 @@ server:
   # several hosts every smaller shape waited far less than under `fair` and the
   # widest far less than under `fill`, though more than under `fair`
   # (docs/reference/records/replay-policies.md). On a deployment with one host a
-  # hold is the whole host, so there it does little that `fair` does not.
+  # waiter closes all of it until its shape fits, so there it does little that
+  # `fair` does not. Under GHES's offers no tier is recorded waiting, so no hold forms.
   #
   # admission_order: fair
 

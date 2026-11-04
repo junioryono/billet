@@ -1199,6 +1199,37 @@ func TestAPoolPassLeavesAYoungerWaitersHost(t *testing.T) {
 	}
 }
 
+// A HOST WIDER THAN ITS OWNER SELLS WHAT THE OWNER DOES NOT NEED, through a listener, so the room
+// does not wait for the owner's listener to wake, and the owner still gets its turn.
+func TestAHeldHostSellsTheRoomAboveItsOwnerThroughAListener(t *testing.T) {
+	t.Parallel()
+
+	h := newHeldSceneOn(t, openState(t), []alloc.NodeRegistration{host("host-a", 16)}, tierOf("b-wide", 8), tierOf("c-small", 2))
+
+	h.want(t, "a-fill", 4)
+	h.want(t, "b-wide", 1)
+
+	if got := h.s.order.ownHold("b-wide"); got != "host-a" {
+		t.Fatalf("the wide tier holds %q", got)
+	}
+
+	h.freeFill(t, "host-a")
+	h.freeFill(t, "host-a")
+	h.freeFill(t, "host-a")
+
+	h.want(t, "c-small", 5)
+
+	if got := startedTiers(h.log)["c-small"]; got != 2 {
+		t.Errorf("with 12 vCPU free and 8 kept the narrower tier started %d; want 2", got)
+	}
+
+	h.want(t, "b-wide", 1)
+
+	if got := startedTiers(h.log)["b-wide"]; got != 1 {
+		t.Errorf("the wide tier started %d on the room kept for it", got)
+	}
+}
+
 // ROOM HELD FOR ANOTHER IS NOT ROOM A WAITER HAS: the second wide tier keeps its own host
 // when the first's empties, or it would read itself as fitting and give it up.
 func TestRoomHeldForAnotherIsNotRoomAWaiterHas(t *testing.T) {

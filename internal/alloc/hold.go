@@ -63,7 +63,7 @@ type heldLease struct {
 // end is no candidate, a remote backend buys its shapes against a budget a hold does not
 // keep, and a macOS slot is a licence rather than room, which a lease of another size
 // frees all the same. A floor elsewhere is charged as a purchase's is.
-func (a *Allocator) HoldCandidates(ctx context.Context, tier string, avoid []string,
+func (a *Allocator) HoldCandidates(ctx context.Context, tier string, avoid map[string]string,
 	own string,
 ) ([]HoldCandidate, bool, error) {
 	t, ok := a.tiers[tier]
@@ -92,11 +92,15 @@ func (a *Allocator) HoldCandidates(ctx context.Context, tier string, avoid []str
 			return err
 		}
 
+		// READ OFF WHAT THE HOSTS HELD AGAINST IT LEAVE, as its purchase would be.
+		open := place.clone()
+		open.keepFor(avoid, a.tiers)
+
 		fitsNow, fitsOwn := false, false
 
 		for _, n := range place.order {
 			switch {
-			case place.roomFor(n.name, t) < 1 || slices.Contains(avoid, n.name):
+			case open.roomFor(n.name, t) < 1:
 			case n.name == own:
 				fitsOwn = true
 			default:
@@ -129,7 +133,8 @@ func (a *Allocator) HoldCandidates(ctx context.Context, tier string, avoid []str
 
 			usable++
 
-			if runsAsLarge(cost, byNode[n.name]) {
+			// ROOM ON ITS OWN HOST KEEPS IT, a lease as large beside that room or not.
+			if (!fitsOwn || n.name != own) && runsAsLarge(cost, byNode[n.name]) {
 				asLarge++
 
 				continue

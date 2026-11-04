@@ -275,6 +275,23 @@ func (p *placer) avoid(hosts []string) {
 	}
 }
 
+// keepFor leaves a held host's room to its owner: all of it until the owner's shape fits,
+// because room short of it reads as none, and that much once it does, so the rest is for
+// sale. An owner the catalogue does not know keeps the whole host.
+func (p *placer) keepFor(holds map[string]string, tiers map[string]config.Tier) {
+	for host, owner := range holds {
+		shape, known := tiers[owner]
+		if !known {
+			p.avoid([]string{host})
+
+			continue
+		}
+
+		p.freeVCPU[host] -= shape.VCPU
+		p.freeMemory[host] -= shape.Memory
+	}
+}
+
 // roomFor is how many more of a tier a host can still take.
 func (p *placer) roomFor(node string, t config.Tier) int {
 	cost, ok := p.cost[node]

@@ -38,7 +38,8 @@ const (
 	// shape wait without bound, the held host empties. A wrong prediction picks a
 	// worse host, and a job that runs far past its kind puts the waiter back in the
 	// line as under fair, so neither is a wrong outcome. Chosen rather than the
-	// default, because a deployment with one host holds all of it.
+	// default, because on a deployment with one host a waiter closes all of it until
+	// its shape fits.
 	AdmissionHold AdmissionOrder = "hold"
 )
 

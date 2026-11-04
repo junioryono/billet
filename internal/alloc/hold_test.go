@@ -277,9 +277,11 @@ func TestBehindALeaseAsLargeIsReportedOnlyWhenItIsTheWholeReason(t *testing.T) {
 		t.Errorf("a waiter that fits now and holds a host reads as behind a lease as large: %v, %v", behind, err)
 	}
 
-	// ON ITS OWN HOST TOO: b has room for it beside a lease as large, and b is what it holds.
-	if _, behind, err := a.HoldCandidates(t.Context(), "anywhere", []string{"nobody"}, "b"); err != nil || behind {
-		t.Errorf("a waiter with room on its own host reads as behind a lease as large: %v, %v", behind, err)
+	// ON ITS OWN HOST TOO: b has room for it beside a lease as large, and b is what it holds,
+	// so it keeps it.
+	own, behind, err := a.HoldCandidates(t.Context(), "anywhere", nil, "b")
+	if err != nil || behind || !slices.Equal(candidateNames(own), []string{"b"}) {
+		t.Errorf("a waiter with room on its own host reads %v, %v, %v; want that host kept", own, behind, err)
 	}
 
 	last := startRunning(t, a, "eight-b")
@@ -405,14 +407,20 @@ func TestAShapeThatFitsNowHasNoCandidates(t *testing.T) {
 	startRunning(t, a, "small-a")
 
 	// b has room, and b is held for another tier: a is what is left, b is ready now.
-	got, _, err = a.HoldCandidates(t.Context(), "wide", []string{"b"}, "")
+	got, _, err = a.HoldCandidates(t.Context(), "wide", map[string]string{"b": "someone"}, "")
 	if err != nil || !slices.Equal(candidateNames(got), []string{"b", "a"}) || !got[0].ReadyAt.Equal(now) {
 		t.Errorf("the candidates are %v, %v; want b, ready now, then a", got, err)
 	}
 
-	got, _, err = a.HoldCandidates(t.Context(), "wide", []string{"a"}, "")
+	got, _, err = a.HoldCandidates(t.Context(), "wide", map[string]string{"a": "someone"}, "")
 	if err != nil || len(got) != 0 {
 		t.Errorf("room on a host not avoided gave %v, %v; want no candidates", got, err)
+	}
+
+	// ROOM ABOVE WHAT AN OWNER NEEDS IS ROOM IT HAS: b is held for a tier of 8, and has 16.
+	got, _, err = a.HoldCandidates(t.Context(), "small-b", map[string]string{"b": "eight-b"}, "")
+	if err != nil || len(got) != 0 {
+		t.Errorf("room above the owner's shape gave %v, %v; want it read as fitting now", got, err)
 	}
 
 	// ROOM ELSEWHERE DOES NOT GIVE UP THE HOST IT HOLDS: a pass the order refuses must not
@@ -472,7 +480,7 @@ func TestARemoteHostOrAMacIsNotHeld(t *testing.T) {
 		startRunning(t, a, "small-b")
 	}
 
-	got, _, err := a.HoldCandidates(t.Context(), "spanning", []string{"cloud"}, "")
+	got, _, err := a.HoldCandidates(t.Context(), "spanning", map[string]string{"cloud": "someone"}, "")
 	if err != nil {
 		t.Fatalf("HoldCandidates: %v", err)
 	}
@@ -482,7 +490,7 @@ func TestARemoteHostOrAMacIsNotHeld(t *testing.T) {
 	startRunning(t, a, "eight-a")
 	startRunning(t, a, "eight-b")
 
-	if _, behind, err := a.HoldCandidates(t.Context(), "spanning-eight", []string{"cloud"}, ""); err != nil || behind {
+	if _, behind, err := a.HoldCandidates(t.Context(), "spanning-eight", map[string]string{"cloud": "someone"}, ""); err != nil || behind {
 		t.Errorf("a tier that can use a remote backend reads as behind a lease as large: %v, %v", behind, err)
 	}
 
@@ -548,7 +556,7 @@ func TestAPurchaseAvoidsAHeldHostUnlessItsFloorIsUnmet(t *testing.T) {
 
 	a := holdFleet(t, &now, anywhere, reserved)
 
-	leases, err := a.EscrowFor(t.Context(), "anywhere", 8, Purchase{Avoid: map[string][]string{"anywhere": {"a"}}})
+	leases, err := a.EscrowFor(t.Context(), "anywhere", 8, Purchase{Avoid: map[string]map[string]string{"anywhere": {"a": "someone"}}})
 	if err != nil {
 		t.Fatalf("EscrowFor: %v", err)
 	}
@@ -564,12 +572,12 @@ func TestAPurchaseAvoidsAHeldHostUnlessItsFloorIsUnmet(t *testing.T) {
 	}
 
 	// Pinned to the avoided host, there is nowhere else.
-	pinned, err := a.EscrowFor(t.Context(), "small-a", 1, Purchase{Avoid: map[string][]string{"small-a": {"a"}}})
+	pinned, err := a.EscrowFor(t.Context(), "small-a", 1, Purchase{Avoid: map[string]map[string]string{"small-a": {"a": "someone"}}})
 	if err != nil || len(pinned) != 0 {
 		t.Errorf("a purchase with only the avoided host gave %v, %v; want nothing", pinned, err)
 	}
 
-	floor, err := a.EscrowFor(t.Context(), "reserved", 1, Purchase{Avoid: map[string][]string{"reserved": {"a"}}})
+	floor, err := a.EscrowFor(t.Context(), "reserved", 1, Purchase{Avoid: map[string]map[string]string{"reserved": {"a": "someone"}}})
 	if err != nil || len(floor) != 1 || floor[0].TargetNode != "a" {
 		t.Fatalf("a tier below its floor, with room only on the avoided host, bought %v, %v", floor, err)
 	}
@@ -581,19 +589,19 @@ func TestAPurchaseAvoidsAHeldHostUnlessItsFloorIsUnmet(t *testing.T) {
 
 	bulkFleet := holdFleet(t, &now, bulk)
 
-	got, err := bulkFleet.EscrowFor(t.Context(), "bulk", 3, Purchase{Avoid: map[string][]string{"bulk": {"b"}}})
+	got, err := bulkFleet.EscrowFor(t.Context(), "bulk", 3, Purchase{Avoid: map[string]map[string]string{"bulk": {"b": "someone"}}})
 	if err != nil || len(got) != 1 {
 		t.Errorf("a tier one short of its floor, asking for three on the held host, bought %v, %v", got, err)
 	}
 
 	// A TIER THE HOLD DOES NOT BIND PLACES THERE, its owner above all.
-	own, err := a.EscrowFor(t.Context(), "small-a", 1, Purchase{Avoid: map[string][]string{"someone-else": {"a"}}})
+	own, err := a.EscrowFor(t.Context(), "small-a", 1, Purchase{Avoid: map[string]map[string]string{"someone-else": {"a": "someone"}}})
 	if err != nil || len(own) != 1 {
 		t.Errorf("a tier no hold binds bought %v, %v", own, err)
 	}
 
 	// At its floor it avoids it like anyone else, even with the room there.
-	again, err := a.EscrowFor(t.Context(), "reserved", 1, Purchase{Avoid: map[string][]string{"reserved": {"a"}}})
+	again, err := a.EscrowFor(t.Context(), "reserved", 1, Purchase{Avoid: map[string]map[string]string{"reserved": {"a": "someone"}}})
 	if err != nil || len(again) != 0 {
 		t.Errorf("a tier at its floor bought %v, %v on the avoided host", again, err)
 	}
@@ -617,7 +625,7 @@ func TestConcurrentPurchasesAvoidingAHostNeverOvercommit(t *testing.T) {
 
 	for range 12 {
 		wg.Go(func() {
-			got, err := a.EscrowFor(t.Context(), "anywhere", 1, Purchase{Avoid: map[string][]string{"anywhere": {"a"}}})
+			got, err := a.EscrowFor(t.Context(), "anywhere", 1, Purchase{Avoid: map[string]map[string]string{"anywhere": {"a": "someone"}}})
 			if err != nil {
 				t.Errorf("EscrowFor: %v", err)
 			}
@@ -722,7 +730,7 @@ func TestATierBelowItsFloorGoesElsewhereWhenItCan(t *testing.T) {
 	// Pack prefers the fuller host; hold that one.
 	startRunning(t, a, "small-a")
 
-	got, err := a.EscrowFor(t.Context(), "reserved", 1, Purchase{Avoid: map[string][]string{"reserved": {"a"}}})
+	got, err := a.EscrowFor(t.Context(), "reserved", 1, Purchase{Avoid: map[string]map[string]string{"reserved": {"a": "someone"}}})
 	if err != nil || len(got) != 1 || got[0].TargetNode != "b" {
 		t.Fatalf("a tier below its floor with room elsewhere bought %v, %v; want it on b", got, err)
 	}
@@ -742,7 +750,7 @@ func TestAPurchaseOutOfTurnLeavesAWaiterRoomOffTheHeldHosts(t *testing.T) {
 	startRunning(t, a, "eight-b")
 	startRunning(t, a, "eight-a")
 
-	purchase := Purchase{Protect: []string{"anywhere"}, Avoid: map[string][]string{"anywhere": {"a"}, "eight-b": {"a"}}}
+	purchase := Purchase{Protect: []string{"anywhere"}, Avoid: map[string]map[string]string{"anywhere": {"a": "someone"}, "eight-b": {"a": "someone"}}}
 
 	got, err := a.EscrowFor(t.Context(), "eight-b", 1, purchase)
 	if err != nil || len(got) != 0 {
@@ -750,7 +758,7 @@ func TestAPurchaseOutOfTurnLeavesAWaiterRoomOffTheHeldHosts(t *testing.T) {
 	}
 
 	// A hold that does not bind the waiter leaves it that room.
-	purchase.Avoid = map[string][]string{"eight-b": {"a"}}
+	purchase.Avoid = map[string]map[string]string{"eight-b": {"a": "someone"}}
 
 	got, err = a.EscrowFor(t.Context(), "eight-b", 1, purchase)
 	if err != nil || len(got) != 1 {
@@ -769,7 +777,7 @@ func TestTheGuardSeesAWaitersFloorOnAHeldHost(t *testing.T) {
 	a := holdFleet(t, &now, floor)
 
 	got, err := a.EscrowFor(t.Context(), "small-b", 1, Purchase{Protect: []string{"floor"},
-		Avoid: map[string][]string{"floor": {"a"}}})
+		Avoid: map[string]map[string]string{"floor": {"a": "someone"}}})
 	if err != nil || len(got) != 1 {
 		t.Errorf("a buyer elsewhere gave %v, %v, with the waiter's floor on the held host", got, err)
 	}
@@ -786,5 +794,89 @@ func TestAnAdmissionSaysItsShape(t *testing.T) {
 	got, err := a.AdmissionFor(t.Context(), "wide")
 	if err != nil || got.VCPU != wide.VCPU || got.Memory != wide.Memory {
 		t.Errorf("the admission says %d vCPU and %d bytes, %v; want %d and %d", got.VCPU, got.Memory, err, wide.VCPU, wide.Memory)
+	}
+}
+
+// A HOLD KEEPS THE ROOM ITS OWNER NEEDS, NOT THE HOST: all of it until the owner fits, and past
+// that only that much, or a wide host idles for an owner of a far narrower shape. Spent as a
+// bulk purchase spends it, and the guard reads it the same way.
+func TestAHeldHostSellsTheRoomAboveWhatItsOwnerNeeds(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	eight := func() Purchase {
+		return Purchase{Avoid: map[string]map[string]string{"small-a": {"a": "eight-a"}}}
+	}
+
+	a := holdFleet(t, &now)
+
+	// a has 16, the owner needs 8, and small-a is 4.
+	got, err := a.EscrowFor(t.Context(), "small-a", 4, eight())
+	if err != nil || len(got) != 2 {
+		t.Errorf("with room for its owner and two more it bought %d, %v; want 2", len(got), err)
+	}
+
+	// Now a has 8, exactly what the owner needs.
+	got, err = a.EscrowFor(t.Context(), "small-a", 1, eight())
+	if err != nil || len(got) != 0 {
+		t.Errorf("with room only for its owner it bought %d, %v", len(got), err)
+	}
+
+	// SHORT OF THE OWNER'S SHAPE THE HOST IS CLOSED: 4 more gone, and 4 left is not for sale.
+	if _, err := a.Reserve(t.Context(), "small-a"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	got, err = a.EscrowFor(t.Context(), "small-a", 1, eight())
+	if err != nil || len(got) != 0 {
+		t.Errorf("with the owner short of room it bought %d, %v", len(got), err)
+	}
+
+	// VCPU ALONE BINDS AS WELL: shapes of little memory, with room for all of it.
+	coreOwner, coreBuyer := tier("core-owner", 8, config.GiB), tier("core-buyer", 4, config.GiB)
+	coreOwner.Provider, coreBuyer.Provider = config.ProviderDocker, config.ProviderDocker
+	coreBuyer.Node = "a"
+
+	cores := holdFleet(t, &now, coreOwner, coreBuyer)
+
+	got, err = cores.EscrowFor(t.Context(), "core-buyer", 4,
+		Purchase{Avoid: map[string]map[string]string{"core-buyer": {"a": "core-owner"}}})
+	if err != nil || len(got) != 2 {
+		t.Errorf("with 16 vCPU and an owner of 8, a tier of 4 bought %d, %v; want 2", len(got), err)
+	}
+
+	// A HOST SHORT OF ITS OWNER COUNTS FOR NOTHING AND TAKES NOTHING FROM THE REST: the waiter's
+	// one lease on b is room it has, whatever a is short of.
+	waiter := tier("waiter", 4, 16*config.GiB)
+	waiter.Provider = config.ProviderDocker
+
+	// A wholly different buyer, bought only to read the guard: it succeeds only if the
+	// waiter still has a lease on b once a counts for nothing.
+	buyer := tier("guard-buyer", 2, 8*config.GiB)
+	buyer.Provider, buyer.Node = config.ProviderDocker, "a"
+
+	guarded := holdFleet(t, &now, waiter, buyer)
+
+	for _, label := range []string{"small-a", "eight-a", "small-b", "eight-b"} {
+		startRunning(t, guarded, label)
+	}
+
+	got, err = guarded.EscrowFor(t.Context(), "guard-buyer", 1, Purchase{Protect: []string{"waiter"},
+		Avoid: map[string]map[string]string{"waiter": {"a": "wide"}}})
+	if err != nil || len(got) != 1 {
+		t.Errorf("with the waiter's lease on b untouched the buyer bought %d, %v", len(got), err)
+	}
+
+	// MEMORY IS ROOM TOO: an owner short of memory closes a host with vCPU to spare.
+	lean := tier("lean", 2, 60*config.GiB)
+	lean.Provider, lean.Node = config.ProviderDocker, "a"
+
+	heavy := tier("heavy", 2, 8*config.GiB)
+	heavy.Provider, heavy.Node = config.ProviderDocker, "a"
+
+	other := holdFleet(t, &now, lean, heavy)
+
+	got, err = other.EscrowFor(t.Context(), "heavy", 1, Purchase{Avoid: map[string]map[string]string{"heavy": {"a": "lean"}}})
+	if err != nil || len(got) != 0 {
+		t.Errorf("with 64 GiB and an owner of 60, a tier of 8 bought %d, %v", len(got), err)
 	}
 }
