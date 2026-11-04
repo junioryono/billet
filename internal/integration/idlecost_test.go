@@ -428,7 +428,7 @@ func TestServeIdleFakeGitHub(t *testing.T) {
 		"github.com", "api.github.com",
 		"pipelines.actions.githubusercontent.com", "broker.actions.githubusercontent.com",
 	})
-	if err := os.WriteFile(os.Getenv("BILLET_MEASURE_IDLE_CA"), caPEM, 0o644); err != nil { //nolint:gosec // a throwaway authority's certificate, read by the measured processes
+	if err := os.WriteFile(os.Getenv("BILLET_MEASURE_IDLE_CA"), caPEM, 0o644); err != nil {
 		t.Fatalf("write the authority: %v", err)
 	}
 
