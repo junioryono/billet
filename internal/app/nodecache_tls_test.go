@@ -180,6 +180,7 @@ func TestTheNodeCacheListenerIsBuiltWithWhatTheEC2GuestNeeds(t *testing.T) {
 		"serveListener = opaqueTLSListener{tls.NewListener(ln, srv.TLSConfig)}",
 		"srv.Serve(serveListener)",
 		"go reapReadCache(evictCtx, service)",
+		"case <-cleanupTicker.C:\n\t\t\t\t\trenewActive()",
 	} {
 		if !strings.Contains(string(source), want) {
 			t.Errorf("startNodeCache no longer has %q", want)

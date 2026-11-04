@@ -292,6 +292,13 @@ func startNodeCache(
 				renewActive()
 			case <-service.ClosedSessions():
 				retryClosed()
+				// A PASS CAN TAKE HOURS ON A STORE OF OBJECTS, and a chain of them chosen over
+				// a tick that was also ready must not outlast what a lease has left.
+				select {
+				case <-cleanupTicker.C:
+					renewActive()
+				default:
+				}
 			}
 		}
 	}()

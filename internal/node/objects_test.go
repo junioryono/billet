@@ -52,6 +52,8 @@ type objectStore struct {
 	holdOnly string
 	// putFailures fails that many PutBlobs before any of them is held.
 	putFailures int
+	// listErr fails every listing.
+	listErr error
 	// putTogether, when set, holds each PutBlob until that many are in flight.
 	putTogether int
 	putArrived  chan struct{}
@@ -185,6 +187,9 @@ func (s *objectStore) ReadArchive(
 func (s *objectStore) ListBlobs(_ context.Context, key string) (map[storecontract.BlobRef]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
 	s.listings++
 	refs := make(map[storecontract.BlobRef]int64)
 	for ref, body := range s.blobs[key] {
@@ -1413,6 +1418,8 @@ func TestAFailedUploadIsTriedAgainDuringThePass(t *testing.T) {
 	t.Parallel()
 	service, storage, _ := objectService(t)
 	service.closedSessionRetry = 5 * time.Millisecond
+	logged := &lockedBuffer{}
+	service.log = slog.New(slog.NewTextHandler(logged, nil))
 	long, short := objectCAS(t, service, "long"), objectCAS(t, service, "short")
 	if code := putObject(t, service, long, "the long upload"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
@@ -1441,6 +1448,11 @@ func TestAFailedUploadIsTriedAgainDuringThePass(t *testing.T) {
 	open()
 	if err := <-pass; err != nil {
 		t.Fatalf("RetryClosed = %v; what failed and then finished has nothing to report", err)
+	}
+	// BUT THE LOG WAS TOLD, because a pass keeps only each session's last word.
+	if said := logged.String(); !strings.Contains(said, "could not yet upload") ||
+		!strings.Contains(said, "s3 went away for a moment") {
+		t.Fatalf("the log says:\n%s", said)
 	}
 }
 
@@ -1498,6 +1510,67 @@ func TestAPassStopsTakingSessionsAtItsBound(t *testing.T) {
 	case <-service.ClosedSessions():
 	default:
 		t.Fatal("the next pass was not told about the session left for it")
+	}
+}
+
+// A CLIENT THAT HANGS UP DURING THE LISTING SAYS NOTHING OF THE STORE, so the next read lists
+// again, where a failure of the store itself is left a minute before it is asked again.
+func TestAListingACancelledClientCutShortIsNotHeldAgainstTheSession(t *testing.T) {
+	t.Parallel()
+	service, storage, _ := objectService(t)
+	objectCAS(t, service, "asker")
+	session := service.sessionOf(provider.InstanceName("asker"))
+	ask := func(ctx context.Context) error {
+		t.Helper()
+		handle, err := service.openCASHandle(t.Context(), session, config.CacheGo, false)
+		if err != nil {
+			t.Fatalf("openCASHandle: %v", err)
+		}
+		defer handle.Close()
+		handle.ctx = ctx
+		_, err = handle.Size(reapi.TableCAS, digestOf("anything"))
+
+		return err
+	}
+	storage.mu.Lock()
+	storage.listErr = context.Canceled
+	storage.mu.Unlock()
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := ask(cancelled); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Size = %v", err)
+	}
+	storage.mu.Lock()
+	storage.listErr = nil
+	storage.mu.Unlock()
+	if err := ask(t.Context()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Size = %v", err)
+	}
+	storage.mu.Lock()
+	listings := storage.listings
+	storage.listErr = errors.New("s3 went away")
+	storage.mu.Unlock()
+	if listings != 1 {
+		t.Fatalf("%d listings; the read after a client hung up did not list again", listings)
+	}
+
+	other := objectCAS(t, service, "other")
+	if other == "" {
+		t.Fatal("no session")
+	}
+	second := service.sessionOf(provider.InstanceName("other"))
+	handle, err := service.openCASHandle(t.Context(), second, config.CacheGo, false)
+	if err != nil {
+		t.Fatalf("openCASHandle: %v", err)
+	}
+	defer handle.Close()
+	if _, err := handle.Size(reapi.TableCAS, digestOf("anything")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Size = %v", err)
+	}
+	handle.hv.index.mu.Lock()
+	defer handle.hv.index.mu.Unlock()
+	if handle.hv.index.retry.IsZero() {
+		t.Fatal("a store that failed was asked again at once")
 	}
 }
 

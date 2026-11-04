@@ -136,7 +136,11 @@ func (s *CacheService) listedSize(
 		}
 		refs, err := s.blobStore().ListBlobs(ctx, hv.Volume.Key)
 		if err != nil {
-			hv.index.retry = s.now().Add(casIndexRetry)
+			// NOT FOR A CLIENT THAT HUNG UP, which says nothing of the store, and would cost
+			// the rest of its session a minute of misses.
+			if ctx.Err() == nil {
+				hv.index.retry = s.now().Add(casIndexRetry)
+			}
 
 			return 0, false, err
 		}
@@ -351,6 +355,11 @@ func (s *CacheService) releaseBlobVolume(
 			case errors.Is(err, errPublishDisabled):
 				abandon("the cache is disabled for this repository")
 			case err != nil:
+				// SAID HERE, because a pass keeps only each session's last word, and an
+				// upload that fails until its window ends has none but the abandonment.
+				s.log.Warn("could not yet upload a cache a completed job wrote; will retry",
+					"instance", session.instance, "kind", hv.Kind, "error", err)
+
 				return false, fmt.Errorf("upload the %s cache: %w", hv.Kind, err)
 			default:
 				journal.Phase = phasePublished
