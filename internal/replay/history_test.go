@@ -538,6 +538,8 @@ func laterShare(t *testing.T, r *Report) float64 {
 // (#686). BILLET_REPLAY_JOBS and BILLET_REPLAY_HOSTS size it for the record, the
 // table then being kept under -replay.out.
 func TestContendedRoomIsDividedByWeight(t *testing.T) {
+	t.Parallel()
+
 	jobs := 80
 	if n := os.Getenv("BILLET_REPLAY_JOBS"); n != "" {
 		if _, err := fmt.Sscan(n, &jobs); err != nil || jobs <= 0 {
@@ -568,68 +570,92 @@ func TestContendedRoomIsDividedByWeight(t *testing.T) {
 	room, slots := float64(weighted.MaxVCPU), weighted.MaxVCPU/2
 	params := ContendedParams{Params: Params{Jobs: jobs}, Fleet: weighted}
 
-	report := Run(t, weighted, ContendedTargets(1, params), opts)
-	if why := report.unspeakable(); why != "" {
-		t.Fatal(why)
-	}
+	// keep writes a replay's table beside the records, when they are kept.
+	keep := func(t *testing.T, part, body string) {
+		t.Helper()
 
-	if share := laterShare(t, report); share < 0.60 || share > 0.73 {
-		t.Errorf("weighted 2:1, the first target held %.3f of the contested vCPU; want about 2/3\n%s", share,
-			report.TargetTable(4))
-	}
+		if *outDir == "" {
+			return
+		}
 
-	control := Run(t, even, ContendedTargets(1, params), opts)
-	if why := control.unspeakable(); why != "" {
-		t.Fatal(why)
-	}
-
-	if share := laterShare(t, control); share < 0.42 || share > 0.58 {
-		t.Errorf("with no weight, the first target held %.3f of the contested vCPU; want about half\n%s", share,
-			control.TargetTable(4))
-	}
-
-	// THE SECOND TARGET'S WEIGHT CLAIMS NOTHING WHILE IT WAITS FOR NOTHING. Its one
-	// rival holds the fleet, measured from the start that filled the room to its
-	// last, before it drained.
-	idleParams := params
-	idleParams.Idle = []string{"billet-second"}
-
-	alone := Run(t, weighted, ContendedTargets(1, idleParams), opts)
-	if why := alone.unspeakable(); why != "" {
-		t.Fatal(why)
-	}
-
-	starts := make([]time.Time, 0, len(alone.Records))
-	for i := range alone.Records {
-		starts = append(starts, alone.Records[i].StartedAt)
-	}
-
-	slices.SortFunc(starts, time.Time.Compare)
-
-	if len(starts) <= slots {
-		t.Fatalf("%d jobs cannot fill the room", len(starts))
-	}
-
-	from, to := starts[slots], starts[len(starts)-1]
-	held := alone.ChargedByTarget(from, to)[config.DefaultTargetName].VCPUSeconds
-
-	if mean := held / to.Sub(from).Seconds(); mean < 0.95*room {
-		t.Errorf("with the other target idle, the first held a mean of %.1f of %.0f vCPU; want all of it", mean, room)
-	}
-
-	if *outDir != "" {
 		if err := os.MkdirAll(*outDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
 
-		body := "## Weighted 2:1\n\n" + report.TargetTable(8) + "\n## No weight\n\n" + control.TargetTable(8) +
-			fmt.Sprintf("\n## The second target idle\n\nThe first held a mean of %.1f of %.0f vCPU.\n",
-				held/to.Sub(from).Seconds(), room)
-		name := fmt.Sprintf("target-weights-%dhosts.md", hosts)
+		name := fmt.Sprintf("target-weights-%dhosts-%s.md", hosts, part)
 		if err := os.WriteFile(filepath.Join(*outDir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
+
+	// THE THREE REPLAYS RUN SIDE BY SIDE, each on a stack of its own: one after another
+	// they took nine minutes of the package's thirty-five under -race in CI.
+	t.Run("weighted", func(t *testing.T) {
+		t.Parallel()
+
+		report := Run(t, weighted, ContendedTargets(1, params), opts)
+		if why := report.unspeakable(); why != "" {
+			t.Fatal(why)
+		}
+
+		if share := laterShare(t, report); share < 0.60 || share > 0.73 {
+			t.Errorf("weighted 2:1, the first target held %.3f of the contested vCPU; want about 2/3\n%s", share,
+				report.TargetTable(4))
+		}
+
+		keep(t, "weighted", "## Weighted 2:1\n\n"+report.TargetTable(8))
+	})
+
+	t.Run("no weight", func(t *testing.T) {
+		t.Parallel()
+
+		control := Run(t, even, ContendedTargets(1, params), opts)
+		if why := control.unspeakable(); why != "" {
+			t.Fatal(why)
+		}
+
+		if share := laterShare(t, control); share < 0.42 || share > 0.58 {
+			t.Errorf("with no weight, the first target held %.3f of the contested vCPU; want about half\n%s", share,
+				control.TargetTable(4))
+		}
+
+		keep(t, "even", "## No weight\n\n"+control.TargetTable(8))
+	})
+
+	// THE SECOND TARGET'S WEIGHT CLAIMS NOTHING WHILE IT WAITS FOR NOTHING. Its one
+	// rival holds the fleet, measured from the start that filled the room to its
+	// last, before it drained.
+	t.Run("the other idle", func(t *testing.T) {
+		t.Parallel()
+
+		idleParams := params
+		idleParams.Idle = []string{"billet-second"}
+
+		alone := Run(t, weighted, ContendedTargets(1, idleParams), opts)
+		if why := alone.unspeakable(); why != "" {
+			t.Fatal(why)
+		}
+
+		starts := make([]time.Time, 0, len(alone.Records))
+		for i := range alone.Records {
+			starts = append(starts, alone.Records[i].StartedAt)
+		}
+
+		slices.SortFunc(starts, time.Time.Compare)
+
+		if len(starts) <= slots {
+			t.Fatalf("%d jobs cannot fill the room", len(starts))
+		}
+
+		from, to := starts[slots], starts[len(starts)-1]
+		mean := alone.ChargedByTarget(from, to)[config.DefaultTargetName].VCPUSeconds / to.Sub(from).Seconds()
+
+		if mean < 0.95*room {
+			t.Errorf("with the other target idle, the first held a mean of %.1f of %.0f vCPU; want all of it", mean, room)
+		}
+
+		keep(t, "idle", fmt.Sprintf("## The second target idle\n\nThe first held a mean of %.1f of %.0f vCPU.\n", mean, room))
+	})
 }
 
 // A FLOOR ABOVE A TARGET'S WEIGHTED SHARE IS STILL KEPT (#530): a tier of weight 1
@@ -637,6 +663,8 @@ func TestContendedRoomIsDividedByWeight(t *testing.T) {
 // target stayed head with its room held by that floor, the floor's tier could buy
 // only ahead of it, and the reserved room sat idle.
 func TestAFloorAboveAWeightedShareIsKept(t *testing.T) {
+	t.Parallel()
+
 	fleet := twoTargets(1, 2)
 	fleet.Tiers[0].Reserved = 8
 
@@ -672,6 +700,8 @@ func TestAFloorAboveAWeightedShareIsKept(t *testing.T) {
 // so the wide tier held its first lease and never fitted a second while the stream
 // ran, with a quarter of the host idle. Kept at the head, it accumulates the room.
 func TestAWideShapeGetsItsTurnUnderWeights(t *testing.T) {
+	t.Parallel()
+
 	fleet := Fleet{
 		Hosts: []Host{{Name: "only", VCPU: 128, Memory: 512 * config.GiB}},
 		Tiers: []TierShape{
