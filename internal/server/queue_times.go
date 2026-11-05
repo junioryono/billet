@@ -250,7 +250,8 @@ func (s *Server) readQueueTimeWork(ctx context.Context, work []queueTimeWork, bu
 		case errors.Is(err, ErrQueueTimesRefused):
 			sweep.paused[w.installation] = now.Add(queueTimeRefused)
 			s.log.Warn("GitHub refused this App installation the job records; the App needs "+
-				"`actions: read`, and a revoked key or a suspended App is refused the same way; "+
+				"`actions: read`, and so does this deployment's stanza if a token broker serves it "+
+				"(`actions_read`), and a revoked key or a suspended App is refused the same way; "+
 				"jobs keep an unknown queue time until it can read them",
 				"target", w.run.target, "installation", w.installation, "after", queueTimeRefused, "error", err)
 			continue

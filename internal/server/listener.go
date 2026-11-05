@@ -167,7 +167,7 @@ const identityWriteLimit = 2 * time.Second
 func historyJob(j dispatch.Job) alloc.HistoryJob {
 	return alloc.HistoryJob{JobID: j.JobID, Owner: j.Owner, Repository: j.Repository,
 		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event, QueuedAt: j.QueuedAt,
-		ScaleSetAssignedAt: j.ScaleSetAssignedAt, RunnerAssignedAt: j.RunnerAssignedAt}
+		ScaleSetAssignedAt: j.ScaleSetAssignedAt, RunnerAssignedAt: j.RunnerAssignedAt, FinishedAt: j.FinishedAt}
 }
 
 // Statistics is GitHub's own view of the scale set.
@@ -241,7 +241,12 @@ type Listener struct {
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
 	beforePoolReconcile func()
-	beforeEscrowRefill  func()
+
+	// timings is where this listener reports its loop's times. lastAnswered is when
+	// its last poll was answered, on the loop's goroutine alone.
+	timings            *ListenerTimings
+	lastAnswered       time.Time
+	beforeEscrowRefill func()
 
 	// Guards the escrow below: renewal and the poll loop touch held and running
 	// concurrently.
@@ -1219,7 +1224,9 @@ func (l *Listener) Run(ctx context.Context) error {
 			l.releaseIdleEscrowAbove(pollCtx, l.messageCapacityTarget(msg))
 		}
 
+		handlingBegan := time.Now()
 		handled := l.handle(pollCtx, msg)
+		l.timings.messageHandled(l.tier, time.Since(handlingBegan))
 
 		// AFTER handle, so an assignment in that message kept its backing — and
 		// only if the advertisement THIS poll sent was already the withdrawn one.

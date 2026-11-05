@@ -121,9 +121,19 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 	// FIFO cannot hang this, regular-file, bounded, mode-checked and actually
 	// parsed — the same rules `billet check` and `billet server` apply, because a
 	// second implementation of them is a second thing to keep right.
-	appKey, err := app.ResolveAppKey(ctx, cfg, targets[0])
-	if err != nil {
-		return err
+	//
+	// A BROKER HOLDS THE KEYS when the config says so, and there are none to capture.
+	keysWithBroker := cfg.Server.TokenBroker != nil
+
+	var appKey []byte
+
+	if !keysWithBroker {
+		held, err := app.ResolveAppKey(ctx, cfg, targets[0])
+		if err != nil {
+			return err
+		}
+
+		appKey = held
 	}
 
 	// AND EVERY FURTHER TARGET'S, all or none: an archive missing one owner's key
@@ -132,14 +142,18 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 	further := make([]deployarchive.TargetKey, 0, len(targets))
 
 	for _, target := range targets[1:] {
+		further = append(further, deployarchive.TargetKey{Name: target.Name, GitHub: archiveIdentity(target)})
+
+		if keysWithBroker {
+			continue
+		}
+
 		pem, err := app.ResolveAppKey(ctx, cfg, target)
 		if err != nil {
 			return fmt.Errorf("target %s: %w", target.Name, err)
 		}
 
-		further = append(further, deployarchive.TargetKey{
-			Name: target.Name, GitHub: archiveIdentity(target), AppKeyPEM: pem,
-		})
+		further[len(further)-1].AppKeyPEM = pem
 	}
 
 	// COPIED FOR REFERENCE AND NEVER INSTALLED BY A RESTORE. It records what the
@@ -213,6 +227,7 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 		GitHub:         archiveIdentity(targets[0]),
 		Targets:        further,
 		AppKeyPEM:      appKey,
+		KeysWithBroker: keysWithBroker,
 		ConfigBody:     configBody,
 		Snapshot:       src.snapshot,
 		Dump:           src.dump,

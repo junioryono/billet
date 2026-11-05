@@ -15,14 +15,18 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `identity_dir` | with `state` | the deployment identity, the node-wire CA and its rotation state, the process lock and the maintenance fence |
 | `state.backend` | with `identity_dir` | `sqlite` or `postgres` |
 | `state.postgres.dsn_env` | for `postgres` | the name of the environment variable holding the DSN, never the DSN |
+| `state.postgres.max_connections` | no | the most connections one process of this deployment holds: the writer, the controller claim's session, and readers, which get what those two leave, up to 4. At least 3; absent, 6. A transaction-mode pooler cannot carry them ([Many deployments on one host](../deploying/many-deployments.md)) |
 | `controllers` | no | `single` (default) or `active-passive`; refused on SQLite |
+| `token_broker.url` | with a broker | where this deployment takes its installation tokens from, https only, naming only a scheme and a host. With it, no target names a `private_key_path` and this host holds no App key ([ADR-025](decisions/adr-025-installation-tokens-from-a-broker.md)) |
+| `token_broker.client_key_path` | with a broker | the key this host proves its deployment with, absolute and outside `identity_dir`; `billet broker client-key` creates it |
+| `token_broker.ca_file` | no | the PEM bundle the broker's certificate is verified against; absent, the system's roots |
 | `identity.backend` | no | `file` (default) or `aws-ssm` |
 | `identity.aws_ssm` | for `aws-ssm` | `region`, `prefix` (isolates one deployment in an account), `kms_key_id` |
 | `max_vcpu`, `max_memory` | yes, positive | the deployment ceiling across every tier |
 | `placement` | no | `pack` (default) or `spread` |
 | `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
-| `logs.retention`, `logs.max_bytes` | no | how long this control plane's index of what jobs wrote keeps a day (default `336h`, at least `1h`) and how much of it stays on disk (a byte size, default `32GiB`, at least `64MiB`), the oldest days removed whole; a file of its own a day under `identity_dir`, not in the ledger, and absent unless a tier sets `logs.keep` ([ADR-024](decisions/adr-024-job-logs.md)) |
+| `logs.retention`, `logs.max_bytes` | no | how long this control plane's index of what jobs wrote keeps a day (default `336h`, at least `1h`) and how much of it stays on disk (a byte size, default `32GiB`, at least `64MiB`), the oldest days removed whole; a file of its own a day under `identity_dir`, not in the ledger, and absent unless a tier sets `logs.keep` ([ADR-026](decisions/adr-026-job-logs.md)) |
 | `test_results_retention` | no | how long the ledger keeps a job's test suites and cases, which `billet tests stats` ranks and `billet jobs show` prints (default `336h`, at least `1h`); they are kept apart from the guest report and past it |
 | `test_results_max_bytes` | no | how much of them the ledger keeps in all, the oldest deleted first (a byte size, default `128MiB`, at least `1MiB`); the control plane reads the whole ledger at every start, and this bounds what they add to that |
 | `job_detail_retention` | no | how long the ledger keeps a finished job's per-sample series, destinations and guest report (default `72h`, at least `1h`); past it they are deleted and `billet jobs show` says the job's detail was retired. The usage summary is kept |
@@ -149,12 +153,13 @@ The per-sample series a node reports with each job records the wall time of its 
 | `arch` | `x64` or `arm64` ([ADR-022](decisions/adr-022-every-linux-image-from-githubs-template.md)), or absent to place on a node of any architecture, as a tier always did. Named on every tier or on none, so the first one is a migration of the whole catalogue, and a macOS tier is `arm64`. A tier naming one is placed only on nodes that report it at registration (a node from before the wire that carries it reports none), and an EC2 node buys it only a shape declared with it. A billet from before it refuses a file that carries it, so `billet check` refuses it while any registered host predates it; upgrade every host and controller first |
 | `node`, `site` | pins; a single-backend macOS tier pins a node |
 | `vcpu`, `memory` | the request; or `sizes` with `memory_per_vcpu` to expand a template into several tiers |
+| `minute_weight` | what one minute of this tier counts as in [`billet usage export`](usage-export.md), in minutes of a 2 vCPU Linux runner; a decimal above 0 and at most 1000, with at most three places, refused beside `sizes`. Absent, the vCPU charged over two. It reports and decides nothing |
 | `disk` | usable root capacity on Firecracker and EC2; ignored by Docker |
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
 | `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference; never one beginning with `-`, which a backend's command line would read as an option |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
-| `logs.keep` | keep this tier's jobs' step logs on the node that ran them and index them for `billet logs search` (default false). Linux Firecracker only, with no other backend: that guest runs the agent that reads them, and a tier that asks elsewhere is refused. A log is as sensitive as its workflow makes it, so this is off unless a tier says ([ADR-024](decisions/adr-024-job-logs.md)) |
-| `debug.attach` | let an operator open a terminal in this tier's jobs' VMs with `billet jobs attach` (default false). Trusted tiers only, since an untrusted tier's jobs are outside work on a machine they control, and Linux Firecracker only, with no other backend. See [ADR-025](decisions/adr-025-job-attach.md) |
+| `logs.keep` | keep this tier's jobs' step logs on the node that ran them and index them for `billet logs search` (default false). Linux Firecracker only, with no other backend: that guest runs the agent that reads them, and a tier that asks elsewhere is refused. A log is as sensitive as its workflow makes it, so this is off unless a tier says ([ADR-026](decisions/adr-026-job-logs.md)) |
+| `debug.attach` | let an operator open a terminal in this tier's jobs' VMs with `billet jobs attach` (default false). Trusted tiers only, since an untrusted tier's jobs are outside work on a machine they control, and Linux Firecracker only, with no other backend. See [ADR-027](decisions/adr-027-job-attach.md) |
 | `debug.hold_on_failure` | keep a failed job's VM this long, or until a session's shell has exited and the last session has closed, its capacity charged: a Go duration above zero and at most `1h`, needing `debug.attach`. Absent, a failed job's VM is destroyed as any other's. A job that passed or was cancelled is never held, and the bound is fixed when the hold opens |
 | `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
@@ -212,3 +217,32 @@ The five components' licenses forbid billet redistributing them, so billet's pub
 - The mirror of those — a store with no `node.cache` to serve it — is a `billet check` verdict rather than a load refusal, because `billet decommission` and `billet init iam` both read a store block on a config that has lost its listener. `node.ebs_s3` without a listener FAILS the check; `node.ceph` without one is reported, since `image_pool` still boots every guest and `cache_pool` is a required field.
 - `billet init` writes a whole file and refuses to replace one it cannot prove is its own output (it writes `<path>.new` instead; `--force` overrides); `billet github-app create --config` edits five scalars under `github:` (or, with `--target NAME`, under the named `targets:` entry, created when absent) in place and preserves everything else.
 - `--config` is never defaulted to the working directory; `billet check -h` prints the per-user default, and the packaged services use `/etc/billet/billet.yaml` (Linux) or `/usr/local/etc/billet/billet.yaml` (macOS).
+
+## The token broker's file
+
+`billet broker serve --config` reads a file of its own, never a `billet.yaml`: the process holding the App keys holds nothing else. A key this schema does not know stops the load.
+
+```yaml
+listen: :8443
+cert_file: /etc/billet-broker/broker.crt
+key_file: /etc/billet-broker/broker.key
+apps:
+  - app_id: 12345
+    private_key_path: /etc/billet-broker/app-12345.pem
+deployments:
+  - id: 0123456789abcdef0123456789abcdef
+    clients: ["SHA256:..."]
+    installations:
+      - {app_id: 12345, installation_id: 67890, target: acme}
+```
+
+| Key | Required | Meaning |
+|---|---|---|
+| `listen`, `cert_file`, `key_file` | yes | where control planes dial, and the certificate they verify |
+| `apps[].app_id`, `apps[].private_key_path` | yes | an App this broker holds; the key is read under the rules `private_key_path` has in a `billet.yaml`, and the path is absolute |
+| `apps[].api_url` | no | the REST base, for GitHub Enterprise Server; absent, the real GitHub |
+| `deployments[].id` | yes | the deployment's identity, as `billet broker client-key` printed it |
+| `deployments[].clients` | yes | the fingerprints of the keys that prove this deployment, one per host. A key proves one deployment |
+| `deployments[].installations[]` | no | the only tokens this deployment may ask for: `app_id`, `installation_id`, `target` (`owner`, or `owner/name` for one repository), and `actions_read`, which lets its tokens read GitHub's job records: without it every job keeps an unknown queue time, and a tier publishing caches from a default branch is refused. `billet broker client-key` prints it set |
+
+An owner registered as a whole organization belongs to one deployment, under any App, because its token reaches every repository; two deployments may share an owner by repository, whose tokens are scoped to the repository, and a repository belongs to one deployment.

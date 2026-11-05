@@ -44,8 +44,11 @@ type BackupRequest struct {
 	// GitHub is the DEFAULT target's App identity from the config.
 	GitHub GitHubIdentity
 	// AppKeyPEM is the default target's App private key, already validated by
-	// the caller.
+	// the caller. Empty, and every target's with it, when KeysWithBroker says so.
 	AppKeyPEM []byte
+	// KeysWithBroker says a token broker holds this deployment's App keys, so there
+	// are none to capture.
+	KeysWithBroker bool
 	// Targets are the further targets the deployment serves, each with its key.
 	//
 	// ALL OR NONE, like every other piece: a backup that captured one target's
@@ -248,7 +251,10 @@ func (req BackupRequest) validate() error {
 		return errors.New(
 			"deployarchive: this state directory has no deployment identity, so there is no " +
 				"deployment here to back up. A control plane mints one the first time it starts")
-	case len(req.AppKeyPEM) == 0:
+	case req.KeysWithBroker && len(req.AppKeyPEM) > 0:
+		return errors.New("deployarchive: a deployment whose keys a broker holds has no App key to capture, " +
+			"and one was supplied")
+	case !req.KeysWithBroker && len(req.AppKeyPEM) == 0:
 		return errors.New(
 			"deployarchive: the GitHub App private key is part of the deployment unit and none " +
 				"was supplied; GitHub issues it exactly once and will not reissue it")
@@ -287,7 +293,10 @@ func (req BackupRequest) validate() error {
 			return fmt.Errorf("deployarchive: target %q is listed twice", target.Name)
 		case target.GitHub.IsZero():
 			return fmt.Errorf("deployarchive: target %q names no App", target.Name)
-		case len(target.AppKeyPEM) == 0:
+		case req.KeysWithBroker && len(target.AppKeyPEM) > 0:
+			return fmt.Errorf("deployarchive: a deployment whose keys a broker holds has no App key to "+
+				"capture, and one was supplied for target %q", target.Name)
+		case !req.KeysWithBroker && len(target.AppKeyPEM) == 0:
 			return fmt.Errorf("deployarchive: target %q's App private key is part of the "+
 				"deployment unit and none was supplied; GitHub issues it exactly once", target.Name)
 		}
@@ -455,15 +464,18 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 			wirecert.CADir(req.StateDir), named)
 	}
 
-	files := []entry{
-		{name: EntryIdentity, body: []byte(req.DeploymentID + "\n")},
-		{name: EntryAppKey, body: req.AppKeyPEM},
+	files := []entry{{name: EntryIdentity, body: []byte(req.DeploymentID + "\n")}}
+	if !req.KeysWithBroker {
+		files = append(files, entry{name: EntryAppKey, body: req.AppKeyPEM})
 	}
 
 	targets := make([]TargetIdentity, 0, len(req.Targets))
 
 	for _, target := range req.Targets {
-		files = append(files, entry{name: EntryAppKeyFor(target.Name), body: target.AppKeyPEM})
+		if !req.KeysWithBroker {
+			files = append(files, entry{name: EntryAppKeyFor(target.Name), body: target.AppKeyPEM})
+		}
+
 		targets = append(targets, TargetIdentity{Name: target.Name, GitHubIdentity: target.GitHub})
 	}
 
@@ -557,11 +569,12 @@ func writeLocked(ctx context.Context, req BackupRequest) (Manifest, error) {
 	}
 
 	m := Manifest{
-		Schema:        schemaFor(ledger),
-		Kind:          Kind,
-		CreatedAt:     req.Now().UTC().Format(time.RFC3339),
-		BilletVersion: version.Version(),
-		DeploymentID:  req.DeploymentID,
+		Schema:         schemaFor(ledger, req.KeysWithBroker),
+		Kind:           Kind,
+		KeysWithBroker: req.KeysWithBroker,
+		CreatedAt:      req.Now().UTC().Format(time.RFC3339),
+		BilletVersion:  version.Version(),
+		DeploymentID:   req.DeploymentID,
 		Source: Source{
 			Host:       req.Hostname,
 			ConfigPath: req.ConfigPath,
