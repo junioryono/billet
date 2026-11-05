@@ -192,12 +192,17 @@ func (l *Listener) parkCompletion(ctx context.Context, job dispatch.Job) bool {
 		if entry.lease == nil {
 			entry.lease = lease
 		}
+		if entry.parkedAt.IsZero() {
+			entry.parkedAt = time.Now()
+		}
 	} else {
 		if l.cleanup == nil {
 			l.cleanup = make(map[int64]*pendingCleanup)
 		}
 
-		l.cleanup[job.RequestID] = &pendingCleanup{job: job, lease: lease, deregistered: deregistered}
+		l.cleanup[job.RequestID] = &pendingCleanup{
+			job: job, lease: lease, deregistered: deregistered, parkedAt: time.Now(),
+		}
 	}
 
 	l.wakeCleanup()

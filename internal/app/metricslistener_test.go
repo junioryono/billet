@@ -34,9 +34,9 @@ func TestTheControlPlaneServesItsListenersTimes(t *testing.T) {
 	}
 
 	timings := &server.ListenerTimings{}
+	cp := &ControlPlane{allocator: a, db: db, cfg: &config.Config{Tiers: []config.Tier{tier}}, listenerTimings: timings}
 
-	m, err := ServeMetrics(t.Context(), "server", &config.MetricsConfig{Listen: "127.0.0.1:0"},
-		withListenerTimings(ledgerSource(a, db, []config.Tier{tier}), timings))
+	m, err := ServeMetrics(t.Context(), "server", &config.MetricsConfig{Listen: "127.0.0.1:0"}, cp.LedgerMetrics())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,6 +48,7 @@ func TestTheControlPlaneServesItsListenersTimes(t *testing.T) {
 	observed.PollTook(tier.Label, 50*time.Second)
 	observed.PollGapTook(tier.Label, 70*time.Second)
 	observed.MessageHandled(tier.Label, 3*time.Second)
+	observed.TeardownTook(tier.Label, 200*time.Second)
 
 	ctx, cancel := context.WithTimeout(t.Context(), metricsTestWait)
 	defer cancel()
@@ -78,6 +79,8 @@ func TestTheControlPlaneServesItsListenersTimes(t *testing.T) {
 		`billet_listener_poll_gap_seconds_bucket{tier="billet-2vcpu",le="90"}`:          1,
 		`billet_listener_message_handling_seconds_bucket{tier="billet-2vcpu",le="2.5"}`: 0,
 		`billet_listener_message_handling_seconds_bucket{tier="billet-2vcpu",le="5"}`:   1,
+		`billet_listener_teardown_seconds_bucket{tier="billet-2vcpu",le="180"}`:         0,
+		`billet_listener_teardown_seconds_bucket{tier="billet-2vcpu",le="300"}`:         1,
 	} {
 		if v := sampleValue(t, got, sample); v != want {
 			t.Errorf("%s is %v, want %v", sample, v, want)

@@ -11,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // recordedTimings is what a listener told its observer.
@@ -20,6 +21,7 @@ type recordedTimings struct {
 	polls    []time.Duration
 	gaps     []time.Duration
 	messages []time.Duration
+	teardown []time.Duration
 }
 
 func (r *recordedTimings) PollTook(tier string, took time.Duration) {
@@ -42,6 +44,96 @@ func (r *recordedTimings) MessageHandled(_ string, took time.Duration) {
 	defer r.mu.Unlock()
 
 	r.messages = append(r.messages, took)
+}
+
+func (r *recordedTimings) TeardownTook(_ string, took time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.teardown = append(r.teardown, took)
+}
+
+// A TEARDOWN IS REPORTED ONCE, WHEN IT SETTLES, FROM WHEN IT WAS PARKED. A destroy that
+// fails and is retried is still the one guest staying charged, and an obligation nothing
+// parked (a retry of a failed launch, say) says nothing of how long a finished guest stayed.
+func TestATeardownIsReportedOnceItSettles(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB},
+			[]config.Tier{tier("a-work")})
+
+		var (
+			mu       sync.Mutex
+			attempts int
+		)
+
+		runner := &fakeRunner{onDestroy: func(id int64) error {
+			if id != 7 {
+				return nil
+			}
+
+			mu.Lock()
+			attempts++
+			n := attempts
+			mu.Unlock()
+
+			if n == 1 {
+				return errors.New("the node is busy")
+			}
+
+			time.Sleep(30 * time.Second)
+
+			return nil
+		}}
+
+		recorded := &recordedTimings{}
+		timings := &ListenerTimings{}
+		timings.Observe(recorded)
+
+		l := NewListener(a, "a-work", &fakeSession{}, WithRunner(runner), WithBackgroundLaunches(),
+			WithTimings(timings), WithCleanupRetryPacing(time.Minute, time.Hour))
+		l.cleanup = map[int64]*pendingCleanup{
+			7: {job: dispatch.Job{RequestID: 7}, parkedAt: time.Now()},
+			8: {job: dispatch.Job{RequestID: 8}},
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		finished := make(chan struct{})
+
+		go func() {
+			defer close(finished)
+
+			l.cleanupLoop(ctx)
+		}()
+
+		l.wakeCleanup()
+		synctest.Wait()
+
+		recorded.mu.Lock()
+		reported := len(recorded.teardown)
+		recorded.mu.Unlock()
+
+		if reported != 0 {
+			t.Fatalf("%d teardowns reported with the only parked one failed and pending", reported)
+		}
+
+		time.Sleep(10 * time.Minute)
+		synctest.Wait()
+
+		cancel()
+		<-finished
+
+		recorded.mu.Lock()
+		defer recorded.mu.Unlock()
+
+		if len(recorded.teardown) != 1 {
+			t.Fatalf("reported %v, want the one parked completion once", recorded.teardown)
+		}
+		if took := recorded.teardown[0]; took < time.Minute+30*time.Second {
+			t.Fatalf("reported %v, want its retry's backoff and its destroy counted", took)
+		}
+	})
 }
 
 // A LISTENER REPORTS WHAT EACH STEP OF ITS LOOP TOOK, with the time a message took to
@@ -175,6 +267,7 @@ func TestTimingsWithNoObserverTellNothing(t *testing.T) {
 	none.pollTook("a-work", time.Second)
 	none.pollGapTook("a-work", time.Second)
 	none.messageHandled("a-work", time.Second)
+	none.teardownTook("a-work", time.Second)
 
 	timings := &ListenerTimings{}
 	timings.pollTook("a-work", time.Second)

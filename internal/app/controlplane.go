@@ -893,3 +893,6 @@ func nodeRunner(plane, steered dispatch.Runner) dispatch.Runner {
 
 	return plane
 }
+
+// ListenerTimings is where this controller's listeners report how long their loops take.
+func (c *Controller) ListenerTimings() *server.ListenerTimings { return c.cp.listenerTimings }

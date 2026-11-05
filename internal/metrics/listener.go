@@ -14,6 +14,7 @@ type ListenerObserver struct {
 	polls    *prometheus.HistogramVec
 	gaps     *prometheus.HistogramVec
 	messages *prometheus.HistogramVec
+	teardown *prometheus.HistogramVec
 }
 
 // listenerBuckets run from a message handled at once to the 953 seconds one tier took to
@@ -40,9 +41,12 @@ func (r *Registry) ListenerObserver() (*ListenerObserver, error) {
 				"this tier's messages. A rising tail is a tier that has stopped hearing its jobs start and finish."),
 		messages: histogram("billet_listener_message_handling_seconds",
 			"How long the listener took to handle each message GitHub delivered."),
+		teardown: histogram("billet_listener_teardown_seconds",
+			"From a finished job's completion being handed to the cleanup loop to that loop settling it, "+
+				"retries included: how long a finished guest stayed charged after billet heard it finished."),
 	}
 
-	for _, c := range []prometheus.Collector{o.polls, o.gaps, o.messages} {
+	for _, c := range []prometheus.Collector{o.polls, o.gaps, o.messages, o.teardown} {
 		if err := r.reg.Register(c); err != nil {
 			return nil, fmt.Errorf("metrics: register the listener timings: %w", err)
 		}
@@ -64,4 +68,9 @@ func (o *ListenerObserver) PollGapTook(tier string, took time.Duration) {
 // MessageHandled records one delivered message's handling.
 func (o *ListenerObserver) MessageHandled(tier string, took time.Duration) {
 	o.messages.WithLabelValues(tier).Observe(took.Seconds())
+}
+
+// TeardownTook records one completion's teardown.
+func (o *ListenerObserver) TeardownTook(tier string, took time.Duration) {
+	o.teardown.WithLabelValues(tier).Observe(took.Seconds())
 }

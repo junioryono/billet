@@ -20,6 +20,9 @@ type ListenerObserver interface {
 	PollGapTook(tier string, took time.Duration)
 	// MessageHandled is one delivered message, from its handling starting to it ending.
 	MessageHandled(tier string, took time.Duration)
+	// TeardownTook is one completion, from its being handed to the cleanup loop to that
+	// loop settling it, retries included.
+	TeardownTook(tier string, took time.Duration)
 }
 
 // ListenerTimings is where a control plane's listeners report their times, and what the
@@ -70,5 +73,11 @@ func (t *ListenerTimings) pollGapTook(tier string, took time.Duration) {
 func (t *ListenerTimings) messageHandled(tier string, took time.Duration) {
 	if o := t.Current(); o != nil {
 		o.MessageHandled(tier, took)
+	}
+}
+
+func (t *ListenerTimings) teardownTook(tier string, took time.Duration) {
+	if o := t.Current(); o != nil {
+		o.TeardownTook(tier, took)
 	}
 }
