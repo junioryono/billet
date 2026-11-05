@@ -177,7 +177,13 @@ $ systemctl status billet-server
 
 ### What active/passive does not do for you
 
-**It does not move the address.** Every node dials one `server_addr`. A failover is promotion *plus* that address arriving at the new host — a floating IP, a DNS change, a load balancer — and that half is your deployment's to arrange. Nodes reconnect and re-register on their own once it does.
+**No address has to move, if the nodes name every controller.** Give each node both controllers in `node.server_addrs`. Only the controller holding the claim serves the node wire; a standby opens none until it is promoted. So a node registers with whichever controller answers, and when it loses that one it tries the others until one answers. A node noticed its controller was gone about fourteen seconds after a partition that left the connection silent, and about one second after a crash, and every node was registered with the promoted controller within 2.7 seconds of its promotion. The rehearsal measures each part of a failover ([Host rehearsals](../reference/records/host-rehearsals.md)).
+
+**A controller cut off from the database but not from its nodes keeps them until it reaches the database again.** A node moves only when its controller stops answering. A controller that loses PostgreSQL while its nodes still reach it answers their polls from memory, and the standby is promoted with no nodes. Writes that cannot reach the database are retried, not read as a replacement. When the old controller reaches PostgreSQL again, its next write is refused by the epoch fence and it stops; only then do its nodes move. Until then, work aimed at those nodes waits. billet has no watchdog that stops a controller sooner, because one that stopped a healthy controller over a database blip would be its own outage.
+
+A node that names one `server_addr` still needs that address to arrive at the promoted host, through a floating IP, a DNS change or a load balancer, and that part is your deployment's to arrange. Nodes reconnect and re-register on their own once it does.
+
+`billet node migrate-endpoint`, `node receipt` and `node repair-unit` move and prove one endpoint, so they refuse a node that names several controllers, and `release inspect` reports its installed endpoint as unknown. The host role's endpoint migration refuses one the same way.
 
 **It does not decide that a controller is dead — PostgreSQL does.** Promotion happens when the incumbent's *session* ends. Under a crash that is immediate; under a network partition it is whenever your server's keepalive or `idle_session_timeout` policy says so. billet adds no watchdog on purpose: the window between a partition and any observation of it survives every detector, and a watchdog that stops a healthy control plane over a blip is its own outage. If you want a tighter bound, tune the database.
 

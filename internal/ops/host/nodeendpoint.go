@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/cli"
@@ -322,18 +323,92 @@ func readRendering(env cli.Env, source string, strict bool) ([]byte, *config.Con
 
 // nodeEndpointOf is a configuration's node endpoint as the one
 // representation, and whether the configuration has a node section at all.
+// A node that names several controllers has no one endpoint, which is
+// errSeveralControllers.
 func nodeEndpointOf(cfg *config.Config) (endpoint.Endpoint, bool, error) {
 	if cfg == nil || cfg.Node == nil {
 		return endpoint.Endpoint{}, false, nil
 	}
 
-	e, err := endpoint.Parse(cfg.Node.ServerAddr, cfg.Node.TLS != nil)
+	addrs := cfg.Node.ControlPlanes()
+	if len(addrs) > 1 {
+		return endpoint.Endpoint{}, true, fmt.Errorf("%w: %s", errSeveralControllers, strings.Join(addrs, ", "))
+	}
+
+	addr := ""
+	if len(addrs) == 1 {
+		addr = addrs[0]
+	}
+
+	e, err := endpoint.Parse(addr, cfg.Node.TLS != nil)
 	if err != nil {
 		return endpoint.Endpoint{}, true, err
 	}
 
 	return e, true, nil
 }
+
+// controllerSet is the controllers a node names or a process dials, in the order
+// named, each as the one representation.
+type controllerSet []endpoint.Endpoint
+
+// contains says whether e is one of the controllers.
+func (s controllerSet) contains(e endpoint.Endpoint) bool {
+	return slices.ContainsFunc(s, e.Equal)
+}
+
+// parseControllerTexts reads a list of canonical endpoints.
+func parseControllerTexts(texts []string) (controllerSet, error) {
+	set := make(controllerSet, 0, len(texts))
+
+	for _, text := range texts {
+		e, err := endpoint.ParseCanonical(text)
+		if err != nil {
+			return nil, err
+		}
+
+		if set.contains(e) {
+			return nil, fmt.Errorf("%s is named twice", text)
+		}
+
+		set = append(set, e)
+	}
+
+	return set, nil
+}
+
+// checkControllerTexts holds a recorded list to what a writer of one writes: two
+// or more canonical endpoints, each once, holding the one named beside it.
+func checkControllerTexts(texts []string, current string) error {
+	if len(texts) < 2 {
+		return fmt.Errorf("names %d controllers; a list names several", len(texts))
+	}
+
+	set, err := parseControllerTexts(texts)
+	if err != nil {
+		return err
+	}
+
+	e, err := endpoint.ParseCanonical(current)
+	if err != nil {
+		return err
+	}
+
+	if !set.contains(e) {
+		return fmt.Errorf("does not name %s, the controller named beside it", current)
+	}
+
+	return nil
+}
+
+// errSeveralControllers is a node configuration that names every controller of
+// an active-passive pair in node.server_addrs. The endpoint commands move a
+// node from one endpoint to another and prove it by the endpoint its
+// registration record names, so a node that dials whichever controller serves
+// is not one they can move or prove yet.
+var errSeveralControllers = errors.New("the node names several controllers in node.server_addrs, and " +
+	"migrate-endpoint, receipt, repair-unit and the installed endpoint describe a node that dials one " +
+	"(#684 carries a list through them)")
 
 // unitObservation is one `systemctl show` of the node unit, the properties
 // the endpoint commands decide on.
