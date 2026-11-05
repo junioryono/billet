@@ -338,8 +338,8 @@ Remove what the record under `/run/billet-uplink/` says a `billet uplink shape` 
 
 | Command | Meaning |
 |---|---|
-| `billet acceptance up --config <derive-from> --workspace <dir> [--account] [--label-prefix accept] [--region]` | derive the isolated deployment from `--config` (read, never written) into a workspace this run owns entirely; `--account` is the AWS account the credential must be in, and `--region` the one `sts:GetCallerIdentity` is asked in (default the config's) |
-| `billet acceptance run --workspace <dir> [--jobs 1] [--wait 30m] [--no-teardown]` | run real jobs and wait for that many to reach a terminal outcome |
+| `billet acceptance up --config <derive-from> --workspace <dir> [--account] [--label-prefix accept] [--region]` | derive the isolated deployment from `--config` (read, never written) into a workspace this run owns entirely; `--account` is the AWS account the credential must be in, and `--region` the one `sts:GetCallerIdentity` is asked in (default the config's); a `--workspace` too long for the node's unix socket (103 bytes on macOS, 107 on Linux) is refused here, before anything exists |
+| `billet acceptance run --workspace <dir> [--jobs 1] [--wait 30m] [--no-teardown]` | run real jobs and wait for that many to reach a terminal outcome; a workspace left sealed, as `--no-teardown` leaves one, is refused before anything starts, naming `billet resume` |
 | `billet acceptance evidence --workspace <dir> [--out]` | write the run's evidence (default under the workspace) |
 | `billet acceptance down --workspace <dir> [--wait 20m] [--keep-workspace]` | destroy exactly what the run made |
 | `billet acceptance sweep --workspace <dir>` | ask whether anything billable is left, destroying nothing |
