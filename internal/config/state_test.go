@@ -491,6 +491,7 @@ func TestANodeBesideARoutedControlPlaneDialsTheRouter(t *testing.T) {
 		"loopback with no certificate":    {"  server_addr: 127.0.0.1:7717\n", "is not server.tls_router.node_addr"},
 		"loopback with a certificate":     {"  server_addr: 127.0.0.1:7717\n" + tls, "is not server.tls_router.node_addr"},
 		"another name with a certificate": {"  server_addr: b.nodes.example.com:443\n" + tls, "is not server.tls_router.node_addr"},
+		"a list naming another":           {"  server_addrs: [a.nodes.example.com:443, 127.0.0.1:7717]\n" + tls, "is not server.tls_router.node_addr"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := loadServer(t, body(tc.node)); err == nil || !strings.Contains(err.Error(), tc.want) {

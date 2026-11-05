@@ -262,7 +262,7 @@ func (a *Allocator) potentialIn(ctx context.Context, tx querier, label string,
 ) (potential, error) {
 	free := &fleet{
 		vcpu: make(map[string]int), memory: make(map[string]config.ByteSize),
-		macOS: make(map[string]int),
+		macOS: make(map[string]int), rows: nodes,
 	}
 	for _, n := range nodes {
 		free.vcpu[n.name], free.memory[n.name] = n.vcpu, n.memory
@@ -302,10 +302,7 @@ func (a *Allocator) potentialIn(ctx context.Context, tx querier, label string,
 		}
 	}
 
-	p, err := free.forTier(ctx, tx, a, t)
-	if err != nil {
-		return potential{}, err
-	}
+	p := free.forTier(a, t)
 
 	// THE HOSTS THAT COULD EVER HOLD ONE, measured while the placer still carries
 	// no deployment ceiling: a host is this tier's only if an empty fleet could

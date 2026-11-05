@@ -141,28 +141,66 @@ func TestTheReferenceRouterRefusesASourcePastItsLimit(t *testing.T) {
 		return conn
 	}
 
-	// startHAProxy's own probes have gone, but give the table a moment to see them go.
-	time.Sleep(200 * time.Millisecond)
+	// waiting reports whether the router is still holding a connection open, inside its
+	// inspect delay, rather than having closed it.
+	waiting := func(conn net.Conn) bool {
+		t.Helper()
 
-	held := []net.Conn{dial(), dial()}
-
-	refused := dial()
-	if err := refused.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		t.Fatalf("set a deadline: %v", err)
-	}
-
-	if _, err := refused.Read(make([]byte, 1)); !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
-		t.Errorf("the connection past the limit answered %v, want it closed as it connected", err)
-	}
-
-	for i, conn := range held {
 		if err := conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
 			t.Fatalf("set a deadline: %v", err)
 		}
 
 		var timeout net.Error
-		if _, err := conn.Read(make([]byte, 1)); !errors.As(err, &timeout) || !timeout.Timeout() {
-			t.Errorf("connection %d inside the limit answered %v, want it still waiting", i, err)
+		_, err := conn.Read(make([]byte, 1))
+
+		return errors.As(err, &timeout) && timeout.Timeout()
+	}
+
+	// TWO HELD, ONCE THE TABLE HAS LET GO OF startHAProxy's OWN PROBES. Until then a probe
+	// still counts against this source, and the second of these is the one refused, which
+	// says nothing about the limit. Asked again until it holds, never waited for by the clock.
+	var held []net.Conn
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for {
+		held = []net.Conn{dial(), dial()}
+		if waiting(held[0]) && waiting(held[1]) {
+			break
+		}
+
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("two connections from one source were never both held inside a limit of 2")
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// REFUSED AS IT CONNECTS, which a client sees at the dial or at its first read,
+	// whichever the reset reaches first.
+	refused, err := d.DialContext(t.Context(), "tcp", addr)
+	if err == nil {
+		t.Cleanup(func() { _ = refused.Close() })
+
+		if err := refused.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatalf("set a deadline: %v", err)
+		}
+
+		_, err = refused.Read(make([]byte, 1))
+	}
+
+	if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+		t.Errorf("the connection past the limit answered %v, want it closed as it connected", err)
+	}
+
+	// AND THE TWO INSIDE IT ARE STILL HELD: the refusal was of the third alone.
+	for i, conn := range held {
+		if !waiting(conn) {
+			t.Errorf("connection %d inside the limit was closed when the one past it was refused", i)
 		}
 	}
 }

@@ -21,7 +21,6 @@ package e2e
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,6 +52,7 @@ import (
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // A registered host in these tests is deliberately larger than any budget they
@@ -960,9 +960,13 @@ type nodeProcess struct {
 	// guestReports gives the node a guest cache service that takes its guests'
 	// own reports; see stackConfig.guestReports.
 	guestReports bool
-	// tls is the client configuration of a node dialling over mutual TLS, whose addr
-	// then says https itself. Nil is the plain wire of a loopback control plane.
-	tls *tls.Config
+	// identity is the certificate a node dialling over mutual TLS presents, loaded as
+	// `billet node` loads it, whose addr then says https itself. Nil is the plain wire
+	// of a loopback control plane.
+	identity *wirecert.Rotating
+	// controllers, when set, are every control-plane address the node dials
+	// (node.server_addrs), in place of the one startNodeLoop is given.
+	controllers []string
 }
 
 // nodeLoop is one running node process: its runner, the incarnation it minted,
@@ -987,14 +991,21 @@ type nodeLoop struct {
 func startNodeLoop(t *testing.T, log *slog.Logger, addr string, np nodeProcess) *nodeLoop {
 	t.Helper()
 
-	base := "http://" + addr
-	if np.tls != nil {
-		base = addr
+	// A TLS NODE'S ADDRESS SAYS https ITSELF; a plain one is given its scheme here.
+	scheme := "http://"
+	if np.identity != nil {
+		scheme = ""
 	}
 
-	nc, err := app.NewNodeClient(&config.Config{Node: &config.NodeConfig{
-		Name: np.host, ServerAddr: base,
-	}}, np.tls)
+	nodeCfg := &config.NodeConfig{Name: np.host, ServerAddr: scheme + addr}
+	if np.controllers != nil {
+		nodeCfg.ServerAddr = ""
+		for _, a := range np.controllers {
+			nodeCfg.ServerAddrs = append(nodeCfg.ServerAddrs, scheme+a)
+		}
+	}
+
+	nc, err := app.NewNodeClient(&config.Config{Node: nodeCfg}, np.identity)
 	if err != nil {
 		t.Fatalf("app.NewNodeClient: %v", err)
 	}

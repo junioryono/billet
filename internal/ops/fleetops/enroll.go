@@ -459,9 +459,16 @@ func ControlPlaneStores(
 // the node wire refuses a connection with no certificate in the handshake — and
 // a machine that is enrolling has none. The flag exists because the operator is
 // already carrying the fingerprint and the join token out of band, and `billet
-// ca token` prints all three together.
+// ca token` prints all three together. A node that names several controllers
+// enrolls at the first: only the controller serves enrollment, so a node
+// enrolling during a failover passes --bootstrap-addr for the one that does.
 func BootstrapBase(cfg *config.Config, flag string) string {
-	for _, addr := range []string{flag, cfg.Node.BootstrapAddr, cfg.Node.ServerAddr} {
+	first := ""
+	if addrs := cfg.Node.ControlPlanes(); len(addrs) > 0 {
+		first = addrs[0]
+	}
+
+	for _, addr := range []string{flag, cfg.Node.BootstrapAddr, first} {
 		if addr = strings.TrimSpace(addr); addr != "" {
 			return "https://" + addr
 		}

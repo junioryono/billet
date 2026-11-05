@@ -272,6 +272,11 @@ type Provider struct {
 	// Seams for the reason the others are.
 	storeLockWindow time.Duration
 	storeLockRetry  time.Duration
+	// deleteWindow bounds one `tart delete` once it has begun, on its own
+	// rather than the caller's context. It ends, with the kill's wait, inside
+	// storeLockWindow, so a peer that began waiting as the delete began still
+	// gets the lock rather than a refusal. A seam for the reason the others are.
+	deleteWindow time.Duration
 	// resolverWaits is how many one-second checks the guest's resolver script
 	// makes before calling the configuration failed. A seam for the reason
 	// execRetry is one: the failure paths are the interesting ones to test, and
@@ -421,6 +426,7 @@ func New(owner string, opts ...Option) (*Provider, error) {
 
 		storeLockWindow: 2 * time.Minute,
 		storeLockRetry:  25 * time.Millisecond,
+		deleteWindow:    100 * time.Second,
 
 		lsof:         "/usr/sbin/lsof",
 		ps:           "/bin/ps",
@@ -1114,6 +1120,10 @@ exit 1`
 func (p *Provider) configureResolver(ctx context.Context, spec provider.Spec) error {
 	if spec.Trust == provider.TrustTrusted || len(p.cfg.UntrustedDNS) == 0 {
 		return nil
+	}
+
+	if err := p.awaitAgent(ctx, spec.Name); err != nil {
+		return fmt.Errorf("configure the isolated guest's resolver: %w", err)
 	}
 
 	out, err := p.run(ctx, "exec", spec.Name, "/bin/sh", "-c",
@@ -2540,6 +2550,57 @@ func (p *Provider) run(ctx context.Context, args ...string) (string, error) {
 	}
 
 	return stdout.String(), nil
+}
+
+// awaitAgent waits for a guest's agent to answer, the first thing an isolated
+// launch asks of a guest.
+//
+// A VM tart lists as running has not started its agent yet, and a `tart exec`
+// that finds none blocks for 30 seconds and then fails: measured with tart
+// 2.36.0 on macOS 26 (M2 Max, ubuntu-runner-arm64, 2026-10-25), the agent
+// answered 30.7, 40.5 and 30.8 seconds after the VM was listed, so asking once
+// failed every untrusted launch there. The question is a command that prints
+// nothing and changes nothing, so asking again repeats no work: a guest whose
+// shell answered it with tart's words for an absent agent would only hold its
+// own launch until the caller's deadline, which bounds the wait. A probe that
+// fails otherwise is reported by its exit status alone, never by what the
+// guest wrote.
+func (p *Provider) awaitAgent(ctx context.Context, name string) error {
+	retry := time.NewTimer(p.execRetry)
+	defer retry.Stop()
+
+	for {
+		_, err := p.run(ctx, "exec", name, "/bin/sh", "-c", ":")
+		if err == nil {
+			return nil
+		}
+		if !isAgentNotListening(err) || ctx.Err() != nil {
+			// p.run wraps exactly one error, the command's own, which carries
+			// no stderr.
+			cause := errors.Unwrap(err)
+			if cause == nil {
+				cause = errors.New("tart exec failed")
+			}
+
+			return fmt.Errorf("ask the guest agent whether it is listening: %w", cause)
+		}
+
+		retry.Reset(p.execRetry)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("the guest agent never answered: %w", ctx.Err())
+		case <-retry.C:
+		}
+	}
+}
+
+// isAgentNotListening reports whether a `tart exec` failed before reaching the
+// guest because its agent is not answering yet. Pinned to tart's own rendering
+// in its exec command, "Failed to connect to the VM using its control socket",
+// as tart 2.36.0 printed it on 2026-10-25.
+func isAgentNotListening(err error) bool {
+	return strings.Contains(err.Error(), "Failed to connect to the VM using its control socket")
 }
 
 // isMissingVM reports whether a command failed because the VM does not exist.

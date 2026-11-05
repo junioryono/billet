@@ -396,15 +396,35 @@ func enrollThroughRouter(t *testing.T, routerPort string, d *routedDeployment, n
 	d.bundle = wirecert.Bundle{CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: signedBy}
 }
 
+// identityOnDisk writes a bundle where a node keeps it and loads it as `billet node` does,
+// so the client takes its server name from each address it dials.
+func identityOnDisk(t *testing.T, b wirecert.Bundle) *wirecert.Rotating {
+	t.Helper()
+
+	dir := t.TempDir()
+	certPath, keyPath, caPath := filepath.Join(dir, "node.crt"), filepath.Join(dir, "node.key"),
+		filepath.Join(dir, "ca.crt")
+
+	for path, body := range map[string][]byte{certPath: b.CertPEM, keyPath: b.KeyPEM, caPath: b.CAPEM} {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	identity, err := wirecert.NewRotating(certPath, keyPath, caPath)
+	if err != nil {
+		t.Fatalf("NewRotating: %v", err)
+	}
+
+	return identity
+}
+
 // startRoutedNode runs a real node loop over the router, on its enrolled bundle, and
 // waits for its control plane to say it registered.
 func startRoutedNode(t *testing.T, routerPort string, d *routedDeployment, nodeName string) {
 	t.Helper()
 
-	tlsConf, err := wirecert.ClientTLS(d.bundle)
-	if err != nil {
-		t.Fatalf("ClientTLS: %v", err)
-	}
+	identity := identityOnDisk(t, d.bundle)
 
 	deployment, err := state.DeploymentID(d.stack.dir)
 	if err != nil {
@@ -413,7 +433,7 @@ func startRoutedNode(t *testing.T, routerPort string, d *routedDeployment, nodeN
 
 	d.node = startNodeLoop(t, slog.Default(), "https://"+net.JoinHostPort(d.names.nodes, routerPort), nodeProcess{
 		host: nodeName, deployment: deployment, provider: d.stack.provider, kind: d.stack.kind,
-		hurry: d.stack.hurry, tls: tlsConf,
+		hurry: d.stack.hurry, identity: identity,
 	})
 	d.stack.stopNode = d.node.stop
 	d.stack.assembled.awaitRegistered(t, 1)
@@ -816,8 +836,20 @@ func TestEveryNodeWireClientSendsTheConfiguredName(t *testing.T) {
 
 	caPEM := pemCertificate(leaf)
 
+	// ANY REAL IDENTITY: what is under test is the name each client sends, which the
+	// handshake carries before either side has judged a certificate.
+	ca, err := wirecert.LoadOrCreateCA(t.TempDir(), "0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatalf("LoadOrCreateCA: %v", err)
+	}
+
+	bundle, err := ca.IssueNode("n")
+	if err != nil {
+		t.Fatalf("IssueNode: %v", err)
+	}
+
 	nc, err := app.NewNodeClient(&config.Config{Node: &config.NodeConfig{Name: "n", ServerAddr: base}},
-		&tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13})
+		identityOnDisk(t, bundle))
 	if err != nil {
 		t.Fatalf("NewNodeClient: %v", err)
 	}

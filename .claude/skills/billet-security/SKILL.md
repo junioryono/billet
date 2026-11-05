@@ -31,7 +31,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **The JIT registration is never in argv and never in a log.**
 - **Nothing the guest wrote is ever quoted into a billet error.**
-- **A deployment on a token broker holds no App key, and every path that wanted one says so (#557, ADR-023).**
+- **A deployment on a token broker holds no App key, and every path that wanted one says so (#557, ADR-024).**
 - **Every type that holds a credential redacts itself, on a value receiver, and the table proves it by mutation.**
 - **The ledger's connection string and the App key are types of their own, and an unparsable DSN's error quotes nothing pgx wrote.**
 - **A failed fetch names the URL it was on, and after a redirect that URL is signed.**

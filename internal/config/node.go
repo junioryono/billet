@@ -137,6 +137,15 @@ type NodeConfig struct {
 	// ServerAddr is the control plane to dial. Nodes always initiate the
 	// connection, so a node needs no inbound reachability of its own.
 	ServerAddr string `yaml:"server_addr"`
+	// ServerAddrs is every controller of an active-passive pair, in the order
+	// the node tries them, in place of ServerAddr (set one or the other).
+	//
+	// EVERY CONTROLLER, SO NO ADDRESS HAS TO MOVE AT A FAILOVER. Only the
+	// controller holding the claim serves the node wire (ADR-015's startup
+	// order), so the one address that accepts a registration is the
+	// controller's; a node that loses its controller tries the others until
+	// one does (ADR-009).
+	ServerAddrs []string `yaml:"server_addrs,omitempty"`
 	// BootstrapAddr is where `billet node --enroll` asks to join, when the control
 	// plane serves enrollment on an address of its own (server.bootstrap_listen).
 	//
@@ -403,6 +412,25 @@ func (c *Config) NodePolicyFor(name string) (NodePolicy, bool) {
 	return NodePolicy{Name: name}, false
 }
 
+// ControlPlanes is every control-plane address this node dials, in the order it
+// tries them: node.server_addrs, or node.server_addr as a list of one, or
+// nothing when neither is set. A copy, so a caller cannot change the config.
+func (n *NodeConfig) ControlPlanes() []string {
+	if n == nil {
+		return nil
+	}
+
+	if n.ServerAddrs != nil {
+		return slices.Clone(n.ServerAddrs)
+	}
+
+	if n.ServerAddr == "" {
+		return nil
+	}
+
+	return []string{n.ServerAddr}
+}
+
 // MaxCustodyDuration parses Node.MaxCustody, reporting zero when unset.
 //
 // Parsed on demand so the config type stays a plain data shape — but validation
@@ -566,6 +594,80 @@ func testOnlyProviderError(where string, p ProviderKind) error {
 		"harness and cannot be named in a configuration", where, p)
 }
 
+// A list's bounds. THE RECORD AND THE RECEIPT THAT NAME IT ARE BOUNDED EVIDENCE of
+// 4096 bytes each, and one a reader refuses as too long is a node whose list no
+// migration can then shorten, so a list that could not fit is refused here, before
+// any process dials it. A pair is two, and four is a node moving from one pair to
+// another. An address is a DNS name's 253 bytes, a colon and a port.
+const (
+	MaxServerAddrs     = 4
+	MaxServerAddrBytes = 259
+)
+
+// validateControlPlanes checks the addresses a node dials: node.server_addr, or
+// node.server_addrs, never both.
+//
+// BOTH IS REFUSED, NOT MERGED. Two keys naming the controllers are two places
+// an operator edits at a failover, and a file where they disagree has no
+// answer billet could pick without guessing which one was meant.
+func (c *Config) validateControlPlanes() []error {
+	if c.Node.ServerAddrs == nil {
+		if err := validateHostPort("node.server_addr", c.Node.ServerAddr); err != nil {
+			return []error{err}
+		}
+
+		return nil
+	}
+
+	if c.Node.ServerAddr != "" {
+		return []error{fmt.Errorf("node.server_addr is %q and node.server_addrs is set too; name every "+
+			"controller in node.server_addrs and remove node.server_addr", c.Node.ServerAddr)}
+	}
+
+	if len(c.Node.ServerAddrs) == 0 {
+		return []error{errors.New("node.server_addrs is empty, so this node has no control plane to dial")}
+	}
+
+	if len(c.Node.ServerAddrs) > MaxServerAddrs {
+		return []error{fmt.Errorf("node.server_addrs names %d controllers, more than the %d a node may",
+			len(c.Node.ServerAddrs), MaxServerAddrs)}
+	}
+
+	var errs []error
+
+	seen := map[string]int{}
+
+	for i, addr := range c.Node.ServerAddrs {
+		field := fmt.Sprintf("node.server_addrs[%d]", i)
+		if err := validateHostPort(field, addr); err != nil {
+			errs = append(errs, err)
+
+			continue
+		}
+
+		if len(addr) > MaxServerAddrBytes {
+			errs = append(errs, fmt.Errorf("%s is %d bytes, longer than the %d a host name and a port take",
+				field, len(addr), MaxServerAddrBytes))
+
+			continue
+		}
+
+		// THE SAME CONTROLLER TWICE IS A TYPO, not a preference: the node would
+		// try it again before the one it meant. Compared as a host name
+		// compares, without case.
+		key := strings.ToLower(addr)
+		if first, dup := seen[key]; dup {
+			errs = append(errs, fmt.Errorf("%s %q repeats node.server_addrs[%d]", field, addr, first))
+
+			continue
+		}
+
+		seen[key] = i
+	}
+
+	return errs
+}
+
 // validateNodeTLS refuses a node that would dial the network unauthenticated.
 //
 // THE NAME IN THE CERTIFICATE IS THE ONLY THING THAT AUTHORISES A NODE, so a
@@ -579,21 +681,30 @@ func (c *Config) validateNodeTLS() []error {
 	// A ROUTED WIRE IS REACHED BY ITS ROUTER'S NAME, from this host as from any other: it
 	// demands a certificate on loopback too, and presents one naming only the router's
 	// names, so any other address fails at the handshake in words that name no config key.
-	if c.Server != nil && c.Server.TLSRouter != nil &&
-		!strings.EqualFold(strings.TrimSpace(c.Node.ServerAddr), strings.TrimSpace(c.Server.TLSRouter.NodeAddr)) {
-		return append(errs, fmt.Errorf("node.server_addr is %q, which is not server.tls_router.node_addr %q: this "+
-			"control plane's certificate names the router's addresses, so a node dials the router, with node.tls",
-			c.Node.ServerAddr, c.Server.TLSRouter.NodeAddr))
+	// EVERY ADDRESS, when a node names several: the control plane in this file is one
+	// listener, behind one router name.
+	if c.Server != nil && c.Server.TLSRouter != nil {
+		for _, addr := range c.Node.ControlPlanes() {
+			if !strings.EqualFold(strings.TrimSpace(addr), strings.TrimSpace(c.Server.TLSRouter.NodeAddr)) {
+				return append(errs, fmt.Errorf("node.server_addr is %q, which is not server.tls_router.node_addr %q: "+
+					"this control plane's certificate names the router's addresses, so a node dials the router, "+
+					"with node.tls", addr, c.Server.TLSRouter.NodeAddr))
+			}
+		}
 	}
 
 	if c.Node.TLS == nil {
-		if c.Node.ServerAddr != "" && !isLoopbackHostPort(c.Node.ServerAddr) {
-			errs = append(errs, fmt.Errorf(
-				"node.server_addr is %q, which is not on this machine, but node.tls is not set: "+
-					"the control plane identifies a node by the name in its certificate and will "+
-					"refuse a connection without one. Run `billet ca issue %s` on the control "+
-					"plane and copy the bundle here",
-				c.Node.ServerAddr, c.Node.Name))
+		// EVERY CONTROLLER THE NODE DIALS, because one remote address is enough
+		// for the node to reach the network unauthenticated.
+		for _, addr := range c.Node.ControlPlanes() {
+			if addr != "" && !isLoopbackHostPort(addr) {
+				errs = append(errs, fmt.Errorf(
+					"the node dials %q, which is not on this machine, but node.tls is not set: "+
+						"the control plane identifies a node by the name in its certificate and will "+
+						"refuse a connection without one. Run `billet ca issue %s` on the control "+
+						"plane and copy the bundle here",
+					addr, c.Node.Name))
+			}
 		}
 
 		return errs
@@ -726,9 +837,7 @@ func (c *Config) validateNode() []error {
 	if c.Node.StateDir == "" {
 		errs = append(errs, errors.New("node.state_dir is required"))
 	}
-	if err := validateHostPort("node.server_addr", c.Node.ServerAddr); err != nil {
-		errs = append(errs, err)
-	}
+	errs = append(errs, c.validateControlPlanes()...)
 
 	// CHECKED HERE OR NOWHERE. It is used once, by `billet node --enroll`, which
 	// prefixes it with https:// and dials — so a value that is a URL already, or

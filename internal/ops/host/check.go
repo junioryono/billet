@@ -460,7 +460,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			site = "local (implicit)"
 		}
 		fmt.Fprintf(env.Stdout, "node     %s at %s via %s -> %s\n", cfg.Node.Name, site,
-			cfg.Node.Provider, cfg.Node.ServerAddr)
+			cfg.Node.Provider, strings.Join(cfg.Node.ControlPlanes(), ", "))
 		printNodeCache(env, cacheLines)
 
 		// Config validation proves the ec2 block is COHERENT. It cannot prove this

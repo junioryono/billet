@@ -74,6 +74,7 @@ On AWS, `terraform/modules/billet/modules/state-rds-postgres` provisions the dat
 - **`synchronous_commit` not `off`.** With it off, PostgreSQL acknowledges a commit before the record is on disk, so a crash can lose scheduling decisions billet has already acted on. billet checks this at startup and refuses.
 - **A role that can create tables** in that schema, because billet migrates it.
 - **PostgreSQL 13 or later.** Nothing here needs anything newer; the test suite runs 18.
+- **Storage whose commit is fast, for a large fleet.** Every billet write is one commit through a single writer, so a commit's latency is most of what a write costs. On a PostgreSQL on its own EBS gp3 volume, the fleet [ADR-023](../reference/decisions/adr-023-fleet-envelope.md) commits to (256 hosts, 4,096 open leases) kept the writer busy 50% of the time, against 23% with the database on NVMe ([the write budget record](../reference/records/ledger-write-budget.md), 2026-10-25). A smaller fleet needs nothing special.
 
 billet does **not** need any extension.
 
@@ -178,7 +179,15 @@ $ systemctl status billet-server
 
 ### What active/passive does not do for you
 
-**It does not move the address.** Every node dials one `server_addr`. A failover is promotion *plus* that address arriving at the new host — a floating IP, a DNS change, a load balancer — and that half is your deployment's to arrange. Nodes reconnect and re-register on their own once it does.
+**No address has to move, if the nodes name every controller.** Give each node both controllers in `node.server_addrs`. Only the controller holding the claim serves the node wire; a standby opens none until it is promoted. So a node registers with whichever controller answers, and when it loses that one it tries the others until one answers. A node noticed its controller was gone about fourteen seconds after a partition that left the connection silent, and about one second after a crash, and every node was registered with the promoted controller within 2.7 seconds of its promotion. The rehearsal measures each part of a failover ([Host rehearsals](../reference/records/host-rehearsals.md)).
+
+**A controller cut off from the database but not from its nodes keeps them until it reaches the database again.** A node moves only when its controller stops answering. A controller that loses PostgreSQL while its nodes still reach it answers their polls from memory, and the standby is promoted with no nodes. Writes that cannot reach the database are retried, not read as a replacement. When the old controller reaches PostgreSQL again, its next write is refused by the epoch fence and it stops; only then do its nodes move. Until then, work aimed at those nodes waits. billet has no watchdog that stops a controller sooner, because one that stopped a healthy controller over a database blip would be its own outage.
+
+A node that names one `server_addr` still needs that address to arrive at the promoted host, through a floating IP, a DNS change or a load balancer, and that part is your deployment's to arrange. Nodes reconnect and re-register on their own once it does.
+
+**Changing a node's list is an endpoint migration.** A process's list is fixed when it starts, so adding or removing a controller restarts the node through `billet node migrate-endpoint`, which the host role runs: it compares the list the running process dials with the configuration's, in any order, so a node on a controller the new list still names is moved when its process does not know the rest. Moving to or from a list works the same way as moving between two addresses ([Upgrades](../operating/upgrades.md)).
+
+**A retirement leaves one controller,** so a node goes into one naming the survivor alone: `billet server retire` refuses a node that names several, and an ordinary converge moves it first.
 
 **It does not decide that a controller is dead — PostgreSQL does.** Promotion happens when the incumbent's *session* ends. Under a crash that is immediate; under a network partition it is whenever your server's keepalive or `idle_session_timeout` policy says so. billet adds no watchdog on purpose: the window between a partition and any observation of it survives every detector, and a watchdog that stops a healthy control plane over a blip is its own outage. If you want a tighter bound, tune the database.
 

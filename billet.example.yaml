@@ -381,6 +381,14 @@ node:
   name: epyc-1
   server_addr: 127.0.0.1:7717
 
+  # EVERY CONTROLLER OF AN ACTIVE-PASSIVE PAIR, in place of server_addr (set
+  # one or the other). Only the controller holding the claim serves the node
+  # wire, so the node registers with whichever answers, and when it loses it,
+  # tries the others: no address has to move at a failover. Each needs a name
+  # in its controller's server.node_tls_hosts, as server_addr does.
+  #
+  # server_addrs: [control-a.example:7717, control-b.example:7717]
+
   # WHERE `billet node --enroll` ASKS TO JOIN, when the control plane serves
   # enrollment on an address of its own (server.bootstrap_listen above).
   #
