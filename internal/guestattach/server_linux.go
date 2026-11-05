@@ -343,6 +343,7 @@ func shellCommand(ctx context.Context, cfg Config, terminal *os.File) (*exec.Cmd
 		return nil, fmt.Errorf("guestattach: read the job's group: %w", err)
 	}
 
+	//nolint:gosec // G204: the shell the guest's own unit names (attach-serve's --shell), not anything a session sends
 	cmd := exec.CommandContext(ctx, cfg.Shell, "-l")
 	cmd.Dir = cfg.Dir
 	cmd.Env = []string{"HOME=" + account.HomeDir, "USER=" + account.Username, "LOGNAME=" + account.Username,

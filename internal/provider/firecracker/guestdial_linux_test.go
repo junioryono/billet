@@ -23,13 +23,17 @@ func vmmEnd(t *testing.T) (*net.UnixConn, net.Conn) {
 
 	path := filepath.Join(t.TempDir(), "v.sock")
 
-	ln, err := net.Listen("unix", path)
+	var listen net.ListenConfig
+
+	ln, err := listen.Listen(t.Context(), "unix", path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
 
-	near, err := net.Dial("unix", path)
+	var dialer net.Dialer
+
+	near, err := dialer.DialContext(t.Context(), "unix", path)
 	if err != nil {
 		t.Fatal(err)
 	}
