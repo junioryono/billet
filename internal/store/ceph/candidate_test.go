@@ -68,7 +68,7 @@ func verifyingClient(t *testing.T, f *cacheFake, v *verifiedSpecs) *Client {
 }
 
 // candidateVolume is a writable volume whose snapshot takes the path asked for:
-// a clone of the staging snapshot, or the compacting copy a lineage at its depth
+// a clone of the staging snapshot, or the flattened clone a lineage at its depth
 // limit takes.
 func candidateVolume(t *testing.T, c *Client, f *cacheFake, compacted bool) storecontract.Volume {
 	t.Helper()
@@ -119,14 +119,32 @@ func TestACandidateIsVerifiedThroughAReadOnlyMapOfItsFrozenSnapshot(t *testing.T
 			c := verifyingClient(t, f, v)
 			volume := candidateVolume(t, c, f, compacted)
 			v.specs, v.readOnly = nil, nil
-			copies := countCalls(f, "cp")
+			flattens := f.countCalls("flatten")
 
 			candidate, err := c.Snapshot(t.Context(), volume)
 			if err != nil {
 				t.Fatalf("Snapshot: %v", err)
 			}
-			if copied := countCalls(f, "cp") > copies; copied != compacted {
-				t.Fatalf("the snapshot copied the lineage: %v, want %v", copied, compacted)
+			if flattened := f.countCalls("flatten") > flattens; flattened != compacted {
+				t.Fatalf("the snapshot flattened the lineage: %v, want %v", flattened, compacted)
+			}
+			if parent := f.parents[candidate.Handle]; compacted && parent != "" {
+				t.Fatalf("a compacted candidate still has parent %q", parent)
+			}
+			// FROZEN AFTER THE FLATTEN: a snapshot taken before it would still read
+			// through the chain the compaction exists to end.
+			flattenedAt, frozenAt := -1, -1
+			for i, call := range f.calls {
+				if slices.Contains(call, "flatten") && slices.Contains(call, candidate.Handle) {
+					flattenedAt = i
+				}
+				if slices.Contains(call, "snap") && slices.Contains(call, candidate.Handle+"@"+candidate.Generation) &&
+					slices.Contains(call, "create") {
+					frozenAt = i
+				}
+			}
+			if compacted && (flattenedAt < 0 || frozenAt < flattenedAt) {
+				t.Fatalf("flattened at call %d and frozen at %d, want the flatten first", flattenedAt, frozenAt)
 			}
 
 			published := candidate.Handle + "@" + candidate.Generation
@@ -453,15 +471,4 @@ func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
 	if damaged, err := checkDamageWith(ctx, "/bin/sh", "/dev/rbd9"); damaged || err == nil {
 		t.Errorf("a cancelled check answered %v, %v; want could-not-tell", damaged, err)
 	}
-}
-
-func countCalls(f *cacheFake, verb string) int {
-	n := 0
-	for _, call := range f.calls {
-		if slices.Contains(call, verb) {
-			n++
-		}
-	}
-
-	return n
 }
