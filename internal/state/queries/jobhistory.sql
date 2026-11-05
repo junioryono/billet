@@ -66,6 +66,9 @@ UPDATE job_history
        github_runner_assigned_at = CASE WHEN github_runner_assigned_at = ''
                                THEN CAST(@github_runner_assigned_at AS TEXT)
                                ELSE github_runner_assigned_at END,
+       github_finished_at = CASE WHEN github_finished_at = ''
+                               THEN CAST(@github_finished_at AS TEXT)
+                               ELSE github_finished_at END,
        github_run_id = CASE WHEN github_run_id = 0 THEN CAST(@github_run_id AS BIGINT)
                             ELSE github_run_id END,
        head_sha    = CASE WHEN head_sha = '' THEN CAST(@head_sha AS TEXT) ELSE head_sha END,
@@ -241,18 +244,34 @@ ON CONFLICT (lease_id) DO UPDATE SET
 -- THE HOLDER IS THE LEASE'S LAST, the node process that held the compute when
 -- the lease ended (migration 65), and an archive from a caller that did not
 -- load it keeps what an earlier one wrote.
+--
+-- THE USAGE NUMBER IS WRITTEN ONCE (migration 72): a lease has one place in the
+-- order leases finished in, and an exporter may already have read past it. The
+-- target and the purchase time are read from the lease row here, so no caller has
+-- to load them, and a lease GitHub never assigned a job still says when it was
+-- bought.
 INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
       sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, holder_incarnation, queued_at,
-      finished_at)
+      finished_at, usage_seq, usage_mark, github_target, bought_at)
 VALUES (@lease_id, @tier, @node, @run_id, @request_id, @conclusion, @failure_reason,
         @disruption, @disrupted_at, @chosen_provider, @instance_type, @vcpu, @memory,
         @site, @price_micros_per_hour, @image_cache, @cache_generation,
         @actions_cache, @sticky_cache, @git_cache, @bazel_cache, @go_cache, @npm_cache,
-        @holder_incarnation, @queued_at, @finished_at)
+        @holder_incarnation, @queued_at, @finished_at, @usage_seq, @usage_mark,
+        COALESCE((SELECT github_target FROM leases WHERE id = @lease_id), ''),
+        COALESCE((SELECT created_at FROM leases WHERE id = @lease_id), ''))
 ON CONFLICT (lease_id) DO UPDATE SET
+  usage_seq      = CASE WHEN job_history.usage_seq = 0
+                        THEN excluded.usage_seq ELSE job_history.usage_seq END,
+  usage_mark     = CASE WHEN job_history.usage_seq = 0
+                        THEN excluded.usage_mark ELSE job_history.usage_mark END,
+  github_target  = CASE WHEN excluded.github_target != ''
+                        THEN excluded.github_target ELSE job_history.github_target END,
+  bought_at      = CASE WHEN job_history.bought_at = ''
+                        THEN excluded.bought_at ELSE job_history.bought_at END,
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
   finished_at    = excluded.finished_at,
@@ -288,6 +307,79 @@ ON CONFLICT (lease_id) DO UPDATE SET
   holder_incarnation = CASE WHEN excluded.holder_incarnation != ''
                             THEN excluded.holder_incarnation
                             ELSE job_history.holder_incarnation END;
+
+-- name: NextUsageSeq :one
+-- Take the next place in the order leases were numbered in.
+--
+-- THE ROW'S LOCK IS THE POINT, held until this transaction commits, so numbers
+-- become visible in the order they were handed out on both engines; migration 72
+-- says why a reader depends on that, and why the first close creates the row.
+INSERT INTO usage_sequence (id, last) VALUES (1, 1)
+ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + 1
+RETURNING last;
+
+-- name: TakeUsageSeqs :one
+-- Take a run of numbers at once, for a batch of leases that finished before there
+-- were numbers, and answer the last. The batch's numbers are the n below it.
+INSERT INTO usage_sequence (id, last) VALUES (1, CAST(@n AS BIGINT))
+ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + CAST(@n AS BIGINT)
+RETURNING last;
+
+-- name: ListUnnumberedUsage :many
+-- Leases that finished before they could be numbered, oldest first: every one left
+-- is in the partial index, so this reads what is left and not the whole history.
+SELECT lease_id FROM job_history
+ WHERE usage_seq = 0 AND finished_at IS NOT NULL AND finished_at != ''
+ ORDER BY finished_at, lease_id
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ReadAnyUnnumberedUsage :one
+-- Whether any finished lease is still waiting for its number.
+SELECT EXISTS(SELECT 1 FROM job_history
+               WHERE usage_seq = 0 AND finished_at IS NOT NULL AND finished_at != '');
+
+-- name: NumberUsage :execrows
+-- Give each lease a read listed its number, in the order it was listed, and the batch's
+-- mark: the caller packs the lease ids end to end, as MarkJobDetailRetired's does, and
+-- takes a run of numbers above base in the same transaction.
+--
+-- A NUMBER ALREADY WRITTEN STAYS, so a lease never moves; the row's own filter is what
+-- says so, in the statement.
+WITH RECURSIVE ids (id, rest, n) AS (
+    SELECT SUBSTR(CAST(@packed AS TEXT), 1, 32), SUBSTR(CAST(@packed AS TEXT), 33), CAST(1 AS BIGINT)
+    UNION ALL
+    SELECT SUBSTR(rest, 1, 32), SUBSTR(rest, 33), n + 1 FROM ids WHERE rest != ''
+)
+UPDATE job_history
+   SET usage_seq = CAST(@base AS BIGINT) + ids.n, usage_mark = CAST(@mark AS TEXT)
+  FROM ids
+ WHERE job_history.lease_id = ids.id AND job_history.usage_seq = 0;
+
+-- name: ListUsageSince :many
+-- Finished leases past a place in the order they were numbered in, bounded.
+--
+-- FILTERED ON usage_seq ALONE, never on a time: a lease that closed with an
+-- earlier clock than one already read must still be seen. The second term is the
+-- partial index's own predicate, which a planner cannot infer from a parameter.
+-- Every empty value is "not recorded", which the export says rather than reading
+-- it as zero.
+SELECT usage_seq, usage_mark, lease_id, tier, github_target, COALESCE(repo, '') AS repo,
+       chosen_provider, instance_type, site, vcpu, memory, price_micros_per_hour,
+       bought_at, COALESCE(started_at, '') AS started_at,
+       COALESCE(finished_at, '') AS finished_at, result, result_at,
+       COALESCE(conclusion, '') AS conclusion, github_runner_assigned_at, github_finished_at,
+       failure_reason, disruption, custody_at
+  FROM job_history
+ WHERE usage_seq > @after AND usage_seq > 0
+ ORDER BY usage_seq
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ReadUsageRecord :one
+-- What took one place in that order, which proves a cursor still means something on
+-- this ledger: the lease alone is not enough, because a ledger restored from a backup
+-- can give the same lease the same number again. The mark is drawn afresh each time.
+SELECT lease_id, usage_mark
+  FROM job_history WHERE usage_seq = @usage_seq AND usage_seq > 0;
 
 -- name: RecordJobPhase :exec
 -- Record when a lease first entered a phase, on the row that outlives it.
@@ -428,7 +520,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        COALESCE(conclusion, '') AS conclusion, failure_reason, result, disruption,
        disrupted_at, queued_at, COALESCE(assigned_at, '') AS assigned_at,
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
-       chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
+       chosen_provider, instance_type, vcpu, memory, site, github_finished_at, github_queued_at,
        github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
@@ -448,4 +540,52 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
 SELECT lease_id FROM job_history
  WHERE github_run_id = @run_id OR (github_run_id = 0 AND run_id = @run_id)
  ORDER BY COALESCE(assigned_at, queued_at), lease_id
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ListJobRuntimes :many
+-- The jobs that started in [since, until) and finished before until, with the
+-- names their runtime is learned under, newest start first, bounded: a window
+-- past the bound loses its oldest jobs, never the newest.
+--
+-- FINISHED BEFORE until, because a job still running at until was not known to
+-- have finished then: a prediction made at until could not have used it, and a
+-- backtest that did would be graded against its own answer. The runtime is
+-- finished_at less started_at, both billet's clock: the archive is when the
+-- lease's room comes back, which is what a host freeing up means.
+SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name,
+       COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at
+  FROM job_history
+ WHERE started_at IS NOT NULL AND started_at >= @since AND started_at < @until
+   AND finished_at IS NOT NULL AND finished_at < @until
+ ORDER BY started_at DESC, lease_id DESC
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ListJobsForExport :many
+-- The jobs assigned in [since, until), with what a trace of the deployment's
+-- own history is made of, oldest assignment first, bounded: a window past the
+-- bound loses its newest jobs, and the export says so.
+--
+-- WINDOWED ON queued_at, billet's clock when the job was assigned, which every
+-- row has and the index covers; a job GitHub queued before the window and
+-- billet was assigned inside it belongs to it, as its wait does. ONLY ROWS A
+-- JOB WAS ASSIGNED TO: the archive of a lease bought and never used writes a
+-- row too, with no assigned_at, and so does a pool slot billet started for
+-- GitHub's assigned count and retired before a job reached it, with
+-- assigned_at but neither GitHub's job id nor its request id nor a start;
+-- either would take the bound from real jobs. A start keeps a row whose
+-- identity was never written: started_at is set only when the lease reached
+-- busy, so only when GitHub started a job on it. result_at is when billet handled the
+-- completion, so a job's runtime as GitHub ran it is result_at less
+-- started_at, without the teardown finished_at includes; a completion
+-- redelivered after an outage makes it longer than the job ran.
+SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name, github_job_id,
+       COALESCE(request_id, 0) AS request_id,
+       CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
+            AS BIGINT) AS run_id,
+       github_queued_at, queued_at, COALESCE(started_at, '') AS started_at,
+       result_at, COALESCE(finished_at, '') AS finished_at, result
+  FROM job_history
+ WHERE queued_at >= @since AND queued_at < @until AND assigned_at IS NOT NULL
+   AND (github_job_id != '' OR COALESCE(request_id, 0) > 0 OR started_at IS NOT NULL)
+ ORDER BY queued_at, lease_id
  LIMIT CAST(@max_rows AS BIGINT);

@@ -144,6 +144,25 @@ func Load(path string) (*Config, error) {
 	return Parse(path, data)
 }
 
+// PeekTokenBroker reports whether a config has a token_broker block, valid or not,
+// without validating anything else, for `billet github-app create`, which runs against
+// a config that is not valid yet and must refuse before the browser flow spends an App's
+// only key. A file it cannot read answers false, and the command's own read of that file
+// reports why.
+func PeekTokenBroker(data []byte) bool {
+	var peek struct {
+		Server struct {
+			TokenBroker *yaml.Node `yaml:"token_broker"`
+		} `yaml:"server"`
+	}
+
+	if err := yaml.Unmarshal(data, &peek); err != nil {
+		return false
+	}
+
+	return peek.Server.TokenBroker != nil
+}
+
 // PeekIdentityBackend answers where a config says its identity material lives,
 // WITHOUT validating anything else.
 //
@@ -380,6 +399,19 @@ func (c *Config) applyDefaults() {
 		}
 		if c.Node.ServerAddr == "" && c.Node.ServerAddrs == nil && c.Server != nil {
 			c.Node.ServerAddr = c.Server.Listen
+
+			// BEHIND A ROUTER THE WIRE IS REACHED BY NAME: the listen address serves a
+			// certificate that does not name it. The collection's endpoint_change module
+			// derives this too, and the two have to agree.
+			if c.Server.TLSRouter != nil && c.Server.TLSRouter.NodeAddr != "" {
+				c.Node.ServerAddr = c.Server.TLSRouter.NodeAddr
+			}
+		}
+
+		// AND ITS ENROLLMENT BY THE OTHER NAME: the node wire demands a certificate in the
+		// handshake, so falling back to it fails in words that name no cause.
+		if c.Node.BootstrapAddr == "" && c.Server != nil && c.Server.TLSRouter != nil {
+			c.Node.BootstrapAddr = c.Server.TLSRouter.EnrollAddr
 		}
 
 		// A fleet entry for THIS host that omits its provider takes the local
@@ -458,6 +490,7 @@ func (c *Config) Validate() error {
 		errs = append(errs, TargetShareErrors(c.TargetShares(), c.Tiers,
 			c.Server.MaxVCPU, c.Server.MaxMemory)...)
 	}
+	errs = append(errs, c.validateTargetWeights()...)
 	errs = append(errs, c.validateNode()...)
 	errs = append(errs, c.validateMetrics()...)
 	errs = append(errs, c.validateNoTestOnlyBackend()...)

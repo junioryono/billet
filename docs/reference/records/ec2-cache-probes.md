@@ -81,7 +81,7 @@ GitHub's store gave this host about 54 to 64 MiB/s on 8 streams. A volume per ar
 
 ## One job through the whole boot, on 2026-11-04
 
-A `c7i.2xlarge` launched from an image of this contract, by a node of this change's build (whose EC2 guest caches were wire 38 then, and are 39 since main took 38 for job test results) under the deployment-scoped policy `billet init iam` renders, ran one job that used no cache: it held the runner for four minutes on an untrusted tier with a repository scope and `publish: default-branch`.
+A `c7i.2xlarge` launched from an image of this contract, by a node of this change's build (whose EC2 guest caches were wire 38 then, and are 40 since main took 38 for job test results and 39 for Windows guests) under the deployment-scoped policy `billet init iam` renders, ran one job that used no cache: it held the runner for four minutes on an untrusted tier with a repository scope and `publish: default-branch`.
 
 | From launch | What had happened |
 |---|---|

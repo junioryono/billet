@@ -49,14 +49,19 @@ func keep(t *testing.T, name string, report *Report) {
 		t.Fatalf("create %s: %v", *outDir, err)
 	}
 
-	var records bytes.Buffer
+	var records, utilization bytes.Buffer
 	if err := report.WriteJSONL(&records); err != nil {
 		t.Fatal(err)
 	}
 
+	if err := report.WriteUtilization(&utilization, UtilizationBucket); err != nil {
+		t.Fatal(err)
+	}
+
 	for file, body := range map[string][]byte{
-		name + ".jsonl":       records.Bytes(),
-		name + ".summary.txt": []byte(report.Summary()),
+		name + ".jsonl":           records.Bytes(),
+		name + ".summary.txt":     []byte(report.Summary()),
+		name + ".utilization.csv": utilization.Bytes(),
 	} {
 		if err := os.WriteFile(filepath.Join(*outDir, file), body, 0o644); err != nil {
 			t.Fatalf("write %s: %v", file, err)

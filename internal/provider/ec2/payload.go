@@ -243,13 +243,7 @@ func payloadArchive(spec BuildSpec, layer string) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("ec2: read the build's scripts: %w", err)
 	}
 
-	type member struct {
-		name string
-		mode int64
-		body []byte
-	}
-
-	var files []member
+	var files []archiveMember
 
 	for _, f := range tree {
 		mode := int64(0o644)
@@ -262,7 +256,7 @@ func payloadArchive(spec BuildSpec, layer string) ([]byte, string, error) {
 			name = amiUnitPath
 		}
 
-		files = append(files, member{name, mode, f.Body})
+		files = append(files, archiveMember{name, mode, f.Body})
 	}
 
 	for _, arch := range []string{runnerimages.ArchX64, runnerimages.ArchArm64} {
@@ -276,7 +270,7 @@ func payloadArchive(spec BuildSpec, layer string) ([]byte, string, error) {
 			return nil, "", fmt.Errorf("ec2: %w", err)
 		}
 
-		files = append(files, member{amiRepoDir + "/internal/runnerimages/" + file, 0o644, body})
+		files = append(files, archiveMember{amiRepoDir + "/internal/runnerimages/" + file, 0o644, body})
 	}
 
 	assets, err := guestCacheAssets()
@@ -284,21 +278,34 @@ func payloadArchive(spec BuildSpec, layer string) ([]byte, string, error) {
 		return nil, "", err
 	}
 	for name, body := range assets {
-		files = append(files, member{amiRepoDir + "/internal/guestassets/" + name, 0o644, []byte(body)})
+		files = append(files, archiveMember{amiRepoDir + "/internal/guestassets/" + name, 0o644, []byte(body)})
 	}
 	// IN A FIXED ORDER, so the payload's digest is one fact about its contents.
-	slices.SortFunc(files, func(a, b member) int { return strings.Compare(a.name, b.name) })
+	slices.SortFunc(files, func(a, b archiveMember) int { return strings.Compare(a.name, b.name) })
 
 	files = append(files,
-		member{amiRepoDir + "/internal/notices/THIRD_PARTY_NOTICES", 0o644, []byte(notices.Text())},
-		member{amiGuestBilletPath, 0o755, spec.GuestBillet},
-		member{amiRepoDir + "/internal/runnerimages/pinned.txt", 0o644, runnerimages.PinnedFile()},
-		member{amiRepoDir + "/internal/guestassets/docker-daemon.json", 0o644,
+		archiveMember{amiRepoDir + "/internal/notices/THIRD_PARTY_NOTICES", 0o644, []byte(notices.Text())},
+		archiveMember{amiGuestBilletPath, 0o755, spec.GuestBillet},
+		archiveMember{amiRepoDir + "/internal/runnerimages/pinned.txt", 0o644, runnerimages.PinnedFile()},
+		archiveMember{amiRepoDir + "/internal/guestassets/docker-daemon.json", 0o644,
 			[]byte(guestassets.DockerDaemonJSON)},
-		member{amiBuildEnv, 0o600, []byte(env)},
-		member{amiLayerPath, 0o755, []byte(layer)},
+		archiveMember{amiBuildEnv, 0o600, []byte(env)},
+		archiveMember{amiLayerPath, 0o755, []byte(layer)},
 	)
 
+	return packArchive(amiBuildDir, 0o700, files)
+}
+
+// archiveMember is one file of a build's payload.
+type archiveMember struct {
+	name string
+	mode int64
+	body []byte
+}
+
+// packArchive is a build's payload as a gzipped tarball and its digest: dir first, with
+// that mode, and then the files.
+func packArchive(dir string, dirMode int64, files []archiveMember) ([]byte, string, error) {
 	var raw bytes.Buffer
 
 	zw := gzip.NewWriter(&raw)
@@ -308,8 +315,8 @@ func payloadArchive(spec BuildSpec, layer string) ([]byte, string, error) {
 	// before anything is unpacked into it.
 	if err := tw.WriteHeader(&tar.Header{
 		Typeflag: tar.TypeDir,
-		Name:     strings.TrimPrefix(amiBuildDir, "/") + "/",
-		Mode:     0o700,
+		Name:     strings.TrimPrefix(dir, "/") + "/",
+		Mode:     dirMode,
 		ModTime:  payloadModTime,
 	}); err != nil {
 		return nil, "", fmt.Errorf("ec2: build the payload archive: %w", err)
@@ -371,6 +378,13 @@ func (p *Provider) stagePayload(
 		return "", nil, err
 	}
 
+	return p.stageArchive(ctx, spec, body, digest)
+}
+
+// stageArchive uploads a build's payload and records where the builder can fetch it.
+func (p *Provider) stageArchive(
+	ctx context.Context, spec *BuildSpec, body []byte, digest string,
+) (string, func() error, error) {
 	// RESOLVED HERE, NOT HELD. The provider carries a awscreds.Source rather than
 	// credentials, because an IMDSv2 role rotates and a set captured at
 	// construction expires mid-build -- which is exactly how an arm64 build failed

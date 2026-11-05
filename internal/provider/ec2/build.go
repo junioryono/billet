@@ -257,6 +257,11 @@ type BuildSpec struct {
 	// not inherit it, which is correct: the cache client runs on the host.
 	CACertPEM string
 
+	// Windows says BaseImage is a Windows AMI and the image is built from GitHub's
+	// windows-2025 template rather than its ubuntu-24.04 one (ADR-026). The operator
+	// says so and launchBuilder holds it to what the base image reports, both ways.
+	Windows bool
+
 	// Accept is the components the image is completed with, from images.accept
 	// (config.ImageComponents' names). The builder installs each one GitHub's
 	// template for Arch offers and leaves out, and says so, each one it does not.
@@ -319,6 +324,10 @@ func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, erro
 			"staged in S3 and fetched by a bootstrap")
 	}
 
+	if spec.Windows {
+		return p.buildWindowsImage(ctx, spec)
+	}
+
 	accept, err := checkAccept(spec.Accept)
 	if err != nil {
 		return "", err
@@ -372,6 +381,13 @@ func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, erro
 		return "", err
 	}
 
+	return p.buildFromScript(ctx, spec, script)
+}
+
+// buildFromScript is the part of a build both operating systems share: launch the
+// builder with this bootstrap, wait for its verdict and its stop, image it, and ask the
+// image to prove itself.
+func (p *Provider) buildFromScript(ctx context.Context, spec BuildSpec, script string) (string, error) {
 	id, err := p.launchBuilder(ctx, spec, script)
 	if err != nil {
 		return "", err
@@ -486,19 +502,32 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 		return "", err
 	}
 
+	// THE OPERATOR SAID WHICH TEMPLATE, AND THE IMAGE SAYS WHAT IT IS. Launched anyway,
+	// the bootstrap is text the base image's first-boot agent does not run, so nothing
+	// happens until billet's deadline, which is hours away and says nothing of why.
+	if layout.windows() != spec.Windows {
+		if layout.windows() {
+			return "", fmt.Errorf("ec2: the base image %s is a Windows AMI, and a Windows build "+
+				"is asked for with --os windows", spec.BaseImage)
+		}
+
+		return "", fmt.Errorf("ec2: --os windows builds from a Windows Server 2025 AMI, and the "+
+			"base image %s is not a Windows AMI", spec.BaseImage)
+	}
+
 	// NOT AN IMAGE BILLET BUILT, which its bootstrap would refuse only after a
 	// builder was bought: GitHub's template runs once per machine. The tags are
 	// what is read here and an operator can remove them, so the bootstrap's own
 	// refusal stays the rule and this one only saves the launch.
 	if layout.billet {
 		return "", fmt.Errorf("ec2: the base image %s is an image billet built, and a build "+
-			"runs GitHub's template on a machine once; pass Canonical's Ubuntu 24.04 image as "+
+			"runs GitHub's template on a machine once; pass the distribution's own image as "+
 			"--base-image instead", spec.BaseImage)
 	}
 
 	rootDevice := layout.root
 
-	userData, err := packUserData(script)
+	userData, err := builderUserData(spec.Windows, script)
 	if err != nil {
 		return "", err
 	}
@@ -585,16 +614,21 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 			"start with a volume that size too", spec.BuilderDiskGiB, maxBuilderDiskGiB)
 	}
 
-	if spec.BuilderDiskGiB != 0 && spec.BuilderDiskGiB < minBuilderDiskGiB {
+	defaultDisk, minDisk, minFree := int64(DefaultBuilderDiskGiB), int64(minBuilderDiskGiB), int64(minBuilderFreeGiB)
+	if spec.Windows {
+		defaultDisk, minDisk, minFree = DefaultWindowsBuilderDiskGiB, minWindowsBuilderDiskGiB, minWindowsBuilderFreeGiB
+	}
+
+	if spec.BuilderDiskGiB != 0 && spec.BuilderDiskGiB < minDisk {
 		return "", fmt.Errorf("ec2: a builder root of %dGiB cannot hold this image; it needs at "+
 			"least %dGiB free and the base image's own filesystem is on the same volume, so "+
 			"--builder-disk must be at least %d",
-			spec.BuilderDiskGiB, minBuilderFreeGiB, minBuilderDiskGiB)
+			spec.BuilderDiskGiB, minFree, minDisk)
 	}
 
 	disk := spec.BuilderDiskGiB
 	if disk == 0 {
-		disk = DefaultBuilderDiskGiB
+		disk = defaultDisk
 	}
 
 	if layout.rootGiB > 0 && disk < layout.rootGiB {

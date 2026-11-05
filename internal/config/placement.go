@@ -29,6 +29,16 @@ const (
 	// host dying takes a smaller share of what is running. The cost is
 	// fragmentation, which is paid by whichever tier is largest.
 	PlacementSpread PlacementPolicy = "spread"
+
+	// PlacementTightest prefers the machine left with the least free room, whatever
+	// the tier being placed, in shares of the machine's own size.
+	//
+	// Pack counts how many more of this tier fit, so two machines holding the same
+	// number of a small tier look alike though one has twice the other's room left.
+	// This leaves the most whole room for a wider shape; whether that shows is what
+	// docs/reference/records/replay-policies.md measures, which is why it is a
+	// choice and not the default.
+	PlacementTightest PlacementPolicy = "tightest"
 )
 
 // Or returns the policy, or pack when nothing was chosen.
@@ -52,10 +62,10 @@ func (p PlacementPolicy) Or() PlacementPolicy {
 // opposite.
 func (p PlacementPolicy) Validate() error {
 	switch p {
-	case "", PlacementPack, PlacementSpread:
+	case "", PlacementPack, PlacementSpread, PlacementTightest:
 		return nil
 	default:
-		return fmt.Errorf("server.placement is %q; it must be %q or %q",
-			p, PlacementPack, PlacementSpread)
+		return fmt.Errorf("server.placement is %q; it must be %q, %q or %q",
+			p, PlacementPack, PlacementSpread, PlacementTightest)
 	}
 }

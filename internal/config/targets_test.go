@@ -1,6 +1,7 @@
 package config
 
 import (
+	"maps"
 	"net/url"
 	"strings"
 	"testing"
@@ -552,5 +553,121 @@ func TestATargetShareLoadsKeyedByTarget(t *testing.T) {
 	if _, err := Load(writeConfig(t, small)); err == nil ||
 		!strings.Contains(err.Error(), `target "personal"`) {
 		t.Errorf("a share below its tier's shape loaded: %v", err)
+	}
+}
+
+// A WEIGHT IS READ PER TARGET, A TARGET THAT WRITES NONE WEIGHING ONE, and with no
+// weight anywhere there are no weights at all: a deployment that never mentions
+// one is ordered exactly as it was before they existed.
+func TestTargetWeightsAreEmptyUnlessATargetWritesOne(t *testing.T) {
+	body := twoTargetConfig(t, "personal")
+	body = strings.Replace(body, "  - label: billet-8vcpu-ubuntu-2404\n",
+		"  - label: billet-8vcpu-ubuntu-2404\n    target: default\n", 1)
+
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got := cfg.TargetWeights(); len(got) != 0 {
+		t.Errorf("with no weight written the weights are %v; want none", got)
+	}
+
+	const key = "    private_key_path: /etc/billet/app-personal.pem\n"
+
+	cfg, err = Load(writeConfig(t, strings.Replace(body, key, key+"    weight: 3\n", 1)))
+	if err != nil {
+		t.Fatalf("Load with a weight: %v", err)
+	}
+
+	if got := cfg.TargetWeights(); !maps.Equal(got, map[string]int{"personal": 3, DefaultTargetName: 1}) {
+		t.Errorf("the weights are %v; want personal's 3, and the default target at 1", got)
+	}
+
+	// The github block writes one too.
+	onDefault := strings.Replace(body, "  private_key_path: /etc/billet/app.pem\n",
+		"  private_key_path: /etc/billet/app.pem\n  weight: 5\n", 1)
+	if onDefault == body {
+		t.Fatal("the fixture's github block has changed, so this case patches nothing")
+	}
+
+	cfg, err = Load(writeConfig(t, onDefault))
+	if err != nil {
+		t.Fatalf("Load with a weight on github: %v", err)
+	}
+
+	if got := cfg.TargetWeights(); !maps.Equal(got, map[string]int{"personal": 1, DefaultTargetName: 5}) {
+		t.Errorf("the weights are %v; want the default target's 5, and personal at 1", got)
+	}
+
+	// THE RANGE, BOTH WAYS.
+	for _, c := range []struct {
+		weight string
+		ok     bool
+	}{{"0", true}, {"1", true}, {"1000", true}, {"-1", false}, {"1001", false}} {
+		_, err := Load(writeConfig(t, strings.Replace(body, key, key+"    weight: "+c.weight+"\n", 1)))
+		if c.ok && err != nil {
+			t.Errorf("weight %s was refused: %v", c.weight, err)
+		}
+
+		if !c.ok && (err == nil || !strings.Contains(err.Error(), `target "personal": weight`)) {
+			t.Errorf("weight %s gave %v; want it refused by target", c.weight, err)
+		}
+	}
+}
+
+// A WEIGHT UNDER FILL WOULD DECIDE NOTHING, so it is refused rather than believed.
+func TestATargetWeightIsRefusedUnderFill(t *testing.T) {
+	const key = "    private_key_path: /etc/billet/app-personal.pem\n"
+
+	body := twoTargetConfig(t, "personal")
+	body = strings.Replace(body, "  - label: billet-8vcpu-ubuntu-2404\n",
+		"  - label: billet-8vcpu-ubuntu-2404\n    target: default\n", 1)
+
+	order := func(body, order string) string {
+		const ceiling = "  max_memory: "
+		if !strings.Contains(body, ceiling) {
+			t.Fatal("the fixture's server block has changed, so this case patches nothing")
+		}
+
+		return strings.Replace(body, ceiling, "  admission_order: "+order+"\n"+ceiling, 1)
+	}
+
+	weighted := strings.Replace(body, key, key+"    weight: 2\n", 1)
+
+	if _, err := Load(writeConfig(t, order(weighted, "fill"))); err == nil ||
+		!strings.Contains(err.Error(), "the weight would decide nothing") {
+		t.Errorf("a weight under fill gave %v; want it refused", err)
+	}
+
+	if _, err := Load(writeConfig(t, order(weighted, "fair"))); err != nil {
+		t.Errorf("a weight under fair was refused: %v", err)
+	}
+
+	cfg, err := Load(writeConfig(t, order(weighted, "hold")))
+	if err != nil {
+		t.Errorf("a weight under hold was refused: %v", err)
+	} else if cfg.Server.Order() != AdmissionHold {
+		t.Errorf("the order is %q; want hold", cfg.Server.Order())
+	}
+
+	if _, err := Load(writeConfig(t, order(body, "holds"))); err == nil ||
+		!strings.Contains(err.Error(), `server.admission_order is "holds"`) {
+		t.Errorf("a misspelt order gave %v; want it refused", err)
+	}
+
+	if _, err := Load(writeConfig(t, order(body, "fill"))); err != nil {
+		t.Errorf("fill with no weight was refused: %v", err)
+	}
+}
+
+// A PLACEMENT IS ONE BILLET IMPLEMENTS, tightest among them.
+func TestTightestIsAPlacementAndATypoIsNot(t *testing.T) {
+	if err := PlacementTightest.Validate(); err != nil {
+		t.Errorf("tightest was refused: %v", err)
+	}
+
+	if err := PlacementPolicy("tighter").Validate(); err == nil || !strings.Contains(err.Error(), `server.placement is "tighter"`) {
+		t.Errorf("a misspelt placement gave %v; want it refused", err)
 	}
 }
