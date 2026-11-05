@@ -15,7 +15,7 @@ What was measured of both, with dates, is in the [bare-metal hosts record](../re
 
 ### Host sources behind one contract
 
-A new package, `internal/hostsource`, holds the contract a source implements, beside `internal/provider` and below the scheduler: it imports neither a provider nor `server`, `node` or `cmd`. A source answers five questions:
+A new package, `internal/hostsource`, holds the contract a source implements, beside `internal/provider` and below the scheduler: a source imports neither `server`, `node`, `nodeplane` nor `cmd`, and writes no ledger, which depguard holds (`hostsource`). A source answers five questions:
 
 - **Order** a host of a named shape in a named location, carrying the payload that host must run on its first boot. It answers with the source's identifier for the host, or with `ErrNoStock` or `ErrQuota` when the source says so, which the scaler reports and never waits on.
 - **Describe** a host: provisioning, running, failed, or gone, as the source reports it, or could-not-tell.
