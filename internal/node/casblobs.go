@@ -389,7 +389,7 @@ func (s *CacheService) releaseBlobVolume(
 	return done()
 }
 
-// keepPublished moves what a published job wrote into the read cache, which is on the
+// keepPublished links what a published job wrote into the read cache, which is on the
 // same disk, so the next job of the key on this node reads it there rather than from
 // the store: a warm build asks for thousands of entries, and each one fetched is a
 // request (114 s against 45 s cold for `go build std` on EC2, 2026-11-05).
@@ -410,7 +410,9 @@ func (s *CacheService) keepPublished(hv *hostVolume, root string, written []stor
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			break
 		}
-		if err := os.Rename(filepath.Join(root, string(ref.Table), ref.Digest[:2], ref.Digest), target); err != nil {
+		// LINKED, NOT MOVED: the session's directory keeps it until the directory goes,
+		// so a release retried after a failure here counts the same writes in its record.
+		if err := os.Link(filepath.Join(root, string(ref.Table), ref.Digest[:2], ref.Digest), target); err != nil {
 			continue
 		}
 		kept++

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,12 +52,19 @@ type fakeNode struct {
 	// held: work a served build should not have repeated. The go command
 	// rewrites some empty marker entries on every build, and those are not work.
 	redone atomic.Int64
-	// delay is how long every request takes, as one fetched from S3 does.
-	delay time.Duration
+	// delay is how long every request takes, as one fetched from S3 does, and
+	// mostInFlight the most that were being answered at once.
+	delay        time.Duration
+	inFlight     atomic.Int64
+	mostInFlight atomic.Int64
 }
 
 func (f *fakeNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	now := f.inFlight.Add(1)
+	for most := f.mostInFlight.Load(); now > most && !f.mostInFlight.CompareAndSwap(most, now); most = f.mostInFlight.Load() {
+	}
 	time.Sleep(f.delay)
+	f.inFlight.Add(-1)
 	if r.Header.Get("Authorization") != "Bearer token" {
 		http.Error(w, "unauthorised", http.StatusUnauthorized)
 
@@ -247,9 +255,7 @@ func TestRequestsAreAnsweredSideBySide(t *testing.T) {
 	}
 	requests = append(requests, request{ID: actions + 1, Command: "close"})
 
-	started := time.Now()
 	answers := exchange(t, Config{Dir: t.TempDir(), Endpoint: node.URL, Token: "token"}, requests...)
-	took := time.Since(started)
 	if len(answers) != actions+1 {
 		t.Fatalf("%d answers, want %d", len(answers), actions+1)
 	}
@@ -258,11 +264,48 @@ func TestRequestsAreAnsweredSideBySide(t *testing.T) {
 			t.Fatalf("request %d was not served: %+v", answer.ID, answer)
 		}
 	}
-	// ONE AT A TIME IS TWO REQUESTS OF 50 ms FOR EACH OF 16, 1.6 s. Eight at once is
-	// four rounds; the bound leaves a loaded host three times that.
-	if serial := 2 * actions * fake.delay; took > serial*3/8 {
-		t.Fatalf("16 gets took %s, near the %s one at a time takes", took, serial)
+	// COUNTED AT THE NODE, NOT TIMED: each request is held 50 ms there, so a helper
+	// answering one at a time never has two open, whatever the host's load.
+	if most := fake.mostInFlight.Load(); most < 2 || most > inFlight {
+		t.Fatalf("the node saw at most %d requests at once, want between 2 and %d", most, inFlight)
 	}
+}
+
+// AN ANSWER THAT COULD NOT BE WRITTEN IS A FAILED RUN, even when the input ended first:
+// the go command would otherwise be left waiting for an answer that never came.
+func TestAnAnswerThatCannotBeWrittenFailsTheRun(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeNode{objects: map[string][]byte{}, delay: 20 * time.Millisecond}
+	node := httptest.NewServer(fake)
+	t.Cleanup(node.Close)
+	var in bytes.Buffer
+	if err := json.NewEncoder(&in).Encode(request{ID: 1, Command: "get", ActionID: bytes.Repeat([]byte{9}, 32)}); err != nil {
+		t.Fatal(err)
+	}
+	// THE ANNOUNCEMENT IS WRITTEN, THE ANSWER IS NOT.
+	out := &failAfter{writes: 1}
+	err := Run(t.Context(), Config{Dir: t.TempDir(), Endpoint: node.URL, Token: "token"}, &in, out)
+	if err == nil || !strings.Contains(err.Error(), "answer request 1") {
+		t.Fatalf("Run = %v, want the failed answer", err)
+	}
+}
+
+// failAfter accepts that many writes and refuses the rest.
+type failAfter struct {
+	mu     sync.Mutex
+	writes int
+}
+
+func (f *failAfter) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.writes == 0 {
+		return 0, errors.New("the go command has gone")
+	}
+	f.writes--
+
+	return len(p), nil
 }
 
 // AN OBJECT THE NODE SERVES IS KEPT ONLY WHEN IT IS WHAT ITS ENTRY NAMES. A

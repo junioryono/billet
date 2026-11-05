@@ -448,6 +448,8 @@ func verifyScript(arch string, contract int, nonce string) (string, reportSchema
 		step("image record")
 		b.WriteString("test \"$(sed -n 's/^RUNNER_VERSION=//p' \"$billet_root\"" + imageRecordPath +
 			")\" = \"$billet_runner\"\n")
+		b.WriteString("test \"$(sed -n 's/^AMI_CONTRACT=//p' \"$billet_root\"" + imageRecordPath +
+			")\" = '" + strconv.Itoa(contract) + "'\n")
 	}
 
 	step("done")

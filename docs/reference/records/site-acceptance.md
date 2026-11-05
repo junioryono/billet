@@ -112,6 +112,18 @@ Then both home nodes were started again. The FIRST job after that (run `33708137
 
 `billet status` on the control plane names every node with its site and what it last reported running; `billet leases` showed nothing held once each teardown had completed. The `rbd` listing of `accept-cache` and the S3 state object are what say which generation is current at each site, and neither can be read from the other site's node.
 
+## Sticky disks on an EBS+S3 site, 2026-11-05
+
+The three sticky-disk proofs [#27](https://github.com/junioryono/billet/issues/27) asked for, on a real EBS+S3 site. One deployment (identity `eb89b765…`): the control plane on the shared test host, reached over a tunnel, and one `ec2` node at `10.77.0.10` in a VPC of its own in `us-west-2a`, with `node.ebs_s3`, a site `b1t22-us-west-2a`, and `node.cache` on `https://10.77.0.10:9443` under a CA the image was built with (`billet ami build --ca-cert`). The node's role was the policy `billet init iam --deployment` rendered for that identity. The tier was untrusted with a repository scope, so its sticky disks published under `default-branch`, and every job was a `workflow_dispatch` on `main`, which the completion proved. Each job launched its own `c7i.2xlarge` from an image of `AMIContract` 5. The workflow is `actions/stickydisk` on one key with a 20 GiB disk, run in four modes: seed, reuse, fail and long.
+
+**Warm.** Run `41957569124` seeded the key on instance `i-05a7956e…`: the disk was created cold, formatted, and given a marker naming the run. The node published it at 02:53:20, 89 s after the job ended (`snap-0389940131e83dfac`, fence 1). Run `41958123229` asked for the same key on instance `i-0633a2fa…`: `cache-hit=true`, the marker read `seed-41957569124`, and billet recorded `sticky warm`.
+
+**A writer that fails.** Run `41958518013` wrote `failed-writer` to the disk, synced, and failed. The node settled the job as `failed` and logged no publication for it. The key's pointer stayed `snap-01590ef3f3bce8ac9`, at fence 2, published by the warm run before it, and run `41959012167` then read the seed's marker with `cache-hit=true` and found no `failed-writer` file.
+
+**A power cut.** On EC2 the node publishes, not the guest: it snapshots the disk after the guest is gone, which is where a publication spends its time, and takes the writer lease only to move the pointer, which takes a moment. So the cut is the node process killed with `SIGKILL` while that snapshot is pending, not a host terminated: killing the host would also have ended the acceptance deployment. A first attempt timed the cut from a live writer in the key's S3 state and never saw one in two publications, which is how the order was found. Run `41963735818` wrote 4 GiB; at 03:51:29 the node was killed with `snap-0fff04cfa55d483e3` pending at 0%, and the pointer `snap-0fbae55ed619b0f70` at fence 4 with no writer. Restarted 16 s later, the node read its journal, found the publication interrupted mid-snapshot, and abandoned it: `a crash interrupted the snapshot, so which candidate exists cannot be told`. The pointer was unchanged and no writer was left. Run `41964302686` then read `long-41959451484`, the last complete generation's marker, with `cache-hit=true`. The interrupted snapshot carries `sh.billet.owner` and `sh.billet.cache-owner`, the tags eviction and `billet decommission` list by.
+
+No refusal from AWS here was one a fake accepted.
+
 ## What this does not prove
 
 - `home-b` is a VM on `home-a`'s chassis. Power, NIC and disk failure domains are not separated; only the software boundary is.

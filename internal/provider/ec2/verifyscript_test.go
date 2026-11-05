@@ -154,6 +154,8 @@ type verifyProbe struct {
 	// imageRecord, when set, is what /etc/billet-image holds in place of the runner's
 	// own version; "missing" leaves it out.
 	imageRecord string
+	// imageContract, when set, is the contract the record names in place of AMIContract.
+	imageContract string
 	// brokenRunner makes Runner.Listener exit non-zero, which is what a missing
 	// libicu looks like from here.
 	brokenRunner bool
@@ -356,12 +358,17 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 	if err := os.MkdirAll(filepath.Dir(croot+imageRecordPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	recordContract := strconv.Itoa(AMIContract)
+	if p.imageContract != "" {
+		recordContract = p.imageContract
+	}
 	switch p.imageRecord {
 	case "missing":
 	case "":
-		writeFile(t, croot+imageRecordPath, "RUNNER_VERSION=2.328.0\nBUILT_AT=2026-11-04T00:00:00Z\n", 0o644)
+		writeFile(t, croot+imageRecordPath, "RUNNER_VERSION=2.328.0\nAMI_CONTRACT="+recordContract+
+			"\nBUILT_AT=2026-11-04T00:00:00Z\n", 0o644)
 	default:
-		writeFile(t, croot+imageRecordPath, "RUNNER_VERSION="+p.imageRecord+"\n", 0o644)
+		writeFile(t, croot+imageRecordPath, "RUNNER_VERSION="+p.imageRecord+"\nAMI_CONTRACT="+recordContract+"\n", 0o644)
 	}
 
 	script = substitute(t, script, "du -sk "+toolcacheDir, "du -sk "+tcDir)
@@ -1011,6 +1018,11 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			// THE CONFORMANCE WORKFLOW CHECKS A CANDIDATE BY THIS RECORD.
 			name:     "the image record names another runner",
 			probe:    verifyProbe{imageRecord: "2.300.0"},
+			wantStep: "image record",
+		},
+		{
+			name:     "the image record names another contract",
+			probe:    verifyProbe{imageContract: "4"},
 			wantStep: "image record",
 		},
 		{

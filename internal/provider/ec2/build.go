@@ -1317,8 +1317,8 @@ func layerScript(spec BuildSpec) (string, error) {
 	// verified and unpacked, the one point where what was downloaded and what was
 	// installed are the same fact. The cache conformance workflow reads it to refuse
 	// a candidate image that is not the one under test.
-	b.WriteString("printf 'RUNNER_VERSION=%s\\nBUILT_AT=%s\\n' '" + spec.RunnerVersion +
-		"' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > " + imageRecordPath + "\n")
+	b.WriteString("printf 'RUNNER_VERSION=%s\\nAMI_CONTRACT=%s\\nBUILT_AT=%s\\n' '" + spec.RunnerVersion +
+		"' '" + strconv.Itoa(AMIContract) + "' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > " + imageRecordPath + "\n")
 	b.WriteString("chmod 0644 " + imageRecordPath + "\n")
 	b.WriteString("cat > /opt/actions-runner/billet-runner-service <<'BILLETRUNNEREOF'\n")
 	b.WriteString(guestassets.RunnerServiceScript)

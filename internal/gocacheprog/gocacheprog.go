@@ -98,7 +98,11 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 		var req request
 		if err := decoder.Decode(&req); err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				// WHAT IS STILL RUNNING HAS NOT ANSWERED YET, and an answer that could not
+				// be written is this run's failure.
+				answers.wg.Wait()
+
+				return answers.failed()
 			}
 
 			return fmt.Errorf("gocacheprog: read a request: %w", err)

@@ -36,6 +36,28 @@ git 2.51.0, 2026-09-25, on a development Mac, with probes kept beside this work:
 
 2026-09-25, this development Mac, Go 1.26.6, `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 -trimpath -ldflags='-s -w'`: 37,843,106 bytes before the Remote Execution API and 38,305,954 after, +462,848 bytes (1.2%). gRPC was already linked through an existing dependency.
 
+## On per-job EC2, 2026-11-05
+
+The caches [ADR-023](../decisions/adr-023-caches-off-firecracker.md) gives an EC2 guest, measured by jobs in a private repository `billet-testbed/b1t22-cache`, on `c7i.2xlarge` instances in `us-west-2a` launched from an image of `AMIContract` 5, by one `ec2` node at `10.77.0.10` on the same subnet, whose store is `ebs-s3` through an S3 gateway endpoint. Both tiers were untrusted with that repository as their `cache_scope`, so their caches published under `default-branch`, and every job was a `workflow_dispatch` on `main`. The times are what the job printed, so they include the step's own start, and come from one run each: they show which side of GitHub billet is on, not a distribution.
+
+**The Actions cache against GitHub's own.** `actions/cache/save@v5` and `restore@v5` of 1 GiB from `/dev/urandom`, which no compression helps, saved in one job and restored twice in another. Run `41967274694` was on a tier with `cache.actions` off, so GitHub served it; run `41967278340`, on the tier with it on, was served by the node, whose answers the toolkit reported as `Cache Size: ~1024 MB` rather than GitHub's progress lines.
+
+| 1 GiB | GitHub's cache | the node's |
+|---|---|---|
+| save | 47.51 s | 17.91 s |
+| first restore | 31.87 s | 22.06 s |
+| second restore | 20.60 s | 4.79 s |
+
+The first restore in each job also paid for that step's own start; inside the node's, the download took under a second (`Cache Size` at 04:27:59.19, `Cache restored successfully` at 04:27:59.85).
+
+**Git.** `actions/checkout@v5` and a `git fetch --depth=50` through the rewrite to the relay (`url.http://172.17.0.1:41322/v1/git/github.com/.insteadof=https://github.com/`): 0.62 s cold and 0.59 s warm, which billet recorded as `git warm`, the node answering `git-upload-pack` from its mirror in 4 ms. The repository is a few kilobytes, so this proves the path and not a speed.
+
+**Go.** `go build std` through `GOCACHEPROG=/opt/billet/bin/billet cache gocacheprog`: 44.67 s cold, and then 114.00 s warm, which billet recorded as `go warm`. A warm build slower than a cold one is no cache at all. The helper answered the go command's requests one at a time, so the build waited for the sum of every request, and on this node an entry it did not hold locally is a request to S3. The helper now answers eight at once, and the node keeps what a published job wrote in its read cache. Those changes are in the image built after this run, and this record will be updated with what that image measures.
+
+**Bazel.** The first Bazel job on EC2 failed: `Unexpected error reading config file '/etc/bazel.bazelrc': (error: 13): Permission denied`, exit 37. The boot script's `umask 077`, which keeps the runner's registration to root, had reached the step that writes every tool's configuration, so the bazelrc was `0600`. A cache must never fail a build, and the step now runs under `022`.
+
+**What this does not prove.** One run of each, on one node, with no other load. The cache conformance workflow had not run on EC2: its candidate-identity check reads `/etc/billet-image`, which the EC2 image did not then write. Trusted-tier interception is unproved here, because the test organization has no runner group a trusted tier can be restricted to. Buck2, npm and the BuildKit cache were not measured.
+
 ## Still to measure, once deployed
 
 Each of these is taken on the reference deployment after the release carrying the caches, and recorded here with its date:
