@@ -4,3 +4,8 @@
 ef987c2a5e2c5d50c77b11c9c3f7b03ecd231543 images/ubuntu/scripts/docs-gen
 6a833584a1c5cff7dd9f3a3becb6a85fab482fa3 images/ubuntu/scripts/helpers
 e492ef6f548dc38035000ea1ff4571d87ac15056 images/ubuntu/scripts/tests
+df62324a716449fa68e1bd8688e7b12036086e0d images/windows/assets
+2164ee1794c032158d03f3149f7a84ed6bf7f969 images/windows/scripts/build
+1e2d65ce12b0aae1e284f976e3e062f1b56b0ad3 images/windows/scripts/docs-gen
+94b2648f62d6b317fdf7d3635a1ac95b93a0045b images/windows/scripts/helpers
+8ba2a4a62e1d5b5be96089bf16a5c1f0f5854f38 images/windows/scripts/tests

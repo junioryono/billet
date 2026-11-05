@@ -47,7 +47,7 @@ func TestAGeneratedLocalConfigServesPlainLoopbackWithoutACA(t *testing.T) {
 
 	// The generated address IS loopback — the same predicate app.ServeNodeWire
 	// branches on to decide whether an authority exists at all.
-	if !nodeplane.LoopbackOnly(cfg.Server.Listen) {
+	if cfg.Server.WireServesTLS() {
 		t.Fatalf("the generated listen %q is not loopback-only", cfg.Server.Listen)
 	}
 

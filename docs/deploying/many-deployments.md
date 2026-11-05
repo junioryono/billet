@@ -74,3 +74,36 @@ Then run `billet check` on each control-plane host, which asks the broker for a 
 **A broker that is down costs little, while the control plane stays up.** A deployment's long polls carry the Actions service's own token and do not ask, and a held token rides out silence until its last minute, so an outage shows only when a refresh falls due, and reads as could-not-tell rather than as the installation being gone. Held tokens live in memory, though: **a control plane that restarts during an outage cannot provision its scale sets, and does not start until the broker answers.** Do not upgrade the two together.
 
 **The broker has one budget for everyone it serves.** A deployment holds only what it is registered for, and a failure is answered from memory for 30 s rather than spending the App's budget at GitHub again, but connections are not limited per deployment: a compromised control plane can use up the broker's 4096. Limit the port in front if your deployments do not trust one another's availability.
+
+## Many deployments behind one address
+
+A node dials its control plane by name, and that name is in its TLS ClientHello, in the clear. So a router that only reads the name and copies bytes can send each connection to its own deployment, with TLS still end to end: **the router never terminates TLS and holds no key.** The certificate a node verifies and the certificate it presents are its deployment's alone.
+
+Each deployment listens on loopback, where only the router reaches it, and says what nodes dial:
+
+```yaml
+server:
+  listen: 127.0.0.1:17001
+  bootstrap_listen: 127.0.0.1:17002
+  tls_router:
+    node_addr: a.nodes.billet.example:443
+    enroll_addr: a.enroll.billet.example:443
+```
+
+With `tls_router` a loopback wire serves mutual TLS, which a loopback wire otherwise does not, and the certificate it presents names those two addresses. They are DNS names because a client sends no SNI for an IP address, so the router could not route it; each deployment's two listeners have a name each, because the node wire demands a client certificate in the handshake and enrollment cannot. `billet ca token` prints these addresses for a joining machine. A node on the same host dials the router like any other, with a certificate: a `node` block in this file takes `node_addr` as its `server_addr`, and any other address is refused.
+
+The router's rule is that **a connection with no SNI, or naming no deployment, is refused at the router, never sent to a default deployment.** A node of one deployment pointed at another's name reaches that deployment's handshake and is refused there, because the other's authority did not sign its certificate.
+
+**The reference configuration is HAProxy,** at `deploy/router/haproxy.cfg` in the repository; billet's test suite runs that file through the whole scenario. Add a `use_backend` and a backend per listener per deployment:
+
+```{literalinclude} ../../deploy/router/haproxy.cfg
+:language: text
+```
+
+**The metrics endpoint stays on loopback,** with no route through the router: scrape it from the host.
+
+**What a deployment sees of a routed connection is the router's address, and nothing reads it.** The wire's two connection budgets count connections rather than addresses, so nothing here needs the PROXY protocol, and no deployment speaks it. They are per deployment, so one deployment's traffic cannot use up another's on its own listeners. **The router is shared, though:** every deployment behind it has the one `maxconn`, and the reference file limits one source address to 2000 connections so that a stranger's silent connections cannot hold them all. Raise that past the most nodes you have behind one NAT.
+
+**A node dialling the router by IP address gets no explanation.** It sends no SNI, so the router refuses it, and on the node that reads as a connection failing and retrying without end. Set `server_addr` to the name in `node_addr`.
+
+**An active-passive pair needs a router on each controller,** or a router that can reach both, because the listeners stay on loopback. `billet server retire` asks for `--endpoint-failover-verified` here, because a routed node endpoint is always a DNS name.

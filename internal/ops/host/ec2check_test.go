@@ -42,13 +42,15 @@ type fakeEC2Topology struct {
 	untaggedImage bool
 	// imageContract stamps the image with this contract instead of the current one.
 	imageContract string
-	authzCode     string          // the code a RunInstances DryRun answers ("DryRunOperation")
-	unavailAMI    map[string]bool // AMIs that answer InvalidAMIID.NotFound; others are available
-	instances     []fakeInstance  // running instances DescribeInstances reports
-	runRec        *runRecorder
-	profile       string
-	queueDenied   bool
-	authFailure   bool
+	// windowsImage has DescribeImages report a Windows AMI.
+	windowsImage bool
+	authzCode    string          // the code a RunInstances DryRun answers ("DryRunOperation")
+	unavailAMI   map[string]bool // AMIs that answer InvalidAMIID.NotFound; others are available
+	instances    []fakeInstance  // running instances DescribeInstances reports
+	runRec       *runRecorder
+	profile      string
+	queueDenied  bool
+	authFailure  bool
 }
 
 // fakeInstance is one running instance the fake's DescribeInstances reports.
@@ -246,9 +248,14 @@ func fakeEC2With(t *testing.T, topo fakeEC2Topology) string {
 			// case — every AMI built before billet stamped its output is in it —
 			// and TestAnImageBelowTheContractIsReported covers it deliberately
 			// rather than every other test inheriting the warning by accident.
+			platform := ""
+			if topo.windowsImage {
+				platform = `<platform>windows</platform>`
+			}
+
 			writeXML(t, w, `<DescribeImagesResponse><imagesSet><item>`+
 				`<imageId>`+params.Get("ImageId.1")+`</imageId>`+
-				`<imageState>`+state+`</imageState>`+
+				`<imageState>`+state+`</imageState>`+platform+
 				`<rootDeviceName>/dev/xvda</rootDeviceName><rootDeviceType>ebs</rootDeviceType>`+
 				`<blockDeviceMapping><item><deviceName>/dev/xvda</deviceName>`+
 				`<ebs><deleteOnTermination>true</deleteOnTermination></ebs></item></blockDeviceMapping>`+

@@ -275,7 +275,7 @@ func TestALogIndexIDCountsOnlyOnItsWire(t *testing.T) {
 	for _, tc := range []struct {
 		version int
 		want    string
-	}{{38, ""}, {39, "index-a"}} {
+	}{{39, ""}, {40, "index-a"}} {
 		c := registeredAt(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(nodeapi.RegisterResponse{Version: tc.version, LeaseTTLSeconds: 60,

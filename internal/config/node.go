@@ -681,6 +681,21 @@ func (c *Config) validateControlPlanes() []error {
 func (c *Config) validateNodeTLS() []error {
 	var errs []error
 
+	// A ROUTED WIRE IS REACHED BY ITS ROUTER'S NAME, from this host as from any other: it
+	// demands a certificate on loopback too, and presents one naming only the router's
+	// names, so any other address fails at the handshake in words that name no config key.
+	// EVERY ADDRESS, when a node names several: the control plane in this file is one
+	// listener, behind one router name.
+	if c.Server != nil && c.Server.TLSRouter != nil {
+		for _, addr := range c.Node.ControlPlanes() {
+			if !strings.EqualFold(strings.TrimSpace(addr), strings.TrimSpace(c.Server.TLSRouter.NodeAddr)) {
+				return append(errs, fmt.Errorf("node.server_addr is %q, which is not server.tls_router.node_addr %q: "+
+					"this control plane's certificate names the router's addresses, so a node dials the router, "+
+					"with node.tls", addr, c.Server.TLSRouter.NodeAddr))
+			}
+		}
+	}
+
 	if c.Node.TLS == nil {
 		// EVERY CONTROLLER THE NODE DIALS, because one remote address is enough
 		// for the node to reach the network unauthenticated.
@@ -705,7 +720,7 @@ func (c *Config) validateNodeTLS() []error {
 	//
 	// So the question is only answerable when this file describes both roles. A
 	// standalone node's file says nothing about how the server bound its listener.
-	if c.Server != nil && LoopbackAddr(c.Server.Listen) {
+	if c.Server != nil && !c.Server.WireServesTLS() {
 		errs = append(errs, fmt.Errorf(
 			"node.tls is set, but server.listen is %q — a control plane that accepts only on "+
 				"loopback serves plain HTTP, because there is nothing between the two "+

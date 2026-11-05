@@ -70,7 +70,6 @@
     },
     "cache": {
       "publish": "Command.tier.cache.publish",
-      "keep_logs": true,
       "owner": "Command.tier.cache.owner",
       "repository": "Command.tier.cache.repository",
       "docker": {
@@ -124,15 +123,5 @@
     "manifest_sha256": "Command.upgrade.manifest_sha256",
     "rollout_id": "Command.upgrade.rollout_id",
     "generation": 711021661
-  },
-  "log_read": {
-    "lease": "Command.log_read.lease",
-    "ranges": [
-      {
-        "first": 1791624903,
-        "last": 907745063
-      }
-    ],
-    "max_bytes": 1378189617
   }
 }

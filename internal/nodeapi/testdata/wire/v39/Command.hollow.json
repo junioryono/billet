@@ -88,10 +88,5 @@
     "manifest_sha256": "",
     "rollout_id": "",
     "generation": 0
-  },
-  "log_read": {
-    "lease": "",
-    "ranges": [],
-    "max_bytes": 0
   }
 }

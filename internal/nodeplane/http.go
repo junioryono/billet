@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -2771,49 +2770,6 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 	default:
 		writeErr(w, http.StatusInternalServerError, "", err.Error())
 	}
-}
-
-// LoopbackOnly reports whether an address is safe to serve the node wire on
-// without TLS.
-//
-// config.LoopbackAddr answers the same question for validation, and the two must
-// agree: whether a node needs a certificate is decided by whether the listener
-// will ask for one.
-//
-// Until mTLS lands the node names itself in the path and nothing verifies that
-// claim, so a listener reachable beyond this host would let anything on the
-// network bind leases and take commands. Refusing is the only honest option; the
-// alternative is a deployment that looks like it works and has no boundary at
-// all.
-func LoopbackOnly(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		// Not an address billet can reason about, so not one it will serve on.
-		return false
-	}
-
-	// AN EMPTY HOST IS THE WILDCARD, NOT LOOPBACK, and the first version of this
-	// function said the opposite. net.Listen("tcp", ":7717") binds every
-	// interface, so treating ":7717" as safe served the unauthenticated wire to
-	// the whole network while reporting that it had not — with a JIT credential
-	// endpoint behind it. The test asserted that behaviour too, which pinned the
-	// hole rather than catching it.
-	if host == "" {
-		return false
-	}
-
-	// The one hostname whose meaning is fixed by convention everywhere billet
-	// runs. Anything else that might resolve to loopback is not trusted: what it
-	// resolves to is not knowable here and can change under the process.
-	if host == "localhost" {
-		return true
-	}
-
-	// ASKED, not pattern-matched. 127.0.0.1, ::1 and the rest of 127/8 are all
-	// loopback and a prefix test on the string got some of them by accident.
-	ip := net.ParseIP(host)
-
-	return ip != nil && ip.IsLoopback()
 }
 
 // hasJIT reports whether any credential-holding source is attached.

@@ -46,7 +46,7 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 | `ansible_collections/junioryono/billet` | The `host` and `development_host` roles and their scenario tests. |
 | `terraform/modules` | The AWS infrastructure modules. |
 | `actions/` | The published Actions: `stickydisk`, `setup-docker-builder`, `stop-docker-builder`, `build-push-action`, and `converge-fleet`, which runs the collection from its own checkout. |
-| `scripts/` | Guest image and kernel builds, release tooling, `install.sh`, rehearsals, repository gates, and the Go tests that execute those scripts. |
+| `scripts/` | Guest image and kernel builds, the AMI builds (`ami/`, and `windows/`, the PowerShell a Windows AMI's build runs), release tooling, `install.sh`, rehearsals, repository gates, and the Go tests that execute those scripts. |
 | `tools/lint` | billet's own analyzers (`parallelshared`, `rawsql`), a nested module so `go/analysis` never ships in the binary. |
 | `docs/` | The Sphinx site: getting started, concepts, deploying, operating, reference (CLI, configuration, decisions, records). |
 
@@ -158,4 +158,4 @@ This repository also supports OpenAI Codex, which reads the cross-tool standard 
 
 ## Platform support
 
-Linux (amd64, arm64) and macOS (arm64). A Windows port needs an equivalent of the `flock`-based state lock.
+A billet role runs on Linux (amd64, arm64) and macOS (arm64). A billet node on Windows needs an equivalent of the `flock`-based state lock and more; [ADR-026](docs/reference/decisions/adr-026-windows-on-ec2.md) counts what. Windows jobs run on EC2, launched from one of those.
