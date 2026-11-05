@@ -381,8 +381,10 @@ func parseAPIError(payload []byte, status int) error {
 
 // instanceItem is one instance as the API describes it.
 type instanceItem struct {
-	InstanceID string `xml:"instanceId"`
-	State      struct {
+	InstanceID   string `xml:"instanceId"`
+	InstanceType string `xml:"instanceType"`
+	PrivateIP    string `xml:"privateIpAddress"`
+	State        struct {
 		Name string `xml:"name"`
 	} `xml:"instanceState"`
 	// StateReason says WHO stopped it, which "stopped" alone does not.
