@@ -1,6 +1,6 @@
--- migration 71: usage_export, for PostgreSQL
+-- migration 72: usage_export, for PostgreSQL
 --
--- The twin of migrations/0071_usage_export.sql.
+-- The twin of migrations/0072_usage_export.sql.
 --
 -- It carries that file's statements with SQLite's spellings translated and
 -- nothing else changed, so the two read side by side. The reasoning lives

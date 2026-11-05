@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,9 @@ func startedAt(f Flow, at time.Time) Flow {
 
 	return f
 }
+
+// saysWhy reports whether r is incomplete for exactly the reasons named.
+func saysWhy(r Result, why ...string) bool { return r.Incomplete && slices.Equal(r.IncompleteWhy, why) }
 
 func only(t *testing.T, r Result, want Destination) {
 	t.Helper()
@@ -604,15 +608,201 @@ func TestMarkIncompleteMarksOnlyThatJob(t *testing.T) {
 	a := NewAccountant()
 	a.Watch("marked", guest, began, nil)
 	a.Watch("other", other, began, nil)
-	a.MarkIncomplete("marked")
-	a.MarkIncomplete("never-watched")
+	a.MarkIncomplete("marked", WhyTableUnread)
+	a.MarkIncomplete("never-watched", WhyTableUnread)
 
-	if r, _ := a.Final("marked", nil, ended); !r.Incomplete {
-		t.Error("a marked job was complete")
+	if r, _ := a.Final("marked", nil, ended); !r.Incomplete || !slices.Equal(r.IncompleteWhy, []string{WhyTableUnread}) {
+		t.Errorf("a marked job: incomplete %v, why %v", r.Incomplete, r.IncompleteWhy)
 	}
 
-	if r, _ := a.Final("other", nil, ended); r.Incomplete {
-		t.Error("marking one job marked another")
+	if r, _ := a.Final("other", nil, ended); r.Incomplete || r.IncompleteWhy != nil {
+		t.Errorf("marking one job marked another: incomplete %v, why %v", r.Incomplete, r.IncompleteWhy)
+	}
+}
+
+// fillRing fills the unclaimed ring from source so that everything held before
+// is dropped, and is dropped under its own source.
+func fillRing(a *Accountant, source netip.Addr, at time.Time) {
+	for i := range MaxUnclaimed {
+		a.Observe(startedAt(flow(uint32(1_000_000+i), source, npm, 1, 1), at))
+	}
+}
+
+// A FLOW THE RING DROPPED IS A JOB'S TO LOSE ONLY IF IT CAME FROM THE JOB'S OWN
+// ADDRESS: attribution is by source, so the host's own traffic and every other
+// guest's, however much of it the ring turned over since this job's grant, is
+// no flow this job lost, and its result stays whole (#678).
+func TestOnlyAFlowFromTheJobsOwnAddressMarksItWhenTheRingDropsIt(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		dropped Flow
+		why     []string
+		unknown bool
+	}{
+		"another address's flow":                       {dropped: flow(1, other, github, 1, 1)},
+		"another address's flow with no packet counts": {dropped: flow(1, other, github, 0, 0)},
+		"another address's flow with no start time":    {dropped: startedAt(flow(1, other, github, 1, 1), time.Time{})},
+		"the job's own flow":                           {dropped: flow(1, guest, github, 1, 1), why: []string{WhyDropped}},
+		"the job's own flow with no packet counts":     {dropped: flow(1, guest, github, 0, 0), why: []string{WhyDropped}, unknown: true},
+		"the job's own flow with no start time": {dropped: startedAt(flow(1, guest, github, 1, 1), time.Time{}),
+			why: []string{WhyDropped}},
+		"the previous holder's flow": {dropped: startedAt(flow(1, guest, github, 1, 1), began.Add(-time.Minute))},
+	} {
+		a := NewAccountant()
+		a.now = func() time.Time { return started }
+		a.Up(began.Add(-time.Hour))
+		a.Observe(tc.dropped)
+		fillRing(a, netip.MustParseAddr("192.168.100.99"), started)
+
+		a.Watch("job", guest, began, nil)
+		r, _ := a.Final("job", nil, ended)
+		if !slices.Equal(r.IncompleteWhy, tc.why) || r.Incomplete != (tc.why != nil) || r.UnansweredUnknown != tc.unknown {
+			t.Errorf("%s: incomplete %v, why %v, unanswered unknown %v; want why %v, unknown %v", name, r.Incomplete,
+				r.IncompleteWhy, r.UnansweredUnknown, tc.why, tc.unknown)
+		}
+	}
+}
+
+// PAST MaxDroppedSources THE DROPS ARE FOLDED, and a fold errs toward a mark:
+// whose a folded drop was is no longer told, so every job granted before it is
+// marked and says so, and the record's size stays bounded.
+func TestDropsFromTooManySourcesAreFoldedAndMarkEveryJob(t *testing.T) {
+	t.Parallel()
+
+	a := NewAccountant()
+	a.Up(began.Add(-time.Hour))
+	source := func(i int) netip.Addr { return netip.AddrFrom4([4]byte{10, 9, byte(i >> 8), byte(i)}) }
+	counterless := func(i int) Flow { return flow(uint32(i+1), source(i), github, 0, 0) }
+	for i := range MaxUnclaimed + MaxDroppedSources + 1 {
+		a.Observe(counterless(i))
+	}
+	if len(a.droppedFrom) > MaxDroppedSources {
+		t.Fatalf("drops are held for %d sources, past the bound of %d", len(a.droppedFrom), MaxDroppedSources)
+	}
+
+	a.Watch("job", guest, began, nil)
+	r, _ := a.Final("job", nil, ended)
+	if !slices.Equal(r.IncompleteWhy, []string{WhyDroppedUntold}) || !r.UnansweredUnknown {
+		t.Errorf("after a fold: why %v, unanswered unknown %v; want %s and unknown", r.IncompleteWhy,
+			r.UnansweredUnknown, WhyDroppedUntold)
+	}
+
+	// A JOB GRANTED AFTER WHAT WAS FOLDED lost nothing to it.
+	a.Watch("later", guest, ended, nil)
+	if r, _ := a.Final("later", nil, ended.Add(time.Hour)); r.Incomplete || r.UnansweredUnknown {
+		t.Errorf("a job granted after the fold: why %v, unanswered unknown %v; want neither", r.IncompleteWhy,
+			r.UnansweredUnknown)
+	}
+}
+
+// A FOLD KEEPS THE LATEST OF EACH TIME, across folds, and never the drop that set
+// it off: each grant below sits between two of the times, so losing, or taking
+// the earliest of, any one of them reads wrong.
+func TestAFoldKeepsTheLatestOfEachKindOfDrop(t *testing.T) {
+	t.Parallel()
+
+	at := began.Add
+	a := NewAccountant()
+	a.now = func() time.Time { return at(2 * time.Minute) }
+	a.Up(began.Add(-time.Hour))
+	source := func(i int) netip.Addr { return netip.AddrFrom4([4]byte{10, 9, byte(i >> 8), byte(i)}) }
+	drop := func(f Flow) { a.noteDropped(&f) }
+
+	// THE FIRST WAVE FILLS THE RECORD: a latest start at one minute, a
+	// counterless flow at thirty seconds, and an unstamped one read at two.
+	drop(startedAt(flow(1, source(0), github, 1, 1), at(time.Minute)))
+	drop(startedAt(flow(2, source(1), github, 0, 0), at(30*time.Second)))
+	drop(startedAt(flow(3, source(2), github, 1, 1), time.Time{}))
+	for i := 3; i < MaxDroppedSources; i++ {
+		drop(startedAt(flow(uint32(i+1), source(i), github, 1, 1), began))
+	}
+
+	// THE DROP THAT SETS THE FOLD OFF stays told apart.
+	trigger := netip.MustParseAddr("10.8.0.1")
+	drop(startedAt(flow(9, trigger, github, 1, 1), at(3*time.Minute)))
+
+	check := func(name string, addr netip.Addr, grant time.Duration, unknown bool, why ...string) {
+		t.Helper()
+		a.Watch(name, addr, at(grant), nil)
+		r, _ := a.Final(name, nil, ended)
+		if !slices.Equal(r.IncompleteWhy, why) || r.UnansweredUnknown != unknown {
+			t.Errorf("%s: why %v, unanswered unknown %v; want why %v, unknown %v", name, r.IncompleteWhy,
+				r.UnansweredUnknown, why, unknown)
+		}
+	}
+	// EACH TIME BY ITSELF, since a grant is marked by whichever one still covers it.
+	folded := func(when string, start, unstamped, counterless time.Duration) {
+		t.Helper()
+		got := a.droppedUntold
+		if !got.start.Equal(at(start)) || !got.unstamped.Equal(at(unstamped)) || !got.counterless.Equal(at(counterless)) {
+			t.Errorf("%s: folded %+v; want start %s, unstamped %s, counterless %s past the grant", when, got, start,
+				unstamped, counterless)
+		}
+	}
+	folded("after the first fold", time.Minute, 2*time.Minute, 30*time.Second)
+	check("granted before the counterless drop", guest, 20*time.Second, true, WhyDroppedUntold)
+	check("granted before the latest start", guest, 45*time.Second, false, WhyDroppedUntold)
+	check("granted before only the unstamped drop", guest, 90*time.Second, false, WhyDroppedUntold)
+	check("granted after everything folded", guest, 150*time.Second, false)
+	check("the source that set the fold off", trigger, 150*time.Second, false, WhyDropped)
+	if len(a.droppedFrom) != 1 {
+		t.Fatalf("after the fold drops are held for %d sources, want the one that set it off", len(a.droppedFrom))
+	}
+
+	// A SECOND FOLD OF OLDER DROPS KEEPS WHAT THE FIRST HELD, and takes the later
+	// start of the one that set the first off.
+	for i := range MaxDroppedSources {
+		drop(startedAt(flow(uint32(i+1), source(i), github, 1, 1), began.Add(-time.Hour)))
+	}
+	folded("after the second fold", 3*time.Minute, 2*time.Minute, 30*time.Second)
+	check("granted before the first fold's counterless drop", guest, 20*time.Second, true, WhyDroppedUntold)
+}
+
+// EACH REASON THE ACCOUNTANT ITSELF FINDS IS NAMED, and only that one: this is
+// what says which rule a job's mark came from.
+func TestEachIncompleteReasonIsNamed(t *testing.T) {
+	t.Parallel()
+
+	inheritedEntry := startedAt(flow(1, guest, github, 1, 1), began.Add(-time.Minute))
+	for why, mark := range map[string]func(a *Accountant){
+		WhyEventsGap: func(a *Accountant) { a.Down() },
+		WhyNoStart:   func(a *Accountant) { a.Observe(startedAt(flow(1, guest, github, 1, 1), time.Time{})) },
+		WhyTooManyFlows: func(a *Accountant) {
+			for i := range MaxFlows + 1 {
+				a.Observe(flow(uint32(i+1), guest, github, 1, 1))
+			}
+		},
+		WhyInherited: func(a *Accountant) {
+			grown := inheritedEntry
+			grown.OrigPackets++
+			a.Observe(grown)
+		},
+	} {
+		a := NewAccountant()
+		a.Watch("job", guest, began, []Flow{inheritedEntry})
+		mark(a)
+		r, _ := a.Final("job", nil, ended)
+		if !r.Incomplete || !slices.Equal(r.IncompleteWhy, []string{why}) {
+			t.Errorf("%s: incomplete %v, why %v", why, r.Incomplete, r.IncompleteWhy)
+		}
+	}
+
+	// A GAP THE JOB'S GRANT FALLS INSIDE, read as it is watched.
+	gap := NewAccountant()
+	gap.Down()
+	gap.Watch("job", guest, began, nil)
+	if r, _ := gap.Final("job", nil, ended); !slices.Equal(r.IncompleteWhy, []string{WhyEventsGap}) {
+		t.Errorf("a job watched during a gap: why %v", r.IncompleteWhy)
+	}
+
+	// SEVERAL REASONS ARE ALL NAMED, sorted.
+	both := NewAccountant()
+	both.Watch("job", guest, began, nil)
+	both.Observe(startedAt(flow(1, guest, github, 1, 1), time.Time{}))
+	both.Down()
+	if r, _ := both.Final("job", nil, ended); !slices.Equal(r.IncompleteWhy, []string{WhyEventsGap, WhyNoStart}) {
+		t.Errorf("two reasons: why %v", r.IncompleteWhy)
 	}
 }
 

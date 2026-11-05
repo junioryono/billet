@@ -3729,7 +3729,7 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 	// is about to be reaped.
 	// IN THE TRANSACTION THAT CLOSES THE LEASE, so the number and the close commit
 	// together and in order: `billet usage export` reads past a number knowing no
-	// lower one can still appear (migration 71).
+	// lower one can still appear (migration 72).
 	sequence, err := state.WriteQueries(tx).NextUsageSeq(ctx)
 	if err != nil {
 		return fmt.Errorf("alloc: number lease %s's usage: %w", l.ID, err)
@@ -3810,7 +3810,7 @@ const timestampFormat = "2006-01-02T15:04:05.000000000Z07:00"
 // ts renders a timestamp so string comparison matches chronological order.
 func ts(t time.Time) string { return t.UTC().Format(timestampFormat) }
 
-// newUsageMark is drawn each time a number is written. Migration 71 says what it is for.
+// newUsageMark is drawn each time a number is written. Migration 72 says what it is for.
 func newUsageMark() (string, error) {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {

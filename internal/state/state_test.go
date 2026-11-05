@@ -1164,6 +1164,10 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 			`ALTER TABLE job_history DROP COLUMN github_scale_set_assigned_at`,
 			`ALTER TABLE job_history DROP COLUMN github_runner_assigned_at`,
 			`ALTER TABLE job_history DROP COLUMN bought_at`,
+			`DROP TABLE job_test_results`,
+			`ALTER TABLE job_history DROP COLUMN head_sha`,
+			`ALTER TABLE job_history DROP COLUMN head_branch`,
+			`ALTER TABLE job_history DROP COLUMN run_attempt`,
 			`DROP TABLE job_guest_reports`,
 			`DROP TABLE job_destinations`,
 			`DROP TABLE job_usage`,
@@ -1278,6 +1282,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	requireIndex(t, upgraded, "job_history_disrupted_idx")
 	requireIndex(t, upgraded, "pending_completions_lease_idx")
 	requireIndex(t, upgraded, "job_guest_reports_recorded_at")
+	requireIndex(t, upgraded, "job_test_results_recorded_at")
 	requireIndex(t, upgraded, "job_history_started_idx")
 	requireIndex(t, upgraded, "job_history_github_run_idx")
 	requireIndex(t, upgraded, "job_history_run_idx")
@@ -1524,7 +1529,7 @@ func TestAPendingCompletionWrittenAtVersion25SurvivesVersion26(t *testing.T) {
 			`ALTER TABLE job_history DROP COLUMN usage_mark`,
 			`ALTER TABLE job_history DROP COLUMN github_finished_at`,
 			`ALTER TABLE job_history DROP COLUMN github_target`,
-			`DELETE FROM schema_migrations WHERE version = 71`,
+			`DELETE FROM schema_migrations WHERE version = 72`,
 			`INSERT INTO pending_completions
 			 (tier, request_id, run_id, result, lease_id, lease_epoch, outcome,
 			  release_only, lease_node, message_id, retired, acknowledged)

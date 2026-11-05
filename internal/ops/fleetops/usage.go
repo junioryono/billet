@@ -313,7 +313,7 @@ func newUsageRecord(cfg *config.Config, deployment string, row *state.UsageRow) 
 
 	if row.Target == "" {
 		r.Unknown["target"] = "no runner was registered for this lease, or it finished before billet recorded " +
-			"the owner on the history (migration 71)"
+			"the owner on the history (migration 72)"
 	}
 	if row.Repository == "" {
 		r.Unknown["repository"] = "GitHub never named a job's repository for this lease"
@@ -366,7 +366,7 @@ func (r *usageRecord) setShape(row *state.UsageRow) {
 //
 // BILLED MINUTES ARE THE JOB'S, ON GITHUB'S CLOCK WHERE IT SAID, rounded up per lease to
 // a whole minute, which is how GitHub bills a hosted job. Billet's own two times are when
-// it received the messages, which migration 71 measures as far later than the job for
+// it received the messages, which migration 72 measures as far later than the job for
 // the start, so they stand in only as a pair and the record says so. A lease whose job
 // never started has a known zero;
 // one GitHub finished without billet seeing it start, or that ended before GitHub
@@ -387,7 +387,7 @@ func (r *usageRecord) setIntervals(row *state.UsageRow) {
 	switch {
 	case row.BoughtAt == "":
 		r.Unknown["held.from"] = "billet did not record when this lease was bought: it finished before billet " +
-			"kept that for every lease (migration 71)"
+			"kept that for every lease (migration 72)"
 		r.Unknown["held.seconds"] = r.Unknown["held.from"]
 	case row.FinishedAt == "":
 		r.Unknown["held.to"] = "the history row has a usage number and no finish time, which billet does not write"

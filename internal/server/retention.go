@@ -83,7 +83,7 @@ const (
 )
 
 // numberUsage gives the leases that finished before there were usage numbers their
-// numbers, until ctx ends. Migration 71 says why this is not the migration's to do. It
+// numbers, until ctx ends. Migration 72 says why this is not the migration's to do. It
 // decides nothing: a pass that fails is logged and the next one tries again.
 func (s *Server) numberUsage(ctx context.Context) {
 	tick := time.NewTicker(retentionEvery)
