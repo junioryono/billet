@@ -200,6 +200,17 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		// store, and the two look identical in every other line of this report.
 		fmt.Fprintf(env.Stdout, "app key  %s\n", app.KeyLocation(cfg, target))
 
+		if cfg.Server != nil && cfg.Server.TokenBroker != nil {
+			verdict, err := checkBrokerTokens(ctx, env, cfg, target, skipNetworkProbes)
+			if err != nil {
+				githubFailure = errors.Join(githubFailure, err)
+			}
+
+			report.github = worseGitHubVerdict(report.github, verdict)
+
+			continue
+		}
+
 		key, err := app.ResolveAppKey(ctx, cfg, target)
 		if err != nil {
 			return report, err
@@ -754,13 +765,10 @@ func checkTierRunnerGroup(
 		return true, nil
 	}
 
-	key, err := app.ResolveAppKey(ctx, cfg, target)
+	policy, err := checkPolicyClient(ctx, cfg, target)
 	if err != nil {
 		return false, err
 	}
-
-	policy := github.NewRunnerGroupPolicyClientAt(app.GitHubAPIBase, app.GitHubTargetOf(target), target.AppID,
-		target.InstallationID, key)
 
 	id, isDefault, err := policy.FindRunnerGroupID(ctx, t.RunnerGroup)
 	if err != nil {
