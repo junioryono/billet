@@ -79,6 +79,8 @@ type Server struct {
 	hurry <-chan struct{}
 	// foregroundLaunches is set by WithForegroundLaunches.
 	foregroundLaunches bool
+	// listenerTimings is set by WithListenerTimings.
+	listenerTimings *ListenerTimings
 	// restartHandoff makes an unsealed stop a handoff; see WithRestartHandoff.
 	restartHandoff bool
 
@@ -288,6 +290,11 @@ func WithHurry(c <-chan struct{}) ControlPlaneOption {
 // a launch still out is not quiet.
 func WithForegroundLaunches() ControlPlaneOption {
 	return func(s *Server) { s.foregroundLaunches = true }
+}
+
+// WithListenerTimings has every listener report how long its loop's steps take.
+func WithListenerTimings(t *ListenerTimings) ControlPlaneOption {
+	return func(s *Server) { s.listenerTimings = t }
 }
 
 // WithStopHandoff makes every listener hand over to the next control plane, rather
@@ -818,6 +825,10 @@ func (s *Server) listenerOpts(prov Provisioner) []Option {
 	// listeners, so a control plane that handed some of them a queue and not
 	// others would be fair about part of its fleet.
 	opts = append(opts, WithAdmissionQueue(s.order))
+
+	if s.listenerTimings != nil {
+		opts = append(opts, WithTimings(s.listenerTimings))
+	}
 
 	if s.runner != nil {
 		opts = append(opts, WithRunner(s.runner))

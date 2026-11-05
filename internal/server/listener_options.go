@@ -39,6 +39,11 @@ func WithRunner(r dispatch.Runner) Option {
 	return func(l *Listener) { l.runner = r }
 }
 
+// WithTimings has this listener report how long its loop's steps take.
+func WithTimings(t *ListenerTimings) Option {
+	return func(l *Listener) { l.timings = t }
+}
+
 // WithRunnerRegistry installs the GitHub side of safe runner retirement.
 // WithCachePublication gives the listener its tier's effective cache
 // configuration and the target's run evidence, which a completion's cache
