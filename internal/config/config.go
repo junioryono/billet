@@ -379,7 +379,7 @@ func (c *Config) applyDefaults() {
 		if c.Node.StateDir == "" {
 			c.Node.StateDir = defaultStateDir("node")
 		}
-		if c.Node.ServerAddr == "" && c.Server != nil {
+		if c.Node.ServerAddr == "" && c.Node.ServerAddrs == nil && c.Server != nil {
 			c.Node.ServerAddr = c.Server.Listen
 		}
 

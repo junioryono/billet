@@ -73,6 +73,56 @@ func TestSharedMaxAgeDecidesTheLifetimeAndForbidsAStaleAnswer(t *testing.T) {
 	}
 }
 
+// ONLY A VERSION DOCUMENT THE REGISTRY SAID NOTHING OF is given a lifetime: what it
+// did say stands, a stated 0, an Expires, a validator and a must-revalidate among
+// it, and no other object is given one. Billet does not read Expires, so an entry
+// that has one is asked for again every time, as it always was.
+func TestOnlyAVersionDocumentWithNoLifetimeIsGivenOne(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	field := func(name string, values ...string) http.Header { return http.Header{name: values} }
+	for _, tc := range []struct {
+		name         string
+		object       npmObject
+		header       http.Header
+		lifetime     time.Duration
+		staleAllowed bool
+	}{
+		{"no header", npmVersionDocument, http.Header{}, 300 * time.Second, true},
+		{"no lifetime in the header", npmVersionDocument, field("Cache-Control", "public"), 300 * time.Second, true},
+		{"a stated lifetime", npmVersionDocument, field("Cache-Control", "max-age=60"), time.Minute, true},
+		{"a stated zero", npmVersionDocument, field("Cache-Control", "max-age=0"), 0, true},
+		{"a stated s-maxage", npmVersionDocument, field("Cache-Control", "s-maxage=0"), 0, false},
+		{"must-revalidate alone", npmVersionDocument, field("Cache-Control", "must-revalidate"), 0, false},
+		{"proxy-revalidate alone", npmVersionDocument, field("Cache-Control", "proxy-revalidate"), 0, false},
+		{"an Expires already past", npmVersionDocument, field("Expires", now.Add(-time.Hour).Format(http.TimeFormat)), 0, true},
+		{"an Expires to come", npmVersionDocument, field("Expires", now.Add(time.Hour).Format(http.TimeFormat)), 0, true},
+		{"an unreadable Expires", npmVersionDocument, field("Expires", "0"), 0, true},
+		{"an empty Expires", npmVersionDocument, field("Expires", ""), 0, true},
+		{"an empty Expires before another", npmVersionDocument, field("Expires", "", "0"), 0, true},
+		{"an ETag", npmVersionDocument, field("Etag", `"v1"`), 0, true},
+		{"a Last-Modified", npmVersionDocument, field("Last-Modified", now.Format(http.TimeFormat)), 0, true},
+		{"a package document", npmPackageDocument, http.Header{}, 0, true},
+		{"a tarball", npmTarball, http.Header{}, 0, true},
+	} {
+		entry := npmEntry{Object: tc.object}
+		npmFreshness(&entry, tc.header, now, now)
+		if entry.Lifetime != tc.lifetime {
+			t.Errorf("%s: lifetime = %s, want %s", tc.name, entry.Lifetime, tc.lifetime)
+		}
+		if tc.lifetime > 0 && !entry.fresh(now.Add(tc.lifetime-time.Second)) {
+			t.Errorf("%s: stale just inside its lifetime", tc.name)
+		}
+		if entry.fresh(now.Add(tc.lifetime)) {
+			t.Errorf("%s: fresh at the end of its lifetime", tc.name)
+		}
+		if got := entry.staleUsable(now.Add(tc.lifetime + time.Minute)); got != tc.staleAllowed {
+			t.Errorf("%s: stale answer allowed = %v, want %v", tc.name, got, tc.staleAllowed)
+		}
+	}
+}
+
 // A TARBALL'S YEAR IS CAPPED AT A DAY, which is billet's ceiling and not the
 // registry's expiry: past the day it is asked for again, but a registry that
 // gives no answer may still be answered from it for the stale hour, because
