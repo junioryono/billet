@@ -138,6 +138,22 @@ server:
   #       # it in the service's environment, the way the App private key is kept
   #       # out of here.
   #       dsn_env: BILLET_STATE_DSN
+  #       # The most connections one process of this deployment holds: the writer,
+  #       # the controller claim's session and its readers. At least 3; absent, 6.
+  #       # Worth setting when many deployments share one server's max_connections.
+  #       # A transaction-mode pooler cannot carry these.
+  #       max_connections: 4
+
+  # Take installation tokens from a broker holding the App's key, for an operator
+  # running many deployments under one App, so that no control plane holds a key
+  # that reaches every other deployment. With this, no target names a
+  # private_key_path; `billet broker client-key` creates the key below, and prints
+  # what to register at the broker.
+  #
+  # token_broker:
+  #   url: https://broker.internal:8443
+  #   ca_file: /etc/billet/broker-ca.pem
+  #   client_key_path: /etc/billet/broker-client.key
 
   # How long a stopping billet waits for the jobs it is ALREADY running before it
   # destroys them. This is what makes `systemctl restart` free rather than a way
@@ -164,6 +180,15 @@ server:
   # the whole ledger at every start.
   #
   # job_detail_retention: 72h
+
+  # How long the ledger keeps a job's test suites and cases, which `billet tests
+  # stats` ranks, and how many bytes of them in all, the oldest deleted first. They
+  # are the job's own VM's report, kept apart from its guest report and for longer,
+  # since a flaky test shows itself over many runs. At least 1h and 1MiB; absent,
+  # 336h and 128MiB. The control plane reads the whole ledger at every start.
+  #
+  # test_results_retention: 336h
+  # test_results_max_bytes: 128MiB
 
   # Prometheus metrics for this control plane, at http://<listen>/metrics.
   # Absent, nothing is served. A literal loopback address (127.0.0.1 or [::1],
@@ -1138,6 +1163,10 @@ tiers:
     # grows past this size. Defaults to 20GiB; at most 100GiB.
     buildkit_cache_mount_limit: 20GiB
 
+  # minute_weight says what one minute of a tier counts as in `billet usage
+  # export`, in minutes of a 2 vCPU Linux runner. Absent, it is the vCPU charged
+  # over two, so this tier counts double. Set it where vCPU alone does not say
+  # what a minute is worth, such as a macOS tier. It reports and decides nothing.
   - label: billet-4vcpu-ubuntu-2404
     provider: firecracker
     # Omitted trust safely defaults to untrusted. Interception needs a trusted

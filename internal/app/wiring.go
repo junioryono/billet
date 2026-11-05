@@ -138,10 +138,11 @@ func (p Provisioner) RESTHeadroom() (int64, int64, time.Time, bool) {
 	return p.Client.RESTHeadroom()
 }
 
-// RunQueueTimes reads when GitHub queued each job of a run, by runner name.
-func (p Provisioner) RunQueueTimes(ctx context.Context, owner, repository string, runID int64,
-) (map[string]time.Time, error) {
-	return p.Client.RunQueueTimes(ctx, owner, repository, runID)
+// RunJobs reads when GitHub queued each job of a run and the commit it ran on, by
+// runner name.
+func (p Provisioner) RunJobs(ctx context.Context, owner, repository string, runID int64,
+) (map[string]server.RunJob, error) {
+	return p.Client.RunJobs(ctx, owner, repository, runID)
 }
 
 // WorkflowRun reads GitHub's record of one run, for a cache authority.

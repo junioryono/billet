@@ -1,6 +1,7 @@
 package lease
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -13,6 +14,14 @@ const GuestReportCodec = 1
 // MaxGuestReportBytes bounds one lease's encoded guest report. Base64 makes it
 // about 350 KiB on the wire, well inside the node wire's 1 MiB body limit.
 const MaxGuestReportBytes = 256 << 10
+
+// TestResultsCodec is the one encoding of a guest report's Tests this control plane
+// keeps, and MaxTestResultsBytes bounds them. Base64 makes them about 87 KiB on the
+// wire, which the node wire's 1 MiB body holds beside Data.
+const (
+	TestResultsCodec    = 1
+	MaxTestResultsBytes = 64 << 10
+)
 
 // MaxGuestAgentVersion bounds the agent's version string, in bytes.
 const MaxGuestAgentVersion = 64
@@ -44,6 +53,13 @@ type GuestReport struct {
 	// at most MaxGuestReportBytes.
 	Codec int    `json:"codec"`
 	Data  []byte `json:"data"`
+	// TestsCodec names how Tests is encoded (TestResultsCodec), and Tests is the
+	// job's test suites and cases as the node encoded them, opaque to the control
+	// plane and at most MaxTestResultsBytes; both are empty for a job that reported
+	// no cases or a pairing below VersionJobTests. The ledger keeps them apart from
+	// Data, for longer.
+	TestsCodec int    `json:"tests_codec,omitempty"`
+	Tests      []byte `json:"tests,omitempty"`
 	// Accepted and Refused count the batches the node took from the agent and
 	// the ones it would not take; DroppedBytes is what it took and could not
 	// keep within Data's bound.
@@ -75,6 +91,9 @@ func (g GuestReport) Validate() error {
 		return fmt.Errorf("alloc: a guest report of %d bytes is over the %d byte bound",
 			len(g.Data), MaxGuestReportBytes)
 	}
+	if err := g.validateTests(); err != nil {
+		return err
+	}
 	// NO SPACE AND NO CONTROL CHARACTER, because a reader prints it on one line
 	// beside fields the guest does not control. The refusal names where, never
 	// what: the guest wrote it, and a refusal travels back to the node and into
@@ -98,6 +117,32 @@ func (g GuestReport) Validate() error {
 	}
 
 	return g.validateTimes()
+}
+
+// validateTests refuses test results the ledger could not keep faithfully: an
+// encoding this control plane does not know, a codec naming nothing, or bytes over
+// their bound.
+func (g GuestReport) validateTests() error {
+	switch {
+	case g.TestsCodec == 0 && len(g.Tests) == 0:
+		return nil
+	case g.TestsCodec != TestResultsCodec:
+		return fmt.Errorf("alloc: test results codec %d is not one this control plane keeps", g.TestsCodec)
+	case len(g.Tests) == 0:
+		return errors.New("alloc: a guest report names a test results codec and carries none")
+	case len(g.Tests) > MaxTestResultsBytes:
+		return fmt.Errorf("alloc: test results of %d bytes are over the %d byte bound",
+			len(g.Tests), MaxTestResultsBytes)
+	}
+
+	return nil
+}
+
+// WithoutTests is the report a wire below VersionJobTests carries.
+func (g GuestReport) WithoutTests() GuestReport {
+	g.TestsCodec, g.Tests = 0, nil
+
+	return g
 }
 
 func (g GuestReport) validateTimes() error {

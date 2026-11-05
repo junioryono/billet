@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 38
+	Version = 39
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -509,6 +509,17 @@ const (
 	// naming one is refused to a node below this at dispatch and again at delivery.
 	VersionArchitectures = 37
 
+	// VersionJobTests is the version from which a guest report may carry the job's
+	// test suites and cases (lease.GuestReport's tests, #536), which the ledger keeps
+	// past the report's own retention and `billet tests stats` ranks.
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT, because
+	// an older plane decodes the request strictly and would refuse the whole report
+	// over the field: below it the node sends the rest. CHECKED WHERE IT IS READ too,
+	// so a pairing that negotiated below it and sends them anyway has the report kept
+	// without them.
+	VersionJobTests = 38
+
 	// VersionTartVerified is the version from which a node reads a Tart tier's
 	// `<image>@verified` and a registration's answer carries the node's macOS limit
 	// (RegisterResponse's macos_vm_limit), which a verification beside the node counts
@@ -518,7 +529,7 @@ const (
 	// records that its control plane does not say. CHECKED WHERE A LAUNCH IS SENT: an
 	// older node hands `@verified` to `tart fqn` as a name, so a Tart tier naming it is
 	// refused to a node below this at dispatch and again at delivery.
-	VersionTartVerified = 38
+	VersionTartVerified = 39
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

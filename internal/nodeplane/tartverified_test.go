@@ -26,25 +26,25 @@ func TestARegistrationCarriesItsNodesMacOSLimitFromItsVersion(t *testing.T) {
 
 	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute, WithMacOSLimits(limit))
 
-	res := p.wireResponse(38, "n1")
+	res := p.wireResponse(39, "n1")
 	if res.MacOSVMLimit == nil || *res.MacOSVMLimit != 5 {
-		t.Fatalf("at wire 38 the answer carries %v, want 5", res.MacOSVMLimit)
+		t.Fatalf("at wire 39 the answer carries %v, want 5", res.MacOSVMLimit)
 	}
 
 	// A ZERO IS AN ANSWER, which the pointer keeps from reading as silence.
-	res = p.wireResponse(38, "n2")
+	res = p.wireResponse(39, "n2")
 	if res.MacOSVMLimit == nil || *res.MacOSVMLimit != 0 {
 		t.Fatalf("for a node of no macOS guests the answer carries %v, want 0", res.MacOSVMLimit)
 	}
 
 	// LITERAL, so moving the constant cannot move the boundary a fleet already runs.
-	raw, err := json.Marshal(p.wireResponse(37, "n1"))
+	raw, err := json.Marshal(p.wireResponse(38, "n1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if strings.Contains(string(raw), "macos_vm_limit") {
-		t.Fatalf("at wire 37 the answer names the field: %s", raw)
+		t.Fatalf("at wire 38 the answer names the field: %s", raw)
 	}
 }
 
@@ -85,7 +85,7 @@ func nodeAtWire(wire int, incarnation string) nodeapi.RegisterRequest {
 func TestAVerifiedTartTierIsNotLaunchedOnAnOlderNode(t *testing.T) {
 	t.Parallel()
 
-	p := verifiedPlane(t, verifiedTartTier(), nodeAtWire(37, "n1-1"))
+	p := verifiedPlane(t, verifiedTartTier(), nodeAtWire(38, "n1-1"))
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
@@ -115,7 +115,7 @@ func TestAnUnverifiedTartTierStillRunsOnAnOlderNode(t *testing.T) {
 	tier := verifiedTartTier()
 	tier.Image = "ghcr.io/acme/macos:26"
 
-	p := verifiedPlane(t, tier, nodeAtWire(37, "n1-1"))
+	p := verifiedPlane(t, tier, nodeAtWire(38, "n1-1"))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	launched := make(chan error, 1)
@@ -145,7 +145,7 @@ func TestAProcessThatCannotReadAVerifiedLaunchQueuedBeforeItDoesNotTakeIt(t *tes
 
 	waitForQueued(t, p, "n1")
 
-	older := nodeAtWire(37, "n1-2")
+	older := nodeAtWire(38, "n1-2")
 	older.Provider = config.ProviderTart
 
 	if _, err := p.Register(t.Context(), older); err != nil {

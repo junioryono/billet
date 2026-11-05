@@ -5,6 +5,8 @@
     "schema": 409304141,
     "codec": 1664590867,
     "data": "R3Vlc3RSZXBvcnRSZXF1ZXN0LnJlcG9ydC5kYXRh",
+    "tests_codec": 1270668306,
+    "tests": "R3Vlc3RSZXBvcnRSZXF1ZXN0LnJlcG9ydC50ZXN0cw==",
     "accepted": 1899723210,
     "refused": 590211354,
     "dropped_bytes": 406716895,

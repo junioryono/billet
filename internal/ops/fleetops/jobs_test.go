@@ -41,6 +41,8 @@ type jobSeed struct {
 	job       *alloc.HistoryJob
 	usage     *alloc.JobUsage
 	series    *alloc.UsageSeries
+	// tests is the job's kept test results, as the node encodes them.
+	tests []byte
 }
 
 // seedJob stages a job through the real allocator and returns its lease.
@@ -85,6 +87,13 @@ func seedJob(t *testing.T, stateDir string, seed jobSeed) string {
 	if seed.job != nil {
 		if err := a.RecordJobIdentity(t.Context(), lease.ID, *seed.job); err != nil {
 			t.Fatalf("RecordJobIdentity: %v", err)
+		}
+	}
+	if seed.tests != nil {
+		if err := a.RecordGuestReport(t.Context(), lease.ID, lease.Epoch, alloc.GuestReport{
+			Codec: alloc.GuestReportCodec, TestsCodec: alloc.TestResultsCodec, Tests: seed.tests,
+		}); err != nil {
+			t.Fatalf("RecordGuestReport: %v", err)
 		}
 	}
 	if seed.usage != nil {
@@ -396,7 +405,7 @@ func TestTheKnownAnswerFixturesAreJobsShowsOwn(t *testing.T) {
 	for _, name := range slices.Sorted(maps.Keys(shapes)) {
 		var out bytes.Buffer
 		if err := renderJobJSON(&out, record, shapes[name].usage, nil, "the usage report came with no series", nil,
-			shapes[name].window); err != nil {
+			jobTests{}, shapes[name].window); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		path := filepath.Join(knownAnswerFixtures, name+".json")

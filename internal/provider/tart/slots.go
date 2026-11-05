@@ -146,7 +146,7 @@ func (p *Provider) macOSLimitFor(isProbe bool) (int, error) {
 	if isProbe {
 		return 0, errors.New("this node has no record of its macOS limit, which its control plane " +
 			"sends at registration, so a macOS probe cannot be counted against it; start the node " +
-			"so it registers, and run this again, or upgrade a control plane older than wire 38, " +
+			"so it registers, and run this again, or upgrade a control plane older than wire 39, " +
 			"which does not send it")
 	}
 

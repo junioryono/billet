@@ -229,7 +229,7 @@ type QueueTimeCursor struct {
 }
 
 // JobsAwaitingQueueTime reads at most limit jobs that started at or after
-// since and have no GitHub queue time, newest start first, from after.
+// since and have no GitHub queue time or no commit, newest start first, from after.
 func (a *Allocator) JobsAwaitingQueueTime(ctx context.Context, since time.Time, after QueueTimeCursor,
 	limit int,
 ) ([]AwaitingQueueTime, error) {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/cache"
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	opsimages "github.com/junioryono/billet/internal/ops/images"
@@ -200,6 +201,17 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		// store, and the two look identical in every other line of this report.
 		fmt.Fprintf(env.Stdout, "app key  %s\n", app.KeyLocation(cfg, target))
 
+		if cfg.Server != nil && cfg.Server.TokenBroker != nil {
+			verdict, err := checkBrokerTokens(ctx, env, cfg, target, skipNetworkProbes)
+			if err != nil {
+				githubFailure = errors.Join(githubFailure, err)
+			}
+
+			report.github = worseGitHubVerdict(report.github, verdict)
+
+			continue
+		}
+
 		key, err := app.ResolveAppKey(ctx, cfg, target)
 		if err != nil {
 			return report, err
@@ -310,6 +322,16 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 
 		fmt.Fprintf(env.Stdout, "state    %s (ok, integrity verified)\n", cfg.Server.IdentityDir)
 
+		// THE CONNECTIONS THIS DEPLOYMENT HOLDS, SAID BECAUSE THE SERVER'S
+		// max_connections IS SHARED and an operator packing deployments on one
+		// server adds these up; the pooler sentence because a pooler in front
+		// looks like the answer and silently drops the claim's exclusion.
+		if n := cfg.Server.LedgerConnections(); n > 0 {
+			fmt.Fprintf(env.Stdout, "ledger   PostgreSQL, up to %d connections per process (the writer, the "+
+				"controller claim, %d readers); a transaction-mode pooler cannot carry the claim or the "+
+				"session settings\n", n, cfg.Server.LedgerReaderConnections())
+		}
+
 		// AN UNWATCHED BACKUP IS NOT ONE EITHER, which is the sibling of the rule
 		// this whole area is built on. A timer that stopped firing looks exactly
 		// like one that is working, and the day an operator finds out is the day
@@ -324,6 +346,11 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		a, err := app.NewAllocator(cfg, db)
 		if err != nil {
 			return report, fmt.Errorf("capacity allocator: %w", err)
+		}
+		// NOT ON THE UPGRADE'S QUIESCENT PROBE, whose stopped-service window pays for
+		// every read, and which decides nothing from this.
+		if !opts.maintenanceProbe {
+			cache.ReportCacheWarmth(ctx, env, a)
 		}
 		registered, err := a.RegisteredNodes(ctx)
 		if err != nil {
@@ -752,13 +779,10 @@ func checkTierRunnerGroup(
 		return true, nil
 	}
 
-	key, err := app.ResolveAppKey(ctx, cfg, target)
+	policy, err := checkPolicyClient(ctx, cfg, target)
 	if err != nil {
 		return false, err
 	}
-
-	policy := github.NewRunnerGroupPolicyClientAt(app.GitHubAPIBase, app.GitHubTargetOf(target), target.AppID,
-		target.InstallationID, key)
 
 	id, isDefault, err := policy.FindRunnerGroupID(ctx, t.RunnerGroup)
 	if err != nil {

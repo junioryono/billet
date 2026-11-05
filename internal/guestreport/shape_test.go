@@ -119,7 +119,7 @@ func TestTheShapeCheckAdmitsListsAtTheirBounds(t *testing.T) {
 func TestEveryListOfTheSchemaHasABound(t *testing.T) {
 	t.Parallel()
 
-	for name, s := range map[string]*shape{"batch": batchShape, "report": reportShape} {
+	for name, s := range map[string]*shape{"batch": batchShape, "report": reportShape, "results": testResultsShape} {
 		var lists []string
 
 		var walk func(n *node, path string)
@@ -144,9 +144,12 @@ func TestEveryListOfTheSchemaHasABound(t *testing.T) {
 
 		walk(s.root, "")
 
-		want := []string{"samples", "processes", "processes.rows", "steps", "tests", "tests.failed"}
-		if name == "report" {
+		want := []string{"samples", "processes", "processes.rows", "steps", "tests", "tests.failed", "cases", "cases.cases"}
+		switch name {
+		case "report":
 			want = []string{"gaps", "samples", "processes", "processes.rows", "steps", "tests", "tests.failed"}
+		case "results":
+			want = []string{"suites", "suites.cases"}
 		}
 
 		if !slices.Equal(lists, want) {

@@ -204,13 +204,19 @@ func TestTranslateCarriesGitHubsTimesForEveryKind(t *testing.T) {
 			ScaleSetAssignTime: at(minute + 1), RunnerAssignTime: at(minute + 2)}
 	}
 
+	finished := func(b gh.JobMessageBase, minute int) gh.JobMessageBase {
+		b.FinishTime = at(minute)
+
+		return b
+	}
+
 	got := translate(&gh.RunnerScaleSetMessage{
 		MessageID:            1,
 		JobAvailableMessages: []*gh.JobAvailable{{JobMessageBase: base(1, 10)}},
 		JobAssignedMessages:  []*gh.JobAssigned{{JobMessageBase: base(2, 20)}},
-		JobStartedMessages:   []*gh.JobStarted{{RunnerID: 7, JobMessageBase: base(3, 30)}},
+		JobStartedMessages:   []*gh.JobStarted{{RunnerID: 7, JobMessageBase: finished(base(3, 30), 35)}},
 		JobCompletedMessages: []*gh.JobCompleted{
-			{Result: "succeeded", JobMessageBase: base(4, 40)},
+			{Result: "succeeded", JobMessageBase: finished(base(4, 40), 45)},
 			{JobMessageBase: gh.JobMessageBase{RunnerRequestID: 5}},
 		},
 	})
@@ -232,6 +238,17 @@ func TestTranslateCarriesGitHubsTimesForEveryKind(t *testing.T) {
 			t.Errorf("%s: times = %v, %v, %v; want minutes %d, %d, %d", c.kind,
 				j.QueuedAt, j.ScaleSetAssignedAt, j.RunnerAssignedAt, c.minute, c.minute+1, c.minute+2)
 		}
+	}
+
+	// ONLY A COMPLETION SAYS WHEN A JOB FINISHED, which is what was measured of it.
+	if !got.Completed[0].FinishedAt.Equal(at(45)) {
+		t.Errorf("a completion's finish = %v, want minute 45", got.Completed[0].FinishedAt)
+	}
+	if !got.Started[0].FinishedAt.IsZero() {
+		t.Errorf("a start carried a finish, %v", got.Started[0].FinishedAt)
+	}
+	if !got.Completed[1].FinishedAt.IsZero() {
+		t.Errorf("a completion with no finish borrowed %v", got.Completed[1].FinishedAt)
 	}
 	if got.Started[0].RunnerID != 7 || got.Completed[0].Result != "succeeded" {
 		t.Errorf("the kind's own fields were lost: started %+v, completed %+v",
