@@ -85,6 +85,7 @@ jobs:
           sha=$(sha_for linux-x64)
           sha_linux_arm64=$(sha_for linux-arm64)
           sha_osx_arm64=$(sha_for osx-arm64)
+          sha_win_x64=$(sha_for win-x64)
           # BILLET_SHA_EXTRACT_END
 
           case "$version" in
@@ -92,7 +93,7 @@ jobs:
             *) echo "github named the release '$version', which is not a version" >&2; exit 1 ;;
           esac
 
-          for pair in "linux-x64:$sha" "linux-arm64:$sha_linux_arm64" "osx-arm64:$sha_osx_arm64"; do
+          for pair in "linux-x64:$sha" "linux-arm64:$sha_linux_arm64" "osx-arm64:$sha_osx_arm64" "win-x64:$sha_win_x64"; do
             platform=${pair%%:*}
             value=${pair#*:}
 
@@ -114,6 +115,7 @@ jobs:
             echo "sha=$sha"
             echo "sha_linux_arm64=$sha_linux_arm64"
             echo "sha_osx_arm64=$sha_osx_arm64"
+            echo "sha_win_x64=$sha_win_x64"
             echo "current=$current"
             echo "published=$(printf '%s' "$body" | jq -r '.published_at')"
           } >>"$GITHUB_OUTPUT"
@@ -126,6 +128,7 @@ jobs:
           SHA: ${{ steps.read.outputs.sha }}
           SHA_LINUX_ARM64: ${{ steps.read.outputs.sha_linux_arm64 }}
           SHA_OSX_ARM64: ${{ steps.read.outputs.sha_osx_arm64 }}
+          SHA_WIN_X64: ${{ steps.read.outputs.sha_win_x64 }}
           CURRENT: ${{ steps.read.outputs.current }}
           PUBLISHED: ${{ steps.read.outputs.published }}
         run: |
@@ -152,12 +155,13 @@ jobs:
           # versions of that test read the workflow's text instead and both were
           # satisfied by a workflow that had stopped emitting the platform rows.
           # Keep the markers, and keep everything between them executable on its
-          # own given VERSION, SHA, SHA_LINUX_ARM64 and SHA_OSX_ARM64.
+          # own given VERSION, SHA, SHA_LINUX_ARM64, SHA_OSX_ARM64 and SHA_WIN_X64.
           # BILLET_PIN_RENDER_BEGIN
           {
             printf '%s %s\n' "$VERSION" "$SHA"
             printf 'linux-arm64 %s\n' "$SHA_LINUX_ARM64"
             printf 'osx-arm64 %s\n' "$SHA_OSX_ARM64"
+            printf 'win-x64 %s\n' "$SHA_WIN_X64"
           } > internal/runnerrelease/pinned.txt
           # BILLET_PIN_RENDER_END
 

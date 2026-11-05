@@ -1,4 +1,4 @@
-# ADR-026: A job's network is named and restricted on the host, by its interface and a resolver of its own
+# ADR-027: A job's network is named and restricted on the host, by its interface and a resolver of its own
 
 Accepted, 2026-11-04. Issue #540, and #510's workspaces build on it. Measurements are in [the egress record](../records/egress-allowlist.md).
 
@@ -45,7 +45,7 @@ The guest is root in its VM and runs whatever the workflow says, so nothing in i
 ## Consequences
 
 - The role's guard gains one rule, so redirected DNS is not dropped: a filter hook's drop in one table cannot be overruled from another. The first converge with it drains the node, as any change to the guest firewall does. A node whose guard lacks the rule says so, refuses a listed launch and runs open guests unwatched.
-- The wire moves to 39. A listed tier is refused to an older node, which would ignore the block and run the job open.
+- The wire moves to 40. A listed tier is refused to an older node, which would ignore the block and run the job open.
 - A listed job's DNS costs one process start for each answer holding an address not yet in its set (4 ms, measured), and nothing for the rest.
 
 ## What this does not do

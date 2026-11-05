@@ -128,7 +128,7 @@ type Spec struct {
 	// InstanceType is the EC2 shape selected and charged at escrow. Empty for
 	// host-backed providers.
 	InstanceType string
-	// Egress is the guest's network policy (ADR-026): listed, watched only, or nil
+	// Egress is the guest's network policy (ADR-027): listed, watched only, or nil
 	// for neither. Only a backend that enforces one on the host may be given one,
 	// and any other refuses it (EgressEnforcer); a backend that ignored it would
 	// run a listed tier's job open.
@@ -137,6 +137,11 @@ type Spec struct {
 	// names none (ADR-022). A backend that can tell what a shape or an image runs
 	// on refuses another.
 	Arch config.Arch
+	// GuestOS is what the lease boots, as it was snapshotted at reservation, and
+	// empty means Linux, which every lease from before it recorded one is. Only ec2
+	// reads it: the boot script is a different language on Windows (ADR-026), and
+	// its AMI is asked whether it agrees.
+	GuestOS config.GuestOS
 	// AuthorizeShape atomically changes that charge before EC2 attempts a
 	// fallback. ok=false means the shape would exceed a budget; err means the
 	// ledger could not make the decision and the launch must stop.

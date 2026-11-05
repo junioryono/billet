@@ -21,7 +21,7 @@ type TierNetwork struct {
 	Egress *TierEgress `yaml:"egress,omitempty"`
 }
 
-// TierEgress is a tier's allowlist, enforced by the node on the host (ADR-026):
+// TierEgress is a tier's allowlist, enforced by the node on the host (ADR-027):
 // a guest resolves only what it allows and connects only to what those names
 // answered and the prefixes it names. Present means listed, so an empty Allow
 // is GitHubRunnerEndpoints and the node's own services and nothing else.
@@ -104,7 +104,7 @@ type EgressEntry struct {
 // `203.0.113.0/24` or `203.0.113.7` those addresses. A node parses what the wire
 // sent it with this too, so an entry it cannot read refuses the launch.
 //
-// IPv6 IS REFUSED BY NAME: a listed guest has none (ADR-026), so an entry for it
+// IPv6 IS REFUSED BY NAME: a listed guest has none (ADR-027), so an entry for it
 // could only ever read as a promise.
 func ParseEgressEntry(raw string) (EgressEntry, error) {
 	if raw == "" {
@@ -194,7 +194,7 @@ func egressIPv6Refused(raw string) error {
 //
 // *.blob.core.windows.net IS EVERY AZURE STORAGE ACCOUNT, and so a way out for a
 // job that holds a key to one: GitHub keeps logs, artifacts and caches there, and
-// names no narrower host. ADR-026 records the limit.
+// names no narrower host. ADR-027 records the limit.
 func GitHubRunnerEndpoints() []string {
 	return []string{
 		"github.com",

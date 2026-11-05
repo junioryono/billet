@@ -1,6 +1,6 @@
 -- migration 73: job_egress
 --
--- WHAT THE HOST SAW OF A JOB'S NETWORK (#540, ADR-026): the names its guest asked
+-- WHAT THE HOST SAW OF A JOB'S NETWORK (#540, ADR-027): the names its guest asked
 -- the node's resolver for, what those names answered, what a tier's allowlist
 -- refused and how many packets it dropped. Kept beside what the host measured
 -- (migration 57) and apart from it, because a list is enforced on a node that

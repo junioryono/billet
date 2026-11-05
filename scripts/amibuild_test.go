@@ -15,7 +15,7 @@ import (
 var amiBuildRoots = []string{
 	"run-runner-images.sh", "check-guest-component.sh",
 	"ami/build-ami.sh", "ami/ami-target.sh", "ami/billet-ami-build.service",
-	"runner-images/upstream", "runner-images/completer",
+	"runner-images/upstream/helpers", "runner-images/upstream/images/ubuntu", "runner-images/completer",
 	"runner-images/plan.json", "runner-images/plan-arm64.json", "runner-images/differences.tsv",
 	"runner-images/pam-environment.awk", "runner-images/write-image-env.sh",
 	"runner-images/install-completer.sh", "runner-images/LICENSE",

@@ -512,7 +512,9 @@ func (r *Runner) Launch(
 	actionsProxy, npmProxy, actionsCAPEM := "", "", ""
 	var buildKitCacheMountLimit config.ByteSize
 	var guestCaches []provider.GuestCache
-	if r.cache != nil {
+	// NO BEARER FOR A GUEST WITH NOTHING TO SPEND IT: every cache's client is in a
+	// Linux guest, and config refuses a cache block on a Windows tier (ADR-026).
+	if r.cache != nil && lease.GuestOS != config.GuestWindows {
 		var credentials CacheCredentials
 		scope := CacheSessionScope{
 			Trust: trust, Intercept: interceptsFor(tier, trust),
@@ -564,6 +566,7 @@ func (r *Runner) Launch(
 		InstanceType: lease.InstanceType,
 		Arch:         tier.Arch,
 		Egress:       guestPolicy,
+		GuestOS:      lease.GuestOS,
 		AuthorizeShape: func(ctx context.Context, instanceType string, vcpu int,
 			memory config.ByteSize,
 		) (bool, error) {

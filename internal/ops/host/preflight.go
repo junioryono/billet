@@ -202,6 +202,16 @@ func ec2Preflight(
 				"and paste the id\n", img.ImageID, reason)
 		case img.State != "available":
 			fmt.Fprintf(env.Stdout, "image    %s is %s, not yet available\n", img.ImageID, img.State)
+		// A WINDOWS IMAGE ANSWERS TO ITS OWN CONTRACT: every gap below names something
+		// about a Linux image's Docker store, toolcache or components.
+		case img.Windows && img.Contract < ec2.WindowsAMIContract:
+			fmt.Fprintf(env.Stdout, "image    %s is a Windows AMI carrying no contract this billet "+
+				"accepts, so nothing billet booted says what it carries; `billet ami verify %s` "+
+				"boots it and stamps it if it meets contract %d, or rebuild with `billet ami build "+
+				"--os windows`\n", img.ImageID, img.ImageID, ec2.WindowsAMIContract)
+		case img.Windows:
+			fmt.Fprintf(env.Stdout, "image    %s available (Windows AMI contract %d)\n",
+				img.ImageID, img.Contract)
 		case img.Contract == 0:
 			// NO STAMP IS NOT AN OLD BUILD. A current build run with --verify=false,
 			// or one whose verification failed, is unstamped as well, so what it
@@ -276,6 +286,10 @@ func ec2Preflight(
 
 	// AND WHAT EACH IMAGE BOOTS ON, against the tiers that name it (ADR-022).
 	if err := ec2TierArchMismatch(cfg, images); err != nil {
+		return err
+	}
+
+	if err := ec2TierGuestOSMismatch(cfg, images); err != nil {
 		return err
 	}
 

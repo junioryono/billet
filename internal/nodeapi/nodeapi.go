@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 39
+	Version = 40
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -520,9 +520,22 @@ const (
 	// without them.
 	VersionJobTests = 38
 
+	// VersionWindowsGuests is the version from which a node reads a lease's guest OS
+	// to choose its boot script, so a Windows lease reaches only a node that will
+	// boot it (ADR-026). The lease has carried the guest OS since long before this,
+	// and no wire struct changes: the step is in what a node does with it.
+	//
+	// REFUSED WHERE IT IS SENT. A node below it sends a Linux boot script to a Windows
+	// AMI, which boots, looks healthy, registers nothing and holds its lease, so
+	// placement passes over one (alloc.WindowsGuestsWireVersion, which a test holds
+	// equal) and a Windows lease is refused to one at dispatch and again at delivery,
+	// as an architecture is. The job waits for a node that can run it, and `billet
+	// status` says so. A Linux lease is as it always was.
+	VersionWindowsGuests = 39
+
 	// VersionEgress is the version from which a launch can carry a tier's allowlist
 	// (TierSpec's egress) and a node can report what the host saw of a job's network
-	// (POST /v1/nodes/{node}/leases/{lease}/egress, a lease.JobEgress) (ADR-026).
+	// (POST /v1/nodes/{node}/leases/{lease}/egress, a lease.JobEgress) (ADR-027).
 	//
 	// THE TWO DIRECTIONS GO DIFFERENT WAYS, because they mean different things.
 	// REFUSED WHERE A LAUNCH IS SENT: an older node ignores TierSpec's egress and
@@ -533,7 +546,7 @@ const (
 	// bare 404, so a node negotiated below this drops it as success and says so
 	// once. A pairing that negotiated below this and sends one anyway is refused.
 	// MinVersion does not move.
-	VersionEgress = 39
+	VersionEgress = 40
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
