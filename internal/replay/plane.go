@@ -158,6 +158,10 @@ type plane struct {
 	// assigned to its tier's scale set as soon as the set advertises room for
 	// it, with no offer and no acquisition, and carries no runner request id.
 	direct bool
+	// backgroundLaunches is Options.BackgroundLaunches, read when the stack is built.
+	backgroundLaunches bool
+	// completed counts the JobCompleted messages delivered.
+	completed int
 	// order is the tier labels in the order their sessions may open.
 	order []string
 
@@ -1073,11 +1077,20 @@ func (p *plane) deliver(ev event) {
 		}))
 
 	case eventCompleted:
+		p.completed++
 		delete(ev.runner.set.assigned, a.Seq)
 		p.pushLocked(ev.runner.set, nil, nil, p.jobJSON("JobCompleted", a, fakeactions.JobFields{
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name, Result: a.Result,
 		}))
 	}
+}
+
+// everyJobCompleted says whether GitHub has told billet every job in the trace finished.
+func (p *plane) everyJobCompleted() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.completed >= len(p.jobs)
 }
 
 // AwaitIdle returns once every tier's session is open, its queue is empty and

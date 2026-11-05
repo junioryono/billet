@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 38
+	Version = 39
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -509,6 +509,17 @@ const (
 	// naming one is refused to a node below this at dispatch and again at delivery.
 	VersionArchitectures = 37
 
+	// VersionJobTests is the version from which a guest report may carry the job's
+	// test suites and cases (lease.GuestReport's tests, #536), which the ledger keeps
+	// past the report's own retention and `billet tests stats` ranks.
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT, because
+	// an older plane decodes the request strictly and would refuse the whole report
+	// over the field: below it the node sends the rest. CHECKED WHERE IT IS READ too,
+	// so a pairing that negotiated below it and sends them anyway has the report kept
+	// without them.
+	VersionJobTests = 38
+
 	// VersionCacheBreaker is the version from which a cache observation may say
 	// `bypassed`, what a job got when its node's breaker had stopped asking the site's
 	// store (#531), and from which a node may report what the breaker is doing
@@ -519,7 +530,7 @@ const (
 	// one over this, and has no such route: below it the node says `unavailable`,
 	// which is true as far as it goes, and sends no report. CHECKED WHERE THE WORD IS
 	// READ too, so a pairing below it that sends one anyway is kept as `unavailable`.
-	VersionCacheBreaker = 38
+	VersionCacheBreaker = 39
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

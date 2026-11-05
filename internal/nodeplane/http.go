@@ -1759,6 +1759,11 @@ func (h *handler) guestReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionJobTests {
+		req.Report = req.Report.WithoutTests()
+	}
+
 	if err := req.Report.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
 

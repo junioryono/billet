@@ -25,6 +25,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A candidate is verified as it is published, not only as it was written.**
 - **A discard is storage, not compute, and never runs on the node's command path (#223).**
 - **On Ceph, a discard moves to the trash and the node's sweep deletes (#280, #292).**
+- **A compaction is a clone and a flatten, never `rbd cp`.**
 - **Every cache image carries object-map, and every command that changes one keeps the kernel client (#394).**
 - **Storage background work yields to jobs (#394).**
 - **An intact orphan volume is reclaimed by an operator, on proof, through the trash (#301).**
@@ -56,6 +57,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A mirror is refreshed by only what moved and repacked after a refresh, never on a request; pruning has the mirror alone, and removes an unreachable object no sooner than fourteen days after the first pass that set it aside (`gitmaintain.go`).**
 - **A guest reaches its build caches through a relay that waits out a node restart (#374).**
 - **What each build cache did is observed like the image store.**
+- **The sticky-disk action adds the guest's system bundle to what Node trusts by default, and on a contract 4 AMI it works on an EC2 guest.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

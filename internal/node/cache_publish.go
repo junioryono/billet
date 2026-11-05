@@ -397,17 +397,33 @@ func attachmentKind(attachment *cacheAttachment) config.CacheKind {
 // proved gone, off the node's command path; the one thing done in line is the
 // Docker store's readiness handshake, because it needs the guest alive. A
 // session already closing is not waited for: its storage is busy and a
-// redelivered completion must not queue behind it, and nothing is recorded,
-// which publishes nothing.
+// redelivered completion must not queue behind it, and it records nothing more.
 func (s *CacheService) SettleCompleted(
 	ctx context.Context, instance string, succeeded bool, authority dispatch.CacheAuthority,
 ) error {
 	session := s.sessionOf(instance)
-	if session == nil || session.closing.Load() {
+	if session == nil {
+		return nil
+	}
+	// A DECISION TO RECORD NOTHING SAYS SO. A completed job's writes are
+	// discarded with the session, so without these a publication that never
+	// happened leaves no line at all: a default-branch job on an EC2 tier published
+	// nothing on 2026-10-25, and its node's log could not say which of these held.
+	//
+	// A CLOSING SESSION IS NOT ONE THAT WILL NOT PUBLISH: an intent an earlier
+	// completion recorded still publishes in its cleanup. Only this one adds nothing.
+	if session.closing.Load() {
+		s.log.Info("a completion recorded no publication: its session is already closing, "+
+			"and what an earlier one recorded stands", "instance", instance)
+
 		return nil
 	}
 
 	if !publicationAllowed(session, succeeded, authority) {
+		s.log.Info("a completed job's caches will not publish", "instance", instance,
+			"policy", sessionPolicy(session), "succeeded", succeeded, "proven", authority.Proven,
+			"publish_default", authority.PublishDefault, "event", authority.Event, "ref", authority.Ref)
+
 		return nil
 	}
 	intent := &publishIntent{LeaseID: authority.LeaseID, JobID: authority.JobID,
@@ -446,6 +462,9 @@ func (s *CacheService) SettleCompleted(
 
 	attachment, err := s.awaitDockerReady(ctx, session)
 	if errors.Is(err, errNoDockerStore) {
+		s.log.Info("a completed job's Docker image store will not publish: it was discarded "+
+			"before it was proved ready", "instance", instance)
+
 		return nil
 	}
 	if err != nil {

@@ -49,6 +49,8 @@ type fakeNode struct {
 	postScript  []reply
 	intervalMS  int64
 	maxBody     int64
+	// schemas is what a hello's answer offers.
+	schemas string
 
 	hellos []time.Time
 	posts  []post
@@ -64,7 +66,7 @@ type fakeNode struct {
 func newFakeNode(t *testing.T) *fakeNode {
 	t.Helper()
 
-	return &fakeNode{t: t, intervalMS: 10_000, maxBody: guestreport.MaxBatchBytes, tokens: 4}
+	return &fakeNode{t: t, intervalMS: 10_000, maxBody: guestreport.MaxBatchBytes, tokens: 4, schemas: "[1]"}
 }
 
 // RoundTrip serves a request in the caller's goroutine, so a synctest bubble holds
@@ -179,7 +181,7 @@ func (f *fakeNode) hello(w http.ResponseWriter) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if _, err := io.WriteString(w, `{"schemas":[1],"interval_ms":`+strconv.FormatInt(f.intervalMS, 10)+
+	if _, err := io.WriteString(w, `{"schemas":`+f.schemas+`,"interval_ms":`+strconv.FormatInt(f.intervalMS, 10)+
 		`,"max_body":`+strconv.FormatInt(f.maxBody, 10)+`,"a_field_from_later":true}`); err != nil {
 		f.t.Errorf("answer a hello: %v", err)
 	}

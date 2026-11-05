@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"sync"
@@ -75,11 +76,12 @@ var ErrSuperseded = errors.New("nodeclient: another process is registered as thi
 
 // Client talks to a control plane.
 type Client struct {
-	base string
-	// endpoint is the request base as the one representation, derived from
-	// base at construction and fixed for the client's life.
-	endpoint endpoint.Endpoint
-	node     string
+	// targets are every controller this node may register with, in the order
+	// it tries them, and current the one its registration was accepted by
+	// (the first until one is): every request but a registration goes there.
+	targets []*target
+	current atomic.Int64
+	node    string
 	// installedDigest is the release manifest that produced this binary, proved
 	// against the bytes running, or empty when nothing on this machine can say.
 	//
@@ -94,7 +96,6 @@ type Client struct {
 	// giving it a new identity each time would make every reconnect look like a
 	// second host.
 	incarnation string
-	http        *http.Client
 	reqTimeout  time.Duration
 
 	// WRITTEN BY EVERY REGISTRATION, READ BY THE JANITOR AND THE POLL LOOP, which
@@ -160,24 +161,137 @@ type Options struct {
 	// legitimately needs longer, and the alternative is every such deployment
 	// discovering the constant by hitting it.
 	RequestTimeout time.Duration
+	// Targets are every controller of an active-passive pair, in the order the
+	// node tries them, each with its own TLS (or HTTP client), in place of Base,
+	// TLS and HTTP above, which are one target's shorthand.
+	//
+	// ONE TLS CONFIG A TARGET, because a node verifies each controller's
+	// certificate against the name it dialled (wirecert's ClientTLS fixes it),
+	// and two controllers have two names.
+	Targets []Target
 }
+
+// Target is one controller a node may register with.
+type Target struct {
+	// Base, TLS and HTTP mean what Options' fields of the same names mean.
+	Base string
+	TLS  *tls.Config
+	HTTP *http.Client
+}
+
+// target is one controller as the client reaches it.
+type target struct {
+	base string
+	// endpoint is the request base as the one representation, derived from
+	// base at construction and fixed for the client's life.
+	endpoint endpoint.Endpoint
+	http     *http.Client
+	// dialer is the dialer the client's own transport connects with; nil for a
+	// caller's HTTP client, whose transport is the caller's.
+	dialer *net.Dialer
+	// resolving is how the transport reaches one of several controllers, nil
+	// for a client of one.
+	resolving *controllerDialer
+}
+
+// Dead-peer detection on the node's connections.
+//
+// A CONTROLLER CUT OFF THE NETWORK SENDS NOTHING, not even a reset, so a long
+// poll to it waited out the whole poll window and its slack before the node
+// tried anything else: measured 2026-09-04 (scripts/promotion-rehearsal.sh),
+// the node re-registered 41 seconds after its standby was promoted. Probes
+// that go unanswered end the connection in about Idle + Interval x Count
+// seconds; a live controller's kernel answers them, so they never cut a healthy
+// poll short. The dial is bounded more tightly than the handshake, because an
+// address that does not answer a SYN in three seconds is not the one to wait
+// on while another controller may be serving. Measured 2026-10-25 on a
+// partition that drops packets: nodes said they had lost their controller 13.9
+// to 14.3 seconds after it, and every node was registered with the promoted
+// one 0.3 to 2.7 seconds after its promotion.
+//
+// THE NAME IS LOOKED UP OUTSIDE THE DIAL'S BOUND, under its own. A dialer's
+// timeout covers its lookup too, and this static build's resolver waits five
+// seconds on each nameserver it tries, so a three-second dial behind a dead
+// first nameserver would never connect to anything.
+//
+// ONLY FOR SEVERAL CONTROLLERS. A node that names one has nowhere else to go,
+// and dials as it always did (singleDialTimeout, Go's default keepalive).
+const (
+	keepAliveIdle     = 5 * time.Second
+	keepAliveInterval = 2 * time.Second
+	keepAliveCount    = 3
+	dialTimeout       = 3 * time.Second
+	lookupTimeout     = 10 * time.Second
+	singleDialTimeout = 10 * time.Second
+)
 
 // New builds a Client. It does not dial; Register does.
 func New(opts Options) (*Client, error) {
-	if opts.Base == "" {
-		return nil, errors.New("nodeclient: a control plane address is required")
-	}
-
 	if opts.Node == "" {
 		return nil, errors.New("nodeclient: a node name is required")
 	}
 
-	base, err := normaliseBase(opts.Base, opts.TLS != nil)
+	targets := opts.Targets
+	if targets == nil {
+		if opts.Base == "" {
+			return nil, errors.New("nodeclient: a control plane address is required")
+		}
+
+		targets = []Target{{Base: opts.Base, TLS: opts.TLS, HTTP: opts.HTTP}}
+	} else if opts.Base != "" || opts.TLS != nil || opts.HTTP != nil {
+		return nil, errors.New("nodeclient: both Targets and Base, TLS or HTTP were supplied; name every " +
+			"controller in Targets")
+	}
+
+	if len(targets) == 0 {
+		return nil, errors.New("nodeclient: a control plane address is required")
+	}
+
+	incarnation, err := mintIncarnation()
 	if err != nil {
 		return nil, err
 	}
 
-	incarnation, err := mintIncarnation()
+	c := &Client{
+		node:        opts.Node,
+		incarnation: incarnation,
+		reqTimeout:  opts.RequestTimeout,
+		// READ HERE, ONCE, FOR THE LIFE OF THIS NODE. See installedDigest.
+		installedDigest: installedDigest(),
+	}
+
+	if c.reqTimeout <= 0 {
+		c.reqTimeout = requestTimeout
+	}
+
+	for i, spec := range targets {
+		t, err := newTarget(spec, len(targets) > 1)
+		if err != nil {
+			return nil, err
+		}
+
+		// THE SAME CONTROLLER TWICE is compared as the one representation, so
+		// two spellings of one endpoint are one target.
+		for _, earlier := range c.targets[:i] {
+			if earlier.endpoint.Equal(t.endpoint) {
+				return nil, fmt.Errorf("nodeclient: the control plane %s is named twice", t.base)
+			}
+		}
+
+		c.targets = append(c.targets, t)
+	}
+
+	return c, nil
+}
+
+// newTarget builds one controller's request base and transport, as one of
+// several when several is true.
+func newTarget(spec Target, several bool) (*target, error) {
+	if spec.Base == "" {
+		return nil, errors.New("nodeclient: a control plane address is required")
+	}
+
+	base, err := normaliseBase(spec.Base, spec.TLS != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -190,32 +304,19 @@ func New(opts Options) (*Client, error) {
 		return nil, fmt.Errorf("nodeclient: the request base %q is not an endpoint's canonical text: %w", base, err)
 	}
 
-	c := &Client{
-		base:        base,
-		endpoint:    ep,
-		node:        opts.Node,
-		incarnation: incarnation,
-		http:        opts.HTTP,
-		reqTimeout:  opts.RequestTimeout,
-		// READ HERE, ONCE, FOR THE LIFE OF THIS NODE. See installedDigest.
-		installedDigest: installedDigest(),
-	}
-
-	if c.reqTimeout <= 0 {
-		c.reqTimeout = requestTimeout
-	}
+	t := &target{base: base, endpoint: ep, http: spec.HTTP}
 
 	// A SUPPLIED CLIENT KEEPS ITS OWN TRANSPORT. Reaching into someone else's
 	// http.Client to install a TLS config would silently change every other
 	// request that client makes, and the caller that passed it in is the one who
 	// knows whether that is wanted.
-	if c.http != nil && opts.TLS != nil {
+	if t.http != nil && spec.TLS != nil {
 		return nil, errors.New(
 			"nodeclient: both an HTTP client and a TLS config were supplied; the TLS config " +
 				"would have to be installed into a transport this package does not own")
 	}
 
-	if c.http == nil {
+	if t.http == nil {
 		// NO CLIENT-WIDE TIMEOUT, deliberately: a command poll is a long poll and
 		// a blanket Timeout would cut it every cycle. What replaces it is a
 		// per-request deadline, applied below — the first version of this comment
@@ -227,10 +328,19 @@ func New(opts Options) (*Client, error) {
 		// open. A dial or a TLS handshake that never completes is never a healthy
 		// poll, and leaving those unbounded means a wedged network holds a
 		// goroutine and a socket indefinitely.
-		c.http = &http.Client{
+		t.dialer = &net.Dialer{Timeout: singleDialTimeout}
+		dial := t.dialer.DialContext
+
+		if several {
+			t.dialer = newDialer()
+			t.resolving = &controllerDialer{connect: t.dialer.DialContext, lookup: lookupZoned}
+			dial = t.resolving.DialContext
+		}
+
+		t.http = &http.Client{
 			Transport: &http.Transport{
-				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-				TLSClientConfig:       opts.TLS,
+				DialContext:           dial,
+				TLSClientConfig:       spec.TLS,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 0, // a long poll withholds headers on purpose
 				IdleConnTimeout:       90 * time.Second,
@@ -238,7 +348,252 @@ func New(opts Options) (*Client, error) {
 		}
 	}
 
-	return c, nil
+	return t, nil
+}
+
+// newDialer is the node's dialer: bounded, and probing its connections for a
+// controller that has gone silent.
+func newDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout: dialTimeout,
+		KeepAliveConfig: net.KeepAliveConfig{
+			Enable: true, Idle: keepAliveIdle, Interval: keepAliveInterval, Count: keepAliveCount,
+		},
+	}
+}
+
+// controllerDialer reaches one of several controllers: the name looked up under
+// lookupTimeout, then its addresses connected to under the connecting dialer's
+// own bound. The addresses of the family the lookup answered first are tried
+// in turn, and those of the other family beside them from fallbackDelay on,
+// as the standard dialer does, so a family that does not route costs a
+// fraction of a second rather than the dial's bound for every address in it.
+type controllerDialer struct {
+	connect func(ctx context.Context, network, address string) (net.Conn, error)
+	lookup  func(ctx context.Context, network, host string) ([]netip.Addr, error)
+}
+
+// fallbackDelay is how long the first family's addresses have to themselves
+// before the other family's are tried beside them: the standard dialer's.
+const fallbackDelay = 300 * time.Millisecond
+
+func (d *controllerDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := netip.ParseAddr(host); err == nil {
+		return d.connect(ctx, network, address)
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
+	addrs, err := d.lookup(lookupCtx, lookupNetwork(network), host)
+
+	cancel()
+
+	if err != nil {
+		return nil, err
+	}
+
+	if len(addrs) == 0 {
+		return nil, &net.DNSError{Err: "no addresses", Name: host, IsNotFound: true}
+	}
+
+	// ONE BOUND FOR EVERY ADDRESS, from here, as the standard dialer shares its
+	// timeout among the addresses a name answers: five addresses that do not
+	// answer cost the dial's three seconds, not fifteen.
+	ctx, cancel = context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+
+	var primaries, fallbacks []netip.Addr
+
+	for _, addr := range addrs {
+		if addr.Unmap().Is4() == addrs[0].Unmap().Is4() {
+			primaries = append(primaries, addr)
+		} else {
+			fallbacks = append(fallbacks, addr)
+		}
+	}
+
+	if len(fallbacks) == 0 {
+		return d.inTurn(ctx, network, primaries, port)
+	}
+
+	return d.race(ctx, network, primaries, fallbacks, port)
+}
+
+// inTurn connects to each address in turn until one answers, each given its
+// share of what is left of the context's deadline.
+func (d *controllerDialer) inTurn(ctx context.Context, network string, addrs []netip.Addr, port string) (net.Conn, error) {
+	var errs []error
+
+	for i, addr := range addrs {
+		attemptCtx, cancel := context.WithDeadline(ctx, partialDeadline(ctx, len(addrs)-i))
+		conn, err := d.connect(attemptCtx, network, net.JoinHostPort(addr.Unmap().String(), port))
+
+		cancel()
+
+		if err == nil {
+			return conn, nil
+		}
+
+		errs = append(errs, err)
+
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	return nil, errors.Join(errs...)
+}
+
+// race tries the primaries, and the fallbacks beside them once fallbackDelay
+// has passed or the primaries have all failed, and answers the first
+// connection either makes. The other attempt is cancelled as it returns, and a
+// connection it makes after all is closed.
+func (d *controllerDialer) race(
+	ctx context.Context, network string, primaries, fallbacks []netip.Addr, port string,
+) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type attempt struct {
+		conn net.Conn
+		err  error
+	}
+
+	results := make(chan attempt, 2)
+	try := func(addrs []netip.Addr) {
+		go func() {
+			conn, err := d.inTurn(ctx, network, addrs, port)
+			results <- attempt{conn, err}
+		}()
+	}
+
+	try(primaries)
+
+	fallback := time.NewTimer(fallbackDelay)
+	defer fallback.Stop()
+
+	started, finished := 1, 0
+
+	var errs []error
+
+	for {
+		select {
+		case <-fallback.C:
+			if started == 1 {
+				try(fallbacks)
+				started++
+			}
+		case r := <-results:
+			finished++
+
+			if r.err == nil {
+				if pending := started - finished; pending > 0 {
+					go func() {
+						for range pending {
+							if late := <-results; late.conn != nil {
+								_ = late.conn.Close()
+							}
+						}
+					}()
+				}
+
+				return r.conn, nil
+			}
+
+			errs = append(errs, r.err)
+
+			if started == 1 {
+				try(fallbacks)
+				started++
+
+				continue
+			}
+
+			if finished == started {
+				return nil, errors.Join(errs...)
+			}
+		}
+	}
+}
+
+// minimumAttempt is the least an address is given while the deadline allows it,
+// the standard dialer's own floor.
+const minimumAttempt = 2 * time.Second
+
+// partialDeadline is the deadline of one of remaining addresses still to try
+// before ctx's: an equal share of the time left, at least minimumAttempt while
+// that much is left, as the standard dialer gives each address.
+func partialDeadline(ctx context.Context, remaining int) time.Time {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return time.Now().Add(dialTimeout)
+	}
+
+	left := time.Until(deadline)
+	share := left / time.Duration(remaining)
+
+	if share < minimumAttempt {
+		share = min(minimumAttempt, left)
+	}
+
+	return time.Now().Add(share)
+}
+
+// lookupZoned looks a name up as net.DefaultResolver does, keeping each IPv6
+// address's zone, which LookupNetIP drops: a link-local controller named in
+// the hosts file is reached only through its interface.
+func lookupZoned(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	return addrsIn(ips, network), nil
+}
+
+// addrsIn is the addresses of a lookup's answer in network ("ip", "ip4" or
+// "ip6"), zones kept. The transport dials "tcp", so the lookup asks for both
+// families and nothing here is filtered in practice; a dial for one family
+// would still wait on the other's query, which is why the filter is no more
+// than a filter.
+func addrsIn(ips []net.IPAddr, network string) []netip.Addr {
+	addrs := make([]netip.Addr, 0, len(ips))
+
+	for _, ip := range ips {
+		addr, ok := netip.AddrFromSlice(ip.IP)
+		if !ok {
+			continue
+		}
+
+		addr = addr.Unmap()
+
+		switch {
+		case network == "ip4" && !addr.Is4(), network == "ip6" && !addr.Is6():
+			continue
+		case addr.Is6() && ip.Zone != "":
+			addr = addr.WithZone(ip.Zone)
+		}
+
+		addrs = append(addrs, addr)
+	}
+
+	return addrs
+}
+
+// lookupNetwork is the network a name is looked up in for a dial in network.
+func lookupNetwork(network string) string {
+	switch network {
+	case "tcp4":
+		return "ip4"
+	case "tcp6":
+		return "ip6"
+	default:
+		return "ip"
+	}
 }
 
 // normaliseBase turns what an operator wrote into a URL requests can be built
@@ -260,24 +615,33 @@ func normaliseBase(raw string, secure bool) (string, error) {
 	return e.String(), nil
 }
 
-// Endpoint is the control-plane endpoint this client dials: the request base
-// it was built with, as the one representation. It is the process's request
-// base and not an observed peer, so name resolution, translation and redirects
-// are outside what it says.
-func (c *Client) Endpoint() endpoint.Endpoint { return c.endpoint }
+// Endpoint is the control-plane endpoint this client dials now: the request
+// base of the controller its registration was accepted by (the first it names
+// until one is), as the one representation. It is the process's request base
+// and not an observed peer, so name resolution, translation and redirects are
+// outside what it says.
+func (c *Client) Endpoint() endpoint.Endpoint { return c.at().endpoint }
 
-// ReplaceTransportForTest installs a transport on a built client and changes
-// nothing else, so a fixture can observe the requests a production-built
-// client sends without building its own.
+// Controllers is how many controllers this client may register with.
+func (c *Client) Controllers() int { return len(c.targets) }
+
+// at is the controller every request but a registration goes to.
+func (c *Client) at() *target { return c.targets[c.current.Load()] }
+
+// ReplaceTransportForTest installs a transport on every controller of a built
+// client and changes nothing else, so a fixture can observe the requests a
+// production-built client sends without building its own.
 func ReplaceTransportForTest(c *Client, rt http.RoundTripper) {
-	c.http = &http.Client{Transport: rt, Timeout: c.http.Timeout}
+	for _, t := range c.targets {
+		t.http = &http.Client{Transport: rt, Timeout: t.http.Timeout}
+	}
 }
 
-// BaseForTest reports the URL requests are built from.
+// BaseForTest reports the URL requests are built from now.
 //
 // Exported for tests because the failure it guards is invisible from outside:
 // a base without a scheme builds a request that never leaves the process.
-func (c *Client) BaseForTest() string { return c.base }
+func (c *Client) BaseForTest() string { return c.at().base }
 
 // Registration is what this node says about itself when it introduces itself.
 //
@@ -352,12 +716,46 @@ func installedDigest() string {
 }
 
 // Register introduces this node and learns the timings it must respect.
+//
+// TO EVERY CONTROLLER IN TURN, from the one it is registered with: the first
+// that accepts is the one every later request goes to. Only the controller
+// holding the deployment's claim serves the node wire, so a standby refuses the
+// connection, and a controller that has lost its claim stops serving it; one
+// that answers is the controller. A verdict stops the round where it is given
+// (ErrRefused, ErrSuperseded): it is the controller's answer about this node,
+// and asking a standby next could only fail to connect. Anything else, an
+// address that does not answer included, moves to the next controller.
 func (c *Client) Register(ctx context.Context, reg Registration) error {
+	start := int(c.current.Load())
+
+	var errs []error
+
+	for i := range c.targets {
+		at := (start + i) % len(c.targets)
+
+		err := c.registerWith(ctx, at, reg)
+		if err == nil {
+			return nil
+		}
+
+		if len(c.targets) == 1 || errors.Is(err, ErrRefused) || errors.Is(err, ErrSuperseded) || ctx.Err() != nil {
+			return err
+		}
+
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
+// registerWith registers with the controller at index at, and on its
+// acceptance makes it the one every later request goes to.
+func (c *Client) registerWith(ctx context.Context, at int, reg Registration) error {
 	var res nodeapi.RegisterResponse
 
 	self := nodeapi.Self()
 
-	err := c.do(ctx, http.MethodPost, "/v1/register", nodeapi.RegisterRequest{
+	err := c.doAt(ctx, c.targets[at], http.MethodPost, "/v1/register", nodeapi.RegisterRequest{
 		Version:    nodeapi.Version,
 		MinVersion: nodeapi.MinVersion,
 		// TAKEN FROM THE BINARY, NOT FROM Registration. It is a fact about this
@@ -395,8 +793,8 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 		// version check it has can run, so what comes back is
 		// `json: unknown field "min_version"` — true, permanent, and unactionable
 		// on its own. Beside this node's range it says which side to upgrade.
-		return fmt.Errorf("nodeclient: registering at protocol %d (this node speaks %s): %w",
-			nodeapi.Version, self, err)
+		return fmt.Errorf("nodeclient: registering with %s at protocol %d (this node speaks %s): %w",
+			c.targets[at].base, nodeapi.Version, self, err)
 	}
 
 	// THE NEGOTIATED VERSION, CHECKED AGAINST WHAT THIS NODE CAN ACTUALLY SPEAK.
@@ -428,8 +826,13 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 	// THE GENERATION MOVES WITH THE WIRE, under one lock, so a stale answer
 	// decoded in between cannot clear a wire this registration is about to
 	// publish or has just published.
+	//
+	// AND THE CONTROLLER WITH THEM: every request after this one goes to the
+	// controller that accepted it, and an answer to one sent before belongs to
+	// the generation it was sent under.
 	c.regMu.Lock()
 	c.generation++
+	c.current.Store(int64(at))
 	c.wire.Store(int64(res.Version))
 	c.imagesAccept = slices.Clone(res.ImagesAccept)
 	c.imagesAcceptCarried = res.Version >= nodeapi.VersionImageAcceptance
@@ -508,13 +911,31 @@ func (c *Client) forgetRegistration(sentUnder int64) {
 	}
 }
 
-// currentGeneration is the registration a request about to be sent belongs to.
-func (c *Client) currentGeneration() int64 {
+// currentTarget is the controller a request about to be sent goes to, and the
+// registration it belongs to, read together under the lock a registration
+// publishes both under.
+func (c *Client) currentTarget() (*target, int64) {
 	c.regMu.Lock()
 	defer c.regMu.Unlock()
 
-	return c.generation
+	return c.at(), c.generation
 }
+
+// errNoAnswer is what an error wraps when the controller gave no answer at
+// all: the connection failed, was cut, or the request's deadline passed with
+// nothing heard. A refusal is an answer, and never wraps it, and neither does
+// the caller's own cancellation. A TLS handshake the node cannot complete (a
+// certificate it does not trust, or an alert) is counted as no answer: the
+// node cannot use that controller, and with another to try it tries it, as a
+// node with one controller retries the one it has.
+var errNoAnswer = errors.New("nodeclient: the control plane did not answer")
+
+// noAnswer carries a transport's error, and says it is errNoAnswer.
+type noAnswer struct{ err error }
+
+func (e noAnswer) Error() string        { return e.err.Error() }
+func (e noAnswer) Unwrap() error        { return e.err }
+func (e noAnswer) Is(target error) bool { return target == errNoAnswer }
 
 // Incarnation identifies this node process.
 func (c *Client) Incarnation() string { return c.incarnation }
@@ -578,7 +999,7 @@ func (c *Client) Poll(ctx context.Context) (nodeapi.Command, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.PollWindow()+pollSlack)
 	defer cancel()
 
-	status, err := c.doStatus(ctx, http.MethodPost, c.nodePath("/poll"), nil, &cmd)
+	status, err := c.doStatus(ctx, nil, http.MethodPost, c.nodePath("/poll"), nil, &cmd)
 	if err != nil {
 		return nodeapi.Command{}, false, err
 	}
@@ -739,6 +1160,11 @@ func (c *Client) RecordGuestReport(ctx context.Context, leaseID string, epoch in
 	// as a time that is not zero, so a zero is normalised too, and stays zero.
 	// The caller's report is not changed.
 	report.FirstReceived, report.LastReceived = report.FirstReceived.UTC(), report.LastReceived.UTC()
+
+	// AN OLDER PLANE'S STRICT DECODER would refuse the whole report over the field.
+	if wire < nodeapi.VersionJobTests {
+		report = report.WithoutTests()
+	}
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/guest"),
 		nodeapi.GuestReportRequest{Epoch: epoch, Report: report}, nil)
@@ -1119,16 +1545,22 @@ func (c *Client) leasePath(leaseID, suffix string) string {
 // Every caller but Poll goes through here, which is what makes the bound
 // universal rather than something each call site remembers.
 func (c *Client) do(ctx context.Context, method, path string, body, into any) error {
+	return c.doAt(ctx, nil, method, path, body, into)
+}
+
+// doAt is do against one controller, or the current one for nil.
+func (c *Client) doAt(ctx context.Context, at *target, method, path string, body, into any) error {
 	ctx, cancel := context.WithTimeout(ctx, c.reqTimeout)
 	defer cancel()
 
-	_, err := c.doStatus(ctx, method, path, body, into)
+	_, err := c.doStatus(ctx, at, method, path, body, into)
 
 	return err
 }
 
-// doStatus performs one request and translates the answer.
-func (c *Client) doStatus(ctx context.Context, method, path string, body, into any) (int, error) {
+// doStatus performs one request, to the controller at or the current one for
+// nil, and translates the answer.
+func (c *Client) doStatus(ctx context.Context, at *target, method, path string, body, into any) (int, error) {
 	var reader io.Reader
 
 	if body != nil {
@@ -1140,7 +1572,15 @@ func (c *Client) doStatus(ctx context.Context, method, path string, body, into a
 		reader = bytes.NewReader(raw)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.base+path, reader)
+	// THE CONTROLLER AND THE REGISTRATION THE REQUEST IS SENT UNDER, read
+	// together, so an answer is attributed to the registration whose controller
+	// gave it. See forgetRegistration.
+	current, sentUnder := c.currentTarget()
+	if at == nil {
+		at = current
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, at.base+path, reader)
 	if err != nil {
 		return 0, fmt.Errorf("nodeclient: build %s: %w", path, err)
 	}
@@ -1155,13 +1595,27 @@ func (c *Client) doStatus(ctx context.Context, method, path string, body, into a
 	// from a second host wearing the same name.
 	req.Header.Set(nodeapi.HeaderIncarnation, c.incarnation)
 
-	// CAPTURED BEFORE THE REQUEST LEAVES, so the answer can be attributed to the
-	// registration it is actually about. See forgetRegistration.
-	sentUnder := c.currentGeneration()
-
-	resp, err := c.http.Do(req)
+	resp, err := at.http.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("nodeclient: %s %s: %w", method, path, err)
+		// A CANCELLATION IS THE CALLER'S, and an error that came with a response
+		// (a redirect refused, whose body the client has already closed) came
+		// from a controller that answered: neither says the controller is gone.
+		if resp != nil || errors.Is(err, context.Canceled) {
+			return 0, fmt.Errorf("nodeclient: %s %s%s: %w", method, at.base, path, err)
+		}
+
+		// AND ITS IDLE CONNECTIONS ARE CLOSED, where the node knows another
+		// controller: one opened before a partition is ended only by its own
+		// keepalive probes, and a request that borrowed it would wait out its
+		// whole deadline where a new dial gives up in seconds.
+		if len(c.targets) > 1 {
+			at.http.CloseIdleConnections()
+		}
+
+		// NO ANSWER, as distinct from a refusal: the controller was not reached,
+		// or stopped answering, which is what a node with another controller to
+		// try acts on (errNoAnswer).
+		return 0, fmt.Errorf("nodeclient: %s %s%s: %w", method, at.base, path, noAnswer{err})
 	}
 
 	defer func() {
