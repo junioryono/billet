@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -14,19 +15,25 @@ import (
 	"github.com/junioryono/billet/internal/hostsource"
 )
 
-// fakeLedger keeps orders the way migration 73 does: one-way moves from one state.
+// fakeLedger keeps orders the way migration 73 does: one-way moves from one state, and
+// a placed order names its host.
 type fakeLedger struct {
-	mu      sync.Mutex
-	now     func() time.Time
-	orders  []alloc.PoolOrder
-	tokens  []string
-	reports map[string]alloc.TierCapacity
-	readErr error
+	mu        sync.Mutex
+	now       func() time.Time
+	orders    []alloc.PoolOrder
+	tokens    []string
+	reports   map[string]alloc.TierCapacity
+	readErr   error
+	tokenErr  error
+	listCalls int
 }
 
 func (l *fakeLedger) RecordPoolOrder(_ context.Context, o alloc.PoolOrder) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if o.Scope == "" {
+		return errors.New("an order without its scope")
+	}
 	for i := range l.orders {
 		if l.orders[i].ID == o.ID {
 			return errors.New("duplicate order")
@@ -41,6 +48,7 @@ func (l *fakeLedger) RecordPoolOrder(_ context.Context, o alloc.PoolOrder) error
 func (l *fakeLedger) PoolOrders(context.Context) ([]alloc.PoolOrder, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.listCalls++
 
 	return append([]alloc.PoolOrder(nil), l.orders...), nil
 }
@@ -51,9 +59,7 @@ func (l *fakeLedger) move(id, from, to, host, reason string) error {
 	for i := range l.orders {
 		if l.orders[i].ID == id && l.orders[i].State == from {
 			l.orders[i].State, l.orders[i].Reason, l.orders[i].Updated = to, reason, l.now()
-			if host != "" {
-				l.orders[i].HostID = host
-			}
+			l.orders[i].HostID = host
 
 			return nil
 		}
@@ -63,6 +69,10 @@ func (l *fakeLedger) move(id, from, to, host, reason string) error {
 }
 
 func (l *fakeLedger) PoolOrderPlaced(_ context.Context, id, host string) error {
+	if host == "" {
+		return errors.New("a placed order without its host")
+	}
+
 	return l.move(id, alloc.PoolOrdering, alloc.PoolPlaced, host, "")
 }
 
@@ -77,6 +87,9 @@ func (l *fakeLedger) PoolOrderRefused(_ context.Context, id, reason string) erro
 func (l *fakeLedger) NewJoinToken(_ context.Context, ttl time.Duration, uses int, note string) (string, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.tokenErr != nil {
+		return "", l.tokenErr
+	}
 	if uses != 1 || ttl <= 0 || !strings.HasPrefix(note, "pool order ") {
 		return "", fmt.Errorf("token asked with uses %d, ttl %v, note %q", uses, ttl, note)
 	}
@@ -93,24 +106,36 @@ func (l *fakeLedger) CapacityReports(context.Context) (map[string]alloc.TierCapa
 	return l.reports, l.readErr
 }
 
-func (l *fakeLedger) states() map[string]string {
+func (l *fakeLedger) snapshot() map[string]alloc.PoolOrder {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	out := map[string]string{}
+	out := map[string]alloc.PoolOrder{}
 	for i := range l.orders {
-		out[l.orders[i].ID] = l.orders[i].State
+		out[l.orders[i].ID] = l.orders[i]
+	}
+
+	return out
+}
+
+func (l *fakeLedger) states() map[string]string {
+	out := map[string]string{}
+	for id, o := range l.snapshot() { //nolint:gocritic // a test's handful of orders
+		out[id] = o.State
 	}
 
 	return out
 }
 
 // fakeSource answers orders from a script, and records that each order it was asked
-// for was already in the ledger: an order is committed before its source is asked.
+// for was already committed: an order is committed before its source is asked.
 type fakeSource struct {
 	t          *testing.T
 	ledger     *fakeLedger
+	scope      string
+	shapes     []string
 	mu         sync.Mutex
 	asked      []hostsource.Request
+	found      []string
 	answer     func(req hostsource.Request) (hostsource.Host, error)
 	find       func(order string) (hostsource.Host, bool, error)
 	idempotent time.Duration
@@ -118,26 +143,38 @@ type fakeSource struct {
 
 func (s *fakeSource) Name() string { return "fake" }
 
+func (s *fakeSource) Scope() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.scope
+}
+
 func (s *fakeSource) Order(_ context.Context, req hostsource.Request) (hostsource.Host, error) {
 	if s.ledger.states()[req.Order] != alloc.PoolOrdering {
 		s.t.Errorf("order %s was sent before it was committed as ordering", req.Order)
 	}
 	s.mu.Lock()
 	s.asked = append(s.asked, req)
+	answer := s.answer
 	s.mu.Unlock()
-	if s.answer == nil {
+	if answer == nil {
 		return hostsource.Host{ID: "host-" + req.Order}, nil
 	}
 
-	return s.answer(req)
+	return answer(req)
 }
 
 func (s *fakeSource) Find(_ context.Context, order string) (hostsource.Host, bool, error) {
-	if s.find == nil {
+	s.mu.Lock()
+	s.found = append(s.found, order)
+	find := s.find
+	s.mu.Unlock()
+	if find == nil {
 		return hostsource.Host{}, false, nil
 	}
 
-	return s.find(order)
+	return find(order)
 }
 
 func (s *fakeSource) Describe(context.Context, string) (hostsource.Host, error) {
@@ -147,8 +184,15 @@ func (s *fakeSource) Gone(context.Context, string) (hostsource.Presence, error) 
 	return hostsource.PresenceUnknown, nil
 }
 func (s *fakeSource) Release(context.Context, hostsource.ReleaseProof) error { return nil }
-func (s *fakeSource) Terms(string) (hostsource.Terms, error) {
-	return hostsource.Terms{IdempotentFor: s.idempotent}, nil
+
+func (s *fakeSource) Terms(shape string) (hostsource.Terms, error) {
+	for _, known := range s.shapes {
+		if known == shape {
+			return hostsource.Terms{IdempotentFor: s.idempotent}, nil
+		}
+	}
+
+	return hostsource.Terms{}, fmt.Errorf("no shape %q", shape)
 }
 
 func (s *fakeSource) requests() []hostsource.Request {
@@ -158,42 +202,51 @@ func (s *fakeSource) requests() []hostsource.Request {
 	return append([]hostsource.Request(nil), s.asked...)
 }
 
+func (s *fakeSource) finds() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]string(nil), s.found...)
+}
+
 type rig struct {
 	now    time.Time
 	ledger *fakeLedger
 	first  *fakeSource
 	second *fakeSource
 	pool   *Pool
-	boots  map[string]string
+	mu     sync.Mutex
+	boots  map[string][]string
 }
 
 func newRig(t *testing.T, policy Policy, tiers ...config.Tier) *rig {
 	t.Helper()
-	r := &rig{now: time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC), boots: map[string]string{}}
+	r := &rig{now: time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC), boots: map[string][]string{}}
 	clock := func() time.Time { return r.now }
 	r.ledger = &fakeLedger{now: clock, reports: map[string]alloc.TierCapacity{}}
-	r.first = &fakeSource{t: t, ledger: r.ledger, idempotent: 10 * time.Minute}
-	r.second = &fakeSource{t: t, ledger: r.ledger, idempotent: 10 * time.Minute}
+	r.first = &fakeSource{t: t, ledger: r.ledger, scope: "first:us-west-2", shapes: []string{"z1d.metal", "m6id.metal"},
+		idempotent: 10 * time.Minute}
+	r.second = &fakeSource{t: t, ledger: r.ledger, scope: "second:acct", shapes: []string{"s2.c2.small"},
+		idempotent: 10 * time.Minute}
 	if policy.Choices == nil {
 		policy.Choices = []Choice{{Source: "first", Shape: "z1d.metal"}, {Source: "second", Shape: "s2.c2.small", Location: "PHX"}}
 	}
 	n := 0
-	var mu sync.Mutex
 	p, err := New(r.ledger, Config{
 		Archs:          map[config.Arch]Policy{config.ArchX64: policy},
 		Sources:        map[string]hostsource.Source{"first": r.first, "second": r.second},
 		RefusalBackoff: 10 * time.Minute,
 		Tiers:          tiers,
 		Boot: func(order, token string) ([]byte, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			r.boots[order] = token
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.boots[order] = append(r.boots[order], token)
 
 			return []byte("join " + token), nil
 		},
 	}, WithClock(clock), WithIDs(func() (string, error) {
-		mu.Lock()
-		defer mu.Unlock()
+		r.mu.Lock()
+		defer r.mu.Unlock()
 		n++
 
 		return fmt.Sprintf("o-%d", n), nil
@@ -210,10 +263,15 @@ func firecrackerTier(label string, arch config.Arch) config.Tier {
 	return config.Tier{Label: label, Provider: config.ProviderFirecracker, Arch: arch}
 }
 
-func (r *rig) waiting(label string, n int) {
+// report sets a tier's capacity report as the listener writes it, observed now.
+func (r *rig) report(label string, waiting int, age time.Duration, observationErr string) {
 	r.ledger.mu.Lock()
 	defer r.ledger.mu.Unlock()
-	r.ledger.reports[label] = alloc.TierCapacity{Listener: alloc.ListenerCapacity{Waiting: n}}
+	r.ledger.reports[label] = alloc.TierCapacity{
+		ObservedAt:       r.now.Add(-age).UTC().Format(time.RFC3339Nano),
+		ObservationError: observationErr,
+		Listener:         alloc.ListenerCapacity{Waiting: waiting},
+	}
 }
 
 func step(t *testing.T, r *rig) {
@@ -223,22 +281,30 @@ func step(t *testing.T, r *rig) {
 	}
 }
 
-// THE FLOOR IS KEPT: an order is committed, sent with its own single-use join token in
-// its boot, and placed when the source names a host; a kept floor orders nothing more.
+// THE FLOOR IS KEPT: an order is committed with its source's scope, sent with its own
+// single-use join token in its boot, and placed under the host the source named; a kept
+// floor orders nothing more.
 func TestTheFloorIsKept(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, Policy{Floor: 2, Max: 4})
 	step(t, r)
 	step(t, r)
 	step(t, r)
-	if got := r.ledger.states(); len(got) != 2 || got["o-1"] != alloc.PoolPlaced || got["o-2"] != alloc.PoolPlaced {
-		t.Fatalf("orders = %v, want two placed", got)
+	orders := r.ledger.snapshot()
+	if len(orders) != 2 {
+		t.Fatalf("orders = %+v, want two", orders)
+	}
+	for _, id := range []string{"o-1", "o-2"} {
+		o := orders[id]
+		if o.State != alloc.PoolPlaced || o.HostID != "host-"+id || o.Scope != "first:us-west-2" {
+			t.Errorf("%s = %+v", id, o)
+		}
 	}
 	asked := r.first.requests()
 	if len(asked) != 2 || asked[0].Shape != "z1d.metal" || asked[0].Arch != config.ArchX64 {
 		t.Fatalf("asked %+v", asked)
 	}
-	if string(asked[0].Boot.Reveal()) != "join "+r.boots["o-1"] || r.boots["o-1"] == r.boots["o-2"] {
+	if string(asked[0].Boot.Reveal()) != "join "+r.boots["o-1"][0] || r.boots["o-1"][0] == r.boots["o-2"][0] {
 		t.Fatalf("boots = %v, payload %q", r.boots, asked[0].Boot.Reveal())
 	}
 	if len(r.second.requests()) != 0 {
@@ -246,48 +312,96 @@ func TestTheFloorIsKept(t *testing.T) {
 	}
 }
 
-// A FIRECRACKER TIER WITH JOBS WAITING IS DEMAND, one host at a time while any is on
-// its way, and never past the maximum; another provider's waiting tier, or one whose
-// architecture is not named, is not demand for the pool.
-func TestDemandGrowsTheFloorOneHostAtATime(t *testing.T) {
+// A FIRECRACKER TIER WITH JOBS WAITING, BY A FRESH REPORT, IS DEMAND, for one host while
+// none is on its way; another provider's tier, or one with no architecture, is not. No
+// host is known to join until the join lands, so demand grows the pool by one at most.
+func TestDemandOrdersOneHostWhileNoneIsOnItsWay(t *testing.T) {
 	t.Parallel()
-	r := newRig(t, Policy{Floor: 0, Max: 2},
+	r := newRig(t, Policy{Floor: 0, Max: 3},
 		firecrackerTier("fc-x64", config.ArchX64),
 		config.Tier{Label: "ec2", Provider: config.ProviderEC2, Arch: config.ArchX64},
 		config.Tier{Label: "fc-any", Provider: config.ProviderFirecracker})
-	r.waiting("ec2", 5)
-	r.waiting("fc-any", 5)
+	r.report("fc-x64", 0, 0, "")
+	r.report("ec2", 5, 0, "")
+	r.report("fc-any", 5, 0, "")
 	step(t, r)
 	if n := len(r.ledger.states()); n != 0 {
 		t.Fatalf("%d orders for demand the pool does not serve", n)
 	}
-	r.waiting("fc-x64", 3)
+	r.report("fc-x64", 3, 0, "")
 	step(t, r)
+	step(t, r)
+	step(t, r)
+	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolPlaced {
+		t.Fatalf("orders = %v, want one placed and no more while it has not joined", got)
+	}
+}
+
+// A TIER THAT NAMES FIRECRACKER AMONG SEVERAL PROVIDERS IS THE POOL'S DEMAND TOO.
+func TestATierOfSeveralProvidersIncludingFirecrackerIsDemand(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 0, Max: 2}, config.Tier{
+		Label: "mixed", Providers: []config.ProviderKind{config.ProviderEC2, config.ProviderFirecracker}, Arch: config.ArchX64,
+	})
+	r.report("mixed", 2, 0, "")
 	step(t, r)
 	if n := len(r.ledger.states()); n != 1 {
-		t.Fatalf("%d orders while one host was on its way, want 1", n)
+		t.Fatalf("%d orders, want 1", n)
 	}
-	// The host joined: the next is ordered for the demand still waiting.
-	r.ledger.mu.Lock()
-	r.ledger.orders[0].NodeName = "pool-o-1"
-	r.ledger.mu.Unlock()
-	step(t, r)
-	step(t, r)
-	if n := len(r.ledger.states()); n != 2 {
-		t.Fatalf("%d orders, want 2", n)
+}
+
+// THE MAXIMUM HOLDS whatever the floor or the demand.
+func TestTheMaximumHolds(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 3, Max: 2})
+	for range 4 {
+		step(t, r)
 	}
-	r.ledger.mu.Lock()
-	r.ledger.orders[1].NodeName = "pool-o-2"
-	r.ledger.mu.Unlock()
-	step(t, r)
 	if n := len(r.ledger.states()); n != 2 {
 		t.Fatalf("%d orders past the maximum of 2", n)
 	}
 }
 
-// A REFUSAL IS AN ANSWER: the order is refused, the next choice is asked, and the
-// refused one is passed over until the backoff passes. An order that never reached the
-// source is the same.
+// DEMAND THAT CANNOT BE READ IS NOT NO DEMAND, AND NOT DEMAND: a missing, stale or
+// failed report, or a ledger that cannot be read, is reported, the floor is still kept,
+// and nothing is ordered for demand.
+func TestUnreadableDemandKeepsTheFloorAndOrdersNothingForDemand(t *testing.T) {
+	t.Parallel()
+	for name, set := range map[string]func(*rig){
+		"no report":       func(*rig) {},
+		"a stale report":  func(r *rig) { r.report("fc", 5, 6*time.Minute, "") },
+		"a failed report": func(r *rig) { r.report("fc", 5, 0, "malformed snapshot") },
+		"an unreadable ledger": func(r *rig) {
+			r.report("fc", 5, 0, "")
+			r.ledger.readErr = errors.New("database is locked")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := newRig(t, Policy{Floor: 0, Max: 3}, firecrackerTier("fc", config.ArchX64))
+			set(r)
+			if err := r.pool.Step(t.Context()); !errors.Is(err, ErrDemandUnknown) {
+				t.Fatalf("step = %v, want the demand unknown", err)
+			}
+			if n := len(r.ledger.states()); n != 0 {
+				t.Fatalf("%d orders for demand that could not be read", n)
+			}
+
+			r = newRig(t, Policy{Floor: 1, Max: 3}, firecrackerTier("fc", config.ArchX64))
+			set(r)
+			if err := r.pool.Step(t.Context()); !errors.Is(err, ErrDemandUnknown) {
+				t.Fatalf("step = %v", err)
+			}
+			if n := len(r.ledger.states()); n != 1 {
+				t.Fatalf("%d orders, want the floor's one", n)
+			}
+		})
+	}
+}
+
+// A REFUSAL IS AN ANSWER on the first attempt: the order is refused, the next choice is
+// asked, and the refused one is passed over until the backoff passes. An order that
+// never reached the source is the same.
 func TestARefusedChoiceIsPassedOverForTheBackoff(t *testing.T) {
 	t.Parallel()
 	for name, refusal := range map[string]error{
@@ -317,10 +431,55 @@ func TestARefusedChoiceIsPassedOverForTheBackoff(t *testing.T) {
 	}
 }
 
+// A REFUSAL PASSES OVER ONLY ITS OWN CHOICE: another shape at the same source is asked.
+func TestARefusalPassesOverOnlyItsChoice(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 1, Max: 1, Choices: []Choice{
+		{Source: "first", Shape: "z1d.metal"}, {Source: "first", Shape: "m6id.metal"},
+	}})
+	r.first.answer = func(req hostsource.Request) (hostsource.Host, error) {
+		if req.Shape == "z1d.metal" {
+			return hostsource.Host{}, hostsource.ErrNoStock
+		}
+
+		return hostsource.Host{ID: "host-" + req.Order}, nil
+	}
+	step(t, r)
+	step(t, r)
+	if got := r.ledger.snapshot(); got["o-2"].Shape != "m6id.metal" || got["o-2"].State != alloc.PoolPlaced {
+		t.Fatalf("orders = %+v", got)
+	}
+}
+
+// NOTHING IS ORDERED WHILE AN ORDER'S OUTCOME IS UNKNOWN, floor or no floor: an order
+// still being ordered, or uncertain, may hold a host already.
+func TestNothingIsOrderedWhileAnOutcomeIsUnknown(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 2, Max: 3})
+	r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, errors.New("timeout") }
+	r.first.find = func(string) (hostsource.Host, bool, error) { return hostsource.Host{}, false, errors.New("timeout") }
+	step(t, r)
+	for range 3 {
+		if err := r.pool.Step(t.Context()); err == nil {
+			t.Fatal("a failed read back was not reported")
+		}
+	}
+	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolOrdering {
+		t.Fatalf("orders while one is unknown: %v", got)
+	}
+	r.first.find = nil
+	r.now = r.now.Add(11 * time.Minute)
+	step(t, r)
+	step(t, r)
+	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolUncertain {
+		t.Fatalf("orders while one is uncertain: %v", got)
+	}
+}
+
 // AN ANSWER THAT IS NOT KNOWN leaves the order being ordered, and the next step reads
-// it back before it does anything else: found, it is placed; listed as absent inside
-// the source's window, it is sent again under the same order; past the window, it is
-// uncertain, and nothing more is ordered for it.
+// it back before anything else: found, it is placed under the found host; listed as
+// absent inside the source's window, it is sent again under the same order with a fresh
+// token; past the window, it is uncertain.
 func TestALostAnswerIsReadBackBeforeAnythingElse(t *testing.T) {
 	t.Parallel()
 	lost := func(hostsource.Request) (hostsource.Host, error) {
@@ -334,8 +493,11 @@ func TestALostAnswerIsReadBackBeforeAnythingElse(t *testing.T) {
 		return hostsource.Host{ID: "found-" + order}, true, nil
 	}
 	step(t, r)
-	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolPlaced {
-		t.Fatalf("found: %v", got)
+	if got := r.ledger.snapshot(); len(got) != 1 || got["o-1"].State != alloc.PoolPlaced || got["o-1"].HostID != "found-o-1" {
+		t.Fatalf("found: %+v", got)
+	}
+	if finds := r.first.finds(); len(finds) != 1 || finds[0] != "o-1" {
+		t.Fatalf("read back %v, want o-1", finds)
 	}
 
 	r = newRig(t, Policy{Floor: 1, Max: 2})
@@ -347,6 +509,9 @@ func TestALostAnswerIsReadBackBeforeAnythingElse(t *testing.T) {
 	asked := r.first.requests()
 	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolPlaced || len(asked) != 2 || asked[1].Order != "o-1" {
 		t.Fatalf("resent inside the window: %v, asked %+v", got, asked)
+	}
+	if tokens := r.boots["o-1"]; len(tokens) != 2 || tokens[0] == tokens[1] {
+		t.Fatalf("a resend's token: %v", tokens)
 	}
 
 	r = newRig(t, Policy{Floor: 1, Max: 2})
@@ -363,11 +528,26 @@ func TestALostAnswerIsReadBackBeforeAnythingElse(t *testing.T) {
 	r.first.answer = lost
 	step(t, r)
 	r.first.find = func(string) (hostsource.Host, bool, error) { return hostsource.Host{}, false, errors.New("timeout") }
-	if err := r.pool.Step(t.Context()); err == nil {
-		t.Fatal("a failed read back was not reported")
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "read back order o-1") {
+		t.Fatalf("a failed read back answered %v", err)
 	}
 	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolOrdering || len(r.first.requests()) != 1 {
 		t.Fatalf("a failed read back decided something: %v, asked %d times", got, len(r.first.requests()))
+	}
+}
+
+// A RESEND THE SOURCE REFUSES SAYS NOTHING ABOUT THE FIRST ATTEMPT, which may have
+// placed a host: the order is uncertain, not refused, and still counts.
+func TestARefusedResendIsUncertainNotRefused(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 1, Max: 2})
+	r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, errors.New("timeout") }
+	step(t, r)
+	r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, hostsource.ErrRefused }
+	step(t, r)
+	got := r.ledger.snapshot()
+	if len(got) != 1 || got["o-1"].State != alloc.PoolUncertain || !strings.Contains(got["o-1"].Reason, "first attempt") {
+		t.Fatalf("orders = %+v", got)
 	}
 }
 
@@ -385,17 +565,40 @@ func TestASourceWithoutDeduplicationIsNeverResent(t *testing.T) {
 	}
 }
 
-// DEMAND THAT CANNOT BE READ IS NOT NO DEMAND: the floor is still kept, growth waits,
-// and the step says it could not read.
-func TestUnreadableDemandStillKeepsTheFloor(t *testing.T) {
+// AN ORDER IS READ BACK ONLY WHERE IT WAS PLACED: a source whose scope changed since
+// is neither asked for it nor sent it again, and the order waits for a person.
+func TestAnOrderIsReadBackOnlyWhereItWasPlaced(t *testing.T) {
 	t.Parallel()
-	r := newRig(t, Policy{Floor: 1, Max: 3}, firecrackerTier("fc", config.ArchX64))
-	r.ledger.readErr = errors.New("database is locked")
-	if err := r.pool.Step(t.Context()); err == nil {
-		t.Fatal("an unreadable demand was not reported")
+	r := newRig(t, Policy{Floor: 1, Max: 2})
+	r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, errors.New("timeout") }
+	step(t, r)
+	r.first.mu.Lock()
+	r.first.scope = "first:eu-west-1"
+	r.first.answer = nil
+	r.first.mu.Unlock()
+	step(t, r)
+	step(t, r)
+	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolOrdering {
+		t.Fatalf("orders = %v", got)
 	}
-	if got := r.ledger.states(); len(got) != 1 {
-		t.Fatalf("orders = %v, want the floor's one", got)
+	if len(r.first.finds()) != 0 || len(r.first.requests()) != 1 {
+		t.Fatalf("read back %v and sent %d times somewhere else", r.first.finds(), len(r.first.requests()))
+	}
+}
+
+// A FIRST ATTEMPT THAT FAILS BEFORE ITS SOURCE IS ASKED SENT NOTHING: a token that could
+// not be minted, or a boot that could not be rendered, refuses the order rather than
+// leaving it for a read back that could only end uncertain.
+func TestAFirstAttemptThatCouldNotBeSentIsRefused(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 1, Max: 1})
+	r.ledger.tokenErr = errors.New("database is locked")
+	if err := r.pool.Step(t.Context()); err == nil {
+		t.Fatal("a token that could not be minted was not reported")
+	}
+	if got := r.ledger.snapshot(); got["o-1"].State != alloc.PoolRefused || !strings.HasPrefix(got["o-1"].Reason, "not sent") ||
+		len(r.first.requests()) != 0 {
+		t.Fatalf("orders = %+v, asked %d", got, len(r.first.requests()))
 	}
 }
 
@@ -406,7 +609,33 @@ func TestAChoiceNamingNoSourceIsRefused(t *testing.T) {
 		Sources: map[string]hostsource.Source{},
 		Boot:    func(string, string) ([]byte, error) { return nil, nil },
 	})
-	if err == nil {
-		t.Fatal("a choice naming no configured source was accepted")
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("a choice naming no configured source answered %v", err)
 	}
+}
+
+// RUN STEPS AT EVERY TICK until its context ends, and a failed step does not stop it.
+func TestRunStepsAtEveryTickUntilItsContextEnds(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		r := newRig(t, Policy{Floor: 0, Max: 1})
+		r.ledger.readErr = errors.New("unreadable") // every step fails on demand
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			r.pool.Run(ctx, time.Minute)
+			close(done)
+		}()
+		time.Sleep(3*time.Minute + time.Second)
+		synctest.Wait()
+		cancel()
+		<-done
+		r.ledger.mu.Lock()
+		calls := r.ledger.listCalls
+		r.ledger.mu.Unlock()
+		// Each step reads the orders twice; four steps: at start and at 1, 2 and 3 min.
+		if calls != 8 {
+			t.Fatalf("the ledger was read %d times, want 8 (four steps)", calls)
+		}
+	})
 }

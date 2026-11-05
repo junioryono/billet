@@ -6,6 +6,7 @@
 CREATE TABLE pool_orders (
     order_id text PRIMARY KEY NOT NULL,
     source text NOT NULL,
+    scope text NOT NULL,
     shape text NOT NULL,
     location text NOT NULL DEFAULT '',
     arch text NOT NULL,

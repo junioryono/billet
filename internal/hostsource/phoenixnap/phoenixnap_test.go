@@ -235,7 +235,7 @@ func TestAQuotaListWithoutTheServersQuotaOrdersNothing(t *testing.T) {
 	f.order = func(http.ResponseWriter) { t.Error("an order was placed") }
 	_, err := source(t, srv).Order(t.Context(), request())
 	if !errors.Is(err, hostsource.ErrNotSent) || errors.Is(err, hostsource.ErrQuota) || errors.Is(err, hostsource.ErrNoStock) {
-		t.Fatalf("order = %v, want could-not-tell", err)
+		t.Fatalf("order = %v, want not sent", err)
 	}
 }
 
@@ -514,7 +514,7 @@ func TestStockThatCannotBeReadIsNotNoStock(t *testing.T) {
 		switch {
 		case c.want != nil && !errors.Is(err, c.want):
 			t.Errorf("%s: %v, want %v", name, err, c.want)
-		case c.want == nil && (err == nil || errors.Is(err, hostsource.ErrNoStock)):
+		case c.want == nil && (!errors.Is(err, hostsource.ErrNotSent) || errors.Is(err, hostsource.ErrNoStock)):
 			t.Errorf("%s: %v, want could-not-tell", name, err)
 		}
 	}
@@ -547,7 +547,7 @@ func TestStockEntriesWithoutAProductCannotBeRead(t *testing.T) {
 		f.mu.Unlock()
 		f.order = func(http.ResponseWriter) { t.Errorf("%s: an order was placed", body) }
 		_, err := source(t, srv).Order(t.Context(), request())
-		if err == nil || errors.Is(err, hostsource.ErrNoStock) {
+		if !errors.Is(err, hostsource.ErrNotSent) || errors.Is(err, hostsource.ErrNoStock) {
 			t.Errorf("stock %s: %v, want could-not-tell", body, err)
 		}
 	}
@@ -680,5 +680,14 @@ func TestARefusalNamesTheServerItAskedFor(t *testing.T) {
 	t.Cleanup(srv.Close)
 	if _, err := source(t, srv).Describe(t.Context(), "srv-1"); err == nil || !strings.Contains(err.Error(), "srv-1") {
 		t.Fatalf("describe = %v", err)
+	}
+}
+
+// THE SCOPE IS THE ACCOUNT THE API CLIENT ORDERS IN, named by the client, never its secret.
+func TestTheScopeIsTheClientsAccount(t *testing.T) {
+	t.Parallel()
+	_, srv := newFake(t)
+	if got := source(t, srv).Scope(); got != "phoenixnap:"+clientID || strings.Contains(got, clientSecret) {
+		t.Fatalf("scope = %q", got)
 	}
 }

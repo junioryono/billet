@@ -600,12 +600,12 @@ func (c *Controller) Schedule(
 	// AND THE POOL, when the config names one (ADR-028). Only the controller runs it,
 	// because two would each order what the floor and the demand call for; a dry run
 	// orders nothing, as it accepts no job.
-	if cp.cfg.Server.Pool != nil && !opts.DryRun {
-		hosts, interval, err := NewPool(cp.cfg, cp.allocator, cp.deployment, slog.Default())
-		if err != nil {
-			return nil, err
-		}
-		c.loops.Background("pool", func(ctx context.Context) { hosts.Run(ctx, interval) })
+	poolLoop, pooled, err := schedulePool(cp.cfg, cp.allocator, cp.deployment, opts.DryRun)
+	if err != nil {
+		return nil, err
+	}
+	if pooled {
+		c.loops.Background("pool", poolLoop)
 	}
 
 	// THE REMOTE PLANE DRIVES ALL COMPUTE, and it is the only thing that can. A

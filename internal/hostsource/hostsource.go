@@ -162,6 +162,10 @@ type Terms struct {
 type Source interface {
 	// Name is the source's kind, for logs and the ledger: "aws-metal", "phoenixnap".
 	Name() string
+	// Scope is where this source orders (an AWS region, subnet and zone; a phoenixNAP
+	// account), recorded with each order, so a lost order is read back and sent again
+	// only where it was placed.
+	Scope() string
 	// Order asks for one host. ErrNoStock and ErrQuota are the source's own refusals;
 	// any other error is could-not-tell, and the pool reads the order back by its
 	// identifier before it orders again.

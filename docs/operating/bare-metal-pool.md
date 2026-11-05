@@ -4,7 +4,8 @@ A control plane with `server.pool` in its config orders Firecracker hosts from r
 
 ## What is built, and what is not yet
 
-- **Built:** ordering. The controller keeps each architecture's floor, orders one host at a time for a Firecracker tier with jobs waiting while none is already on its way, never past the maximum, and passes over a choice its source refused (no stock, a quota, a refusal an operator acts on) for `refusal_backoff`. Its sources are AWS bare-metal instances (`aws-metal`) and phoenixNAP Bare Metal Cloud (`phoenixnap`).
+- **Built:** ordering. The controller keeps each architecture's floor, never past the maximum, and orders one more host for a Firecracker tier whose fresh capacity report has jobs waiting, while no placed host is still on its way. It orders nothing on an architecture while any order there is unknown, being ordered or uncertain, because that order may hold a host already. It passes over a choice its source refused (no stock, a quota, a refusal an operator acts on) for `refusal_backoff`. A report older than five minutes, or in error, is not read as demand, and the floor is kept regardless. Its sources are AWS bare-metal instances (`aws-metal`) and phoenixNAP Bare Metal Cloud (`phoenixnap`).
+- **Demand grows the pool by one host at most, for now.** A placed host counts as on its way until a node is known to have joined from it, and nothing records that yet, so a second host for demand waits for the join.
 - **Not yet:** a host joins with `billet join` and its order's single-use token, and its enrollment waits for a person to approve it with `billet nodes approve`, as any node's does; automated admission comes next. A host is never released by the pool yet: releasing needs the host linked to the node that joined from it, and a proof that it holds nothing (ADR-028), which come with the join. Until then an operator drains and releases a pool host by hand.
 
 ## An order's life
@@ -14,9 +15,11 @@ Every order is a row in the ledger, written before its source is asked, so `bill
 - **ordering**: the row is committed and the source has been, or is being, asked.
 - **placed**: the source named the host.
 - **refused**: the source refused, or the order failed before anything reached the source; the reason is on the order.
-- **uncertain**: the answer was lost, the source lists no host for the order, and a resend could place a second one. On AWS, whose launches carry the order as an idempotency token, the pool sends a lost order again for ten minutes from its first attempt before it calls it uncertain; phoenixNAP takes no such token, so a lost answer there is uncertain at once.
+- **uncertain**: the answer was lost, the source lists no host for the order, and a resend could place a second one. On AWS, whose launches carry the order as an idempotency token, the pool sends a lost order again for ten minutes from its first attempt before it calls it uncertain; phoenixNAP takes no such token, so a lost answer there is uncertain at once. A resend the source refuses makes the order uncertain too: the refusal says nothing about the first attempt, which may have placed a host.
 
-An uncertain order holds its place against the maximum and blocks growth for demand on its architecture, because it may hold a host. Look for it in the source's own console: an EC2 instance tagged `sh.billet.pool-order=<order>`, or a phoenixNAP server named `billet-<order>`. If there is one, it is real and joins or can be released by hand; if there is none, close the order:
+An order records where its source orders (an AWS region, subnet and zone; a phoenixNAP account). If the config changes so the source orders somewhere else, an order still being ordered is not read back or sent again there; it waits, with a warning in the log, because reading it back anywhere else could miss the host it placed.
+
+An uncertain order holds its place against the maximum and stops all ordering on its architecture, because it may hold a host. Look for it in the source's own console: an EC2 instance tagged `sh.billet.pool-order=<order>`, or a phoenixNAP server named `billet-<order>`. If there is one, it is real and joins or can be released by hand; if there is none, close the order:
 
 ```bash
 billet pool abandon --reason "no instance tagged with the order in us-west-2" p1a2b3c4d5e6

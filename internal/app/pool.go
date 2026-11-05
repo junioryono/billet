@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -37,6 +38,11 @@ func NewPool(cfg *config.Config, ledger *alloc.Allocator, deployment string, log
 	if err != nil {
 		return nil, 0, fmt.Errorf("app: read server.pool.boot_prelude: %w", err)
 	}
+	// A BOOT THAT CANNOT BE RENDERED IS REFUSED HERE, at the start, rather than once per
+	// order after the order is committed.
+	if _, err := PoolBoot(cfg, string(prelude), "SHA256:"+strings.Repeat("a", 64), "p000000000000", tokenStandIn); err != nil {
+		return nil, 0, err
+	}
 	archs := make(map[config.Arch]pool.Policy, len(pc.Architectures))
 	for arch, pa := range pc.Architectures {
 		choices := make([]pool.Choice, 0, len(pa.Order))
@@ -50,20 +56,27 @@ func NewPool(cfg *config.Config, ledger *alloc.Allocator, deployment string, log
 		Sources:        sources,
 		RefusalBackoff: pc.PoolRefusalBackoff(),
 		Tiers:          cfg.Tiers,
-		Boot: func(order, token string) ([]byte, error) {
-			fingerprint, err := caFingerprint(cfg)
-			if err != nil {
-				return nil, err
-			}
-
-			return PoolBoot(cfg, string(prelude), fingerprint, order, token)
-		},
+		Boot:           poolBootFor(cfg, string(prelude)),
 	}, pool.WithLogger(log))
 	if err != nil {
 		return nil, 0, err
 	}
 
 	return p, pc.PoolInterval(), nil
+}
+
+// schedulePool is the controller's pool loop, and false when the config names no pool
+// or the run is dry, which orders nothing as it accepts no job.
+func schedulePool(cfg *config.Config, ledger *alloc.Allocator, deployment string, dryRun bool) (func(context.Context), bool, error) {
+	if cfg.Server.Pool == nil || dryRun {
+		return nil, false, nil
+	}
+	hosts, interval, err := NewPool(cfg, ledger, deployment, slog.Default())
+	if err != nil {
+		return nil, false, err
+	}
+
+	return func(ctx context.Context) { hosts.Run(ctx, interval) }, true, nil
 }
 
 func poolSources(pc *config.PoolConfig, deployment string) (map[string]hostsource.Source, error) {
@@ -106,6 +119,19 @@ func poolSources(pc *config.PoolConfig, deployment string) (map[string]hostsourc
 	return out, nil
 }
 
+// poolBootFor renders each order's boot with the authority as it is when the order is
+// sent, so a rotation between orders is followed.
+func poolBootFor(cfg *config.Config, prelude string) func(order, token string) ([]byte, error) {
+	return func(order, token string) ([]byte, error) {
+		fingerprint, err := caFingerprint(cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		return PoolBoot(cfg, prelude, fingerprint, order, token)
+	}
+}
+
 // caFingerprint is the deployment authority's, read from the public certificate.
 func caFingerprint(cfg *config.Config) (string, error) {
 	raw, err := os.ReadFile(wirecert.CACertPath(cfg.Server.IdentityDir))
@@ -120,6 +146,10 @@ func caFingerprint(cfg *config.Config) (string, error) {
 // billet and what a Firecracker node needs, then the `billet join` that enrolls it
 // under its order's single-use token. The token is a credential, so the whole payload
 // is one, and it fits EC2's user data.
+//
+// THE PRELUDE RUNS IN A SHELL OF ITS OWN, written to a file through a quoted heredoc,
+// so a `set -x` it carries for its own debugging never traces the join, and tracing is
+// switched off again before the token is ever in a command line.
 func PoolBoot(cfg *config.Config, prelude, fingerprint, order, token string) ([]byte, error) {
 	pc := cfg.Server.Pool
 	join := []string{
@@ -139,11 +169,21 @@ func PoolBoot(cfg *config.Config, prelude, fingerprint, order, token string) ([]
 	for i, a := range join {
 		quoted[i] = singleQuoted(a)
 	}
+	body := strings.TrimRight(prelude, "\n")
+	for _, line := range strings.Split(body, "\n") {
+		if line == preludeEnd {
+			return nil, fmt.Errorf("app: server.pool.boot_prelude has a line %q, which ends the heredoc it is "+
+				"written through", preludeEnd)
+		}
+	}
 
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\n# billet pool order " + order + "\nset -euo pipefail\n\n")
-	b.WriteString(strings.TrimRight(prelude, "\n"))
-	b.WriteString("\n\n" + strings.Join(quoted, " ") + "\n")
+	b.WriteString("umask 077\ncat >/run/billet-pool-prelude.sh <<'" + preludeEnd + "'\n")
+	b.WriteString(body + "\n" + preludeEnd + "\n")
+	b.WriteString("bash /run/billet-pool-prelude.sh\nrm -f /run/billet-pool-prelude.sh\n\n")
+	b.WriteString("set +o xtrace +o verbose\n")
+	b.WriteString(strings.Join(quoted, " ") + "\n")
 	if b.Len() > maxBootPayload {
 		return nil, fmt.Errorf("app: a pool host's boot is %d bytes, past the %d a source carries; shorten "+
 			"server.pool.boot_prelude", b.Len(), maxBootPayload)
@@ -151,6 +191,13 @@ func PoolBoot(cfg *config.Config, prelude, fingerprint, order, token string) ([]
 
 	return []byte(b.String()), nil
 }
+
+// preludeEnd closes the heredoc the prelude is written through.
+const preludeEnd = "BILLET_POOL_PRELUDE_END"
+
+// tokenStandIn is as long as a join token (20 random bytes in base32), so a boot
+// rendered with it at assembly is as long as every order's.
+const tokenStandIn = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 // singleQuoted is one shell word holding s exactly: inside single quotes the shell
 // reads every byte literally, and an embedded quote closes, escapes and reopens.

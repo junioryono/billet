@@ -156,6 +156,7 @@ type NodeEnrollment struct {
 type PoolOrder struct {
 	OrderID        string
 	Source         string
+	Scope          string
 	Shape          string
 	Location       string
 	Arch           string

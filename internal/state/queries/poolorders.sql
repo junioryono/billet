@@ -2,11 +2,11 @@
 -- so each update names the state it moves from and reports how many rows moved.
 
 -- name: InsertPoolOrder :exec
-INSERT INTO pool_orders (order_id, source, shape, location, arch, state, first_attempt_at, updated_at)
-VALUES (@order_id, @source, @shape, @location, @arch, 'ordering', @first_attempt_at, @updated_at);
+INSERT INTO pool_orders (order_id, source, scope, shape, location, arch, state, first_attempt_at, updated_at)
+VALUES (@order_id, @source, @scope, @shape, @location, @arch, 'ordering', @first_attempt_at, @updated_at);
 
 -- name: ListPoolOrders :many
-SELECT order_id, source, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at
+SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at
 FROM pool_orders
 ORDER BY first_attempt_at, order_id;
 

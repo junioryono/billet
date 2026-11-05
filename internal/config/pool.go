@@ -6,6 +6,7 @@ import (
 	"net"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -282,6 +283,15 @@ func (m *PoolAWSMetal) validate() []error {
 		if !a.Valid() || image == "" {
 			errs = append(errs, fmt.Errorf("server.pool.aws_metal.images.%s %q must name an AMI for a known "+
 				"architecture", a, image))
+		}
+	}
+
+	// A POOL HOST RUNS FIRECRACKER, WHICH NEEDS KVM, and on AWS only a bare-metal type
+	// has it. Every such type names it (`m7gd.metal`, `c7i.metal-24xl`).
+	for i, s := range m.Shapes {
+		if !strings.Contains(s.Type, ".metal") {
+			errs = append(errs, fmt.Errorf("server.pool.aws_metal.shapes[%d].type %q is not a bare-metal type; a pool "+
+				"host runs Firecracker, which needs the KVM only a .metal type has", i, s.Type))
 		}
 	}
 

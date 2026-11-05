@@ -61,6 +61,8 @@ func (f *fakeHosts) Describe(context.Context, string) (ec2.HostRecord, error) {
 	return f.record, f.describe
 }
 
+func (f *fakeHosts) Scope() string { return "aws:us-west-2:subnet-0abc" }
+
 func (f *fakeHosts) Terminate(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -236,5 +238,14 @@ func TestALaunchRefusedLocallyIsNotSent(t *testing.T) {
 	_, err := newTestSource(t, f).Order(t.Context(), hostsource.Request{Order: "o-1", Shape: "m7gd.metal"})
 	if !errors.Is(err, hostsource.ErrNotSent) {
 		t.Fatalf("order = %v", err)
+	}
+}
+
+// THE SCOPE IS WHERE AN ORDER WAS PLACED: the provider's region and subnet, and this
+// source's zone, so a changed config is never mistaken for the same place.
+func TestTheScopeNamesRegionSubnetAndZone(t *testing.T) {
+	t.Parallel()
+	if got := newTestSource(t, &fakeHosts{}).Scope(); got != "aws:us-west-2:subnet-0abc:us-west-2a" {
+		t.Fatalf("scope = %q", got)
 	}
 }

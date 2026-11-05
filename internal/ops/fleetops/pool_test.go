@@ -35,7 +35,8 @@ func TestThePoolCommandListsOrdersAndClosesOnlyAnUncertainOne(t *testing.T) {
 	}
 	for _, id := range []string{"p-placed", "p-lost"} {
 		if err := a.RecordPoolOrder(ctx, alloc.PoolOrder{
-			ID: id, Source: "aws-metal", Shape: "z1d.metal", Location: "us-west-2a", Arch: config.ArchX64,
+			ID: id, Source: "aws-metal", Scope: "aws:us-west-2:subnet-0abc:us-west-2a", Shape: "z1d.metal",
+			Location: "us-west-2a", Arch: config.ArchX64,
 		}); err != nil {
 			t.Fatalf("record: %v", err)
 		}
@@ -52,8 +53,19 @@ func TestThePoolCommandListsOrdersAndClosesOnlyAnUncertainOne(t *testing.T) {
 	if err := Pool(ctx, env, []string{"--config", cfg}); err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	for _, want := range []string{"p-placed", "i-0abc", "placed", "p-lost", "uncertain", "the answer was lost",
-		"1 uncertain", "billet pool abandon"} {
+	rows := map[string][]string{}
+	for _, line := range strings.Split(out.String(), "\n") {
+		if f := strings.Fields(line); len(f) > 0 {
+			rows[f[0]] = f
+		}
+	}
+	if r := rows["p-placed"]; len(r) < 8 || r[1] != "x64" || r[2] != "aws-metal" || r[5] != "placed" || r[6] != "i-0abc" {
+		t.Errorf("the p-placed row = %q", r)
+	}
+	if r := rows["p-lost"]; len(r) < 8 || r[5] != "uncertain" || r[6] != "-" {
+		t.Errorf("the p-lost row = %q", r)
+	}
+	for _, want := range []string{"the answer was lost", "1 uncertain", "billet pool abandon"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("the listing has no %q:\n%s", want, out)
 		}

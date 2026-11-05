@@ -36,6 +36,7 @@ type hosts interface {
 	Find(ctx context.Context, order string) (ec2.HostRecord, bool, error)
 	Describe(ctx context.Context, id string) (ec2.HostRecord, error)
 	Terminate(ctx context.Context, id string) error
+	Scope() string
 }
 
 // Shape is one metal type a pool may order, with what it is.
@@ -85,6 +86,9 @@ var _ hostsource.Source = (*Source)(nil)
 
 // Name is the source's kind.
 func (s *Source) Name() string { return Name }
+
+// Scope is the provider's region and subnet, and this source's zone.
+func (s *Source) Scope() string { return s.hosts.Scope() + ":" + s.location }
 
 // Terms are on-demand EC2's: billed by the second, and a launch measured reaching its
 // first script within a minute. The lead time to a registered node is not measured.

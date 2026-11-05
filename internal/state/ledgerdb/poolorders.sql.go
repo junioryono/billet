@@ -11,13 +11,14 @@ import (
 
 const insertPoolOrder = `-- name: InsertPoolOrder :exec
 
-INSERT INTO pool_orders (order_id, source, shape, location, arch, state, first_attempt_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, 'ordering', $6, $7)
+INSERT INTO pool_orders (order_id, source, scope, shape, location, arch, state, first_attempt_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, 'ordering', $7, $8)
 `
 
 type InsertPoolOrderParams struct {
 	OrderID        string
 	Source         string
+	Scope          string
 	Shape          string
 	Location       string
 	Arch           string
@@ -31,6 +32,7 @@ func (q *Queries) InsertPoolOrder(ctx context.Context, arg InsertPoolOrderParams
 	_, err := q.db.ExecContext(ctx, insertPoolOrder,
 		arg.OrderID,
 		arg.Source,
+		arg.Scope,
 		arg.Shape,
 		arg.Location,
 		arg.Arch,
@@ -41,7 +43,7 @@ func (q *Queries) InsertPoolOrder(ctx context.Context, arg InsertPoolOrderParams
 }
 
 const listPoolOrders = `-- name: ListPoolOrders :many
-SELECT order_id, source, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at
+SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at
 FROM pool_orders
 ORDER BY first_attempt_at, order_id
 `
@@ -58,6 +60,7 @@ func (q *Queries) ListPoolOrders(ctx context.Context) ([]PoolOrder, error) {
 		if err := rows.Scan(
 			&i.OrderID,
 			&i.Source,
+			&i.Scope,
 			&i.Shape,
 			&i.Location,
 			&i.Arch,

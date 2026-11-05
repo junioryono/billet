@@ -1,18 +1,22 @@
 // Package pool orders Firecracker hosts from rented bare metal ahead of demand
 // (ADR-028). The control plane runs it, because it holds the demand.
 //
-// AN ORDER IS COMMITTED BEFORE ITS SOURCE IS ASKED, and read back with Find before
-// anything else is done about it, so an order whose answer was lost is never placed
-// twice. A resend happens only inside the source's own deduplication window from the
-// order's first attempt; past it, the order is uncertain and a person decides.
+// AN ORDER IS COMMITTED BEFORE ITS SOURCE IS ASKED, with the scope its source orders
+// in, and read back with Find before anything else is done about it, so an order whose
+// answer was lost is never placed twice, nor read back somewhere a changed config
+// points. A resend happens only inside the source's own deduplication window from the
+// order's first attempt; past it, the order is uncertain and a person decides. A resend
+// the source refuses proves nothing about the first attempt, so it is uncertain too.
 //
-// GROWTH IS ONE HOST AT A TIME PER ARCHITECTURE while any is on its way: a host takes
-// minutes to join, and ordering again for demand it has not yet met would order a
-// host per step. The floor is kept regardless.
+// NOTHING IS ORDERED ON AN ARCHITECTURE WHILE ANY ORDER THERE IS UNKNOWN (being
+// ordered, or uncertain): it may hold a host the floor or the demand already counts.
+// Growth for demand is one host at a time while any placed host has not joined, because
+// a host takes minutes to join. The floor is kept otherwise.
 //
 // SHRINKING IS NOT HERE. A host leaves only by drain, on proof it holds nothing
 // (ADR-028), and that proof needs the host linked to the node that joined from it,
-// which the join brings.
+// which the join brings. Until it does, no host is known to have joined, and demand
+// grows the pool by one host past the floor at most.
 package pool
 
 import (
@@ -32,6 +36,14 @@ import (
 // DefaultTokenLife is how long an ordered host's join token lives: past any measured
 // lead time, short enough that a token nobody used is soon worth nothing.
 const DefaultTokenLife = 2 * time.Hour
+
+// DefaultDemandFreshness is the oldest a tier's capacity report may be and still be
+// read as its demand: a report a listener has not refreshed is a previous controller's,
+// or a listener that stopped, and says nothing about now.
+const DefaultDemandFreshness = 5 * time.Minute
+
+// ErrDemandUnknown is demand that could not be read: a tier with no fresh report.
+var ErrDemandUnknown = errors.New("pool: a Firecracker tier's demand cannot be read")
 
 // Ledger is what the pool reads and writes of the ledger.
 type Ledger interface {
@@ -64,6 +76,8 @@ type Config struct {
 	Sources        map[string]hostsource.Source
 	RefusalBackoff time.Duration
 	TokenLife      time.Duration
+	// DemandFreshness is the oldest a capacity report may be and still count.
+	DemandFreshness time.Duration
 	// Boot renders an ordered host's first boot from its order and join token.
 	Boot func(order, token string) ([]byte, error)
 	// Tiers are the deployment's tiers; a Firecracker tier with jobs waiting is
@@ -106,6 +120,9 @@ func New(ledger Ledger, cfg Config, opts ...Option) (*Pool, error) {
 	}
 	if cfg.TokenLife <= 0 {
 		cfg.TokenLife = DefaultTokenLife
+	}
+	if cfg.DemandFreshness <= 0 {
+		cfg.DemandFreshness = DefaultDemandFreshness
 	}
 	p := &Pool{ledger: ledger, cfg: cfg, now: time.Now, newID: newOrderID, log: slog.Default()}
 	for _, o := range opts {
@@ -156,12 +173,15 @@ func (p *Pool) Step(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 	for arch, a := range p.cfg.Archs {
-		active, pending := count(orders, arch)
-		want := a.Floor
-		if demand[arch] && pending == 0 {
-			want = active + 1
+		c := count(orders, arch)
+		if c.unknown > 0 {
+			continue
 		}
-		if active >= a.Max || active >= want {
+		want := a.Floor
+		if demand[arch] && c.onItsWay == 0 {
+			want = c.active + 1
+		}
+		if c.active >= a.Max || c.active >= want {
 			continue
 		}
 		if err := p.order(ctx, arch, a, orders); err != nil {
@@ -172,10 +192,13 @@ func (p *Pool) Step(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// count is an architecture's orders that hold or may hold a host, and those of them
-// that are on their way: ordered and not yet known to have joined.
-func count(orders []alloc.PoolOrder, arch config.Arch) (int, int) {
-	active, pending := 0, 0
+// counts are an architecture's orders that hold or may hold a host (active), those
+// whose outcome is not known (unknown), and those placed and not yet known to have
+// joined (onItsWay).
+type counts struct{ active, unknown, onItsWay int }
+
+func count(orders []alloc.PoolOrder, arch config.Arch) counts {
+	var c counts
 	for i := range orders {
 		o := &orders[i]
 		if o.Arch != arch {
@@ -183,34 +206,48 @@ func count(orders []alloc.PoolOrder, arch config.Arch) (int, int) {
 		}
 		switch o.State {
 		case alloc.PoolOrdering, alloc.PoolUncertain:
-			active++
-			pending++
+			c.active++
+			c.unknown++
 		case alloc.PoolPlaced:
-			active++
+			c.active++
 			if o.NodeName == "" {
-				pending++
+				c.onItsWay++
 			}
 		}
 	}
 
-	return active, pending
+	return c
 }
 
-// demand is the architectures a Firecracker tier has jobs waiting on.
+// demand is the architectures a Firecracker tier has jobs waiting on, by a report
+// fresh enough to say so. A Firecracker tier whose report is missing, stale or in error
+// makes the whole reading unknown.
 func (p *Pool) demand(ctx context.Context) (map[config.Arch]bool, error) {
 	reports, err := p.ledger.CapacityReports(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("pool: read the tiers' demand: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrDemandUnknown, err)
 	}
 	out := map[config.Arch]bool{}
+	var unknown []string
 	for i := range p.cfg.Tiers {
 		t := &p.cfg.Tiers[i]
-		if !servesFirecracker(t) {
+		if !servesFirecracker(t) || t.Arch == "" {
 			continue
 		}
-		if r, ok := reports[t.Label]; ok && r.Listener.Waiting > 0 {
+		r, ok := reports[t.Label]
+		observed, parseErr := time.Parse(time.RFC3339Nano, r.ObservedAt)
+		switch {
+		case !ok, r.ObservationError != "", parseErr != nil, p.now().Sub(observed) > p.cfg.DemandFreshness:
+			unknown = append(unknown, t.Label)
+
+			continue
+		}
+		if r.Listener.Waiting > 0 {
 			out[t.Arch] = true
 		}
+	}
+	if len(unknown) > 0 {
+		return out, fmt.Errorf("%w: no fresh report for %v", ErrDemandUnknown, unknown)
 	}
 
 	return out, nil
@@ -243,14 +280,16 @@ func (p *Pool) order(ctx context.Context, arch config.Arch, a Policy, orders []a
 	if err != nil {
 		return err
 	}
-	if err := p.ledger.RecordPoolOrder(ctx, alloc.PoolOrder{
-		ID: id, Source: choice.Source, Shape: choice.Shape, Location: choice.Location, Arch: arch,
-	}); err != nil {
+	o := alloc.PoolOrder{
+		ID: id, Source: choice.Source, Scope: p.cfg.Sources[choice.Source].Scope(),
+		Shape: choice.Shape, Location: choice.Location, Arch: arch,
+	}
+	if err := p.ledger.RecordPoolOrder(ctx, o); err != nil {
 		return err
 	}
 	p.log.Info("ordering a pool host", "order", id, "arch", arch, "source", choice.Source, "shape", choice.Shape)
 
-	return p.send(ctx, alloc.PoolOrder{ID: id, Source: choice.Source, Shape: choice.Shape, Location: choice.Location, Arch: arch})
+	return p.send(ctx, o, true)
 }
 
 // firstChoice skips a choice whose source refused it inside the backoff.
@@ -275,19 +314,30 @@ func (p *Pool) firstChoice(a Policy, orders []alloc.PoolOrder) (Choice, bool) {
 }
 
 // send asks the source for an order already committed, with a fresh join token, and
-// records the answer. Any answer but a host or the source's refusal leaves the order
-// being ordered, for the next step to read back.
-func (p *Pool) send(ctx context.Context, o alloc.PoolOrder) error {
-	src := p.cfg.Sources[o.Source]
+// records the answer. On the first attempt, a refusal, or a failure before anything
+// was sent, is the order's answer. On a resend it is not: it says nothing about the
+// first attempt, which may have placed a host, so the order is uncertain. Any other
+// answer leaves the order being ordered, for the next step to read back.
+func (p *Pool) send(ctx context.Context, o alloc.PoolOrder, first bool) error {
+	notSent := func(err error) error {
+		if !first {
+			return err
+		}
+		if rerr := p.ledger.PoolOrderRefused(ctx, o.ID, "not sent: "+err.Error()); rerr != nil {
+			return errors.Join(err, rerr)
+		}
+
+		return err
+	}
 	token, err := p.ledger.NewJoinToken(ctx, p.cfg.TokenLife, 1, "pool order "+o.ID)
 	if err != nil {
-		return err
+		return notSent(fmt.Errorf("pool: mint the join token of order %s: %w", o.ID, err))
 	}
 	boot, err := p.cfg.Boot(o.ID, token)
 	if err != nil {
-		return fmt.Errorf("pool: render the boot of order %s: %w", o.ID, err)
+		return notSent(fmt.Errorf("pool: render the boot of order %s: %w", o.ID, err))
 	}
-	host, err := src.Order(ctx, hostsource.Request{
+	host, err := p.cfg.Sources[o.Source].Order(ctx, hostsource.Request{
 		Order: o.ID, Shape: o.Shape, Location: o.Location, Arch: o.Arch, Boot: hostsource.NewSecret(boot),
 	})
 	switch {
@@ -295,6 +345,13 @@ func (p *Pool) send(ctx context.Context, o alloc.PoolOrder) error {
 		return p.ledger.PoolOrderPlaced(ctx, o.ID, host.ID)
 	case errors.Is(err, hostsource.ErrNoStock), errors.Is(err, hostsource.ErrQuota), errors.Is(err, hostsource.ErrRefused),
 		errors.Is(err, hostsource.ErrNotSent):
+		if !first {
+			p.log.Warn("a resend was refused, and the first attempt may have placed a host; the order is uncertain",
+				"order", o.ID, "err", err)
+
+			return p.ledger.PoolOrderUncertain(ctx, o.ID,
+				"a resend was refused, and the first attempt may have placed a host: "+err.Error())
+		}
 		p.log.Warn("the source refused a pool order", "order", o.ID, "source", o.Source, "err", err)
 
 		return p.ledger.PoolOrderRefused(ctx, o.ID, err.Error())
@@ -304,13 +361,20 @@ func (p *Pool) send(ctx context.Context, o alloc.PoolOrder) error {
 	return nil
 }
 
-// resume reads an order back. Found, it is placed. Listed as absent, it is sent again
-// only inside the source's deduplication window from its first attempt; past it, it
-// is uncertain. A failed read decides nothing.
+// resume reads an order back where it was placed. Found, it is placed. Listed as
+// absent, it is sent again only inside the source's deduplication window from its
+// first attempt; past it, it is uncertain. A failed read, or a source whose scope has
+// changed since the order, decides nothing.
 func (p *Pool) resume(ctx context.Context, o alloc.PoolOrder) error {
 	src := p.cfg.Sources[o.Source]
-	if src == nil {
+	switch {
+	case src == nil:
 		p.log.Warn("a pool order names a source no longer configured; it waits", "order", o.ID, "source", o.Source)
+
+		return nil
+	case src.Scope() != o.Scope:
+		p.log.Warn("a pool order was placed where its source no longer orders; it waits, because reading it back "+
+			"anywhere else could miss the host it placed", "order", o.ID, "placed", o.Scope, "now", src.Scope())
 
 		return nil
 	}
@@ -326,7 +390,7 @@ func (p *Pool) resume(ctx context.Context, o alloc.PoolOrder) error {
 		return fmt.Errorf("pool: the terms of order %s: %w", o.ID, err)
 	}
 	if terms.IdempotentFor > 0 && p.now().Sub(o.FirstAttempt) < terms.IdempotentFor {
-		return p.send(ctx, o)
+		return p.send(ctx, o, false)
 	}
 
 	return p.ledger.PoolOrderUncertain(ctx, o.ID, fmt.Sprintf(

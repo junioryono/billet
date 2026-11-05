@@ -56,6 +56,9 @@ type Hosts struct{ p *Provider }
 // Hosts is the provider's pool-host surface.
 func (p *Provider) Hosts() *Hosts { return &Hosts{p: p} }
 
+// Scope is the region and subnet this provider launches pool hosts in.
+func (h *Hosts) Scope() string { return "aws:" + h.p.cfg.Region + ":" + h.p.cfg.SubnetID }
+
 // HostLaunch is one pool host to start.
 type HostLaunch struct {
 	// Order is the pool's order, which becomes the launch's ClientToken, so a launch

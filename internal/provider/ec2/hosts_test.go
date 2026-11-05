@@ -483,3 +483,30 @@ func TestARefusalNamesTheOrderAskedFor(t *testing.T) {
 		t.Fatalf("find = %v", err)
 	}
 }
+
+// A LAUNCH THE PROVIDER REFUSES BEFORE RUNINSTANCES SENT NOTHING, whichever local check
+// refused it, and says so.
+func TestEveryLocalRefusalOfALaunchIsNotSent(t *testing.T) {
+	t.Parallel()
+	f := newFakeEC2(t)
+	h := newTestProvider(t, f, nil).Hosts()
+	for name, mutate := range map[string]func(*HostLaunch){
+		"no instance type":  func(l *HostLaunch) { l.InstanceType = "" },
+		"no image":          func(l *HostLaunch) { l.Image = "" },
+		"user data too big": func(l *HostLaunch) { l.UserData = make([]byte, maxUserData+1) },
+	} {
+		l := hostLaunch()
+		mutate(&l)
+		if _, err := h.Launch(t.Context(), l); !errors.Is(err, ErrLaunchNotSent) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	l := hostLaunch()
+	l.UserData = make([]byte, maxUserData)
+	if _, err := h.Launch(t.Context(), l); err != nil {
+		t.Fatalf("user data of exactly the limit: %v", err)
+	}
+	if n := f.countOf("RunInstances"); n != 1 {
+		t.Fatalf("%d launches reached EC2, want only the one within the limit", n)
+	}
+}

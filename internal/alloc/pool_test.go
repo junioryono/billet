@@ -2,6 +2,7 @@ package alloc
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +17,7 @@ func poolAllocator(t *testing.T, now *time.Time) *Allocator {
 }
 
 func poolOrder(id string) PoolOrder {
-	return PoolOrder{ID: id, Source: "aws-metal", Shape: "z1d.metal", Location: "us-west-2a", Arch: config.ArchX64}
+	return PoolOrder{ID: id, Source: "aws-metal", Scope: "aws:us-west-2:subnet-0abc:us-west-2a", Shape: "z1d.metal", Location: "us-west-2a", Arch: config.ArchX64}
 }
 
 // AN ORDER IS COMMITTED BEFORE ITS SOURCE IS ASKED, and reads back exactly as written,
@@ -33,12 +34,14 @@ func TestAPoolOrderReadsBackAsCommitted(t *testing.T) {
 		t.Fatalf("orders = %+v, %v", orders, err)
 	}
 	got := orders[0]
-	if got.ID != "o-1" || got.Source != "aws-metal" || got.Shape != "z1d.metal" || got.Location != "us-west-2a" ||
+	if got.ID != "o-1" || got.Source != "aws-metal" || got.Scope != "aws:us-west-2:subnet-0abc:us-west-2a" ||
+		got.Shape != "z1d.metal" || got.Location != "us-west-2a" ||
 		got.Arch != config.ArchX64 || got.State != PoolOrdering || got.HostID != "" || !got.FirstAttempt.Equal(now) {
 		t.Fatalf("order = %+v", got)
 	}
-	if err := a.RecordPoolOrder(t.Context(), poolOrder("o-1")); err == nil {
-		t.Fatal("an order identifier was recorded twice")
+	if err := a.RecordPoolOrder(t.Context(), poolOrder("o-1")); err == nil || !strings.Contains(err.Error(), "UNIQUE") &&
+		!strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("an order identifier recorded twice answered %v", err)
 	}
 }
 
@@ -80,8 +83,8 @@ func TestPoolOrderMovesAreOneWay(t *testing.T) {
 		t.Fatalf("abandon: %v", err)
 	}
 	orders, err := a.PoolOrders(ctx)
-	if err != nil {
-		t.Fatalf("orders: %v", err)
+	if err != nil || len(orders) != 3 {
+		t.Fatalf("orders = %+v, %v; want three", orders, err)
 	}
 	want := map[string]struct{ state, host, reason string }{
 		"placed":    {PoolPlaced, "i-1", ""},
@@ -101,21 +104,25 @@ func TestAPoolOrderMissingWhatItNeedsIsRefused(t *testing.T) {
 	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 	a := poolAllocator(t, &now)
 	for name, o := range map[string]PoolOrder{
-		"no id":           {Source: "s", Shape: "x", Arch: config.ArchX64},
-		"no source":       {ID: "o", Shape: "x", Arch: config.ArchX64},
-		"no shape":        {ID: "o", Source: "s", Arch: config.ArchX64},
-		"no architecture": {ID: "o", Source: "s", Shape: "x"},
-		"unknown arch":    {ID: "o", Source: "s", Shape: "x", Arch: "sparc"},
+		"no id":           {Source: "s", Scope: "c", Shape: "x", Arch: config.ArchX64},
+		"no source":       {ID: "o", Scope: "c", Shape: "x", Arch: config.ArchX64},
+		"no scope":        {ID: "o", Source: "s", Shape: "x", Arch: config.ArchX64},
+		"no shape":        {ID: "o", Source: "s", Scope: "c", Arch: config.ArchX64},
+		"no architecture": {ID: "o", Source: "s", Scope: "c", Shape: "x"},
+		"unknown arch":    {ID: "o", Source: "s", Scope: "c", Shape: "x", Arch: "sparc"},
 	} {
-		if err := a.RecordPoolOrder(t.Context(), o); err == nil {
-			t.Errorf("%s: recorded", name)
+		if err := a.RecordPoolOrder(t.Context(), o); err == nil || !strings.Contains(err.Error(), "pool order") {
+			t.Errorf("%s: %v", name, err)
 		}
+	}
+	if orders, err := a.PoolOrders(t.Context()); err != nil || len(orders) != 0 {
+		t.Fatalf("a refused order was written: %+v, %v", orders, err)
 	}
 	if err := a.RecordPoolOrder(t.Context(), poolOrder("o-1")); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	if err := a.PoolOrderPlaced(t.Context(), "o-1", ""); err == nil {
-		t.Error("an order was placed without a host")
+	if err := a.PoolOrderPlaced(t.Context(), "o-1", ""); err == nil || errors.Is(err, ErrPoolOrderMoved) {
+		t.Errorf("an order placed without a host answered %v", err)
 	}
 	if err := a.PoolOrderUncertain(t.Context(), "o-1", "lost"); err != nil {
 		t.Fatalf("uncertain: %v", err)

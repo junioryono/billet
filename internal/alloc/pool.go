@@ -30,8 +30,11 @@ var ErrPoolOrderMoved = errors.New("alloc: the pool order is not in the state th
 
 // PoolOrder is one order a pool of rented bare metal placed (ADR-028).
 type PoolOrder struct {
-	ID       string
-	Source   string
+	ID     string
+	Source string
+	// Scope is where the source orders, as it was when the order was placed; a lost
+	// order is read back only there.
+	Scope    string
 	Shape    string
 	Location string
 	Arch     config.Arch
@@ -49,8 +52,8 @@ type PoolOrder struct {
 // answer is lost is read back under its identifier rather than placed twice.
 func (a *Allocator) RecordPoolOrder(ctx context.Context, o PoolOrder) error {
 	switch {
-	case o.ID == "" || o.Source == "" || o.Shape == "" || o.Arch == "":
-		return fmt.Errorf("alloc: a pool order needs an id, a source, a shape and an architecture: %+v", o)
+	case o.ID == "" || o.Source == "" || o.Scope == "" || o.Shape == "" || o.Arch == "":
+		return fmt.Errorf("alloc: a pool order needs an id, a source, its scope, a shape and an architecture: %+v", o)
 	case !o.Arch.Valid():
 		return fmt.Errorf("alloc: pool order %s names architecture %q", o.ID, o.Arch)
 	}
@@ -58,7 +61,7 @@ func (a *Allocator) RecordPoolOrder(ctx context.Context, o PoolOrder) error {
 
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		return state.WriteQueries(tx).InsertPoolOrder(ctx, ledgerdb.InsertPoolOrderParams{
-			OrderID: o.ID, Source: o.Source, Shape: o.Shape, Location: o.Location,
+			OrderID: o.ID, Source: o.Source, Scope: o.Scope, Shape: o.Shape, Location: o.Location,
 			Arch: string(o.Arch), FirstAttemptAt: now, UpdatedAt: now,
 		})
 	})
@@ -84,7 +87,7 @@ func (a *Allocator) PoolOrders(ctx context.Context) ([]PoolOrder, error) {
 				return fmt.Errorf("alloc: pool order %s: updated %q: %w", r.OrderID, r.UpdatedAt, err)
 			}
 			out = append(out, PoolOrder{
-				ID: r.OrderID, Source: r.Source, Shape: r.Shape, Location: r.Location,
+				ID: r.OrderID, Source: r.Source, Scope: r.Scope, Shape: r.Shape, Location: r.Location,
 				Arch: config.Arch(r.Arch), State: r.State, HostID: r.HostID, NodeName: r.NodeName,
 				Reason: r.Reason, FirstAttempt: first, Updated: updated,
 			})

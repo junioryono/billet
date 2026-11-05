@@ -90,7 +90,15 @@ func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
 		"one variable for both":   {"client_secret_env: PNAP_CLIENT_SECRET", "client_secret_env: PNAP_CLIENT_ID", "one variable for both"},
 		"a shape declared twice":  {"        - {type: m7gd.metal, arch: arm64}", "        - {type: m7gd.metal, arch: arm64}\n        - {type: m7gd.metal, arch: arm64}", "declared twice"},
 		"an unknown arch shape":   {"{type: s2.c2.small, arch: x64}", "{type: s2.c2.small, arch: sparc}", "not an architecture billet knows"},
-		"no source configured":    {"    aws_metal:", "    unused_aws_metal:", "field unused_aws_metal not found"},
+		"a non-metal aws shape":   {"- {type: z1d.metal, arch: x64}", "- {type: c7i.2xlarge, arch: x64}", "not a bare-metal type"},
+		"a bad bootstrap addr":    {"    boot_prelude:", "    bootstrap_addr: nowhere\n    boot_prelude:", "bootstrap_addr"},
+		"an ipv6 wildcard join":   {"join_server: 10.77.0.10:7717", "join_server: '[::]:7717'", "join_server"},
+		"an empty shape type":     {"{type: s2.c2.small, arch: x64}", "{type: '', arch: x64}", "type is required"},
+		"an empty order":          {"        order:\n          - {source: aws-metal, shape: m7gd.metal, location: us-west-2a}", "        order: []", "order is empty"},
+		"an unconfigured source": {
+			"    phoenixnap:\n      client_id_env: PNAP_CLIENT_ID\n      client_secret_env: PNAP_CLIENT_SECRET\n      shapes:\n        - {type: s2.c2.small, arch: x64}\n",
+			"", "which server.pool.phoenixnap does not configure",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

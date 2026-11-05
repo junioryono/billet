@@ -20,6 +20,10 @@
 -- The states a later change uses are listed now because a CHECK constraint cannot
 -- change without rebuilding the table, and a published migration is frozen.
 --
+-- scope is where the source orders, as it was when the order was placed (an AWS
+-- region, subnet and zone): a lost order is read back and sent again only where it
+-- was placed, never wherever a changed config points now.
+--
 -- first_attempt_at bounds a resend: a source deduplicates an order for a window from
 -- its first attempt (hostsource.Terms.IdempotentFor), and past it a lost answer is
 -- uncertain.
@@ -28,6 +32,7 @@
 CREATE TABLE pool_orders (
     order_id TEXT PRIMARY KEY NOT NULL,
     source TEXT NOT NULL,
+    scope TEXT NOT NULL,
     shape TEXT NOT NULL,
     location TEXT NOT NULL DEFAULT '',
     arch TEXT NOT NULL,
