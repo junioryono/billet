@@ -185,7 +185,8 @@ func byJobID(byRequest map[int64]*Arrival, jobID string) (*Arrival, bool) {
 // arriving after until (when set) is outside the replay's window, and one in it
 // that had not started is still queued when the ledger recorded it or GitHub
 // (waiting, the plane's books) still holds it, and lost otherwise.
-func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, direct bool, until time.Time,
+func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, direct, background bool,
+	until time.Time,
 	waiting, startsSent map[int64]bool,
 ) (*Report, error) {
 	bound := int64(len(trace.Arrivals)) + historyBound
@@ -331,7 +332,7 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, dir
 			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
 		}
 
-		if err := rec.checkOrder(); err != nil {
+		if err := rec.checkOrderWhen(background); err != nil {
 			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
 		}
 
@@ -474,13 +475,19 @@ func (rec *Record) checkAgainstLease(host string, vcpu int, memory config.ByteSi
 // archived, and a job cannot start before it arrived. A row out of that order
 // would yield a negative wait or end a charge before it began, and a report
 // built on it would still look authoritative.
-func (rec *Record) checkOrder() error {
+func (rec *Record) checkOrder() error { return rec.checkOrderWhen(false) }
+
+// checkOrderWhen is checkOrder for a replay whose runners may predate their jobs. A pool
+// member is any job's, and one delivered events wait for cannot have started before the
+// job that caused it. With launches beside the listener's loop one can, and the job it
+// takes later still cannot START before it arrived, which stays refused.
+func (rec *Record) checkOrderWhen(runnerMayPredateJob bool) error {
 	switch {
 	case rec.AssignedAt.IsZero():
 		return errors.New("the job was recorded with no assignment time")
 	case rec.AssignedAt.Before(rec.ChargedFrom):
 		return fmt.Errorf("assigned at %s, before its lease was escrowed at %s", rec.AssignedAt, rec.ChargedFrom)
-	case rec.AssignedAt.Before(rec.Arrival):
+	case !runnerMayPredateJob && rec.AssignedAt.Before(rec.Arrival):
 		return fmt.Errorf("assigned at %s, before it arrived at %s", rec.AssignedAt, rec.Arrival)
 	case !rec.StartedAt.IsZero() && rec.StartedAt.Before(rec.AssignedAt):
 		return fmt.Errorf("started at %s, before it was assigned at %s", rec.StartedAt, rec.AssignedAt)

@@ -176,6 +176,15 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 // holding it withholds capacity from every other tier for no reason. GitHub
 // reassigns the job when its pickup deadline passes.
 func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job dispatch.Job) error {
+	_, err := l.launchReporting(ctx, lease, job)
+
+	return err
+}
+
+// launchReporting is launch, also saying whether it left compute running for the
+// lease. A launch that failed can still be in l.running, when its retirement could
+// not finish, so that is no answer to the question.
+func (l *Listener) launchReporting(ctx context.Context, lease *alloc.Lease, job dispatch.Job) (bool, error) {
 	// EVERY LAUNCH, on the pool path and the direct-assignment path alike: each
 	// end of a launch dates a waiter's progress, so a waiter launching slot after
 	// slot keeps its line, and one launch longer than WaiterAllowance does not.
@@ -209,9 +218,9 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job dispatch.
 					alloc.ErrConflict, binding.Tier, binding.LaunchRequestID)
 			}
 			if regErr != nil {
-				return fmt.Errorf("server: verify pool runner for lease %s: %w", lease.ID, regErr)
+				return false, fmt.Errorf("server: verify pool runner for lease %s: %w", lease.ID, regErr)
 			}
-			return nil
+			return true, nil
 		}
 
 		l.log.Error("the lease was reclaimed while its job was starting; destroying the "+
@@ -224,7 +233,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job dispatch.
 				"tier", l.tier, "request", job.RequestID, "error", destroyErr)
 		}
 
-		return nil
+		return false, nil
 	}
 
 	// THE CAPACITY IS NOT HANDED BACK IF THE RUNNER IS STILL HOLDING IT.
@@ -244,7 +253,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job dispatch.
 		delete(l.runningJobs, job.RequestID)
 		l.mu.Unlock()
 
-		return nil
+		return false, nil
 	}
 	registrationCtx, registrationCancel := withoutCancelWithin(ctx, l.releaseGrace)
 	defer registrationCancel()
@@ -253,16 +262,16 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job dispatch.
 		if retireErr := l.alloc.RetirePoolRunner(registrationCtx, lease.ID); retireErr != nil {
 			l.log.Error("a failed launch's registration could not be claimed for cleanup; its capacity stays held",
 				"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", retireErr)
-			return nil
+			return false, nil
 		}
 		binding.Status = alloc.PoolRunnerRetiring
 		l.retirePoolMember(registrationCtx, binding)
-		return nil
+		return false, nil
 	}
 	if !errors.Is(bindingErr, alloc.ErrLeaseNotFound) {
 		l.log.Error("a failed launch's registration could not be resolved; its capacity stays held",
 			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", bindingErr)
-		return nil
+		return false, nil
 	}
 
 	l.log.Error("could not start the compute for an assigned job; handing the capacity back",
@@ -320,7 +329,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job dispatch.
 
 	l.mu.Unlock()
 
-	return nil
+	return false, nil
 }
 
 // leaseFor is the lease this listener currently associates with a request, from
