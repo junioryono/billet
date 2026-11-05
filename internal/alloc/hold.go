@@ -48,7 +48,7 @@ type heldLease struct {
 // a hold can help. When it fits now and holds own, own alone is listed: a pass the order
 // refuses must not give up the room it accumulated.
 //
-// THE PREDICTION CHOOSES THE HOST AND NOTHING ELSE (ADR-026). Each host's leases are
+// THE PREDICTION CHOOSES THE HOST AND NOTHING ELSE (ADR-027). Each host's leases are
 // sorted by predicted end and their room added up until the shape fits. A wrong
 // prediction picks a worse host and never a wrong outcome; a history that cannot be
 // read predicts from what is left of it or the default, and picks a host all the

@@ -289,7 +289,7 @@ func (f *fleet) floorLeases(ctx context.Context, tx querier, a *Allocator) (map[
 // SHARED ON PURPOSE: whatever one tier's floor takes is gone from the machines
 // every other tier is offered, because they are the same machines.
 func (f *fleet) forTier(a *Allocator, t config.Tier) *placer {
-	nodes := a.eligibleFrom(f.rows, t, t.NeedsCacheAwareNode())
+	nodes := a.eligibleFrom(f.rows, t, wireFloor(t))
 
 	p := &placer{
 		order:            nodes,

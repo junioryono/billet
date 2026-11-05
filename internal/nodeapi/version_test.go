@@ -169,6 +169,10 @@ func TestBarrierVersionsAgree(t *testing.T) {
 		t.Errorf("nodeapi.VersionCacheAuthority = %d, alloc.CacheAuthorityWireVersion = %d",
 			VersionCacheAuthority, alloc.CacheAuthorityWireVersion)
 	}
+	if VersionWindowsGuests != alloc.WindowsGuestsWireVersion {
+		t.Errorf("nodeapi.VersionWindowsGuests = %d, alloc.WindowsGuestsWireVersion = %d",
+			VersionWindowsGuests, alloc.WindowsGuestsWireVersion)
+	}
 	if VersionComputeBarrier != alloc.BarrierWireVersion {
 		t.Errorf("nodeapi says a host can answer a barrier from wire %d and alloc says %d; "+
 			"a host between the two is neither asked nor reported",

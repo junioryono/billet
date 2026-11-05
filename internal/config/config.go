@@ -399,6 +399,19 @@ func (c *Config) applyDefaults() {
 		}
 		if c.Node.ServerAddr == "" && c.Node.ServerAddrs == nil && c.Server != nil {
 			c.Node.ServerAddr = c.Server.Listen
+
+			// BEHIND A ROUTER THE WIRE IS REACHED BY NAME: the listen address serves a
+			// certificate that does not name it. The collection's endpoint_change module
+			// derives this too, and the two have to agree.
+			if c.Server.TLSRouter != nil && c.Server.TLSRouter.NodeAddr != "" {
+				c.Node.ServerAddr = c.Server.TLSRouter.NodeAddr
+			}
+		}
+
+		// AND ITS ENROLLMENT BY THE OTHER NAME: the node wire demands a certificate in the
+		// handshake, so falling back to it fails in words that name no cause.
+		if c.Node.BootstrapAddr == "" && c.Server != nil && c.Server.TLSRouter != nil {
+			c.Node.BootstrapAddr = c.Server.TLSRouter.EnrollAddr
 		}
 
 		// A fleet entry for THIS host that omits its provider takes the local
