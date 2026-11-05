@@ -1,0 +1,733 @@
+package setup
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/durablefile"
+	"github.com/junioryono/billet/internal/regularfile"
+)
+
+// workflowsDir is where GitHub reads a repository's workflows from, the one
+// directory it reads them from and without recursing.
+const workflowsDir = ".github/workflows"
+
+// Migrate is `billet migrate`: moving what already runs elsewhere onto billet.
+func Migrate(ctx context.Context, env cli.Env, args []string) error {
+	if len(args) > 0 && args[0] == "workflows" {
+		return cmdMigrateWorkflows(ctx, env, args[1:])
+	}
+
+	return errors.New("usage: billet migrate workflows [--config PATH] [--path DIR] [--repo OWNER/NAME] " +
+		"[--map LABEL=TIER]... [--rightsize FILE] [--public] [--write] [--open-pr]")
+}
+
+// labelMaps is --map, in the order given.
+type labelMaps map[string]string
+
+func (m labelMaps) String() string { return "" }
+
+func (m labelMaps) Set(s string) error {
+	label, tier, ok := strings.Cut(s, "=")
+	if !ok || strings.TrimSpace(label) == "" || strings.TrimSpace(tier) == "" {
+		return fmt.Errorf("%q is not LABEL=TIER", s)
+	}
+	m[strings.ToLower(label)] = tier
+
+	return nil
+}
+
+// cmdMigrateWorkflows rewrites a checkout's `runs-on` lines to the deployment's
+// tiers. It reads the checkout and the configuration and asks GitHub nothing;
+// opening the pull request is the operator's own git and gh, because billet's App
+// has no contents permission and this command does not ask for one (ADR-011).
+func cmdMigrateWorkflows(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet migrate workflows", env.Stdout)
+	cfgPath := cli.AddConfigFlag(fs)
+	path := fs.String("path", ".", "the repository checkout to read")
+	repo := fs.String("repo", "", "the repository as owner/name (default: read from the checkout's origin remote)")
+	maps := labelMaps{}
+	fs.Var(maps, "map", "use this tier for this label, as LABEL=TIER with the tier's label; may be repeated")
+	rightsize := fs.String("rightsize", "", "also apply the recommendations in this file, which is the output of "+
+		"billet jobs rightsize --json")
+	public := fs.Bool("public", false, "choose for the larger shape GitHub gives a public repository")
+	write := fs.Bool("write", false, "edit the files in place rather than only printing the diff")
+	openPR := fs.Bool("open-pr", false, "edit the files on a new branch, commit, push and open a pull request with "+
+		"your own git and gh")
+	if err := cli.Parse(fs, args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	repository := *repo
+	if repository == "" {
+		repository, err = originRepository(ctx, *path)
+		if err != nil {
+			return err
+		}
+	} else if _, _, ok := config.SplitRepository(repository); !ok {
+		return fmt.Errorf("billet migrate workflows: --repo takes owner/name, not %q", repository)
+	}
+
+	chooser, err := newTierChooser(cfg, repository, maps, *public)
+	if err != nil {
+		return err
+	}
+
+	var entries *rightsizeEntries
+	if *rightsize != "" {
+		if entries, err = readRightsize(*rightsize, repository); err != nil {
+			return err
+		}
+	}
+
+	if *openPR {
+		if err := refuseUnlessClean(ctx, *path); err != nil {
+			return err
+		}
+	}
+
+	plan, err := planMigration(*path, repository, chooser, entries)
+	if err != nil {
+		return err
+	}
+
+	for i := range plan.files {
+		if _, err := io.WriteString(env.Stdout, unifiedDiff(plan.files[i].name, plan.files[i].before, plan.files[i].after)); err != nil {
+			return fmt.Errorf("write the diff: %w", err)
+		}
+	}
+	report := plan.reportText()
+	if _, err := io.WriteString(env.Stderr, report); err != nil {
+		return fmt.Errorf("write the report: %w", err)
+	}
+
+	switch {
+	case !plan.changes():
+		if *write || *openPR {
+			fmt.Fprintln(env.Stderr, "nothing to change")
+		}
+
+		return nil
+	case *openPR:
+		return openMigrationPR(ctx, env, *path, plan, report)
+	case *write:
+		return plan.install(*path)
+	}
+
+	return nil
+}
+
+// originRepository reads owner/name from the checkout's origin remote.
+//
+// THE URL IS NEVER QUOTED IN AN ERROR: a remote can carry a token in its userinfo,
+// and this command's output lands in logs and pull requests.
+func originRepository(ctx context.Context, path string) (string, error) {
+	output, err := runGit(ctx, path, "remote", "get-url", "origin")
+	if err != nil {
+		return "", errors.New("billet migrate workflows: could not read the checkout's origin remote; " +
+			"pass --repo owner/name")
+	}
+
+	repository, ok := repositoryOfRemote(strings.TrimSpace(output))
+	if !ok {
+		return "", errors.New("billet migrate workflows: could not read owner/name from the checkout's origin " +
+			"remote; pass --repo owner/name")
+	}
+
+	return repository, nil
+}
+
+// repositoryOfRemote reads owner/name from a remote in any form git takes: a URL, or
+// the scp form git@host:owner/name.
+func repositoryOfRemote(remote string) (string, bool) {
+	path := ""
+	if u, err := url.Parse(remote); err == nil && u.Scheme != "" && u.Host != "" {
+		path = u.Path
+	} else if _, rest, ok := strings.Cut(remote, ":"); ok && !strings.Contains(remote, "://") {
+		path = rest
+	}
+
+	path = strings.TrimSuffix(strings.Trim(path, "/"), ".git")
+	if _, _, ok := config.SplitRepository(path); !ok {
+		return "", false
+	}
+
+	return path, true
+}
+
+// tierChooser chooses a tier for a label from a deployment's configuration.
+type tierChooser struct {
+	repository string
+	public     bool
+	// tiers are the tiers whose target serves the repository.
+	tiers []config.Tier
+	// mapped is --map, label to tier.
+	mapped map[string]*config.Tier
+	// names is every runs-on any of the deployment's tiers answers to.
+	names map[string]bool
+}
+
+// newTierChooser reads what the configuration offers this repository, and refuses a
+// --map naming a tier it does not have or one that cannot serve the repository.
+func newTierChooser(cfg *config.Config, repository string, maps labelMaps, public bool) (*tierChooser, error) {
+	owner, _, _ := config.SplitRepository(repository)
+
+	serving := map[string]bool{}
+	for _, target := range cfg.GitHubTargets() {
+		if strings.EqualFold(target.Repository, repository) || (target.Repository == "" && strings.EqualFold(target.Org, owner)) {
+			serving[target.Name] = true
+		}
+	}
+	if len(serving) == 0 {
+		return nil, fmt.Errorf("billet migrate workflows: no target of this configuration serves %s, so no tier of "+
+			"it can run its jobs", strconv.Quote(repository))
+	}
+
+	c := &tierChooser{repository: repository, public: public, mapped: map[string]*config.Tier{}, names: map[string]bool{}}
+	for i := range cfg.Tiers {
+		if t := &cfg.Tiers[i]; serving[config.ShareTarget(*t)] {
+			c.tiers = append(c.tiers, *t)
+			c.names[strings.ToLower(t.ScaleSetName())] = true
+		}
+	}
+
+	labels := make([]string, 0, len(maps))
+	for label := range maps {
+		labels = append(labels, label)
+	}
+	slices.Sort(labels)
+	for _, label := range labels {
+		i := slices.IndexFunc(c.tiers, func(t config.Tier) bool { return t.Label == maps[label] })
+		if i < 0 {
+			return nil, fmt.Errorf("billet migrate workflows: --map %s=%s names a tier this configuration does not "+
+				"give %s", label, maps[label], strconv.Quote(repository))
+		}
+		c.mapped[label] = &c.tiers[i]
+	}
+
+	return c, nil
+}
+
+func (c *tierChooser) onBillet(label string) bool { return c.names[strings.ToLower(label)] }
+
+// choose picks the tier for a label: --map's, or the smallest whose platform is the
+// label's and whose shape holds what the label gives a job.
+func (c *tierChooser) choose(label, workflowFile string) (string, string, string) {
+	if t, ok := c.mapped[strings.ToLower(label)]; ok {
+		return t.ScaleSetName(), fmt.Sprintf("tier %s by --map", t.Label), ""
+	}
+
+	hosted, ok := lookupHostedLabel(label, c.public)
+	if !ok {
+		return "", "it is neither a label GitHub hosts nor a runs-on of this deployment; a larger runner's or a " +
+			"self-hosted runner's name is yours, so pass --map for it", findUnknown
+	}
+	if hosted.NoMapping != "" {
+		return "", hosted.NoMapping, findNoTier
+	}
+
+	best, why := c.smallestFor(hosted, workflowFile)
+	if best == nil {
+		return "", why, findNoTier
+	}
+
+	platform := best.Platform()
+	shapeOf := "a private repository's"
+	if c.public {
+		shapeOf = "a public repository's"
+	}
+
+	return best.ScaleSetName(), fmt.Sprintf("tier %s (%d vCPU, %s, %s), the smallest holding %s %d vCPU and %d GB on %s",
+		best.Label, best.VCPU, cli.HumanBytes(int64(best.Memory)), platform.Arch, shapeOf, hosted.VCPU, hosted.MemoryGB,
+		label), ""
+}
+
+// smallestFor is the smallest tier for a hosted label, or why there is none, naming
+// the closest thing that was passed over: "report, never guess" is only useful to an
+// operator who can see what they would have to change.
+func (c *tierChooser) smallestFor(hosted hostedLabel, workflowFile string) (*config.Tier, string) {
+	var best *config.Tier
+	unknownArch, wrongVersion, tooSmall, disallowed := 0, 0, 0, 0
+	sameOS := 0
+
+	for i := range c.tiers {
+		t := &c.tiers[i]
+		if t.GuestOS != hosted.OS {
+			continue
+		}
+		sameOS++
+		platform := t.Platform()
+		switch {
+		case platform.Arch == "":
+			unknownArch++
+
+			continue
+		case platform.Arch != hosted.Arch:
+			continue
+		case hosted.Version != "" && platform.OSVersion != hosted.Version:
+			wrongVersion++
+
+			continue
+		case int64(t.Memory) < hosted.MemoryGB*1_000_000_000 || t.VCPU < hosted.VCPU:
+			tooSmall++
+
+			continue
+		case !allowsWorkflow(t, c.repository, workflowFile):
+			disallowed++
+
+			continue
+		}
+		if best == nil || cmp.Or(cmp.Compare(t.VCPU, best.VCPU), cmp.Compare(t.Memory, best.Memory),
+			cmp.Compare(t.Label, best.Label)) < 0 {
+			best = t
+		}
+	}
+	if best != nil {
+		return best, ""
+	}
+
+	switch {
+	case sameOS == 0:
+		return nil, fmt.Sprintf("no tier serving this repository has guest OS %s", hosted.OS)
+	case unknownArch > 0:
+		return nil, fmt.Sprintf("%d tiers of the OS say nothing of their architecture, so name `arch` on them or "+
+			"pass --map", unknownArch)
+	case disallowed > 0:
+		return nil, fmt.Sprintf("%d trusted tiers would hold it and do not list this workflow, so add it to their "+
+			"`workflows` or pass --map", disallowed)
+	case wrongVersion > 0:
+		return nil, fmt.Sprintf("%d tiers of its architecture are on another version of the OS, or do not say which, "+
+			"and moving a job to one may break it, so pass --map if it will not", wrongVersion)
+	case tooSmall > 0:
+		return nil, fmt.Sprintf("the %d tiers of its platform are smaller than %d vCPU and %d GB, so pass --map if it "+
+			"fits", tooSmall, hosted.VCPU, hosted.MemoryGB)
+	default:
+		return nil, fmt.Sprintf("no tier of guest OS %s runs on %s", hosted.OS, hosted.Arch)
+	}
+}
+
+// allowsWorkflow says a tier will take a job of this workflow. An untrusted tier takes
+// any. A trusted one lists the workflows its runner group admits, and a job moved
+// there without being listed would queue forever; the ref in the list is GitHub's to
+// judge, so only the file is compared.
+func allowsWorkflow(t *config.Tier, repository, workflowFile string) bool {
+	if t.Trust.Effective() != config.WorkloadTrusted {
+		return true
+	}
+
+	want := repository + "/" + workflowFile
+
+	return slices.ContainsFunc(t.Workflows, func(allowed string) bool {
+		path, _, _ := strings.Cut(allowed, "@")
+
+		return strings.EqualFold(path, want)
+	})
+}
+
+// rightsizeEntry is one job of `billet jobs rightsize --json`, as far as this command
+// reads it.
+type rightsizeEntry struct {
+	Workflow          string `json:"workflow"`
+	Job               string `json:"job"`
+	CurrentRunsOn     string `json:"current_runs_on"`
+	Recommendation    string `json:"recommendation"`
+	Reason            string `json:"reason"`
+	Confidence        string `json:"confidence"`
+	RecommendedTier   string `json:"recommended_tier"`
+	RecommendedRunsOn string `json:"recommended_runs_on"`
+	Repository        string `json:"repository"`
+}
+
+// rightsizeEntries is a report's recommendations for one repository that name a tier
+// to move to, by workflow file.
+type rightsizeEntries struct {
+	byFile map[string][]rightsizeEntry
+}
+
+// rightsizeSchemaRead is the report's schema this binary reads.
+const rightsizeSchemaRead = 1
+
+// maxRightsizeFile bounds the read of a report, which a week of a large fleet's jobs
+// stays well under.
+const maxRightsizeFile = 256 << 20
+
+// readRightsize reads a report and keeps what it recommends for repository.
+func readRightsize(path, repository string) (*rightsizeEntries, error) {
+	raw, err := regularfile.ReadFile(path, maxRightsizeFile, regularfile.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("billet migrate workflows: read --rightsize: %w", err)
+	}
+
+	var report struct {
+		Schema *int             `json:"schema"`
+		Jobs   []rightsizeEntry `json:"jobs"`
+	}
+	if err := json.Unmarshal(raw, &report); err != nil {
+		return nil, fmt.Errorf("billet migrate workflows: --rightsize is not the output of `billet jobs rightsize "+
+			"--json`: %w", err)
+	}
+	if report.Schema == nil || *report.Schema != rightsizeSchemaRead {
+		return nil, fmt.Errorf("billet migrate workflows: --rightsize is not schema %d of `billet jobs rightsize "+
+			"--json`; read it with the billet that wrote it", rightsizeSchemaRead)
+	}
+
+	out := &rightsizeEntries{byFile: map[string][]rightsizeEntry{}}
+	for i := range report.Jobs {
+		entry := report.Jobs[i]
+		if !strings.EqualFold(entry.Repository, repository) || entry.RecommendedRunsOn == "" {
+			continue
+		}
+		file, ok := cutRepository(entry.Workflow, repository)
+		if !ok {
+			continue
+		}
+		out.byFile[file] = append(out.byFile[file], entry)
+	}
+
+	return out, nil
+}
+
+// cutRepository is a workflow's path inside repository, false for a workflow another
+// repository owns, as a reusable one can be.
+func cutRepository(workflow, repository string) (string, bool) {
+	prefix := repository + "/"
+	if len(workflow) <= len(prefix) || !strings.EqualFold(workflow[:len(prefix)], prefix) {
+		return "", false
+	}
+
+	return workflow[len(prefix):], true
+}
+
+// applyRightsize moves the jobs a report recommends moving. Only a job the report's
+// name proves it means, on the tier the report judged, moves; anything else is said.
+func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines lineIndex, chooser *tierChooser,
+	entries *rightsizeEntries,
+) {
+	list := entries.byFile[file]
+	for i := range list {
+		entry := &list[i]
+		say := func(line int, detail string) {
+			r.findings = append(r.findings, finding{Kind: findRightsize, File: file, Line: line, Job: entry.Job,
+				Text: entry.Job, Detail: detail})
+		}
+
+		var matches []*jobRunsOn
+		for j := range jobs {
+			if jobs[j].display == entry.Job {
+				matches = append(matches, &jobs[j])
+			}
+		}
+		// THE FILE IS NOT TRUSTED TO NAME WHAT GOES INTO A WORKFLOW: only a runs-on this
+		// deployment's own configuration gives the repository is ever written, so a
+		// report edited or written by something else cannot put text into a job.
+		switch {
+		case !chooser.onBillet(entry.RecommendedRunsOn):
+			say(0, fmt.Sprintf("it recommends %s, which is no runs-on this configuration gives the repository",
+				strconv.Quote(entry.RecommendedRunsOn)))
+
+			continue
+		case len(matches) == 0:
+			say(0, "no job here on one of this deployment's tiers is named that: a matrix leg's name and a job whose "+
+				"name is an expression come to this")
+
+			continue
+		case len(matches) > 1:
+			say(matches[0].node.Line, fmt.Sprintf("%d jobs here are named that", len(matches)))
+
+			continue
+		case matches[0].matrix:
+			say(matches[0].node.Line, "the job has a matrix, whose legs were judged one by one")
+
+			continue
+		case !strings.EqualFold(matches[0].node.Value, entry.CurrentRunsOn):
+			say(matches[0].node.Line, fmt.Sprintf("it runs on %s here, and the recommendation was for %s",
+				strconv.Quote(matches[0].node.Value), strconv.Quote(entry.CurrentRunsOn)))
+
+			continue
+		case r.edited[matches[0].node]:
+			say(matches[0].node.Line, "another recommendation in the report already moved it")
+
+			continue
+		}
+
+		node := matches[0].node
+		placed, reason := lines.place(node)
+		if reason != "" {
+			say(node.Line, reason)
+
+			continue
+		}
+		r.edits = append(r.edits, edit{start: placed.start, end: placed.end, text: entry.RecommendedRunsOn})
+		r.edited[node] = true
+		r.findings = append(r.findings, finding{Kind: findRewritten, File: file, Line: node.Line, Job: matches[0].key,
+			Text: node.Value, Detail: fmt.Sprintf("to %s, tier %s by the rightsize report: %s; confidence %s",
+				entry.RecommendedRunsOn, strconv.Quote(entry.RecommendedTier), strconv.Quote(entry.Reason),
+				strconv.Quote(entry.Confidence))})
+	}
+}
+
+// migrationFile is one file the plan would change.
+type migrationFile struct {
+	name          string
+	before, after []byte
+	mode          os.FileMode
+}
+
+// migrationPlan is what the command would do: nothing has been written.
+type migrationPlan struct {
+	files    []migrationFile
+	findings []finding
+	entries  *rightsizeEntries
+}
+
+func (p *migrationPlan) changes() bool {
+	return slices.ContainsFunc(p.files, func(f migrationFile) bool { return !bytes.Equal(f.before, f.after) })
+}
+
+// planMigration reads every workflow in the checkout and decides what happens to it.
+func planMigration(path, repository string, chooser *tierChooser, entries *rightsizeEntries) (*migrationPlan, error) {
+	dir := filepath.Join(path, filepath.FromSlash(workflowsDir))
+	listing, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("billet migrate workflows: read the workflows of %s: %w", strconv.Quote(repository), err)
+	}
+
+	plan := &migrationPlan{entries: entries}
+	seen := map[string]bool{}
+	for _, entry := range listing {
+		ext := filepath.Ext(entry.Name())
+		if ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		name := workflowsDir + "/" + entry.Name()
+		seen[name] = true
+
+		// NOFOLLOW AND REGULAR ONLY: a workflow is a file in somebody's checkout, and
+		// a link out of it or a FIFO in it is no workflow GitHub would read.
+		raw, err := regularfile.ReadFile(filepath.Join(dir, entry.Name()), maxWorkflowSize,
+			regularfile.Options{NoFollow: true})
+		if err != nil {
+			plan.findings = append(plan.findings, finding{Kind: findUnreadable, File: name,
+				Detail: "it could not be read as a regular file of at most " + cli.HumanBytes(maxWorkflowSize) + ": " +
+					strconv.Quote(err.Error())})
+
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("billet migrate workflows: read %s: %w", strconv.Quote(name), err)
+		}
+
+		rewrite := rewriteWorkflow(name, raw, chooser, entries)
+		plan.findings = append(plan.findings, rewrite.findings...)
+		plan.files = append(plan.files, migrationFile{name: name, before: rewrite.before, after: rewrite.after,
+			mode: info.Mode().Perm()})
+	}
+
+	if entries != nil {
+		files := make([]string, 0, len(entries.byFile))
+		for file := range entries.byFile {
+			files = append(files, file)
+		}
+		slices.Sort(files)
+		for _, file := range files {
+			if seen[file] {
+				continue
+			}
+			for i := range entries.byFile[file] {
+				job := entries.byFile[file][i].Job
+				plan.findings = append(plan.findings, finding{Kind: findRightsize, File: file, Job: job, Text: job,
+					Detail: "the report names this workflow, and the checkout has no such file"})
+			}
+		}
+	}
+
+	return plan, nil
+}
+
+// reportOrder is the order the report says things in: what changed, then what is left
+// for a person.
+var reportOrder = []string{findRewritten, findOnBillet, findExpression, findMatrix, findGroup, findList, findCall,
+	findCaller, findNoTier, findUnknown, findCouldNot, findRightsize, findUnreadable}
+
+// reportText is the whole account of every `runs-on`. EVERY STRING A WORKFLOW CHOSE
+// IS QUOTED, so a job name cannot forge a line of it.
+func (p *migrationPlan) reportText() string {
+	var b strings.Builder
+	for _, kind := range reportOrder {
+		var of []finding
+		for i := range p.findings {
+			if p.findings[i].Kind == kind {
+				of = append(of, p.findings[i])
+			}
+		}
+		if len(of) == 0 {
+			continue
+		}
+		slices.SortStableFunc(of, func(x, y finding) int {
+			return cmp.Or(cmp.Compare(x.File, y.File), cmp.Compare(x.Line, y.Line))
+		})
+		fmt.Fprintf(&b, "%s (%d):\n", kind, len(of))
+		for i := range of {
+			f := &of[i]
+			place := strconv.Quote(f.File)
+			if f.Line > 0 {
+				place += ":" + strconv.Itoa(f.Line)
+			}
+			b.WriteString("  " + place)
+			if f.Job != "" {
+				b.WriteString(" job " + strconv.Quote(f.Job))
+			}
+			if f.Text != "" && f.Text != f.Job {
+				b.WriteString(": " + strconv.Quote(f.Text))
+			}
+			if f.Detail != "" {
+				b.WriteString(": " + f.Detail)
+			}
+			b.WriteString("\n")
+		}
+	}
+	if b.Len() == 0 {
+		return "no workflow here names a runs-on\n"
+	}
+
+	return b.String()
+}
+
+// install writes the changed files in place, each whole or not at all, and keeps
+// its mode.
+func (p *migrationPlan) install(path string) error {
+	for i := range p.files {
+		f := &p.files[i]
+		if bytes.Equal(f.before, f.after) {
+			continue
+		}
+		target := filepath.Join(path, filepath.FromSlash(f.name))
+		if _, err := (durablefile.Installer{}).Install(filepath.Dir(target), filepath.Base(target), f.mode,
+			func(w io.Writer) error {
+				_, err := w.Write(f.after)
+
+				return err
+			}); err != nil {
+			return fmt.Errorf("billet migrate workflows: write %s: %w", strconv.Quote(f.name), err)
+		}
+	}
+
+	return nil
+}
+
+// refuseUnlessClean refuses a checkout --open-pr could not commit cleanly: anything
+// uncommitted would go on the branch beside the migration or be lost to it, and a
+// detached HEAD has no branch for a pull request to merge into.
+func refuseUnlessClean(ctx context.Context, path string) error {
+	status, err := runGit(ctx, path, "status", "--porcelain")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(status) != "" {
+		return errors.New("billet migrate workflows: --open-pr needs a clean checkout, and this one has uncommitted " +
+			"changes; commit or set them aside first")
+	}
+	if _, err := runGit(ctx, path, "symbolic-ref", "--quiet", "HEAD"); err != nil {
+		return errors.New("billet migrate workflows: --open-pr needs a branch to start from, and this checkout's " +
+			"HEAD is detached")
+	}
+
+	return nil
+}
+
+// runGit runs the operator's git in the checkout and returns what it printed.
+func runGit(ctx context.Context, path string, args ...string) (string, error) {
+	return runTool(ctx, path, "git", args...)
+}
+
+// runTool runs one of the operator's own tools in dir, with their environment and argv
+// and no shell, and carries what it said into the error, since only it knows what went
+// wrong. Only a subcommand is named there: an argument can be a whole pull request.
+func runTool(ctx context.Context, dir, name string, args ...string) (string, error) {
+	proc := exec.CommandContext(ctx, name, args...)
+	proc.Dir = dir
+	var stderr bytes.Buffer
+	proc.Stderr = &stderr
+	output, err := proc.Output()
+	if err != nil {
+		return "", fmt.Errorf("%s %s: %w: %s", name, args[0], err, strings.TrimSpace(stderr.String()))
+	}
+
+	return string(output), nil
+}
+
+// openMigrationPR does what the plan says on a new branch and opens the pull request.
+// It stops at the first failure and says what was already done, because nothing here
+// can be undone for the operator: their branch and their commit are theirs to keep or
+// remove.
+func openMigrationPR(ctx context.Context, env cli.Env, path string, plan *migrationPlan, report string) error {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return errors.New("billet migrate workflows: --open-pr uses your own gh, and none is on PATH; nothing was changed")
+	}
+
+	branch := "billet/migrate-workflows-" + time.Now().UTC().Format("20060102-150405")
+	if _, err := runGit(ctx, path, "checkout", "-q", "-b", branch); err != nil {
+		return fmt.Errorf("billet migrate workflows: nothing was changed: %w", err)
+	}
+
+	stopped := func(err error, done string) error {
+		return fmt.Errorf("billet migrate workflows: stopped on branch %s after %s: %w", branch, done, err)
+	}
+	if err := plan.install(path); err != nil {
+		return stopped(err, "creating it")
+	}
+
+	args := []string{"add", "--"}
+	for i := range plan.files {
+		if !bytes.Equal(plan.files[i].before, plan.files[i].after) {
+			args = append(args, filepath.FromSlash(plan.files[i].name))
+		}
+	}
+	if _, err := runGit(ctx, path, args...); err != nil {
+		return stopped(err, "writing the files")
+	}
+
+	const title = "CI: Run workflows on billet's tiers"
+	if _, err := runGit(ctx, path, "commit", "-q", "-m", title); err != nil {
+		return stopped(err, "staging the files")
+	}
+	if _, err := runGit(ctx, path, "push", "-q", "-u", "origin", branch); err != nil {
+		return stopped(err, "committing")
+	}
+
+	body := "Written by `billet migrate workflows`. It moved each `runs-on` it could and lists what it left alone.\n\n" +
+		"```\n" + strings.ReplaceAll(report, "```", "'''") + "```\n"
+	output, err := runTool(ctx, path, "gh", "pr", "create", "--title="+title, "--body="+body, "--head="+branch)
+	if err != nil {
+		return stopped(err, "pushing")
+	}
+	if _, err := io.WriteString(env.Stdout, output); err != nil {
+		return fmt.Errorf("write the pull request's address: %w", err)
+	}
+
+	return nil
+}
+
+var _ flag.Value = labelMaps{}

@@ -1,0 +1,8 @@
+name: reusable caller
+on: [push]
+jobs:
+  call:
+    uses: ./.github/workflows/called.yml
+    with:
+      os: ubuntu-latest
+      greeting: hello

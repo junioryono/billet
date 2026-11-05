@@ -77,6 +77,8 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: host.Fleet},
 		{Name: "github-app", Summary: "create and install the GitHub App billet uses",
 			Run: setup.GitHubApp},
+		{Name: "migrate", Summary: "point a repository's workflows at this deployment's tiers",
+			Run: setup.Migrate},
 		{Name: "teardown", Summary: "delete the scale sets billet created on GitHub",
 			Run: fleetops.Teardown},
 		{Name: "decommission", Summary: "remove the ec2 instances and cache billet made outside Terraform",
