@@ -53,9 +53,21 @@ type cacheFake struct {
 	nextDevice           int
 	failMeta             string
 	failRemove           bool
-	missingImages        map[string]bool
-	onMetaList           func()
-	metaListErr          error
+	failFlatten          error
+	// duringFlatten runs inside a flatten, which is how a test ends the caller's
+	// context there.
+	duringFlatten func()
+	// flattenBudget is what the flatten's context had left when it was asked.
+	flattenBudget time.Duration
+	// slowRemoval is how long `rbd rm` of a cache image takes, as it does while a
+	// killed client's watcher lingers (about half a minute, measured 2026-11-04): a
+	// removal with less left on its context is cut short and removes nothing.
+	slowRemoval time.Duration
+	// lastBudget is what the command being run had left on its context.
+	lastBudget    time.Duration
+	missingImages map[string]bool
+	onMetaList    func()
+	metaListErr   error
 	// removeLocked records, per metadata key, whether the cache index lock was
 	// held at the instant `image-meta remove` ran for it.
 	removeLocked map[string]bool
@@ -112,6 +124,14 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 
 	f.calls = append(f.calls, slices.Clone(args))
 
+	f.lastBudget = 0
+	if deadline, ok := ctx.Deadline(); ok {
+		f.lastBudget = time.Until(deadline)
+	}
+	if slices.Contains(args, "flatten") {
+		f.flattenBudget = f.lastBudget
+	}
+
 	if i := slices.Index(args, "lock"); i >= 0 {
 		return f.lock(ctx, args[i+1:])
 	}
@@ -136,7 +156,9 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 		return f.status(args[i+1])
 	}
 
-	for _, verb := range []string{"create", "clone", "cp", "info", "rm", "ls"} {
+	// NO `cp`: a copy of a snapshot of an object-map clone loses what its parents
+	// hold (compactCacheImage), so a call to it is refused here as unknown.
+	for _, verb := range []string{"create", "clone", "flatten", "info", "rm", "ls"} {
 		if i := slices.Index(args, verb); i >= 0 {
 			return f.image(verb, args[i+1:], args)
 		}
@@ -508,8 +530,11 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 
 		parent := strings.SplitN(tail[0], "@", 2)[0]
 		depth := f.depths[parent] + 1
-		if depth > maxCacheCloneDepth {
-			return nil, fmt.Errorf("fake: clone depth %d exceeds %d", depth, maxCacheCloneDepth)
+		// ONE LEVEL PAST THE LIMIT, which a compaction's clone reaches before its
+		// flatten; what keeps a chain from growing is the lineage rule, and each
+		// test of a compaction reads the depth that is left.
+		if depth > maxCacheCloneDepth+1 {
+			return nil, fmt.Errorf("fake: clone depth %d exceeds %d", depth, maxCacheCloneDepth+1)
 		}
 
 		f.images[tail[1]] = true
@@ -517,13 +542,19 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 		f.depths[tail[1]] = depth
 
 		return nil, nil
-	case "cp":
-		if !f.snapshots[tail[0]] {
+	case "flatten":
+		if !f.images[tail[0]] {
 			return nil, errors.New("rbd: (2) No such file or directory")
 		}
+		if f.duringFlatten != nil {
+			f.duringFlatten()
+		}
+		if f.failFlatten != nil {
+			return nil, f.failFlatten
+		}
 
-		f.images[tail[1]] = true
-		f.depths[tail[1]] = 0
+		delete(f.parents, tail[0])
+		f.depths[tail[0]] = 0
 
 		return nil, nil
 	case "info":
@@ -542,6 +573,9 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 	case "rm":
 		if f.failRemove {
 			return nil, errors.New("injected remove failure")
+		}
+		if f.slowRemoval > 0 && f.images[tail[0]] && f.lastBudget < f.slowRemoval {
+			return nil, fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
 		}
 		if f.halfRemoved[tail[0]] {
 			delete(f.halfRemoved, tail[0])
@@ -2242,14 +2276,13 @@ func TestLineageCompactionLetsEvictionReclaimHistoryBehindAnActiveCache(t *testi
 	if got := f.metadata[current.Handle][cacheMetaPrefix+"lineage"]; got != "0" {
 		t.Fatalf("compacted lineage depth = %q, want 0", got)
 	}
-	cpCalls := 0
-	for _, call := range f.calls {
-		if slices.Contains(call, "cp") {
-			cpCalls++
-		}
+	if flattens := f.countCalls("flatten"); flattens != 1 {
+		t.Fatalf("flatten count = %d, want one bounded compaction", flattens)
 	}
-	if cpCalls != 1 {
-		t.Fatalf("independent copy count = %d, want one bounded compaction", cpCalls)
+	// ON THE COMPACTION'S OWN BOUND: at the ordinary one a large image's flatten
+	// would be killed, every time, the way a large volume's `rbd rm` was.
+	if f.flattenBudget <= DefaultTimeout || f.flattenBudget > cacheCompactionLimit {
+		t.Fatalf("the flatten had %s, want the compaction's bound of %s", f.flattenBudget, cacheCompactionLimit)
 	}
 
 	for _, candidate := range generations[:len(generations)-1] {
@@ -2289,7 +2322,7 @@ func TestLineageCompactionLetsEvictionReclaimHistoryBehindAnActiveCache(t *testi
 		t.Fatalf("eviction left retired writers behind the active cache: %v", f.trash)
 	}
 
-	requireCacheImageRules(t, f.calls, "cp")
+	requireCacheImageRules(t, f.calls, "flatten")
 }
 
 func TestCloningALegacyGenerationDoesNotCrossTheDepthLimit(t *testing.T) {
@@ -2324,14 +2357,85 @@ func TestCloningALegacyGenerationDoesNotCrossTheDepthLimit(t *testing.T) {
 	if got := f.metadata[volume.Handle][cacheMetaPrefix+"lineage"]; got != "0" {
 		t.Fatalf("legacy writable lineage metadata = %q, want 0", got)
 	}
-	cpCalls := 0
-	for _, call := range f.calls {
-		if slices.Contains(call, "cp") {
-			cpCalls++
+	if flattens := f.countCalls("flatten"); flattens != 1 {
+		t.Fatalf("legacy flatten count = %d, want 1", flattens)
+	}
+}
+
+// A COMPACTION THAT CANNOT FLATTEN PUBLISHES NOTHING AND LEAVES NOTHING. The clone
+// it stopped at still depends on the chain it was to replace, and handing it on
+// would look compacted and be one level deeper.
+func TestACompactionThatCannotFlattenLeavesNoCandidate(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	key := "acme/api/flatten-fails"
+	source := "billet-cache/cache-g-1-legacy"
+	pointer := cachePointer{
+		Generation: "g1", Handle: source, UsedAt: time.Now().UTC(), RetentionHours: 7 * 24,
+	}
+	encoded, err := json.Marshal(pointer)
+	if err != nil {
+		t.Fatalf("marshal pointer: %v", err)
+	}
+	f.images[source] = true
+	f.snapshots[source+"@g1"] = true
+	f.depths[source] = maxCacheCloneDepth
+	f.metadata[c.cacheIndex()] = map[string]string{pointerKey(key): string(encoded)}
+	f.failFlatten = errors.New("injected flatten failure")
+
+	if _, err := c.Clone(t.Context(), key, ""); err == nil ||
+		!strings.Contains(err.Error(), "injected flatten failure") {
+		t.Fatalf("Clone = %v, want the flatten's failure", err)
+	}
+	for image := range f.images {
+		if strings.Contains(image, "cache-v-") {
+			t.Errorf("the failed compaction left %s behind", image)
 		}
 	}
-	if cpCalls != 1 {
-		t.Fatalf("legacy independent copy count = %d, want 1", cpCalls)
+}
+
+// A FLATTEN CUT SHORT HAS ITS PARTIAL IMAGE REMOVED, THOUGH ITS CALLER HAS GONE. The
+// caller's context is what usually ends one, and a partial image left behind keeps
+// its parents in the trash for days. Driven through Snapshot, the path every key at
+// the lineage limit takes.
+func TestAFlattenCutShortHasItsPartialImageRemoved(t *testing.T) {
+	t.Parallel()
+
+	v := &verifiedSpecs{verdict: clean}
+	f := newCacheFake()
+	v.f = f
+	c := verifyingClient(t, f, v)
+	volume := candidateVolume(t, c, f, true)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	f.duringFlatten = cancel
+	f.failFlatten = context.Canceled
+	// Longer than the ordinary command's bound, which the caller's cleanup runs at,
+	// so only the compaction's own removal can finish it.
+	f.slowRemoval = DefaultTimeout + 15*time.Second
+
+	// Anything named cache-g- from here on is this compaction's: the generation
+	// published before it stays, and its parent is its own.
+	published := map[string]bool{}
+	for image := range f.images {
+		published[image] = true
+	}
+	if _, err := c.Snapshot(ctx, volume); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Snapshot = %v, want the flatten's cancellation", err)
+	}
+	if flattens := f.countCalls("flatten"); flattens != 1 {
+		t.Fatalf("flatten count = %d, so this did not cut one short", flattens)
+	}
+	// THE REMOVAL ITSELF MAY NOT BLOCKLIST THE HOST, whose one kernel client every
+	// other job's disk shares, if it breaks the dead flatten's lock.
+	requireCacheImageRules(t, f.calls, "flatten", "rm")
+	for image := range f.images {
+		if strings.Contains(image, "cache-g-") && !published[image] {
+			t.Errorf("the flatten left the partial %s behind, holding %s", image, f.parents[image])
+		}
 	}
 }
 
@@ -2347,7 +2451,7 @@ func TestCanceledCloneCleanupRemovesThePartialImage(t *testing.T) {
 	f.metadata[c.cacheIndex()] = map[string]string{activeKey(leaseID): `{"key":"legacy"}`}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	primary := errors.New("copy canceled")
+	primary := errors.New("compaction canceled")
 
 	err := c.cleanupCloneFailure(ctx, leaseID, handle, primary)
 	if !errors.Is(err, primary) {
@@ -3348,13 +3452,13 @@ func TestHalfRemovedFailuresAtTheFrontDoNotStarveTheRest(t *testing.T) {
 
 // THE RECHECK OUTLASTS EVERY COMMAND THAT CREATES A CACHE IMAGE. An image is
 // listed before its header exists for as long as the command creating it runs,
-// and the slowest, a lineage copy, may run for cacheCompactionLimit.
+// and the slowest, a lineage's compaction, may run for cacheCompactionLimit.
 func TestTheHalfRemovedRecheckOutlastsEveryCreation(t *testing.T) {
 	t.Parallel()
 
 	for name, bound := range map[string]time.Duration{
-		"a lineage copy": cacheCompactionLimit,
-		"an rbd command": DefaultTimeout,
+		"a lineage's compaction": cacheCompactionLimit,
+		"an rbd command":         DefaultTimeout,
 	} {
 		if halfRemovedRecheck <= bound {
 			t.Errorf("the recheck, %s, does not outlast %s, bounded at %s", halfRemovedRecheck, name, bound)
