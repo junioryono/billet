@@ -40,7 +40,15 @@ func TestANodeNamesEveryControllerItDials(t *testing.T) {
 			[]string{"control-b.example:7717", "10.0.0.4:7717"},
 		},
 		"a list of one": {withAddrs("  server_addrs: [10.0.0.4:7717]\n"), []string{"10.0.0.4:7717"}},
-		"server_addr":   {remoteNode, []string{"10.0.0.4:7717"}},
+		"as many as a node may name": {
+			withAddrs("  server_addrs: [a:1, b:1, c:1, d:1]\n"),
+			[]string{"a:1", "b:1", "c:1", "d:1"},
+		},
+		"the longest address": {
+			withAddrs("  server_addrs: [" + strings.Repeat("a", 253) + ":65535]\n"),
+			[]string{strings.Repeat("a", 253) + ":65535"},
+		},
+		"server_addr": {remoteNode, []string{"10.0.0.4:7717"}},
 		// NAMING NONE, beside a server on another port, so the answer can only
 		// have come from the server's listen address.
 		"the server's own": {

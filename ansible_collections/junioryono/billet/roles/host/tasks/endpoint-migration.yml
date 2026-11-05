@@ -265,8 +265,10 @@
         - name: Report the migration
           ansible.builtin.debug:
             msg: >-
-              The node {{ billet_endpoint_answer.node }} was migrated from {{ billet_endpoint_answer.from }}
-              to {{ billet_endpoint_answer.to }} (invocation {{ billet_endpoint_answer.invocation_id }},
+              The node {{ billet_endpoint_answer.node }} was migrated from
+              {{ (billet_endpoint_answer.from_endpoints | join(', ')) if billet_endpoint_answer.from_endpoints is defined else billet_endpoint_answer.from }}
+              to {{ (billet_endpoint_answer.to_endpoints | join(', ')) if billet_endpoint_answer.to_endpoints is defined else billet_endpoint_answer.to }}
+              (invocation {{ billet_endpoint_answer.invocation_id }},
               incarnation {{ billet_endpoint_answer.incarnation }}), its registration confirmed by
               {{ billet_migration_controller }} at epoch {{ billet_registration_answer.epoch }}, and its receipt
               {{ billet_receipt_answer.outcome }}.

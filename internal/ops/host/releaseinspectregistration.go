@@ -86,6 +86,21 @@ var registrationRecordFields = []string{"schema", "node", "deployment", "incarna
 // registrationRecordEndpointsField is the member schema 2 adds.
 const registrationRecordEndpointsField = "endpoints"
 
+// controllers is what the record's process dials: the list a schema 2 record
+// names, or the one endpoint of a schema 1 record, whose process knows no other.
+func (r *registrationRecord) controllers() (controllerSet, error) {
+	if len(r.Endpoints) == 0 {
+		e, err := endpoint.ParseCanonical(r.Endpoint)
+		if err != nil {
+			return nil, err
+		}
+
+		return controllerSet{e}, nil
+	}
+
+	return parseControllerTexts(r.Endpoints)
+}
+
 // hex32 is the shape of an incarnation and of a systemd invocation id.
 var hex32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
@@ -409,14 +424,23 @@ func expectedRegistrationIdentity(cfg *config.Config) registrationIdentity {
 }
 
 // registrationReport is the known form of host.registration: exactly the six
-// members a consumer reads.
+// members a consumer reads, and the list a node naming several controllers
+// dials.
 type registrationReport struct {
-	Node         string `json:"node"`
-	Deployment   string `json:"deployment"`
-	Incarnation  string `json:"incarnation"`
-	InvocationID string `json:"invocation_id"`
-	Endpoint     string `json:"endpoint"`
-	RegisteredAt string `json:"registered_at"`
+	Node         string   `json:"node"`
+	Deployment   string   `json:"deployment"`
+	Incarnation  string   `json:"incarnation"`
+	InvocationID string   `json:"invocation_id"`
+	Endpoint     string   `json:"endpoint"`
+	Endpoints    []string `json:"endpoints,omitempty"`
+	RegisteredAt string   `json:"registered_at"`
+}
+
+// controllers is what the report's process dials, as registrationRecord says it.
+func (r registrationReport) controllers() (controllerSet, error) {
+	rec := registrationRecord{Endpoint: r.Endpoint, Endpoints: r.Endpoints}
+
+	return rec.controllers()
 }
 
 // judgeRegistration turns the sample's evidence into host.registration: the
@@ -461,7 +485,8 @@ func judgeRegistration(ev registrationEvidence, unitInvocation maybe, identity r
 
 	return known(registrationReport{
 		Node: ev.record.Node, Deployment: ev.record.Deployment, Incarnation: ev.record.Incarnation,
-		InvocationID: ev.record.InvocationID, Endpoint: ev.record.Endpoint, RegisteredAt: ev.record.RegisteredAt,
+		InvocationID: ev.record.InvocationID, Endpoint: ev.record.Endpoint, Endpoints: ev.record.Endpoints,
+		RegisteredAt: ev.record.RegisteredAt,
 	})
 }
 
@@ -490,7 +515,9 @@ func hostRegistration(node inspectService, id registrationIdentity) maybe {
 // installedEndpoint is the installed configuration's node endpoint as the one
 // representation, from the configuration observation the report already
 // holds: null without a node section, unknown with the representation's own
-// reason when it refuses a spelling the configuration accepted.
+// reason when it refuses a spelling the configuration accepted, and when the
+// node names several controllers, whose list is installedEndpoints: there is no
+// one endpoint to say.
 func installedEndpoint(cfg *config.Config, readable bool) maybe {
 	if !readable {
 		return unknown("the configuration could not be read")
@@ -506,4 +533,20 @@ func installedEndpoint(cfg *config.Config, readable bool) maybe {
 	}
 
 	return known(e.String())
+}
+
+// installedEndpoints is the list a configuration naming several controllers
+// names, and nil for one that names fewer or cannot say: host.installed_endpoints
+// appears only beside the unknown installed_endpoint it explains.
+func installedEndpoints(cfg *config.Config, readable bool) []string {
+	if !readable {
+		return nil
+	}
+
+	set, _, err := nodeEndpointsOf(cfg)
+	if err != nil || len(set) < 2 {
+		return nil
+	}
+
+	return set.texts()
 }
