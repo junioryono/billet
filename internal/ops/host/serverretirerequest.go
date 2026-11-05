@@ -1323,6 +1323,16 @@ func judgeNodeChain(m retireMode, in *retireInput, env *retireEnvelope, name, id
 		return node, r
 	}
 
+	// A RETIREMENT LEAVES ONE CONTROLLER, so a node goes into one naming the
+	// survivor alone: a list still naming this controller would dial it after it
+	// is gone, and billet cannot establish that any other member survives. Moving
+	// there is an ordinary endpoint migration, and the chain below then follows
+	// the one endpoint from the receipt to the record.
+	if _, st, _ := doc.get("host", "installed_endpoints"); st == fieldPresent {
+		return node, retireRefuse(retireReasonEndpoint, "the node "+who+" names several controllers in node.server_addrs, and "+
+			"a retirement leaves one", "name the survivor alone, which an endpoint migration moves the node to, then retire")
+	}
+
 	desired, ok := in.DesiredNodes[who]
 	if !ok {
 		return node, retireRefuse(retireReasonDesired, "the input carries no desired configuration for the node host "+who, "")

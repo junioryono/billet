@@ -15,6 +15,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // heldLaunches holds every launch open until release closes, as a busy node does.
@@ -965,4 +966,564 @@ func TestABackgroundLaunchFailureReachesTheLoop(t *testing.T) {
 			t.Fatalf("Run returned %v, want the launch's verification failure", err)
 		}
 	})
+}
+
+// heldDestroys is a runner whose launches return at once and whose destroys hold until
+// released, as a node does while launches run ahead of them.
+type heldDestroys struct {
+	fakeRunner
+
+	release chan struct{}
+	unblock func()
+	entered chan struct{}
+	mark    func()
+
+	mu      sync.Mutex
+	leases  []*alloc.Lease
+	started int
+}
+
+func newHeldDestroys() *heldDestroys {
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	r := &heldDestroys{
+		release: release, unblock: sync.OnceFunc(func() { close(release) }),
+		entered: entered, mark: sync.OnceFunc(func() { close(entered) }),
+	}
+	r.onDestroyCompleted = func(int64, string) error {
+		r.mark()
+		<-r.release
+
+		return nil
+	}
+
+	return r
+}
+
+func (r *heldDestroys) Launch(_ context.Context, lease *alloc.Lease, _ dispatch.Job) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.started++
+	r.leases = append(r.leases, lease)
+
+	return nil
+}
+
+func (r *heldDestroys) runnerName() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return provider.InstanceName(r.leases[0].ID)
+}
+
+func (r *heldDestroys) launched() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.started
+}
+
+// A DESTROY DOES NOT STOP THE TIER HEARING FROM GITHUB (#708). It waits behind the node's
+// launches and can take minutes. The capacity stays charged until it is done, because only
+// proof the compute is gone releases it, and what it frees then buys the next runner
+// without waiting for a poll.
+func TestADestroyDoesNotStopTheNextMessage(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{tier("a-work")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(24*time.Hour))
+		runner := newHeldDestroys()
+		t.Cleanup(runner.unblock)
+
+		var (
+			mu           sync.Mutex
+			acknowledged []int64
+			delivered    int
+		)
+
+		session := &fakeSession{
+			stats: &Statistics{TotalAssignedJobs: 2},
+			onGet: func() (*Message, error) {
+				mu.Lock()
+				delivered++
+				n := delivered
+				mu.Unlock()
+
+				// The launch runs beside the poll, so the runner may not be there yet.
+				for runner.launched() < 1 {
+					time.Sleep(time.Millisecond)
+				}
+
+				job := dispatch.Job{RunnerID: 41, RunID: 3, JobID: "job-3"}
+
+				switch n {
+				case 1:
+					job.RunnerName = runner.runnerName()
+
+					return &Message{MessageID: 1, Started: []dispatch.Job{job},
+						Statistics: &Statistics{TotalAssignedJobs: 2}}, nil
+				case 2:
+					job.RunnerName = runner.runnerName()
+					job.Result = "succeeded"
+
+					return &Message{MessageID: 2, Completed: []dispatch.Job{job},
+						Statistics: &Statistics{TotalAssignedJobs: 1}}, nil
+				case 3:
+					return &Message{MessageID: 3, Statistics: &Statistics{TotalAssignedJobs: 1}}, nil
+				}
+				time.Sleep(time.Hour)
+
+				return nil, ErrNoMessage
+			},
+			onDelete: func(id int64) error {
+				mu.Lock()
+				defer mu.Unlock()
+
+				acknowledged = append(acknowledged, id)
+
+				return nil
+			},
+		}
+		acked := func(id int64) bool {
+			mu.Lock()
+			defer mu.Unlock()
+
+			return slices.Contains(acknowledged, id)
+		}
+
+		registry := &concurrentRegistry{}
+
+		l := NewListener(a, tiers[0].Label, session, WithRunner(runner), WithPoolLaunchBatch(2),
+			WithBackgroundLaunches(), WithRunnerRegistry(registry))
+		ctx, cancel := context.WithCancel(t.Context())
+		finished := make(chan error, 1)
+
+		go func() { finished <- l.Run(ctx) }()
+
+		t.Cleanup(func() {
+			runner.unblock()
+			cancel()
+			<-finished
+		})
+
+		select {
+		case <-runner.entered:
+		case <-time.After(time.Minute):
+			t.Fatal("the completion's destroy never began")
+		}
+		synctest.Wait()
+
+		if !acked(2) || !acked(3) {
+			t.Fatal("the tier stopped handling messages while a destroy was out")
+		}
+		if got := runner.launched(); got != 1 {
+			t.Fatalf("%d runners started with the only room still held by a guest being destroyed, want 1", got)
+		}
+
+		runner.unblock()
+		synctest.Wait()
+
+		if got := runner.launched(); got != 2 {
+			t.Fatalf("%d runners started with one poll out after the destroy freed room, want 2", got)
+		}
+		if len(registry.names) != 1 {
+			t.Fatalf("removed %v, want the one runner removed once", registry.names)
+		}
+	})
+}
+
+// slowRegistry takes a moment to remove a runner, so a removal running beside the loop
+// is still out when the loop's next step reads the count.
+type slowRegistry struct {
+	concurrentRegistry
+}
+
+func (r *slowRegistry) RemoveRunner(ctx context.Context, id int64, name string) error {
+	time.Sleep(time.Second)
+
+	return r.concurrentRegistry.RemoveRunner(ctx, id, name)
+}
+
+// A FINISHED RUNNER STOPS COUNTING BEFORE THE POOL IS NEXT COUNTED, WHILE ITS DESTROY IS
+// STILL OUT (#708). The pool pass after a completion counts every registered lease, so a
+// finished runner still counted makes the runner launched for the next job look surplus,
+// and retiring that one loses GitHub the runner it just handed a job to. A replay found
+// this as a job that finished before it started.
+func TestAFinishedRunnerIsNotCountedWhileItsDestroyIsOut(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{tier("a-work")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 2 * tierVCPU, MaxMemory: 256 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(24*time.Hour))
+		runner := newHeldDestroys()
+
+		var (
+			mu        sync.Mutex
+			delivered int
+		)
+
+		session := &fakeSession{
+			stats: &Statistics{TotalAssignedJobs: 2},
+			onGet: func() (*Message, error) {
+				mu.Lock()
+				delivered++
+				n := delivered
+				mu.Unlock()
+
+				for runner.launched() < 2 {
+					time.Sleep(time.Millisecond)
+				}
+
+				job := dispatch.Job{RunnerID: 41, RunID: 3, JobID: "job-3", RunnerName: runner.runnerName()}
+
+				switch n {
+				case 1:
+					return &Message{MessageID: 1, Started: []dispatch.Job{job},
+						Statistics: &Statistics{TotalAssignedJobs: 2}}, nil
+				case 2:
+					job.Result = "succeeded"
+
+					return &Message{MessageID: 2, Completed: []dispatch.Job{job},
+						Statistics: &Statistics{TotalAssignedJobs: 1}}, nil
+				}
+				time.Sleep(time.Hour)
+
+				return nil, ErrNoMessage
+			},
+		}
+
+		registry := &slowRegistry{}
+
+		runFlightListener(t, a, tiers[0].Label, session, runner, WithRunnerRegistry(registry))
+		// After the helper's, so it runs first: the listener cannot stop behind a held destroy.
+		t.Cleanup(runner.unblock)
+
+		select {
+		case <-runner.entered:
+		case <-time.After(time.Minute):
+			t.Fatal("the completion's destroy never began")
+		}
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		registry.mu.Lock()
+		removed := slices.Clone(registry.names)
+		registry.mu.Unlock()
+
+		if want := []string{runner.runnerName()}; !slices.Equal(removed, want) {
+			t.Fatalf("removed %v with one job still assigned, want only the finished runner %v", removed, want)
+		}
+		if active, err := a.ActiveRunnerLeases(t.Context(), tiers[0].Label); err != nil || active != 1 {
+			t.Fatalf("%d runners counted (%v) with the destroy out, want the one still serving", active, err)
+		}
+	})
+}
+
+// WITH NOTHING TO DEREGISTER, ONLY THE RELEASE ENDS THE COUNT, so the destroy stays on
+// the loop: parked, it would leave a finished runner counted for as long as it took.
+func TestWithNoRegistryACompletionIsNotParked(t *testing.T) {
+	t.Parallel()
+
+	l := NewListener(nil, "a-work", &fakeSession{}, WithBackgroundLaunches())
+	l.running[7] = &alloc.Lease{ID: "lease-7"}
+
+	if l.parkCompletion(t.Context(), dispatch.Job{RequestID: 7, Result: "succeeded"}) {
+		t.Fatal("a completion was parked with no registry to stop it being counted")
+	}
+	if _, parked := l.cleanup[7]; parked {
+		t.Fatal("it left a cleanup obligation behind")
+	}
+}
+
+// A DESTROY DOES NOT WAIT FOR ANOTHER, up to the bound (#708). A node runs a destroy behind
+// the launches in flight, and one sent only after the last returned waits behind whichever
+// started since. What finds no room starts as soon as there is some, not on the next tick.
+func TestDestroysRunTogetherUpToTheBound(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		const parked = cleanupConcurrency + 2
+
+		var (
+			mu        sync.Mutex
+			out, done int
+		)
+
+		release := make(chan struct{})
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			mu.Lock()
+			out++
+			mu.Unlock()
+
+			<-release
+
+			mu.Lock()
+			out--
+			done++
+			mu.Unlock()
+
+			return nil
+		}}
+		counts := func() (int, int) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			return out, done
+		}
+
+		a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB},
+			[]config.Tier{tier("a-work")}, alloc.WithLeaseTTL(24*time.Hour))
+		l := NewListener(a, "a-work", &fakeSession{}, WithRunner(runner), WithBackgroundLaunches())
+		l.cleanup = make(map[int64]*pendingCleanup, parked)
+
+		for id := int64(1); id <= parked; id++ {
+			l.cleanup[id] = &pendingCleanup{job: dispatch.Job{RequestID: id}}
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		finished := make(chan struct{})
+
+		go func() {
+			defer close(finished)
+
+			l.cleanupLoop(ctx)
+		}()
+
+		l.wakeCleanup()
+		synctest.Wait()
+
+		if running, _ := counts(); running != cleanupConcurrency {
+			t.Fatalf("%d destroys out with %d parked, want %d", running, parked, cleanupConcurrency)
+		}
+
+		release <- struct{}{}
+		synctest.Wait()
+
+		if running, ended := counts(); running != cleanupConcurrency || ended != 1 {
+			t.Fatalf("%d destroys out and %d ended after one returned, want %d and 1 with no tick",
+				running, ended, cleanupConcurrency)
+		}
+
+		close(release)
+		synctest.Wait()
+
+		if _, ended := counts(); ended != parked {
+			t.Fatalf("%d destroys ended, want each of the %d once", ended, parked)
+		}
+		if remaining := len(l.cleanup); remaining != 0 {
+			t.Fatalf("%d obligations left after every destroy succeeded", remaining)
+		}
+
+		cancel()
+		<-finished
+	})
+}
+
+// A JOB ONLY PROMISED IS NOT PARKED: its lease stays where the next pool pass can take it
+// for another job, and a destroy out beside that pass could release it from under the
+// compute that job started.
+func TestACompletedPromiseIsNotParked(t *testing.T) {
+	t.Parallel()
+
+	l := NewListener(newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB},
+		[]config.Tier{tier("a-work")}), "a-work", &fakeSession{}, WithBackgroundLaunches(),
+		WithRunnerRegistry(&fakeRunnerRegistry{}))
+	l.acquiring[7] = &promise{lease: &alloc.Lease{ID: "lease-7"}}
+
+	if l.parkCompletion(t.Context(), dispatch.Job{RequestID: 7, Result: "cancelled"}) {
+		t.Fatal("a completion was parked while the next pool pass could still take its lease")
+	}
+	if _, parked := l.cleanup[7]; parked {
+		t.Fatal("it left a cleanup obligation behind")
+	}
+}
+
+// A PARKED COMPLETION KEEPS ITS LEASE WHEN A FAILED RENEWAL DROPS IT FROM `running`. Its
+// destroy succeeds later and nothing else would name the capacity to release, which stays
+// charged with its durable completion retired.
+func TestAParkedCompletionKeepsItsLeaseWhenARenewalDropsIt(t *testing.T) {
+	t.Parallel()
+
+	registry := &fakeRunnerRegistry{}
+	l := NewListener(newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB},
+		[]config.Tier{tier("a-work")}), "a-work", &fakeSession{}, WithBackgroundLaunches(),
+		WithRunnerRegistry(registry))
+	lease := &alloc.Lease{ID: "lease-7"}
+	l.running[7] = lease
+
+	if !l.parkCompletion(t.Context(), dispatch.Job{RequestID: 7, Result: "succeeded"}) {
+		t.Fatal("a completion with a running lease was not parked")
+	}
+	if _, stillRenewed := l.running[7]; !stillRenewed {
+		t.Fatal("parking stopped renewing a lease whose compute is still alive")
+	}
+
+	delete(l.running, 7)
+
+	if got, _, _ := l.completionRelease(7); got != lease {
+		t.Fatalf("after a renewal dropped it the completion releases %v, want its lease", got)
+	}
+}
+
+// A PARKED LEASE IS RELEASED ONCE AT SHUTDOWN. It is in `running` and on the entry, so
+// handling both would ask the ledger to release it and write its completion twice.
+func TestAParkedLeaseStillInRunningIsDecidedOnce(t *testing.T) {
+	t.Parallel()
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB},
+		[]config.Tier{tier("a-work")})
+
+	leases, err := a.Escrow(t.Context(), "a-work", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lease := leases[0]
+
+	store := &countingCompletions{}
+	l := NewListener(a, "a-work", &fakeSession{}, WithBackgroundLaunches())
+	l.completionStore = store
+	job := dispatch.Job{RequestID: 7, Result: "succeeded", CompletionID: 3}
+	l.running[7] = lease
+	l.cleanup = map[int64]*pendingCleanup{7: {job: job, lease: lease}}
+
+	l.releaseAll(t.Context(), map[int64]bool{7: true})
+
+	if store.puts != 0 {
+		t.Fatalf("%d completions written after `running` had already decided this lease, want none", store.puts)
+	}
+	if store.retired != 1 {
+		t.Fatalf("its completion was retired %d times, want once", store.retired)
+	}
+}
+
+// countingCompletions counts what a release writes.
+type countingCompletions struct {
+	puts, retired int
+}
+
+func (c *countingCompletions) PutPendingCompletion(_ context.Context, _ state.PendingCompletion,
+) (state.PendingCompletionDisposition, error) {
+	c.puts++
+
+	return state.PendingCompletionActionable, nil
+}
+
+func (c *countingCompletions) RetirePendingCompletion(context.Context, string, int64, int64) error {
+	c.retired++
+
+	return nil
+}
+
+func (c *countingCompletions) AcknowledgePendingCompletion(context.Context, string, int64, int64) error {
+	return nil
+}
+
+func (c *countingCompletions) PendingCompletions(context.Context, string) ([]state.PendingCompletion, error) {
+	return nil, nil
+}
+
+// removingCancels is a registry whose removal succeeds and whose caller's context then
+// ends, so the ledger refuses the mark that follows it.
+type removingCancels struct {
+	fakeRunnerRegistry
+
+	cancel context.CancelFunc
+}
+
+func (r *removingCancels) RemoveRunner(ctx context.Context, id int64, name string) error {
+	defer r.cancel()
+
+	return r.fakeRunnerRegistry.RemoveRunner(ctx, id, name)
+}
+
+// A MARK THAT FAILED IS NOT DONE. The lease stays counted, so the cleanup loop has to write
+// it again: told the removal was finished it never would, however long the destroy took,
+// and the finished runner would make a live one look surplus for all that time.
+func TestAFailedDeregistrationMarkIsAskedAgain(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("a-work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+
+	leases, err := a.Escrow(t.Context(), tiers[0].Label, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lease := leases[0]
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	registry := &removingCancels{cancel: cancel}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithBackgroundLaunches(), WithRunnerRegistry(registry))
+	l.running[7] = lease
+
+	job := dispatch.Job{RequestID: 7, Result: "succeeded"}
+
+	if !l.parkCompletion(ctx, job) {
+		t.Fatal("a completion with a running lease was not parked")
+	}
+	if len(registry.names) != 1 {
+		t.Fatalf("removed %v before parking, want the one removal", registry.names)
+	}
+	if l.deregisteredWhenParked(job) {
+		t.Fatal("a mark the ledger refused was recorded as done, so nothing would write it again")
+	}
+}
+
+// AN ATTEMPT THAT LEFT ITS OBLIGATION DUE WAITS ITS TURN, however it failed. With every
+// place taken each end wakes the next attempt, and one that set no backoff of its own
+// would go round at the speed the ledger refuses it.
+func TestAnAttemptThatLeftItsObligationDueBacksOff(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("a-work")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 256 * config.GiB}, tiers)
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithBackgroundLaunches(),
+		WithCleanupRetryPacing(time.Minute, time.Hour))
+
+	entry := &pendingCleanup{job: dispatch.Job{RequestID: 7}, retireOnly: true}
+	l.cleanup = map[int64]*pendingCleanup{7: entry}
+	l.attempting[7] = true
+
+	l.endAttempt(7)
+
+	if entry.due(time.Now()) {
+		t.Fatal("an obligation an attempt left due can be retried at once")
+	}
+	if l.attempting[7] {
+		t.Fatal("the attempt kept its place")
+	}
+}
+
+// A REQUEST A FORCE HAS CLAIMED IS NOT ALSO DESTROYED BY A RETRY: both would race for the
+// node's one command slot, and either's end would clear the other's claim.
+func TestAnAttemptLeavesARequestAForceClaimed(t *testing.T) {
+	t.Parallel()
+
+	destroys := 0
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		destroys++
+
+		return nil
+	}}
+
+	l := NewListener(nil, "a-work", &fakeSession{}, WithRunner(runner), WithBackgroundLaunches())
+	l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
+	l.destroying[7] = true
+
+	l.attempt(t.Context(), dispatch.Job{RequestID: 7})
+
+	if destroys != 0 {
+		t.Fatalf("destroyed %d times a request a force had claimed", destroys)
+	}
+	if !l.destroying[7] {
+		t.Fatal("the attempt cleared the force's claim")
+	}
 }

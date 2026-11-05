@@ -200,11 +200,13 @@ type Listener struct {
 	backgroundLaunches bool
 	// flights is each lease whose background launch has not returned, under mu, and
 	// launchFailure the first error one returned; launchSlots bounds how many run at
-	// once, launchEnded wakes the loop when one ends, and launches joins them all.
+	// once, loopWake wakes the loop when one ends or a teardown frees room, cleanupWake
+	// wakes the cleanup loop for a completion just parked, and launches joins them all.
 	flights       map[string]*launchFlight
 	launchFailure error
 	launchSlots   chan struct{}
-	launchEnded   chan struct{}
+	loopWake      chan struct{}
+	cleanupWake   chan struct{}
 	launches      sync.WaitGroup
 	// batchBuying is set, under mu, while a pool pass buys its batch, and
 	// batchBought records that it bought: the admission order re-dates the tier
@@ -225,6 +227,13 @@ type Listener struct {
 	// which is exactly the fact the test needs and the only one that makes the
 	// wrong ordering fail causally rather than usually.
 	heartbeatLock func()
+
+	// heartbeatRenew runs between the moment a heartbeat pass asks for its
+	// renewals and the call that makes them. TEST-ONLY and nil in every
+	// deployment, and it replaces nothing: a test spends time in it that a pass
+	// would spend waiting on the allocator, to prove a renewal is confirmed as
+	// of when it was asked for and not as of when the last batch answered.
+	heartbeatRenew func()
 
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
@@ -345,6 +354,11 @@ type Listener struct {
 	// Requests a cleanup retry is inside a Destroy for right now. The shutdown
 	// pass skips them rather than spending its budget on work already happening.
 	destroying map[int64]bool
+	// attempting is each cleanup attempt out beside the cleanup loop, attemptsWaiting
+	// that one due found no room among them, and attempts joins them all.
+	attempting      map[int64]bool
+	attemptsWaiting bool
+	attempts        sync.WaitGroup
 
 	// Stops the cleanup loop starting anything new. Set under l.mu before the loop
 	// is cancelled, so "no new attempts" and "what is in flight" are one decision.
@@ -466,7 +480,8 @@ type openedSession struct {
 // NewListener builds a listener for one tier.
 func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Option) *Listener {
 	l := &Listener{
-		launchEnded:   make(chan struct{}, 1),
+		loopWake:      make(chan struct{}, 1),
+		cleanupWake:   make(chan struct{}, 1),
 		alloc:         a,
 		tier:          tier,
 		session:       session,
@@ -477,6 +492,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		acquiring:     make(map[int64]*promise),
 		cleanup:       make(map[int64]*pendingCleanup),
 		destroying:    make(map[int64]bool),
+		attempting:    make(map[int64]bool),
 		configErrs:    make(map[string]error),
 		confirmed:     make(map[string]time.Time),
 		heldOrder:     make(map[string]uint64),
