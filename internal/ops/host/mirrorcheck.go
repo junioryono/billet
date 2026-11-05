@@ -41,8 +41,8 @@ func judgeRegistryMirrors(ctx context.Context, cfg *config.Config, skipProbes bo
 
 		return []string{
 			"NO DOCKER HUB MIRROR at site " + site + ": this node's guests pull from Docker Hub over the " +
-				"site's own address, and Docker limits an unauthenticated address to 100 pulls in 6 hours " +
-				"(its documentation, read 2026-11-04), shared by everything behind it",
+				"site's own address, and Docker limits an unauthenticated address: 100 pulls an hour by its " +
+				"own header on 2026-11-05, shared by everything behind it",
 			"the host role runs one unless billet_registry_mirrors is false; node.registry_mirrors names " +
 				"your own, and a pull past the limit fails with toomanyrequests",
 		}, nil
