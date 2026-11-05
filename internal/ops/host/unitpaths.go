@@ -338,7 +338,7 @@ func configPaths(cfg *config.Config, cfgPath string) []unitpath.Need {
 	needs = append(needs, unitpath.Need{Path: cfgPath, Access: unitpath.Read, Why: "the configuration"})
 
 	for _, key := range keys {
-		needs = append(needs, unitpath.Need{Path: key, Access: unitpath.Read, Why: "a GitHub App private key"})
+		needs = append(needs, unitpath.Need{Path: key, Access: unitpath.Read, Why: "a private key this service reads"})
 	}
 
 	return needs

@@ -130,6 +130,12 @@ type Tier struct {
 	VCPU   int      `yaml:"vcpu"`
 	Memory ByteSize `yaml:"memory"`
 
+	// MinuteWeight is what one minute of this tier counts as in `billet usage
+	// export`, in minutes of a 2 vCPU Linux runner. Absent, it is the vCPU charged
+	// over two. It reports and decides nothing: no scheduling code reads it, and
+	// TestNoSchedulerReadsAMinuteWeight holds that.
+	MinuteWeight MinuteWeight `yaml:"minute_weight,omitempty"`
+
 	// Sizes expands this entry into one tier per vCPU count, most operators'
 	// single largest source of hand-written YAML.
 	//
@@ -816,6 +822,9 @@ func (c *Config) validateTiers() []error {
 		}
 		if t.VCPU <= 0 {
 			errs = append(errs, fmt.Errorf("%s: vcpu must be positive", where))
+		}
+		if t.MinuteWeight < 0 {
+			errs = append(errs, fmt.Errorf("%s: minute_weight must be positive", where))
 		}
 		if t.Memory <= 0 {
 			errs = append(errs, fmt.Errorf("%s: memory must be positive", where))

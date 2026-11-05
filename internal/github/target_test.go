@@ -374,8 +374,7 @@ func TestRunnerGroupQuestionsAreRefusedForARepository(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, RepositoryTarget("acme", "widgets"), 11, 22, key)
-	c.token = "cached-token"
-	c.expiresAt = time.Now().Add(time.Hour)
+	seedToken(t, c, "cached-token")
 
 	if err := c.ValidateTrustedRunnerGroup(t.Context(), 7, nil); !errors.Is(err, ErrNoRunnerGroups) {
 		t.Errorf("ValidateTrustedRunnerGroup: %v, want ErrNoRunnerGroups", err)
@@ -407,8 +406,7 @@ func TestRunnerRecoveryListsTheRepositorysRunners(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, RepositoryTarget("acme", "widgets"), 11, 22, key)
-	c.token = "cached-token"
-	c.expiresAt = time.Now().Add(time.Hour)
+	seedToken(t, c, "cached-token")
 
 	got, err := c.InspectScaleSetRunner(t.Context(), "billet-l1", 71)
 	if err != nil {

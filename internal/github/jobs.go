@@ -112,6 +112,19 @@ func NewJobRecordsAt(base string, target Target, appID, installationID int64,
 	return newRunnerGroupPolicyClient(defaultPolicyBounds, base, target, appID, installationID, privateKey)
 }
 
+// NewJobRecordsWith is the job-record reader on tokens a source hands it, for a
+// deployment holding no App key of its own.
+func NewJobRecordsWith(base string, target Target, appID, installationID int64, tokens TokenSource) JobRecords {
+	if base == "" {
+		base = apiBase
+	}
+
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, base, target, appID, installationID, nil)
+	c.tokens = tokens
+
+	return c
+}
+
 // jobRecord is one entry of GitHub's job list, every field a pointer so an
 // absent one is told from an empty one. RunnerName is raw so that an absent
 // field (could not tell) is told from null (no runner yet).

@@ -95,6 +95,10 @@ type ControlPlane struct {
 	serverOpts []server.ControlPlaneOption
 	steering   Steering
 
+	// listenerTimings joins this plane's listeners to its metrics endpoint, either of
+	// which may start first.
+	listenerTimings *server.ListenerTimings
+
 	// self is the address OpenControlPlane made this plane at, for the reason a
 	// Controller records its own: the proofs were earned against what is there,
 	// and a plane overwritten with another's value is not it.
@@ -211,6 +215,8 @@ func OpenControlPlane(
 	}
 
 	cp := &ControlPlane{
+		listenerTimings: &server.ListenerTimings{},
+
 		cfg:        cfg,
 		host:       host,
 		db:         db,
@@ -453,7 +459,7 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 			return nil, err
 		}
 
-		// A CONTROL PLANE WITH NO INDEX STILL SCHEDULES: it loses search and no decision (ADR-024).
+		// A CONTROL PLANE WITH NO INDEX STILL SCHEDULES: it loses search and no decision (ADR-026).
 		// Its nodes are told of no index, and keep what they hold until one is back. An id that
 		// cannot be read is never replaced by a new one, since that would ship everything again.
 		index, err := state.OpenLogIndex(LogIndexDir(cp.cfg))
@@ -593,7 +599,8 @@ func (c *Controller) Schedule(
 	serverOpts := append([]server.ControlPlaneOption{}, cp.serverOpts...)
 	serverOpts = append(serverOpts, server.WithHurry(opts.Hurry), server.WithLeadershipLost(cp.db.LeadershipLost),
 		server.WithCompletionLedger(cp.db), server.WithTargets(cp.targets...),
-		server.WithStopHandoff(), server.WithHeartbeatOverrun(c.heartbeatOverrun))
+		server.WithStopHandoff(), server.WithHeartbeatOverrun(c.heartbeatOverrun),
+		server.WithListenerTimings(cp.listenerTimings))
 
 	if opts.ForegroundLaunches {
 		serverOpts = append(serverOpts, server.WithForegroundLaunches())
@@ -928,3 +935,6 @@ func nodeRunner(plane, steered dispatch.Runner) dispatch.Runner {
 
 	return plane
 }
+
+// ListenerTimings is where this controller's listeners report how long their loops take.
+func (c *Controller) ListenerTimings() *server.ListenerTimings { return c.cp.listenerTimings }
