@@ -1,4 +1,4 @@
-# ADR-023: Scheduling learns from the deployment's own history, and a prediction decides nothing
+# ADR-024: Scheduling learns from the deployment's own history, and a prediction decides nothing
 
 Accepted, 2026-10-25. Issue #524, the first of four (#524, #526, #530, #527) that schedule from what the deployment itself has measured. Later sections extend this record as those land.
 

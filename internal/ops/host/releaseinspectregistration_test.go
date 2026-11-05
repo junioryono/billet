@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -245,7 +246,7 @@ func TestReleaseInspectRegistrationIsCurrentOnlyForTheNodesInvocation(t *testing
 	r := f.report(t)
 	rec := registrationOf(t, r)
 
-	if rec != (registrationReport{Node: "node-a", Deployment: "1234567890abcdef1234567890abcdef", Incarnation: testIncarnation,
+	if !reflect.DeepEqual(rec, registrationReport{Node: "node-a", Deployment: "1234567890abcdef1234567890abcdef", Incarnation: testIncarnation,
 		InvocationID: nodeInvocation, Endpoint: "https://10.0.0.5:7717", RegisteredAt: "2026-09-09T12:00:00Z"}) {
 		t.Errorf("host.registration = %+v", rec)
 	}
@@ -518,8 +519,33 @@ func TestReleaseInspectRegistrationValidity(t *testing.T) {
 		body string
 		want string
 	}{
-		"not JSON":                   {"not json\n", "malformed"},
-		"schema 2":                   {string(mustJSON(t, f.record(map[string]any{"schema": 2}))), "schema is 2"},
+		"not JSON":                {"not json\n", "malformed"},
+		"schema 3":                {string(mustJSON(t, f.record(map[string]any{"schema": 3}))), "schema is 3"},
+		"schema 2 naming no list": {string(mustJSON(t, f.record(map[string]any{"schema": 2}))), `"endpoints" is missing`},
+		"schema 1 naming a list": {
+			string(mustJSON(t, f.record(map[string]any{"endpoints": []string{"https://10.0.0.5:7717", "https://10.0.0.6:7717"}}))),
+			`"endpoints" is not one the node writes`,
+		},
+		"a list of one": {
+			string(mustJSON(t, f.record(map[string]any{"schema": 2, "endpoints": []string{"https://10.0.0.5:7717"}}))),
+			"names 1 controllers",
+		},
+		"a list without the controller it is on": {
+			string(mustJSON(t, f.record(map[string]any{"schema": 2, "endpoints": []string{"https://10.0.0.6:7717", "https://10.0.0.7:7717"}}))),
+			"does not name https://10.0.0.5:7717",
+		},
+		"a list naming one controller twice": {
+			string(mustJSON(t, f.record(map[string]any{"schema": 2, "endpoints": []string{"https://10.0.0.5:7717", "https://10.0.0.5:7717"}}))),
+			"named twice",
+		},
+		"a list of something else": {
+			string(mustJSON(t, f.record(map[string]any{"schema": 2, "endpoints": []any{"https://10.0.0.5:7717", 7717}}))),
+			"not a list of strings",
+		},
+		"a null list": {
+			strings.Replace(string(mustJSON(t, f.record(map[string]any{"schema": 2, "endpoints": []string{"x"}}))), `["x"]`, "null", 1),
+			"not a list of strings",
+		},
 		"schema as the string \"1\"": {strings.Replace(string(valid), `"schema":1`, `"schema":"1"`, 1), `schema is "1"`},
 		"schema 1.0":                 {strings.Replace(string(valid), `"schema":1`, `"schema":1.0`, 1), "schema is 1.0"},
 		"an unknown key":             {string(mustJSON(t, f.record(map[string]any{"extra": "x"}))), `"extra" is not one the node writes`},
@@ -1044,5 +1070,22 @@ func TestARecordELOOPIsClassifiedByPlatform(t *testing.T) {
 	ev := readRegistrationRecord(f.recordPath)
 	if darwin := runtime.GOOS == "darwin"; ev.invalid != darwin || ev.unreadable == darwin {
 		t.Errorf("invalid %v unreadable %v on %s (%s)", ev.invalid, ev.unreadable, runtime.GOOS, ev.why)
+	}
+}
+
+// A PROCESS THAT DIALS SEVERAL RECORDS THEM UNDER SCHEMA 2, and the inspector reads
+// that as the record of the running node. Refusing it would leave a node naming a
+// pair with no usable record at all, and a schema 1 record from such a process
+// would claim its one endpoint is everything it dials.
+func TestReleaseInspectReadsARecordNamingSeveralControllers(t *testing.T) {
+	f := nodeTLSFixture(t, true)
+
+	f.writeRecord(t, f.record(map[string]any{
+		"schema": 2, "endpoints": []string{"https://10.0.0.6:7717", "https://10.0.0.5:7717"},
+	}))
+	f.nodeProperty(t, "InvocationID", nodeInvocation)
+
+	if rec := registrationOf(t, f.report(t)); rec.Endpoint != "https://10.0.0.5:7717" {
+		t.Errorf("host.registration names %q, want the controller the node is on", rec.Endpoint)
 	}
 }

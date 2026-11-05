@@ -1219,6 +1219,20 @@ func TestTheReceiptFixturesAreTheCommandsOwn(t *testing.T) {
 
 			return f.refresh(t, f.rendering(endpointB))
 		},
+		"written-several": func(t *testing.T, f *receiptCmdFixture) endpointOut {
+			t.Helper()
+			f.dialBoth(t)
+
+			return f.evidence(t, f.evidenceObject(t, map[string]any{"from": canonicalA, "to": canonicalB,
+				"from_endpoints": []string{canonicalA}, "to_endpoints": []string{canonicalA, canonicalB}}), f.confirmationObject(nil))
+		},
+		"current-several": func(t *testing.T, f *receiptCmdFixture) endpointOut {
+			t.Helper()
+			f.dialBoth(t)
+			mustWritten(t, f.refresh(t, f.several(endpointA, endpointB)))
+
+			return f.refresh(t, f.several(endpointA, endpointB))
+		},
 		"reported": func(t *testing.T, f *receiptCmdFixture) endpointOut {
 			t.Helper()
 
@@ -1271,7 +1285,11 @@ func TestTheReceiptFixturesAreTheCommandsOwn(t *testing.T) {
 			digest := f.installedSHA(t)
 
 			o := produce(t, f)
-			compareFixture(t, "node-receipt", name, f.normalise(o.raw, digest))
+
+			// THE DIGEST OF WHAT THE SHAPE LEFT INSTALLED too: the file holds this
+			// run's directory, so an unnormalised digest differs every run.
+			out := f.normalise(f.normalise(o.raw, digest), f.installedSHA(t))
+			compareFixture(t, "node-receipt", name, out)
 
 			if name == "written" {
 				body, err := os.ReadFile(f.path)
@@ -1282,6 +1300,14 @@ func TestTheReceiptFixturesAreTheCommandsOwn(t *testing.T) {
 	}
 
 	fixtureSetIs(t, "node-receipt", append(fixtureNames(shapes), "receipt"))
+}
+
+// dialBoth is a node naming both controllers, on the second.
+func (f *receiptCmdFixture) dialBoth(t *testing.T) {
+	t.Helper()
+	f.writeConfig(t, f.several(endpointA, endpointB))
+	f.touchBeforeStart(t, f.configPath)
+	f.writeRecord(t, f.dialling(canonicalB, newInvocation, newIncarnation, canonicalA, canonicalB))
 }
 
 // normalise spells the host-specific values as the packaged host's.
