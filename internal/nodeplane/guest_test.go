@@ -338,3 +338,74 @@ func TestAGuestReportReachesTheLedgerThroughTheWire(t *testing.T) {
 		t.Fatalf("the ledger kept %+v from %q, want %+v from n1", got.GuestReport, got.Node, aGuestReport())
 	}
 }
+
+// TEST RESULTS FROM A PAIRING BELOW THE WIRE THAT CARRIES THEM ARE DROPPED AND THE
+// REPORT KEPT, so a node sending what its wire does not carry has nothing recorded
+// that wire never said, and costs nothing else. LITERAL VERSIONS, for the reason above.
+func TestTestResultsFromAWireThatDoesNotCarryThemAreDropped(t *testing.T) {
+	t.Parallel()
+
+	report := aGuestReport()
+	report.TestsCodec, report.Tests = alloc.TestResultsCodec, []byte{7}
+	body, err := json.Marshal(nodeapi.GuestReportRequest{Epoch: 7, Report: report})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	for _, tc := range []struct {
+		version int
+		kept    bool
+	}{{37, false}, {38, true}} {
+		store := &fakeStore{}
+		_, base := serve(t, store)
+		incarnation := fmt.Sprintf("wire-%d", tc.version)
+		registerAt(t, base, tc.version, incarnation)
+
+		status, refusal := postAs(t, base, "/v1/nodes/n1/leases/l1/guest", incarnation, body)
+		if status != http.StatusNoContent {
+			t.Fatalf("at wire %d the report answered %d %+v, want it kept", tc.version, status, refusal)
+		}
+
+		store.mu.Lock()
+		if len(store.guests) != 1 {
+			store.mu.Unlock()
+			t.Fatalf("at wire %d the ledger was asked to record %d reports, want 1", tc.version, len(store.guests))
+		}
+		got := store.guests[0].report
+		store.mu.Unlock()
+
+		if kept := len(got.Tests) == 1 && got.TestsCodec == alloc.TestResultsCodec; kept != tc.kept {
+			t.Errorf("at wire %d the ledger was asked to keep tests %v under codec %d, want kept %t", tc.version,
+				got.Tests, got.TestsCodec, tc.kept)
+		}
+	}
+}
+
+// TEST RESULTS THIS CONTROL PLANE CANNOT KEEP ARE REFUSED AT THE BOUNDARY, as a report
+// it cannot keep is, and at their bound they fit one request.
+func TestTestResultsAreHeldToTheirBoundAtTheWire(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{}
+	_, base := serve(t, store)
+	c := dial(t, base)
+
+	report := aGuestReport()
+	report.Data = make([]byte, alloc.MaxGuestReportBytes)
+	report.TestsCodec, report.Tests = alloc.TestResultsCodec, make([]byte, alloc.MaxTestResultsBytes)
+	if err := c.RecordGuestReport(t.Context(), "l1", 7, report); err != nil {
+		t.Fatalf("the largest report with the largest test results: %v", err)
+	}
+
+	report.Tests = make([]byte, alloc.MaxTestResultsBytes+1)
+	err := c.RecordGuestReport(t.Context(), "l1", 7, report)
+	if err == nil || !strings.Contains(err.Error(), "over the") {
+		t.Errorf("test results past their bound = %v, want refused", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.guests) != 1 {
+		t.Errorf("the ledger was asked to record %d reports, want the one that fits", len(store.guests))
+	}
+}

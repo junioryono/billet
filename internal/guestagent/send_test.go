@@ -101,10 +101,11 @@ func TestTheNodesLimitsAreReadLeniently(t *testing.T) {
 		want verdict
 		lim  limits
 	}{
-		{`{"schemas":[1],"interval_ms":10000,"max_body":65536}`, accepted, limits{10 * time.Second, 65536}},
-		{`{"schemas":[2,1],"interval_ms":10000,"max_body":65536,"later":{"x":1}}`, accepted, limits{10 * time.Second, 65536}},
-		{`{"schemas":[1],"interval_ms":5000,"max_body":1048576}`, accepted, limits{5 * time.Second, guestreport.MaxBatchBytes}},
-		{`{"schemas":[1],"interval_ms":10000,"max_body":4096}`, accepted, limits{10 * time.Second, 4096}},
+		{`{"schemas":[1],"interval_ms":10000,"max_body":65536}`, accepted, limits{interval: 10 * time.Second, maxBody: 65536}},
+		{`{"schemas":[2,1],"interval_ms":10000,"max_body":65536,"later":{"x":1}}`, accepted, limits{interval: 10 * time.Second, maxBody: 65536, cases: true}},
+		{`{"schemas":[1,3],"interval_ms":10000,"max_body":65536}`, accepted, limits{interval: 10 * time.Second, maxBody: 65536}},
+		{`{"schemas":[1],"interval_ms":5000,"max_body":1048576}`, accepted, limits{interval: 5 * time.Second, maxBody: guestreport.MaxBatchBytes}},
+		{`{"schemas":[1],"interval_ms":10000,"max_body":4096}`, accepted, limits{interval: 10 * time.Second, maxBody: 4096}},
 		{`{"schemas":[2],"interval_ms":10000,"max_body":65536}`, stop, limits{}},
 		{`{"schemas":[],"interval_ms":10000,"max_body":65536}`, stop, limits{}},
 		{`{"interval_ms":10000,"max_body":65536}`, unknown, limits{}},
