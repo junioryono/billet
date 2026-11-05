@@ -21,4 +21,4 @@ BuildKit garbage collection keeps records unused for eight days and constrains t
 
 When the Firecracker node configures `registry_mirrors`, the builder routes `docker.io`, `ghcr.io`, and `quay.io` to their three site-local pull-through caches. The endpoints are public-cache infrastructure, not credential stores: every guest at the site can reach them.
 
-Concurrent successful jobs serialize publication and the last post hook to publish becomes current; a few runs may be needed for unrelated concurrent layer sets to accumulate. Scope a key as broadly as the images share layers, and no broader.
+Concurrent successful jobs serialize publication and the last post hook to publish becomes current; a few runs may be needed for unrelated concurrent layer sets to accumulate. Scope a key as broadly as the images share layers, and no broader. Two unrelated Dockerfiles built one at a time on the default key both stayed warm, and what they do built at once was not settled; when they build at once, give each its own key, such as its path ([What a Docker build's cache saves](../../docs/reference/records/docker-builder.md)).

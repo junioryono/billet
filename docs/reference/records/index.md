@@ -22,6 +22,7 @@ cpu-placement
 docker-published-ports
 untrusted-fork-tart
 untrusted-fork-ec2
+docker-builder
 ```
 
 | Record | Covers |
@@ -43,3 +44,4 @@ untrusted-fork-ec2
 | [Docker's published ports, with and without the userland proxy](docker-published-ports.md) | what turning Docker's userland proxy off did on a billet EC2 guest on 2026-10-25: the published port nearly as fast as the container's own address (select-only up 53%), and `localhost` broken for Node 18 and `[::1]` for every client, so billet's images keep the proxy, which GitHub's runner image template also leaves at Docker's default (#163) |
 | [An untrusted fork pull request on Tart](untrusted-fork-tart.md) | a fork's pull request run twice on an untrusted Tart tier on a development Mac on 2026-10-25 (a Linux arm64 guest): softnet with `@host` kept it from the LAN's router and another LAN host, both of which answered the Mac, while the internet worked; a VM booted with billet's flags reached neither of the Mac's own addresses where a listener answered a VM on tart's NAT, no cache and no billet authority reached it, and the outside evidence agreed; plus the two defects only the real run found, an isolated launch that did not wait for the guest agent and a cleanup that killed `tart delete` part-way (#23) |
 | [An untrusted fork pull request on EC2](untrusted-fork-ec2.md) | a fork's pull request run on an untrusted EC2 tier in the CI account on 2026-10-25: the untrusted security group and no instance profile seen from inside the job and from outside it, no interception, and the pool's own image store published by default-branch jobs, read by the fork and never published from it, proved by a tag each job wrote; and on 2026-11-04, on an AMI built from GitHub's template, the same proof for sticky disks: read warm by the fork, its own key cold again on its re-run, and what it wrote to the default branch's disk absent from that re-run and from the next default-branch job (#23) |
+| [What a Docker build's cache saves](docker-builder.md) | the persistent builder against a registry cache, `type=gha` and none, for four projects and four kinds of change on 2026-11-05; two Dockerfiles on one key; attach time against the state's size; and what the Docker image store saves a job using a 6 GB image (#542) |
