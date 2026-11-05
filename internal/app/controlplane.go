@@ -453,7 +453,7 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 			return nil, err
 		}
 
-		// A CONTROL PLANE WITH NO INDEX STILL SCHEDULES: it loses search and no decision (ADR-023).
+		// A CONTROL PLANE WITH NO INDEX STILL SCHEDULES: it loses search and no decision (ADR-024).
 		// Its nodes are told of no index, and keep what they hold until one is back. An id that
 		// cannot be read is never replaced by a new one, since that would ship everything again.
 		index, err := state.OpenLogIndex(LogIndexDir(cp.cfg))
@@ -553,6 +553,10 @@ type ScheduleOptions struct {
 	// that runs the node runtime in process against the allocator; the wire is
 	// still served. Nil in a deployment.
 	NodeRunner dispatch.Runner
+	// ForegroundLaunches makes every listener wait for each launch, for the replay
+	// harness, whose determinism needs a parked listener to mean a quiet one. False in
+	// a deployment.
+	ForegroundLaunches bool
 }
 
 // Schedule assembles everything that schedules: the liveness and barrier loops,
@@ -590,6 +594,10 @@ func (c *Controller) Schedule(
 	serverOpts = append(serverOpts, server.WithHurry(opts.Hurry), server.WithLeadershipLost(cp.db.LeadershipLost),
 		server.WithCompletionLedger(cp.db), server.WithTargets(cp.targets...),
 		server.WithStopHandoff(), server.WithHeartbeatOverrun(c.heartbeatOverrun))
+
+	if opts.ForegroundLaunches {
+		serverOpts = append(serverOpts, server.WithForegroundLaunches())
+	}
 
 	if opts.DryRun {
 		serverOpts = append(serverOpts, server.AdvertiseNothing())

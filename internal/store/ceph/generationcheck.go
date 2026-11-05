@@ -47,8 +47,8 @@ const e2fsckUncorrected = 4
 // after it failed, which the next sweep retries; false with an error is
 // could-not-tell.
 //
-// THE GENERATION, NOT A JOB'S COPY OF IT. Clone copies a generation whose
-// lineage is at its limit or unrecorded, and a damaged copy says nothing about
+// THE GENERATION, NOT A JOB'S COMPACTION OF IT. Clone compacts a generation whose
+// lineage is at its limit or unrecorded, and a damaged result says nothing about
 // the generation it was made from.
 func (c *Client) GenerationDamaged(ctx context.Context, key, generation string) (bool, error) {
 	if err := checkCacheKey(key); err != nil {

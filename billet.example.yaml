@@ -177,7 +177,7 @@ server:
   # This control plane's index of what jobs wrote, where a tier sets logs.keep: a file
   # of its own a day under identity_dir, not in the ledger, about three times the text
   # it covers. The text stays on the node that ran the job. At least 1h and 64MiB;
-  # absent, 336h and 32GiB. See ADR-023.
+  # absent, 336h and 32GiB. See ADR-024.
   #
   # logs:
   #   retention: 336h
@@ -373,6 +373,14 @@ node:
   # certificate, the two must agree.
   name: epyc-1
   server_addr: 127.0.0.1:7717
+
+  # EVERY CONTROLLER OF AN ACTIVE-PASSIVE PAIR, in place of server_addr (set
+  # one or the other). Only the controller holding the claim serves the node
+  # wire, so the node registers with whichever answers, and when it loses it,
+  # tries the others: no address has to move at a failover. Each needs a name
+  # in its controller's server.node_tls_hosts, as server_addr does.
+  #
+  # server_addrs: [control-a.example:7717, control-b.example:7717]
 
   # WHERE `billet node --enroll` ASKS TO JOIN, when the control plane serves
   # enrollment on an address of its own (server.bootstrap_listen above).
@@ -1052,7 +1060,7 @@ node:
 
   # What this node keeps of its jobs' step logs, where a tier sets logs.keep: compressed
   # under state_dir, the oldest jobs evicted whole. At least 1h, 64MiB and 1MiB; absent, 336h,
-  # 64GiB and 64MiB. Only a node with monitoring.guest receives any. See ADR-023.
+  # 64GiB and 64MiB. Only a node with monitoring.guest receives any. See ADR-024.
   #
   # logs:
   #   retention: 336h

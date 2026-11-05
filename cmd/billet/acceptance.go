@@ -16,6 +16,7 @@ import (
 	"github.com/junioryono/billet/internal/awssts"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/ops/host"
 	"github.com/junioryono/billet/internal/state"
 
 	"gopkg.in/yaml.v3"
@@ -180,6 +181,17 @@ func cmdAcceptanceUp(ctx context.Context, env cli.Env, args []string) error {
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
+	}
+
+	// SAID HERE, BEFORE THE RUN. Otherwise `up` succeeds, `run` creates the scale
+	// sets, and only then does the node refuse to start, because a unix socket's
+	// path is at most 103 bytes on macOS and 107 on Linux and a temporary directory
+	// spends most of that (a Tart node, 2026-10-25).
+	if strings.TrimSpace(*workspace) != "" {
+		if err := host.CheckNodeStateDir(filepath.Join(*workspace, "node")); err != nil {
+			return fmt.Errorf("--workspace %s is too long for this run's node, so choose a shorter "+
+				"one: %w", *workspace, err)
+		}
 	}
 
 	ws, err := deriveAcceptance(ctx, acceptanceInputs{

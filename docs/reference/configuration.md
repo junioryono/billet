@@ -22,7 +22,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `placement` | no | `pack` (default) or `spread` |
 | `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
-| `logs.retention`, `logs.max_bytes` | no | how long this control plane's index of what jobs wrote keeps a day (default `336h`, at least `1h`) and how much of it stays on disk (a byte size, default `32GiB`, at least `64MiB`), the oldest days removed whole; a file of its own a day under `identity_dir`, not in the ledger, and absent unless a tier sets `logs.keep` ([ADR-023](decisions/adr-023-job-logs.md)) |
+| `logs.retention`, `logs.max_bytes` | no | how long this control plane's index of what jobs wrote keeps a day (default `336h`, at least `1h`) and how much of it stays on disk (a byte size, default `32GiB`, at least `64MiB`), the oldest days removed whole; a file of its own a day under `identity_dir`, not in the ledger, and absent unless a tier sets `logs.keep` ([ADR-024](decisions/adr-024-job-logs.md)) |
 | `test_results_retention` | no | how long the ledger keeps a job's test suites and cases, which `billet tests stats` ranks and `billet jobs show` prints (default `336h`, at least `1h`); they are kept apart from the guest report and past it |
 | `test_results_max_bytes` | no | how much of them the ledger keeps in all, the oldest deleted first (a byte size, default `128MiB`, at least `1MiB`); the control plane reads the whole ledger at every start, and this bounds what they add to that |
 | `job_detail_retention` | no | how long the ledger keeps a finished job's per-sample series, destinations and guest report (default `72h`, at least `1h`); past it they are deleted and `billet jobs show` says the job's detail was retired. The usage summary is kept |
@@ -67,12 +67,13 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | Key | Required | Meaning |
 |---|---|---|
 | `name` | on loopback | otherwise the certificate's name; defaults to the hostname |
-| `server_addr` | yes | the control plane's node wire |
-| `bootstrap_addr` | no | used once at `--enroll`; falls back to `server_addr` |
+| `server_addr` | this or `server_addrs` | the control plane's node wire |
+| `server_addrs` | this or `server_addr` | every controller of an active-passive pair, tried in order: the node registers with whichever serves the wire, and on losing it, tries the others ([Failover](../deploying/postgres-and-active-passive.md#what-activepassive-does-not-do-for-you)); refused beside `server_addr`, empty, naming one controller twice, or naming more than four |
+| `bootstrap_addr` | no | used once at `--enroll`; falls back to `server_addr`, or the first of `server_addrs` |
 | `provider` | yes | `docker`, `firecracker`, `tart`, `ec2`, `codebuild`; `simulated` is billet's own test-only backend and is refused anywhere in a configuration |
 | `site` | no | one of the control plane's `sites`; required with `ebs_s3`; refused on `codebuild` |
 | `max_vcpu`, `max_memory` | for `ec2` and `codebuild` | what this host contributes; detected on a host backend when unset |
-| `tls.cert`, `tls.key`, `tls.ca` | for a non-loopback `server_addr` | from `billet ca issue` or enrollment; refused against a loopback server |
+| `tls.cert`, `tls.key`, `tls.ca` | for any non-loopback controller address | from `billet ca issue` or enrollment; refused against a loopback server |
 | `lock_dir`, `allow_unlocked_deployment` | no | the host-wide deployment lock; a shared directory must be setgid; failing to place the lock is an error unless opted out |
 | `state_dir` | yes | generation pointers, image cache, the node's identity |
 | `max_custody` | no | a bound on compute billet is holding without a completion; empty means none, and a job killed by it is archived failed |
@@ -152,7 +153,7 @@ The per-sample series a node reports with each job records the wall time of its 
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
 | `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference; never one beginning with `-`, which a backend's command line would read as an option |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
-| `logs.keep` | keep this tier's jobs' step logs on the node that ran them and index them for `billet logs search` (default false). Linux Firecracker only, with no other backend: that guest runs the agent that reads them, and a tier that asks elsewhere is refused. A log is as sensitive as its workflow makes it, so this is off unless a tier says ([ADR-023](decisions/adr-023-job-logs.md)) |
+| `logs.keep` | keep this tier's jobs' step logs on the node that ran them and index them for `billet logs search` (default false). Linux Firecracker only, with no other backend: that guest runs the agent that reads them, and a tier that asks elsewhere is refused. A log is as sensitive as its workflow makes it, so this is off unless a tier says ([ADR-024](decisions/adr-024-job-logs.md)) |
 | `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
 | `intercept` | the deprecated spelling of `cache.actions.enabled`; refused beside `cache.actions` |

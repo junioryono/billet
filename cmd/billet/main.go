@@ -221,8 +221,8 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 		return fmt.Errorf("%s has no node section", *cfgPath)
 	}
 
-	if cfg.Node.ServerAddr == "" {
-		return fmt.Errorf("%s has no node.server_addr, so this host does not know which "+
+	if len(cfg.Node.ControlPlanes()) == 0 {
+		return fmt.Errorf("%s has no node.server_addr or node.server_addrs, so this host does not know which "+
 			"control plane to dial", *cfgPath)
 	}
 

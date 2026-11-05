@@ -27,7 +27,8 @@ adr-019-guest-image-corresponding-source
 adr-020-npm-registry-interception
 adr-021-tart-images-verified-not-published
 adr-022-every-linux-image-from-githubs-template
-adr-023-job-logs
+adr-023-fleet-envelope
+adr-024-job-logs
 ```
 
 | Record | Decides |
@@ -54,4 +55,5 @@ adr-023-job-logs
 | [ADR-020](adr-020-npm-registry-interception.md) | why the node may serve the public npm registry to its guests through the Actions cache's interception, a second intercepted host; why only an anonymous read is ever cached, why one store per node serves every trust class, how a stalled fetch is retried and a stale document served, and why it starts off by default |
 | [ADR-021](adr-021-tart-images-verified-not-published.md) | why billet publishes no macOS or Tart Linux image and what Apple's macOS and Xcode licences say about redistributing one; how a Tart tier's `@verified` boots a copy of a local base VM billet probed, why a macOS slot is a lock the guest's own process holds and a probe yields to a job, and why a runner's deadline is kept apart from whether the image boots |
 | [ADR-022](adr-022-every-linux-image-from-githubs-template.md) | why the arm64 guest and the EC2 AMI on both architectures run GitHub's own template too, with one scoped difference list; how the AMI builder proves it finished; why an AMI installs a left-out component only when `images.accept` names it; how one release carries both architectures without a new manifest or channel schema, and carries the last good arm64 image forward when its build fails; why generations and tiers carry an architecture |
-| [ADR-023](adr-023-job-logs.md) | why a job's log is kept on its node and indexed on the control plane, in a file a day of its own, and read back through the node wire |
+| [ADR-023](adr-023-fleet-envelope.md) | the fleet one control plane must schedule, 256 hosts and 4,096 open leases, and what each of its writes may take of the ledger's one writer slot; why a listener renews its leases in one commit a pass, why placement is counted a preference rank at a time, and why the commit's speed is the operator's |
+| [ADR-024](adr-024-job-logs.md) | why a job's log is kept on its node and indexed on the control plane, in a file a day of its own, and read back through the node wire |

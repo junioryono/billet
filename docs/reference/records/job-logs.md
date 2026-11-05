@@ -1,6 +1,6 @@
 # Job logs
 
-What the runner and the index actually did, for the facts [ADR-023](../decisions/adr-023-job-logs.md) relies on.
+What the runner and the index actually did, for the facts [ADR-024](../decisions/adr-024-job-logs.md) relies on.
 
 ## What the runner writes
 
