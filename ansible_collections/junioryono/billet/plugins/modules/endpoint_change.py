@@ -11,13 +11,13 @@ node controllers with the rendering's through the one endpoint representation
 (`module_utils/endpoint.py`, held to the same vector table as the Go one) and
 refuses a difference before anything is stopped. Each side's controllers are
 derived as billet's config loader derives them: `node.server_addrs`, or
-`node.server_addr` as a list of one, else the server section's `listen` (which
-itself defaults to 127.0.0.1:7717) when a server section exists, else none; the
-scheme is `node.tls`'s. A CHANGE IS TWO SETS THAT DIFFER, in any order, as the Go
-judgement has it, since an order matters only when a process starts: a side
-without a node section (no node installed yet, or the node removed) names none,
-and a node's first start or its removal is not a migration, so those compare as
-unchanged.
+`node.server_addr` as a list of one, else the server section's
+`tls_router.node_addr` or its `listen` (which itself defaults to 127.0.0.1:7717)
+when a server section exists, else none; the scheme is `node.tls`'s. A CHANGE IS
+TWO SETS THAT DIFFER, in any order, as the Go judgement has it, since an order
+matters only when a process starts: a side without a node section (no node
+installed yet, or the node removed) names none, and a node's first start or its
+removal is not a migration, so those compare as unchanged.
 
 Everything arrives parsed: the role reads the installed file and renders the
 desired one on the controller, so this module needs no YAML on the host and
@@ -98,7 +98,13 @@ def controllers_of(cfg, where):
         if "server" in cfg and cfg["server"] is not None:
             server = _mapping(cfg["server"], where + ".server")
             listen = server.get("listen")
-            addrs = [listen if listen not in (None, "") else DEFAULT_LISTEN]
+            addr = listen if listen not in (None, "") else DEFAULT_LISTEN
+            router = server.get("tls_router")
+            if router is not None:
+                routed = _mapping(router, where + ".server.tls_router").get("node_addr")
+                if routed not in (None, ""):
+                    addr = routed
+            addrs = [addr]
         else:
             raise Refusal("%s.node names no server_addr and there is no server section to take one from" % where)
     else:

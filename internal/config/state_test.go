@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -340,6 +341,160 @@ func TestAConfigOnABrokerNamesNoKey(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := loadServer(t, base("", tc.block)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A DEPLOYMENT BEHIND A ROUTER LISTENS ON LOOPBACK AND SERVES TLS, which nothing else
+// does, and the names it is reached by have to be ones a client sends as SNI.
+func TestATLSRouterMakesALoopbackWireServeTLS(t *testing.T) {
+	base := func(listen, block string) string {
+		return "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n  private_key_path: /tmp/key.pem\n" +
+			"server:\n  listen: " + listen + "\n  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n" + block
+	}
+
+	const router = "  tls_router:\n    node_addr: a.nodes.example.com:443\n    enroll_addr: a.enroll.example.com:443\n" +
+		"  bootstrap_listen: 127.0.0.1:7718\n"
+
+	cfg, err := loadServer(t, base("127.0.0.1:7717", router))
+	if err != nil {
+		t.Fatalf("a deployment behind a router: %v", err)
+	}
+
+	if !cfg.Server.WireServesTLS() {
+		t.Error("a loopback wire behind a router does not serve TLS")
+	}
+
+	if got := strings.Join(cfg.Server.RouterHosts(), ","); got != "a.nodes.example.com,a.enroll.example.com" {
+		t.Errorf("its certificate would name %q", got)
+	}
+
+	// A SINGLE LABEL IS A NAME: crypto/tls sends it as SNI.
+	if _, err := loadServer(t, base("127.0.0.1:7717", "  tls_router:\n    node_addr: router:443\n")); err != nil {
+		t.Errorf("a single-label name: %v", err)
+	}
+
+	plain, err := loadServer(t, base("127.0.0.1:7717", ""))
+	if err != nil {
+		t.Fatalf("a loopback deployment: %v", err)
+	}
+
+	if plain.Server.WireServesTLS() {
+		t.Error("a plain loopback wire claims to serve TLS")
+	}
+
+	if _, err := loadServer(t, base("127.0.0.1:7717", "  bootstrap_listen: 127.0.0.1:7718\n")); err == nil ||
+		!strings.Contains(err.Error(), "nothing for a node to enroll into") {
+		t.Errorf("enrollment on a plain loopback wire answered %v; a router is the only thing that changes that", err)
+	}
+
+	for name, tc := range map[string]struct{ listen, block, want string }{
+		"no node address": {"127.0.0.1:7717", "  tls_router:\n    enroll_addr: a.b.example.com:443\n", "node_addr"},
+		"an IP": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: 10.0.0.1:443\n", "no SNI",
+		},
+		"an empty label":            {"127.0.0.1:7717", "  tls_router:\n    node_addr: a..example.com:443\n", "must name a DNS name"},
+		"a trailing dot":            {"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com.:443\n", "must name a DNS name"},
+		"a leading hyphen":          {"127.0.0.1:7717", "  tls_router:\n    node_addr: -a.example.com:443\n", "must name a DNS name"},
+		"an underscore":             {"127.0.0.1:7717", "  tls_router:\n    node_addr: a_b.example.com:443\n", "must name a DNS name"},
+		"a number for a last label": {"127.0.0.1:7717", "  tls_router:\n    node_addr: 10.0.1:443\n", "must name a DNS name"},
+		"no host":                   {"127.0.0.1:7717", "  tls_router:\n    node_addr: :443\n", "must name a DNS name"},
+		"no port":                   {"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com\n", "host:port"},
+		"enrollment with no name": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n  bootstrap_listen: 127.0.0.1:7718\n",
+			"enroll_addr is required",
+		},
+		"a name for no listener": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: b.example.com:443\n",
+			"nothing to send it to",
+		},
+		"one name for both": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: a.example.com:443\n" +
+				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
+		},
+		"one name in two cases": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: A.Example.com:443\n" +
+				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
+		},
+		"one name on two ports": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: a.example.com:8443\n" +
+				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
+		},
+		"a wire off loopback": {"10.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n", "listens on loopback"},
+		"enrollment off loopback": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: b.example.com:443\n" +
+				"  bootstrap_listen: 10.0.0.1:7718\n", "listens on loopback",
+		},
+		"two spellings of the names": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n  node_tls_hosts: [a.example.com]\n",
+			"node_tls_hosts is set",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadServer(t, base(tc.listen, tc.block)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A NODE IN A ROUTED CONTROL PLANE'S FILE DIALS THE ROUTER, because the certificate
+// names only the router's names and the wire demands one: loopback plain HTTP reaches
+// nothing, and a certificate alone would fail on the address it dials.
+func TestANodeBesideARoutedControlPlaneDialsTheRouter(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"node.crt", "node.key", "ca.crt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tls := "  tls:\n    cert: " + filepath.Join(dir, "node.crt") + "\n    key: " + filepath.Join(dir, "node.key") +
+		"\n    ca: " + filepath.Join(dir, "ca.crt") + "\n"
+
+	body := func(node string) string {
+		return "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n  private_key_path: /tmp/key.pem\n" +
+			"server:\n  listen: 127.0.0.1:7717\n  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n" +
+			"  tls_router:\n    node_addr: a.nodes.example.com:443\n" +
+			"node:\n  name: n\n  provider: docker\n  state_dir: /srv/billet-node\n" + node
+	}
+
+	cfg, err := loadServer(t, body(tls))
+	if err != nil {
+		t.Fatalf("a node with a certificate and no server_addr: %v", err)
+	}
+	if cfg.Node.ServerAddr != "a.nodes.example.com:443" {
+		t.Errorf("node.server_addr defaulted to %q, want the router's address", cfg.Node.ServerAddr)
+	}
+
+	withEnrollment := strings.Replace(body(tls), "    node_addr: a.nodes.example.com:443\n",
+		"    node_addr: a.nodes.example.com:443\n    enroll_addr: a.enroll.example.com:443\n", 1)
+	withEnrollment = strings.Replace(withEnrollment, "  max_memory: 8GiB\n",
+		"  max_memory: 8GiB\n  bootstrap_listen: 127.0.0.1:7718\n", 1)
+
+	enrolling, err := loadServer(t, withEnrollment)
+	if err != nil {
+		t.Fatalf("a node beside a router with enrollment: %v", err)
+	}
+	if enrolling.Node.BootstrapAddr != "a.enroll.example.com:443" {
+		t.Errorf("node.bootstrap_addr defaulted to %q, want the router's enrollment address", enrolling.Node.BootstrapAddr)
+	}
+
+	if _, err := loadServer(t, body("  server_addr: A.Nodes.Example.com:443\n"+tls)); err != nil {
+		t.Errorf("another spelling of the router's address: %v", err)
+	}
+
+	for name, tc := range map[string]struct{ node, want string }{
+		"no certificate":                  {"", "node.tls is not set"},
+		"loopback with no certificate":    {"  server_addr: 127.0.0.1:7717\n", "is not server.tls_router.node_addr"},
+		"loopback with a certificate":     {"  server_addr: 127.0.0.1:7717\n" + tls, "is not server.tls_router.node_addr"},
+		"another name with a certificate": {"  server_addr: b.nodes.example.com:443\n" + tls, "is not server.tls_router.node_addr"},
+		"a list naming another":           {"  server_addrs: [a.nodes.example.com:443, 127.0.0.1:7717]\n" + tls, "is not server.tls_router.node_addr"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadServer(t, body(tc.node)); err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("got %v, want it to say %q", err, tc.want)
 			}
 		})

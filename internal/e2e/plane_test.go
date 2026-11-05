@@ -52,6 +52,7 @@ import (
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // A registered host in these tests is deliberately larger than any budget they
@@ -342,6 +343,9 @@ func (p *plane) acquiredIDs() []int64 {
 
 // stack is billet, assembled the way cmd/billet assembles it.
 type stack struct {
+	// assembled is the control plane this stack runs, its served wire included.
+	assembled *assembled
+
 	// dir is the state directory, so a restart can be built over it.
 	dir string
 
@@ -501,6 +505,11 @@ type stackOpt func(*stackConfig)
 type stackConfig struct {
 	wire      bool
 	untrusted bool
+	// noFirstNode starts no node for a wire stack: its first node is the test's to
+	// start, through whatever is in front of the wire.
+	noFirstNode bool
+	// configure adjusts the control plane's config before it is assembled.
+	configure func(*config.Config)
 	// tokens, when set, gives the deployment a token source in place of the App key,
 	// built over the stack's own identity directory and plane.
 	tokens func(t *testing.T, dir string, p *plane) billetgithub.TokenSource
@@ -811,7 +820,12 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		steering.Allocator = append(steering.Allocator, alloc.WithClock(sc.now))
 	}
 
-	c := openAssembled(t, harnessConfig(dir, 8, 16*config.GiB, tiers), targets, steering)
+	assembledCfg := harnessConfig(dir, 8, 16*config.GiB, tiers)
+	if sc.configure != nil {
+		sc.configure(assembledCfg)
+	}
+
+	c := openAssembled(t, assembledCfg, targets, steering)
 	a := c.ctl.Allocator()
 
 	// A per-test deployment identity, so two of these running concurrently do not
@@ -876,14 +890,17 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		guestCache *node.CacheService
 	)
 
-	if sc.wire {
+	switch {
+	case sc.wire && sc.noFirstNode:
+		wire, wireAddr = c.wire.Plane(), c.wire.Addr
+	case sc.wire:
 		first := startFirstNode(t, log, c, nodeProcess{
 			host: host, deployment: deployment, provider: prov, kind: kind,
 			hurry: hurry, drainTimeout: sc.nodeDrainTimeout, guestReports: sc.guestReports,
 		})
 		runner, stopNode, guestCache = first.runner, first.stop, first.guestCache
 		wire, wireAddr = c.wire.Plane(), c.wire.Addr
-	} else {
+	default:
 		// PRE-REGISTERED ONLY FOR THE IN-PROCESS STACK, and after the fleet was
 		// forgotten, as a registration over the wire would be. Over the wire the
 		// plane's own registration must write this row, so doing it there would
@@ -911,6 +928,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		runner: runner, scheduler: scheduler, provider: prov, kind: kind, backend: sc.backend,
 		node: host, tiers: tiers,
 		wire: wire, stopNode: stopNode, wireAddr: wireAddr, guestCache: guestCache,
+		assembled: c,
 	}
 }
 
@@ -946,6 +964,10 @@ type nodeProcess struct {
 	// guestReports gives the node a guest cache service that takes its guests'
 	// own reports; see stackConfig.guestReports.
 	guestReports bool
+	// identity is the certificate a node dialling over mutual TLS presents, loaded as
+	// `billet node` loads it, whose addr then says https itself. Nil is the plain wire
+	// of a loopback control plane.
+	identity *wirecert.Rotating
 	// controllers, when set, are every control-plane address the node dials
 	// (node.server_addrs), in place of the one startNodeLoop is given.
 	controllers []string
@@ -973,15 +995,21 @@ type nodeLoop struct {
 func startNodeLoop(t *testing.T, log *slog.Logger, addr string, np nodeProcess) *nodeLoop {
 	t.Helper()
 
-	nodeCfg := &config.NodeConfig{Name: np.host, ServerAddr: "http://" + addr}
+	// A TLS NODE'S ADDRESS SAYS https ITSELF; a plain one is given its scheme here.
+	scheme := "http://"
+	if np.identity != nil {
+		scheme = ""
+	}
+
+	nodeCfg := &config.NodeConfig{Name: np.host, ServerAddr: scheme + addr}
 	if np.controllers != nil {
 		nodeCfg.ServerAddr = ""
 		for _, a := range np.controllers {
-			nodeCfg.ServerAddrs = append(nodeCfg.ServerAddrs, "http://"+a)
+			nodeCfg.ServerAddrs = append(nodeCfg.ServerAddrs, scheme+a)
 		}
 	}
 
-	nc, err := app.NewNodeClient(&config.Config{Node: nodeCfg}, nil)
+	nc, err := app.NewNodeClient(&config.Config{Node: nodeCfg}, np.identity)
 	if err != nil {
 		t.Fatalf("app.NewNodeClient: %v", err)
 	}

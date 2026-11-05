@@ -2288,8 +2288,8 @@ func TestOnlyLoopbackIsSafeWithoutTLS(t *testing.T) {
 		"garbage":     false,
 		"1.2.3.4.5:1": false,
 	} {
-		if got := nodeplane.LoopbackOnly(addr); got != want {
-			t.Errorf("LoopbackOnly(%q) = %v, want %v", addr, got, want)
+		if got := config.LoopbackAddr(addr); got != want {
+			t.Errorf("LoopbackAddr(%q) = %v, want %v", addr, got, want)
 		}
 	}
 }

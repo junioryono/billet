@@ -113,6 +113,8 @@ The transaction is the one [Upgrading billet](../operating/upgrades.md) describe
 
 ## The config
 
+`images.accept` does not apply to a Mac. It names the licensed components billet installs into the Linux image it builds from GitHub's template, and billet publishes no macOS image: the tart image is the one you give it.
+
 ```yaml
 node:
   name: mac-mini-1
