@@ -505,8 +505,11 @@ func TestJobStatsWordsEachEnergySourceAsItMeasures(t *testing.T) {
 		if e.IdleJoules != nil {
 			t.Errorf("%s has an idle figure %v, want null", e.Source, *e.IdleJoules)
 		}
-		if e.IdleIncluded != (e.Source == alloc.EnergyRAPLUnsplit) {
-			t.Errorf("%s says idle included %t", e.Source, e.IdleIncluded)
+		switch {
+		case e.Source == "watts-from-a-later-billet" && e.IdleIncluded != nil:
+			t.Errorf("a source this binary does not know says idle included %t, want null", *e.IdleIncluded)
+		case e.Source != "watts-from-a-later-billet" && (e.IdleIncluded == nil || *e.IdleIncluded != (e.Source == alloc.EnergyRAPLUnsplit)):
+			t.Errorf("%s says idle included %v", e.Source, e.IdleIncluded)
 		}
 	}
 }

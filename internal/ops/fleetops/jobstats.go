@@ -879,13 +879,29 @@ type statsDurations struct {
 }
 
 // statsEnergyJSON is one source's energy. IdleJoules is null for a source that does
-// not split idle out, and IdleIncluded says the active figure has the idle in it.
+// not split idle out, and IdleIncluded says whether the active figure has the idle in
+// it, null for a source this binary does not know.
 type statsEnergyJSON struct {
 	Source       string   `json:"source"`
 	ActiveJoules float64  `json:"active_joules"`
 	IdleJoules   *float64 `json:"idle_joules"`
-	IdleIncluded bool     `json:"idle_included"`
+	IdleIncluded *bool    `json:"idle_included"`
 	Jobs         int      `json:"jobs"`
+}
+
+// idleIncluded says whether a source's one figure has the machine's idle draw in it,
+// nil for a source this binary does not know.
+func idleIncluded(source string) *bool {
+	var included bool
+	switch source {
+	case alloc.EnergyRAPLUnsplit:
+		included = true
+	case alloc.EnergyRAPL, alloc.EnergyMeter, alloc.EnergyProcess:
+	default:
+		return nil
+	}
+
+	return &included
 }
 
 // idleJoules is a source's idle energy, nil for one that reports none of its own.
@@ -943,7 +959,7 @@ func statsFiguresJSONOf(f *statsFigures) statsFiguresJSON {
 		e := &f.Energy[i]
 		out.Energy = append(out.Energy, statsEnergyJSON{Source: e.Source,
 			ActiveJoules: float64(e.ActiveMicrojoules) / 1e6, IdleJoules: idleJoules(e),
-			IdleIncluded: e.Source == alloc.EnergyRAPLUnsplit,
+			IdleIncluded: idleIncluded(e.Source),
 			Jobs:         e.Jobs})
 	}
 

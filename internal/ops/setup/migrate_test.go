@@ -467,7 +467,6 @@ jobs:
 	elsewhere.Repository = "acme/web"
 	// A second entry for a job the first moved cannot move it again.
 	again := entry("by-key")
-	again.RecommendedRunsOn = onFour
 
 	path := writeRightsize(t, 1, entry("by-key"), entry("Shown name"), entry("key-of-a-named-job"), entry("legs"),
 		entry("computed"), entry("${{ github.ref }}"), entry("Twin"), entry("moved-since"), forged, entry("still-hosted"),
@@ -816,8 +815,13 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 	dir := checkout(t, map[string]string{"ci.yml": migrateWorkflow, "unmoved.yml": "on: [push]\njobs:\n  a:\n    runs-on: our-own\n"})
 	cfg := migrateConfigFile(t)
 
+	// Origin fetches from acme and pushes to alice's fork: the head is alice's.
+	runIn(t, dir, "config", "remote.origin.pushurl", "https://github.com/alice/api.git")
+	// pushInsteadOf IS NOT APPLIED TO AN EXPLICIT PUSH URL, insteadOf is.
+	runIn(t, dir, "config", "url."+originOf(t, dir)+".insteadOf", "https://github.com/alice/api.git")
+
 	// The repository named in another case than origin's: the pull request goes to it
-	// as named, from the branch on origin's owner.
+	// as named, from the branch on the fork origin pushes to.
 	stdout, stderr, err := migrateRun(t, "--config", cfg, "--path", dir, "--repo", "Acme/API", "--open-pr")
 	if err != nil {
 		t.Fatalf("--open-pr: %v\n%s", err, stderr)
@@ -846,7 +850,7 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 	if err != nil {
 		t.Fatalf("gh was never run: %v", err)
 	}
-	for _, want := range []string{"pr\ncreate\n", "--repo=Acme/API\n", "--base=main\n", "--head=acme:" + branch + "\n",
+	for _, want := range []string{"pr\ncreate\n", "--repo=Acme/API\n", "--base=main\n", "--head=alice:" + branch + "\n",
 		"--body-file=-\n"} {
 		if !strings.Contains(string(args), want) {
 			t.Errorf("gh's arguments do not hold %q:\n%s", want, args)
@@ -881,6 +885,18 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 		t.Errorf("a refusal left the checkout on %q", got)
 	}
 
+	// An origin pushing to two places has no one fork a head can name.
+	twice := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	runIn(t, twice, "config", "--add", "remote.origin.pushurl", "https://github.com/alice/api.git")
+	runIn(t, twice, "config", "--add", "remote.origin.pushurl", "https://github.com/bob/api.git")
+	if _, _, err := migrateRun(t, "--config", cfg, "--path", twice, "--repo", "acme/api", "--open-pr"); err == nil ||
+		!strings.Contains(err.Error(), "no one URL to push to; nothing was changed") {
+		t.Errorf("two push URLs = %v, want refused before anything changed", err)
+	}
+	if got := head(twice); got != "main" {
+		t.Errorf("a refusal over push URLs left the checkout on %q", got)
+	}
+
 	detached := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
 	runIn(t, detached, "checkout", "-q", "--detach")
 	if _, _, err := migrateRun(t, "--config", cfg, "--path", detached, "--repo", "acme/api", "--open-pr"); err == nil ||
@@ -900,7 +916,8 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	// The push fails: there is no such remote any more. The commit stands, and the
 	// error says so.
 	unpushed := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
-	runIn(t, unpushed, "remote", "set-url", "--push", "origin", filepath.Join(t.TempDir(), "gone"))
+	runIn(t, unpushed, "config", "remote.origin.pushurl", "https://github.com/bob/api.git")
+	runIn(t, unpushed, "config", "url."+filepath.Join(t.TempDir(), "gone")+".insteadOf", "https://github.com/bob/api.git")
 	_, _, err := migrateRun(t, "--config", cfg, "--path", unpushed, "--repo", "acme/api", "--open-pr")
 	if err == nil || !strings.Contains(err.Error(), "stopped on branch billet/migrate-workflows-") ||
 		!strings.Contains(err.Error(), "after committing") {
@@ -1087,7 +1104,7 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 			says: "is not"},
 		{name: "another architecture", tiers: tiers(func(t *config.Tier) { t.Image = "ubuntu-2404-arm64@verified" }),
 			says: "is not"},
-		{name: "an architecture that cannot be told", tiers: func() []config.Tier {
+		{name: "the same image naming no architecture is one family", tiers: func() []config.Tier {
 			out := tiers(func(t *config.Tier) { t.Image = "ubuntu-2404@verified" })
 			for i := range out {
 				if out[i].Label == "platform-4vcpu" {
@@ -1095,7 +1112,22 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 				}
 			}
 			return out
-		}(), says: "is not"},
+		}(), writes: onTwo},
+		{name: "a recommended tier whose image changed since the report", tiers: tiers(func(t *config.Tier) {
+			t.Image = "ubuntu-2404-x64@g2"
+		}), says: "is not"},
+		{name: "a recommended tier with less disk since the report", tiers: func() []config.Tier {
+			out := migrateTiers()
+			for i := range out {
+				switch out[i].Label {
+				case "platform-4vcpu":
+					out[i].Disk = 40 * config.GiB
+				case "platform-2vcpu":
+					out[i].Disk = 20 * config.GiB
+				}
+			}
+			return out
+		}(), says: "less disk"},
 		{name: "a trusted tier listing the workflow under another case", tiers: func() []config.Tier {
 			out := migrateTiers()
 			for i := range out {
@@ -1393,5 +1425,58 @@ func TestEveryRewriteIsReadBackBeforeItIsKept(t *testing.T) {
 	if !applied.IsValid() || !kept.IsValid() || kept < applied {
 		t.Errorf("rewriteWorkflow applies its edits at %s and reads them back at %s; want a read-back after",
 			fset.Position(applied), fset.Position(kept))
+	}
+}
+
+// originOf is the bare repository a checkout() pushes to, from the rule it wrote.
+func originOf(t *testing.T, dir string) string {
+	t.Helper()
+
+	out := runIn(t, dir, "config", "--get-regexp", `^url\..*\.pushinsteadof$`)
+	key, _, _ := strings.Cut(strings.TrimSpace(out), " ")
+
+	return strings.TrimSuffix(strings.TrimPrefix(key, "url."), ".pushinsteadof")
+}
+
+// A WORKFLOWS DIRECTORY REPLACED BETWEEN PLANNING AND WRITING IS NOT WRITTEN THROUGH,
+// even to files whose bytes are the ones planned.
+func TestMigrateWorkflowsDoesNotWriteThroughAReplacedDirectory(t *testing.T) {
+	t.Parallel()
+
+	tier := []config.Tier{{Label: "billet-2vcpu", Target: "default", Arch: config.ArchX64, Provider: config.ProviderDocker,
+		GuestOS: config.GuestLinux, VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu:24.04"}}
+	dir := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	elsewhere := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	plan, err := planMigration(dir, "acme/api", chooserOf(t, tier, labelMaps{}, false), nil)
+	if err != nil || !plan.changes() {
+		t.Fatalf("plan = %+v, %v; want a change", plan, err)
+	}
+
+	workflows := filepath.Join(dir, ".github", "workflows")
+	if err := os.Rename(workflows, workflows+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(elsewhere, ".github", "workflows"), workflows); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.install(dir); err == nil || !strings.Contains(err.Error(), "is a link or a file") {
+		t.Errorf("installing through a replaced directory = %v, want refused", err)
+	}
+	if got := readFile(t, filepath.Join(elsewhere, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
+		t.Errorf("another checkout's workflow was written: %q", got)
+	}
+
+	// A directory replaced by another directory is refused too.
+	if err := os.Remove(workflows); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(workflows, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workflows, "ci.yml"), []byte(migrateWorkflow), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.install(dir); err == nil || !strings.Contains(err.Error(), "changed since it was read") {
+		t.Errorf("installing into another directory = %v, want refused", err)
 	}
 }

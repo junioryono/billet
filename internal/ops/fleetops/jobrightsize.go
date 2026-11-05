@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -549,7 +548,10 @@ func recommend(job *rightsizeJob, current *config.Tier, tiers []config.Tier) {
 		job.Recommendation = rightsizeKeep
 		job.Reason = fmt.Sprintf("CPU busy at p90 %.0f%% is idle, and its memory could not be told: %s", 100*busy,
 			memoryUntold(job))
-	case guestJudged || hostJudged:
+	// ROOM IS SAID ONLY WHERE SOMETHING SHOWED IT: the VM's own figure, under the
+	// line that asks for more, or a host peak small even with the page cache in it. A
+	// host peak above that says nothing either way.
+	case guestJudged || hostSmall:
 		job.Recommendation = rightsizeKeep
 		job.Reason = fmt.Sprintf("neither idle nor short of room (CPU busy at p90 %.0f%%)", 100*busy)
 	default:
@@ -584,18 +586,11 @@ func cpuBoundWhy(job *rightsizeJob) string {
 	return fmt.Sprintf(" (CPU pressure at p90 %.0f%%)", 100**job.PressureP90)
 }
 
-// sameFamily says a tier differs from current only in its name, its size and how
-// many of it the deployment keeps, so a move between them changes how much room a
-// job has and nothing about what it runs on, how it starts, where, or under whose
-// authority. EVERY FIELD IS COMPARED BUT THOSE, so a field a later billet adds is
-// one more that must match rather than one this forgot. The room a job has that
-// nothing here measured (its disk, its shared memory, its BuildKit cache mounts) is
-// never made smaller. A trusted tier must also allow the workflow, or the runner
-// group would refuse the job the recommendation moved there.
+// sameFamily says a tier is of current's family (config.Tier.SameFamily) and, when
+// trusted, allows the workflow, or its runner group would refuse the job a
+// recommendation moved there.
 func sameFamily(current, other *config.Tier, workflow string) bool {
-	if other.Label == current.Label || !reflect.DeepEqual(sizeless(*current), sizeless(*other)) ||
-		!roomKept(current.Disk, other.Disk) || !roomKept(current.SHM, other.SHM) ||
-		!roomKept(current.BuildKitCacheMountLimit, other.BuildKitCacheMountLimit) {
+	if !current.SameFamily(*other) {
 		return false
 	}
 
@@ -608,25 +603,6 @@ func sameFamily(current, other *config.Tier, workflow string) bool {
 
 		return path == workflow
 	})
-}
-
-// sizeless is a tier with what may differ within a family cleared: its names, its
-// size, how many of it are kept warm, run at once or reserved, and the workflows a
-// trusted one allows, which sameFamily checks for the one workflow that matters.
-func sizeless(t config.Tier) config.Tier {
-	t.Label, t.RunsOn, t.Declaration, t.Targets = "", "", "", config.TierTargets{}
-	t.VCPU, t.Memory, t.Sizes, t.MemoryPerVCPU = 0, 0, nil, 0
-	t.Disk, t.SHM, t.BuildKitCacheMountLimit = 0, 0, 0
-	t.WarmPool, t.MaxConcurrent, t.Reserved, t.Workflows = 0, 0, 0, nil
-
-	return t
-}
-
-// roomKept says other gives a job at least the room current does, where zero is the
-// backend's default: a default is equal only to a default, since what it comes to
-// is the backend's to say.
-func roomKept(current, other config.ByteSize) bool {
-	return other == current || (current != 0 && other > current)
 }
 
 // smallestOf is the smallest of the family that fits, by vCPU, then memory, then
@@ -649,13 +625,20 @@ func smallestOf(current *config.Tier, tiers []config.Tier, workflow string, fits
 
 // largerTier is the smallest tier with more of what the job is short of and no
 // less of the other.
+//
+// LARGER THAN WHAT THE JOB HAD, which is the shape charged, not the tier's request: a
+// fallback can buy a shape larger than the tier asks for, and a tier between the two
+// would take room from the job the recommendation means to give it more.
 func largerTier(job *rightsizeJob, current *config.Tier, tiers []config.Tier, moreMemory, moreCPU bool) *config.Tier {
+	hadVCPU, hadMemory := max(job.VCPU, int64(current.VCPU)), max(job.Memory, int64(current.Memory))
+
 	return smallestOf(current, tiers, job.Workflow, func(t *config.Tier) bool {
-		if t.VCPU < current.VCPU || t.Memory < current.Memory {
+		vcpu, memory := int64(t.VCPU), int64(t.Memory)
+		if vcpu < hadVCPU || memory < hadMemory {
 			return false
 		}
 
-		return (!moreMemory || t.Memory > current.Memory) && (!moreCPU || t.VCPU > current.VCPU)
+		return (!moreMemory || memory > hadMemory) && (!moreCPU || vcpu > hadVCPU)
 	})
 }
 

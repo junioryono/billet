@@ -490,3 +490,30 @@ func TestJobsRightsizeThroughTheCommand(t *testing.T) {
 		t.Errorf("--since soon = %v, want it refused", err)
 	}
 }
+
+// LARGER IS LARGER THAN THE SHAPE CHARGED: a job a fallback ran on 16 vCPU and 64 GB
+// near its memory is never moved to an 8 vCPU, 32 GB tier for being larger than the
+// 4 vCPU one it asked for.
+func TestALargerTierIsLargerThanTheShapeCharged(t *testing.T) {
+	t.Parallel()
+
+	got := rightsizeOne(t, runsOf("test", 40, 0.50, 0.95, 0.50, func(_ int, j *fixedJob) {
+		j.vcpu, j.memory = 16, int64(64*gb)
+	}), rightsizeTiers)
+	if got.Recommendation != rightsizeLarger || got.Recommended != nil {
+		t.Errorf("%s to %+v (%s); want larger, with no tier above 64 GB to name", got.Recommendation, got.Recommended,
+			got.Reason)
+	}
+}
+
+// A HOST PEAK ABOVE THE IDLE LINE SAYS NOTHING OF ROOM, with no word from the VM, so a
+// job that is not idle is kept without the claim.
+func TestAHighHostPeakClaimsNoRoom(t *testing.T) {
+	t.Parallel()
+
+	got := rightsizeOne(t, runsOf("test", 40, 0.50, 0, 2.80, func(_ int, j *fixedJob) { j.guest = nil }), rightsizeTiers)
+	if got.Recommendation != rightsizeKeep || strings.Contains(got.Reason, "short of room") ||
+		!strings.Contains(got.Reason, "its memory could not be told") {
+		t.Errorf("%s (%s); want keep, saying memory could not be told", got.Recommendation, got.Reason)
+	}
+}

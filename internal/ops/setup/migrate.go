@@ -159,6 +159,31 @@ func originRepository(ctx context.Context, path string) (string, error) {
 	return repository, nil
 }
 
+// pushOwner is the owner of the repository origin pushes to, which the pull request's
+// head names. ORIGIN'S CONFIGURED PUSH URL, falling back to its URL, and not the one
+// git resolves: a fork pushes somewhere its fetch URL does not say, and a rewrite rule
+// is how a host is reached, not which repository it is. More than one push URL is a
+// push to several, which one head cannot name.
+func pushOwner(ctx context.Context, path string) (string, error) {
+	urls, err := runGit(ctx, path, "config", "--get-all", "remote.origin.pushurl")
+	if err != nil || strings.TrimSpace(urls) == "" {
+		urls, err = runGit(ctx, path, "config", "--get-all", "remote.origin.url")
+	}
+	lines := strings.Fields(urls)
+	if err != nil || len(lines) != 1 {
+		return "", errors.New("billet migrate workflows: --open-pr pushes to origin, and origin has no one URL to push " +
+			"to; nothing was changed")
+	}
+	repository, ok := repositoryOfRemote(lines[0])
+	if !ok {
+		return "", errors.New("billet migrate workflows: --open-pr pushes to origin, and its push URL names no " +
+			"owner/name; nothing was changed")
+	}
+	owner, _, _ := config.SplitRepository(repository)
+
+	return owner, nil
+}
+
 // repositoryOfRemote reads owner/name from a remote in any form git takes: a URL, or
 // the scp form git@host:owner/name.
 func repositoryOfRemote(remote string) (string, bool) {
@@ -491,8 +516,8 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 
 			continue
 		case !compatibleMove(current, recommended, chooser.repository, file):
-			say(0, fmt.Sprintf("tier %s is not %s with another size here: its target, guest OS, architecture or trust "+
-				"differs, or it does not allow this workflow", strconv.Quote(recommended.Label),
+			say(0, fmt.Sprintf("tier %s is not %s with another size here: some other setting of it differs, it has "+
+				"less disk or shared memory, or it does not allow this workflow", strconv.Quote(recommended.Label),
 				strconv.Quote(current.Label)))
 
 			continue
@@ -540,14 +565,10 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 }
 
 // compatibleMove says moving a job from current to recommended changes its size and
-// nothing a job can tell: the same target, guest OS, architecture (known) and trust,
-// and a tier that allows the workflow.
+// nothing else, judged by the tiers as they are now: the rule `billet jobs rightsize`
+// recommends by (config.Tier.SameFamily), and a tier that allows the workflow.
 func compatibleMove(current, recommended *config.Tier, repository, workflowFile string) bool {
-	cur, rec := current.Platform(), recommended.Platform()
-
-	return config.ShareTarget(*current) == config.ShareTarget(*recommended) && current.GuestOS == recommended.GuestOS &&
-		cur.Arch != "" && cur.Arch == rec.Arch && current.Trust.Effective() == recommended.Trust.Effective() &&
-		allowsWorkflow(recommended, repository, workflowFile)
+	return current.SameFamily(*recommended) && allowsWorkflow(recommended, repository, workflowFile)
 }
 
 // migrationFile is one file the plan would change.
@@ -557,8 +578,10 @@ type migrationFile struct {
 	mode          os.FileMode
 }
 
-// migrationPlan is what the command would do: nothing has been written.
+// migrationPlan is what the command would do: nothing has been written. dirs is what
+// .github and its workflows directory were when they were read.
 type migrationPlan struct {
+	dirs     []os.FileInfo
 	files    []migrationFile
 	findings []finding
 	entries  *rightsizeEntries
@@ -573,15 +596,9 @@ func planMigration(path, repository string, chooser *tierChooser, entries *right
 	// NEITHER DIRECTORY MAY BE A LINK: a checkout is somebody's repository, and a
 	// .github that points elsewhere would have this read, and --write change, another
 	// tree's workflows.
-	for _, d := range []string{".github", workflowsDir} {
-		info, err := os.Lstat(filepath.Join(path, filepath.FromSlash(d)))
-		switch {
-		case err != nil:
-			return nil, fmt.Errorf("billet migrate workflows: read the workflows of %s: %w", strconv.Quote(repository), err)
-		case !info.IsDir():
-			return nil, fmt.Errorf("billet migrate workflows: %s in the checkout is a link or a file, not a directory, "+
-				"so its workflows are not this checkout's", d)
-		}
+	dirs, err := workflowDirs(path)
+	if err != nil {
+		return nil, fmt.Errorf("billet migrate workflows: read the workflows of %s: %w", strconv.Quote(repository), err)
 	}
 
 	dir := filepath.Join(path, filepath.FromSlash(workflowsDir))
@@ -590,7 +607,7 @@ func planMigration(path, repository string, chooser *tierChooser, entries *right
 		return nil, fmt.Errorf("billet migrate workflows: read the workflows of %s: %w", strconv.Quote(repository), err)
 	}
 
-	plan := &migrationPlan{entries: entries}
+	plan := &migrationPlan{entries: entries, dirs: dirs}
 	seen := map[string]bool{}
 	for _, entry := range listing {
 		ext := filepath.Ext(entry.Name())
@@ -698,6 +715,18 @@ func (p *migrationPlan) reportText() string {
 // EVERY FILE IS READ AGAIN FIRST, and nothing is written if one has changed since it
 // was planned: writing the plan over an edit made meanwhile would lose the edit.
 func (p *migrationPlan) install(path string) error {
+	// THE DIRECTORIES TOO: the files read again below are named through them, and a
+	// directory replaced since by a link elsewhere would put the writes there.
+	dirs, err := workflowDirs(path)
+	if err != nil {
+		return fmt.Errorf("billet migrate workflows: %w, so nothing was written", err)
+	}
+	for i := range dirs {
+		if !os.SameFile(dirs[i], p.dirs[i]) {
+			return errors.New("billet migrate workflows: the workflows directory changed since it was read, so " +
+				"nothing was written; run again")
+		}
+	}
 	for i := range p.files {
 		f := &p.files[i]
 		if bytes.Equal(f.before, f.after) {
@@ -727,6 +756,26 @@ func (p *migrationPlan) install(path string) error {
 	}
 
 	return nil
+}
+
+// workflowDirs is .github and its workflows directory, each refused unless it is a
+// directory: a checkout is somebody's repository, and a link there would have this
+// read, and --write change, another tree's workflows.
+func workflowDirs(path string) ([]os.FileInfo, error) {
+	out := make([]os.FileInfo, 0, 2)
+	for _, d := range []string{".github", workflowsDir} {
+		info, err := os.Lstat(filepath.Join(path, filepath.FromSlash(d)))
+		switch {
+		case err != nil:
+			return nil, err
+		case !info.IsDir():
+			return nil, fmt.Errorf("%s in the checkout is a link or a file, not a directory, so its workflows are not "+
+				"this checkout's", d)
+		}
+		out = append(out, info)
+	}
+
+	return out, nil
 }
 
 // refuseUnlessClean refuses a checkout --open-pr could not commit cleanly: anything
@@ -800,11 +849,10 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 		return fmt.Errorf("billet migrate workflows: nothing was changed: %w", err)
 	}
 	base = strings.TrimSpace(base)
-	origin, err := originRepository(ctx, path)
+	pushedTo, err := pushOwner(ctx, path)
 	if err != nil {
-		return fmt.Errorf("%w; --open-pr pushes to origin, so nothing was changed", err)
+		return err
 	}
-	pushedTo, _, _ := config.SplitRepository(origin)
 
 	branch := "billet/migrate-workflows-" + time.Now().UTC().Format("20060102-150405")
 	if _, err := runGit(ctx, path, "checkout", "-q", "-b", branch); err != nil {
