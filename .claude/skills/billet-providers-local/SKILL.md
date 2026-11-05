@@ -44,6 +44,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The runner gets GitHub's locale.**
 - **A moving image tag resolves to its pulled digest**
 - **SIGKILL re-adopts; SIGTERM drains.**
+- **Every first exec waits for the guest agent, and a begun delete finishes.**
 
 ### Simulated: [references/simulated.md](references/simulated.md)
 

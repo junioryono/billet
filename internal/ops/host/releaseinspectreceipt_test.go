@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -131,7 +132,7 @@ func TestTheReceiptReaderTypesPresenceAndAbsence(t *testing.T) {
 	f.writeReceipt(t, validReceipt())
 
 	ev := readEndpointReceipt(f.path)
-	if ev.presence != receiptPresent || ev.receipt == nil || *ev.receipt != validReceipt() {
+	if ev.presence != receiptPresent || ev.receipt == nil || !reflect.DeepEqual(*ev.receipt, validReceipt()) {
 		t.Fatalf("presence %s why %q receipt %+v", ev.presence, ev.why, ev.receipt)
 	}
 
