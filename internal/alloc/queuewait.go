@@ -203,8 +203,8 @@ func (a *Allocator) jobWaits(ctx context.Context, since time.Time, limit int) ([
 	return out, partial, err
 }
 
-// AwaitingQueueTime is a started job with no GitHub queue time on record, and
-// what finds it in GitHub's REST record of its run.
+// AwaitingQueueTime is a started job with no GitHub queue time or no run attempt
+// on record, and what finds it in GitHub's REST record of its run.
 type AwaitingQueueTime struct {
 	LeaseID string
 	Tier    string
@@ -217,6 +217,9 @@ type AwaitingQueueTime struct {
 	// ScaleSetAssignedAt is when GitHub handed the job to the scale set, zero
 	// where no message carried it; a job is queued before that.
 	ScaleSetAssignedAt time.Time
+	// NeedsQueueTime and NeedsRunAttempt say which of the two the row lacks, at
+	// least one of them true.
+	NeedsQueueTime, NeedsRunAttempt bool
 	// Cursor is where the page after this row begins.
 	Cursor QueueTimeCursor
 }
@@ -229,7 +232,8 @@ type QueueTimeCursor struct {
 }
 
 // JobsAwaitingQueueTime reads at most limit jobs that started at or after
-// since and have no GitHub queue time, newest start first, from after.
+// since and have no GitHub queue time or no run attempt, newest start first, from
+// after.
 func (a *Allocator) JobsAwaitingQueueTime(ctx context.Context, since time.Time, after QueueTimeCursor,
 	limit int,
 ) ([]AwaitingQueueTime, error) {
@@ -251,7 +255,8 @@ func (a *Allocator) JobsAwaitingQueueTime(ctx context.Context, since time.Time, 
 			out = append(out, AwaitingQueueTime{LeaseID: r.LeaseID, Tier: r.Tier,
 				Repository: r.Repo, RunID: r.RunID, JobID: r.GithubJobID,
 				ScaleSetAssignedAt: parseStamp(r.GithubScaleSetAssignedAt),
-				Cursor:             QueueTimeCursor{startedAt: r.StartedAt, leaseID: r.LeaseID}})
+				NeedsQueueTime:     r.GithubQueuedAt == "", NeedsRunAttempt: r.GithubRunAttempt == 0,
+				Cursor: QueueTimeCursor{startedAt: r.StartedAt, leaseID: r.LeaseID}})
 		}
 
 		return nil
@@ -317,7 +322,7 @@ func Summarize(jobs []JobWait, part func(JobWait) (time.Duration, bool)) WaitSum
 
 	n := len(samples)
 	at := func(perTenThousand int) time.Duration {
-		return samples[nearestRank(perTenThousand, n)-1].d
+		return samples[NearestRank(perTenThousand, n)-1].d
 	}
 
 	out := WaitSummary{
@@ -335,11 +340,11 @@ func Summarize(jobs []JobWait, part func(JobWait) (time.Duration, bool)) WaitSum
 	return out
 }
 
-// nearestRank is the 1-based rank of a percentile given in parts per ten
+// NearestRank is the 1-based rank of a percentile given in parts per ten
 // thousand: the smallest rank whose share of n reaches it, ceil(p*n/10000).
 // In integers, because a float rounding of 0.9999*n is exactly where p99.99
 // would pick the wrong job.
-func nearestRank(perTenThousand, n int) int {
+func NearestRank(perTenThousand, n int) int {
 	return max((perTenThousand*n+9999)/10000, 1)
 }
 

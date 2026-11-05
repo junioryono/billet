@@ -20,19 +20,22 @@ import (
 // stamp is a time as job_history keeps it.
 func stamp(at time.Time) string { return at.UTC().Format("2006-01-02T15:04:05.000000000Z07:00") }
 
-// queueTimeReader is a provisioner whose target answers GitHub's queue times
-// from a table, and keeps every run it was asked for.
+// queueTimeReader is a provisioner whose target answers GitHub's job records from
+// tables, and keeps every run it was asked for. A runner in times is attempt 1
+// unless attempts names it; attempts alone is a runner whose created_at the record
+// did not give.
 type queueTimeReader struct {
 	*fakeProvisioner
 
-	mu    sync.Mutex
-	runs  []int64
-	times map[int64]map[string]time.Time
-	err   error
+	mu       sync.Mutex
+	runs     []int64
+	times    map[int64]map[string]time.Time
+	attempts map[int64]map[string]int64
+	err      error
 }
 
-func (r *queueTimeReader) RunQueueTimes(_ context.Context, owner, repository string, runID int64,
-) (map[string]time.Time, error) {
+func (r *queueTimeReader) RunJobRecords(_ context.Context, owner, repository string, runID int64,
+) (map[string]RunnerRecord, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -43,7 +46,16 @@ func (r *queueTimeReader) RunQueueTimes(_ context.Context, owner, repository str
 	if r.err != nil {
 		return nil, r.err
 	}
-	return r.times[runID], nil
+	records := map[string]RunnerRecord{}
+	for name, queued := range r.times[runID] {
+		records[name] = RunnerRecord{QueuedAt: queued, RunAttempt: 1}
+	}
+	for name, attempt := range r.attempts[runID] {
+		record := records[name]
+		record.RunAttempt = attempt
+		records[name] = record
+	}
+	return records, nil
 }
 
 func (r *queueTimeReader) asked() []int64 {
@@ -141,6 +153,133 @@ func TestAStartedJobsQueueTimeComesFromItsRunsRecord(t *testing.T) {
 	}
 	if _, waits := told.told(); len(waits) != 2 {
 		t.Errorf("told %d waits, want one for each job", len(waits))
+	}
+}
+
+// A JOB'S RUN ATTEMPT REACHES ITS ROW FROM THE READ THAT GAVE ITS QUEUE TIME, and
+// one lacking only that is read for it: the row keeps the first attempt it was
+// told, a record that does not say backs the run off rather than reading it on
+// every pass, and a record whose queue time is refused still gives its attempt.
+func TestAStartedJobsRunAttemptComesFromItsRunsRecord(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	runner := p.launchedFor11(t)
+	handed := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Millisecond)
+	start := job11
+	start.RunnerID, start.RunnerName = 77, runner.RunnerName
+	start.Owner, start.Repository = "acme", "api"
+	start.ScaleSetAssignedAt = handed
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{start},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("start job 11: %v", err)
+	}
+	run := queueTimeRun{target: "acme", repository: "acme/api", run: job11.RunID}
+	name := provider.InstanceName(runner.LeaseID)
+	row := func() alloc.JobRecord {
+		t.Helper()
+		got, err := p.a.Job(t.Context(), runner.LeaseID)
+		if err != nil {
+			t.Fatalf("Job: %v", err)
+		}
+		return got
+	}
+
+	// The queue time is after the hand-over and the attempt is 2: the time is
+	// refused, the attempt stands, and the run backs off for the time alone.
+	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{},
+		times:    map[int64]map[string]time.Time{job11.RunID: {name: handed.Add(time.Second)}},
+		attempts: map[int64]map[string]int64{job11.RunID: {name: 2}}}
+	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+	targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
+	sweep := newQueueTimeSweep()
+	now := time.Now()
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now)
+	if got := row(); got.GitHubRunAttempt != 2 || got.GitHubQueuedAt != "" {
+		t.Fatalf("after a refused queue time the row has attempt %d and time %q; want attempt 2 and none",
+			got.GitHubRunAttempt, got.GitHubQueuedAt)
+	}
+	if _, ok := sweep.retries[run]; !ok {
+		t.Error("a run whose job still lacks a queue time is not backed off")
+	}
+
+	// A later read naming another attempt does not rewrite the first; the good
+	// time it carries fills what was missing, and nothing is awaited any more.
+	reader.mu.Lock()
+	reader.times[job11.RunID][name] = handed.Add(-time.Second)
+	reader.attempts[job11.RunID][name] = 5
+	reader.mu.Unlock()
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(2*queueTimeRetryFirst))
+	if got := row(); got.GitHubRunAttempt != 2 || got.GitHubQueuedAt != stamp(handed.Add(-time.Second)) {
+		t.Errorf("after the second read the row has attempt %d and time %q; want attempt 2 kept and the time "+
+			"filled", got.GitHubRunAttempt, got.GitHubQueuedAt)
+	}
+	if _, ok := sweep.retries[run]; ok {
+		t.Error("a run whose job lacks nothing is still scheduled for a retry")
+	}
+	asked := len(reader.asked())
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(4*queueTimeRetryFirst))
+	if got := len(reader.asked()); got != asked {
+		t.Errorf("a job lacking nothing was read again: %d reads after %d", got, asked)
+	}
+}
+
+// A JOB WITH ITS QUEUE TIME AND NO ATTEMPT IS STILL AWAITED, which is every job
+// that started in the day before a control plane took this read up; it is read
+// for the attempt alone, and a record that does not give one backs the run off.
+func TestAJobLackingOnlyItsAttemptIsReadForIt(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	runner := p.launchedFor11(t)
+	queued := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Second)
+	start := job11
+	start.RunnerID, start.RunnerName = 77, runner.RunnerName
+	start.Owner, start.Repository = "acme", "api"
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{start},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("start job 11: %v", err)
+	}
+	job, err := p.a.Job(t.Context(), runner.LeaseID)
+	if err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if err := p.a.RecordJobIdentity(t.Context(), runner.LeaseID,
+		alloc.HistoryJob{JobID: job.Job.JobID, QueuedAt: queued}); err != nil {
+		t.Fatalf("record the queue time: %v", err)
+	}
+
+	name := provider.InstanceName(runner.LeaseID)
+	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{},
+		attempts: map[int64]map[string]int64{job11.RunID: {name: 0}}}
+	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+	targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
+	sweep := newQueueTimeSweep()
+	now := time.Now()
+	run := queueTimeRun{target: "acme", repository: "acme/api", run: job11.RunID}
+
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now)
+	if got := reader.asked(); len(got) != 1 {
+		t.Fatalf("a job lacking only its attempt read runs %v, want its run once", got)
+	}
+	if _, ok := sweep.retries[run]; !ok {
+		t.Error("a record that gives no attempt does not back the run off")
+	}
+
+	reader.mu.Lock()
+	reader.attempts[job11.RunID][name] = 1
+	reader.mu.Unlock()
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(2*queueTimeRetryFirst))
+	got, err := p.a.Job(t.Context(), runner.LeaseID)
+	if err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if got.GitHubRunAttempt != 1 || got.GitHubQueuedAt != stamp(queued) {
+		t.Errorf("the row has attempt %d and time %q; want attempt 1 and the time it had", got.GitHubRunAttempt,
+			got.GitHubQueuedAt)
+	}
+	if _, ok := sweep.retries[run]; ok {
+		t.Error("a run whose job lacks nothing is still scheduled for a retry")
 	}
 }
 
@@ -539,10 +678,10 @@ type budgetedReader struct {
 	stated                  bool
 }
 
-func (r *budgetedReader) RunQueueTimes(ctx context.Context, owner, repository string, runID int64,
-) (map[string]time.Time, error) {
+func (r *budgetedReader) RunJobRecords(ctx context.Context, owner, repository string, runID int64,
+) (map[string]RunnerRecord, error) {
 	r.remaining -= r.spend
-	return r.queueTimeReader.RunQueueTimes(ctx, owner, repository, runID)
+	return r.queueTimeReader.RunJobRecords(ctx, owner, repository, runID)
 }
 
 func (r *budgetedReader) RESTHeadroom() (int64, int64, time.Time, bool) {

@@ -1,7 +1,7 @@
 == billet jobs show ==
 lease      6f1c2a9e0b7d4c3e8a5f9d2b1c0e7a64
 tier       billet-2vcpu on epyc-1 (docker, 2 vCPU, 8.0 GiB)
-job        "build (ubuntu, go 1.26)" (github job "51000000007", run 4242, request 77)
+job        "build (ubuntu, go 1.26)" (github job "51000000007", run 4242, attempt not recorded, request 77)
 repository "acme/api"
 workflow   "acme/api/.github/workflows/ci.yml@refs/heads/main"
 event      "push"

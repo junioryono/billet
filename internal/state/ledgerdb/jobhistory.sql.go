@@ -510,10 +510,12 @@ const listJobsAwaitingQueueTime = `-- name: ListJobsAwaitingQueueTime :many
 SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at
+       github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at,
+       github_queued_at, github_run_attempt
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= $1
-   AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
+   AND (github_queued_at = '' OR github_run_attempt = 0)
+   AND github_job_id != '' AND COALESCE(repo, '') != ''
    AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
    AND (CAST($2 AS TEXT) = ''
         OR started_at < CAST($2 AS TEXT)
@@ -537,12 +539,15 @@ type ListJobsAwaitingQueueTimeRow struct {
 	GithubJobID              string
 	StartedAt                string
 	GithubScaleSetAssignedAt string
+	GithubQueuedAt           string
+	GithubRunAttempt         int64
 }
 
-// The jobs that started since a moment and still have no GitHub queue time,
-// with what finds each in GitHub's REST record of its run: the repository, the
-// run and GitHub's job id (the lease names the runner). Newest start first,
-// bounded, so a backlog is worked from the jobs an operator is looking at now.
+// The jobs that started since a moment and still have no GitHub queue time or
+// no run attempt, with what finds each in GitHub's REST record of its run: the
+// repository, the run and GitHub's job id (the lease names the runner), and which
+// of the two it lacks. Newest start first, bounded, so a backlog is worked from
+// the jobs an operator is looking at now.
 //
 // THE RUN IS THE ONE THAT STARTED: github_run_id, which the JobStarted wrote
 // (migration 62). A pooled runner's run_id is the run of the job it was
@@ -577,6 +582,8 @@ func (q *Queries) ListJobsAwaitingQueueTime(ctx context.Context, arg ListJobsAwa
 			&i.GithubJobID,
 			&i.StartedAt,
 			&i.GithubScaleSetAssignedAt,
+			&i.GithubQueuedAt,
+			&i.GithubRunAttempt,
 		); err != nil {
 			return nil, err
 		}
@@ -643,7 +650,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
        chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
        github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
-       detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
+       detail_retired_at, github_run_id, github_run_attempt, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
        holder_incarnation
@@ -681,6 +688,7 @@ type ReadJobRow struct {
 	BoughtAt                 string
 	DetailRetiredAt          string
 	GithubRunID              int64
+	GithubRunAttempt         int64
 	ImageCache               string
 	CacheGeneration          string
 	ActionsCache             string
@@ -738,6 +746,7 @@ func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, erro
 		&i.BoughtAt,
 		&i.DetailRetiredAt,
 		&i.GithubRunID,
+		&i.GithubRunAttempt,
 		&i.ImageCache,
 		&i.CacheGeneration,
 		&i.ActionsCache,
@@ -990,8 +999,11 @@ UPDATE job_history
                                THEN CAST($8 AS TEXT)
                                ELSE github_runner_assigned_at END,
        github_run_id = CASE WHEN github_run_id = 0 THEN CAST($9 AS BIGINT)
-                            ELSE github_run_id END
- WHERE lease_id = $10
+                            ELSE github_run_id END,
+       github_run_attempt = CASE WHEN github_run_attempt = 0
+                                 THEN CAST($10 AS BIGINT)
+                                 ELSE github_run_attempt END
+ WHERE lease_id = $11
    AND (github_job_id = '' OR github_job_id = CAST($1 AS TEXT))
 `
 
@@ -1005,6 +1017,7 @@ type RecordJobIdentityParams struct {
 	GithubScaleSetAssignedAt string
 	GithubRunnerAssignedAt   string
 	GithubRunID              int64
+	GithubRunAttempt         int64
 	LeaseID                  string
 }
 
@@ -1020,6 +1033,9 @@ type RecordJobIdentityParams struct {
 // GITHUB'S TIMES FOLLOW THE SAME RULE: each is written once, from the first
 // message about this job that carried it, and an empty one (a time the message
 // left out) never replaces anything. They are GitHub's clock, kept verbatim.
+//
+// THE RUN ATTEMPT TOO: zero is a read that did not say, and never replaces one
+// that did.
 func (q *Queries) RecordJobIdentity(ctx context.Context, arg RecordJobIdentityParams) error {
 	_, err := q.db.ExecContext(ctx, recordJobIdentity,
 		arg.GithubJobID,
@@ -1031,6 +1047,7 @@ func (q *Queries) RecordJobIdentity(ctx context.Context, arg RecordJobIdentityPa
 		arg.GithubScaleSetAssignedAt,
 		arg.GithubRunnerAssignedAt,
 		arg.GithubRunID,
+		arg.GithubRunAttempt,
 		arg.LeaseID,
 	)
 	return err

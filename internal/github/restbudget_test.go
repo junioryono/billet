@@ -71,7 +71,7 @@ func TestTheBudgetIsWhatTheLastInstallationAnswerStated(t *testing.T) {
 		{Limit: 5000, Remaining: 0, Used: 5000, Reset: reset},
 	}
 	for i, w := range want {
-		if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); (err != nil) != (answers[i].status != http.StatusOK) {
+		if _, err := c.RunJobRecords(t.Context(), "acme", "api", 31); (err != nil) != (answers[i].status != http.StatusOK) {
 			t.Fatalf("answer %d (%d) read as %v", i, answers[i].status, err)
 		}
 		got, ok := c.RESTBudget()
@@ -124,8 +124,8 @@ func TestTheTokenExchangeIsNotTheInstallationsAccount(t *testing.T) {
 	o := &recordingObserver{}
 	c.ObserveREST(o)
 
-	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err != nil {
-		t.Fatalf("RunQueueTimes: %v", err)
+	if _, err := c.RunJobRecords(t.Context(), "acme", "api", 31); err != nil {
+		t.Fatalf("RunJobRecords: %v", err)
 	}
 	if got, ok := c.RESTBudget(); ok {
 		t.Errorf("the token exchange's answer stated the installation's budget as %+v", got)
@@ -171,8 +171,8 @@ func TestEachRedirectIsCountedAsAnAnswer(t *testing.T) {
 	o := &recordingObserver{}
 	c.ObserveREST(o)
 
-	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err != nil {
-		t.Fatalf("RunQueueTimes: %v", err)
+	if _, err := c.RunJobRecords(t.Context(), "acme", "api", 31); err != nil {
+		t.Fatalf("RunJobRecords: %v", err)
 	}
 	if got, ok := c.RESTBudget(); !ok || got.Remaining != 3999 {
 		t.Errorf("the budget after a redirect = %+v (%t), want the final answer's 3999", got, ok)
@@ -213,7 +213,7 @@ func TestTheRedirectPastTheLimitIsCountedAsAnAnswer(t *testing.T) {
 	o := &recordingObserver{}
 	c.ObserveREST(o)
 
-	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil {
+	if _, err := c.RunJobRecords(t.Context(), "acme", "api", 31); err == nil {
 		t.Fatal("a redirect loop read as an answer")
 	}
 	if got, ok := c.RESTBudget(); !ok || got.Remaining != 5000-hops.Load() {
@@ -284,7 +284,7 @@ func TestARequestWithNoAnswerIsToldAsNone(t *testing.T) {
 	o := &recordingObserver{}
 	c.ObserveREST(o)
 
-	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil {
+	if _, err := c.RunJobRecords(t.Context(), "acme", "api", 31); err == nil {
 		t.Fatal("a dropped connection read as an answer")
 	}
 	if _, ok := c.RESTBudget(); ok {
@@ -314,7 +314,7 @@ func TestAnAnswerTooLargeToReadStillStatesTheBudget(t *testing.T) {
 	o := &recordingObserver{}
 	c.ObserveREST(o)
 
-	if _, err := c.RunQueueTimes(t.Context(), "acme", "api", 31); err == nil {
+	if _, err := c.RunJobRecords(t.Context(), "acme", "api", 31); err == nil {
 		t.Fatal("an answer past the bound read as one")
 	}
 	got, ok := c.RESTBudget()

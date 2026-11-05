@@ -51,6 +51,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The gate that proves the set still fits the schema is `TestEveryGeneratedQueryPreparesAgainstTheMigratedSchema`.**
 - **Raw SQL is banned mechanically.**
 - **Migrations 53 to 55 carry #226's cache evidence and outcomes.**
+- **Migration 71 keeps a job's run attempt, zero being not recorded and never a first attempt.**
 - **The ledger is not authoritative for cache generation pointers.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).

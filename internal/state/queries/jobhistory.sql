@@ -49,6 +49,9 @@ UPDATE job_history SET run_id = @run_id
 -- GITHUB'S TIMES FOLLOW THE SAME RULE: each is written once, from the first
 -- message about this job that carried it, and an empty one (a time the message
 -- left out) never replaces anything. They are GitHub's clock, kept verbatim.
+--
+-- THE RUN ATTEMPT TOO: zero is a read that did not say, and never replaces one
+-- that did.
 UPDATE job_history
    SET github_job_id = CAST(@github_job_id AS TEXT),
        repo          = CASE WHEN COALESCE(repo, '') = '' THEN CAST(@repo AS TEXT)
@@ -67,7 +70,10 @@ UPDATE job_history
                                THEN CAST(@github_runner_assigned_at AS TEXT)
                                ELSE github_runner_assigned_at END,
        github_run_id = CASE WHEN github_run_id = 0 THEN CAST(@github_run_id AS BIGINT)
-                            ELSE github_run_id END
+                            ELSE github_run_id END,
+       github_run_attempt = CASE WHEN github_run_attempt = 0
+                                 THEN CAST(@github_run_attempt AS BIGINT)
+                                 ELSE github_run_attempt END
  WHERE lease_id = @lease_id
    AND (github_job_id = '' OR github_job_id = CAST(@github_job_id AS TEXT));
 
@@ -96,10 +102,11 @@ SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: ListJobsAwaitingQueueTime :many
--- The jobs that started since a moment and still have no GitHub queue time,
--- with what finds each in GitHub's REST record of its run: the repository, the
--- run and GitHub's job id (the lease names the runner). Newest start first,
--- bounded, so a backlog is worked from the jobs an operator is looking at now.
+-- The jobs that started since a moment and still have no GitHub queue time or
+-- no run attempt, with what finds each in GitHub's REST record of its run: the
+-- repository, the run and GitHub's job id (the lease names the runner), and which
+-- of the two it lacks. Newest start first, bounded, so a backlog is worked from
+-- the jobs an operator is looking at now.
 --
 -- THE RUN IS THE ONE THAT STARTED: github_run_id, which the JobStarted wrote
 -- (migration 62). A pooled runner's run_id is the run of the job it was
@@ -115,10 +122,12 @@ SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
 SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at
+       github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at,
+       github_queued_at, github_run_attempt
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= @since
-   AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
+   AND (github_queued_at = '' OR github_run_attempt = 0)
+   AND github_job_id != '' AND COALESCE(repo, '') != ''
    AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
    AND (CAST(@before_started AS TEXT) = ''
         OR started_at < CAST(@before_started AS TEXT)
@@ -426,7 +435,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
        chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
        github_scale_set_assigned_at, github_runner_assigned_at, bought_at,
-       detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
+       detail_retired_at, github_run_id, github_run_attempt, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
        holder_incarnation

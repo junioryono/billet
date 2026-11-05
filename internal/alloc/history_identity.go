@@ -31,6 +31,9 @@ type HistoryJob struct {
 	// runner may differ from the run its lease was assigned; zero is unknown.
 	// Only a JobStarted gives it.
 	RunID int64
+	// RunAttempt is which attempt of the run the job was, numbered from 1 as
+	// GitHub numbers them; zero is unknown. Only GitHub's REST record gives it.
+	RunAttempt int64
 }
 
 // Repo is the job's repository as owner/name, or whichever half is known.
@@ -74,6 +77,7 @@ func (a *Allocator) RecordJobIdentity(ctx context.Context, leaseID string, job H
 			GithubScaleSetAssignedAt: stamp(job.ScaleSetAssignedAt),
 			GithubRunnerAssignedAt:   stamp(job.RunnerAssignedAt),
 			GithubRunID:              max(job.RunID, 0),
+			GithubRunAttempt:         max(job.RunAttempt, 0),
 			LeaseID:                  leaseID,
 		}); err != nil {
 			return fmt.Errorf("alloc: record the job lease %s ran: %w", leaseID, err)
@@ -134,7 +138,10 @@ type JobRecord struct {
 	// GitHubRunID is the run of the job that started, which for a pooled runner
 	// may differ from RunID; zero is not recorded.
 	GitHubRunID int64
-	DisruptedAt string
+	// GitHubRunAttempt is which attempt of that run the job was; zero is not
+	// recorded, never a first attempt.
+	GitHubRunAttempt int64
+	DisruptedAt      string
 	// Caches is what the node observed each cache do for the job, first
 	// observation kept. An empty token is not observed, and a token this binary
 	// does not know is a newer binary's, kept verbatim.
@@ -180,7 +187,7 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			GitHubQueuedAt: row.GithubQueuedAt, GitHubScaleSetAssignedAt: row.GithubScaleSetAssignedAt,
 			GitHubRunnerAssignedAt: row.GithubRunnerAssignedAt, BoughtAt: row.BoughtAt,
 			DetailRetiredAt: row.DetailRetiredAt,
-			GitHubRunID:     row.GithubRunID, DisruptedAt: row.DisruptedAt,
+			GitHubRunID:     row.GithubRunID, GitHubRunAttempt: row.GithubRunAttempt, DisruptedAt: row.DisruptedAt,
 			Caches: CacheObservation{
 				ImageCache: ImageCache(row.ImageCache), CacheGeneration: row.CacheGeneration,
 				ActionsCache: ActionsCache(row.ActionsCache),
