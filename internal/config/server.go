@@ -234,6 +234,10 @@ type ServerConfig struct {
 	// Identity says where the deployment's identity material lives. Absent means
 	// `file`, which is what every deployment before this key had.
 	Identity *IdentityConfig `yaml:"identity,omitempty"`
+
+	// TokenBroker takes this deployment's installation tokens from a broker. With it,
+	// no target names a key and this host holds none.
+	TokenBroker *TokenBrokerConfig `yaml:"token_broker,omitempty"`
 	// MaxVCPU and MaxMemory bound what the allocator will ever hand out across every
 	// tier combined. Required and positive: capacity is escrowed before each listener
 	// advertises, so an absent ceiling lets concurrent listeners collectively
@@ -685,6 +689,7 @@ func (c *Config) validateServer() []error {
 	// the block that one has just checked.
 	errs = append(errs, c.Server.validateControllers()...)
 	errs = append(errs, c.validateIdentity()...)
+	errs = append(errs, c.Server.validateTokenBroker()...)
 	if err := validateHostPort("server.listen", c.Server.Listen); err != nil {
 		errs = append(errs, err)
 	}

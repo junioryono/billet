@@ -106,6 +106,14 @@ Create the GitHub App in a browser, install it on the organization or the reposi
 | `--actions-read` | request `actions: read` (default `true`), which default-branch cache publication needs to prove a job's branch from GitHub's record of its run; `--actions-read=false` leaves it out |
 | `--port` | a fixed loopback callback port, for `ssh -L` |
 
+### `billet broker serve --config broker.yaml`
+
+Hold App keys for deployments that hold none, and mint their installation tokens over mutual TLS, for what each deployment's registration names and nothing else. [ADR-025](decisions/adr-025-installation-tokens-from-a-broker.md) says why, and [Configuration](configuration.md#the-token-brokers-file) states the file.
+
+### `billet broker client-key [--config PATH] [--show] [--new-deployment]`
+
+On a control-plane host configured with `server.token_broker`: make the key this host proves its deployment with, at `client_key_path`, and print the deployment, the key's fingerprint and the stanza to register at the broker. It refuses to replace a key that exists, because the broker knows it by fingerprint; `--show` prints an existing key's. An active-passive pair runs it on each host and registers both.
+
 ### `billet github-app store-key --from <path> [--target NAME]`
 
 Publish an existing App private key into a store-backed deployment (`server.identity.backend: aws-ssm`), at the `default` target's parameter or at the named target's (`github-app-key-<name>`).

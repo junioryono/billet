@@ -50,7 +50,6 @@ type Archive struct {
 func requiredEntries(m Manifest) []string {
 	required := []string{
 		EntryIdentity,
-		EntryAppKey,
 		AuthorityEntry("ca.key"),
 		AuthorityEntry("ca.crt"),
 		AuthorityEntry("authority-created"),
@@ -62,6 +61,14 @@ func requiredEntries(m Manifest) []string {
 	case m.Ledger.IsFile():
 		required = append(required, EntryLedger)
 	}
+
+	// A BROKER HOLDS THE KEYS, which the manifest has to say; every other archive
+	// is not one without them.
+	if m.KeysWithBroker {
+		return required
+	}
+
+	required = append(required, EntryAppKey)
 
 	// EVERY FURTHER TARGET'S KEY, because the manifest says the deployment
 	// serves that target: an archive missing one restores half a deployment.
@@ -89,7 +96,6 @@ func requiredEntries(m Manifest) []string {
 func knownEntries(m Manifest) map[string]bool {
 	out := map[string]bool{
 		EntryIdentity: true,
-		EntryAppKey:   true,
 		// Reference only; a restore never installs it. See BackupRequest.
 		EntryConfig: true,
 	}
@@ -107,6 +113,14 @@ func knownEntries(m Manifest) map[string]bool {
 	for _, f := range wirecert.AuthorityFiles {
 		out[AuthorityEntry(f.Name)] = true
 	}
+
+	// AN ARCHIVE SAYING A BROKER HOLDS THE KEYS MAY NOT CARRY ONE: the manifest
+	// contradicts it, and a deployment that holds no key would be handed one.
+	if m.KeysWithBroker {
+		return out
+	}
+
+	out[EntryAppKey] = true
 
 	// A further target's key is known only when the manifest lists the target,
 	// so a key entry for a target the manifest does not name is refused as
@@ -416,6 +430,10 @@ func (a *Archive) crossCheck() error {
 			return fmt.Errorf("deployarchive: the previous authority in this backup does not hold "+
 				"together: %w", err)
 		}
+	}
+
+	if a.Manifest.KeysWithBroker {
+		return nil
 	}
 
 	// PARSED, NOT MERELY PRESENT. A truncated PEM is exactly what an interrupted

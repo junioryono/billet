@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -52,21 +51,10 @@ type runnerGroupPolicyClient struct {
 	target         Target
 	appID          int64
 	installationID int64
-	privateKey     []byte
 
-	// tokenSlot admits one installation-token exchange at a time. A channel
-	// rather than a mutex so a caller waiting behind a stalled exchange gives up
-	// when its own context does.
-	tokenSlot chan struct{}
-	token     string
-	expiresAt time.Time
-
-	// sentJWTs are the App JWTs this client has sent, newest last, so an
-	// answer that echoes one back is refused like one echoing the token: a
-	// server that saw a JWT at the token exchange could return it in any later
-	// answer. Guarded by sentMu, since reads run beside the exchange.
-	sentMu   sync.Mutex
-	sentJWTs []string
+	// tokens is where this client's installation tokens come from, nil when it
+	// was built with no credential.
+	tokens TokenSource
 
 	// rest is the installation's REST budget as GitHub last stated it, and who
 	// is told of each request; see restbudget.go.
@@ -139,13 +127,34 @@ func NewRunnerGroupPolicyClientAt(base string, target Target, appID, installatio
 	return newRunnerGroupPolicyClient(defaultPolicyBounds, base, target, appID, installationID, privateKey)
 }
 
+// NewRunnerGroupPolicyClientWith is the policy client on tokens a source hands it,
+// for a deployment holding no App key of its own. An empty base means the real
+// GitHub.
+func NewRunnerGroupPolicyClientWith(base string, target Target, appID, installationID int64,
+	tokens TokenSource,
+) RunnerGroupPolicyClient {
+	if base == "" {
+		base = apiBase
+	}
+
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, base, target, appID, installationID, nil)
+	c.tokens = tokens
+
+	return c
+}
+
 func newRunnerGroupPolicyClient(bounds policyBounds, base string, target Target, appID,
 	installationID int64, privateKey []byte,
 ) *runnerGroupPolicyClient {
 	c := &runnerGroupPolicyClient{client: newPolicyHTTPClient(bounds), request: bounds.request,
-		base: base, target: target, appID: appID, installationID: installationID,
-		privateKey: bytes.Clone(privateKey), tokenSlot: make(chan struct{}, 1)}
+		base: base, target: target, appID: appID, installationID: installationID}
 	c.client.CheckRedirect = c.rest.redirected
+
+	// ON THE CLIENT'S OWN CONNECTIONS, so a token exchange reuses the socket its
+	// reads hold and the redirect rule above covers it too.
+	if len(privateKey) > 0 {
+		c.tokens = newAppKeyTokens(c.client, c.request, base, appID, installationID, privateKey, TokenScope{})
+	}
 
 	return c
 }
@@ -181,18 +190,34 @@ func policyDialer(b policyBounds) *net.Dialer {
 // still returned, because they state the budget the request drew on.
 func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint, bearer string,
 ) (int, http.Header, []byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.request)
+	return exchange(ctx, c.client, c.request, method, endpoint, bearer, nil)
+}
+
+// exchange is one request on client under request's bound, with a JSON body when
+// one is given.
+func exchange(ctx context.Context, client *http.Client, request time.Duration, method, endpoint, bearer string,
+	sent []byte,
+) (int, http.Header, []byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, request)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, http.NoBody)
+	var content io.Reader = http.NoBody
+	if len(sent) > 0 {
+		content = bytes.NewReader(sent)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, content)
 	if err != nil {
 		return 0, nil, nil, fmt.Errorf("%w: build request: %w", errNotSent, err)
 	}
 
 	setAPIHeaders(req)
 	req.Header.Set("Authorization", "Bearer "+bearer)
+	if len(sent) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
-	resp, err := c.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		// A REDIRECT THE CLIENT REFUSED TO FOLLOW is still an answer, the only
 		// error the client returns one with, its body already closed.
@@ -238,7 +263,7 @@ func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, oper
 	// AN ANSWER THAT CARRIES THE TOKEN IS NOT READ AT ALL: every string in it
 	// can reach an operator's output, as a job's name or inside an error about a
 	// field that did not parse, and no redaction of one path covers the next.
-	if carries(body, token) || c.carriesJWT(body) {
+	if carries(body, token) || c.carriesAJWT(body) {
 		return nil, fmt.Errorf("github: %s: the answer carried the request's credential, or could not "+
 			"be checked for it, so it is not read", operation)
 	}
@@ -246,28 +271,17 @@ func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, oper
 	return body, nil
 }
 
-// maxSentJWTs bounds the JWTs a client remembers. One is signed per token
+// maxSentJWTs bounds the JWTs a source remembers. One is signed per token
 // exchange, so this spans far longer than any answer a server could still be
 // holding one for.
 const maxSentJWTs = 16
 
-// rememberJWT keeps a JWT this client is about to send.
-func (c *runnerGroupPolicyClient) rememberJWT(jwt string) {
-	c.sentMu.Lock()
-	defer c.sentMu.Unlock()
-	c.sentJWTs = append(c.sentJWTs, jwt)
-	if len(c.sentJWTs) > maxSentJWTs {
-		c.sentJWTs = c.sentJWTs[len(c.sentJWTs)-maxSentJWTs:]
-	}
-}
+// carriesAJWT reports whether a body holds a JWT this client's own source sent. A
+// source with no key signed none.
+func (c *runnerGroupPolicyClient) carriesAJWT(body []byte) bool {
+	source, ok := c.tokens.(appKeyTokens)
 
-// carriesJWT reports whether a body holds any JWT this client has sent.
-func (c *runnerGroupPolicyClient) carriesJWT(body []byte) bool {
-	c.sentMu.Lock()
-	sent := slices.Clone(c.sentJWTs)
-	c.sentMu.Unlock()
-
-	return slices.ContainsFunc(sent, func(jwt string) bool { return carries(body, jwt) })
+	return ok && source.carriesJWT(body)
 }
 
 // carries reports whether a body holds bearer, as it was sent or in any JSON
@@ -415,7 +429,7 @@ func apiErrorWithout(status int, body []byte, bearer string) error {
 
 // configured reports whether this client can authenticate at all.
 func (c *runnerGroupPolicyClient) configured() bool {
-	return c != nil && !c.target.IsZero() && c.appID > 0 && c.installationID > 0 && len(c.privateKey) > 0
+	return c != nil && !c.target.IsZero() && c.appID > 0 && c.installationID > 0 && c.tokens != nil
 }
 
 // groupsOrRefuse is the guard every runner-group method starts with: a
@@ -662,57 +676,12 @@ func (c *runnerGroupPolicyClient) InspectScaleSetRunner(
 }
 
 func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string, error) {
-	select {
-	case c.tokenSlot <- struct{}{}:
-	case <-ctx.Done():
-		return "", fmt.Errorf("%w: waiting for another installation-token exchange: %w",
-			errNoAnswer, ctx.Err())
+	token, err := c.tokens.InstallationToken(ctx)
+	if err != nil {
+		return "", err //nolint:wrapcheck // the source's error names the operation, and Undecided reads it through.
 	}
-	defer func() { <-c.tokenSlot }()
 
-	if c.token != "" && time.Until(c.expiresAt) > time.Minute {
-		return c.token, nil
-	}
-	jwt, err := SignAppJWT(c.appID, c.privateKey, time.Now())
-	if err == nil {
-		c.rememberJWT(jwt)
-	}
-	if err != nil {
-		return "", err
-	}
-	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", c.base, c.installationID)
-	// THE APP'S OWN BUDGET answers a JWT, not the installation's, so its
-	// headers are not the installation's account.
-	status, _, body, err := c.exchange(ctx, http.MethodPost, endpoint, jwt)
-	if err != nil {
-		return "", fmt.Errorf("github: create installation token: %w", err)
-	}
-	if status != http.StatusCreated {
-		// TYPED, so a caller can tell GitHub refusing the App (401, 403) from
-		// GitHub being unable to answer (5xx, a throttle) through Undecided.
-		return "", fmt.Errorf("github: create installation token: %w",
-			apiErrorWithout(status, body, jwt))
-	}
-	// THE ANSWER CARRIES THE NEW TOKEN, and must not carry the JWT that asked.
-	if carries(body, jwt) {
-		return "", errors.New("github: create installation token: the answer carried the App's JWT, " +
-			"or could not be checked for it, so it is not read")
-	}
-	var out struct {
-		Token     string `json:"token"`
-		ExpiresAt string `json:"expires_at"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("github: decode installation token: %w", err)
-	}
-	// PARSED HERE RATHER THAN BY time.Time's decoder, whose error quotes the
-	// value it could not read.
-	expiresAt, err := time.Parse(time.RFC3339, out.ExpiresAt)
-	if out.Token == "" || out.ExpiresAt == "" || err != nil {
-		return "", fmt.Errorf("github: installation-token response was incomplete")
-	}
-	c.token, c.expiresAt = out.Token, expiresAt
-	return c.token, nil
+	return token.Bearer(), nil
 }
 
 func (c *runnerGroupPolicyClient) String() string {

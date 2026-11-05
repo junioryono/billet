@@ -32,9 +32,13 @@ type Manifest struct {
 	// App and its key under EntryAppKeyFor. Schema 3; empty on every archive of
 	// a single-target deployment, which is what keeps such an archive readable
 	// by the billet that wrote it.
-	Targets   []TargetIdentity `json:"targets,omitempty"`
-	Authority AuthorityFacts   `json:"authority"`
-	Ledger    LedgerFacts      `json:"ledger"`
+	Targets []TargetIdentity `json:"targets,omitempty"`
+	// KeysWithBroker says this deployment holds no App key, because a token broker
+	// holds them, so this archive carries none. Schema 5. The claim decides, never
+	// the absence of a file: a truncated archive must not read as a deliberate one.
+	KeysWithBroker bool           `json:"keys_with_broker,omitempty"`
+	Authority      AuthorityFacts `json:"authority"`
+	Ledger         LedgerFacts    `json:"ledger"`
 
 	Files []FileRecord `json:"files"`
 }
@@ -268,6 +272,12 @@ func decodeManifest(body []byte) (Manifest, error) {
 	if m.Schema < 3 && len(m.Targets) > 0 {
 		return Manifest{}, fmt.Errorf(
 			"%w: %s declares schema %d and also lists further targets, which schema %d "+
+				"has no way to express", errNotAnArchive, EntryManifest, m.Schema, m.Schema)
+	}
+
+	if m.Schema < 5 && m.KeysWithBroker {
+		return Manifest{}, fmt.Errorf(
+			"%w: %s declares schema %d and also says a broker holds the App keys, which schema %d "+
 				"has no way to express", errNotAnArchive, EntryManifest, m.Schema, m.Schema)
 	}
 
