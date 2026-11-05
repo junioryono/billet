@@ -209,10 +209,12 @@ func (n *Node) open(bundle *wirecert.Bundle) error {
 	// A ROTATING IDENTITY, so a renewal takes effect without a restart. The
 	// callback is answered per handshake, which is what makes it safe to replace
 	// the certificate under a node holding long-lived connections.
-	var tlsConf *tls.Config
+	var identity *wirecert.Rotating
 
 	if bundle != nil {
-		identity, err := wirecert.NewRotating(cfg.Node.TLS.CertPath, cfg.Node.TLS.KeyPath, cfg.Node.TLS.CAPath)
+		var err error
+
+		identity, err = wirecert.NewRotating(cfg.Node.TLS.CertPath, cfg.Node.TLS.KeyPath, cfg.Node.TLS.CAPath)
 		if err != nil {
 			return err
 		}
@@ -233,16 +235,10 @@ func (n *Node) open(bundle *wirecert.Bundle) error {
 				"expires", identity.Leaf().NotAfter.Format(time.DateOnly))
 		}
 
-		host, err := serverHostname(cfg.Node.ServerAddr)
-		if err != nil {
-			return err
-		}
-
 		n.identity = identity
-		tlsConf = identity.ClientTLS(host)
 	}
 
-	client, err := NewNodeClient(cfg, tlsConf)
+	client, err := NewNodeClient(cfg, identity)
 	if err != nil {
 		return err
 	}
@@ -409,7 +405,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		defer stopPower()
 	}
 
-	fmt.Fprintf(host.Out, "billet node %s: dialing %s\n", cfg.Node.Name, cfg.Node.ServerAddr)
+	fmt.Fprintf(host.Out, "billet node %s: dialing %s\n", cfg.Node.Name, strings.Join(cfg.Node.ControlPlanes(), ", "))
 
 	// NO GUEST-OS CLAIM. A host's allowlist lives in the SERVER's fleet
 	// configuration, not here, and Bind is what enforces it. Sending one from the
@@ -670,9 +666,9 @@ func nodeContribution(cfg *config.Config) (config.Contribution, error) {
 // serverHostname is the name a node checks its control plane's certificate
 // against.
 //
-// Taken from node.server_addr, which is the address the node actually dials, so
-// the certificate is verified against the thing that was reached rather than
-// against whatever the certificate happens to claim.
+// Taken from the address the node actually dials (node.server_addr, or each of
+// node.server_addrs), so the certificate is verified against the thing that was
+// reached rather than against whatever the certificate happens to claim.
 func serverHostname(addr string) (string, error) {
 	s := addr
 	if !strings.Contains(s, "://") {
@@ -681,11 +677,11 @@ func serverHostname(addr string) (string, error) {
 
 	u, err := url.Parse(s)
 	if err != nil {
-		return "", fmt.Errorf("node.server_addr %q is not an address billet can dial: %w", addr, err)
+		return "", fmt.Errorf("the control plane address %q is not an address billet can dial: %w", addr, err)
 	}
 
 	if u.Hostname() == "" {
-		return "", fmt.Errorf("node.server_addr %q names no host, so there is nothing to verify "+
+		return "", fmt.Errorf("the control plane address %q names no host, so there is nothing to verify "+
 			"the control plane's certificate against", addr)
 	}
 
@@ -859,14 +855,35 @@ func NodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 }
 
 // NewNodeClient is THE ONE CONSTRUCTION of the node's client from its
-// configuration: the address, the name and the TLS state as the command
-// resolves them, so a fixture that builds the client the way the command does
-// and the command itself cannot disagree about the request base.
-func NewNodeClient(cfg *config.Config, tlsConf *tls.Config) (*nodeclient.Client, error) {
+// configuration: every controller it dials, the name and the TLS state as the
+// command resolves them, so a fixture that builds the client the way the
+// command does and the command itself cannot disagree about the request base.
+//
+// A TLS CONFIG A CONTROLLER, from the one identity: each verifies the
+// certificate it is shown against the name it dialled. A nil identity is the
+// loopback wire, which has no certificates.
+func NewNodeClient(cfg *config.Config, identity *wirecert.Rotating) (*nodeclient.Client, error) {
+	addrs := cfg.Node.ControlPlanes()
+	targets := make([]nodeclient.Target, 0, len(addrs))
+
+	for _, addr := range addrs {
+		var tlsConf *tls.Config
+
+		if identity != nil {
+			host, err := serverHostname(addr)
+			if err != nil {
+				return nil, err
+			}
+
+			tlsConf = identity.ClientTLS(host)
+		}
+
+		targets = append(targets, nodeclient.Target{Base: addr, TLS: tlsConf})
+	}
+
 	return nodeclient.New(nodeclient.Options{
-		Base: cfg.Node.ServerAddr,
-		Node: cfg.Node.Name,
-		TLS:  tlsConf,
+		Node:    cfg.Node.Name,
+		Targets: targets,
 	})
 }
 

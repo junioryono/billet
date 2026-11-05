@@ -32,10 +32,6 @@ const probeTeardownWindow = 3 * time.Minute
 // yieldPoll is how often a probe looks for a job's request.
 const yieldPoll = 3 * time.Second
 
-// deleteWindow bounds one `tart delete`, against the seconds removing a macOS VM's
-// directory takes.
-const deleteWindow = 5 * time.Minute
-
 // lockSettle bounds the wait for a lock nothing should hold.
 const lockSettle = 2 * time.Second
 

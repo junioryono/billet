@@ -601,9 +601,9 @@ func (p *Provider) deleteOwnedVM(ctx context.Context, name string) error {
 		return fmt.Errorf("read %s's marker: %w", name, err)
 	}
 
-	// ITS OWN BOUND, whatever the caller's: this holds the store lock, which every
-	// deployment on the Mac takes to publish a guest or remove one. What runs out is left
-	// for the image's next verification.
+	// ITS OWN BOUND, whatever the caller's, the one a lease's delete has: this holds the
+	// store lock, which every deployment on the Mac takes to publish a guest or remove one.
+	// What runs out is left for the image's next verification.
 	deleteCtx, cancel := context.WithTimeout(ctx, p.deleteWindow)
 	defer cancel()
 

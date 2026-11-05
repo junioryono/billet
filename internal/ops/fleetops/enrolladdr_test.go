@@ -25,6 +25,7 @@ func TestTheEnrollmentAddressPrefersTheFlagThenTheConfig(t *testing.T) {
 		name             string
 		flag, cfgAddr    string
 		serverAddr, want string
+		serverAddrs      []string
 	}{
 		{
 			name: "the flag wins over both",
@@ -41,6 +42,16 @@ func TestTheEnrollmentAddressPrefersTheFlagThenTheConfig(t *testing.T) {
 			serverAddr: "wire.example:7717", want: "https://wire.example:7717",
 		},
 		{
+			name:        "with every controller named, the first is the fallback",
+			serverAddrs: []string{"wire-a.example:7717", "wire-b.example:7717"},
+			want:        "https://wire-a.example:7717",
+		},
+		{
+			name:    "and the config key still wins over them",
+			cfgAddr: "cfg.example:7718", serverAddrs: []string{"wire-a.example:7717", "wire-b.example:7717"},
+			want: "https://cfg.example:7718",
+		},
+		{
 			name: "whitespace is not an address",
 			flag: "   ", cfgAddr: "\t", serverAddr: "wire.example:7717",
 			want: "https://wire.example:7717",
@@ -51,6 +62,7 @@ func TestTheEnrollmentAddressPrefersTheFlagThenTheConfig(t *testing.T) {
 
 			cfg := &config.Config{Node: &config.NodeConfig{
 				ServerAddr:    c.serverAddr,
+				ServerAddrs:   c.serverAddrs,
 				BootstrapAddr: c.cfgAddr,
 			}}
 
