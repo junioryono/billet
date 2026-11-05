@@ -11,9 +11,9 @@ import (
 	"github.com/junioryono/billet/internal/provider"
 )
 
-// QueueTimes reads when GitHub queued each job of a run, keyed by the name of
-// the runner that ran it. A target's Provisioner implements it over the App's
-// REST client.
+// QueueTimes reads what GitHub's list of a run's jobs says of each, keyed by the name
+// of the runner that ran it. A target's Provisioner implements it over the App's REST
+// client.
 //
 // THE SCALE-SET PROTOCOL DOES NOT CARRY IT. Every JobStarted, JobAssigned and
 // JobCompleted the reference fleet received on 2026-10-18 under v0.17.0 and
@@ -21,7 +21,17 @@ import (
 // JobAvailable arrived at all. GitHub's REST record of the job does: its
 // created_at, which fell a second or less before the start's scaleSetAssignTime.
 type QueueTimes interface {
-	RunQueueTimes(ctx context.Context, owner, repository string, runID int64) (map[string]time.Time, error)
+	RunJobs(ctx context.Context, owner, repository string, runID int64) (map[string]RunJob, error)
+}
+
+// RunJob is GitHub's record of one job of a run: when it was queued, the commit and
+// branch it ran on, and which attempt of the run it was, which no scale-set message
+// carries either. Empty is what the record did not say.
+type RunJob struct {
+	QueuedAt   time.Time
+	HeadSHA    string
+	HeadBranch string
+	RunAttempt int64
 }
 
 // RESTHeadroom is an App installation's REST budget as GitHub last stated it:
@@ -123,9 +133,9 @@ func installationOf(target Target) string {
 	return "target " + target.Config.Name
 }
 
-// fillQueueTimes records GitHub's queue time for the jobs this deployment
-// started, from each job's REST record, until ctx ends. It decides nothing:
-// a pass that fails is logged and the next one tries again.
+// fillQueueTimes records GitHub's queue time and commit for the jobs this
+// deployment started, from each job's REST record, until ctx ends. It decides
+// nothing: a pass that fails is logged and the next one tries again.
 func (s *Server) fillQueueTimes(ctx context.Context, targets map[string]Target) {
 	sweep := newQueueTimeSweep()
 	tick := time.NewTicker(queueTimeEvery)
@@ -185,8 +195,8 @@ func inReserve(budgets []RESTHeadroom, now time.Time) (int64, int64, time.Time, 
 // ONE READ OF A RUN SERVES EVERY JOB OF IT, so a run of forty jobs costs two
 // requests rather than eighty. A job is matched by its runner's name, which is
 // its lease's and unique by construction, across every attempt of the run.
-// The write is the identity write, which fills only an empty queue time and
-// only on the row of the job it names, and tells the job's wait.
+// The write is the identity write, which fills only what is empty and only on the
+// row of the job it names, and tells the job's wait.
 func (s *Server) fillQueueTimesOnce(ctx context.Context, targets map[string]Target, sweep *queueTimeSweep,
 	now time.Time,
 ) {
@@ -334,8 +344,8 @@ func (s *Server) gatherQueueTimeWork(ctx context.Context, targets map[string]Tar
 	return work, true
 }
 
-// fillRunQueueTimes reads one run and records each job's queue time, and says
-// how many of jobs it could not; an error is the read's.
+// fillRunQueueTimes reads one run and records each job's queue time and commit, and
+// says how many of jobs it could not; an error is the read's.
 func (s *Server) fillRunQueueTimes(ctx context.Context, reader QueueTimes, run queueTimeRun,
 	jobs []alloc.AwaitingQueueTime,
 ) (int, error) {
@@ -343,7 +353,7 @@ func (s *Server) fillRunQueueTimes(ctx context.Context, reader QueueTimes, run q
 	if !ok {
 		return len(jobs), nil
 	}
-	times, err := reader.RunQueueTimes(ctx, owner, repository, run.run)
+	records, err := reader.RunJobs(ctx, owner, repository, run.run)
 	if err != nil {
 		return len(jobs), err
 	}
@@ -351,25 +361,31 @@ func (s *Server) fillRunQueueTimes(ctx context.Context, reader QueueTimes, run q
 	missing := 0
 	for i := range jobs {
 		job := &jobs[i]
-		queued, ok := times[provider.InstanceName(job.LeaseID)]
+		record, ok := records[provider.InstanceName(job.LeaseID)]
 		if !ok {
 			missing++
 			continue
 		}
 		// A JOB IS QUEUED BEFORE GITHUB HANDS IT TO THE SCALE SET, both on GitHub's
-		// clock; a record that says otherwise is not this attempt's, and the wait
-		// stays unknown rather than wrong. It is counted missing, so the run backs
-		// off rather than being read on every pass.
-		if !job.ScaleSetAssignedAt.IsZero() && queued.After(job.ScaleSetAssignedAt) {
+		// clock; a record that says otherwise is not this attempt's, and neither its
+		// time nor its commit is this job's, so both stay unknown rather than wrong.
+		// It is counted missing, so the run backs off rather than being read on every
+		// pass.
+		if !job.ScaleSetAssignedAt.IsZero() && record.QueuedAt.After(job.ScaleSetAssignedAt) {
 			missing++
 			continue
 		}
 		write, cancel := context.WithTimeout(ctx, identityWriteLimit)
-		err := s.alloc.RecordJobIdentity(write, job.LeaseID, alloc.HistoryJob{JobID: job.JobID, QueuedAt: queued})
+		err := s.alloc.RecordJobIdentity(write, job.LeaseID, alloc.HistoryJob{JobID: job.JobID,
+			QueuedAt: record.QueuedAt, HeadSHA: record.HeadSHA, HeadBranch: record.HeadBranch,
+			RunAttempt: record.RunAttempt})
 		cancel()
 		if err != nil {
 			s.log.Warn("could not record GitHub's queue time for a job; trying again",
 				"tier", job.Tier, "lease", job.LeaseID, "error", err)
+		}
+		// A RECORD THAT NAMES NO COMMIT leaves the job listed, so it backs off too.
+		if err != nil || record.HeadSHA == "" {
 			missing++
 		}
 	}

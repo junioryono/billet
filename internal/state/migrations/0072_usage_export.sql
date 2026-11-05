@@ -1,4 +1,4 @@
--- migration 71: usage_export
+-- migration 72: usage_export
 --
 -- WHAT LETS A BILLING SYSTEM READ EACH FINISHED LEASE EXACTLY ONCE (#559).
 --

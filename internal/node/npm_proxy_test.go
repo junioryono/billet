@@ -963,6 +963,85 @@ func TestASessionThatEndsWhileARequestIsClassifiedDoesNotCallTheNpmCacheUnused(t
 	}
 }
 
+// A VERSION DOCUMENT THE REGISTRY GAVE NO LIFETIME is fresh for the 300 s it gives
+// an unscoped package's, so a second job's fetch of a scoped package's never
+// leaves the node, and a stall on it is no stall inside that time. It is then
+// asked for again, and answered stale only when the registry gives no answer.
+func TestAVersionDocumentWithNoLifetimeIsKeptAsAnUnscopedOnesIs(t *testing.T) {
+	t.Parallel()
+
+	const document = `{"name":"@pnpm/exe.linux-x64","version":"12.4.2"}`
+	path := "/@pnpm/exe.linux-x64/12.4.2"
+	key := "full " + path
+	// THE FIRST TWO ASKS ARE ANSWERED, WITH NO HEADERS OF ITS OWN, AND THEN NONE.
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n > 2 {
+			answerWith(http.StatusServiceUnavailable, "", "", "down")(w, r)
+
+			return
+		}
+		answerWith(http.StatusOK, "", "", document)(w, r)
+	})
+	service, credentials := npmService(t, registry)
+	request := npmRequestLine(path, "Accept: application/json\r\n")
+	fetch := func(what string) {
+		t.Helper()
+		if resp, body := npmGet(t, service, credentials, request); resp.StatusCode != http.StatusOK || body != document {
+			t.Fatalf("%s = %d %q", what, resp.StatusCode, body)
+		}
+	}
+
+	fetch("the first fetch")
+	fetch("a second job's fetch")
+	if registry.count() != 1 {
+		t.Fatalf("the registry was asked %d times for two fetches inside the lifetime, want once", registry.count())
+	}
+
+	store := service.npmCache().store
+	ageNpmEntry(t, store, key, npmVersionLifetime+time.Second)
+	fetch("a fetch past the lifetime")
+	if registry.count() != 2 {
+		t.Fatalf("the registry was asked %d times after the lifetime, want a second time", registry.count())
+	}
+
+	ageNpmEntry(t, store, key, npmVersionLifetime+time.Second)
+	fetch("a fetch past the lifetime from a registry that gives no answer")
+	if registry.count() != 4 {
+		t.Fatalf("the registry was asked %d times, want both attempts before the stale answer", registry.count())
+	}
+}
+
+// A VERSION DOCUMENT WITH A VALIDATOR IS ASKED ABOUT EVERY TIME, and a 304 to it,
+// which carries no more than its validator, gives it no lifetime either: that 304
+// could otherwise drop what its 200 said, an Expires among it, and keep it fresh.
+func TestARevalidatedVersionDocumentIsGivenNoLifetime(t *testing.T) {
+	t.Parallel()
+
+	const document = `{"name":"left-pad","version":"1.3.0"}`
+	registry := newFakeRegistry(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 1 {
+			w.Header().Set("Expires", "Thu, 01 Jan 1970 00:00:00 GMT")
+			answerWith(http.StatusOK, "", `"v1"`, document)(w, r)
+
+			return
+		}
+		answerWith(http.StatusNotModified, "", "", "")(w, r)
+	})
+	service, credentials := npmService(t, registry)
+	request := npmRequestLine("/left-pad/1.3.0", "Accept: application/json\r\n")
+	for i := range 3 {
+		if resp, body := npmGet(t, service, credentials, request); resp.StatusCode != http.StatusOK || body != document {
+			t.Fatalf("fetch %d = %d %q", i+1, resp.StatusCode, body)
+		}
+		if registry.count() != i+1 {
+			t.Fatalf("after fetch %d the registry was asked %d times; want every fetch to ask", i+1, registry.count())
+		}
+	}
+	if validator := registry.request(2).Header.Get("If-None-Match"); validator != `"v1"` {
+		t.Fatalf("the third ask carried the validator %q", validator)
+	}
+}
+
 // ageNpmEntry moves an entry's clock back by, so it expires as if time passed.
 func ageNpmEntry(t *testing.T, store *npmStore, key string, by time.Duration) {
 	t.Helper()

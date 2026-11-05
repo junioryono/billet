@@ -83,5 +83,5 @@ A value the ledger does not know is `null` or empty, and `unknown` names it with
 - **A job with no result yet**, which ended with the lease before GitHub reported one: `billed_minutes` is unknown and `held` says how long the lease lasted. What to charge is the consumer's decision, and billet does not guess one.
 - **A result with no start**: GitHub reported a result and billet never saw the job start, so it has no length.
 - **A clock that stepped** so that an end precedes its start: the length is unknown, not negative.
-- **A row older than a column**: leases that finished before billet recorded a target (migration 71), a shape or a price (migration 49) say so. A bought machine with no price reads as unknown, never as free.
+- **A row older than a column**: leases that finished before billet recorded a target (migration 72), a shape or a price (migration 49) say so. A bought machine with no price reads as unknown, never as free.
 - **A backend this billet does not know**, written by a newer release: `provider` is kept as the ledger has it, and `ownership` is unknown.

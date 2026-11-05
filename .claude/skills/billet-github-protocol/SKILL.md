@@ -32,7 +32,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A target is an organization or a repository, and its GitHub path is its identity.**
 - **Scale sets are billet's to remove.**
 - **Onboarding is the App Manifest flow, so every deployment ends up with provably identical minimal permissions for its scope.**
-- **A deployment on a broker has a third way to authenticate, and the vendored client is told nothing about it (#557, ADR-024).**
+- **A deployment on a broker has a third way to authenticate, and the vendored client is told nothing about it (#557, ADR-025).**
 - **Two issuers.**
 - **billet is not actions-runner-controller without Kubernetes.**
 - **Two compatibility caveats are permanent until GitHub moves.**

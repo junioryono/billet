@@ -70,7 +70,10 @@ UPDATE job_history
                                THEN CAST(@github_finished_at AS TEXT)
                                ELSE github_finished_at END,
        github_run_id = CASE WHEN github_run_id = 0 THEN CAST(@github_run_id AS BIGINT)
-                            ELSE github_run_id END
+                            ELSE github_run_id END,
+       head_sha    = CASE WHEN head_sha = '' THEN CAST(@head_sha AS TEXT) ELSE head_sha END,
+       head_branch = CASE WHEN head_branch = '' THEN CAST(@head_branch AS TEXT) ELSE head_branch END,
+       run_attempt = CASE WHEN run_attempt = 0 THEN CAST(@run_attempt AS BIGINT) ELSE run_attempt END
  WHERE lease_id = @lease_id
    AND (github_job_id = '' OR github_job_id = CAST(@github_job_id AS TEXT));
 
@@ -99,9 +102,10 @@ SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: ListJobsAwaitingQueueTime :many
--- The jobs that started since a moment and still have no GitHub queue time,
--- with what finds each in GitHub's REST record of its run: the repository, the
--- run and GitHub's job id (the lease names the runner). Newest start first,
+-- The jobs that started since a moment and still have no GitHub queue time or no
+-- commit, both of which GitHub's list of a run's jobs gives in one read, with what
+-- finds each in that list: the repository, the run and GitHub's job id (the lease
+-- names the runner). Newest start first,
 -- bounded, so a backlog is worked from the jobs an operator is looking at now.
 --
 -- THE RUN IS THE ONE THAT STARTED: github_run_id, which the JobStarted wrote
@@ -121,7 +125,7 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= @since
-   AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
+   AND (github_queued_at = '' OR head_sha = '') AND github_job_id != '' AND COALESCE(repo, '') != ''
    AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
    AND (CAST(@before_started AS TEXT) = ''
         OR started_at < CAST(@before_started AS TEXT)
@@ -241,7 +245,7 @@ ON CONFLICT (lease_id) DO UPDATE SET
 -- the lease ended (migration 65), and an archive from a caller that did not
 -- load it keeps what an earlier one wrote.
 --
--- THE USAGE NUMBER IS WRITTEN ONCE (migration 71): a lease has one place in the
+-- THE USAGE NUMBER IS WRITTEN ONCE (migration 72): a lease has one place in the
 -- order leases finished in, and an exporter may already have read past it. The
 -- target and the purchase time are read from the lease row here, so no caller has
 -- to load them, and a lease GitHub never assigned a job still says when it was
@@ -308,7 +312,7 @@ ON CONFLICT (lease_id) DO UPDATE SET
 -- Take the next place in the order leases were numbered in.
 --
 -- THE ROW'S LOCK IS THE POINT, held until this transaction commits, so numbers
--- become visible in the order they were handed out on both engines; migration 71
+-- become visible in the order they were handed out on both engines; migration 72
 -- says why a reader depends on that, and why the first close creates the row.
 INSERT INTO usage_sequence (id, last) VALUES (1, 1)
 ON CONFLICT (id) DO UPDATE SET last = usage_sequence.last + 1
@@ -521,7 +525,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
-       holder_incarnation
+       holder_incarnation, head_sha, head_branch, run_attempt
   FROM job_history WHERE lease_id = @lease_id;
 
 -- name: ListJobsOfRun :many

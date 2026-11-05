@@ -246,12 +246,16 @@ var (
 	batchShape = &shape{root: schemaOf(reflect.TypeFor[Batch](), "", map[string]int{
 		"samples": MaxBatchSamples, "processes": MaxBatchProcessSamples, "processes.rows": MaxProcessRows,
 		"steps": MaxBatchSteps, "tests": MaxBatchSuites, "tests.failed": MaxFailedNames,
+		"cases": MaxBatchCaseSuites, "cases.cases": MaxBatchCases,
 	}), rows: MaxBatchProcessSamples * MaxProcessRows}
 	reportShape = &shape{root: schemaOf(reflect.TypeFor[Report](), "", map[string]int{
 		"samples": MaxReportSamples, "processes": MaxReportProcessSamples, "processes.rows": MaxProcessRows,
 		"steps": MaxReportSteps, "tests": MaxReportSuites, "tests.failed": MaxFailedNames,
 		"gaps": MaxReportGaps,
 	}), rows: MaxReportRows}
+	testResultsShape = &shape{root: schemaOf(reflect.TypeFor[TestResults](), "", map[string]int{
+		"suites": MaxBatchCaseSuites, "suites.cases": MaxBatchCases,
+	})}
 )
 
 // schemaOf is the schema of a struct type as encoding/json reads it: each field by

@@ -1492,7 +1492,7 @@ func TestAnAttemptThatLeftItsObligationDueBacksOff(t *testing.T) {
 	l.cleanup = map[int64]*pendingCleanup{7: entry}
 	l.attempting[7] = true
 
-	l.endAttempt(7)
+	l.endAttempt(7, time.Time{})
 
 	if entry.due(time.Now()) {
 		t.Fatal("an obligation an attempt left due can be retried at once")

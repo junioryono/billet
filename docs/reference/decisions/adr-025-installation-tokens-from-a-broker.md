@@ -1,4 +1,4 @@
-# ADR-024: Installation tokens from a broker
+# ADR-025: Installation tokens from a broker
 
 **Status:** Accepted (2026-11-03).
 

@@ -48,7 +48,7 @@ func exerciseUsageMigration(t *testing.T, open func(context.Context) (*DB, error
 			`ALTER TABLE pending_completions DROP COLUMN job_runner_assigned_at`,
 			`ALTER TABLE pending_completions DROP COLUMN job_finished_at`,
 			`ALTER TABLE job_history DROP COLUMN github_target`,
-			`DELETE FROM schema_migrations WHERE version = 71`,
+			`DELETE FROM schema_migrations WHERE version = 72`,
 			`INSERT INTO job_history (lease_id, tier, queued_at, finished_at) VALUES
 			   ('latest', 'small', 't', '2026-01-03T00:00:00.000000000Z'),
 			   ('running', 'small', 't', NULL),

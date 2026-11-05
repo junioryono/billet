@@ -56,6 +56,10 @@ type Server struct {
 	// detailRetention is how long a job's series, destinations and guest report
 	// are kept; zero is config.DefaultJobDetailRetention.
 	detailRetention time.Duration
+	// testRetention and testBound are how long a job's test results are kept and how
+	// many bytes of them in all; zero is config's default for each.
+	testRetention time.Duration
+	testBound     int64
 	// owner identifies this process to GitHub's message queue, so a session left
 	// by a crashed run can be told apart from a live one.
 	owner string
@@ -75,6 +79,8 @@ type Server struct {
 	hurry <-chan struct{}
 	// foregroundLaunches is set by WithForegroundLaunches.
 	foregroundLaunches bool
+	// listenerTimings is set by WithListenerTimings.
+	listenerTimings *ListenerTimings
 	// restartHandoff makes an unsealed stop a handoff; see WithRestartHandoff.
 	restartHandoff bool
 
@@ -263,6 +269,12 @@ func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.detailRetention = d }
 }
 
+// WithTestResultsRetention is server.test_results_retention and
+// server.test_results_max_bytes reaching the loop that deletes test results past them.
+func WithTestResultsRetention(d time.Duration, maxBytes int64) ControlPlaneOption {
+	return func(s *Server) { s.testRetention, s.testBound = d, maxBytes }
+}
+
 // WithHurry gives every listener the channel that ends its drain wait early.
 //
 // This is the operator's second signal reaching the code that honours it. See
@@ -278,6 +290,11 @@ func WithHurry(c <-chan struct{}) ControlPlaneOption {
 // a launch still out is not quiet.
 func WithForegroundLaunches() ControlPlaneOption {
 	return func(s *Server) { s.foregroundLaunches = true }
+}
+
+// WithListenerTimings has every listener report how long its loop's steps take.
+func WithListenerTimings(t *ListenerTimings) ControlPlaneOption {
+	return func(s *Server) { s.listenerTimings = t }
 }
 
 // WithStopHandoff makes every listener hand over to the next control plane, rather
@@ -326,11 +343,20 @@ func OptionsFromConfig(cfg *config.Config) ([]ControlPlaneOption, error) {
 	if err != nil {
 		return nil, err
 	}
+	testRetention, err := cfg.Server.TestResultsRetentionDuration()
+	if err != nil {
+		return nil, err
+	}
+	testBound, err := cfg.Server.TestResultsBound()
+	if err != nil {
+		return nil, err
+	}
 
 	return []ControlPlaneOption{
 		WithDrainTimeout(drain),
 		WithAdmissionOrder(cfg.Server.Order()),
 		WithJobDetailRetention(retention),
+		WithTestResultsRetention(testRetention, int64(testBound)),
 	}, nil
 }
 
@@ -475,6 +501,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.
 	group.Background("job detail retention", s.retireJobDetail)
+	group.Background("test results retention", s.retireTestResults)
 	group.Background("usage numbering", s.numberUsage)
 
 	// Cancelled together. One listener failing takes the others down rather than
@@ -799,6 +826,10 @@ func (s *Server) listenerOpts(prov Provisioner) []Option {
 	// listeners, so a control plane that handed some of them a queue and not
 	// others would be fair about part of its fleet.
 	opts = append(opts, WithAdmissionQueue(s.order))
+
+	if s.listenerTimings != nil {
+		opts = append(opts, WithTimings(s.listenerTimings))
+	}
 
 	if s.runner != nil {
 		opts = append(opts, WithRunner(s.runner))

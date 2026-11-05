@@ -2,12 +2,16 @@ package guestagent
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -43,13 +47,24 @@ type junitWalk struct {
 	stopped  bool
 
 	suites []guestreport.SuiteResult
+	// cases are the suites with their cases, within a batch's bounds, and parsed
+	// are those of the file being read, kept only once it has parsed to its end.
+	cases  junitCases
+	parsed junitCases
+}
+
+// junitCases is the suites and cases a search kept, and what its bounds left out.
+type junitCases struct {
+	suites  []guestreport.SuiteCases
+	dropped guestreport.DroppedCases
 }
 
 // collectJUnit is the test suites in the JUnit XML files under roots, at most a
-// batch's worth: the ones with failures first, then the ones with the most tests.
-// Nothing under a root is reached through a symlink out of it, and only a regular
-// file is read.
-func collectJUnit(roots []string, now func() time.Time, log *limitedLog) []guestreport.SuiteResult {
+// batch's worth: the ones with failures first, then the ones with the most tests;
+// and their cases, within a batch's bounds. Nothing under a root is reached through
+// a symlink out of it, and only a regular file is read.
+func collectJUnit(roots []string, now func() time.Time, log *limitedLog,
+) ([]guestreport.SuiteResult, junitCases) {
 	w := &junitWalk{deadline: now().Add(junitBudget), now: now}
 
 	for _, root := range roots {
@@ -72,7 +87,7 @@ func collectJUnit(roots []string, now func() time.Time, log *limitedLog) []guest
 		_ = r.Close()
 	}
 
-	return w.suites
+	return w.suites, w.cases
 }
 
 // openRoot is os.OpenRoot of a directory. os.OpenRoot opens the root itself
@@ -157,12 +172,28 @@ func (w *junitWalk) read(dir *os.File, name string) {
 	for _, s := range suites {
 		w.suites = keep(w.suites, s)
 	}
+
+	for _, s := range w.parsed.suites {
+		w.cases.keep(s)
+	}
+
+	w.cases.dropped.Add(w.parsed.dropped.Suites, w.parsed.dropped.Cases)
 }
 
 // parsedCase is the testcase being read.
 type parsedCase struct {
 	name                     string
 	failed, errored, skipped bool
+	// identity is what its result says it is, whole where it fits a report's bound
+	// and otherwise cut and marked apart, so two tests never read as one.
+	identity string
+	// millis is what its time attribute says, nil where it says nothing readable.
+	millis *int64
+	// message is the first failure's or error's message attribute, or the start
+	// of its text where it has none, and inFailure says that text is what is
+	// being read.
+	message   string
+	inFailure bool
 }
 
 // parse reads one file's suites with a streaming decoder, keeping a batch's worth
@@ -171,10 +202,12 @@ type parsedCase struct {
 // no testcase of its own is not kept.
 func (w *junitWalk) parse(r io.Reader, file string) ([]guestreport.SuiteResult, bool) {
 	dec := xml.NewDecoder(r)
+	w.parsed = junitCases{}
 
 	var (
 		out    []guestreport.SuiteResult
 		open   []guestreport.SuiteResult
+		cases  []guestreport.SuiteCases
 		tcase  *parsedCase
 		depth  int
 		tokens int
@@ -218,12 +251,17 @@ func (w *junitWalk) parse(r io.Reader, file string) ([]guestreport.SuiteResult, 
 			switch {
 			case t.Name.Local == "testsuite":
 				open = append(open, guestreport.SuiteResult{Name: suiteName(attr(t, "name"), file)})
+				cases = append(cases, guestreport.SuiteCases{Name: suiteIdentity(attr(t, "name"), file)})
 			case t.Name.Local == "testcase" && len(open) > 0 && tcase == nil:
-				tcase = &parsedCase{name: caseName(attr(t, "classname"), attr(t, "name"))}
+				tcase = &parsedCase{name: caseName(attr(t, "classname"), attr(t, "name")),
+					identity: caseIdentity(attr(t, "classname"), attr(t, "name")),
+					millis:   caseMillis(attr(t, "time"))}
 			case tcase != nil && t.Name.Local == "failure":
 				tcase.failed = true
+				tcase.beginFailure(t)
 			case tcase != nil && t.Name.Local == "error":
 				tcase.errored = true
+				tcase.beginFailure(t)
 			case tcase != nil && t.Name.Local == "skipped":
 				tcase.skipped = true
 			}
@@ -233,17 +271,163 @@ func (w *junitWalk) parse(r io.Reader, file string) ([]guestreport.SuiteResult, 
 			switch {
 			case t.Name.Local == "testcase" && tcase != nil:
 				countCase(&open[len(open)-1], tcase)
+				addCase(&cases[len(cases)-1], tcase, &w.parsed.dropped)
 				tcase = nil
+			case tcase != nil && (t.Name.Local == "failure" || t.Name.Local == "error"):
+				tcase.inFailure = false
 			case t.Name.Local == "testsuite" && len(open) > 0:
 				done := open[len(open)-1]
 				open = open[:len(open)-1]
 
+				kept := cases[len(cases)-1]
+				cases = cases[:len(cases)-1]
+
 				if done.Tests > 0 {
 					out = keep(out, done)
+					kept.Tests, kept.Failures, kept.Errors, kept.Skipped = done.Tests, done.Failures, done.Errors,
+						done.Skipped
+					kept.Complete = int64(len(kept.Cases)) == done.Tests
+					w.parsed.keep(kept)
 				}
+			}
+		case xml.CharData:
+			if tcase != nil && tcase.inFailure && tcase.message == "" {
+				tcase.message = caseMessage(string(t))
 			}
 		}
 	}
+}
+
+// beginFailure notes a failure or an error of the case: its message attribute, and
+// that its text may stand in for one, unless an earlier one already gave a message.
+func (c *parsedCase) beginFailure(e xml.StartElement) {
+	if c.message != "" {
+		return
+	}
+
+	c.message = caseMessage(attr(e, "message"))
+	c.inFailure = true
+}
+
+// addCase adds one case to its suite's list. A list at its bound gives up what is
+// least worth keeping first, so one result file of many cases costs no more to hold
+// than a batch's worth; what it gives up is counted, and the suite is Complete only if
+// its list ends as long as its count.
+func addCase(s *guestreport.SuiteCases, c *parsedCase, dropped *guestreport.DroppedCases) {
+	for len(s.Cases) >= guestreport.MaxBatchCases {
+		before := len(s.Cases)
+		one := []guestreport.SuiteCases{*s}
+		guestreport.ShedCaseCount(&one)
+		*s = one[0]
+		dropped.Add(0, int64(before-len(s.Cases)))
+	}
+
+	status := guestreport.CasePassed
+
+	switch {
+	case c.failed:
+		status = guestreport.CaseFailed
+	case c.errored:
+		status = guestreport.CaseErrored
+	case c.skipped:
+		status = guestreport.CaseSkipped
+	}
+
+	out := guestreport.CaseResult{Name: c.identity, Status: status, DurationMillis: c.millis}
+	if c.failed || c.errored {
+		out.Message = c.message
+	}
+
+	s.Cases = append(s.Cases, out)
+}
+
+// keep adds s, holding what a batch may: the suites that rank first, as keep ranks
+// them, the rest counted, and past the bound on cases only what ShedCaseCount does
+// not give up.
+func (c *junitCases) keep(s guestreport.SuiteCases) {
+	c.suites = append(c.suites, s)
+
+	if len(c.suites) > guestreport.MaxBatchCaseSuites {
+		slices.SortStableFunc(c.suites, func(a, b guestreport.SuiteCases) int {
+			return cmp.Or(
+				cmp.Compare(b.Failures+b.Errors, a.Failures+a.Errors),
+				cmp.Compare(b.Tests, a.Tests),
+				cmp.Compare(a.Name, b.Name),
+			)
+		})
+
+		for _, left := range c.suites[guestreport.MaxBatchCaseSuites:] {
+			c.dropped.Add(1, int64(len(left.Cases)))
+		}
+
+		c.suites = slices.Clip(c.suites[:guestreport.MaxBatchCaseSuites])
+	}
+
+	for guestreport.CountCases(c.suites) > guestreport.MaxBatchCases {
+		before := guestreport.CountCases(c.suites)
+		guestreport.ShedCaseCount(&c.suites)
+		c.dropped.Add(0, int64(before-guestreport.CountCases(c.suites)))
+	}
+}
+
+// identityMark is the text a cut identity ends with: a separator and eight hex digits.
+const identityMark = 9
+
+// boundedIdentity is s as a report carries it within limit bytes. WHOLE WHERE IT FITS
+// AND NEEDS NO CLEANING. Otherwise it is cut and marked with a digest of the whole,
+// because the rankings count by this text and two names made one would read as one
+// test, whose pass and failure would make it flaky. A job can still write a literal name
+// that reads as another's, as it can write any result it likes: what this answers is two
+// honest tests, not a job lying about its own.
+func boundedIdentity(s string, limit int) string {
+	if cleaned := guestreport.Clean(s, limit); cleaned == s {
+		return textOrMark(cleaned)
+	}
+
+	digest := sha256.Sum256([]byte(s))
+
+	return guestreport.Clean(s, limit-identityMark) + "#" + hex.EncodeToString(digest[:4])
+}
+
+// caseIdentity is a test case's class and name as a report carries it.
+func caseIdentity(class, name string) string {
+	full := name
+	if class != "" {
+		full = class + "." + name
+	}
+
+	return boundedIdentity(full, guestreport.MaxFailedNameBytes)
+}
+
+// suiteIdentity is a suite's name as a report carries its cases, the file's when the
+// suite has none.
+func suiteIdentity(name, file string) string {
+	if name == "" {
+		name = file
+	}
+
+	return boundedIdentity(name, guestreport.MaxNameBytes)
+}
+
+// caseMillis is a testcase's time attribute, decimal seconds, in milliseconds: nil
+// for one that is absent, unreadable (some tools group digits with a comma),
+// negative or past what a report holds, because no duration is not a duration of
+// zero.
+func caseMillis(s string) *int64 {
+	seconds, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || math.IsNaN(seconds) || seconds < 0 || seconds*1000 > guestreport.MaxValue {
+		return nil
+	}
+
+	millis := int64(math.Round(seconds * 1000))
+
+	return &millis
+}
+
+// caseMessage is a failure's message as a report carries it, "" when it says
+// nothing.
+func caseMessage(s string) string {
+	return guestreport.Clean(strings.TrimSpace(s), guestreport.MaxCaseMessageBytes)
 }
 
 // countCase adds one testcase to its suite.
