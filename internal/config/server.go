@@ -235,6 +235,10 @@ type ServerConfig struct {
 	// `file`, which is what every deployment before this key had.
 	Identity *IdentityConfig `yaml:"identity,omitempty"`
 
+	// TLSRouter says this control plane sits behind a TLS-passthrough router, which
+	// is what makes a loopback wire serve mutual TLS. See TLSRouterConfig.
+	TLSRouter *TLSRouterConfig `yaml:"tls_router,omitempty"`
+
 	// TokenBroker takes this deployment's installation tokens from a broker. With it,
 	// no target names a key and this host holds none.
 	TokenBroker *TokenBrokerConfig `yaml:"token_broker,omitempty"`
@@ -695,6 +699,7 @@ func (c *Config) validateServer() []error {
 	}
 
 	errs = append(errs, c.validateBootstrapListen()...)
+	errs = append(errs, c.validateTLSRouter()...)
 
 	if err := c.Server.Placement.Validate(); err != nil {
 		errs = append(errs, err)
@@ -833,7 +838,7 @@ func (c *Config) validateBootstrapListen() []error {
 	// A LOOPBACK WIRE HAS NO CERTIFICATES AT ALL, so it has nothing to enroll a
 	// machine into — and nothing off this host could reach the operational wire
 	// anyway. The same rule refuses node.tls against a loopback server.
-	if LoopbackAddr(c.Server.Listen) {
+	if !c.Server.WireServesTLS() {
 		return []error{fmt.Errorf(
 			"server.bootstrap_listen is set, but server.listen is %q — a control plane that "+
 				"accepts only on loopback serves plain HTTP and issues no certificates, so there "+

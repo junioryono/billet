@@ -178,7 +178,7 @@ func (a *Allocator) ShapeHosts(ctx context.Context) (map[string][]string, error)
 		for _, label := range a.sortedLabels() {
 			t := a.tiers[label]
 
-			nodes, err := a.eligibleNodesFor(ctx, tx, t, false)
+			nodes, err := a.eligibleNodesFor(ctx, tx, t, guestWireFloor(t))
 			if err != nil {
 				return err
 			}

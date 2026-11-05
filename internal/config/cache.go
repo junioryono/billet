@@ -429,7 +429,9 @@ func (s CacheSpec) needsGuestCacheServices() bool {
 func (c *Config) materializeCacheScope() {
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
-		if t.CacheScope != nil {
+		// A WINDOWS GUEST HAS NO CLIENT FOR ANY CACHE, and a scope nobody wrote would be
+		// refused as though they had (windowsTierErrors).
+		if t.CacheScope != nil || t.GuestOS == GuestWindows {
 			continue
 		}
 		publish := CachePublish("")
