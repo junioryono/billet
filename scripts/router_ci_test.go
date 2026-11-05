@@ -25,7 +25,7 @@ func TestTheTestJobRequiresHAProxy(t *testing.T) {
 		t.Fatal("ci.yml has no `test` job")
 	}
 
-	if next := regexp.MustCompile(`\n  [a-zA-Z0-9_-]+:\n`).FindStringIndex(job); next != nil {
+	if next := regexp.MustCompile(`\n {2}[a-zA-Z0-9_-]+:\n`).FindStringIndex(job); next != nil {
 		job = job[:next[0]]
 	}
 
