@@ -25,6 +25,7 @@ untrusted-fork-tart
 untrusted-fork-ec2
 ec2-cache-probes
 idle-control-plane
+runtime-predictions
 ```
 
 | Record | Covers |
@@ -49,3 +50,4 @@ idle-control-plane
 | [An untrusted fork pull request on Tart](untrusted-fork-tart.md) | a fork's pull request run twice on an untrusted Tart tier on a development Mac on 2026-10-25 (a Linux arm64 guest): softnet with `@host` kept it from the LAN's router and another LAN host, both of which answered the Mac, while the internet worked; a VM booted with billet's flags reached neither of the Mac's own addresses where a listener answered a VM on tart's NAT, no cache and no billet authority reached it, and the outside evidence agreed; plus the two defects only the real run found, an isolated launch that did not wait for the guest agent and a cleanup that killed `tart delete` part-way (#23) |
 | [An untrusted fork pull request on EC2](untrusted-fork-ec2.md) | a fork's pull request run on an untrusted EC2 tier in the CI account on 2026-10-25: the untrusted security group and no instance profile seen from inside the job and from outside it, no interception, and the pool's own image store published by default-branch jobs, read by the fork and never published from it, proved by a tag each job wrote; and on 2026-11-04, on an AMI built from GitHub's template, the same proof for sticky disks: read warm by the fork, its own key cold again on its re-run, and what it wrote to the default branch's disk absent from that re-run and from the next default-branch job (#23) |
 | [What an idle control plane costs](idle-control-plane.md) | fifty idle control planes on one host, measured 2026-11-04: memory, CPU, connections to PostgreSQL and what a limit does to them, and what a restart waits for on real GitHub |
+| [Runtime predictions](runtime-predictions.md) | how well a job's runtime is predicted from the deployment's own history, measured on the reference deployment's fortnight to 2026-10-25: 30,253 jobs graded as an hourly-refreshing controller would have predicted them, 78% within 2x and 99.4% from the job's own runs, the wide shapes best (84 to 96% within 2x), the 2 vCPU tiers close in seconds and loose in ratio, and what the record does not grade |

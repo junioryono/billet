@@ -21,6 +21,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Status separates ownership from phase.**
 - **A commitment made to a remote service cannot be revoked by a local timer.**
 - **A pool member GitHub cannot route work to is retired on GitHub's per-registration word, never on the aggregate.**
+- **A runtime prediction may choose a host and decides nothing else (#524).**
 - **A tier naming an architecture is placed only on nodes that reported it, and a node that reported none serves only tiers naming none (ADR-022).**
 - **The loop that decides never waits for a machine to start (#708).**
 
