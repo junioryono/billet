@@ -1068,6 +1068,7 @@ func (s *CacheService) publishActionsReceipt(
 		return actionsReceiptResponse(receipt)
 	}
 	current, err := s.store.Current(ctx, receipt.StoreKey)
+	s.countedPublication(session.instance, "an Actions cache lookup", err)
 	if err == nil {
 		return s.completeReceipt(ctx, session, receipt, current)
 	}
@@ -1096,6 +1097,7 @@ func (s *CacheService) publishActionsReceipt(
 			return actionsReceiptResponse(receipt)
 		}
 		current, currentErr := s.store.Current(ctx, receipt.StoreKey)
+		s.countedPublication(session.instance, "an Actions cache lookup", currentErr)
 		if currentErr == nil {
 			return s.completeReceipt(ctx, session, receipt, current)
 		}
@@ -1158,6 +1160,7 @@ func (s *CacheService) reacquireReceiptWriter(
 	}
 	lease, fence, err := s.store.AcquireWriter(ctx, receipt.StoreKey,
 		session.instance+"/actions/"+receipt.ID, cacheWriterTTL)
+	s.countedPublication(session.instance, "an Actions cache writer", err)
 	if err != nil {
 		return err
 	}

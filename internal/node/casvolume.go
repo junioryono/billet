@@ -882,8 +882,10 @@ func (s *CacheService) mergeCASVolume(
 		return candidate.Generation, true, nil
 	}
 
-	latest, err := s.store.Clone(ctx, key, current)
-	s.countedPublication(session.instance, "a clone to merge into", err)
+	// A CLONE HANDED OVER IS THE STORE DOING WHAT A JOB NEEDS, as a job's own is.
+	latest, err := s.handOver(session.instance, "a clone to merge into", func() (storecontract.Volume, error) {
+		return s.store.Clone(ctx, key, current)
+	})
 	if err != nil {
 		return "", false, release(fmt.Errorf("clone the newest generation: %w", err))
 	}

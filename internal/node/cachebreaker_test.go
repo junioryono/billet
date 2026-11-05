@@ -1343,6 +1343,30 @@ func TestAContentAddressedRequestRefusedATrialDoesNotBackOff(t *testing.T) {
 	}
 }
 
+// A MERGE'S CLONE IS A VOLUME HANDED OVER: it ends a probation and clears the count, as a
+// job's own clone does.
+func TestAMergesCloneSettlesAProbation(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	service, _, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+	service.GuardStore("ceph", testStoreDeadline)
+	ours := "our object"
+	if got := casRequest(t, service, token, http.MethodPut, "/v1/cas/go/cas/"+digestOf(ours), ours); got.Code != http.StatusOK {
+		t.Fatalf("PUT = %d %s", got.Code, got.Body.String())
+	}
+	// ANOTHER JOB PUBLISHED MEANWHILE, so this one merges into a clone of its generation.
+	storage.current = "theirs"
+	onProbation(service.breaker)
+	// THE PUBLICATION IS REFUSED, so only the clone can have settled it.
+	storage.publishErr = errors.New("not clean")
+
+	endSession(t, service, instance, publishingAuthority())
+	if got := service.breaker.report().State; got != lease.CacheStoreClosed {
+		t.Fatalf("after a merge's clone was handed over: state %q", got)
+	}
+}
+
 // A RETRIED PUBLICATION'S CONFLICT DOES NOT HIDE ITS TIMEOUT: the timeout is the last thing
 // the store did, and the error carries both.
 func TestAConflictBesideATimeoutStillCounts(t *testing.T) {
