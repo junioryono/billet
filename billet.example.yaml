@@ -165,6 +165,15 @@ server:
   #
   # job_detail_retention: 72h
 
+  # How long the ledger keeps a job's test suites and cases, which `billet tests
+  # stats` ranks, and how many bytes of them in all, the oldest deleted first. They
+  # are the job's own VM's report, kept apart from its guest report and for longer,
+  # since a flaky test shows itself over many runs. At least 1h and 1MiB; absent,
+  # 336h and 128MiB. The control plane reads the whole ledger at every start.
+  #
+  # test_results_retention: 336h
+  # test_results_max_bytes: 128MiB
+
   # Prometheus metrics for this control plane, at http://<listen>/metrics.
   # Absent, nothing is served. A literal loopback address (127.0.0.1 or [::1],
   # not localhost) unless allow_remote is true: the endpoint has no
@@ -375,6 +384,14 @@ node:
   # certificate, the two must agree.
   name: epyc-1
   server_addr: 127.0.0.1:7717
+
+  # EVERY CONTROLLER OF AN ACTIVE-PASSIVE PAIR, in place of server_addr (set
+  # one or the other). Only the controller holding the claim serves the node
+  # wire, so the node registers with whichever answers, and when it loses it,
+  # tries the others: no address has to move at a failover. Each needs a name
+  # in its controller's server.node_tls_hosts, as server_addr does.
+  #
+  # server_addrs: [control-a.example:7717, control-b.example:7717]
 
   # WHERE `billet node --enroll` ASKS TO JOIN, when the control plane serves
   # enrollment on an address of its own (server.bootstrap_listen above).

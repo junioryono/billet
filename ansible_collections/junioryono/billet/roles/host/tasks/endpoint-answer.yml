@@ -42,10 +42,15 @@
     billet_endpoint_hex32: '^[0-9a-f]{32}\Z'
     billet_endpoint_sha: '^[0-9a-f]{64}\Z'
     billet_endpoint_failed: "{{ billet_endpoint_outcome in ['refused', 'unknown'] }}"
+    # THE LISTS ARE A NODE NAMING SEVERAL CONTROLLERS', and only theirs: `from`,
+    # `to` and `endpoint` go on naming one endpoint beside them, so nothing about
+    # a node with one controller changes. Each list holds the endpoint beside it;
+    # a side that names an endpoint has a list when the other does, one of them
+    # names several, and an unchanged node's list always does.
     billet_endpoint_members:
-      reported: [schema, outcome, planned, first_start, node_removed, from, to, effective, record, config, unit]
-      unchanged: [schema, outcome, node, deployment, endpoint, effective, record, node_removed, unit]
-      migrated: [schema, outcome, node, deployment, from, to, config_path, installed_sha256, invocation_id, incarnation, registered_at, stopped]
+      reported: [schema, outcome, planned, first_start, node_removed, from, to, from_endpoints, to_endpoints, effective, record, config, unit]
+      unchanged: [schema, outcome, node, deployment, endpoint, endpoints, effective, record, node_removed, unit]
+      migrated: [schema, outcome, node, deployment, from, to, from_endpoints, to_endpoints, config_path, installed_sha256, invocation_id, incarnation, registered_at, stopped]
       refused: [schema, outcome, reason, why, next, state]
       unknown: [schema, outcome, reason, why, next, state]
     billet_endpoint_required:
@@ -64,6 +69,8 @@
       # THE MEMBER SET IS THE PRODUCER'S: nothing missing, nothing unknown.
       - name: members
         ok: "{{ billet_endpoint_outcome in billet_endpoint_members and (billet_endpoint_a.keys() | list | difference(billet_endpoint_members[billet_endpoint_outcome]) | length == 0) and (billet_endpoint_required[billet_endpoint_outcome] | difference(billet_endpoint_a.keys() | list) | length == 0) }}"
+      - name: endpoint_lists
+        ok: "{{ ('from_endpoints' not in billet_endpoint_a or (billet_endpoint_a.from_endpoints | junioryono.billet.controller_list(billet_endpoint_a.from | default(none)))) and ('to_endpoints' not in billet_endpoint_a or (billet_endpoint_a.to_endpoints | junioryono.billet.controller_list(billet_endpoint_a.to | default(none)))) and ('endpoints' not in billet_endpoint_a or ((billet_endpoint_a.endpoints | junioryono.billet.controller_list(billet_endpoint_a.endpoint | default(none))) and (billet_endpoint_a.endpoints | length) > 1)) and (('from_endpoints' not in billet_endpoint_a and 'to_endpoints' not in billet_endpoint_a) or (('from_endpoints' in billet_endpoint_a) == ((billet_endpoint_a.from | default(none)) is string) and ('to_endpoints' in billet_endpoint_a) == ((billet_endpoint_a.to | default(none)) is string) and ((billet_endpoint_a.from_endpoints | default([]) | length) > 1 or (billet_endpoint_a.to_endpoints | default([]) | length) > 1))) }}"
       - name: reason
         ok: "{{ not billet_endpoint_failed or (billet_endpoint_a.reason | default('') is string and billet_endpoint_a.reason | default('') | length > 0) }}"
       - name: why

@@ -513,6 +513,12 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// And the parked ones, with the outcome they were parked with: a launch that
 	// never started did not finish, whatever the ordinary path records.
 	for id, entry := range parked {
+		// THE SAME LEASE, ALREADY DECIDED ABOVE: a completion parked for the cleanup loop
+		// names the lease `running` still renews until its destroy returns.
+		if lease := running[id]; !entry.releaseOnly && lease != nil && lease.ID == entry.lease.ID {
+			continue
+		}
+
 		// A RELEASE-ONLY ENTRY ALREADY HAS ABSENCE PROOF. Every other parked
 		// entry still needs destroyAll to confirm teardown or hand custody to the
 		// runner. In particular, a completion restored before its holder registers

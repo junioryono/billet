@@ -8,11 +8,38 @@ import (
 	"github.com/junioryono/billet/internal/config"
 )
 
+// greedyTotal counts by placing the tier's jobs one at a time, as next would,
+// on a copy of the placer: the count total is held to.
+func (p *placer) greedyTotal(t config.Tier) int {
+	clone := p.clone()
+	sum := 0
+	for {
+		if _, _, ok := clone.next(t); !ok {
+			return sum
+		}
+		sum++
+	}
+}
+
+// costShape is how a random fleet's hosts charge for the tier.
+type costShape int
+
+const (
+	// costsVaried charges each host its own cost.
+	costsVaried costShape = iota
+	// costsUniform charges every host one cost.
+	costsUniform
+	// costsPerRank charges the hosts of one rank one cost and another rank
+	// another, as a tier falling back from its hosts to a remote shape does;
+	// some ranks are varied within.
+	costsPerRank
+)
+
 // randomPlacer is a placer over a random fleet: hosts with random free room
-// (some overcommitted), some with no cost for the tier, costs either all the
-// same or varied, a deployment ceiling from none to tight, either policy and a
-// spread of provider ranks.
-func randomPlacer(r *rand.Rand, uniform bool) *placer {
+// (some overcommitted), some with no cost for the tier, costs all the same,
+// one per rank or varied, a deployment ceiling from none to tight, either
+// policy and a spread of provider ranks.
+func randomPlacer(r *rand.Rand, shape costShape) *placer {
 	hosts := r.IntN(12)
 
 	p := &placer{
@@ -26,7 +53,13 @@ func randomPlacer(r *rand.Rand, uniform bool) *placer {
 		policy:           []config.PlacementPolicy{config.PlacementPack, config.PlacementSpread}[r.IntN(2)],
 	}
 
-	shared := placementCost{vcpu: 1 + r.IntN(8), memory: config.ByteSize(1+r.IntN(16)) * config.GiB}
+	randomCost := func() placementCost {
+		return placementCost{vcpu: 1 + r.IntN(8), memory: config.ByteSize(1+r.IntN(16)) * config.GiB}
+	}
+
+	shared := randomCost()
+	perRank := []placementCost{randomCost(), randomCost(), randomCost()}
+	variedRank := r.IntN(6)
 
 	for i := range hosts {
 		name := fmt.Sprintf("host-%02d", i)
@@ -40,10 +73,12 @@ func randomPlacer(r *rand.Rand, uniform bool) *placer {
 		switch {
 		case r.IntN(6) == 0:
 			// No cost: this host cannot take the tier.
-		case uniform:
+		case shape == costsUniform:
 			p.cost[name] = shared
+		case shape == costsPerRank && p.rank[name] != variedRank:
+			p.cost[name] = perRank[p.rank[name]]
 		default:
-			p.cost[name] = placementCost{vcpu: 1 + r.IntN(8), memory: config.ByteSize(1+r.IntN(16)) * config.GiB}
+			p.cost[name] = randomCost()
 		}
 	}
 
@@ -61,21 +96,21 @@ func randomPlacer(r *rand.Rand, uniform bool) *placer {
 	return p
 }
 
-// THE COUNT IS THE GREEDY COUNT. Whenever every candidate charges the same,
-// counting in one pass gives exactly what placing one job at a time gives,
-// across random fleets, ceilings, policies, ranks and macOS licences; and
-// where they do not, total still answers what the greedy count does.
+// THE COUNT IS THE GREEDY COUNT. Counting a rank whose candidates charge the
+// same in one pass, and placing the rest one at a time over their own rank's
+// hosts, gives exactly what placing every job one at a time gives, across
+// random fleets, ceilings, policies, ranks and macOS licences.
 func TestCountingHeadroomGivesTheGreedyCount(t *testing.T) {
 	t.Parallel()
 
 	r := rand.New(rand.NewPCG(2026, 1008))
 
-	var uniformChecked, ceilingBound, macOS int
+	var uniformCounted, rankedCounted, mixedRanks, ceilingBound, macOS int
 
-	for i := range 20000 {
-		uniform := r.IntN(4) != 0
+	for i := range 30000 {
+		shape := []costShape{costsVaried, costsUniform, costsPerRank}[r.IntN(3)]
 
-		p := randomPlacer(r, uniform)
+		p := randomPlacer(r, shape)
 
 		tier := config.Tier{Label: "t", GuestOS: config.GuestLinux}
 		if r.IntN(3) == 0 {
@@ -83,39 +118,58 @@ func TestCountingHeadroomGivesTheGreedyCount(t *testing.T) {
 		}
 
 		want := p.greedyTotal(tier)
+		got, counted := p.countByRank(tier)
 
-		if got, ok := p.uniformTotal(tier); ok {
-			uniformChecked++
-
-			if tier.GuestOS == config.GuestMacOS {
-				macOS++
+		ranks := map[int]bool{}
+		for _, n := range p.order {
+			if _, ok := p.cost[n.name]; ok {
+				ranks[p.rank[n.name]] = true
 			}
-
-			// BOUND BY THE CEILING when lifting it would place more.
-			lifted := p.clone()
-			lifted.deploymentVCPU, lifted.deploymentMemory = int(^uint(0)>>1), config.ByteSize(1<<63-1)
-
-			if lifted.greedyTotal(tier) > want {
-				ceilingBound++
-			}
-
-			if got != want {
-				t.Fatalf("case %d: counted %d, placed %d, on %+v", i, got, want, *p)
-			}
-		} else if uniform {
-			t.Fatalf("case %d: one cost for every candidate and no count: %+v", i, p.cost)
 		}
 
-		if got := p.total(tier); got != want {
-			t.Fatalf("case %d: total %d, placed %d", i, got, want)
+		// BOUND BY THE CEILING when lifting it would place more.
+		lifted := p.clone()
+		lifted.deploymentVCPU, lifted.deploymentMemory = int(^uint(0)>>1), config.ByteSize(1<<63-1)
+
+		switch {
+		case shape == costsUniform && counted != len(ranks):
+			t.Fatalf("case %d: one cost for every candidate and %d of %d ranks counted: %+v",
+				i, counted, len(ranks), p.cost)
+		case shape == costsUniform && counted > 0:
+			uniformCounted++
+		case shape == costsPerRank && counted > 0 && len(ranks) > 1:
+			rankedCounted++
+
+			// A RANK COUNTED BESIDE ONE PLACED, so the deployment room the one
+			// leaves the other is what is being checked.
+			if counted < len(ranks) {
+				mixedRanks++
+			}
+		}
+
+		if counted > 0 && lifted.greedyTotal(tier) > want {
+			ceilingBound++
+		}
+
+		if counted > 0 && tier.GuestOS == config.GuestMacOS {
+			macOS++
+		}
+
+		if got != want {
+			t.Fatalf("case %d: counted %d, placed %d, on %+v", i, got, want, *p)
+		}
+
+		if total := p.total(tier); total != got {
+			t.Fatalf("case %d: total %d, countByRank %d", i, total, got)
 		}
 	}
 
-	// THE CASES THAT MATTER WERE MADE, not only possible: counted in one pass,
-	// on macOS, and with the deployment's ceiling the binding bound.
-	if uniformChecked < 10000 || macOS < 2000 || ceilingBound < 2000 {
-		t.Fatalf("of 20000 cases %d were counted in one pass, %d on macOS and %d bound by the ceiling",
-			uniformChecked, macOS, ceilingBound)
+	// THE CASES THAT MATTER WERE MADE, not only possible: one cost counted in
+	// one pass, several ranks each counted at its own cost, a counted rank
+	// beside a placed one, on macOS, and with the deployment's ceiling binding.
+	if uniformCounted < 5000 || rankedCounted < 3000 || mixedRanks < 1000 || macOS < 3000 || ceilingBound < 3000 {
+		t.Fatalf("of 30000 cases %d were counted at one cost, %d at a cost per rank (%d beside a placed rank), "+
+			"%d on macOS and %d bound by the ceiling", uniformCounted, rankedCounted, mixedRanks, macOS, ceilingBound)
 	}
 }
 
@@ -154,7 +208,7 @@ func TestCountingHeadroomSpendsNothing(t *testing.T) {
 	r := rand.New(rand.NewPCG(7, 7))
 
 	for range 200 {
-		p := randomPlacer(r, true)
+		p := randomPlacer(r, costsPerRank)
 		before := *p.clone()
 
 		p.total(config.Tier{Label: "t", GuestOS: config.GuestMacOS})

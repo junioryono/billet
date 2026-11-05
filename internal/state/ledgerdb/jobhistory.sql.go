@@ -579,7 +579,7 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= $1
-   AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
+   AND (github_queued_at = '' OR head_sha = '') AND github_job_id != '' AND COALESCE(repo, '') != ''
    AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
    AND (CAST($2 AS TEXT) = ''
         OR started_at < CAST($2 AS TEXT)
@@ -605,9 +605,10 @@ type ListJobsAwaitingQueueTimeRow struct {
 	GithubScaleSetAssignedAt string
 }
 
-// The jobs that started since a moment and still have no GitHub queue time,
-// with what finds each in GitHub's REST record of its run: the repository, the
-// run and GitHub's job id (the lease names the runner). Newest start first,
+// The jobs that started since a moment and still have no GitHub queue time or no
+// commit, both of which GitHub's list of a run's jobs gives in one read, with what
+// finds each in that list: the repository, the run and GitHub's job id (the lease
+// names the runner). Newest start first,
 // bounded, so a backlog is worked from the jobs an operator is looking at now.
 //
 // THE RUN IS THE ONE THAT STARTED: github_run_id, which the JobStarted wrote
@@ -804,7 +805,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
-       holder_incarnation
+       holder_incarnation, head_sha, head_branch, run_attempt
   FROM job_history WHERE lease_id = $1
 `
 
@@ -855,6 +856,9 @@ type ReadJobRow struct {
 	QuarantinedAt            string
 	LaunchIncarnation        string
 	HolderIncarnation        string
+	HeadSha                  string
+	HeadBranch               string
+	RunAttempt               int64
 }
 
 // One job's whole history row, for `billet jobs show`.
@@ -912,6 +916,9 @@ func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, erro
 		&i.QuarantinedAt,
 		&i.LaunchIncarnation,
 		&i.HolderIncarnation,
+		&i.HeadSha,
+		&i.HeadBranch,
+		&i.RunAttempt,
 	)
 	return i, err
 }
@@ -1148,8 +1155,11 @@ UPDATE job_history
                                THEN CAST($8 AS TEXT)
                                ELSE github_runner_assigned_at END,
        github_run_id = CASE WHEN github_run_id = 0 THEN CAST($9 AS BIGINT)
-                            ELSE github_run_id END
- WHERE lease_id = $10
+                            ELSE github_run_id END,
+       head_sha    = CASE WHEN head_sha = '' THEN CAST($10 AS TEXT) ELSE head_sha END,
+       head_branch = CASE WHEN head_branch = '' THEN CAST($11 AS TEXT) ELSE head_branch END,
+       run_attempt = CASE WHEN run_attempt = 0 THEN CAST($12 AS BIGINT) ELSE run_attempt END
+ WHERE lease_id = $13
    AND (github_job_id = '' OR github_job_id = CAST($1 AS TEXT))
 `
 
@@ -1163,6 +1173,9 @@ type RecordJobIdentityParams struct {
 	GithubScaleSetAssignedAt string
 	GithubRunnerAssignedAt   string
 	GithubRunID              int64
+	HeadSha                  string
+	HeadBranch               string
+	RunAttempt               int64
 	LeaseID                  string
 }
 
@@ -1189,6 +1202,9 @@ func (q *Queries) RecordJobIdentity(ctx context.Context, arg RecordJobIdentityPa
 		arg.GithubScaleSetAssignedAt,
 		arg.GithubRunnerAssignedAt,
 		arg.GithubRunID,
+		arg.HeadSha,
+		arg.HeadBranch,
+		arg.RunAttempt,
 		arg.LeaseID,
 	)
 	return err
