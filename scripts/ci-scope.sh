@@ -100,7 +100,7 @@ is_replay_input() {
 		internal/power/* | internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
 		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \
 		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
-		internal/usage/* | internal/version/* | internal/wallmeter/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;
+		internal/tokenbroker/* | internal/usage/* | internal/version/* | internal/wallmeter/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;
 	# internal/lifeops embeds the units and plists, so the harness builds deploy.
 	deploy/*) return 0 ;;
 	# And the EC2 provider builds the top of scripts/, for the AMI's build it

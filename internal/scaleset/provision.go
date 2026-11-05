@@ -56,7 +56,7 @@ func (c *Client) ValidateTrustedRunnerGroup(ctx context.Context, group string,
 	}
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
 	if err != nil {
-		return fmt.Errorf("scaleset: find trusted runner group %q: %w", group, err)
+		return fmt.Errorf("scaleset: find trusted runner group %q: %w", group, c.tokens.named(err))
 	}
 	if rg == nil {
 		return fmt.Errorf("scaleset: trusted runner group %q does not exist", group)
@@ -84,7 +84,7 @@ func (c *Client) RecoverRunner(
 	runner, err := c.gh.GetRunnerByName(ctx, runnerName)
 	if err != nil {
 		return billetgithub.RunnerRecovery{}, fmt.Errorf("scaleset: find runner %q for recovery: %w",
-			runnerName, err)
+			runnerName, c.tokens.named(err))
 	}
 	if runner == nil {
 		return billetgithub.RunnerRecovery{}, nil
@@ -178,7 +178,7 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
 	if err != nil {
-		return nil, fmt.Errorf("scaleset: find runner group %q: %w", group, err)
+		return nil, fmt.Errorf("scaleset: find runner group %q: %w", group, c.tokens.named(err))
 	}
 
 	if rg == nil {
@@ -187,7 +187,7 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 
 	existing, err := c.gh.GetRunnerScaleSet(ctx, rg.ID, name)
 	if err != nil {
-		return nil, fmt.Errorf("scaleset: look up scale set %q: %w", name, err)
+		return nil, fmt.Errorf("scaleset: look up scale set %q: %w", name, c.tokens.named(err))
 	}
 
 	if existing != nil {
@@ -270,7 +270,7 @@ func (c *Client) DeleteScaleSet(
 
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
 	if err != nil {
-		return false, fmt.Errorf("scaleset: find runner group %q: %w", group, err)
+		return false, fmt.Errorf("scaleset: find runner group %q: %w", group, c.tokens.named(err))
 	}
 
 	if rg == nil {
@@ -279,7 +279,7 @@ func (c *Client) DeleteScaleSet(
 
 	existing, err := c.gh.GetRunnerScaleSet(ctx, rg.ID, name)
 	if err != nil {
-		return false, fmt.Errorf("scaleset: look up scale set %q: %w", name, err)
+		return false, fmt.Errorf("scaleset: look up scale set %q: %w", name, c.tokens.named(err))
 	}
 
 	if existing == nil {
@@ -303,7 +303,7 @@ func (c *Client) DeleteScaleSet(
 	}
 
 	if err := c.gh.DeleteRunnerScaleSet(ctx, existing.ID); err != nil {
-		return false, fmt.Errorf("scaleset: delete scale set %q: %w", name, err)
+		return false, fmt.Errorf("scaleset: delete scale set %q: %w", name, c.tokens.named(err))
 	}
 
 	c.log.Info("deleted scale set", "name", name, "group", group, "id", existing.ID)
@@ -322,7 +322,7 @@ func (c *Client) Describe(ctx context.Context, name, group string) (*ScaleSet, [
 
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
 	if err != nil {
-		return nil, nil, fmt.Errorf("scaleset: find runner group %q: %w", group, err)
+		return nil, nil, fmt.Errorf("scaleset: find runner group %q: %w", group, c.tokens.named(err))
 	}
 
 	if rg == nil {
@@ -331,7 +331,7 @@ func (c *Client) Describe(ctx context.Context, name, group string) (*ScaleSet, [
 
 	existing, err := c.gh.GetRunnerScaleSet(ctx, rg.ID, name)
 	if err != nil {
-		return nil, nil, fmt.Errorf("scaleset: look up scale set %q: %w", name, err)
+		return nil, nil, fmt.Errorf("scaleset: look up scale set %q: %w", name, c.tokens.named(err))
 	}
 
 	if existing == nil {
@@ -585,7 +585,7 @@ func (c *Client) RemoveRunner(ctx context.Context, runnerID int64, runnerName st
 	if runnerName != "" {
 		runner, err := c.gh.GetRunnerByName(ctx, runnerName)
 		if err != nil {
-			return fmt.Errorf("scaleset: find runner %q before removal: %w", runnerName, err)
+			return fmt.Errorf("scaleset: find runner %q before removal: %w", runnerName, c.tokens.named(err))
 		}
 		if runner == nil {
 			return nil
@@ -634,7 +634,7 @@ func (c *Client) LookupRunnerGroup(ctx context.Context, group string) (*RunnerGr
 
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
 	if err != nil {
-		return nil, fmt.Errorf("scaleset: find runner group %q: %w", group, err)
+		return nil, fmt.Errorf("scaleset: find runner group %q: %w", group, c.tokens.named(err))
 	}
 
 	if rg == nil {
