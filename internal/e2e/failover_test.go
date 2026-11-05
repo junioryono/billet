@@ -211,6 +211,11 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 			first := openAssembled(t, harnessConfig(dir, 8, 16*config.GiB, tiers), targets, steering)
 			deployment := first.ctl.Deployment()
 
+			// A SHORT POLL WINDOW, because a registration does not wake a poll already
+			// parked: the superseded process hears it at its poll's next answer, which
+			// the default window puts up to fifty seconds away.
+			first.wire.Plane().SetPollWindowForTest(time.Second)
+
 			// THE ADDRESS THE NEXT CONTROLLER SERVES AT, known to the node before it
 			// exists when it is another, as a standby's is.
 			next := first.wire.Addr
@@ -317,6 +322,7 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 
 			replaced := openAssembled(t, cfg, targets, steering)
 			plane := replaced.wire.Plane()
+			plane.SetPollWindowForTest(time.Second)
 			ledger := replaced.ctl.Allocator()
 
 			waitUntil(t, "the current process to register with the new controller", func() bool {
