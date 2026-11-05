@@ -365,6 +365,7 @@ func TestSettlingARequestRecordsItOnItsJobsAndCountsIt(t *testing.T) {
 		counted  int64
 	}{
 		{"accepted", RerunRequested, 1},
+		{"may have been accepted", RerunUnconfirmed, 1},
 		{"never accepted", RerunFailed, 0},
 		{"refused by a lowered limit", RerunLimit, 0},
 	} {
@@ -417,9 +418,6 @@ func TestSettlingARequestRecordsItOnItsJobsAndCountsIt(t *testing.T) {
 			}
 
 			want := tc.decision
-			if want == RerunLimit {
-				want = RerunFailed
-			}
 			got, kind, asked, err := a.RerunOfAttempt(t.Context(), "acme/api", 31, 2)
 			if err != nil || !asked || got != want || kind != RerunOneJob {
 				t.Errorf("RerunOfAttempt = %q, %q, %v, %v, want %q of one job", got, kind, asked, err, want)
@@ -431,7 +429,7 @@ func TestSettlingARequestRecordsItOnItsJobsAndCountsIt(t *testing.T) {
 			// A SETTLED REQUEST'S ANSWER STANDS, whatever comes after, on the row and on
 			// the job.
 			other := RerunRequested
-			if tc.decision == RerunRequested {
+			if tc.decision == RerunRequested || tc.decision == RerunUnconfirmed {
 				other = RerunFailed
 			}
 			if err := a.SettleRerun(t.Context(), request, other, "too late"); err != nil {

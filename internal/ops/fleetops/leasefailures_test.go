@@ -265,15 +265,16 @@ func TestRerunColumnSaysWhatWasDecided(t *testing.T) {
 	t.Parallel()
 
 	for decision, want := range map[alloc.RerunDecision]string{
-		"":                    "-",
-		alloc.RerunRequested:  "requested",
-		alloc.RerunUnproven:   "unproven",
-		alloc.RerunMixed:      "mixed",
-		alloc.RerunLimit:      "limit",
-		alloc.RerunSuperseded: "superseded",
-		alloc.RerunExpired:    "expired",
-		alloc.RerunFailed:     "failed",
-		"from-a-newer-billet": `"from-a-newer-billet"`,
+		"":                     "-",
+		alloc.RerunRequested:   "requested",
+		alloc.RerunUnconfirmed: "unconfirmed",
+		alloc.RerunUnproven:    "unproven",
+		alloc.RerunMixed:       "mixed",
+		alloc.RerunLimit:       "limit",
+		alloc.RerunSuperseded:  "superseded",
+		alloc.RerunExpired:     "expired",
+		alloc.RerunFailed:      "failed",
+		"from-a-newer-billet":  `"from-a-newer-billet"`,
 	} {
 		if got := rerunColumn(decision); got != want {
 			t.Errorf("rerunColumn(%q) = %q, want %q", decision, got, want)

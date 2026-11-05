@@ -114,6 +114,18 @@ type rerunSweep struct {
 	asked    map[string]time.Time
 	tried    map[rerunRun]time.Time
 	listed   alloc.RerunCursor
+	// began is when the pass began on the wall clock, which clock measures from.
+	began time.Time
+}
+
+// clock is the pass's now moved on by how long the pass has run, for a deadline
+// checked after a read that may have been slow.
+func (s *rerunSweep) clock(now time.Time) time.Time {
+	if s.began.IsZero() {
+		return now
+	}
+
+	return now.Add(time.Since(s.began))
 }
 
 func newRerunSweep() *rerunSweep {
@@ -146,9 +158,10 @@ func (s *Server) rerunLimits() map[string]int64 {
 // rerunDisrupted asks GitHub to re-run the jobs billet proved it ended, until ctx
 // ends. It can stop nothing: a pass that fails is logged and the next tries again.
 //
-// IT RUNS WHERE NO TIER ASKS TOO, and a pass there is two reads of the ledger: a
-// request in doubt still has to be settled when its tier stops asking, and the
-// record of which tiers ask is what makes a tier asking again start again.
+// IT RUNS WHERE NO TIER ASKS TOO: its first pass records that none does, which is
+// what makes a tier asking again start again, and each pass after reads the requests
+// in doubt, which still have to be settled when their tier stops asking, and asks
+// GitHub only about them.
 func (s *Server) rerunDisrupted(ctx context.Context, targets map[string]Target, limits map[string]int64) {
 	every := rerunEvery
 	if s.rerunEvery > 0 {
@@ -174,6 +187,7 @@ func (s *Server) rerunDisrupted(ctx context.Context, targets map[string]Target, 
 func (s *Server) rerunOnce(ctx context.Context, targets map[string]Target, limits map[string]int64,
 	sweep *rerunSweep, now time.Time,
 ) {
+	sweep.began = time.Now()
 	if sweep.asked == nil {
 		tiers := make([]string, 0, len(limits))
 		for tier := range limits {
@@ -420,6 +434,15 @@ func (s *Server) bringUpOpenRerun(ctx context.Context, set *rerunWorkSet, reques
 	waiting func(rerunRun) bool,
 ) {
 	run := rerunRun{repository: request.Repository, run: request.RunID}
+
+	// PAST TWICE THE WINDOW IT IS SETTLED HERE, with no read: a paused or exhausted
+	// installation, or one that refuses every read, must not hold its jobs for ever.
+	if !request.Created.IsZero() && now.Sub(request.Created) > 2*rerunWindow {
+		s.settleUnread(ctx, request.RerunRequest, "its run could not be read within two days")
+
+		return
+	}
+
 	if waiting(run) || set.add(run, request.Tier) {
 		return
 	}
@@ -436,8 +459,8 @@ func (s *Server) bringUpOpenRerun(ctx context.Context, set *rerunWorkSet, reques
 		return
 	}
 
-	// PAST THE WINDOW IT IS SETTLED AS LANDED, never sent: it may have landed, and
-	// counting it only makes billet ask less.
+	// PAST THE WINDOW IT IS SETTLED, never sent: it may have landed, and counting it
+	// only makes billet ask less.
 	if s.rerunWindowPassed(request.RerunRequest, now) {
 		s.settleUnread(ctx, request.RerunRequest, "no target this control plane serves can read its run")
 
@@ -453,11 +476,12 @@ func (s *Server) rerunWindowPassed(request alloc.RerunRequest, now time.Time) bo
 	return !request.Created.IsZero() && now.Sub(request.Created) > rerunWindow
 }
 
-// settleUnread settles, as landed, a request in doubt past the window whose run cannot
-// be read: it may have landed, and counting it only makes billet ask less. Its jobs
-// are decided at last, which a job covered by a request in doubt otherwise never is.
+// settleUnread settles a request in doubt whose run could not be read in time as
+// unconfirmed: it may have landed, and counting it only makes billet ask less. Its
+// jobs are decided at last, which a job covered by a request in doubt otherwise never
+// is.
 func (s *Server) settleUnread(ctx context.Context, request alloc.RerunRequest, why string) {
-	if err := s.alloc.SettleRerun(ctx, request, alloc.RerunRequested, why); err != nil {
+	if err := s.alloc.SettleRerun(ctx, request, alloc.RerunUnconfirmed, why); err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn("could not settle a re-run in doubt past its window; trying again",
 				"repository", request.Repository, "run", request.RunID, "error", err)
@@ -466,7 +490,7 @@ func (s *Server) settleUnread(ctx context.Context, request alloc.RerunRequest, w
 		return
 	}
 
-	s.log.Warn("settled a re-run in doubt past its window as landed, since it may have; nothing was sent",
+	s.log.Warn("settled a re-run in doubt as unconfirmed, counted as landed since it may have; nothing was sent",
 		"repository", request.Repository, "run", request.RunID, "attempt", request.Attempt, "why", why)
 }
 
@@ -529,7 +553,9 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 	}
 	if err != nil {
 		// A RUN THAT CANNOT BE READ, OR READ SENSIBLY, holds a request in doubt only
-		// until the window: a run deleted at GitHub must not hold its jobs for ever.
+		// until the window: a run deleted at GitHub must not hold its jobs for ever. A
+		// throttle or a refusal is the installation's and may pass, so it holds until
+		// the gathering settles it, unread, at twice the window.
 		if doubted && s.rerunWindowPassed(open, now) && ctx.Err() == nil &&
 			!errors.Is(err, ErrRerunThrottled) && !errors.Is(err, ErrRerunRefused) {
 			s.settleUnread(ctx, open, rerunDetail(err))
@@ -602,8 +628,15 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 		return nil
 	}
 
+	// THE WINDOW ON THE CLOCK AS IT IS NOW, after the reads, so no job is asked about
+	// past it however slow GitHub was.
 	leases := make([]string, 0, len(proved))
 	for i := range proved {
+		if sweep.clock(now).Sub(proved[i].candidate.ResultAt) > rerunWindow {
+			s.decideAll(ctx, proved, alloc.RerunExpired, attempt.Attempt)
+
+			return nil
+		}
 		leases = append(leases, proved[i].candidate.LeaseID)
 	}
 	if err := s.alloc.BeginRerun(ctx, request, leases); err != nil {
@@ -690,8 +723,9 @@ func (s *Server) settleOpenRerun(ctx context.Context, w *rerunWork, open alloc.R
 	}
 
 	// NOT SENT PAST THE WINDOW: a job red that long is nobody's news, whatever kept
-	// the request from GitHub meanwhile.
-	if s.rerunWindowPassed(open, now) {
+	// the request from GitHub meanwhile. On the clock as it is now, after the read,
+	// rather than as it was when the pass began.
+	if s.rerunWindowPassed(open, sweep.clock(now)) {
 		sweep.failures[w.run] = "it was not sent within a day of being decided"
 
 		return false, s.giveUpRerun(ctx, w, open, alloc.RerunExpired, sweep)

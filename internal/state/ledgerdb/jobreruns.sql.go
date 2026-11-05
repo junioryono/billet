@@ -517,7 +517,7 @@ func (q *Queries) ReadOpenRerun(ctx context.Context, arg ReadOpenRerunParams) (R
 }
 
 const readRerunOfAttempt = `-- name: ReadRerunOfAttempt :one
-SELECT state, kind FROM job_reruns
+SELECT decision, kind FROM job_reruns
  WHERE repo = $1 AND run_id = $2 AND run_attempt = $3
 `
 
@@ -528,8 +528,8 @@ type ReadRerunOfAttemptParams struct {
 }
 
 type ReadRerunOfAttemptRow struct {
-	State string
-	Kind  string
+	Decision string
+	Kind     string
 }
 
 // How the request about one attempt of a run ended, and what it asked for.
@@ -538,7 +538,7 @@ type ReadRerunOfAttemptRow struct {
 func (q *Queries) ReadRerunOfAttempt(ctx context.Context, arg ReadRerunOfAttemptParams) (ReadRerunOfAttemptRow, error) {
 	row := q.db.QueryRowContext(ctx, readRerunOfAttempt, arg.Repo, arg.RunID, arg.RunAttempt)
 	var i ReadRerunOfAttemptRow
-	err := row.Scan(&i.State, &i.Kind)
+	err := row.Scan(&i.Decision, &i.Kind)
 	return i, err
 }
 
@@ -598,12 +598,13 @@ func (q *Queries) SettleJobsOfRerun(ctx context.Context, arg SettleJobsOfRerunPa
 }
 
 const settleRerun = `-- name: SettleRerun :exec
-UPDATE job_reruns SET state = $1, settled_at = $2, detail = $3
- WHERE repo = $4 AND run_id = $5 AND run_attempt = $6 AND state = 'asking'
+UPDATE job_reruns SET state = $1, decision = $2, settled_at = $3, detail = $4
+ WHERE repo = $5 AND run_id = $6 AND run_attempt = $7 AND state = 'asking'
 `
 
 type SettleRerunParams struct {
 	State      string
+	Decision   string
 	SettledAt  string
 	Detail     string
 	Repo       string
@@ -615,6 +616,7 @@ type SettleRerunParams struct {
 func (q *Queries) SettleRerun(ctx context.Context, arg SettleRerunParams) error {
 	_, err := q.db.ExecContext(ctx, settleRerun,
 		arg.State,
+		arg.Decision,
 		arg.SettledAt,
 		arg.Detail,
 		arg.Repo,

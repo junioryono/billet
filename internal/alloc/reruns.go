@@ -30,6 +30,10 @@ type RerunDecision string
 const (
 	// RerunRequested means GitHub accepted a request that covers this job.
 	RerunRequested RerunDecision = "requested"
+	// RerunUnconfirmed means a request that covers this job may have landed, and
+	// GitHub could not be read to say for longer than a day. It is counted against a
+	// limit as if it landed, which only makes billet ask less.
+	RerunUnconfirmed RerunDecision = "unconfirmed"
 	// RerunUnproven means GitHub's record of the job does not prove a lost runner,
 	// so it may have failed on its own.
 	RerunUnproven RerunDecision = "unproven"
@@ -56,10 +60,10 @@ const (
 	RerunOneJob RerunKind = "job"
 )
 
-// The states of a request. A request is `asking` from before it leaves until
-// GitHub's answer, or its record of the run, says how it ended.
+// The states a request is settled in. It is `asking`, which only the queries write
+// and read, from before it leaves until GitHub's answer, or its record of the run,
+// says how it ended.
 const (
-	rerunStateAsking    = "asking"
 	rerunStateRequested = "requested"
 	rerunStateFailed    = "failed"
 )
@@ -302,7 +306,8 @@ func (a *Allocator) OpenRerun(ctx context.Context, repository string, runID int6
 }
 
 // RerunOfAttempt says what the request about one attempt of a run came to and what
-// it asked for, false when that attempt was never asked about.
+// it asked for, false when that attempt was never asked about. The decision is empty
+// while the request is in doubt, which the decision column is until it is settled.
 func (a *Allocator) RerunOfAttempt(ctx context.Context, repository string, runID, attempt int64,
 ) (RerunDecision, RerunKind, bool, error) {
 	var (
@@ -324,10 +329,7 @@ func (a *Allocator) RerunOfAttempt(ctx context.Context, repository string, runID
 			return fmt.Errorf("alloc: read the re-run of attempt %d of run %d: %w", attempt, runID, err)
 		}
 
-		decision, kind, asked = RerunFailed, RerunKind(row.Kind), true
-		if row.State == rerunStateRequested {
-			decision = RerunRequested
-		}
+		decision, kind, asked = RerunDecision(row.Decision), RerunKind(row.Kind), true
 
 		return nil
 	})
@@ -395,11 +397,11 @@ func (a *Allocator) RetryRerun(ctx context.Context, request RerunRequest) error 
 }
 
 // SettleRerun ends a request in doubt with what it came to, on every job bound to
-// it: RerunRequested for one GitHub accepted, which is the one counted against a
-// limit, and for one never accepted the reason, RerunFailed or RerunLimit.
+// it: RerunRequested for one GitHub accepted and RerunUnconfirmed for one that may
+// have been, both counted against a limit, and for one never accepted the reason.
 func (a *Allocator) SettleRerun(ctx context.Context, request RerunRequest, decision RerunDecision, detail string) error {
 	settled := rerunStateFailed
-	if decision == RerunRequested {
+	if decision == RerunRequested || decision == RerunUnconfirmed {
 		settled = rerunStateRequested
 	}
 
@@ -408,7 +410,7 @@ func (a *Allocator) SettleRerun(ctx context.Context, request RerunRequest, decis
 		at := ts(a.now().UTC())
 
 		if err := q.SettleRerun(ctx, ledgerdb.SettleRerunParams{
-			State: settled, SettledAt: at, Detail: detail,
+			State: settled, Decision: string(decision), SettledAt: at, Detail: detail,
 			Repo: request.Repository, RunID: request.RunID, RunAttempt: request.Attempt,
 		}); err != nil {
 			return fmt.Errorf("alloc: settle the re-run of run %d: %w", request.RunID, err)

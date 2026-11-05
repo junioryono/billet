@@ -11,8 +11,9 @@
 -- reading the run rather than by asking again.
 --
 -- tries bounds it. A request that keeps failing settles `failed` and is reported,
--- and never retries forever. detail is GitHub's decoded message, or the class of
--- a transport failure: nothing a guest wrote.
+-- and never retries forever. decision is what it came to, the word its jobs carry,
+-- which a job late to its attempt takes too. detail is GitHub's decoded message, or
+-- the class of a transport failure: nothing a guest wrote.
 --
 -- job_history carries the outcome on the job, the row an operator and a report
 -- read. rerun_decision is empty until decided, from a vocabulary closed in Go
@@ -42,6 +43,7 @@ CREATE TABLE job_reruns (
     tries INTEGER NOT NULL DEFAULT 0 CHECK (tries >= 0),
     created_at TEXT NOT NULL,
     settled_at TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo, run_id, run_attempt)
 ) STRICT

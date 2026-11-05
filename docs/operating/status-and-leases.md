@@ -91,6 +91,7 @@ The `RE-RUN` column of `billet leases failures`, and the `failure` line of `bill
 | Decision | What it means |
 |---|---|
 | `requested` | GitHub accepted a request that covers this job |
+| `unconfirmed` | a request that covers this job may have landed, and GitHub could not be read to say for over a day; it is counted as one that did |
 | `unproven` | GitHub's record does not show a lost runner, so the job may have failed on its own |
 | `mixed` | several jobs were proved beside a job that failed on its own, and neither of GitHub's two requests can run them without it |
 | `limit` | the run already had every re-run the tiers of the jobs it would run again allow |

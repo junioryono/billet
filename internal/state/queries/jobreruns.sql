@@ -114,7 +114,7 @@ SELECT run_attempt, kind, github_job_id, tries, created_at
 -- How the request about one attempt of a run ended, and what it asked for.
 -- sql.ErrNoRows is an attempt not asked about; a job that finished late finds here
 -- what its attempt's request came to, since the key allows that attempt no second.
-SELECT state, kind FROM job_reruns
+SELECT decision, kind FROM job_reruns
  WHERE repo = @repo AND run_id = @run_id AND run_attempt = @run_attempt;
 
 -- name: CountRunReruns :one
@@ -136,7 +136,7 @@ UPDATE job_reruns SET tries = tries + 1
 
 -- name: SettleRerun :exec
 -- End a request. Only one in doubt: a settled request's answer stands.
-UPDATE job_reruns SET state = @state, settled_at = @settled_at, detail = @detail
+UPDATE job_reruns SET state = @state, decision = @decision, settled_at = @settled_at, detail = @detail
  WHERE repo = @repo AND run_id = @run_id AND run_attempt = @run_attempt AND state = 'asking';
 
 -- name: BindJobToRerun :exec

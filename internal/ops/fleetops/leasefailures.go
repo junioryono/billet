@@ -118,7 +118,7 @@ func rerunColumn(d alloc.RerunDecision) string {
 	switch d {
 	case "":
 		return "-"
-	case alloc.RerunRequested, alloc.RerunUnproven, alloc.RerunMixed, alloc.RerunLimit,
+	case alloc.RerunRequested, alloc.RerunUnconfirmed, alloc.RerunUnproven, alloc.RerunMixed, alloc.RerunLimit,
 		alloc.RerunSuperseded, alloc.RerunExpired, alloc.RerunFailed:
 		return string(d)
 	default:

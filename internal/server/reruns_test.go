@@ -1463,13 +1463,119 @@ func TestARunThatCannotBeReadHoldsARequestOnlyUntilTheWindow(t *testing.T) {
 	r.after(rerunWindow + time.Hour).pass()
 
 	if got, _, _ := r.request(1); got != "requested" {
-		t.Errorf("past the window = %s", got)
+		t.Errorf("past the window = %s, want it counted as landed", got)
 	}
-	if got := r.decision("lost"); got != alloc.RerunRequested {
+	if got := r.decision("lost"); got != alloc.RerunUnconfirmed {
 		t.Errorf("decision = %q", got)
 	}
 	if r.github.asked() != 0 {
 		t.Error("sent")
+	}
+}
+
+// AN INSTALLATION THAT REFUSES EVERY READ HOLDS A REQUEST IN DOUBT ONLY UNTIL TWICE THE
+// WINDOW: a refusal may pass, so a day is not enough, and two are.
+func TestARefusedInstallationHoldsARequestOnlyUntilTwiceTheWindow(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, 10*time.Minute)
+	if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+		Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+		t.Fatal(err)
+	}
+	r.github.readErr = fmt.Errorf("HTTP 403: %w", ErrRerunRefused)
+
+	r.after(rerunWindow + time.Hour).pass()
+	if got, _, _ := r.request(1); got != "asking" {
+		t.Fatalf("a refusal past one window = %s, want it held", got)
+	}
+
+	r.after(rerunWindow).pass()
+	if got := r.decision("lost"); got != alloc.RerunUnconfirmed {
+		t.Errorf("past twice the window = %q", got)
+	}
+	if r.github.asked() != 0 {
+		t.Error("sent")
+	}
+}
+
+// THE DEADLINE IS THE CLOCK AS IT IS AFTER THE READ, not as the pass began: a slow
+// GitHub does not let a request out past the window.
+func TestTheWindowIsCheckedAfterTheRead(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, 10*time.Minute)
+	if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+		Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+		t.Fatal(err)
+	}
+	r.lists(1)
+
+	// THE PASS BEGAN TWO HOURS AGO ON THE WALL CLOCK, an hour short of the window by
+	// its own reckoning.
+	r.after(rerunWindow - time.Hour)
+	r.sweep.began = time.Now().Add(-2 * time.Hour)
+	w := rerunWork{run: rerunRun{repository: "acme/api", run: 31}, target: "default", installation: "i",
+		client: r.github}
+	if err := r.s.decideRerun(t.Context(), &w, r.limits, r.sweep, r.now); err != nil {
+		t.Fatal(err)
+	}
+
+	if r.github.asked() != 0 {
+		t.Error("sent past the window")
+	}
+	if got := r.decision("lost"); got != alloc.RerunExpired {
+		t.Errorf("decision = %q", got)
+	}
+}
+
+// A JOB FIRST ASKED ABOUT IS HELD TO THE SAME CLOCK: a job an hour inside the window
+// when the pass began, and past it once a slow read has returned, is not sent.
+func TestAFreshJobIsCheckedAgainstTheWindowAfterTheRead(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, rerunWindow-time.Hour)
+	r.lists(1, listed("lost", 77, true))
+
+	r.sweep.began = time.Now().Add(-2 * time.Hour)
+	w := rerunWork{run: rerunRun{repository: "acme/api", run: 31}, target: "default", installation: "i",
+		client: r.github}
+	if err := r.s.decideRerun(t.Context(), &w, r.limits, r.sweep, r.now); err != nil {
+		t.Fatal(err)
+	}
+
+	if r.github.asked() != 0 {
+		t.Error("sent past the window")
+	}
+	if got := r.decision("lost"); got != alloc.RerunExpired {
+		t.Errorf("decision = %q", got)
+	}
+}
+
+// A JOB LATE TO AN ATTEMPT WHOSE REQUEST ENDED AT THE LIMIT SAYS SO, as its siblings
+// do, rather than that GitHub refused something it was never sent.
+func TestALateJobTakesTheStoredAnswer(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	request := alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: alloc.RerunFailedJobs}
+	if err := r.a.BeginRerun(t.Context(), request, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.a.SettleRerun(t.Context(), request, alloc.RerunLimit, "lowered"); err != nil {
+		t.Fatal(err)
+	}
+
+	r.job("late", 31, 10*time.Minute)
+	r.lists(1, listed("late", 77, true))
+
+	r.pass()
+
+	if got := r.decision("late"); got != alloc.RerunLimit {
+		t.Errorf("decision = %q", got)
 	}
 }
 

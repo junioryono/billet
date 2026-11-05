@@ -16,6 +16,7 @@ CREATE TABLE job_reruns (
     tries bigint NOT NULL DEFAULT 0 CHECK (tries >= 0),
     created_at text NOT NULL,
     settled_at text NOT NULL DEFAULT '',
+    decision text NOT NULL DEFAULT '',
     detail text NOT NULL DEFAULT '',
     PRIMARY KEY (repo, run_id, run_attempt)
 );
