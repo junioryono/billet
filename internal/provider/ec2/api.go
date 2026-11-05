@@ -376,15 +376,15 @@ func transportFailure(err error) error {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return err
 	}
+	// A DNS FAILURE NAMES ONLY THE CONFIGURED HOST, and arrives inside an OpError that
+	// is neither a syscall nor a timeout, so it is asked for first.
+	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
+		return dnsErr
+	}
 	if opErr, ok := errors.AsType[*net.OpError](err); ok {
 		if sysErr, sys := errors.AsType[*os.SyscallError](opErr.Err); (sys && sysErr.Err != nil) || opErr.Timeout() {
 			return opErr
 		}
-
-		return errAnswerWithheld
-	}
-	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
-		return dnsErr
 	}
 
 	return errAnswerWithheld

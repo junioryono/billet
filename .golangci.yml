@@ -262,6 +262,8 @@ linters:
               desc: "A provider must not import the node runtime that drives it."
             - pkg: "github.com/junioryono/billet/cmd"
               desc: "Providers must not import cmd/."
+            - pkg: "github.com/junioryono/billet/internal/hostsource"
+              desc: "A host source may use a provider's client; a provider never reaches up to a host source."
 
         # A host source rents the machine a node runs on (ADR-026). It answers the
         # pool and nothing above it, and it writes no ledger: the pool reads what a
@@ -278,6 +280,8 @@ linters:
             - pkg: "github.com/junioryono/billet/internal/state"
               desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
             - pkg: "github.com/junioryono/billet/internal/alloc"
+              desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
+            - pkg: "github.com/junioryono/billet/internal/rollout"
               desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
             - pkg: "github.com/junioryono/billet/cmd"
               desc: "Host sources must not import cmd/."
@@ -757,6 +761,8 @@ linters:
               desc: "A package that opens a write transaction must not run subprocesses: DB.Tx holds SQLite's single writer slot for as long as the command takes."
             - pkg: "github.com/junioryono/billet/internal/provider"
               desc: "The ledger is a lower layer than compute; a provider call inside a transaction holds the single writer slot across a remote API."
+            - pkg: "github.com/junioryono/billet/internal/hostsource"
+              desc: "A host source calls a provider's API (ADR-026): the release proof is built inside the transaction, and the source is called after it commits."
             - pkg: "github.com/junioryono/billet/internal/store"
               desc: "The ledger is a lower layer than site storage; an rbd call inside a transaction holds the single writer slot."
             - pkg: "github.com/junioryono/billet/internal/tokenbroker"

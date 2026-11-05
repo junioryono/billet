@@ -651,3 +651,34 @@ func TestWithheldKeepsASystemCause(t *testing.T) {
 		t.Errorf("a certificate's text survived: %v", err)
 	}
 }
+
+// A DNS FAILURE AND A TIMEOUT NAME ONLY THIS API'S HOST, so both keep their cause.
+func TestWithheldKeepsDNSAndTimeouts(t *testing.T) {
+	t.Parallel()
+	dns := &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "api.example", IsNotFound: true}}
+	if got, ok := errors.AsType[*net.DNSError](withheld(fmt.Errorf("Get: %w", dns))); !ok || !got.IsNotFound {
+		t.Errorf("a failed lookup lost its cause")
+	}
+	timeout := &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	if got := withheld(fmt.Errorf("Get: %w", timeout)); !errors.Is(got, os.ErrDeadlineExceeded) {
+		t.Errorf("a timeout lost its cause: %v", got)
+	}
+}
+
+// A REFUSAL OVER AN ANSWER NAMES THE SERVER THAT WAS ASKED FOR.
+func TestARefusalNamesTheServerItAskedFor(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := `{"id":"srv-9","status":"powered-on"}`
+		if r.URL.Path == "/token" {
+			body = `{"access_token":"tok-1","expires_in":300}`
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("write: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	if _, err := source(t, srv).Describe(t.Context(), "srv-1"); err == nil || !strings.Contains(err.Error(), "srv-1") {
+		t.Fatalf("describe = %v", err)
+	}
+}

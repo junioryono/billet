@@ -15,7 +15,7 @@ What was measured of both, with dates, is in the [bare-metal hosts record](../re
 
 ### Host sources behind one contract
 
-A new package, `internal/hostsource`, holds the contract a source implements, beside `internal/provider` and below the scheduler: a source imports neither `server`, `node`, `nodeplane` nor `cmd`, and writes no ledger, which depguard holds (`hostsource`). A source answers:
+A new package, `internal/hostsource`, holds the contract a source implements, beside `internal/provider` and below the scheduler: a source imports neither `server`, `node`, `nodeplane` nor `cmd`, and writes no ledger, a provider never imports a source, and no ledger writer imports one, so a source is never called inside a transaction; depguard holds all four (`hostsource`, `provider`, `ledgerwriters`). A source may use a provider's client, as the AWS source uses the `ec2` provider's. A source answers:
 
 - **Order** a host of a named shape in a named location, carrying the payload its first boot runs and the pool's order identifier, which the source records on the host (an EC2 `ClientToken` and tag, a phoenixNAP hostname). It answers with the source's identifier for the host, with `ErrNoStock` or `ErrQuota`, which the scaler reports and never waits on, or with `ErrRefused`, a refusal an operator acts on (phoenixNAP's 403 to an API client that may not order, measured). Any other error is could-not-tell.
 - **Find** the host an order placed, by that identifier, so an order whose answer was lost is read back rather than placed again.
@@ -24,7 +24,7 @@ A new package, `internal/hostsource`, holds the contract a source implements, be
 - **Release** a host, only with a proof (below).
 - **Terms**: lead time, billing granularity and minimum term, per shape, which decide whether a source covers the floor or bursts, and for how long after its first attempt an order is idempotent, which decides whether a lost answer may be ordered again. A shape that is preemptible is refused.
 
-The AWS source, `internal/hostsource/awsmetal`, launches, describes and terminates through the same EC2 client the `ec2` provider uses, with its retry ladder, its error codes, its `ClientToken` idempotency and its redaction, so there is one EC2 client as there is one signer; where that client lives so both may import it is the AWS source's change to make. The phoenixNAP source, `internal/hostsource/phoenixnap`, uses the BMC API with a client-credentials token. Each source's credentials are redacting types read from the environment or the identity store, never from argv, and never logged.
+The AWS source, `internal/hostsource/awsmetal`, launches, describes and terminates through the same EC2 client the `ec2` provider uses, with its retry ladder, its error codes, its `ClientToken` idempotency and its redaction, so there is one EC2 client as there is one signer. Today the source reaches it through a pool-host surface the `ec2` provider exports; moving the client below both, with the one transport-error rule the phoenixNAP source now copies, is owed with the pool. The phoenixNAP source, `internal/hostsource/phoenixnap`, uses the BMC API with a client-credentials token. Each source's credentials are redacting types read from the environment or the identity store, never from argv, and never logged.
 
 ### Shape
 

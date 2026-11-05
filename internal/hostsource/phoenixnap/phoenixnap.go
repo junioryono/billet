@@ -467,6 +467,9 @@ func withheld(err error) error {
 	case errors.Is(err, context.DeadlineExceeded):
 		return fmt.Errorf("%w: %w", errWithheld, context.DeadlineExceeded)
 	}
+	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
+		return dnsErr
+	}
 	if opErr, ok := errors.AsType[*net.OpError](err); ok {
 		if sysErr, sys := errors.AsType[*os.SyscallError](opErr.Err); (sys && sysErr.Err != nil) || opErr.Timeout() {
 			return opErr

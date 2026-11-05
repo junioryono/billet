@@ -2,9 +2,11 @@
 // (ADR-026): order a host, describe it, prove it gone, release it, and say what its
 // terms are. A pool on top of it grows and shrinks; a source only answers.
 //
-// A SIBLING OF internal/provider, BELOW THE SCHEDULER. A provider starts one job's
-// compute and a source rents the machine a node runs on; neither imports the other,
-// and neither imports server, node or cmd.
+// BESIDE internal/provider, BELOW THE SCHEDULER. A provider starts one job's compute
+// and a source rents the machine a node runs on. A source may use a provider's client
+// (awsmetal uses the ec2 provider's, so there is one EC2 client), a provider never
+// imports a source, and neither imports server, node or cmd (depguard: provider,
+// hostsource). Lifting the EC2 client below both is owed with the pool.
 //
 // EVERY ANSWER THAT RELEASES ANYTHING HAS THREE VALUES, and its zero value is the one
 // that holds. A source that cannot tell whether a host is gone says so, says gone only

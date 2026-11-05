@@ -456,3 +456,30 @@ func TestTransportFailureKeepsOnlySystemCauses(t *testing.T) {
 		t.Errorf("a deadline lost its classification: %v", got)
 	}
 }
+
+// A DNS FAILURE AND A TIMEOUT NAME ONLY THE CONFIGURED ENDPOINT, so both keep their
+// cause, as an operator needs to read them.
+func TestTransportFailureKeepsDNSAndTimeouts(t *testing.T) {
+	t.Parallel()
+	dns := &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "ec2.example", IsNotFound: true}}
+	if got, ok := errors.AsType[*net.DNSError](transportFailure(fmt.Errorf("Post: %w", dns))); !ok || !got.IsNotFound {
+		t.Errorf("a failed lookup lost its cause")
+	}
+	timeout := &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	if got := transportFailure(fmt.Errorf("Post: %w", timeout)); !errors.Is(got, os.ErrDeadlineExceeded) {
+		t.Errorf("a timeout lost its cause: %v", got)
+	}
+}
+
+// A REFUSAL OVER AN ANSWER NAMES THE ORDER THAT WAS ASKED FOR.
+func TestARefusalNamesTheOrderAskedFor(t *testing.T) {
+	t.Parallel()
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusOK, describeReply("", poolOwnerOnlyXML("i-1"))
+	}
+	_, _, err := newTestProvider(t, f, nil).Hosts().Find(t.Context(), "o-1")
+	if err == nil || !strings.Contains(err.Error(), "o-1") {
+		t.Fatalf("find = %v", err)
+	}
+}
