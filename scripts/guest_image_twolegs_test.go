@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -711,15 +712,15 @@ func TestALastGoodImageIsCarriedOnlyWhenItIsProved(t *testing.T) {
 			}
 
 			// WHAT WAS PROVED IS WHAT IS PUBLISHED, byte for byte.
-			if got, want := readBytes(t, filepath.Join(out, "manifest-aarch64.json")), readBytes(t, filepath.Join(dir, "verified-manifest")); string(got) != string(want) {
+			if got, want := readBytes(t, filepath.Join(out, "manifest-aarch64.json")), readBytes(t, filepath.Join(dir, "verified-manifest")); !bytes.Equal(got, want) {
 				t.Error("the manifest left in the release is not the one that was verified")
 			}
 
-			if got, want := readBytes(t, filepath.Join(out, "manifest-aarch64.sigstore.json")), readBytes(t, filepath.Join(dir, "verified-bundle")); string(got) != string(want) {
+			if got, want := readBytes(t, filepath.Join(out, "manifest-aarch64.sigstore.json")), readBytes(t, filepath.Join(dir, "verified-bundle")); !bytes.Equal(got, want) {
 				t.Error("the bundle left in the release is not the one that was verified")
 			}
 
-			if got, want := readBytes(t, filepath.Join(dir, "verified-pointer")), []byte(pointer); string(got) != string(want) {
+			if got, want := readBytes(t, filepath.Join(dir, "verified-pointer")), []byte(pointer); !bytes.Equal(got, want) {
 				t.Errorf("what was verified of the channel is %q", got)
 			}
 
