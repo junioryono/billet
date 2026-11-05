@@ -1,9 +1,12 @@
 package ec2
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -202,5 +205,123 @@ func TestDescribeSaysNotFoundAsItsOwnAnswer(t *testing.T) {
 	}
 	if _, err := newTestProvider(t, f, nil).Hosts().Describe(t.Context(), "i-1"); !errors.Is(err, ErrHostNotFound) {
 		t.Fatalf("describe = %v", err)
+	}
+}
+
+func jobAndPoolTaggedXML(id string) string {
+	return `<item><instanceId>` + id + `</instanceId><instanceState><name>running</name></instanceState>` +
+		`<tagSet><item><key>Name</key><value>billet-lease</value></item>` +
+		`<item><key>sh.billet.owner</key><value>dep-1</value></item>` +
+		`<item><key>sh.billet.pool-owner</key><value>dep-1</value></item>` +
+		`<item><key>sh.billet.pool-order</key><value>o-1</value></item></tagSet></item>`
+}
+
+func poolOwnerOnlyXML(id string) string {
+	return `<item><instanceId>` + id + `</instanceId><instanceState><name>running</name></instanceState>` +
+		`<tagSet><item><key>sh.billet.pool-owner</key><value>dep-1</value></item></tagSet></item>`
+}
+
+// AN INSTANCE THAT CARRIES THE JOB INSTANCES' OWNER TAG, or the pool tag without an
+// order, is not a pool host for any of the three operations, and an order lookup that
+// meets one is an error rather than "none".
+func TestAnInstanceWithConflictingOrMissingPoolTagsIsNotAPoolHost(t *testing.T) {
+	t.Parallel()
+	for name, item := range map[string]string{
+		"job and pool tags":  jobAndPoolTaggedXML("i-1"),
+		"pool tag, no order": poolOwnerOnlyXML("i-1"),
+	} {
+		f := newFakeEC2(t)
+		f.respond = func(action string, _ url.Values) (int, string) {
+			if action == "DescribeInstances" {
+				return http.StatusOK, describeReply("", item)
+			}
+
+			return http.StatusOK, defaultReply(action)
+		}
+		h := newTestProvider(t, f, nil).Hosts()
+		if _, err := h.Describe(t.Context(), "i-1"); !errors.Is(err, ErrNotAPoolHost) {
+			t.Errorf("%s: describe = %v", name, err)
+		}
+		if err := h.Terminate(t.Context(), "i-1"); !errors.Is(err, ErrNotAPoolHost) {
+			t.Errorf("%s: terminate = %v", name, err)
+		}
+		if _, err := h.Console(t.Context(), "i-1"); !errors.Is(err, ErrNotAPoolHost) {
+			t.Errorf("%s: console = %v", name, err)
+		}
+		if n := f.countOf("TerminateInstances") + f.countOf("GetConsoleOutput"); n != 0 {
+			t.Errorf("%s: %d calls reached a non-pool instance", name, n)
+		}
+	}
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusOK, describeReply("", jobAndPoolTaggedXML("i-1"))
+	}
+	if _, ok, err := newTestProvider(t, f, nil).Hosts().Find(t.Context(), "o-1"); !errors.Is(err, ErrNotAPoolHost) || ok {
+		t.Fatalf("find over a job instance carrying the order = %t, %v", ok, err)
+	}
+}
+
+// AN ANSWER THAT IS NOT A LIST OF INSTANCES IS NOT AN EMPTY ONE: another root, or an
+// instance without an id, cannot be read as none.
+func TestAMalformedDescribeIsNotAnEmptyList(t *testing.T) {
+	t.Parallel()
+	for name, reply := range map[string]string{
+		"another root": `<unexpected/>`,
+		// Every pool tag present, so only the missing id can be what refuses it.
+		"no id": describeReply("", strings.Replace(poolHostXML("i-1", "dep-1", "o-1", "running"),
+			"<instanceId>i-1</instanceId>", "", 1)),
+	} {
+		f := newFakeEC2(t)
+		f.respond = func(string, url.Values) (int, string) { return http.StatusOK, reply }
+		if _, ok, err := newTestProvider(t, f, nil).Hosts().Find(t.Context(), "o-1"); err == nil || ok {
+			t.Errorf("%s: find = %t, %v", name, ok, err)
+		}
+	}
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) { return http.StatusOK, describeReply("") }
+	if _, ok, err := newTestProvider(t, f, nil).Hosts().Find(t.Context(), "o-1"); err != nil || ok {
+		t.Fatalf("a genuinely empty list: %t, %v", ok, err)
+	}
+}
+
+// AN ANSWER THAT WILL NOT PARSE CAN QUOTE THE REQUEST, so a launch's failure keeps no
+// text but its classification.
+func TestALaunchAnswerThatWillNotParseQuotesNothing(t *testing.T) {
+	t.Parallel()
+	f := newFakeEC2(t)
+	f.respond = func(action string, _ url.Values) (int, string) {
+		if action == "RunInstances" {
+			return http.StatusOK, `<RunInstancesResponse><token-9QX></RunInstancesResponse>`
+		}
+
+		return http.StatusOK, defaultReply(action)
+	}
+	_, err := newTestProvider(t, f, nil).Hosts().Launch(t.Context(), hostLaunch())
+	if err == nil || strings.Contains(err.Error(), "token-9QX") || !errors.Is(err, errWithheld) {
+		t.Fatalf("launch = %v", err)
+	}
+}
+
+// A LAUNCH CARRIES THE JOIN TOKEN, so it renders as its order, shape and image only.
+func TestAHostLaunchIsRedactedOnEveryRenderingPath(t *testing.T) {
+	t.Parallel()
+	l := hostLaunch()
+	safe := "ec2.HostLaunch{order=o-1 type=m7gd.metal image=ami-0host user data redacted}"
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%x", "%q"} {
+		if got := fmt.Sprintf(verb, l); got != safe {
+			t.Errorf("%s = %q", verb, got)
+		}
+	}
+	b, err := json.Marshal(l)
+	if err != nil || string(b) != `"`+safe+`"` {
+		t.Errorf("json = %s (%v)", b, err)
+	}
+	var text, asJSON bytes.Buffer
+	slog.New(slog.NewTextHandler(&text, nil)).Info("x", "launch", l)
+	slog.New(slog.NewJSONHandler(&asJSON, nil)).Info("x", "launch", l)
+	for _, out := range []string{text.String(), asJSON.String()} {
+		if !strings.Contains(out, "user data redacted") || strings.Contains(out, "token-9QX") {
+			t.Errorf("slog = %s", out)
+		}
 	}
 }

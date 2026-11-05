@@ -136,6 +136,9 @@ func TestEC2RefusalsAreTheContractsAnswers(t *testing.T) {
 	}
 	f := &fakeHosts{launchErr: codedError{"InternalError"}}
 	_, err := newTestSource(t, f).Order(t.Context(), hostsource.Request{Order: "o-1", Shape: "m7gd.metal"})
+	if code, ok := codeOfStandIn(err); !ok || code != "InternalError" {
+		t.Fatalf("an ambiguous failure lost its error: %v", err)
+	}
 	for _, answer := range []error{hostsource.ErrNoStock, hostsource.ErrQuota, hostsource.ErrRefused} {
 		if errors.Is(err, answer) {
 			t.Errorf("an ambiguous failure read as %v", answer)
@@ -208,5 +211,19 @@ func TestAStoppedHostIsFailed(t *testing.T) {
 		if got := stateOf(state); got != want {
 			t.Errorf("%q = %v, want %v", state, got, want)
 		}
+	}
+}
+
+// EC2'S CLIENTTOKEN DEDUPLICATES A RESENT LAUNCH FOR A BOUNDED TIME, so the source
+// says so, with billet's window; an undeclared shape has no terms.
+func TestTermsGiveTheClientTokenWindow(t *testing.T) {
+	t.Parallel()
+	s := newTestSource(t, &fakeHosts{})
+	terms, err := s.Terms("m7gd.metal")
+	if err != nil || terms.IdempotentFor != 10*time.Minute || terms.BillingUnit != time.Second || terms.Preemptible {
+		t.Fatalf("terms = %+v, %v", terms, err)
+	}
+	if _, err := s.Terms("c7i.metal-24xl"); err == nil {
+		t.Fatal("an undeclared shape has terms")
 	}
 }

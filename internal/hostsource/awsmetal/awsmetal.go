@@ -23,6 +23,13 @@ import (
 // Name is this source's kind.
 const Name = "aws-metal"
 
+// clientTokenWindow is how long after its first attempt a pool order may be sent again
+// under its ClientToken. AWS keeps a token's record for a bounded time it does not
+// state; the ec2 provider measured one still refusing a changed relaunch long after the
+// fact, and ten minutes is billet's bound, far inside that. Past it, a lost answer waits
+// for a person.
+const clientTokenWindow = 10 * time.Minute
+
 // hosts is the part of the ec2 provider's pool-host surface this source uses.
 type hosts interface {
 	Launch(ctx context.Context, l ec2.HostLaunch) (ec2.HostRecord, error)
@@ -86,7 +93,7 @@ func (s *Source) Terms(shape string) (hostsource.Terms, error) {
 		return hostsource.Terms{}, fmt.Errorf("awsmetal: %s is not a declared shape", shape)
 	}
 
-	return hostsource.Terms{LeadTime: time.Minute, BillingUnit: time.Second, Idempotent: true}, nil
+	return hostsource.Terms{LeadTime: time.Minute, BillingUnit: time.Second, IdempotentFor: clientTokenWindow}, nil
 }
 
 // Order launches one host of a declared shape in this source's zone.

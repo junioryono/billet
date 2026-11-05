@@ -3,8 +3,12 @@ package ec2
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -58,6 +62,26 @@ type HostLaunch struct {
 	// UserData is the host's first boot, carrying its join token.
 	UserData []byte
 }
+
+// A LAUNCH CARRIES THE JOIN TOKEN IN ITS USER DATA, so it redacts itself, on a value
+// receiver, wherever it is rendered.
+func (l HostLaunch) String() string {
+	return "ec2.HostLaunch{order=" + l.Order + " type=" + l.InstanceType + " image=" + l.Image + " user data redacted}"
+}
+
+// GoString covers %#v.
+func (l HostLaunch) GoString() string { return l.String() }
+
+// Format catches every verb.
+func (l HostLaunch) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, l.String()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps the user data out of anything that serialises a launch.
+func (l HostLaunch) MarshalJSON() ([]byte, error) { return json.Marshal(l.String()) }
+
+// LogValue is what slog consults.
+func (l HostLaunch) LogValue() slog.Value { return slog.StringValue(l.String()) }
 
 // HostRecord is one pool host as EC2 describes it.
 type HostRecord struct {
@@ -145,6 +169,11 @@ func (h *Hosts) Find(ctx context.Context, order string) (HostRecord, bool, error
 		if v, _ := item.tag(poolOrderTag); v != order {
 			continue
 		}
+		// AN INSTANCE THAT CARRIES THIS ORDER AND IS NOT A POOL HOST is not skipped: a
+		// list read as none licenses ordering again.
+		if !h.isPoolHost(item) {
+			return HostRecord{}, false, fmt.Errorf("%w: %s carries order %s", ErrNotAPoolHost, item.InstanceID, order)
+		}
 		rec := hostRecord(item)
 		if rec.State == "terminated" {
 			ended = &rec
@@ -182,7 +211,7 @@ func (h *Hosts) Describe(ctx context.Context, id string) (HostRecord, error) {
 		if item.InstanceID != id {
 			continue
 		}
-		if owner, tagged := item.tag(poolOwnerTag); !tagged || owner != h.p.owner {
+		if !h.isPoolHost(item) {
 			return HostRecord{}, fmt.Errorf("%w: %s", ErrNotAPoolHost, id)
 		}
 
@@ -219,17 +248,45 @@ func (h *Hosts) Console(ctx context.Context, id string) (string, error) {
 	return h.p.consoleOutput(ctx, id, true)
 }
 
+// isPoolHost is this deployment's pool tag, an order tag a pool could have written,
+// and NOT the job instances' owner tag: an instance carrying both is neither, and
+// nothing here describes, terminates or reads it.
+func (h *Hosts) isPoolHost(item instanceItem) bool {
+	owner, pooled := item.tag(poolOwnerTag)
+	order, ordered := item.tag(poolOrderTag)
+	_, jobTagged := item.tag(ownerTag)
+
+	return pooled && owner == h.p.owner && ordered && poolOrderPattern.MatchString(order) && !jobTagged
+}
+
+// hostsDescribeResponse is DescribeInstances, with its root element checked: an answer
+// with another root, or none, decodes into nothing and would read as no instances.
+type hostsDescribeResponse struct {
+	XMLName      xml.Name `xml:"DescribeInstancesResponse"`
+	Reservations []struct {
+		Instances []instanceItem `xml:"instancesSet>item"`
+	} `xml:"reservationSet>item"`
+	NextToken string `xml:"nextToken"`
+}
+
 func (h *Hosts) describe(ctx context.Context, params url.Values) ([]instanceItem, error) {
 	params.Set("Action", "DescribeInstances")
 	var items []instanceItem
 	seen := map[string]struct{}{}
 	for {
-		var out describeInstancesResponse
+		var out hostsDescribeResponse
 		if err := h.p.api.call(ctx, params, &out); err != nil {
 			return nil, err
 		}
 		for _, r := range out.Reservations {
-			items = append(items, r.Instances...)
+			for _, item := range r.Instances {
+				// AN INSTANCE WITHOUT AN ID CANNOT BE ACCOUNTED FOR, and dropping it
+				// would turn an incomplete answer into a shorter one.
+				if item.InstanceID == "" {
+					return nil, errors.New("ec2: the api described an instance without an id; refusing a partial answer")
+				}
+				items = append(items, item)
+			}
 		}
 		if out.NextToken == "" {
 			return items, nil

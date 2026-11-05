@@ -138,12 +138,14 @@ type Terms struct {
 	BillingUnit time.Duration
 	// MinimumTerm is the shortest a host may be held, zero when there is none.
 	MinimumTerm time.Duration
-	// Idempotent says an Order sent again under the same identifier cannot place a
-	// second host, because the source deduplicates it (EC2's ClientToken). Only then
-	// may a pool order again after Find proved no host; on any other source an order
-	// whose answer was lost waits for a person, because an order still in flight can
-	// land after a list that did not show it. The zero value is not idempotent.
-	Idempotent bool
+	// IdempotentFor is how long after an order's first attempt the same order sent
+	// again cannot place a second host, because the source deduplicates it (EC2's
+	// ClientToken). A source does not keep that record forever, so a pool may order
+	// again after Find listed no host only inside this window from the first attempt it
+	// recorded; past it, or on a source with none, an order whose answer was lost waits
+	// for a person, because an order still in flight can land after a list that did not
+	// show it. Zero, the zero value, is not idempotent.
+	IdempotentFor time.Duration
 	// Preemptible is a host the source may take back with warning. A pool never runs
 	// jobs on one (ADR-026), and a source that offers only these is refused.
 	Preemptible bool
@@ -161,8 +163,8 @@ type Source interface {
 	Describe(ctx context.Context, id string) (Host, error)
 	// Find reads back the host the source recorded an order on, so an order whose
 	// answer was lost is found rather than placed twice. ok is false only when the
-	// source listed none, which licenses ordering again only where Terms say the
-	// source is Idempotent.
+	// source listed none, which licenses ordering again only inside the source's
+	// IdempotentFor window from the order's first attempt.
 	Find(ctx context.Context, order string) (host Host, ok bool, err error)
 	// Gone is the one answer that frees a host's row. It says gone only on the source's
 	// own terminal answer for that host, never on not-found or on elapsed time.

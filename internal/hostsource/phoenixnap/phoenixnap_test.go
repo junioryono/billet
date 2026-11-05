@@ -40,6 +40,7 @@ type fakeBMC struct {
 	grants  int
 	ordered []map[string]any
 	quotas  string
+	stock   string
 	order   func(w http.ResponseWriter)
 	servers string
 	status  int
@@ -50,7 +51,7 @@ type fakeBMC struct {
 
 func newFake(t *testing.T) (*fakeBMC, *httptest.Server) {
 	t.Helper()
-	f := &fakeBMC{t: t, quotas: quotasWithRoom, servers: `[]`}
+	f := &fakeBMC{t: t, quotas: quotasWithRoom, stock: stock, servers: `[]`}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
 
@@ -81,7 +82,7 @@ func (f *fakeBMC) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/bmc/v1/quotas":
 		f.write(w, f.quotas)
 	case r.Method == http.MethodGet && r.URL.Path == "/billing/v1/product-availability":
-		f.write(w, stock)
+		f.write(w, f.stock)
 	case r.Method == http.MethodPost && r.URL.Path == "/bmc/v1/servers":
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -480,7 +481,52 @@ func TestAnOrderHereIsNotIdempotent(t *testing.T) {
 	t.Parallel()
 	_, srv := newFake(t)
 	terms, err := source(t, srv).Terms("s2.c2.small")
-	if err != nil || terms.Idempotent || terms.BillingUnit != time.Hour {
+	if err != nil || terms.IdempotentFor != 0 || terms.BillingUnit != time.Hour {
 		t.Fatalf("terms = %+v, %v", terms, err)
+	}
+}
+
+// STOCK THAT CANNOT BE READ IS NOT AN EMPTY SHELF: an omitted list of locations, or an
+// entry without a location, orders nothing and is not reported as no stock. An empty
+// list (measured) is no stock.
+func TestStockThatCannotBeReadIsNotNoStock(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		stock string
+		want  error
+	}{
+		"locations omitted": {`[{"productCode":"s2.c2.small","productCategory":"SERVER"}]`, nil},
+		"locations null":    {`[{"productCode":"s2.c2.small","locationAvailabilityDetails":null}]`, nil},
+		"entry without location": {`[{"productCode":"s2.c2.small","locationAvailabilityDetails":` +
+			`[{"minQuantityAvailable":true,"availableQuantity":3}]}]`, nil},
+		"empty list": {`[{"productCode":"s2.c2.small","locationAvailabilityDetails":[]}]`, hostsource.ErrNoStock},
+	} {
+		f, srv := newFake(t)
+		f.mu.Lock()
+		f.stock = c.stock
+		f.mu.Unlock()
+		f.order = func(http.ResponseWriter) { t.Errorf("%s: an order was placed", name) }
+		_, err := source(t, srv).Order(t.Context(), request())
+		switch {
+		case c.want != nil && !errors.Is(err, c.want):
+			t.Errorf("%s: %v, want %v", name, err, c.want)
+		case c.want == nil && (err == nil || errors.Is(err, hostsource.ErrNoStock)):
+			t.Errorf("%s: %v, want could-not-tell", name, err)
+		}
+	}
+}
+
+// A MALFORMED REDIRECT FAILS BEFORE ANY REDIRECT POLICY RUNS, and net/http's error
+// renders its Location; the source keeps none of that text.
+func TestAMalformedRedirectQuotesNothing(t *testing.T) {
+	t.Parallel()
+	f, srv := newFake(t)
+	f.order = func(w http.ResponseWriter) {
+		w.Header().Set("Location", "/%zz/token-9QX")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}
+	_, err := source(t, srv).Order(t.Context(), request())
+	if err == nil || strings.Contains(err.Error(), "token-9QX") {
+		t.Fatalf("order = %v", err)
 	}
 }

@@ -1757,7 +1757,7 @@ const maxUserData = 16 * 1024
 func withoutMessage(err error) error {
 	apiErr, ok := errors.AsType[*apiError](err)
 	if !ok {
-		return err
+		return withheldFailure(err)
 	}
 
 	// AND THE CODE IS CHECKED RATHER THAN TRUSTED. "AWS's fixed enumeration" is an
@@ -1772,6 +1772,30 @@ func withoutMessage(err error) error {
 
 	return &apiError{Code: code, Status: apiErr.Status,
 		Message: "(message withheld: this request carries a runner registration)"}
+}
+
+// errWithheld is a failure of a credential-bearing call that was not an API refusal:
+// a transport error or an answer that would not parse.
+var errWithheld = errors.New("the call failed and its error is withheld: this request carries a credential")
+
+// withheldFailure keeps only what is safe to say about a failure that is not an API
+// refusal. A transport error renders the URL it was answered with, a redirect's
+// Location included, and an XML syntax error quotes the answer, and either can carry
+// the request back; so the text goes and the classification stays: a cancelled or
+// expired context, and a refused redirect, are still themselves.
+func withheldFailure(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%w: %w", errWithheld, context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%w: %w", errWithheld, context.DeadlineExceeded)
+	case errors.Is(err, errRedirected):
+		return errRedirected
+	}
+
+	return errWithheld
 }
 
 // awsErrorCode is the shape of an EC2 error code — a short identifier, never

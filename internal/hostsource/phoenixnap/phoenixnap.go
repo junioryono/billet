@@ -370,7 +370,9 @@ func (s *Source) checkQuota(ctx context.Context) error {
 
 type availability struct {
 	ProductCode string `json:"productCode"`
-	Locations   []struct {
+	// Locations is a pointer so an omitted or null list is told apart from an empty
+	// one: the first cannot be read, the second (measured) means none in stock.
+	Locations *[]struct {
 		Location  string `json:"location"`
 		Available *bool  `json:"minQuantityAvailable"`
 		Quantity  *int   `json:"availableQuantity"`
@@ -387,7 +389,13 @@ func (s *Source) checkStock(ctx context.Context, shape, location string) error {
 		if a.ProductCode != shape {
 			continue
 		}
-		for _, l := range a.Locations {
+		if a.Locations == nil {
+			return fmt.Errorf("phoenixnap: the stock of %s came without its locations, so it cannot be told", shape)
+		}
+		for _, l := range *a.Locations {
+			if l.Location == "" {
+				return fmt.Errorf("phoenixnap: the stock of %s names an entry without a location, so it cannot be told", shape)
+			}
 			if l.Location != location {
 				continue
 			}
@@ -436,6 +444,23 @@ func stateOf(status string) hostsource.State {
 
 var errNotFound = errors.New("phoenixnap: not found")
 
+// errWithheld is a call that failed without an answer; its text is not kept.
+var errWithheld = errors.New("the request failed and its error is withheld: a request here carries a credential")
+
+// withheld keeps only the classification of a transport failure. net/http's error
+// renders the URL it was answered with, a malformed redirect's Location included,
+// before any redirect policy runs, and that can carry the request back.
+func withheld(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%w: %w", errWithheld, context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%w: %w", errWithheld, context.DeadlineExceeded)
+	}
+
+	return errWithheld
+}
+
 // apiError is a refusal the API answered. Its message is the API's only when it is the
 // one measured refusal; otherwise it is the status's own text, because the API's could
 // echo the order's body, which carries the join token.
@@ -468,7 +493,7 @@ func (s *Source) call(ctx context.Context, method, path string, body []byte, out
 	}
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("phoenixnap: %s %s: %w", method, path, err)
+		return fmt.Errorf("phoenixnap: %s %s: %w", method, path, withheld(err))
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
@@ -533,7 +558,7 @@ func (s *Source) bearer(ctx context.Context) (string, error) {
 	req.SetBasicAuth(s.creds.ClientID, string(s.creds.Secret.Reveal()))
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("phoenixnap: token: %w", err)
+		return "", fmt.Errorf("phoenixnap: token: %w", withheld(err))
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
