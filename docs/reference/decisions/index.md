@@ -28,7 +28,7 @@ adr-020-npm-registry-interception
 adr-021-tart-images-verified-not-published
 adr-022-every-linux-image-from-githubs-template
 adr-023-fleet-envelope
-adr-025-rented-bare-metal-pool
+adr-026-rented-bare-metal-pool
 ```
 
 | Record | Decides |
@@ -56,4 +56,4 @@ adr-025-rented-bare-metal-pool
 | [ADR-021](adr-021-tart-images-verified-not-published.md) | why billet publishes no macOS or Tart Linux image and what Apple's macOS and Xcode licences say about redistributing one; how a Tart tier's `@verified` boots a copy of a local base VM billet probed, why a macOS slot is a lock the guest's own process holds and a probe yields to a job, and why a runner's deadline is kept apart from whether the image boots |
 | [ADR-022](adr-022-every-linux-image-from-githubs-template.md) | why the arm64 guest and the EC2 AMI on both architectures run GitHub's own template too, with one scoped difference list; how the AMI builder proves it finished; why an AMI installs a left-out component only when `images.accept` names it; how one release carries both architectures without a new manifest or channel schema, and carries the last good arm64 image forward when its build fails; why generations and tiers carry an architecture |
 | [ADR-023](adr-023-fleet-envelope.md) | the fleet one control plane must schedule, 256 hosts and 4,096 open leases, and what each of its writes may take of the ledger's one writer slot; why a listener renews its leases in one commit a pass, why placement is counted a preference rank at a time, and why the commit's speed is the operator's |
-| [ADR-025](adr-025-rented-bare-metal-pool.md) | how billet rents bare metal for Firecracker from a dedicated-server provider and from AWS behind one host-source contract; the pool's shape, where its caches live so it can shrink to its floor, why it grows ahead of demand and shrinks only by drain on proof, why it never runs jobs on spot, how an ordered host joins without a person, and why a guest's traffic is policed on the host |
+| [ADR-026](adr-026-rented-bare-metal-pool.md) | how billet rents bare metal for Firecracker from a dedicated-server provider and from AWS behind one host-source contract; the pool's shape, where its caches live so it can shrink to its floor, why it grows ahead of demand and shrinks only by drain on proof, why a pool host is never spot, how an ordered host joins without a person only where its source vouches for its key, what a returned host keeps, and why a guest's traffic is policed on the host |

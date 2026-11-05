@@ -252,7 +252,7 @@ func TestReleaseDeletesOnlyOnProof(t *testing.T) {
 	if _, _, deleted := f.snapshot(); len(deleted) != 0 {
 		t.Fatal("a server was deleted without proof")
 	}
-	proof, err := hostsource.NewReleaseProof("srv-1", hostsource.Drained{Host: "srv-1", At: time.Unix(1, 0)}, 0, 0)
+	proof, err := hostsource.NewDrainedProof(hostsource.Holdings{Host: "srv-1", Sealed: time.Unix(1, 0)})
 	if err != nil {
 		t.Fatalf("proof: %v", err)
 	}

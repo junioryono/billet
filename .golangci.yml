@@ -263,7 +263,7 @@ linters:
             - pkg: "github.com/junioryono/billet/cmd"
               desc: "Providers must not import cmd/."
 
-        # A host source rents the machine a node runs on (ADR-025). It answers the
+        # A host source rents the machine a node runs on (ADR-026). It answers the
         # pool and nothing above it, and it writes no ledger: the pool reads what a
         # release needs and hands the source a proof.
         hostsource:

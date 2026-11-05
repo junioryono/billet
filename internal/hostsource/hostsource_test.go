@@ -75,42 +75,68 @@ func TestOnlyAProofForThisHostReleasesIt(t *testing.T) {
 	if err := (ReleaseProof{}).For("i-1"); !errors.Is(err, ErrNoProof) {
 		t.Fatalf("the zero proof released a host: %v", err)
 	}
-	proof, err := NewReleaseProof("i-1", Drained{Host: "i-1", At: time.Unix(1, 0)}, 0, 0)
+	drained, err := NewDrainedProof(Holdings{Host: "i-1", Sealed: time.Unix(1, 0)})
 	if err != nil {
-		t.Fatalf("a drained host holding nothing was refused: %v", err)
+		t.Fatalf("a sealed host holding nothing was refused: %v", err)
 	}
-	if err := proof.For("i-1"); err != nil {
-		t.Fatalf("the proof did not release its own host: %v", err)
+	unjoined, err := NewUnjoinedProof(Unjoined{Host: "i-1", OrderSealed: time.Unix(1, 0)})
+	if err != nil {
+		t.Fatalf("a sealed order that never joined was refused: %v", err)
 	}
-	if err := proof.For("i-2"); !errors.Is(err, ErrNoProof) {
-		t.Fatalf("the proof released another host: %v", err)
+	for name, proof := range map[string]ReleaseProof{"drained": drained, "unjoined": unjoined} {
+		if err := proof.For("i-1"); err != nil {
+			t.Fatalf("%s: the proof did not release its own host: %v", name, err)
+		}
+		if err := proof.For("i-2"); !errors.Is(err, ErrNoProof) {
+			t.Fatalf("%s: the proof released another host: %v", name, err)
+		}
 	}
 }
 
-// A PROOF IS BUILT ONLY FROM POSITIVE ANSWERS: a drained ending for this host, and
+// A DRAINED PROOF IS BUILT ONLY FROM POSITIVE ANSWERS: sealed against placement, and
 // nothing held. Could-not-tell is a negative count, and is refused like a holding.
-func TestAProofNeedsADrainedEndingAndNothingHeld(t *testing.T) {
+func TestADrainedProofNeedsASealAndNothingHeld(t *testing.T) {
 	t.Parallel()
 	at := time.Unix(1, 0)
-	for name, c := range map[string]struct {
-		host            string
-		drained         Drained
-		leases, custody int
-	}{
-		"no host named":             {"", Drained{Host: "", At: at}, 0, 0},
-		"no drained ending":         {"i-1", Drained{Host: "i-1"}, 0, 0},
-		"another host's ending":     {"i-1", Drained{Host: "i-2", At: at}, 0, 0},
-		"a lease still held":        {"i-1", Drained{Host: "i-1", At: at}, 1, 0},
-		"custody still held":        {"i-1", Drained{Host: "i-1", At: at}, 0, 1},
-		"leases could not be read":  {"i-1", Drained{Host: "i-1", At: at}, -1, 0},
-		"custody could not be read": {"i-1", Drained{Host: "i-1", At: at}, 0, -1},
+	for name, h := range map[string]Holdings{
+		"no host named":                {Sealed: at},
+		"not sealed":                   {Host: "i-1"},
+		"a lease still held":           {Host: "i-1", Sealed: at, Leases: 1},
+		"quarantine still held":        {Host: "i-1", Sealed: at, Quarantine: 1},
+		"custody still held":           {Host: "i-1", Sealed: at, Custody: 1},
+		"an instance still reported":   {Host: "i-1", Sealed: at, Inventory: 1},
+		"leases could not be read":     {Host: "i-1", Sealed: at, Leases: -1},
+		"quarantine could not be read": {Host: "i-1", Sealed: at, Quarantine: -1},
+		"custody could not be read":    {Host: "i-1", Sealed: at, Custody: -1},
+		"inventory could not be read":  {Host: "i-1", Sealed: at, Inventory: -1},
 	} {
-		proof, err := NewReleaseProof(c.host, c.drained, c.leases, c.custody)
+		proof, err := NewDrainedProof(h)
 		if !errors.Is(err, ErrNoProof) {
 			t.Errorf("%s: built a proof (%v)", name, err)
 		}
-		if proof.For(c.host) == nil {
-			t.Errorf("%s: the refused proof still releases %q", name, c.host)
+		if proof.For(h.Host) == nil {
+			t.Errorf("%s: the refused proof still releases %q", name, h.Host)
+		}
+	}
+}
+
+// A HOST THAT NEVER JOINED is released without a drain, but only when its order is
+// sealed against enrollment and no enrollment was ever admitted for it.
+func TestAnUnjoinedProofNeedsASealedOrderAndNoAdmission(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(1, 0)
+	for name, u := range map[string]Unjoined{
+		"no host named":               {OrderSealed: at},
+		"order not sealed":            {Host: "i-1"},
+		"an enrollment was admitted":  {Host: "i-1", OrderSealed: at, Admitted: 1},
+		"admission could not be read": {Host: "i-1", OrderSealed: at, Admitted: -1},
+	} {
+		proof, err := NewUnjoinedProof(u)
+		if !errors.Is(err, ErrNoProof) {
+			t.Errorf("%s: built a proof (%v)", name, err)
+		}
+		if proof.For(u.Host) == nil {
+			t.Errorf("%s: the refused proof still releases %q", name, u.Host)
 		}
 	}
 }

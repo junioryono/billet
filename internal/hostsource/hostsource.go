@@ -1,5 +1,5 @@
 // Package hostsource is the contract a source of rented bare metal implements
-// (ADR-025): order a host, describe it, prove it gone, release it, and say what its
+// (ADR-026): order a host, describe it, prove it gone, release it, and say what its
 // terms are. A pool on top of it grows and shrinks; a source only answers.
 //
 // A SIBLING OF internal/provider, BELOW THE SCHEDULER. A provider starts one job's
@@ -7,9 +7,9 @@
 // and neither imports server, node or cmd.
 //
 // EVERY ANSWER THAT RELEASES ANYTHING HAS THREE VALUES, and its zero value is the one
-// that holds. A source that cannot tell whether a host is gone says so, and a release
-// is refused without a proof the pool built from the node's own drained ending and a
-// ledger holding no lease and no custody on the host.
+// that holds. A source that cannot tell whether a host is gone says so, says gone only
+// on its own terminal answer for that host, and a release is refused without a proof
+// the pool built from the ledger in the transaction that sealed the host.
 package hostsource
 
 import (
@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -37,7 +38,7 @@ var ErrQuota = errors.New("hostsource: the account's quota is reached")
 var ErrRefused = errors.New("hostsource: the source refused the request")
 
 // ErrNoProof is a release refused because its proof is missing or names another host.
-var ErrNoProof = errors.New("hostsource: a host is released only on proof it is drained and holds nothing")
+var ErrNoProof = errors.New("hostsource: a host is released only on proof it holds nothing or never joined")
 
 // Request is one host the pool asks a source for.
 type Request struct {
@@ -138,7 +139,7 @@ type Terms struct {
 	// MinimumTerm is the shortest a host may be held, zero when there is none.
 	MinimumTerm time.Duration
 	// Preemptible is a host the source may take back with warning. A pool never runs
-	// jobs on one (ADR-025), and a source that offers only these is refused.
+	// jobs on one (ADR-026), and a source that offers only these is refused.
 	Preemptible bool
 }
 
@@ -156,7 +157,8 @@ type Source interface {
 	// answer was lost is found rather than placed twice. ok is false only when the
 	// source proved there is none.
 	Find(ctx context.Context, order string) (host Host, ok bool, err error)
-	// Gone is the one answer that frees anything.
+	// Gone is the one answer that frees a host's row. It says gone only on the source's
+	// own terminal answer for that host, never on not-found or on elapsed time.
 	Gone(ctx context.Context, id string) (Presence, error)
 	// Release asks the source to take the host back, on proof.
 	Release(ctx context.Context, proof ReleaseProof) error
@@ -165,38 +167,73 @@ type Source interface {
 }
 
 // ReleaseProof is what Release requires. Its zero value proves nothing, and the only
-// way to build one that does is NewReleaseProof, from positive answers.
+// ways to build one that does are NewDrainedProof and NewUnjoinedProof, from positive
+// answers the pool read in the transaction that sealed the host.
 type ReleaseProof struct {
 	host     string
-	drained  time.Time
+	at       time.Time
 	verified bool
 }
 
-// Drained says the node on a host ended drained, from its own ending record, and when.
-type Drained struct {
+// Holdings is what the ledger says a host holds, read in the transaction that sealed it
+// against placement. A count the pool could not read is negative.
+type Holdings struct {
 	Host string
-	At   time.Time
+	// Sealed is when the host was sealed against placement, zero if it is not.
+	Sealed     time.Time
+	Leases     int
+	Quarantine int
+	Custody    int
+	// Inventory is how many instances the node's last inventory reported.
+	Inventory int
 }
 
-// NewReleaseProof builds a proof from what the pool read: the node's drained ending,
-// and the ledger's count of leases and custody records still on the host. Anything
-// but a drained ending for this host and two zero counts is refused, and so is a
-// count the caller could not read, which it passes as negative.
-func NewReleaseProof(host string, drained Drained, leases, custody int) (ReleaseProof, error) {
+// NewDrainedProof builds the proof a drained host is released on (ADR-026): sealed
+// against placement, and holding no lease, no quarantine and no custody, with its
+// node's last inventory empty. A count that could not be read refuses like a holding.
+func NewDrainedProof(h Holdings) (ReleaseProof, error) {
+	counts := []int{h.Leases, h.Quarantine, h.Custody, h.Inventory}
 	switch {
-	case host == "":
+	case h.Host == "":
 		return ReleaseProof{}, fmt.Errorf("%w: no host named", ErrNoProof)
-	case drained.Host != host:
-		return ReleaseProof{}, fmt.Errorf("%w: the drained ending is %q's, not %q's", ErrNoProof, drained.Host, host)
-	case drained.At.IsZero():
-		return ReleaseProof{}, fmt.Errorf("%w: %s has no drained ending", ErrNoProof, host)
-	case leases < 0 || custody < 0:
-		return ReleaseProof{}, fmt.Errorf("%w: what %s holds could not be read", ErrNoProof, host)
-	case leases > 0 || custody > 0:
-		return ReleaseProof{}, fmt.Errorf("%w: %s holds %d leases and %d custody records", ErrNoProof, host, leases, custody)
+	case h.Sealed.IsZero():
+		return ReleaseProof{}, fmt.Errorf("%w: %s is not sealed against placement", ErrNoProof, h.Host)
+	case slices.ContainsFunc(counts, func(n int) bool { return n < 0 }):
+		return ReleaseProof{}, fmt.Errorf("%w: what %s holds could not be read", ErrNoProof, h.Host)
+	case slices.ContainsFunc(counts, func(n int) bool { return n > 0 }):
+		return ReleaseProof{}, fmt.Errorf("%w: %s holds %d leases, %d quarantined, %d in custody and %d instances",
+			ErrNoProof, h.Host, h.Leases, h.Quarantine, h.Custody, h.Inventory)
 	}
 
-	return ReleaseProof{host: host, drained: drained.At, verified: true}, nil
+	return ReleaseProof{host: h.Host, at: h.Sealed, verified: true}, nil
+}
+
+// Unjoined is what the ledger says of a host whose node never enrolled, read in the
+// transaction that sealed its order against enrollment and revoked its token.
+type Unjoined struct {
+	Host string
+	// OrderSealed is when the order was sealed against enrollment, zero if it is not.
+	OrderSealed time.Time
+	// Admitted is how many enrollments were ever admitted for the order; negative if
+	// it could not be read.
+	Admitted int
+}
+
+// NewUnjoinedProof builds the proof a host that never joined is released on: it never
+// held anything a job could use, so it has no drain to prove (ADR-026).
+func NewUnjoinedProof(u Unjoined) (ReleaseProof, error) {
+	switch {
+	case u.Host == "":
+		return ReleaseProof{}, fmt.Errorf("%w: no host named", ErrNoProof)
+	case u.OrderSealed.IsZero():
+		return ReleaseProof{}, fmt.Errorf("%w: %s's order is not sealed against enrollment", ErrNoProof, u.Host)
+	case u.Admitted < 0:
+		return ReleaseProof{}, fmt.Errorf("%w: whether %s ever joined could not be read", ErrNoProof, u.Host)
+	case u.Admitted > 0:
+		return ReleaseProof{}, fmt.Errorf("%w: %s joined, so it is released by drain", ErrNoProof, u.Host)
+	}
+
+	return ReleaseProof{host: u.Host, at: u.OrderSealed, verified: true}, nil
 }
 
 // Host is the host the proof is for.
