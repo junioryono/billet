@@ -86,6 +86,9 @@ type RerunCursor struct {
 // OpenRerun is a request that may have landed.
 type OpenRerun struct {
 	RerunRequest
+	// Tier is one tier of the jobs it still covers, which says an App that can read
+	// its run; empty when it covers none undecided.
+	Tier string
 	// Cursor is where the page after this row begins.
 	Cursor OpenRerunCursor
 }
@@ -110,15 +113,18 @@ func rerunCandidates[R ledgerdb.ListRerunCandidatesRow | ledgerdb.ListRerunCandi
 	return out
 }
 
-// RunRerunCandidates lists every candidate of one run, newest first, at most limit.
-func (a *Allocator) RunRerunCandidates(ctx context.Context, repository string, runID int64, limit int,
+// RunRerunCandidates lists the candidates of one run, newest first from after, at
+// most limit.
+func (a *Allocator) RunRerunCandidates(ctx context.Context, repository string, runID int64, after RerunCursor,
+	limit int,
 ) ([]RerunCandidate, error) {
 	var out []RerunCandidate
 
 	err := a.db.View(ctx, func(q querier) error {
 		rows, err := state.ReadQueries(q).ListRerunCandidatesOfRun(ctx, ledgerdb.ListRerunCandidatesOfRunParams{
 			RunID: runID, Repo: repository, CauseOne: string(RerunCauses[0]), CauseTwo: string(RerunCauses[1]),
-			Succeeded: resultSucceeded, MaxRows: int64(limit),
+			Succeeded: resultSucceeded, BeforeResult: after.resultAt, BeforeLease: after.leaseID,
+			MaxRows: int64(limit),
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: list the candidates of run %d: %w", runID, err)
@@ -161,6 +167,8 @@ type RerunRequest struct {
 	JobID int64
 	// Tries is how many times it has been sent, this one included.
 	Tries int64
+	// Created is when it was first written, zero for one not yet written.
+	Created time.Time
 }
 
 // RerunCandidates lists the jobs awaiting a decision whose result arrived at or
@@ -212,7 +220,8 @@ func (a *Allocator) OpenReruns(ctx context.Context, after OpenRerunCursor, limit
 			r := &rows[i]
 			out = append(out, OpenRerun{
 				RerunRequest: RerunRequest{Repository: r.Repo, RunID: r.RunID, Attempt: r.RunAttempt,
-					Kind: RerunKind(r.Kind), JobID: r.GithubJobID, Tries: r.Tries},
+					Kind: RerunKind(r.Kind), JobID: r.GithubJobID, Tries: r.Tries, Created: parseStamp(r.CreatedAt)},
+				Tier:   r.Tier,
 				Cursor: OpenRerunCursor{createdAt: r.CreatedAt, repo: r.Repo, run: r.RunID},
 			})
 		}
@@ -283,7 +292,7 @@ func (a *Allocator) OpenRerun(ctx context.Context, repository string, runID int6
 		}
 
 		open = RerunRequest{Repository: repository, RunID: runID, Attempt: row.RunAttempt,
-			Kind: RerunKind(row.Kind), JobID: row.GithubJobID, Tries: row.Tries}
+			Kind: RerunKind(row.Kind), JobID: row.GithubJobID, Tries: row.Tries, Created: parseStamp(row.CreatedAt)}
 		found = true
 
 		return nil

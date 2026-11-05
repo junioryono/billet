@@ -38,9 +38,15 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo,
 -- name: ListOpenReruns :many
 -- The requests that may have landed, whatever became of the jobs that made them,
 -- oldest first and paged from a cursor, (after_created, after_repo, after_run), the
--- last row of the page before, an empty after_created being the oldest. Paged so a
--- request waiting on a long run is passed rather than read before every other.
-SELECT repo, run_id, run_attempt, kind, github_job_id, tries, created_at
+-- last row of the page before, an empty after_created being the oldest. With one
+-- tier of the jobs each still covers, the first by name, which says an App that can
+-- read its run; empty when it covers none undecided.
+SELECT repo, run_id, run_attempt, kind, github_job_id, tries, created_at,
+       CAST(COALESCE((SELECT MIN(h.tier) FROM job_history h
+                       WHERE COALESCE(h.repo, '') = job_reruns.repo AND h.rerun_attempt = job_reruns.run_attempt
+                         AND h.rerun_decision = ''
+                         AND (h.github_run_id = job_reruns.run_id
+                              OR (h.github_run_id = 0 AND h.run_id = job_reruns.run_id))), '') AS TEXT) AS tier
   FROM job_reruns
  WHERE state = 'asking'
    AND (CAST(@after_created AS TEXT) = ''
@@ -60,8 +66,9 @@ SELECT DISTINCT tier FROM job_history
  ORDER BY tier;
 
 -- name: ListRerunCandidatesOfRun :many
--- ListRerunCandidates for one run, every candidate of it, which is what a run is
--- decided from: the pages that brought the run up may not have held all of them.
+-- ListRerunCandidates for one run, which a run is decided from: the pages that
+-- brought the run up may not have held all of it. Paged from the same cursor, so a
+-- reader can read it to its end rather than decide from a prefix.
 SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
@@ -75,6 +82,9 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo,
    AND result != '' AND result != @succeeded
    AND rerun_decision = ''
    AND github_job_id != ''
+   AND (CAST(@before_result AS TEXT) = ''
+        OR result_at < CAST(@before_result AS TEXT)
+        OR (result_at = CAST(@before_result AS TEXT) AND lease_id < CAST(@before_lease AS TEXT)))
  ORDER BY result_at DESC, lease_id DESC
  LIMIT CAST(@max_rows AS BIGINT);
 
@@ -94,7 +104,7 @@ DELETE FROM rerun_tiers WHERE tier = @tier;
 -- name: ReadOpenRerun :one
 -- The request of one run that may have landed, newest attempt first. sql.ErrNoRows
 -- is the ordinary answer: nothing is in doubt.
-SELECT run_attempt, kind, github_job_id, tries
+SELECT run_attempt, kind, github_job_id, tries, created_at
   FROM job_reruns
  WHERE repo = @repo AND run_id = @run_id AND state = 'asking'
  ORDER BY run_attempt DESC

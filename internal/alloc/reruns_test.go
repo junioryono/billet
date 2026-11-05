@@ -627,8 +627,68 @@ func TestABoundTierIsOneOfAnUndecidedJob(t *testing.T) {
 		t.Errorf("tiers = %v, %v", tiers, err)
 	}
 
-	got, err := a.RunRerunCandidates(t.Context(), "acme/api", 31, 10)
+	got, err := a.RunRerunCandidates(t.Context(), "acme/api", 31, RerunCursor{}, 10)
 	if err != nil || len(got) != 1 || got[0].LeaseID != "covered" || got[0].Bound != 2 {
 		t.Errorf("the run's candidates = %+v, %v", got, err)
+	}
+}
+
+// A RUN'S CANDIDATES ARE PAGED TO THEIR END, and no other run's are among them.
+func TestARunsCandidatesArePaged(t *testing.T) {
+	t.Parallel()
+
+	a := newRerunAllocator(t)
+	now := time.Now()
+	seedRerunRow(t, a, rerunRow{lease: "a", resultAt: now.Add(-time.Hour)})
+	seedRerunRow(t, a, rerunRow{lease: "b", resultAt: now.Add(-2 * time.Hour)})
+	seedRerunRow(t, a, rerunRow{lease: "c", resultAt: now.Add(-3 * time.Hour)})
+	seedRerunRow(t, a, rerunRow{lease: "other-run", githubRunID: 32})
+
+	var (
+		seen   []string
+		cursor RerunCursor
+	)
+	for range 5 {
+		page, err := a.RunRerunCandidates(t.Context(), "acme/api", 31, cursor, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		seen = append(seen, page[0].LeaseID)
+		cursor = page[0].Cursor
+	}
+	if fmt.Sprint(seen) != "[a b c]" {
+		t.Errorf("pages = %v", seen)
+	}
+}
+
+// THE LIST OF REQUESTS IN DOUBT NAMES A TIER THEY STILL COVER, and none once every job
+// they covered is decided.
+func TestAnOpenRerunNamesATierItCovers(t *testing.T) {
+	t.Parallel()
+
+	a := newRerunAllocator(t)
+	seedRerunRow(t, a, rerunRow{lease: "covered"})
+	request := RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: RerunFailedJobs}
+	if err := a.BeginRerun(t.Context(), request, []string{"covered"}); err != nil {
+		t.Fatal(err)
+	}
+
+	open, err := a.OpenReruns(t.Context(), OpenRerunCursor{}, 10)
+	if err != nil || len(open) != 1 || open[0].Tier != "billet-2vcpu" {
+		t.Fatalf("open = %+v, %v", open, err)
+	}
+
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET rerun_decision = 'expired' WHERE lease_id = 'covered'`)
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if open, err := a.OpenReruns(t.Context(), OpenRerunCursor{}, 10); err != nil || len(open) != 1 || open[0].Tier != "" {
+		t.Errorf("with its job decided, open = %+v, %v", open, err)
 	}
 }

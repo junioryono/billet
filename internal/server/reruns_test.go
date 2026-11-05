@@ -32,6 +32,7 @@ type rerunGitHub struct {
 	readErr   error
 	askErr    error
 	reads     int
+	readRuns  []int64
 	failedAsk []int64
 	jobAsk    []int64
 	asks      []string
@@ -41,11 +42,12 @@ type rerunGitHub struct {
 	onAsk func(*rerunGitHub)
 }
 
-func (g *rerunGitHub) LatestAttempt(_ context.Context, owner, repository string, _ int64) (RunAttempt, error) {
+func (g *rerunGitHub) LatestAttempt(_ context.Context, owner, repository string, runID int64) (RunAttempt, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	g.reads++
+	g.readRuns = append(g.readRuns, runID)
 	if owner != "acme" || repository != "api" {
 		return RunAttempt{}, fmt.Errorf("read %s/%s", owner, repository)
 	}
@@ -1227,12 +1229,11 @@ func TestALateJobOfAnAttemptAskedAboutForOneJobIsMixed(t *testing.T) {
 	t.Parallel()
 
 	r := newRerunStack(t)
-	r.limits[rerunTier] = 2
 	request := alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: alloc.RerunOneJob, JobID: 99}
 	if err := r.a.BeginRerun(t.Context(), request, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.a.SettleRerun(t.Context(), request, alloc.RerunRequested, ""); err != nil {
+	if err := r.a.SettleRerun(t.Context(), request, alloc.RerunFailed, "GitHub said no"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1285,12 +1286,16 @@ func TestARunIsDecidedFromAllItsCandidates(t *testing.T) {
 	}
 }
 
-// WHERE NO TIER ASKS, THAT IS RECORDED, so a tier that asks again later starts then.
+// WHERE NO TIER ASKS, THE LOOP STILL RECORDS THAT, through its own first pass, so a
+// tier that asks again later starts then.
 func TestNoTierAskingForgetsWhenOneDid(t *testing.T) {
 	t.Parallel()
 
 	r := newRerunStack(t)
-	r.s.forgetRerunTiers(t.Context())
+	r.limits = map[string]int64{}
+	r.sweep = newRerunSweep()
+
+	r.pass()
 
 	asked, err := r.a.AskReruns(t.Context(), []string{rerunTier})
 	if err != nil {
@@ -1298,5 +1303,195 @@ func TestNoTierAskingForgetsWhenOneDid(t *testing.T) {
 	}
 	if !asked[rerunTier].Equal(*r.ledger) {
 		t.Errorf("asked since %s, want the moment it asked again, %s", asked[rerunTier], *r.ledger)
+	}
+}
+
+// A REQUEST IN DOUBT IS SETTLED WHEN NO TIER ASKS ANY MORE: as landed where the run
+// says it did, and refused by the limit where it did not, never sent again.
+func TestARequestInDoubtIsSettledWhenNoTierAsks(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		attempt RunAttempt
+		want    alloc.RerunDecision
+	}{
+		{"it landed", RunAttempt{Completed: false, Attempt: 1}, alloc.RerunRequested},
+		{"it did not", RunAttempt{Completed: true, Attempt: 1}, alloc.RerunLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRerunStack(t)
+			r.job("lost", 31, 10*time.Minute)
+			if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+				Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+				t.Fatal(err)
+			}
+			r.limits = map[string]int64{}
+			r.sweep = newRerunSweep()
+			r.github.attempt = tc.attempt
+
+			r.pass()
+
+			if r.github.asked() != 0 {
+				t.Error("sent with no tier asking")
+			}
+			if got := r.decision("lost"); got != tc.want {
+				t.Errorf("decision = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A SNAPSHOT THAT CONTRADICTS ITSELF SENDS NOTHING, a request in doubt included: a
+// request for the run's failed jobs reaches whatever attempt GitHub is really on.
+func TestAContradictorySnapshotSendsNothing(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, 10*time.Minute)
+	if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+		Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+		t.Fatal(err)
+	}
+	r.lists(1, AttemptJob{ID: 88, RunnerName: "hosted", Attempt: 2, Failed: true})
+
+	r.pass()
+
+	if r.github.asked() != 0 {
+		t.Error("sent on a snapshot that contradicts itself")
+	}
+	if got, tries, _ := r.request(1); got != "asking" || tries != 1 {
+		t.Errorf("request = %s, %d tries", got, tries)
+	}
+}
+
+// A JOB LATE TO AN ATTEMPT WHOSE REQUEST WAS GIVEN UP TAKES THAT ANSWER, even with the
+// run at its limit: no new request is being weighed. (One GitHub accepted moved the
+// run to a later attempt, so a job late to it is superseded.)
+func TestALateJobTakesItsAttemptsAnswerAtTheLimit(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	accepted := alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: alloc.RerunFailedJobs}
+	if err := r.a.BeginRerun(t.Context(), accepted, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.a.SettleRerun(t.Context(), accepted, alloc.RerunRequested, ""); err != nil {
+		t.Fatal(err)
+	}
+	givenUp := alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 2, Kind: alloc.RerunFailedJobs}
+	if err := r.a.BeginRerun(t.Context(), givenUp, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.a.SettleRerun(t.Context(), givenUp, alloc.RerunFailed, "GitHub said no"); err != nil {
+		t.Fatal(err)
+	}
+
+	r.job("late", 31, 10*time.Minute)
+	r.lists(2, listed("late", 77, true))
+
+	r.pass()
+
+	if got := r.decision("late"); got != alloc.RerunFailed {
+		t.Errorf("decision = %q, want the attempt's answer rather than the limit", got)
+	}
+}
+
+// A REQUEST IN DOUBT IS NOT SENT MORE THAN A DAY AFTER IT WAS DECIDED, however long
+// the control plane was gone, nor after a tier it covers stopped asking and asked
+// again.
+func TestARequestInDoubtIsNotSentLate(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		setup func(r *rerunStack)
+	}{
+		{"past the window", func(r *rerunStack) { r.after(rerunWindow + time.Hour) }},
+		{"its tier asked again since", func(r *rerunStack) {
+			r.after(time.Hour)
+			if _, err := r.a.AskReruns(r.t.Context(), nil); err != nil {
+				r.t.Fatal(err)
+			}
+			r.sweep = newRerunSweep()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRerunStack(t)
+			r.job("lost", 31, 10*time.Minute)
+			if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+				Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+				t.Fatal(err)
+			}
+			tc.setup(r)
+			r.lists(1)
+
+			r.pass()
+
+			if r.github.asked() != 0 {
+				t.Error("sent late")
+			}
+			if got := r.decision("lost"); got != alloc.RerunExpired {
+				t.Errorf("decision = %q", got)
+			}
+		})
+	}
+}
+
+// A RUN THAT CANNOT BE READ HOLDS A REQUEST IN DOUBT ONLY UNTIL THE WINDOW, and then
+// the request is settled as landed, since it may have, and nothing is sent.
+func TestARunThatCannotBeReadHoldsARequestOnlyUntilTheWindow(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, 10*time.Minute)
+	if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+		Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+		t.Fatal(err)
+	}
+	r.github.readErr = errors.New("HTTP 404: Not Found")
+
+	r.pass()
+	if got, _, _ := r.request(1); got != "asking" {
+		t.Fatalf("inside the window = %s", got)
+	}
+
+	r.after(rerunWindow + time.Hour).pass()
+
+	if got, _, _ := r.request(1); got != "requested" {
+		t.Errorf("past the window = %s", got)
+	}
+	if got := r.decision("lost"); got != alloc.RerunRequested {
+		t.Errorf("decision = %q", got)
+	}
+	if r.github.asked() != 0 {
+		t.Error("sent")
+	}
+}
+
+// THE FEW READS AN INSTALLATION HAS A PASS GO ROUND EVERY RUN IN TURN: the runs read
+// longest ago come first, so a run not read in one pass is read in the next.
+func TestTheReadsGoRoundEveryRun(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	for i := range rerunRunsPerInstallation + 2 {
+		r.job(fmt.Sprintf("job-%d", i), int64(31+i), 10*time.Minute)
+	}
+	r.github.attempt = RunAttempt{Completed: false, Attempt: 1}
+
+	r.pass()
+	r.after(rerunUnfinishedEvery + time.Second).pass()
+
+	read := map[int64]bool{}
+	for _, run := range r.github.readRuns {
+		read[run] = true
+	}
+	if len(read) != rerunRunsPerInstallation+2 {
+		t.Errorf("runs read in two passes = %v, want every one", r.github.readRuns)
 	}
 }

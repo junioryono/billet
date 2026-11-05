@@ -476,15 +476,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// AND A JOB BILLET ENDED IS RE-RUN WHERE A TIER ASKS, under the same rule: GitHub
 	// slow, refusing or gone costs the re-run and never a job waiting to start.
-	// WHERE NONE ASKS, THAT IS RECORDED, so a tier that asks again later starts then
-	// rather than from a time before a job went red while nothing asked.
-	if limits := s.rerunLimits(); len(limits) > 0 {
-		group.Background("disrupted job re-runs", func(ctx context.Context) {
-			s.rerunDisrupted(ctx, targets, limits)
-		})
-	} else {
-		group.Background("forget re-run tiers", s.forgetRerunTiers)
-	}
+	limits := s.rerunLimits()
+	group.Background("disrupted job re-runs", func(ctx context.Context) {
+		s.rerunDisrupted(ctx, targets, limits)
+	})
 
 	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.
 	group.Background("job detail retention", s.retireJobDetail)

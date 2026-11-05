@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -69,9 +70,11 @@ const (
 	// a tier that does not ask is paged past, never decided.
 	rerunPageRows = 1000
 	rerunPages    = 10
-	// rerunOpenListed bounds the requests in doubt one pass reads. There is at most
-	// one per run, and each is settled within a few passes.
-	rerunOpenListed = 100
+	// rerunOpenPageRows and rerunOpenPages bound the requests in doubt one pass reads,
+	// all of them on every pass: there is at most one per run, and each is settled
+	// within a few passes, so these are bounds on a ledger something else is wrong with.
+	rerunOpenPageRows = 100
+	rerunOpenPages    = 100
 	// rerunRunsPerInstallation is how many runs one pass reads through one App
 	// installation, the same share of its budget the queue-time sweep takes.
 	rerunRunsPerInstallation = 3
@@ -101,21 +104,21 @@ type rerunRun struct {
 
 // rerunSweep is what the loop remembers between passes: each run's backoff, each
 // installation paused by a throttle or a refusal, the last failure of a request
-// still in doubt, for the row it settles, since when each tier has asked, and where
-// in each of the two lists the next pass reads on from.
+// still in doubt, for the row it settles, since when each tier has asked, when each
+// run was last read, and where in the candidates the next pass reads on from.
 type rerunSweep struct {
 	retries  map[rerunRun]queueTimeRetry
 	paused   map[string]time.Time
 	reserved map[string]bool
 	failures map[rerunRun]string
 	asked    map[string]time.Time
-	open     alloc.OpenRerunCursor
+	tried    map[rerunRun]time.Time
 	listed   alloc.RerunCursor
 }
 
 func newRerunSweep() *rerunSweep {
 	return &rerunSweep{retries: map[rerunRun]queueTimeRetry{}, paused: map[string]time.Time{},
-		reserved: map[string]bool{}, failures: map[rerunRun]string{}}
+		reserved: map[string]bool{}, failures: map[rerunRun]string{}, tried: map[rerunRun]time.Time{}}
 }
 
 // rerunWork is one run a pass will read, through the first target that serves it.
@@ -140,17 +143,12 @@ func (s *Server) rerunLimits() map[string]int64 {
 	return limits
 }
 
-// forgetRerunTiers records that no tier asks for re-runs, for a control plane where
-// none does: a tier that asks again later starts from then, and a job that went red
-// while none asked is not re-run because one asks again.
-func (s *Server) forgetRerunTiers(ctx context.Context) {
-	if _, err := s.alloc.AskReruns(ctx, nil); err != nil && ctx.Err() == nil {
-		s.log.Warn("could not record that no tier asks for re-runs", "error", err)
-	}
-}
-
 // rerunDisrupted asks GitHub to re-run the jobs billet proved it ended, until ctx
 // ends. It can stop nothing: a pass that fails is logged and the next tries again.
+//
+// IT RUNS WHERE NO TIER ASKS TOO, and a pass there is two reads of the ledger: a
+// request in doubt still has to be settled when its tier stops asking, and the
+// record of which tiers ask is what makes a tier asking again start again.
 func (s *Server) rerunDisrupted(ctx context.Context, targets map[string]Target, limits map[string]int64) {
 	every := rerunEvery
 	if s.rerunEvery > 0 {
@@ -199,11 +197,23 @@ func (s *Server) rerunOnce(ctx context.Context, targets map[string]Target, limit
 			delete(sweep.failures, run)
 		}
 	}
+	for run, at := range sweep.tried {
+		if now.Sub(at) > rerunWindow {
+			delete(sweep.tried, run)
+		}
+	}
 
 	read := map[string]int{}
 	budgets := installationBudgets(targets)
 
+	// THE RUN READ LONGEST AGO FIRST, never-read before any, so the few reads an
+	// installation has a pass go round every run in turn, and a run that keeps
+	// failing cannot hold the share for ever.
 	work := s.gatherRerunWork(ctx, targets, limits, sweep, now)
+	slices.SortStableFunc(work, func(a, b rerunWork) int {
+		return sweep.tried[a.run].Compare(sweep.tried[b.run])
+	})
+
 	for i := range work {
 		w := &work[i]
 		if ctx.Err() != nil {
@@ -223,6 +233,7 @@ func (s *Server) rerunOnce(ctx context.Context, targets map[string]Target, limit
 		}
 		delete(sweep.reserved, w.installation)
 		read[w.installation]++
+		sweep.tried[w.run] = now
 
 		s.afterRerun(ctx, w, s.decideRerun(ctx, w, limits, sweep, now), sweep, now)
 	}
@@ -291,13 +302,13 @@ func (set *rerunWorkSet) add(run rerunRun, tiers ...string) bool {
 }
 
 // gatherRerunWork finds the runs worth reading this pass: those with a request in
-// doubt, and those with a job awaiting a decision, and decides as expired what has
-// waited too long to be worth a request.
+// doubt, every one, and those with a job awaiting a decision, and decides as expired
+// what has waited too long to be worth a request.
 //
-// BOTH LISTS ARE READ ON FROM WHERE THE LAST PASS STOPPED, and back to their start
-// once they reach their end, so what one pass cannot reach is not passed over for
-// ever by what comes before it. The newest page of candidates is read on every pass,
-// so a job that just went red does not wait for the backlog.
+// THE CANDIDATES ARE READ ON FROM WHERE THE LAST PASS STOPPED, and back to their start
+// once they reach their end, so what one pass cannot reach is not passed over for ever
+// by what comes before it. The newest page is read on every pass, so a job that just
+// went red does not wait for the backlog.
 func (s *Server) gatherRerunWork(ctx context.Context, targets map[string]Target, limits map[string]int64,
 	sweep *rerunSweep, now time.Time,
 ) []rerunWork {
@@ -308,37 +319,26 @@ func (s *Server) gatherRerunWork(ctx context.Context, targets map[string]Target,
 		return ok && now.Before(retry.after)
 	}
 
-	open, err := s.alloc.OpenReruns(ctx, sweep.open, rerunOpenListed)
-	if err != nil {
-		if ctx.Err() == nil {
-			s.log.Warn("could not list the re-runs in doubt; trying again", "error", err)
-		}
+	var cursor alloc.OpenRerunCursor
 
-		return nil
-	}
-	sweep.open = alloc.OpenRerunCursor{}
-	if len(open) == rerunOpenListed {
-		sweep.open = open[len(open)-1].Cursor
-	}
-	for i := range open {
-		request := &open[i]
-		run := rerunRun{repository: request.Repository, run: request.RunID}
-		if waiting(run) {
-			continue
-		}
-
-		tiers, err := s.alloc.BoundRerunTiers(ctx, request.RerunRequest)
+	for range rerunOpenPages {
+		open, err := s.alloc.OpenReruns(ctx, cursor, rerunOpenPageRows)
 		if err != nil {
 			if ctx.Err() == nil {
-				s.log.Warn("could not read the tiers a re-run in doubt covers; trying again", "error", err)
+				s.log.Warn("could not list the re-runs in doubt; trying again", "error", err)
 			}
 
-			continue
+			return nil
 		}
-		if !set.add(run, tiers...) {
-			s.log.Warn("no target this control plane serves can read the run of a re-run in doubt; it waits",
-				"repository", request.Repository, "run", request.RunID, "tiers", tiers)
+
+		for i := range open {
+			s.bringUpOpenRerun(ctx, set, &open[i], now, waiting)
 		}
+
+		if len(open) < rerunOpenPageRows {
+			break
+		}
+		cursor = open[len(open)-1].Cursor
 	}
 
 	since, asking := now, false
@@ -414,6 +414,62 @@ func (s *Server) gatherRerunWork(ctx context.Context, targets map[string]Target,
 	return set.work
 }
 
+// bringUpOpenRerun adds the run of a request in doubt, through the tier the list
+// names or, where that one has no reader, any other it still covers.
+func (s *Server) bringUpOpenRerun(ctx context.Context, set *rerunWorkSet, request *alloc.OpenRerun, now time.Time,
+	waiting func(rerunRun) bool,
+) {
+	run := rerunRun{repository: request.Repository, run: request.RunID}
+	if waiting(run) || set.add(run, request.Tier) {
+		return
+	}
+
+	tiers, err := s.alloc.BoundRerunTiers(ctx, request.RerunRequest)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log.Warn("could not read the tiers a re-run in doubt covers; trying again", "error", err)
+		}
+
+		return
+	}
+	if set.add(run, tiers...) {
+		return
+	}
+
+	// PAST THE WINDOW IT IS SETTLED AS LANDED, never sent: it may have landed, and
+	// counting it only makes billet ask less.
+	if s.rerunWindowPassed(request.RerunRequest, now) {
+		s.settleUnread(ctx, request.RerunRequest, "no target this control plane serves can read its run")
+
+		return
+	}
+
+	s.log.Warn("no target this control plane serves can read the run of a re-run in doubt; it waits",
+		"repository", request.Repository, "run", request.RunID, "tiers", tiers)
+}
+
+// rerunWindowPassed says whether a request in doubt has waited past the window.
+func (s *Server) rerunWindowPassed(request alloc.RerunRequest, now time.Time) bool {
+	return !request.Created.IsZero() && now.Sub(request.Created) > rerunWindow
+}
+
+// settleUnread settles, as landed, a request in doubt past the window whose run cannot
+// be read: it may have landed, and counting it only makes billet ask less. Its jobs
+// are decided at last, which a job covered by a request in doubt otherwise never is.
+func (s *Server) settleUnread(ctx context.Context, request alloc.RerunRequest, why string) {
+	if err := s.alloc.SettleRerun(ctx, request, alloc.RerunRequested, why); err != nil {
+		if ctx.Err() == nil {
+			s.log.Warn("could not settle a re-run in doubt past its window; trying again",
+				"repository", request.Repository, "run", request.RunID, "error", err)
+		}
+
+		return
+	}
+
+	s.log.Warn("settled a re-run in doubt past its window as landed, since it may have; nothing was sent",
+		"repository", request.Repository, "run", request.RunID, "attempt", request.Attempt, "why", why)
+}
+
 // decideJob records a decision on one job, and logs a write that failed: the job
 // stays undecided and the next pass decides it again.
 func (s *Server) decideJob(ctx context.Context, job *alloc.RerunCandidate, decision alloc.RerunDecision, attempt int64) {
@@ -456,12 +512,36 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 	}
 
 	attempt, err := w.client.LatestAttempt(ctx, owner, repository, w.run.run)
+	if err == nil {
+		// TWO READS THAT DISAGREE ABOUT THE LATEST ATTEMPT decide nothing, and send
+		// nothing: a request for the run's failed jobs reaches whatever attempt GitHub
+		// is on.
+		for i := range attempt.Jobs {
+			if attempt.Jobs[i].Attempt > attempt.Attempt {
+				err = fmt.Errorf("server: run %d is on attempt %d and lists a job of attempt %d",
+					w.run.run, attempt.Attempt, attempt.Jobs[i].Attempt)
+			}
+		}
+	}
+	if err == nil && doubted && attempt.Attempt < open.Attempt {
+		err = fmt.Errorf("server: run %d is on attempt %d, before the attempt %d billet asked about",
+			w.run.run, attempt.Attempt, open.Attempt)
+	}
 	if err != nil {
+		// A RUN THAT CANNOT BE READ, OR READ SENSIBLY, holds a request in doubt only
+		// until the window: a run deleted at GitHub must not hold its jobs for ever.
+		if doubted && s.rerunWindowPassed(open, now) && ctx.Err() == nil &&
+			!errors.Is(err, ErrRerunThrottled) && !errors.Is(err, ErrRerunRefused) {
+			s.settleUnread(ctx, open, rerunDetail(err))
+
+			return nil
+		}
+
 		return err
 	}
 
 	if doubted {
-		settled, err := s.settleOpenRerun(ctx, w, open, attempt, limits, owner, repository, sweep)
+		settled, err := s.settleOpenRerun(ctx, w, open, attempt, limits, owner, repository, sweep, now)
 		if err != nil || !settled {
 			return err
 		}
@@ -488,19 +568,10 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 		return err
 	}
 
-	used, err := s.alloc.RunReruns(ctx, w.run.repository, w.run.run)
-	if err != nil {
-		return err
-	}
-	if used >= allowedFor(proved, limits) {
-		s.decideAll(ctx, proved, alloc.RerunLimit, attempt.Attempt)
-
-		return nil
-	}
-
-	// A JOB WHOSE RESULT CAME LATE, after its attempt was asked about. The key allows
-	// the attempt no second request. A request for the run's failed jobs covered it,
-	// and its answer is the job's; a request for another job alone did not.
+	// A JOB WHOSE RESULT CAME LATE, after its attempt was asked about, BEFORE THE LIMIT:
+	// the key allows the attempt no second request, so no new one is being weighed. A
+	// request for the run's failed jobs covered it, and its answer is the job's; a
+	// request for another job alone did not.
 	settled, kind, asked, err := s.alloc.RerunOfAttempt(ctx, w.run.repository, w.run.run, attempt.Attempt)
 	if err != nil {
 		return err
@@ -510,6 +581,16 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 			settled = alloc.RerunMixed
 		}
 		s.decideAll(ctx, proved, settled, attempt.Attempt)
+
+		return nil
+	}
+
+	used, err := s.alloc.RunReruns(ctx, w.run.repository, w.run.run)
+	if err != nil {
+		return err
+	}
+	if used >= allowedFor(proved, limits) {
+		s.decideAll(ctx, proved, alloc.RerunLimit, attempt.Attempt)
 
 		return nil
 	}
@@ -543,29 +624,41 @@ func (s *Server) runCandidates(ctx context.Context, run rerunRun, limits map[str
 		settle = s.rerunSettle
 	}
 
-	listed, err := s.alloc.RunRerunCandidates(ctx, run.repository, run.run, rerunPageRows)
-	if err != nil {
-		return nil, err
-	}
+	var (
+		jobs   []alloc.RerunCandidate
+		cursor alloc.RerunCursor
+	)
 
-	var jobs []alloc.RerunCandidate
-
-	for i := range listed {
-		job := listed[i]
-
-		asked, opted := sweep.asked[job.Tier]
-		if _, limited := limits[job.Tier]; !opted || !limited || job.ResultAt.Before(asked) || job.Bound > 0 ||
-			now.Sub(job.ResultAt) > rerunWindow {
-			continue
-		}
-		if now.Sub(job.ResultAt) < settle {
-			return nil, errRunUnfinished
+	// TO ITS END, never a prefix: a run decided from part of its jobs would read the
+	// rest as jobs that failed on their own.
+	for range rerunPages {
+		listed, err := s.alloc.RunRerunCandidates(ctx, run.repository, run.run, cursor, rerunPageRows)
+		if err != nil {
+			return nil, err
 		}
 
-		jobs = append(jobs, job)
+		for i := range listed {
+			job := listed[i]
+
+			asked, opted := sweep.asked[job.Tier]
+			if _, limited := limits[job.Tier]; !opted || !limited || job.ResultAt.Before(asked) || job.Bound > 0 ||
+				now.Sub(job.ResultAt) > rerunWindow {
+				continue
+			}
+			if now.Sub(job.ResultAt) < settle {
+				return nil, errRunUnfinished
+			}
+
+			jobs = append(jobs, job)
+		}
+
+		if len(listed) < rerunPageRows {
+			return jobs, nil
+		}
+		cursor = listed[len(listed)-1].Cursor
 	}
 
-	return jobs, nil
+	return nil, fmt.Errorf("server: run %d has more candidates than %d pages hold", run.run, rerunPages)
 }
 
 // settleOpenRerun answers a request in doubt from GitHub's record of the run, never by
@@ -576,7 +669,7 @@ func (s *Server) runCandidates(ctx context.Context, run rerunRun, limits map[str
 // the attempt asked about never heard it: that one is sent again, unless its tries
 // are used or a limit has since been lowered under it.
 func (s *Server) settleOpenRerun(ctx context.Context, w *rerunWork, open alloc.RerunRequest, attempt RunAttempt,
-	limits map[string]int64, owner, repository string, sweep *rerunSweep,
+	limits map[string]int64, owner, repository string, sweep *rerunSweep, now time.Time,
 ) (bool, error) {
 	switch {
 	case !attempt.Completed || attempt.Attempt > open.Attempt:
@@ -592,18 +685,31 @@ func (s *Server) settleOpenRerun(ctx context.Context, w *rerunWork, open alloc.R
 		}
 
 		return true, nil
-	case attempt.Attempt < open.Attempt:
-		return false, fmt.Errorf("server: run %d is on attempt %d, before the attempt %d billet asked about",
-			w.run.run, attempt.Attempt, open.Attempt)
 	case open.Tries >= rerunMaxTries:
 		return false, s.giveUpRerun(ctx, w, open, alloc.RerunFailed, sweep)
 	}
 
+	// NOT SENT PAST THE WINDOW: a job red that long is nobody's news, whatever kept
+	// the request from GitHub meanwhile.
+	if s.rerunWindowPassed(open, now) {
+		sweep.failures[w.run] = "it was not sent within a day of being decided"
+
+		return false, s.giveUpRerun(ctx, w, open, alloc.RerunExpired, sweep)
+	}
+
 	// EVERY TIER IT STILL COVERS, AS IT IS NOW, since a limit may have been lowered
-	// while the request was in doubt. A tier no longer asking allows none.
+	// while the request was in doubt. A tier no longer asking allows none, and one
+	// that has started asking again since the request was made asks afresh.
 	tiers, err := s.alloc.BoundRerunTiers(ctx, open)
 	if err != nil {
 		return false, err
+	}
+	for _, tier := range tiers {
+		if asked, ok := sweep.asked[tier]; ok && asked.After(open.Created) {
+			sweep.failures[w.run] = "a tier it covers stopped asking and asked again since it was made"
+
+			return false, s.giveUpRerun(ctx, w, open, alloc.RerunExpired, sweep)
+		}
 	}
 	allowed := int64(0)
 	for i, tier := range tiers {
@@ -693,7 +799,8 @@ func (s *Server) decideEachJob(ctx context.Context, w *rerunWork, jobs []alloc.R
 		listed, found := byRunner[provider.InstanceName(job.LeaseID)]
 		switch {
 		case !found, listed.Attempt < attempt.Attempt:
-			// THE RUN MOVED PAST THE JOB'S ATTEMPT WITHOUT BILLET: a person re-ran it.
+			// THE RUN MOVED PAST THE JOB'S ATTEMPT: a person re-ran it, or a request of
+			// billet's own the job was not yet a candidate for when it was made.
 			s.decideJob(ctx, job, alloc.RerunSuperseded, attempt.Attempt)
 		case !listed.RunnerLost:
 			s.decideJob(ctx, job, alloc.RerunUnproven, attempt.Attempt)

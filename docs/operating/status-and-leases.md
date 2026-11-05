@@ -80,7 +80,7 @@ It shows two facts side by side and no verdict between them: GitHub's own result
 
 A tier can ask for more: `retry: {disrupted: 1}` lets billet ask GitHub to re-run a job it ended, up to that many times for one workflow run. The App needs `actions: write`, which `billet github-app create --actions-write` asks for; on an App that already exists, add the permission on the App's settings page and accept it on the installation, and `billet check` says when it holds what the tiers need. [ADR-023](../reference/decisions/adr-023-rerunning-disrupted-jobs.md) holds the decision.
 
-A job is re-run only when both are true:
+A job is re-run only when all of these are true:
 
 - The ledger recorded a disruption from the closed list while the job could still have been running: `reclaimed` or `guest-absent`. Not `node-forgotten`, because a host cut off by a partition goes on running the job. Not `held-past-limit`, because `node.max_custody` is a bound an operator chose and a job that hangs would meet it again. Not an operator's `billet force-destroy`, because a person chose that.
 - The job ended after its tier started asking: a job already red when `retry.disrupted` was set is not re-run because the config changed.
@@ -94,8 +94,8 @@ The `RE-RUN` column of `billet leases failures`, and the `failure` line of `bill
 | `unproven` | GitHub's record does not show a lost runner, so the job may have failed on its own |
 | `mixed` | several jobs were proved beside a job that failed on its own, and neither of GitHub's two requests can run them without it |
 | `limit` | the run already had every re-run the tiers of the jobs it would run again allow |
-| `superseded` | the run's latest attempt is a later one than the job's, usually a person re-running it |
-| `expired` | nothing could be decided within a day of the job's result |
+| `superseded` | the run's latest attempt is a later one than the job's: a person re-ran it, or a request of billet's own made before the job's result arrived |
+| `expired` | nothing could be decided within a day of the job's result, or a request was not sent within a day of being decided |
 | `failed` | GitHub did not accept the request in five sends, read the run after each; the log says why |
 
 A dash is nothing decided: a tier that did not ask, or a run that has not finished. A run is decided only once every job of it has finished, because GitHub refuses a re-run of one still going, and a failed request is retried with a backoff and never holds up scheduling. `billet_job_reruns{tier,decision}` counts the last day's decisions.
