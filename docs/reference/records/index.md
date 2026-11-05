@@ -20,6 +20,7 @@ assignment-protocol
 guest-release-removal
 cpu-placement
 image-store-wait
+cache-breaker
 ```
 
 | Record | Covers |
@@ -39,3 +40,4 @@ image-store-wait
 | [Removing the guest releases published before #584](guest-release-removal.md) | the 19 `guest-*` releases removed on 2026-10-22 because they carried components billet may not redistribute and no corresponding source, the release that replaced them, and what that does to a deployment |
 | [CPU placement and idle power](cpu-placement.md) | what pinning microVMs to host cpus (`compact`, `spread`, `packed`) and capping the cpu while idle did to run time and power on the reference node on 2026-10-23, in three drained sessions with the wall meter beside RAPL: compact slower than spread on every load spread could hold, but using less energy on a memory-bound load at half the threads; sharing a CCD's L3 costing little and idle CCDs showing no energy saving; no cpu ceiling showing an idle saving; boost off saving energy under compact and costing it under spread; `node.power` restoring a launch's ceiling in about 20 ms; and billet's energy attribution at a mean 0.89 of the package's energy above idle, the shortfall tracking the host's own CPU |
 | [How long a guest waits for its Docker image store](image-store-wait.md) | what the reference deployment's ledger and node journal showed on 2026-10-24 about a guest's wait for its image store before its runner starts: no runner handed a job anywhere near the old 780-second bound, the slow ones all stores whose acquisition ran into Ceph's trouble at the three-minute bound and were still handed their jobs, and the four-minute bound on the whole request that the guest now waits just past, with a failed attach kept in custody until the compute is gone (#320) |
+| [A store that stops answering](cache-breaker.md) | the store breaker's deadlines, and a real Ceph site with its cache index's lock held, its cache pool's OSDs stopped and its monitors out of reach |

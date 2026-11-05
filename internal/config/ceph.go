@@ -38,10 +38,13 @@ type CephConfig struct {
 	// which finds /etc/ceph/ceph.<user>.keyring.
 	KeyringPath string `yaml:"keyring_path,omitempty"`
 
-	// ImagePool holds golden images and the per-job root clones taken from them.
+	// ImagePool holds golden images. The per-job root disks cloned from them live in
+	// CachePool, so that pool's health is every launch's (measured 2026-11-05: with
+	// its OSDs stopped, no root disk could be cloned).
 	ImagePool string `yaml:"image_pool"`
 
-	// CachePool holds cache volumes: sticky disks, build state, the layer cache.
+	// CachePool holds cache volumes (sticky disks, build state, the layer cache) and
+	// every job's root disk.
 	//
 	// SEPARATE FROM ImagePool, and validation refuses one name for both. Not for
 	// tuning — RBD's object size is a per-IMAGE property, so the reason ZFS wanted
