@@ -39,6 +39,11 @@ var ErrQuota = errors.New("hostsource: the account's quota is reached")
 // why, rather than reading the order back and placing it again.
 var ErrRefused = errors.New("hostsource: the source refused the request")
 
+// ErrNotSent means the order failed before anything was sent to the source: a local
+// refusal, or a read the order depended on (a quota, a stock list) that failed. No
+// host can exist for it, so it is not could-not-tell.
+var ErrNotSent = errors.New("hostsource: the order was not sent")
+
 // ErrNoProof is a release refused because its proof is missing or names another host.
 var ErrNoProof = errors.New("hostsource: a host is released only on proof it holds nothing or never joined")
 

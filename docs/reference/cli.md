@@ -201,6 +201,8 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 | Command | Meaning |
 |---|---|
 | `billet status` | admission, controller and epoch, capacity, tiers (grouped by target when there are several), nodes with protocol versions, cost peaks, unproven hosts, and the host's own converge guard when one is held (`guard held by H for AGE`). Under each tier whose jobs started in the last hour, the p99 of their queue wait, from GitHub's queue time to billet's start (`billet jobs wait` has the rest), with the jobs that have no GitHub queue time on record counted as unknown |
+| `billet pool` | every order the pool of rented bare metal placed (ADR-028): its architecture, source, shape and location, its state (ordering, placed, uncertain, refused and later sealed, released, gone, abandoned), the host and node, and why; an uncertain order is one whose answer was lost and that a resend could place twice |
+| `billet pool abandon --reason TEXT <order>` | close an uncertain order on a person's word, after checking the source's own console finds no host for it; the reason is recorded on the order |
 | `billet leases held` | every lease whose compute is not confirmed gone |
 | `billet leases quarantined` | capacity held for compute nobody has accounted for |
 | `billet leases failures [--since 24h] [--limit 50]` | jobs GitHub did not report as succeeded on leases billet's infrastructure disrupted; billet re-runs nothing |

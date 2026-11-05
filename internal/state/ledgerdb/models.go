@@ -153,6 +153,20 @@ type NodeEnrollment struct {
 	Source      string
 }
 
+type PoolOrder struct {
+	OrderID        string
+	Source         string
+	Shape          string
+	Location       string
+	Arch           string
+	State          string
+	HostID         string
+	NodeName       string
+	Reason         string
+	FirstAttemptAt string
+	UpdatedAt      string
+}
+
 type PoolRunner struct {
 	LeaseID            string
 	Tier               string

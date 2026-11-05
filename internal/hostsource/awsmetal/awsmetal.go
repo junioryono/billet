@@ -101,11 +101,12 @@ func (s *Source) Order(ctx context.Context, req hostsource.Request) (hostsource.
 	shape, ok := s.shapes[req.Shape]
 	switch {
 	case !ok:
-		return hostsource.Host{}, fmt.Errorf("awsmetal: %s is not a declared shape", req.Shape)
+		return hostsource.Host{}, fmt.Errorf("%w: awsmetal: %s is not a declared shape", hostsource.ErrNotSent, req.Shape)
 	case req.Arch != "" && req.Arch != shape.Arch:
-		return hostsource.Host{}, fmt.Errorf("awsmetal: %s is %s, not %s", req.Shape, shape.Arch, req.Arch)
+		return hostsource.Host{}, fmt.Errorf("%w: awsmetal: %s is %s, not %s", hostsource.ErrNotSent, req.Shape, shape.Arch, req.Arch)
 	case req.Location != "" && req.Location != s.location:
-		return hostsource.Host{}, fmt.Errorf("awsmetal: this source orders in %s, not %s", s.location, req.Location)
+		return hostsource.Host{}, fmt.Errorf("%w: awsmetal: this source orders in %s, not %s",
+			hostsource.ErrNotSent, s.location, req.Location)
 	}
 	rec, err := s.hosts.Launch(ctx, ec2.HostLaunch{
 		Order:        req.Order,
@@ -196,6 +197,9 @@ func stateOf(state string) hostsource.State {
 
 // refusal turns EC2's synchronous refusals into the contract's answers.
 func (s *Source) refusal(err error) error {
+	if errors.Is(err, ec2.ErrLaunchNotSent) {
+		return fmt.Errorf("%w: %w", hostsource.ErrNotSent, err)
+	}
 	code, ok := s.code(err)
 	if !ok {
 		return err
