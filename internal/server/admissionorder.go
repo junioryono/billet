@@ -122,9 +122,10 @@ import (
 //
 // A WAITER BEHIND A LEASE AS LARGE on every host it could use needs no host: that lease
 // ending is room it fits in. It holds back only a buyer at least as wide, the one that
-// could put another such lease in its way. A narrower buyer can only take part of the
-// room, which leaves a host it has a claim on, and letting one through is the difference
-// between this order and fair. Nothing kept a version that let every waiter out from
+// could put another such lease in its way. A narrower buyer goes past, and letting one
+// through is the difference between this order and fair, but not into room the waiter
+// fits in now (Purchase.Keep): on a host wide enough for several leases as large, the
+// room each one left went to narrower work before the waiter read it. Nothing kept a version that let every waiter out from
 // starving a shape as large as the hosts run.
 //
 // A HOLD BINDS ONLY WHO STANDS BEHIND ITS OWNER, because its owner cannot buy past a
@@ -425,12 +426,17 @@ func (q *admissionQueue) avoiding(tier string) []string {
 	return slices.Sorted(maps.Keys(q.heldAgainst(tier)))
 }
 
-// avoidedBy is what is held against a purchase of this tier and each tier it leaves room
-// for, read once under one plan: a purchase and the room it must leave its
-// waiters are measured against the same holds.
-func (q *admissionQueue) avoidedBy(tier string, protect []string) map[string]map[string]string {
+// purchaseFor is what the order asks of a purchase of this tier leaving room for
+// protect, read once under one plan: what each tier it names may not use, and the
+// waiters ahead it passes that are behind a lease as large, whose room it must leave
+// them once they fit (Purchase.Keep). Without that, a waiter on a host wide enough for
+// several leases as large found each one's room taken by narrower work before it read
+// it, and waited as under fill (measured on the reference week, 2026-11-04).
+func (q *admissionQueue) purchaseFor(tier string, protect []string) alloc.Purchase {
+	purchase := alloc.Purchase{Protect: protect}
+
 	if !q.holds() {
-		return nil
+		return purchase
 	}
 
 	q.mu.Lock()
@@ -439,13 +445,31 @@ func (q *admissionQueue) avoidedBy(tier string, protect []string) map[string]map
 	q.planHolds()
 
 	now := q.now()
-	out := make(map[string]map[string]string, len(protect)+1)
+	spent := q.waiting[tier].spent
 
-	for _, label := range append([]string{tier}, protect...) {
-		out[label] = q.heldAgainstLocked(label, now)
+	for _, label := range q.inOrder(now) {
+		if label == tier {
+			if !spent {
+				break
+			}
+
+			continue
+		}
+
+		waiter := q.waiting[label]
+		if waiter.behindAsLarge && waiter.held == "" && !slices.Contains(protect, label) &&
+			!q.steppedAside(label, waiter, q.lastRanks, now) {
+			purchase.Keep = append(purchase.Keep, label)
+		}
 	}
 
-	return out
+	purchase.Avoid = make(map[string]map[string]string, len(protect)+len(purchase.Keep)+1)
+
+	for _, label := range append(append([]string{tier}, protect...), purchase.Keep...) {
+		purchase.Avoid[label] = q.heldAgainstLocked(label, now)
+	}
+
+	return purchase
 }
 
 // boughtOne records one lease of a pool pass bought, whose re-dating waits for the end

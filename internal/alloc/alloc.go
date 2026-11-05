@@ -601,6 +601,10 @@ type Purchase struct {
 	// its floor uses a host's whole room only if it has room nowhere else, and only up
 	// to its floor.
 	Avoid map[string]map[string]string
+	// Keep is the tiers ahead of this purchase that it lets past without leaving them
+	// a lease, because none could use the room it takes. One that can use some now is
+	// left it: a purchase that takes room a tier here fits in now is rolled back.
+	Keep []string
 }
 
 // EscrowFor is Escrow under what the admission order asks of this purchase.
@@ -614,15 +618,21 @@ func (a *Allocator) EscrowFor(ctx context.Context, tier string, want int, purcha
 		return nil, fmt.Errorf("%w: %q", ErrUnknownTier, tier)
 	}
 
-	var guarded []config.Tier
+	var guarded, kept []config.Tier
 	for _, label := range purchase.Protect {
 		if w, ok := a.tiers[label]; ok && label != tier {
 			guarded = append(guarded, w)
 		}
 	}
 
+	for _, label := range purchase.Keep {
+		if w, ok := a.tiers[label]; ok && label != tier {
+			kept = append(kept, w)
+		}
+	}
+
 	for take := want; take > 0; take-- {
-		leases, err := a.escrow(ctx, t, take, guarded, purchase.Avoid)
+		leases, err := a.escrow(ctx, t, take, guarded, kept, purchase.Avoid)
 		if errors.Is(err, errWaiterLeftShort) {
 			continue
 		}
@@ -646,7 +656,7 @@ var (
 // escrow buys up to want leases of t in one transaction, rolling it back with
 // errWaiterShortNow or errWaiterLeftShort when it would leave a tier in guarded
 // unable to be granted one.
-func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded []config.Tier,
+func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded, kept []config.Tier,
 	avoid map[string]map[string]string,
 ) ([]*Lease, error) {
 	if want == 0 {
@@ -688,6 +698,21 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 			return err
 		}
 
+		// A TIER KEPT THAT FITS NOW KEEPS THAT ROOM: it waited on a lease as large, and the
+		// room that lease left is what it waited for.
+		var fitting []config.Tier
+
+		for i := range kept {
+			room, err := a.roomOf(ctx, tx, kept[i], avoid[kept[i].Label])
+			if err != nil {
+				return err
+			}
+
+			if room > 0 {
+				fitting = append(fitting, kept[i])
+			}
+		}
+
 		// WHO HOLDS A HOST AND FITS THERE KEEPS THAT, unless this tier is below its floor,
 		// whose room is promised.
 		var fitted map[string]bool
@@ -723,6 +748,10 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 		// READ BACK WITH THE LEASES IN THE LEDGER, floors re-placed and all.
 		if len(leases) > 0 {
 			if err := guardedHaveRoom(ctx, a, tx, guarded, avoid, errWaiterLeftShort); err != nil {
+				return err
+			}
+
+			if err := guardedHaveRoom(ctx, a, tx, fitting, avoid, errWaiterLeftShort); err != nil {
 				return err
 			}
 
@@ -806,18 +835,9 @@ func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []co
 	avoid map[string]map[string]string, short error,
 ) error {
 	for i := range guarded {
-		room, place, err := a.headroomWithPlacer(ctx, tx, guarded[i])
+		room, err := a.roomOf(ctx, tx, guarded[i], avoid[guarded[i].Label])
 		if err != nil {
 			return err
-		}
-
-		if hosts := avoid[guarded[i].Label]; room > 0 && len(hosts) > 0 {
-			place, _, err = a.placerAvoiding(ctx, tx, guarded[i], place, hosts, room)
-			if err != nil {
-				return err
-			}
-
-			room = place.total(guarded[i])
 		}
 
 		if room < 1 {
@@ -826,6 +846,26 @@ func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []co
 	}
 
 	return nil
+}
+
+// roomOf is how many leases of t an escrow in this transaction could grant now, off
+// the room held against it.
+func (a *Allocator) roomOf(ctx context.Context, tx querier, t config.Tier, holds map[string]string) (int, error) {
+	room, place, err := a.headroomWithPlacer(ctx, tx, t)
+	if err != nil {
+		return 0, err
+	}
+
+	if room > 0 && len(holds) > 0 {
+		place, _, err = a.placerAvoiding(ctx, tx, t, place, holds, room)
+		if err != nil {
+			return 0, err
+		}
+
+		room = place.total(t)
+	}
+
+	return room, nil
 }
 
 // encodeProviders renders a preference list for the ledger.

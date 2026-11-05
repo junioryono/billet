@@ -547,8 +547,8 @@ func TestRoomAppearingBeforeTheReadKeepsTheLine(t *testing.T) {
 }
 
 // THE CENTRAL WALK, THROUGH LISTENERS. The widest shape waits behind a lease as large. A
-// narrower tier passes it. The lease ends and the narrower takes part of the room; the host
-// now has no lease as large, so the widest is given it, nothing else lands, and it buys.
+// narrower tier passes it into the room beside that lease. The lease ends, the room it left
+// is the widest shape's, and the narrower tier takes none of it.
 func TestAWaiterBehindALeaseAsLargeGetsItsTurnAgainstANarrowerStream(t *testing.T) {
 	t.Parallel()
 
@@ -556,8 +556,8 @@ func TestAWaiterBehindALeaseAsLargeGetsItsTurnAgainstANarrowerStream(t *testing.
 	big.Memory, wide.Memory, small.Memory = config.GiB, config.GiB, config.GiB
 	tiers := []config.Tier{big, wide, small}
 
-	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
-	if _, err := a.RegisterNode(t.Context(), host("only", 16)); err != nil {
+	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 24, MaxMemory: 64 * config.GiB}, tiers)
+	if _, err := a.RegisterNode(t.Context(), host("only", 24)); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -578,38 +578,27 @@ func TestAWaiterBehindALeaseAsLargeGetsItsTurnAgainstANarrowerStream(t *testing.
 	want(bigL, 1)
 	want(wideL, 1)
 
-	if got := s.order.ownHold(wide.Label); got != "" {
-		t.Fatalf("the wide tier holds %q behind a lease as large", got)
-	}
-
-	if !s.order.waiting[wide.Label].behindAsLarge {
-		t.Fatal("the wide tier does not read as behind a lease as large")
-	}
-
-	finishOne(t, a, big.Label)
-	want(smallL, 1)
-
-	if got := startedTiers(log)[small.Label]; got != 1 {
-		t.Fatalf("the narrower tier started %d past the wide one", got)
-	}
-
-	want(wideL, 1)
-
-	if got := s.order.ownHold(wide.Label); got != "only" {
-		t.Fatalf("with no lease as large left the wide tier holds %q", got)
+	if got := s.order.ownHold(wide.Label); got != "" || !s.order.waiting[wide.Label].behindAsLarge {
+		t.Fatalf("the wide tier holds %q, and does not read as behind a lease as large", got)
 	}
 
 	want(smallL, 4)
 
-	if got := startedTiers(log)[small.Label]; got != 1 {
-		t.Errorf("the narrower tier started %d on the host held", got)
+	if got := startedTiers(log)[small.Label]; got != 4 {
+		t.Fatalf("the narrower tier started %d past the wide one, beside the lease as large", got)
 	}
 
-	finishOne(t, a, small.Label)
+	finishOne(t, a, big.Label)
+	want(smallL, 8)
+
+	if got := startedTiers(log)[small.Label]; got != 4 {
+		t.Errorf("the narrower tier started %d, the last %d in the room the lease as large left", got, got-4)
+	}
+
 	want(wideL, 1)
 
 	if got := startedTiers(log)[wide.Label]; got != 1 {
-		t.Errorf("the wide tier started %d with the host emptied", got)
+		t.Errorf("the wide tier started %d in the room the lease as large left", got)
 	}
 }
 
@@ -1456,6 +1445,77 @@ func TestAControlPlaneOverTheSameLedgerHoldsTheSameHost(t *testing.T) {
 
 	if got := held(); got != "host-b" {
 		t.Errorf("a new control plane holds %q", got)
+	}
+}
+
+// A PURCHASE PASSES A WAITER BEHIND A LEASE AS LARGE, AND LEAVES IT THE ROOM IT FITS IN: it
+// goes past one ahead with no host and none to come, but not one with a host, one behind
+// it, one stalled, or one it already leaves a lease.
+func TestAPurchaseKeepsOnlyTheWaitersAheadBehindALeaseAsLarge(t *testing.T) {
+	t.Parallel()
+
+	q := holdQueue(wantsHosts{"behind", nil}, wantsHosts{"held", []string{"a"}}, wantsHosts{"buyer", nil},
+		wantsHosts{"after", nil})
+	q.behindAsLarge("behind")
+	q.behindAsLarge("after")
+
+	if got := q.purchaseFor("buyer", nil).Keep; !slices.Equal(got, []string{"behind"}) {
+		t.Errorf("the purchase keeps %v; want the waiter ahead behind a lease as large", got)
+	}
+
+	if got := q.purchaseFor("buyer", []string{"behind"}).Keep; len(got) != 0 {
+		t.Errorf("a purchase leaving the waiter a lease also keeps %v", got)
+	}
+
+	if got := q.purchaseFor("newcomer", nil).Keep; !slices.Equal(got, []string{"after", "behind"}) &&
+		!slices.Equal(got, []string{"behind", "after"}) {
+		t.Errorf("a buyer not waiting keeps %v; want every waiter behind a lease as large", got)
+	}
+
+	if got := q.purchaseFor("buyer", nil).Avoid["behind"]; got == nil {
+		t.Error("the purchase reads no holds for the waiter it keeps")
+	}
+
+	start := q.now()
+	q.now = func() time.Time { return start.Add(WaiterAllowance + time.Second) }
+
+	if got := q.purchaseFor("newcomer", nil).Keep; len(got) != 0 {
+		t.Errorf("a buyer keeps %v, every waiter stalled", got)
+	}
+
+	if got := newAdmissionQueue(config.AdmissionFair).purchaseFor("buyer", nil).Keep; len(got) != 0 {
+		t.Errorf("under fair a purchase keeps %v", got)
+	}
+}
+
+// A HOST WIDE ENOUGH FOR SEVERAL LEASES AS LARGE: the waiter reads as behind one while another
+// runs, so each one's ending is the room it waits for, and a narrower stream waking first must
+// not take it. Measured on the reference week, the 16 vCPU p99 was 4h09 under hold this way.
+func TestAWaiterBehindALeaseAsLargeGetsTheRoomOneLeaves(t *testing.T) {
+	t.Parallel()
+
+	h := newHeldSceneOn(t, openState(t), []alloc.NodeRegistration{host("host-a", 24)}, tierOf("b-big", 8),
+		tierOf("c-wide", 8), tierOf("d-small", 2))
+
+	h.want(t, "b-big", 2)
+	h.want(t, "a-fill", 2)
+	h.want(t, "c-wide", 1)
+
+	if !h.s.order.waiting["c-wide"].behindAsLarge {
+		t.Fatal("the wide tier does not read as behind a lease as large, and this proves nothing")
+	}
+
+	finishOne(t, h.a, "b-big")
+	h.want(t, "d-small", 4)
+
+	if got := startedTiers(h.log)["d-small"]; got != 0 {
+		t.Errorf("the narrower tier started %d in the room the waiter ahead fits in", got)
+	}
+
+	h.want(t, "c-wide", 1)
+
+	if got := startedTiers(h.log)["c-wide"]; got != 1 {
+		t.Errorf("the wide tier started %d in the room a lease as large left", got)
 	}
 }
 

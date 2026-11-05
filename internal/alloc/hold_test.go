@@ -943,3 +943,49 @@ func TestAPurchaseThatMovesAFloorOntoAHeldHostIsRefused(t *testing.T) {
 		t.Errorf("a tier below its floor bought %d, %v on the only host it has", len(got), err)
 	}
 }
+
+// A WAITER KEPT KEEPS THE ROOM IT FITS IN NOW, and only that: a purchase that would take it
+// is rolled back, one that leaves it is not, and while it fits nowhere nothing is kept.
+func TestAPurchaseLeavesAKeptWaiterTheRoomItFitsIn(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	two := tier("two-a", 2, 8*config.GiB)
+	two.Provider, two.Node = config.ProviderDocker, "a"
+
+	eight := tier("eight-on-a", 8, 32*config.GiB)
+	eight.Provider, eight.Node = config.ProviderDocker, "a"
+
+	a := holdFleet(t, &now, two, eight)
+
+	keep := Purchase{Keep: []string{"eight-on-a"}}
+
+	// a is empty: 16 free, room for two of the waiter's. Two leases of 2 leave it 12.
+	got, err := a.EscrowFor(t.Context(), "two-a", 2, keep)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("leaving the waiter room it bought %d, %v", len(got), err)
+	}
+
+	// Asked for three, it takes two: a third would leave 6, short of one of the waiter's.
+	got, err = a.EscrowFor(t.Context(), "two-a", 3, keep)
+	if err != nil || len(got) != 2 {
+		t.Errorf("with 12 free and a waiter of 8 kept it bought %d, %v; want 2", len(got), err)
+	}
+
+	// 8 free: the waiter fits, so nothing more is for sale.
+	got, err = a.EscrowFor(t.Context(), "two-a", 1, keep)
+	if err != nil || len(got) != 0 {
+		t.Errorf("with the waiter fitting exactly it bought %d, %v", len(got), err)
+	}
+
+	// Not kept, the same purchase goes through.
+	got, err = a.EscrowFor(t.Context(), "two-a", 1, Purchase{})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("not kept it bought %d, %v", len(got), err)
+	}
+
+	// 6 free: the waiter fits nowhere, so nothing is kept from what is left.
+	got, err = a.EscrowFor(t.Context(), "two-a", 3, keep)
+	if err != nil || len(got) != 3 {
+		t.Errorf("with the waiter fitting nowhere it bought %d, %v; want all three", len(got), err)
+	}
+}

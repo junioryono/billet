@@ -534,6 +534,8 @@ func laterShare(t *testing.T, r *Report) float64 {
 // UNDER HOLD A WEIGHT STILL DIVIDES THE ROOM, between tiers of different shapes, where a
 // narrower one would pass a wider but for its rank.
 func TestAWeightDividesTheRoomUnderHold(t *testing.T) {
+	t.Parallel()
+
 	fleet := twoTargets(2, 1)
 	fleet.AdmissionOrder = config.AdmissionHold
 	fleet.Tiers[0].VCPU, fleet.Tiers[0].Memory = 4, 16*config.GiB
@@ -790,6 +792,8 @@ func TestAWideShapeGetsItsTurnUnderWeights(t *testing.T) {
 // as hold does, by keeping the stream off both hosts while one empties; hold keeps the
 // stream off the one host, so the stream's jobs start on the other meanwhile.
 func TestHoldGivesTheWideShapeItsTurnAndKeepsTheOtherHostOpen(t *testing.T) {
+	t.Parallel()
+
 	fleet := Fleet{
 		Hosts: []Host{
 			{Name: "host-a", VCPU: 16, Memory: 64 * config.GiB},
