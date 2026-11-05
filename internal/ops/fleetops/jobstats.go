@@ -195,9 +195,11 @@ type statsFigures struct {
 	Energy           []statsEnergy
 	EnergyUnmeasured int
 	// CostUSD is the charged price over the duration of the CostJobs jobs whose
-	// lease bought a shape at a recorded price.
+	// lease bought a shape at a recorded price. Bought counts the jobs whose lease
+	// bought a shape at all, so the rest of them have a cost nobody recorded.
 	CostUSD  float64
 	CostJobs int
+	Bought   int
 }
 
 // statsEnergy is what one source measured for a group's jobs.
@@ -239,7 +241,7 @@ func factsOfRepo(facts []alloc.JobFact, repo string) []alloc.JobFact {
 		return facts
 	}
 
-	return slices.DeleteFunc(facts, func(f alloc.JobFact) bool { return f.Repo != repo })
+	return slices.DeleteFunc(facts, func(f alloc.JobFact) bool { return !strings.EqualFold(f.Repo, repo) })
 }
 
 // statsKey is the group one job belongs to. A job name is the workflow's to choose
@@ -355,6 +357,9 @@ func figuresOf(facts []alloc.JobFact) statsFigures {
 				out.CostJobs++
 			}
 		}
+		if f.InstanceType != "" {
+			out.Bought++
+		}
 
 		if f.Usage == nil || !f.Usage.Measured(alloc.UsageEnergy) {
 			out.EnergyUnmeasured++
@@ -456,15 +461,25 @@ func flakyAcross(attempts []*alloc.JobFact) (bool, bool) {
 	sorted := slices.Clone(attempts)
 	slices.SortFunc(sorted, func(x, y *alloc.JobFact) int { return cmp.Compare(x.RunAttempt, y.RunAttempt) })
 
+	// THE FIRST ATTEMPT MUST BE ON RECORD: one that ran elsewhere, or before both
+	// windows, may be the failure a later pass makes a flake.
+	if sorted[0].RunAttempt != 1 {
+		return false, false
+	}
 	for i, f := range sorted {
 		if f.RunAttempt <= 0 || (i > 0 && sorted[i-1].RunAttempt == f.RunAttempt) {
 			return false, false
 		}
 	}
 
+	// AN ATTEMPT WITH NO RESULT YET DECIDES NOTHING, and the run is judged only once a
+	// flake is already there or every attempt has ended: a failure followed by a
+	// re-run still going is not a run that stayed failed.
 	failed := false
 	for _, f := range sorted {
 		switch {
+		case f.Result == "":
+			return false, false
 		case f.Result == statsResultFailed && !f.Attributed():
 			failed = true
 		case f.Succeeded() && failed:
@@ -627,12 +642,7 @@ func energyText(f *statsFigures) string {
 	parts := make([]string, 0, len(f.Energy))
 	for i := range f.Energy {
 		e := &f.Energy[i]
-		source := e.Source
-		if source == "" {
-			source = "source not recorded"
-		}
-		parts = append(parts, fmt.Sprintf("%s: %s active, %s idle over %d jobs", source,
-			joules(e.ActiveMicrojoules), joules(e.IdleMicrojoules), e.Jobs))
+		parts = append(parts, fmt.Sprintf("%s over %d jobs", energyOfSource(e), e.Jobs))
 	}
 	text := strings.Join(parts, "; ")
 	if f.EnergyUnmeasured > 0 {
@@ -642,12 +652,53 @@ func energyText(f *statsFigures) string {
 	return text
 }
 
-func costText(f *statsFigures) string {
-	if f.CostJobs == 0 {
-		return "no bought shape"
+// energyOfSource words one source's energy as `billet jobs show` words a job's: only
+// a source that splits it says what was idle.
+func energyOfSource(e *statsEnergy) string {
+	switch e.Source {
+	case alloc.EnergyRAPL:
+		return fmt.Sprintf("rapl: %s active, %s idle (package RAPL, a model rather than a meter)",
+			joules(e.ActiveMicrojoules), joules(e.IdleMicrojoules))
+	case alloc.EnergyMeter:
+		return fmt.Sprintf("meter: %s active, %s idle (the whole host at the wall)", joules(e.ActiveMicrojoules),
+			joules(e.IdleMicrojoules))
+	case alloc.EnergyProcess:
+		return fmt.Sprintf("process: %s (macOS's own estimate for the VM's process; the machine's idle draw is not in it)",
+			joules(e.ActiveMicrojoules))
+	case alloc.EnergyRAPLUnsplit:
+		return fmt.Sprintf("rapl-unsplit: %s (package RAPL with no idle baseline, so idle is inside it)",
+			joules(e.ActiveMicrojoules))
+	case "":
+		return fmt.Sprintf("source not recorded: %s", joules(e.ActiveMicrojoules))
 	}
 
-	return fmt.Sprintf("$%.2f over %d of %d jobs", f.CostUSD, f.CostJobs, f.Jobs)
+	return fmt.Sprintf("%s: %s, split by a source this binary does not know", strconv.Quote(e.Source),
+		joules(e.ActiveMicrojoules))
+}
+
+// energySplit says whether a source's idle figure is one: the others report a total
+// with idle in it or none at all.
+func energySplit(source string) bool {
+	return source == alloc.EnergyRAPL || source == alloc.EnergyMeter
+}
+
+// costText says what the bought shapes cost. NOTHING BOUGHT IS SAID ONLY WHEN NO LEASE
+// BOUGHT A SHAPE: a bought one whose price or duration was not recorded has a cost
+// nobody can say, never none.
+func costText(f *statsFigures) string {
+	switch {
+	case f.Bought == 0 && f.CostJobs == 0:
+		return "no bought shape"
+	case f.CostJobs == 0:
+		return fmt.Sprintf("not recorded for the %d jobs on a bought shape (no price or no duration)", f.Bought)
+	}
+
+	text := fmt.Sprintf("$%.2f over %d of %d jobs", f.CostUSD, f.CostJobs, f.Jobs)
+	if missing := f.Bought - f.CostJobs; missing > 0 {
+		text += fmt.Sprintf("; not recorded for %d more on a bought shape", missing)
+	}
+
+	return text
 }
 
 // groupHeading names a group. EVERY STRING GITHUB OR A WORKFLOW CHOSE IS QUOTED,
@@ -814,6 +865,7 @@ type statsFiguresJSON struct {
 	EnergyUnmeasured int               `json:"energy_not_measured"`
 	CostUSD          *float64          `json:"cloud_cost_usd"`
 	CostJobs         int               `json:"cloud_cost_jobs"`
+	BoughtJobs       int               `json:"bought_shape_jobs"`
 }
 
 type statsDurations struct {
@@ -826,11 +878,24 @@ type statsDurations struct {
 	P99Lease string  `json:"p99_lease"`
 }
 
+// statsEnergyJSON is one source's energy. IdleJoules is null for a source that does
+// not split idle out, and IdleIncluded says the active figure has the idle in it.
 type statsEnergyJSON struct {
-	Source       string  `json:"source"`
-	ActiveJoules float64 `json:"active_joules"`
-	IdleJoules   float64 `json:"idle_joules"`
-	Jobs         int     `json:"jobs"`
+	Source       string   `json:"source"`
+	ActiveJoules float64  `json:"active_joules"`
+	IdleJoules   *float64 `json:"idle_joules"`
+	IdleIncluded bool     `json:"idle_included"`
+	Jobs         int      `json:"jobs"`
+}
+
+// idleJoules is a source's idle energy, nil for one that reports none of its own.
+func idleJoules(e *statsEnergy) *float64 {
+	if !energySplit(e.Source) {
+		return nil
+	}
+	idle := float64(e.IdleMicrojoules) / 1e6
+
+	return &idle
 }
 
 // rateOf is part over whole, null when whole is zero.
@@ -853,6 +918,7 @@ func statsFiguresJSONOf(f *statsFigures) statsFiguresJSON {
 		FlakyRuns: f.Flaky, FlakyRate: rateOf(f.Flaky, f.Judged), NoDuration: f.NoDuration,
 		QueueWaitJobs: f.Wait.Count, NoQueueTime: f.NoQueueTime, VCPUHoursJobs: f.VCPUJobs,
 		Energy: []statsEnergyJSON{}, EnergyUnmeasured: f.EnergyUnmeasured, CostJobs: f.CostJobs,
+		BoughtJobs: f.Bought,
 	}
 	if out.Other == nil {
 		out.Other = map[string]int{}
@@ -876,8 +942,9 @@ func statsFiguresJSONOf(f *statsFigures) statsFiguresJSON {
 	for i := range f.Energy {
 		e := &f.Energy[i]
 		out.Energy = append(out.Energy, statsEnergyJSON{Source: e.Source,
-			ActiveJoules: float64(e.ActiveMicrojoules) / 1e6, IdleJoules: float64(e.IdleMicrojoules) / 1e6,
-			Jobs: e.Jobs})
+			ActiveJoules: float64(e.ActiveMicrojoules) / 1e6, IdleJoules: idleJoules(e),
+			IdleIncluded: e.Source == alloc.EnergyRAPLUnsplit,
+			Jobs:         e.Jobs})
 	}
 
 	return out

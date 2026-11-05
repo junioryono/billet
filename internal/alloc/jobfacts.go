@@ -38,9 +38,12 @@ type JobFact struct {
 	GitHubQueuedAt time.Time
 	// VCPU, Memory and PriceMicrosPerHour are what the lease was charged; a zero
 	// is not recorded, and a zero price is also what a host-backed lease has.
+	// InstanceType is the shape it bought, empty for a host-backed lease, which
+	// buys nothing.
 	VCPU               int64
 	Memory             int64
 	PriceMicrosPerHour int64
+	InstanceType       string
 	// Usage is the host's report, nil when none was recorded. It carries the
 	// groups, the window, CPU, peak memory, OOM kills, CPU pressure and energy;
 	// disk, network and the counters are not read.
@@ -123,7 +126,7 @@ func jobFactOf(r *ledgerdb.ListJobFactsRow) JobFact {
 		JobName: r.JobName, RunID: r.RunID, RunAttempt: r.GithubRunAttempt, Result: r.Result,
 		Conclusion: r.Conclusion, Disruption: r.Disruption, StartedAt: parseStamp(r.StartedAt),
 		ResultAt: parseStamp(r.ResultAt), GitHubQueuedAt: parseStamp(r.GithubQueuedAt),
-		VCPU: r.Vcpu, Memory: r.Memory, PriceMicrosPerHour: r.PriceMicrosPerHour,
+		VCPU: r.Vcpu, Memory: r.Memory, PriceMicrosPerHour: r.PriceMicrosPerHour, InstanceType: r.InstanceType,
 	}
 	if r.HasUsage == 0 {
 		return fact

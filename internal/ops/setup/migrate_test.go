@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
 	"os"
 	"os/exec"
@@ -236,7 +239,7 @@ func TestAHostedLabelIsReadForWhatItGives(t *testing.T) {
 		}
 	}
 
-	for _, label := range []string{"windows-latest", "windows-2022", "windows-11-arm", "xcode-27"} {
+	for _, label := range []string{"windows-latest", "windows-2022", "windows-11-arm", "xcode-27", "macos-13", "macos-12"} {
 		if got, ok := lookupHostedLabel(label, false); !ok || got.NoMapping == "" {
 			t.Errorf("%s = %+v, %t; want a label GitHub hosts that is never chosen for", label, got, ok)
 		}
@@ -491,7 +494,7 @@ jobs:
 		`"${{ github.ref }}": no job here`,
 		`job "Twin"`, "2 jobs here are named that",
 		`"moved-since": it runs on "` + onSixteen + `" here, and the recommendation was for "` + onFour + `"`,
-		`"forged": it recommends "billet-2vcpu-ubuntu-2404\n    evil: true", which is no runs-on`,
+		`"forged": it recommends "billet-2vcpu-ubuntu-2404\n    evil: true", which is no one tier`,
 		`"still-hosted": no job here`,
 		`"no-such-job": no job here`,
 		`"idle"; confidence "high"`,
@@ -584,7 +587,10 @@ func checkout(t *testing.T, workflows map[string]string) string {
 	runIn(t, dir, "config", "user.email", "test@example.invalid")
 	runIn(t, dir, "config", "user.name", "test")
 	runIn(t, dir, "config", "commit.gpgsign", "false")
-	runIn(t, dir, "remote", "add", "origin", origin)
+	// ORIGIN READS AS THE REPOSITORY ON GITHUB AND PUSHES TO THE BARE ONE BESIDE IT, so
+	// the command reads owner/name from it as from a real checkout.
+	runIn(t, dir, "remote", "add", "origin", "https://github.com/acme/api.git")
+	runIn(t, dir, "config", "url."+origin+".pushInsteadOf", "https://github.com/acme/api.git")
 
 	workflowDir := filepath.Join(dir, filepath.FromSlash(workflowsDir))
 	if err := os.MkdirAll(workflowDir, 0o750); err != nil {
@@ -793,7 +799,7 @@ func stubGH(t *testing.T, exit string) string {
 	dir := t.TempDir()
 	record := filepath.Join(dir, "args")
 	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '" + record + "'; done\n" +
-		"echo https://github.com/acme/api/pull/7\n" + exit + "\n"
+		"cat > '" + record + ".body'\necho https://github.com/acme/api/pull/7\n" + exit + "\n"
 	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -810,7 +816,9 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 	dir := checkout(t, map[string]string{"ci.yml": migrateWorkflow, "unmoved.yml": "on: [push]\njobs:\n  a:\n    runs-on: our-own\n"})
 	cfg := migrateConfigFile(t)
 
-	stdout, stderr, err := migrateRun(t, "--config", cfg, "--path", dir, "--repo", "acme/api", "--open-pr")
+	// The repository named in another case than origin's: the pull request goes to it
+	// as named, from the branch on origin's owner.
+	stdout, stderr, err := migrateRun(t, "--config", cfg, "--path", dir, "--repo", "Acme/API", "--open-pr")
 	if err != nil {
 		t.Fatalf("--open-pr: %v\n%s", err, stderr)
 	}
@@ -838,9 +846,16 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 	if err != nil {
 		t.Fatalf("gh was never run: %v", err)
 	}
-	for _, want := range []string{"pr\ncreate\n--title=", "--head=" + branch, `"our-own"`, "billet migrate workflows"} {
+	for _, want := range []string{"pr\ncreate\n", "--repo=Acme/API\n", "--base=main\n", "--head=acme:" + branch + "\n",
+		"--body-file=-\n"} {
 		if !strings.Contains(string(args), want) {
 			t.Errorf("gh's arguments do not hold %q:\n%s", want, args)
+		}
+	}
+	body := readFile(t, record+".body")
+	for _, want := range []string{`"our-own"`, "billet migrate workflows"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the pull request's body, read on stdin, does not hold %q:\n%s", want, body)
 		}
 	}
 }
@@ -885,7 +900,7 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	// The push fails: there is no such remote any more. The commit stands, and the
 	// error says so.
 	unpushed := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
-	runIn(t, unpushed, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone"))
+	runIn(t, unpushed, "remote", "set-url", "--push", "origin", filepath.Join(t.TempDir(), "gone"))
 	_, _, err := migrateRun(t, "--config", cfg, "--path", unpushed, "--repo", "acme/api", "--open-pr")
 	if err == nil || !strings.Contains(err.Error(), "stopped on branch billet/migrate-workflows-") ||
 		!strings.Contains(err.Error(), "after committing") {
@@ -1010,7 +1025,7 @@ func TestAPlacementIsCheckedAgainstTheBytes(t *testing.T) {
 		{yaml.Node{Kind: yaml.ScalarNode, Value: "ubuntu-latest", Line: 1, Column: 4, Style: yaml.DoubleQuotedStyle},
 			"does not hold the label"},
 	} {
-		got, reason := lines.place(&tc.node)
+		got, reason := lines.span(&tc.node)
 		if tc.says == "" && (reason != "" || got.start != 3 || got.end != 16) {
 			t.Errorf("%+v placed at %+v (%s), want 3 to 16", tc.node, got, reason)
 		}
@@ -1030,4 +1045,353 @@ func readFile(t *testing.T, path string) string {
 	}
 
 	return string(raw)
+}
+
+// A MOVE A REPORT ASKS FOR IS CHECKED AGAINST THIS CONFIGURATION, and what is written
+// is the configuration's own name for the tier: a stale or edited report cannot move
+// a job to another OS, another architecture, a tier that will not take its workflow,
+// a tier whose architecture cannot be told, or a look-alike of a real name.
+func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
+	t.Parallel()
+
+	const file = ".github/workflows/ci.yml"
+	before := "on: [push]\njobs:\n  build:\n    runs-on: " + onFour + "\n"
+	tiers := func(change func(*config.Tier)) []config.Tier {
+		out := migrateTiers()
+		for i := range out {
+			if out[i].Label == "platform-2vcpu" {
+				change(&out[i])
+			}
+		}
+		return out
+	}
+	entry := rightsizeEntry{Repository: "acme/api", Workflow: "acme/api/" + file, Job: "build", CurrentRunsOn: onFour,
+		Recommendation: "smaller", Reason: "idle", Confidence: "high", RecommendedRunsOn: onTwo}
+
+	for _, tc := range []struct {
+		name   string
+		tiers  []config.Tier
+		entry  func(*rightsizeEntry)
+		writes string
+		says   string
+	}{
+		{name: "a compatible move writes the configuration's name", entry: func(e *rightsizeEntry) {
+			e.RecommendedRunsOn = "BILLET-2VCPU-UBUNTU-2404"
+		}, writes: onTwo},
+		{name: "a lowercase k names the tier, and a Kelvin sign, which folds to it, does not",
+			tiers: tiers(func(t *config.Tier) { t.RunsOn = "kube-2vcpu" }),
+			entry: func(e *rightsizeEntry) { e.RecommendedRunsOn = "\u212aube-2vcpu" }, says: "which is no one tier"},
+		{name: "the same tier by its ASCII name", tiers: tiers(func(t *config.Tier) { t.RunsOn = "kube-2vcpu" }),
+			entry: func(e *rightsizeEntry) { e.RecommendedRunsOn = "KUBE-2vcpu" }, writes: "kube-2vcpu"},
+		{name: "another guest OS on the same architecture", tiers: tiers(func(t *config.Tier) { t.GuestOS = config.GuestWindows }),
+			says: "is not"},
+		{name: "another architecture", tiers: tiers(func(t *config.Tier) { t.Image = "ubuntu-2404-arm64@verified" }),
+			says: "is not"},
+		{name: "an architecture that cannot be told", tiers: func() []config.Tier {
+			out := tiers(func(t *config.Tier) { t.Image = "ubuntu-2404@verified" })
+			for i := range out {
+				if out[i].Label == "platform-4vcpu" {
+					out[i].Image = "ubuntu-2404@verified"
+				}
+			}
+			return out
+		}(), says: "is not"},
+		{name: "a trusted tier listing the workflow under another case", tiers: func() []config.Tier {
+			out := migrateTiers()
+			for i := range out {
+				switch out[i].Label {
+				case "platform-4vcpu":
+					out[i].Trust, out[i].Workflows = config.WorkloadTrusted, []string{"acme/api/" + file + "@refs/heads/main"}
+				case "platform-2vcpu":
+					out[i].Trust, out[i].Workflows = config.WorkloadTrusted, []string{"acme/api/.github/workflows/CI.yml@refs/heads/main"}
+				}
+			}
+			return out
+		}(), says: "is not"},
+		{name: "a trusted tier listing it, the repository in another case", tiers: func() []config.Tier {
+			out := migrateTiers()
+			for i := range out {
+				if out[i].Label == "platform-4vcpu" || out[i].Label == "platform-2vcpu" {
+					out[i].Trust, out[i].Workflows = config.WorkloadTrusted, []string{"ACME/Api/" + file + "@refs/heads/main"}
+				}
+			}
+			return out
+		}(), writes: onTwo},
+		{name: "the report names no job", entry: func(e *rightsizeEntry) { e.Job = "" }, says: "the report names no job"},
+		{name: "judged on a tier that is not here", entry: func(e *rightsizeEntry) { e.CurrentRunsOn = "gone" },
+			says: `it was judged on "gone"`},
+	} {
+		tierSet := tc.tiers
+		if tierSet == nil {
+			tierSet = migrateTiers()
+		}
+		e := entry
+		if tc.entry != nil {
+			tc.entry(&e)
+		}
+		entries := &rightsizeEntries{byFile: map[string][]rightsizeEntry{file: {e}}}
+		got := rewriteWorkflow(file, []byte(before), chooserOf(t, tierSet, labelMaps{}, false), entries)
+		want := before
+		if tc.writes != "" {
+			want = strings.Replace(before, onFour, tc.writes, 1)
+		}
+		if string(got.after) != want {
+			t.Errorf("%s: became %q, want %q", tc.name, got.after, want)
+		}
+		if report := (&migrationPlan{findings: got.findings}).reportText(); tc.says != "" && !strings.Contains(report, tc.says) {
+			t.Errorf("%s: the report does not say %q:\n%s", tc.name, tc.says, report)
+		}
+	}
+
+	// A job whose name only GitHub can work out is matched by no entry, empty or not.
+	computed := "on: [push]\njobs:\n  build:\n    name: ${{ github.ref }}\n    runs-on: " + onFour + "\n"
+	e := entry
+	e.Job = ""
+	got := rewriteWorkflow(file, []byte(computed), chooserOf(t, migrateTiers(), labelMaps{}, false),
+		&rightsizeEntries{byFile: map[string][]rightsizeEntry{file: {e}}})
+	if string(got.after) != computed {
+		t.Errorf("an empty entry moved a job named by an expression:\n%s", got.after)
+	}
+}
+
+// A JOB SHARED THROUGH AN ANCHOR, AN ALIAS OF ONE, AND ONE TAKING ITS KEYS WITH <<
+// ARE LEFT ALONE AND SAID: an edit to one would move the others.
+func TestASharedJobIsLeftAlone(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, data, says string }{
+		{"an anchored job", "jobs:\n  a: &shared\n    runs-on: ubuntu-latest\n  b: *shared\n", "the job is a YAML anchor"},
+		{"a merged job", "x: &defaults\n  runs-on: ubuntu-latest\njobs:\n  a:\n    <<: *defaults\n    steps: []\n",
+			"takes keys from another mapping"},
+		{"anchored jobs", "jobs: &all\n  a:\n    runs-on: ubuntu-latest\n", "its jobs are a YAML anchor"},
+	} {
+		got := rewriteWorkflow("w.yml", []byte(tc.data), chooserOf(t, migrateTiers(), labelMaps{}, false), nil)
+		report := (&migrationPlan{findings: got.findings}).reportText()
+		if string(got.after) != tc.data || !strings.Contains(report, tc.says) {
+			t.Errorf("%s: became %q, saying\n%s\nwant it left alone saying %q", tc.name, got.after, report, tc.says)
+		}
+	}
+
+	aliased := "jobs:\n  a: &shared\n    runs-on: ubuntu-latest\n  b: *shared\n"
+	got := rewriteWorkflow("w.yml", []byte(aliased), chooserOf(t, migrateTiers(), labelMaps{}, false), nil)
+	if report := (&migrationPlan{findings: got.findings}).reportText(); !strings.Contains(report, `job "b": the job is a YAML alias`) {
+		t.Errorf("the alias job was not said:\n%s", report)
+	}
+}
+
+// A TIER WHOSE NAME WOULD READ BACK AS ANOTHER TYPE IS WRITTEN QUOTED, and one already
+// quoted keeps its quotes: runs-on must still be the string after the edit.
+func TestAReplacementReadsBackAsTheLabel(t *testing.T) {
+	t.Parallel()
+
+	tiers := migrateTiers()
+	for i := range tiers {
+		if tiers[i].Label == "platform-2vcpu" {
+			tiers[i].RunsOn = "null"
+		}
+	}
+	for _, tc := range []struct{ data, want string }{
+		{"jobs:\n  a:\n    runs-on: ubuntu-latest\n", "jobs:\n  a:\n    runs-on: \"null\"\n"},
+		{"jobs:\n  a:\n    runs-on: [ubuntu-latest]\n", "jobs:\n  a:\n    runs-on: [\"null\"]\n"},
+		{"jobs:\n  a:\n    runs-on: 'ubuntu-latest'\n", "jobs:\n  a:\n    runs-on: 'null'\n"},
+	} {
+		got := rewriteWorkflow("w.yml", []byte(tc.data), chooserOf(t, tiers, labelMaps{}, false), nil)
+		if string(got.after) != tc.want {
+			t.Errorf("%q became %q, want %q", tc.data, got.after, tc.want)
+		}
+	}
+	for value, bare := range map[string]bool{"billet-2vcpu": true, "null": false, "true": false, "1": false, "~": false,
+		"a: b": false, "#x": false, "[x]": false, "yes": true} {
+		if got := readsBackAs(value); got != bare {
+			t.Errorf("readsBackAs(%q) = %t, want %t", value, got, bare)
+		}
+	}
+}
+
+// LINES ARE COUNTED AS THE PARSER COUNTS THEM: a lone CR, a NEL, an LS or a PS above
+// the label moves every later line, and an edit placed by a count of LFs alone would
+// land on another line. Whatever the count, the result is read back before it is
+// kept, and a file that would not read back as itself with only the label changed is
+// left alone.
+func TestLinesAreCountedAsTheParserCountsThem(t *testing.T) {
+	t.Parallel()
+
+	for name, sep := range map[string]string{"CR": "\r", "NEL": "\u0085", "LS": "\u2028", "PS": "\u2029"} {
+		data := "# a" + sep + "# b\njobs:\n  a:\n    runs-on: ubuntu-latest\n  b:\n    runs-on: ubuntu-latest\n"
+		got := rewriteWorkflow("w.yml", []byte(data), chooserOf(t, migrateTiers(), labelMaps{}, false), nil)
+		want := strings.ReplaceAll(data, "ubuntu-latest", onTwo)
+		if string(got.after) != want {
+			t.Errorf("%s above the jobs: became %q, want %q", name, got.after, want)
+		}
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte("jobs:\n  a:\n    runs-on: x\n    name: y\n"), &doc); err != nil {
+		t.Fatal(err)
+	}
+	runsOn := mappingValue(mappingValue(mappingValue(rootOf(&doc), "jobs"), "a"), "runs-on")
+	for _, tc := range []struct {
+		after, says string
+	}{
+		{"jobs:\n  a:\n    runs-on: z\n    name: y\n", ""},
+		{"jobs:\n  a:\n    runs-on: z\n    name: w\n", "a value that was not meant to change did"},
+		{"jobs:\n  a:\n    runs-on: w\n    name: y\n", "a value did not become the label meant"},
+		{"jobs:\n  a:\n    runs-on: [z]\n    name: y\n", "its structure changed"},
+		{"jobs: [\n", "it no longer parses"},
+	} {
+		if got := sameWorkflowBut(&doc, []byte(tc.after), []edit{{node: runsOn, value: "z"}}); got != tc.says {
+			t.Errorf("%q: %q, want %q", tc.after, got, tc.says)
+		}
+	}
+}
+
+// NEITHER WORKFLOW DIRECTORY MAY BE A LINK, and a file changed after it was read is
+// not written over: either would have the command change what it did not read.
+func TestMigrateWorkflowsWritesOnlyWhatItRead(t *testing.T) {
+	t.Parallel()
+
+	cfg := migrateConfigFile(t)
+	elsewhere := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	for _, link := range []string{".github", ".github/workflows"} {
+		dir := t.TempDir()
+		target := filepath.Join(elsewhere, filepath.FromSlash(link))
+		at := filepath.Join(dir, filepath.FromSlash(link))
+		if err := os.MkdirAll(filepath.Dir(at), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, at); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := migrateRun(t, "--config", cfg, "--path", dir, "--repo", "acme/api", "--write")
+		if err == nil || !strings.Contains(err.Error(), "is a link or a file, not a directory") {
+			t.Errorf("a linked %s = %v, want refused", link, err)
+		}
+	}
+	if got := readFile(t, filepath.Join(elsewhere, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
+		t.Errorf("a link wrote another checkout's workflow: %q", got)
+	}
+
+	dir := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	plan, err := planMigration(dir, "acme/api", chooserOf(t, []config.Tier{{Label: "billet-2vcpu", Target: "default",
+		Arch: config.ArchX64, Provider: config.ProviderDocker, GuestOS: config.GuestLinux, VCPU: 2, Memory: 8 * config.GiB,
+		Image: "ubuntu:24.04"}}, labelMaps{}, false), nil)
+	if err != nil || !plan.changes() {
+		t.Fatalf("plan = %+v, %v; want a change", plan, err)
+	}
+	target := filepath.Join(dir, ".github", "workflows", "ci.yml")
+	if err := os.WriteFile(target, []byte(migrateWorkflow+"# edited meanwhile\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.install(dir); err == nil || !strings.Contains(err.Error(), "changed since it was read") {
+		t.Errorf("installing over an edit = %v, want refused", err)
+	}
+	if got := readFile(t, target); !strings.HasSuffix(got, "# edited meanwhile\n") {
+		t.Errorf("the edit was written over: %q", got)
+	}
+}
+
+// A TOOL'S MESSAGE LOSES EVERY URL'S CREDENTIALS before it reaches an error.
+func TestAToolsMessageLosesItsCredentials(t *testing.T) {
+	t.Parallel()
+
+	for in, want := range map[string]string{
+		"fatal: unable to access 'https://x-access-token:s3cret@github.com/a/b.git/': 403": "fatal: unable to access 'https://github.com/a/b.git/': 403",
+		"push to ssh://git:pw@host/a/b failed":                                             "push to ssh://host/a/b failed",
+		"nothing to hide at https://github.com/a/b":                                        "nothing to hide at https://github.com/a/b",
+	} {
+		if got := withoutCredentials(in); got != want {
+			t.Errorf("withoutCredentials(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A JOB WHOSE STRATEGY CANNOT BE READ MAY HAVE A MATRIX, so a recommendation for it
+// is never applied to the whole job.
+func TestARecommendationLeavesAJobWhoseStrategyCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	const file = ".github/workflows/ci.yml"
+	data := "x: &legs\n  matrix:\n    n: [1, 2]\njobs:\n  build:\n    strategy: *legs\n    runs-on: " + onFour + "\n"
+	entry := rightsizeEntry{Repository: "acme/api", Workflow: "acme/api/" + file, Job: "build", CurrentRunsOn: onFour,
+		Recommendation: "smaller", RecommendedRunsOn: onTwo}
+	got := rewriteWorkflow(file, []byte(data), chooserOf(t, migrateTiers(), labelMaps{}, false),
+		&rightsizeEntries{byFile: map[string][]rightsizeEntry{file: {entry}}})
+	report := (&migrationPlan{findings: got.findings}).reportText()
+	if string(got.after) != data || !strings.Contains(report, "the job has a matrix") {
+		t.Errorf("became %q, saying\n%s\nwant it left alone as a job with a matrix", got.after, report)
+	}
+}
+
+// AN EDIT THAT DOES NOT READ BACK AS MEANT IS NOT KEPT: the file is left as it was,
+// and each rewrite in it is said not to have happened.
+func TestAnEditThatDoesNotReadBackIsNotKept(t *testing.T) {
+	t.Parallel()
+
+	data := []byte("jobs:\n  a:\n    runs-on: ubuntu-latest\n")
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	runsOn := mappingValue(mappingValue(mappingValue(rootOf(&doc), "jobs"), "a"), "runs-on")
+	span, reason := newLineIndex(data).span(runsOn)
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	for _, tc := range []struct {
+		text string
+		kept bool
+	}{{"meant", true}, {"something-else", false}} {
+		r := workflowRewrite{before: data, edited: map[*yaml.Node]bool{},
+			edits:    []edit{{start: span.start, end: span.end, text: tc.text, node: runsOn, value: "meant"}},
+			findings: []finding{{Kind: findRewritten, File: "w.yml", Job: "a"}}}
+		r.after = applyEdits(data, r.edits)
+		r.keepOnlyIfSame(&doc)
+		if kept := !bytes.Equal(r.after, data); kept != tc.kept {
+			t.Errorf("writing %q: kept %t, want %t", tc.text, kept, tc.kept)
+		}
+		if !tc.kept && (r.findings[0].Kind != findCouldNot || !strings.Contains(r.findings[0].Detail, "did not read back")) {
+			t.Errorf("writing %q: the rewrite is still said to have happened: %+v", tc.text, r.findings[0])
+		}
+	}
+}
+
+// THE READ-BACK IS ON THE PATH EVERY EDIT TAKES, after the edits are applied: no input
+// reaches it through a correct placement, so the call is held here, where a test of
+// the read-back alone cannot see it.
+func TestEveryRewriteIsReadBackBeforeItIsKept(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "migrateworkflow.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse migrateworkflow.go: %v", err)
+	}
+	var applied, kept token.Pos
+	for _, d := range file.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "rewriteWorkflow" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			switch f := call.Fun.(type) {
+			case *ast.Ident:
+				if f.Name == "applyEdits" {
+					applied = call.Pos()
+				}
+			case *ast.SelectorExpr:
+				if f.Sel.Name == "keepOnlyIfSame" {
+					kept = call.Pos()
+				}
+			}
+			return true
+		})
+	}
+	if !applied.IsValid() || !kept.IsValid() || kept < applied {
+		t.Errorf("rewriteWorkflow applies its edits at %s and reads them back at %s; want a read-back after",
+			fset.Position(applied), fset.Position(kept))
+	}
 }

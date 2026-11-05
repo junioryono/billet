@@ -17,7 +17,7 @@ SELECT h.lease_id, h.tier, COALESCE(h.node, '') AS node, COALESCE(h.repo, '') AS
             AS BIGINT) AS run_id,
        h.github_run_attempt, h.result, COALESCE(h.conclusion, '') AS conclusion, h.disruption,
        COALESCE(h.started_at, '') AS started_at, h.result_at, h.github_queued_at,
-       h.vcpu, h.memory, h.price_micros_per_hour,
+       h.vcpu, h.memory, h.price_micros_per_hour, h.instance_type,
        CAST(CASE WHEN u.lease_id IS NULL THEN 0 ELSE 1 END AS BIGINT) AS has_usage,
        COALESCE(u.unmeasured, '') AS unmeasured,
        CAST(COALESCE(u.window_ms, 0) AS BIGINT) AS window_ms,
@@ -63,6 +63,7 @@ type ListJobFactsRow struct {
 	Vcpu               int64
 	Memory             int64
 	PriceMicrosPerHour int64
+	InstanceType       string
 	HasUsage           int64
 	Unmeasured         string
 	WindowMs           int64
@@ -120,6 +121,7 @@ func (q *Queries) ListJobFacts(ctx context.Context, arg ListJobFactsParams) ([]L
 			&i.Vcpu,
 			&i.Memory,
 			&i.PriceMicrosPerHour,
+			&i.InstanceType,
 			&i.HasUsage,
 			&i.Unmeasured,
 			&i.WindowMs,

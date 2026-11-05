@@ -69,6 +69,12 @@ func lookupHostedLabel(label string, public bool) (hostedLabel, bool) {
 		return linux(arch, m[1]), true
 	}
 	if m := hostedMacOS.FindStringSubmatch(lower); m != nil {
+		// macOS 13 AND OLDER RAN ON INTEL AND ARE GONE FROM GITHUB'S REFERENCE, so what
+		// a job there needed is not this command's to guess.
+		if version, err := strconv.Atoi(m[1]); err == nil && version <= 13 && m[2] == "" {
+			return hostedLabel{OS: config.GuestMacOS, NoMapping: "GitHub retired it, and it ran on Intel; pass --map"}, true
+		}
+
 		return macOSLabel(m[1], m[2]), true
 	}
 

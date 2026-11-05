@@ -2,7 +2,9 @@ package github
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -165,6 +167,8 @@ func TestARunsRecordsKeepTheAttemptThatRanACarriedJob(t *testing.T) {
 		job(12, "the-first-says-nothing", first, ""), job(13, "the-first-says-nothing", copied, `,"run_attempt":2`),
 		job(14, "shared-then-more", first, `,"run_attempt":2`), job(15, "shared-then-more", first, `,"run_attempt":2`),
 		job(16, "shared-then-more", first, `,"run_attempt":1`),
+		job(19, "more-then-shared", first, `,"run_attempt":1`), job(20, "more-then-shared", copied, `,"run_attempt":2`),
+		job(21, "more-then-shared", copied, `,"run_attempt":2`),
 		job(17, "no-time-on-the-first", "null", `,"run_attempt":2`), job(18, "no-time-on-the-first", copied, `,"run_attempt":3`),
 	}
 	c, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, page int) {
@@ -176,6 +180,24 @@ func TestARunsRecordsKeepTheAttemptThatRanACarriedJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunJobRecords: %v", err)
 	}
+
+	// The same entries in the reverse order settle every name the same way.
+	reversed := slices.Clone(jobs)
+	slices.Reverse(reversed)
+	back, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, page int) {
+		from, to := (page-1)*runJobsPerPage, min(page*runJobsPerPage, len(reversed))
+		fmt.Fprintf(w, `{"total_count":%d,"jobs":[%s]}`, len(reversed), strings.Join(reversed[from:to], ","))
+	})
+	again, err := back.RunJobRecords(t.Context(), "acme", "api", 31)
+	if err != nil {
+		t.Fatalf("RunJobRecords in reverse: %v", err)
+	}
+	if !maps.EqualFunc(records, again, func(x, y RunnerRecord) bool {
+		return x.QueuedAt.Equal(y.QueuedAt) && x.RunAttempt == y.RunAttempt
+	}) {
+		t.Errorf("the order of the list decided the answer: %v against %v", records, again)
+	}
+
 	queued := time.Date(2026, 10, 22, 17, 9, 6, 0, time.UTC)
 	for runner, want := range map[string]RunnerRecord{
 		"carried":              {QueuedAt: queued, RunAttempt: 2},
@@ -188,7 +210,8 @@ func TestARunsRecordsKeepTheAttemptThatRanACarriedJob(t *testing.T) {
 			t.Errorf("%s = %+v (%t), want %+v", runner, got, ok, want)
 		}
 	}
-	for _, runner := range []string{"one-attempt-twice", "a-copy-says-nothing", "the-first-says-nothing", "shared-then-more"} {
+	for _, runner := range []string{"one-attempt-twice", "a-copy-says-nothing", "the-first-says-nothing", "shared-then-more",
+		"more-then-shared"} {
 		if got, ok := records[runner]; ok {
 			t.Errorf("%s = %+v; the attempts cannot separate these, so want none", runner, got)
 		}

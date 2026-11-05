@@ -44,12 +44,14 @@ github:
   private_key_path: `+key+`
 tiers:
   - label: billet-2vcpu
+    arch: x64
     provider: docker
     vcpu: 2
     memory: 8GiB
     image: ubuntu:24.04
   - label: billet-8vcpu
     runs_on: eight
+    arch: x64
     provider: docker
     vcpu: 8
     memory: 32GiB
@@ -148,7 +150,7 @@ tiers:
 	if want := strings.Replace(before, "runs-on: eight", "runs-on: billet-2vcpu", 1); string(got) != want {
 		t.Errorf("the workflow became %q, want %q; the command said:\n%s", got, want, said)
 	}
-	if !strings.Contains(said, `tier "billet-2vcpu" by the rightsize report`) {
+	if !strings.Contains(said, "tier billet-2vcpu by the rightsize report") {
 		t.Errorf("the command does not say the report moved it:\n%s", said)
 	}
 }

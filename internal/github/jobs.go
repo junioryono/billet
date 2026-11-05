@@ -201,45 +201,63 @@ func (c *runnerGroupPolicyClient) RunJobRecords(
 		return nil, fmt.Errorf("github: a workflow run needs a positive id, not %d", runID)
 	}
 
-	records := map[string]RunnerRecord{}
-	shared := map[string]bool{}
+	// EVERY ENTRY OF A NAME IS READ BEFORE THE NAME IS DECIDED, so the answer cannot
+	// depend on the order GitHub lists them in.
+	listed := map[string][]RunnerRecord{}
 	err := c.listRunJobs(ctx, owner, repository, runID, MaxQueueTimeRunJobs, func(record jobRecord,
 		name string,
 	) error {
-		if name == "" || shared[name] {
-			return nil
-		}
-		queued, hasTime := createdAt(record.CreatedAt)
-		hasAttempt := record.RunAttempt != nil && *record.RunAttempt > 0
-		if prior, seen := records[name]; seen {
-			switch {
-			case !hasAttempt || prior.RunAttempt == 0 || prior.RunAttempt == *record.RunAttempt:
-				delete(records, name)
-				shared[name] = true
-				return nil
-			case *record.RunAttempt > prior.RunAttempt:
-				return nil
-			}
-		}
-		if !hasTime && !hasAttempt {
-			shared[name] = true
+		if name == "" {
 			return nil
 		}
 		var runner RunnerRecord
-		if hasTime {
+		if queued, ok := createdAt(record.CreatedAt); ok {
 			runner.QueuedAt = queued
 		}
-		if hasAttempt {
+		if record.RunAttempt != nil && *record.RunAttempt > 0 {
 			runner.RunAttempt = *record.RunAttempt
 		}
-		records[name] = runner
+		listed[name] = append(listed[name], runner)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	records := map[string]RunnerRecord{}
+	for name, entries := range listed {
+		if runner, ok := ranOn(entries); ok {
+			records[name] = runner
+		}
+	}
+
 	return records, nil
+}
+
+// ranOn is the entry of the job a runner ran, from every entry GitHub lists under the
+// runner's name: the one entry there is, or the lowest attempt of several, which
+// every later attempt carried forward. False is a name the entries cannot settle:
+// one that gives neither fact, an entry with no attempt beside another, or two
+// entries of one attempt.
+func ranOn(entries []RunnerRecord) (RunnerRecord, bool) {
+	if len(entries) == 1 {
+		e := entries[0]
+		return e, !e.QueuedAt.IsZero() || e.RunAttempt > 0
+	}
+
+	seen := map[int64]bool{}
+	lowest := entries[0]
+	for _, e := range entries {
+		if e.RunAttempt <= 0 || seen[e.RunAttempt] {
+			return RunnerRecord{}, false
+		}
+		seen[e.RunAttempt] = true
+		if e.RunAttempt < lowest.RunAttempt {
+			lowest = e
+		}
+	}
+
+	return lowest, true
 }
 
 // listRunJobs hands visit every job of a run, across every attempt, with the

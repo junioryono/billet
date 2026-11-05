@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -130,7 +131,7 @@ func cmdMigrateWorkflows(ctx context.Context, env cli.Env, args []string) error 
 
 		return nil
 	case *openPR:
-		return openMigrationPR(ctx, env, *path, plan, report)
+		return openMigrationPR(ctx, env, *path, repository, plan, report)
 	case *write:
 		return plan.install(*path)
 	}
@@ -229,7 +230,34 @@ func newTierChooser(cfg *config.Config, repository string, maps labelMaps, publi
 	return c, nil
 }
 
-func (c *tierChooser) onBillet(label string) bool { return c.names[strings.ToLower(label)] }
+// onBillet says whether a label is one of the deployment's runs-on. GitHub compares
+// labels without regard to case, and only an ASCII label is folded, so a look-alike
+// such as the Kelvin sign is never one of them.
+func (c *tierChooser) onBillet(label string) bool {
+	return printableASCII(label) && c.names[strings.ToLower(label)]
+}
+
+// tierAnswering is the one tier serving the repository that answers to runs-on, nil
+// for none or for several, which cannot be told apart.
+func (c *tierChooser) tierAnswering(runsOn string) *config.Tier {
+	var found *config.Tier
+	for i := range c.tiers {
+		if sameLabel(c.tiers[i].ScaleSetName(), runsOn) {
+			if found != nil {
+				return nil
+			}
+			found = &c.tiers[i]
+		}
+	}
+
+	return found
+}
+
+// sameLabel compares two labels as GitHub does, without regard to case, and folds
+// ASCII alone.
+func sameLabel(a, b string) bool {
+	return printableASCII(a) && printableASCII(b) && strings.EqualFold(a, b)
+}
 
 // choose picks the tier for a label: --map's, or the smallest whose platform is the
 // label's and whose shape holds what the label gives a job.
@@ -336,12 +364,14 @@ func allowsWorkflow(t *config.Tier, repository, workflowFile string) bool {
 		return true
 	}
 
-	want := repository + "/" + workflowFile
-
+	// THE REPOSITORY IS COMPARED WITHOUT CASE, AS GITHUB NAMES IT, AND THE FILE WITH:
+	// ci.yml and CI.yml are two files a repository can hold.
 	return slices.ContainsFunc(t.Workflows, func(allowed string) bool {
 		path, _, _ := strings.Cut(allowed, "@")
+		owner, rest, _ := strings.Cut(path, "/")
+		name, file, _ := strings.Cut(rest, "/")
 
-		return strings.EqualFold(path, want)
+		return strings.EqualFold(owner+"/"+name, repository) && file == workflowFile
 	})
 }
 
@@ -357,6 +387,7 @@ type rightsizeEntry struct {
 	RecommendedTier   string `json:"recommended_tier"`
 	RecommendedRunsOn string `json:"recommended_runs_on"`
 	Repository        string `json:"repository"`
+	MemorySource      string `json:"memory_source"`
 }
 
 // rightsizeEntries is a report's recommendations for one repository that name a tier
@@ -432,19 +463,37 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 				Text: entry.Job, Detail: detail})
 		}
 
+		// A NAME ONLY GITHUB CAN WORK OUT IS NO NAME: it is empty here, and an entry
+		// naming no job is refused below before any match is taken.
 		var matches []*jobRunsOn
 		for j := range jobs {
 			if jobs[j].display == entry.Job {
 				matches = append(matches, &jobs[j])
 			}
 		}
-		// THE FILE IS NOT TRUSTED TO NAME WHAT GOES INTO A WORKFLOW: only a runs-on this
-		// deployment's own configuration gives the repository is ever written, so a
-		// report edited or written by something else cannot put text into a job.
+		// THE FILE IS NOT TRUSTED TO SAY WHERE A JOB GOES: both tiers are this
+		// configuration's own, the move must keep what the job runs on and who may run
+		// it, and what is written is the configuration's name for the tier.
+		current, recommended := chooser.tierAnswering(entry.CurrentRunsOn), chooser.tierAnswering(entry.RecommendedRunsOn)
 		switch {
-		case !chooser.onBillet(entry.RecommendedRunsOn):
-			say(0, fmt.Sprintf("it recommends %s, which is no runs-on this configuration gives the repository",
+		case entry.Job == "":
+			say(0, "the report names no job")
+
+			continue
+		case recommended == nil:
+			say(0, fmt.Sprintf("it recommends %s, which is no one tier this configuration gives the repository",
 				strconv.Quote(entry.RecommendedRunsOn)))
+
+			continue
+		case current == nil:
+			say(0, fmt.Sprintf("it was judged on %s, which is no one tier this configuration gives the repository",
+				strconv.Quote(entry.CurrentRunsOn)))
+
+			continue
+		case !compatibleMove(current, recommended, chooser.repository, file):
+			say(0, fmt.Sprintf("tier %s is not %s with another size here: its target, guest OS, architecture or trust "+
+				"differs, or it does not allow this workflow", strconv.Quote(recommended.Label),
+				strconv.Quote(current.Label)))
 
 			continue
 		case len(matches) == 0:
@@ -460,7 +509,7 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 			say(matches[0].node.Line, "the job has a matrix, whose legs were judged one by one")
 
 			continue
-		case !strings.EqualFold(matches[0].node.Value, entry.CurrentRunsOn):
+		case !sameLabel(matches[0].node.Value, current.ScaleSetName()):
 			say(matches[0].node.Line, fmt.Sprintf("it runs on %s here, and the recommendation was for %s",
 				strconv.Quote(matches[0].node.Value), strconv.Quote(entry.CurrentRunsOn)))
 
@@ -471,20 +520,34 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 			continue
 		}
 
-		node := matches[0].node
-		placed, reason := lines.place(node)
+		node, to := matches[0].node, recommended.ScaleSetName()
+		placed, reason := lines.place(node, to)
 		if reason != "" {
 			say(node.Line, reason)
 
 			continue
 		}
-		r.edits = append(r.edits, edit{start: placed.start, end: placed.end, text: entry.RecommendedRunsOn})
+		r.edits = append(r.edits, placed)
 		r.edited[node] = true
+		memory := ""
+		if entry.MemorySource == "guest" {
+			memory = ", its memory as the job's own VM reported it"
+		}
 		r.findings = append(r.findings, finding{Kind: findRewritten, File: file, Line: node.Line, Job: matches[0].key,
-			Text: node.Value, Detail: fmt.Sprintf("to %s, tier %s by the rightsize report: %s; confidence %s",
-				entry.RecommendedRunsOn, strconv.Quote(entry.RecommendedTier), strconv.Quote(entry.Reason),
-				strconv.Quote(entry.Confidence))})
+			Text: node.Value, Detail: fmt.Sprintf("to %s, tier %s by the rightsize report%s: %s; confidence %s", to,
+				recommended.Label, memory, strconv.Quote(entry.Reason), strconv.Quote(entry.Confidence))})
 	}
+}
+
+// compatibleMove says moving a job from current to recommended changes its size and
+// nothing a job can tell: the same target, guest OS, architecture (known) and trust,
+// and a tier that allows the workflow.
+func compatibleMove(current, recommended *config.Tier, repository, workflowFile string) bool {
+	cur, rec := current.Platform(), recommended.Platform()
+
+	return config.ShareTarget(*current) == config.ShareTarget(*recommended) && current.GuestOS == recommended.GuestOS &&
+		cur.Arch != "" && cur.Arch == rec.Arch && current.Trust.Effective() == recommended.Trust.Effective() &&
+		allowsWorkflow(recommended, repository, workflowFile)
 }
 
 // migrationFile is one file the plan would change.
@@ -507,6 +570,20 @@ func (p *migrationPlan) changes() bool {
 
 // planMigration reads every workflow in the checkout and decides what happens to it.
 func planMigration(path, repository string, chooser *tierChooser, entries *rightsizeEntries) (*migrationPlan, error) {
+	// NEITHER DIRECTORY MAY BE A LINK: a checkout is somebody's repository, and a
+	// .github that points elsewhere would have this read, and --write change, another
+	// tree's workflows.
+	for _, d := range []string{".github", workflowsDir} {
+		info, err := os.Lstat(filepath.Join(path, filepath.FromSlash(d)))
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("billet migrate workflows: read the workflows of %s: %w", strconv.Quote(repository), err)
+		case !info.IsDir():
+			return nil, fmt.Errorf("billet migrate workflows: %s in the checkout is a link or a file, not a directory, "+
+				"so its workflows are not this checkout's", d)
+		}
+	}
+
 	dir := filepath.Join(path, filepath.FromSlash(workflowsDir))
 	listing, err := os.ReadDir(dir)
 	if err != nil {
@@ -617,7 +694,22 @@ func (p *migrationPlan) reportText() string {
 
 // install writes the changed files in place, each whole or not at all, and keeps
 // its mode.
+//
+// EVERY FILE IS READ AGAIN FIRST, and nothing is written if one has changed since it
+// was planned: writing the plan over an edit made meanwhile would lose the edit.
 func (p *migrationPlan) install(path string) error {
+	for i := range p.files {
+		f := &p.files[i]
+		if bytes.Equal(f.before, f.after) {
+			continue
+		}
+		now, err := regularfile.ReadFile(filepath.Join(path, filepath.FromSlash(f.name)), maxWorkflowSize,
+			regularfile.Options{NoFollow: true})
+		if err != nil || !bytes.Equal(now, f.before) {
+			return fmt.Errorf("billet migrate workflows: %s changed since it was read, so nothing was written; run "+
+				"again", strconv.Quote(f.name))
+		}
+	}
 	for i := range p.files {
 		f := &p.files[i]
 		if bytes.Equal(f.before, f.after) {
@@ -666,26 +758,53 @@ func runGit(ctx context.Context, path string, args ...string) (string, error) {
 // and no shell, and carries what it said into the error, since only it knows what went
 // wrong. Only a subcommand is named there: an argument can be a whole pull request.
 func runTool(ctx context.Context, dir, name string, args ...string) (string, error) {
+	return runToolWith(ctx, dir, nil, name, args...)
+}
+
+// runToolWith is runTool with stdin.
+func runToolWith(ctx context.Context, dir string, stdin io.Reader, name string, args ...string) (string, error) {
 	proc := exec.CommandContext(ctx, name, args...)
-	proc.Dir = dir
+	proc.Dir, proc.Stdin = dir, stdin
 	var stderr bytes.Buffer
 	proc.Stderr = &stderr
 	output, err := proc.Output()
 	if err != nil {
-		return "", fmt.Errorf("%s %s: %w: %s", name, args[0], err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("%s %s: %w: %s", name, args[0], err, withoutCredentials(strings.TrimSpace(stderr.String())))
 	}
 
 	return string(output), nil
 }
 
+// urlCredentials is the userinfo of a URL, which a remote can carry a token in.
+var urlCredentials = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]+@`)
+
+// withoutCredentials is a tool's message with every URL's userinfo cut out, since
+// this command's output lands in logs and pull requests.
+func withoutCredentials(s string) string { return urlCredentials.ReplaceAllString(s, "$1") }
+
 // openMigrationPR does what the plan says on a new branch and opens the pull request.
 // It stops at the first failure and says what was already done, because nothing here
 // can be undone for the operator: their branch and their commit are theirs to keep or
 // remove.
-func openMigrationPR(ctx context.Context, env cli.Env, path string, plan *migrationPlan, report string) error {
+//
+// THE PULL REQUEST IS NAMED WHOLE, so gh guesses none of it: into repository, onto
+// the branch the checkout was on, from the branch pushed to origin's owner.
+func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, plan *migrationPlan,
+	report string,
+) error {
 	if _, err := exec.LookPath("gh"); err != nil {
 		return errors.New("billet migrate workflows: --open-pr uses your own gh, and none is on PATH; nothing was changed")
 	}
+	base, err := runGit(ctx, path, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		return fmt.Errorf("billet migrate workflows: nothing was changed: %w", err)
+	}
+	base = strings.TrimSpace(base)
+	origin, err := originRepository(ctx, path)
+	if err != nil {
+		return fmt.Errorf("%w; --open-pr pushes to origin, so nothing was changed", err)
+	}
+	pushedTo, _, _ := config.SplitRepository(origin)
 
 	branch := "billet/migrate-workflows-" + time.Now().UTC().Format("20060102-150405")
 	if _, err := runGit(ctx, path, "checkout", "-q", "-b", branch); err != nil {
@@ -719,7 +838,9 @@ func openMigrationPR(ctx context.Context, env cli.Env, path string, plan *migrat
 
 	body := "Written by `billet migrate workflows`. It moved each `runs-on` it could and lists what it left alone.\n\n" +
 		"```\n" + strings.ReplaceAll(report, "```", "'''") + "```\n"
-	output, err := runTool(ctx, path, "gh", "pr", "create", "--title="+title, "--body="+body, "--head="+branch)
+	// THE BODY ON STDIN, since a report can be longer than one argument may be.
+	output, err := runToolWith(ctx, path, strings.NewReader(body), "gh", "pr", "create", "--repo="+repository,
+		"--base="+base, "--head="+pushedTo+":"+branch, "--title="+title, "--body-file=-")
 	if err != nil {
 		return stopped(err, "pushing")
 	}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -80,14 +81,16 @@ const rightsizeCovers = "Covers the jobs GitHub started on a runner of this depl
 	"A canceled run, a run with no result and a run billet's own infrastructure disrupted are left out. A run " +
 	"is measured when the host's per-sample series covers at least 90% of it, from GitHub starting it to its " +
 	"result, which is kept for server.job_detail_retention. CPU busy is the job's cgroup CPU over that window " +
-	"(the guest's vCPUs and its VMM's threads) over the charged vCPUs, so the VMM can take it past 100%. " +
+	"(the guest's vCPUs and its VMM's threads) over the charged vCPUs, so the VMM can take it past 100%, and a " +
+	"smaller tier is sized by that CPU in whole cores. Only runs at the newest run's charged shape count. " +
 	"Memory is what the job's own VM reported as the most it used, MemTotal less MemAvailable, over the memory " +
 	"it saw, read only from a report the node kept whole; the job runs as root there, so it is labelled as the " +
 	"VM's and only ever advises. The host's peak counts the page cache and the VMM, so it decides nothing but " +
 	"that a job stayed small; an OOM kill is the host's. CPU pressure is over the lease's whole life. A " +
-	"candidate tier is one that differs from the current tier only in its name and size: the same target, " +
-	"guest OS, architecture, image, providers, trust, runner group, site and node, and a trusted tier must " +
-	"allow the workflow. GitHub's runner group settings are not read, and may still refuse a repository."
+	"candidate tier is one that differs from the current tier only in its name, its vCPUs and memory, and how " +
+	"many of it are kept warm, run at once or reserved: every other setting is the same, its disk, shared " +
+	"memory and BuildKit cache mount limit are no smaller, and a trusted tier must allow the workflow. GitHub's " +
+	"runner group settings are not read, and may still refuse a repository."
 
 // rightsizeThresholds words the thresholds for a person.
 func rightsizeThresholds() string {
@@ -157,14 +160,19 @@ type rightsizeJob struct {
 	RunsOn string
 	VCPU   int64
 	Memory int64
-	// Samples is the measured runs on the tier, which every figure but the host's
-	// counts is over, and OtherTiers the runs on other tiers. The runs on the tier
-	// that were not measured are counted by why: no usage report the host could
-	// read CPU from, no series kept (its detail retired, or none sent), or a
-	// series that does not cover the run.
-	Samples, OtherTiers           int
-	NoReport, NoSeries, Uncovered int
-	BusyP90                       *float64
+	// Samples is the measured runs on the tier at its newest charged shape, which
+	// every figure but the host's counts is over; OtherTiers is the runs on other
+	// tiers, and OtherShapes the runs on this one at another charged shape, before a
+	// resize or on another shape a fallback bought. The runs that were not measured
+	// are counted by why: no usage report the host could read CPU from, no series
+	// kept (its detail retired, or none sent), or a series that does not cover the
+	// run.
+	Samples, OtherTiers, OtherShapes int
+	NoReport, NoSeries, Uncovered    int
+	// BusyP90 is the CPU over the charged vCPUs, and DemandP90 the CPU in whole
+	// cores, which is what a smaller tier is sized by.
+	BusyP90   *float64
+	DemandP90 *float64
 	// GuestRuns is how many samples have a report the node kept whole from the
 	// job's own VM; GuestP95 is the most memory the VM said it used at p95, over
 	// what it saw, and GuestNeedP95 the charged memory that use comes to.
@@ -187,12 +195,15 @@ type rightsizeJob struct {
 	Recommendation, Reason, Confidence string
 	// Recommended is the tier to move to, nil when none fits or none is asked for.
 	Recommended *config.Tier
+	// MemorySource is "guest" when the memory a recommendation rests on is what the
+	// job's own VM reported, "host" when it is the host's, and empty for neither.
+	MemorySource string
 }
 
 // rightsizeRun is one measured run's figures. A figure the run has not got is
 // false in its flag, never zero.
 type rightsizeRun struct {
-	busy float64
+	busy, cores float64
 	// guest: the most of its memory the job's own VM said it used, as a fraction
 	// and as the charged memory that comes to.
 	guest     bool
@@ -261,8 +272,16 @@ func rightsizeJobOf(ctx context.Context, a *alloc.Allocator, repo, workflow, job
 
 	var measured []rightsizeRun
 	for _, f := range runs {
-		if f.Tier != newest.Tier {
+		switch {
+		case f.Tier != newest.Tier:
 			out.OtherTiers++
+
+			continue
+		// A RUN AT ANOTHER CHARGED SHAPE IS ANOTHER QUESTION: a tier resized under
+		// its name, or a fallback that bought another shape, says nothing about how
+		// full the shape the job has now is.
+		case f.VCPU != newest.VCPU || f.Memory != newest.Memory:
+			out.OtherShapes++
 
 			continue
 		}
@@ -331,7 +350,8 @@ func readRightsizeRun(ctx context.Context, a *alloc.Allocator, f *alloc.JobFact)
 		return rightsizeRun{}, runUncovered, nil
 	}
 
-	run := rightsizeRun{busy: float64(w.CPUMicros) / (float64(w.Covered.Microseconds()) * float64(f.VCPU))}
+	cores := float64(w.CPUMicros) / float64(w.Covered.Microseconds())
+	run := rightsizeRun{busy: cores / float64(f.VCPU), cores: cores}
 	if u.Measured(alloc.UsageMemory) {
 		run.host, run.hostPeak = true, u.MemoryPeakBytes
 	}
@@ -389,12 +409,12 @@ func guestMemoryOf(ctx context.Context, a *alloc.Allocator, f *alloc.JobFact) (f
 func summarizeRuns(job *rightsizeJob, runs []rightsizeRun) {
 	job.Samples = len(runs)
 
-	busy := make([]float64, 0, len(runs))
+	busy, cores := make([]float64, 0, len(runs)), make([]float64, 0, len(runs))
 	guest, host, pressure := make([]float64, 0, len(runs)), make([]float64, 0, len(runs)), make([]float64, 0, len(runs))
 	guestNeed, hostPeak := make([]int64, 0, len(runs)), make([]int64, 0, len(runs))
 	for i := range runs {
 		r := &runs[i]
-		busy = append(busy, r.busy)
+		busy, cores = append(busy, r.busy), append(cores, r.cores)
 		if r.guest {
 			guest = append(guest, r.guestFrac)
 			guestNeed = append(guestNeed, r.guestNeed)
@@ -413,7 +433,7 @@ func summarizeRuns(job *rightsizeJob, runs []rightsizeRun) {
 	}
 	job.GuestRuns, job.HostRuns, job.PressureMeasured = len(guest), len(host), len(pressure)
 
-	job.BusyP90 = percentileOf(busy, 9000)
+	job.BusyP90, job.DemandP90 = percentileOf(busy, 9000), percentileOf(cores, 9000)
 	job.GuestP95, job.GuestNeedP95 = percentileOf(guest, 9500), percentileOf(guestNeed, 9500)
 	job.HostP95, job.HostPeakP95 = percentileOf(host, 9500), percentileOf(hostPeak, 9500)
 	job.PressureP90 = percentileOf(pressure, 9000)
@@ -493,9 +513,11 @@ func recommend(job *rightsizeJob, current *config.Tier, tiers []config.Tier) {
 		var why []string
 		if overMemory {
 			why = append(why, fmt.Sprintf("over the memory limit (%d OOM kills)", job.OOMKills))
+			job.MemorySource = "host"
 		} else if nearMemory {
 			why = append(why, fmt.Sprintf("near the memory limit (the job's own VM reported using %.0f%% at p95)",
 				100**job.GuestP95))
+			job.MemorySource = "guest"
 		}
 		if cpuBound {
 			why = append(why, "CPU-bound"+cpuBoundWhy(job))
@@ -513,11 +535,13 @@ func recommend(job *rightsizeJob, current *config.Tier, tiers []config.Tier) {
 		var from string
 		if hostSmall {
 			need, from = *job.HostPeakP95, fmt.Sprintf("the host's memory peak at p95 %.0f%%", 100**job.HostP95)
+			job.MemorySource = "host"
 		} else {
 			need, from = *job.GuestNeedP95, fmt.Sprintf("memory the job's own VM reported at p95 %.0f%%", 100**job.GuestP95)
+			job.MemorySource = "guest"
 		}
 		job.Reason = fmt.Sprintf("idle (CPU busy at p90 %.0f%%, %s)", 100*busy, from)
-		job.Recommended = smallerTier(job, current, tiers, busy, need)
+		job.Recommended = smallerTier(job, current, tiers, *job.DemandP90, need)
 		if job.Recommended == nil {
 			job.Reason += "; no smaller tier is configured that would hold it"
 		}
@@ -525,9 +549,15 @@ func recommend(job *rightsizeJob, current *config.Tier, tiers []config.Tier) {
 		job.Recommendation = rightsizeKeep
 		job.Reason = fmt.Sprintf("CPU busy at p90 %.0f%% is idle, and its memory could not be told: %s", 100*busy,
 			memoryUntold(job))
-	default:
+	case guestJudged || hostJudged:
 		job.Recommendation = rightsizeKeep
 		job.Reason = fmt.Sprintf("neither idle nor short of room (CPU busy at p90 %.0f%%)", 100*busy)
+	default:
+		// KEEP IS WHAT A PERSON DOES WITHOUT AN ANSWER, and the reason says it is not
+		// one: nothing here showed the job has the memory it needs.
+		job.Recommendation = rightsizeKeep
+		job.Reason = fmt.Sprintf("CPU busy at p90 %.0f%% is neither idle nor CPU-bound, and its memory could not be "+
+			"told: %s", 100*busy, memoryUntold(job))
 	}
 }
 
@@ -554,25 +584,19 @@ func cpuBoundWhy(job *rightsizeJob) string {
 	return fmt.Sprintf(" (CPU pressure at p90 %.0f%%)", 100**job.PressureP90)
 }
 
-// sameFamily says a tier differs from current only in its name and size, so a move
-// between them changes how much room a job has and nothing about what it runs on,
-// where, or under whose authority. A trusted tier must also allow the workflow,
-// or the runner group would refuse the job the recommendation moved there.
+// sameFamily says a tier differs from current only in its name, its size and how
+// many of it the deployment keeps, so a move between them changes how much room a
+// job has and nothing about what it runs on, how it starts, where, or under whose
+// authority. EVERY FIELD IS COMPARED BUT THOSE, so a field a later billet adds is
+// one more that must match rather than one this forgot. The room a job has that
+// nothing here measured (its disk, its shared memory, its BuildKit cache mounts) is
+// never made smaller. A trusted tier must also allow the workflow, or the runner
+// group would refuse the job the recommendation moved there.
 func sameFamily(current, other *config.Tier, workflow string) bool {
-	if other.Label == current.Label || other.Target != current.Target || other.GuestOS != current.GuestOS ||
-		other.Arch != current.Arch || other.RunnerGroup != current.RunnerGroup || other.Site != current.Site ||
-		other.Node != current.Node || other.Trust.Effective() != current.Trust.Effective() {
+	if other.Label == current.Label || !reflect.DeepEqual(sizeless(*current), sizeless(*other)) ||
+		!roomKept(current.Disk, other.Disk) || !roomKept(current.SHM, other.SHM) ||
+		!roomKept(current.BuildKitCacheMountLimit, other.BuildKitCacheMountLimit) {
 		return false
-	}
-
-	providers := current.AcceptableProviders()
-	if !slices.Equal(providers, other.AcceptableProviders()) {
-		return false
-	}
-	for _, p := range providers {
-		if current.ImageFor(p) != other.ImageFor(p) {
-			return false
-		}
 	}
 
 	if other.Trust.Effective() != config.WorkloadTrusted {
@@ -584,6 +608,25 @@ func sameFamily(current, other *config.Tier, workflow string) bool {
 
 		return path == workflow
 	})
+}
+
+// sizeless is a tier with what may differ within a family cleared: its names, its
+// size, how many of it are kept warm, run at once or reserved, and the workflows a
+// trusted one allows, which sameFamily checks for the one workflow that matters.
+func sizeless(t config.Tier) config.Tier {
+	t.Label, t.RunsOn, t.Declaration, t.Targets = "", "", "", config.TierTargets{}
+	t.VCPU, t.Memory, t.Sizes, t.MemoryPerVCPU = 0, 0, nil, 0
+	t.Disk, t.SHM, t.BuildKitCacheMountLimit = 0, 0, 0
+	t.WarmPool, t.MaxConcurrent, t.Reserved, t.Workflows = 0, 0, 0, nil
+
+	return t
+}
+
+// roomKept says other gives a job at least the room current does, where zero is the
+// backend's default: a default is equal only to a default, since what it comes to
+// is the backend's to say.
+func roomKept(current, other config.ByteSize) bool {
+	return other == current || (current != 0 && other > current)
 }
 
 // smallestOf is the smallest of the family that fits, by vCPU, then memory, then
@@ -617,10 +660,10 @@ func largerTier(job *rightsizeJob, current *config.Tier, tiers []config.Tier, mo
 }
 
 // smallerTier is the smallest tier smaller than the current one that the job, busy
-// at busy and needing need bytes of charged memory, would fill to no more than
-// rightsizeTarget.
-func smallerTier(job *rightsizeJob, current *config.Tier, tiers []config.Tier, busy float64, need int64) *config.Tier {
-	needCPU := int(math.Ceil(busy * float64(current.VCPU) / rightsizeTarget))
+// for cores whole cores and needing need bytes of charged memory, would fill to no
+// more than rightsizeTarget.
+func smallerTier(job *rightsizeJob, current *config.Tier, tiers []config.Tier, cores float64, need int64) *config.Tier {
+	needCPU := int(math.Ceil(cores / rightsizeTarget))
 	needMemory := config.ByteSize(math.Ceil(float64(need) / rightsizeTarget))
 
 	return smallestOf(current, tiers, job.Workflow, func(t *config.Tier) bool {
@@ -671,8 +714,8 @@ func renderRightsize(w io.Writer, r rightsizeReport) {
 		}
 		line("tier", "%s (%s), %s", job.Tier, runsOn, shape)
 		line("runs", "%d measured on this tier; not measured: %d with no usage report, %d with no series kept, %d "+
-			"with a series short of the run; %d on other tiers", job.Samples, job.NoReport, job.NoSeries,
-			job.Uncovered, job.OtherTiers)
+			"with a series short of the run; %d on this tier at another charged shape; %d on other tiers",
+			job.Samples, job.NoReport, job.NoSeries, job.Uncovered, job.OtherShapes, job.OtherTiers)
 		line("cpu busy", "%s at p90", percentOrNotMeasured(job.BusyP90))
 		if job.GuestP95 == nil {
 			line("vm memory", "not reported (no measured run has a whole report from the job's own VM)")
@@ -729,22 +772,29 @@ type rightsizeJSON struct {
 }
 
 type rightsizeJobJSON struct {
-	Repository       string `json:"repository"`
-	Workflow         string `json:"workflow"`
-	Job              string `json:"job"`
-	CurrentTier      string `json:"current_tier"`
-	CurrentRunsOn    string `json:"current_runs_on"`
-	VCPU             int64  `json:"vcpu"`
-	MemoryBytes      int64  `json:"memory_bytes"`
+	Repository    string `json:"repository"`
+	Workflow      string `json:"workflow"`
+	Job           string `json:"job"`
+	CurrentTier   string `json:"current_tier"`
+	CurrentRunsOn string `json:"current_runs_on"`
+	// VCPU and MemoryBytes are the charged shape, null where it was not recorded.
+	VCPU             *int64 `json:"vcpu"`
+	MemoryBytes      *int64 `json:"memory_bytes"`
 	Runs             int    `json:"runs"`
 	RunsNoReport     int    `json:"runs_no_usage_report"`
 	RunsNoSeries     int    `json:"runs_no_series"`
 	RunsUncovered    int    `json:"runs_series_short"`
+	RunsOtherShapes  int    `json:"runs_other_shape"`
 	RunsOnOtherTiers int    `json:"runs_on_other_tiers"`
-	// CPUBusyP90 is the cgroup's CPU over the job's window and the charged vCPUs.
-	CPUBusyP90 *float64 `json:"cpu_busy_p90"`
-	// GuestMemoryP95 is what the job's own VM reported, which it could have changed.
+	// CPUBusyP90 is the cgroup's CPU over the job's window and the charged vCPUs,
+	// and CPUCoresP90 the same CPU in whole cores.
+	CPUBusyP90  *float64 `json:"cpu_busy_p90"`
+	CPUCoresP90 *float64 `json:"cpu_cores_p90"`
+	// GuestMemoryP95 is what the job's own VM reported, which it could have changed,
+	// and MemorySource which side a smaller recommendation's memory rests on: "host",
+	// "guest", or empty for one that rests on neither.
 	GuestMemoryP95    *float64 `json:"guest_reported_memory_p95_fraction"`
+	MemorySource      string   `json:"memory_source"`
 	GuestRuns         int      `json:"guest_reported_runs"`
 	HostMemoryPeakP95 *int64   `json:"host_memory_peak_p95_bytes"`
 	HostMemoryP95     *float64 `json:"host_memory_peak_p95_fraction"`
@@ -760,6 +810,15 @@ type rightsizeJobJSON struct {
 	RecommendedRunsOn string   `json:"recommended_runs_on"`
 }
 
+// positive is v, or nil where zero says it was not recorded.
+func positive(v int64) *int64 {
+	if v <= 0 {
+		return nil
+	}
+
+	return &v
+}
+
 func renderRightsizeJSON(w io.Writer, r rightsizeReport) error {
 	out := rightsizeJSON{
 		Schema: rightsizeSchema, From: r.From.UTC().Format(time.RFC3339Nano),
@@ -770,9 +829,10 @@ func renderRightsizeJSON(w io.Writer, r rightsizeReport) error {
 		job := &r.Jobs[i]
 		row := rightsizeJobJSON{
 			Repository: job.Repository, Workflow: job.Workflow, Job: job.Job, CurrentTier: job.Tier,
-			CurrentRunsOn: job.RunsOn, VCPU: job.VCPU, MemoryBytes: job.Memory, Runs: job.Samples,
+			CurrentRunsOn: job.RunsOn, VCPU: positive(job.VCPU), MemoryBytes: positive(job.Memory), Runs: job.Samples,
 			RunsNoReport: job.NoReport, RunsNoSeries: job.NoSeries, RunsUncovered: job.Uncovered,
-			RunsOnOtherTiers: job.OtherTiers, CPUBusyP90: job.BusyP90, GuestMemoryP95: job.GuestP95,
+			RunsOtherShapes: job.OtherShapes, RunsOnOtherTiers: job.OtherTiers, CPUBusyP90: job.BusyP90,
+			CPUCoresP90: job.DemandP90, GuestMemoryP95: job.GuestP95, MemorySource: job.MemorySource,
 			GuestRuns: job.GuestRuns, HostMemoryPeakP95: job.HostPeakP95, HostMemoryP95: job.HostP95,
 			HostMemoryRuns: job.HostRuns, OOMMeasuredRuns: job.OOMMeasured, CPUPressureP90: job.PressureP90,
 			PressureMeasured: job.PressureMeasured, Recommendation: job.Recommendation, Reason: job.Reason,

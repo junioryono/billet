@@ -248,9 +248,63 @@ func TestOnlyRunsOnTheCurrentTierCount(t *testing.T) {
 func TestTheBusyFractionIsTheSeriesOverTheJob(t *testing.T) {
 	t.Parallel()
 
-	got := rightsizeOne(t, runsOf("test", 10, 0.5, 0.1, 0.1, nil), rightsizeTiers)
-	if got.BusyP90 == nil || *got.BusyP90 < 0.499 || *got.BusyP90 > 0.501 {
-		t.Errorf("busy = %v, want the series' 0.5 over the job's window", got.BusyP90)
+	got := rightsizeOne(t, runsOf("test", 10, 0.5, 0.1, 0.1, func(_ int, j *fixedJob) {
+		j.outside = fraction(0.95)
+	}), rightsizeTiers)
+	if got.BusyP90 == nil || *got.BusyP90 < 0.495 || *got.BusyP90 > 0.505 {
+		t.Errorf("busy = %v, want the series' 0.5 over the job's window, not the 0.95 around it", got.BusyP90)
+	}
+	if got.DemandP90 == nil || *got.DemandP90 < 1.98 || *got.DemandP90 > 2.02 {
+		t.Errorf("demand = %v cores, want 2 of the 4 charged", got.DemandP90)
+	}
+}
+
+// ONLY RUNS AT THE NEWEST RUN'S CHARGED SHAPE COUNT, and a smaller tier is sized by
+// the CPU in whole cores: a shape a fallback bought larger than the tier asks for
+// is busier in cores than its fraction of the tier would say.
+func TestRunsAtAnotherShapeAreLeftOutAndATierIsSizedInCores(t *testing.T) {
+	t.Parallel()
+
+	resized := runsOf("test", 12, 0.05, 0.10, 0.10, nil)
+	resized = append(resized, runsOf("test", 30, 0.95, 0.95, 0.95, func(i int, j *fixedJob) {
+		j.lease, j.vcpu, j.memory = fmt.Sprintf("before-%d", i), 2, int64(8*gb)
+		j.startedAgo = 72*time.Hour + time.Duration(i)*time.Minute
+	})...)
+	got := rightsizeOne(t, resized, rightsizeTiers)
+	if got.Samples != 12 || got.OtherShapes != 30 || got.Recommendation != rightsizeSmaller {
+		t.Errorf("%d samples, %d at another shape, %s (%s); want 12, 30 and smaller", got.Samples, got.OtherShapes,
+			got.Recommendation, got.Reason)
+	}
+
+	// Charged 8 vCPU on the 4 vCPU tier and 25% busy: 2 cores, which a 2 vCPU tier
+	// would run 100% busy, so there is no smaller tier for it.
+	bought := rightsizeOne(t, runsOf("test", 40, 0.25, 0.10, 0.10, func(_ int, j *fixedJob) { j.vcpu = 8 }), rightsizeTiers)
+	if bought.Recommendation != rightsizeSmaller || bought.Recommended != nil {
+		t.Errorf("a larger bought shape: %s to %+v; want smaller and no tier that holds 2 cores", bought.Recommendation,
+			bought.Recommended)
+	}
+}
+
+// WITH NOTHING TO SAY OF ITS MEMORY, A JOB THAT IS NOT IDLE IS KEPT WITHOUT A CLAIM
+// IT HAS ROOM, and the JSON has no shape where none was recorded.
+func TestKeepClaimsNoRoomItCouldNotTell(t *testing.T) {
+	t.Parallel()
+
+	got := rightsizeOne(t, runsOf("test", 40, 0.50, 0, 0, func(_ int, j *fixedJob) {
+		j.guest = nil
+		j.usage.unmeasured = "memory"
+	}), rightsizeTiers)
+	if got.Recommendation != rightsizeKeep || strings.Contains(got.Reason, "short of room") ||
+		!strings.Contains(got.Reason, "its memory could not be told") {
+		t.Errorf("%s (%s); want keep, saying memory could not be told", got.Recommendation, got.Reason)
+	}
+
+	var out bytes.Buffer
+	if err := renderRightsizeJSON(&out, rightsizeReport{Jobs: []rightsizeJob{{Repository: "acme/api"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"vcpu": null`) || !strings.Contains(out.String(), `"memory_bytes": null`) {
+		t.Errorf("an unrecorded shape is not null:\n%s", out.String())
 	}
 }
 
@@ -265,6 +319,11 @@ func TestARecommendationStaysInTheTiersFamily(t *testing.T) {
 	current := rightsizeTier("t4", 4, 16*gb)
 
 	for name, change := range map[string]func(*config.Tier){
+		"another command":      func(t *config.Tier) { t.Command = []string{"./other-runner"} },
+		"another cache":        func(t *config.Tier) { t.Intercept = true },
+		"a smaller disk":       func(t *config.Tier) { t.Disk = 10 * gb },
+		"a default for a disk": func(t *config.Tier) {},
+		"a disk for a default": func(t *config.Tier) { t.Disk = 30 * gb },
 		"another target":       func(t *config.Tier) { t.Target = "other" },
 		"another image":        func(t *config.Tier) { t.Image = "ubuntu-2204-x64@verified" },
 		"another provider":     func(t *config.Tier) { t.Provider = config.ProviderDocker },
@@ -277,7 +336,11 @@ func TestARecommendationStaysInTheTiersFamily(t *testing.T) {
 	} {
 		small := rightsizeTier("small", 2, 8*gb)
 		change(&small)
-		got := rightsizeOne(t, idle, []config.Tier{current, small})
+		from := current
+		if name == "a smaller disk" || name == "a default for a disk" {
+			from.Disk = 20 * gb
+		}
+		got := rightsizeOne(t, idle, []config.Tier{from, small})
 		if got.Recommendation != rightsizeSmaller || got.Recommended != nil ||
 			!strings.Contains(got.Reason, "no smaller tier is configured") {
 			t.Errorf("%s: %s to %+v (%s); want smaller and no tier", name, got.Recommendation, got.Recommended, got.Reason)
@@ -306,6 +369,17 @@ func TestARecommendationStaysInTheTiersFamily(t *testing.T) {
 	gone := rightsizeOne(t, idle, []config.Tier{rightsizeTier("t2", 2, 8*gb)})
 	if gone.Recommendation != rightsizeNone || !strings.Contains(gone.Reason, "tier t4 is not in this configuration") {
 		t.Errorf("a tier the configuration lost: %s (%s)", gone.Recommendation, gone.Reason)
+	}
+
+	// How many of a tier are kept warm, run at once or reserved, and a larger disk, are
+	// no difference of family.
+	capacity := rightsizeTier("small", 2, 8*gb)
+	capacity.WarmPool, capacity.MaxConcurrent, capacity.Reserved = 3, 5, 1
+	withDisk := current
+	withDisk.Disk, capacity.Disk = 20*gb, 30*gb
+	if got := rightsizeOne(t, idle, []config.Tier{withDisk, capacity}); got.Recommended == nil || got.Recommended.Label != "small" {
+		t.Errorf("a tier differing only in capacity and a larger disk was not recommended: %+v (%s)", got.Recommended,
+			got.Reason)
 	}
 
 	// A move out of a trusted pool is not a change of size.

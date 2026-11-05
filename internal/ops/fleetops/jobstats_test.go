@@ -46,13 +46,17 @@ type fixedJob struct {
 	vcpu        int64
 	memory      int64
 	priceMicros int64
-	usage       *fixedUsage
+	// instanceType is the shape the lease bought; empty is a host-backed lease.
+	instanceType string
+	usage        *fixedUsage
 	// series is the host's per-sample series, as a run's busy fraction of its
 	// charged vCPUs from a second before its start to a second after its result;
 	// nil writes none. cover is how much of the run it covers, from the start, 1
-	// when zero.
-	series *float64
-	cover  float64
+	// when zero. outside, when set, runs the series for an hour before the job and
+	// an hour after it at that fraction instead.
+	series  *float64
+	cover   float64
+	outside *float64
 	// guest is the most of its memory the job's own VM says it used, written as a
 	// report the node kept whole unless guestPartial; nil writes none.
 	guest        *float64
@@ -63,7 +67,9 @@ func fraction(v float64) *float64 { return &v }
 
 // fixedSeries is a run's series: a sample every ten seconds whose cgroup CPU grows at
 // busy of vcpu.
-func fixedSeries(t *testing.T, started time.Time, ran time.Duration, cover, busy float64, vcpu int64) []byte {
+func fixedSeries(t *testing.T, started time.Time, ran time.Duration, cover, busy float64, outside *float64,
+	vcpu int64,
+) []byte {
 	t.Helper()
 
 	if cover == 0 {
@@ -74,14 +80,27 @@ func fixedSeries(t *testing.T, started time.Time, ran time.Duration, cover, busy
 	if cover < 1 {
 		end = started.Add(time.Duration(cover * float64(ran)))
 	}
+	finish := started.Add(ran)
+	rate := func(at time.Time) float64 { return busy }
+	if outside != nil {
+		first, end = started.Add(-time.Hour), finish.Add(time.Hour)
+		rate = func(at time.Time) float64 {
+			if at.After(started) && !at.After(finish) {
+				return busy
+			}
+			return *outside
+		}
+	}
 	var points []usage.Point
+	var cpu float64
+	last := first
 	for at := first; ; at = at.Add(10 * time.Second) {
 		if at.After(end) {
 			at = end
 		}
-		elapsed := at.Sub(first)
-		points = append(points, usage.Point{OffsetMillis: elapsed.Milliseconds(),
-			CPUUsage: int64(busy * float64(vcpu) * float64(elapsed.Microseconds()))})
+		cpu += rate(at) * float64(vcpu) * float64(at.Sub(last).Microseconds())
+		last = at
+		points = append(points, usage.Point{OffsetMillis: at.Sub(first).Milliseconds(), CPUUsage: int64(cpu)})
 		if !at.Before(end) {
 			break
 		}
@@ -131,17 +150,17 @@ func writeFixedJobs(t *testing.T, db *state.DB, jobs []fixedJob) {
 			if _, err := tx.ExecContext(t.Context(), `INSERT INTO job_history
 				(lease_id, tier, node, repo, workflow_ref, job_name, github_run_id, github_run_attempt,
 				 result, result_at, conclusion, disruption, queued_at, started_at, github_queued_at, vcpu,
-				 memory, price_micros_per_hour)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				 memory, price_micros_per_hour, instance_type)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				j.lease, j.tier, j.node, j.repo, j.workflow, j.job, j.run, j.attempt, j.result, resultAt,
 				conclusion, j.disruption, fixedStamp(started), fixedStamp(started), queuedAt, j.vcpu,
-				j.memory, j.priceMicros); err != nil {
+				j.memory, j.priceMicros, j.instanceType); err != nil {
 				return fmt.Errorf("job %s: %w", j.lease, err)
 			}
 			if j.series != nil {
 				if _, err := tx.ExecContext(t.Context(), `INSERT INTO job_series (lease_id, codec, series) VALUES (?, ?, ?)`,
 					j.lease, usage.SeriesCodecGaps, base64.StdEncoding.EncodeToString(
-						fixedSeries(t, started, j.ran, j.cover, *j.series, j.vcpu))); err != nil {
+						fixedSeries(t, started, j.ran, j.cover, *j.series, j.outside, j.vcpu))); err != nil {
 					return fmt.Errorf("series of %s: %w", j.lease, err)
 				}
 			}
@@ -320,12 +339,19 @@ func TestJobStatsJudgesAFlakeOnlyFromAttemptsItCanTell(t *testing.T) {
 		attempt("regressed-1", 107, 1, "succeeded", day), attempt("regressed-2", 107, 2, "failed", day),
 		// Different jobs of one run are not attempts of one job.
 		attempt("other-1", 108, 1, "failed", day), otherJob,
+		// A re-run still going decides nothing, and neither does a first attempt
+		// still going; a flake already there before one is still a flake.
+		attempt("going-1", 109, 1, "failed", day), attempt("going-2", 109, 2, "", day),
+		attempt("only-going", 110, 1, "", day),
+		attempt("done-1", 111, 1, "failed", day), attempt("done-2", 111, 2, "succeeded", day),
+		attempt("done-3", 111, 3, "", day),
 	})
 
 	c, p := report.Groups[0].Current, report.Groups[0].Previous
-	// 100, 101, 104, 105, 106, 107, and 108's two jobs; not 102 or 103.
-	if c.Judged != 8 || c.Flaky != 2 {
-		t.Errorf("current judged %d and found %d flaky; want 8 and 2", c.Judged, c.Flaky)
+	// 100, 101, 104, 105, 106, 107, 108's first job and 111; not 102, 103, 109 or 110,
+	// nor 108's second job, whose first attempt ran elsewhere.
+	if c.Judged != 8 || c.Flaky != 3 {
+		t.Errorf("current judged %d and found %d flaky; want 8 and 3", c.Judged, c.Flaky)
 	}
 	if p.Judged != 0 || p.Flaky != 0 {
 		t.Errorf("previous judged %d and found %d flaky; a run ending in this week belongs to it", p.Judged, p.Flaky)
@@ -336,7 +362,7 @@ func TestJobStatsJudgesAFlakeOnlyFromAttemptsItCanTell(t *testing.T) {
 
 	var out bytes.Buffer
 	renderJobStats(&out, report)
-	if want := fmt.Sprintf("25.0%% (2 of 8 job runs; attempt recorded for %d of %d jobs)", c.WithAttempt, c.Jobs); !strings.Contains(out.String(), want) {
+	if want := fmt.Sprintf("37.5%% (3 of 8 job runs; attempt recorded for %d of %d jobs)", c.WithAttempt, c.Jobs); !strings.Contains(out.String(), want) {
 		t.Errorf("the report does not say %q:\n%s", want, out.String())
 	}
 
@@ -361,6 +387,7 @@ func TestJobStatsNeverPrintsAFigureItDidNotMeasureAsZero(t *testing.T) {
 		result: "succeeded", startedAgo: 24 * time.Hour, ran: time.Hour, queued: 30 * time.Second, vcpu: 4,
 		memory: int64(16 * config.GiB)}
 	rapl, rapl2, meter, unmeasuredEnergy, bought := base, base, base, base, base
+	bought.instanceType = "m7i.xlarge"
 	rapl.lease, rapl.usage = "rapl", &fixedUsage{activeUJ: 2_000_000, idleUJ: 500_000, energySource: alloc.EnergyRAPL}
 	rapl2.lease, rapl2.usage = "rapl-2", &fixedUsage{activeUJ: 1_000_000, idleUJ: 500_000, energySource: alloc.EnergyRAPL}
 	meter.lease, meter.usage = "meter", &fixedUsage{activeUJ: 5_000_000, idleUJ: 2_000_000, energySource: alloc.EnergyMeter}
@@ -400,7 +427,8 @@ func TestJobStatsNeverPrintsAFigureItDidNotMeasureAsZero(t *testing.T) {
 	var out bytes.Buffer
 	renderJobStats(&out, report)
 	for _, want := range []string{
-		"energy     meter: 5.0 J active, 2.0 J idle over 1 jobs; rapl: 3.0 J active, 1.0 J idle over 2 jobs; " +
+		"energy     meter: 5.0 J active, 2.0 J idle (the whole host at the wall) over 1 jobs; rapl: 3.0 J active, " +
+			"1.0 J idle (package RAPL, a model rather than a meter) over 2 jobs; " +
 			"not measured for 2 jobs",
 		"cloud cost $2.00 over 1 of 5 jobs", "vCPU-hours 20.0 over 5 of 5 jobs", "queue wait p99 30s (5 jobs)",
 		"energy     not measured", "cloud cost no bought shape", "duration   not recorded for any of 1 jobs",
@@ -440,6 +468,76 @@ func TestJobStatsNeverPrintsAFigureItDidNotMeasureAsZero(t *testing.T) {
 	if first.CostUSD == nil || *first.CostUSD != 2 || first.VCPUHours == nil || *first.VCPUHours != 20 ||
 		len(first.Energy) != 2 || first.Energy[0].ActiveJoules != 5 {
 		t.Errorf("the measured group = %+v", decoded.Groups[0])
+	}
+}
+
+// EACH ENERGY SOURCE IS WORDED AS IT MEASURES: only a source that splits out the
+// idle draw says what was idle, an unsplit total says idle is inside it, and the
+// JSON gives no idle figure where there is none.
+func TestJobStatsWordsEachEnergySourceAsItMeasures(t *testing.T) {
+	t.Parallel()
+
+	job := func(lease, source string) fixedJob {
+		return fixedJob{lease: lease, tier: "t", repo: "acme/api", workflow: fixedWorkflow, job: "test", run: 1,
+			result: "succeeded", startedAgo: time.Hour, ran: time.Minute,
+			usage: &fixedUsage{activeUJ: 4_000_000, idleUJ: 9_000_000, energySource: source}}
+	}
+	report := statsOver(t, statsByRepository, "", []fixedJob{job("a", alloc.EnergyProcess),
+		job("b", alloc.EnergyRAPLUnsplit), job("c", "watts-from-a-later-billet")})
+
+	var out bytes.Buffer
+	renderJobStats(&out, report)
+	for _, want := range []string{
+		"process: 4.0 J (macOS's own estimate for the VM's process; the machine's idle draw is not in it) over 1 jobs",
+		"rapl-unsplit: 4.0 J (package RAPL with no idle baseline, so idle is inside it) over 1 jobs",
+		`"watts-from-a-later-billet": 4.0 J, split by a source this binary does not know over 1 jobs`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the report does not say %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "9.0 J") {
+		t.Errorf("an idle figure no source split out was printed:\n%s", out.String())
+	}
+
+	figures := statsFiguresJSONOf(&report.Groups[0].Current)
+	for _, e := range figures.Energy {
+		if e.IdleJoules != nil {
+			t.Errorf("%s has an idle figure %v, want null", e.Source, *e.IdleJoules)
+		}
+		if e.IdleIncluded != (e.Source == alloc.EnergyRAPLUnsplit) {
+			t.Errorf("%s says idle included %t", e.Source, e.IdleIncluded)
+		}
+	}
+}
+
+// NOTHING BOUGHT IS SAID ONLY WHEN NO LEASE BOUGHT A SHAPE: a bought shape with no
+// recorded price, or still running, has a cost nobody can say.
+func TestJobStatsTellsAnUnrecordedCostFromNone(t *testing.T) {
+	t.Parallel()
+
+	job := func(lease, shape string, price int64, ran time.Duration) fixedJob {
+		return fixedJob{lease: lease, tier: "t", repo: "acme/api", workflow: fixedWorkflow, job: "test", run: 1,
+			result: "succeeded", startedAgo: 2 * time.Hour, ran: ran, vcpu: 2, instanceType: shape, priceMicros: price}
+	}
+	for _, tc := range []struct {
+		name string
+		jobs []fixedJob
+		want string
+	}{
+		{"host-backed alone", []fixedJob{job("a", "", 0, time.Hour)}, "cloud cost no bought shape"},
+		{"bought at no recorded price", []fixedJob{job("a", "m7i.xlarge", 0, time.Hour)},
+			"cloud cost not recorded for the 1 jobs on a bought shape"},
+		{"bought and still running", []fixedJob{job("a", "m7i.xlarge", 1_000_000, 0)},
+			"cloud cost not recorded for the 1 jobs on a bought shape"},
+		{"one priced, one not", []fixedJob{job("a", "m7i.xlarge", 1_000_000, time.Hour), job("b", "m7i.xlarge", 0, time.Hour)},
+			"cloud cost $1.00 over 1 of 2 jobs; not recorded for 1 more on a bought shape"},
+	} {
+		var out bytes.Buffer
+		renderJobStats(&out, statsOver(t, statsByRepository, "", tc.jobs))
+		if !strings.Contains(out.String(), tc.want) {
+			t.Errorf("%s: the report does not say %q:\n%s", tc.name, tc.want, out.String())
+		}
 	}
 }
 
@@ -486,7 +584,7 @@ func TestJobStatsGroupsByWhatItIsAsked(t *testing.T) {
 		}
 	}
 
-	if got := keys(statsOver(t, statsByTier, "acme/web", jobs)); len(got) != 1 || got["small"] != 1 {
+	if got := keys(statsOver(t, statsByTier, "ACME/Web", jobs)); len(got) != 1 || got["small"] != 1 {
 		t.Errorf("--repo acme/web = %v, want its one job", got)
 	}
 }

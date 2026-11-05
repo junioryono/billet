@@ -45,10 +45,13 @@ type finding struct {
 	Detail string
 }
 
-// edit replaces [start, end) of a file's bytes.
+// edit replaces [start, end) of a file's bytes with text, which writes value into
+// node: the label itself, quoted where a bare one would read as something else.
 type edit struct {
 	start, end int
 	text       string
+	node       *yaml.Node
+	value      string
 }
 
 // workflowRewrite is what one file's read comes to: its findings and the bytes it
@@ -87,7 +90,15 @@ func rewriteWorkflow(file string, data []byte, chooser *tierChooser, recommend *
 		return out
 	}
 	jobs := mappingValue(rootOf(&doc), "jobs")
-	if jobs == nil || jobs.Kind != yaml.MappingNode {
+	switch {
+	case jobs == nil:
+		return out
+	case jobs.Kind == yaml.AliasNode || jobs.Anchor != "":
+		out.findings = append(out.findings, finding{Kind: findCouldNot, File: file, Line: jobs.Line,
+			Detail: "its jobs are a YAML anchor or alias, which another mapping shares"})
+
+		return out
+	case jobs.Kind != yaml.MappingNode:
 		return out
 	}
 
@@ -96,7 +107,26 @@ func rewriteWorkflow(file string, data []byte, chooser *tierChooser, recommend *
 
 	for i := 0; i+1 < len(jobs.Content); i += 2 {
 		key, job := jobs.Content[i].Value, jobs.Content[i+1]
-		if job.Kind != yaml.MappingNode {
+		// A JOB SHARED THROUGH AN ANCHOR MOVES WITH EVERY ALIAS OF IT, and one that
+		// takes its keys from another mapping takes its runs-on from there, so none of
+		// them can be edited as one job.
+		switch {
+		case job.Kind == yaml.AliasNode:
+			out.findings = append(out.findings, finding{Kind: findCouldNot, File: file, Line: job.Line, Job: key,
+				Detail: "the job is a YAML alias of another, and moves with it"})
+
+			continue
+		case job.Kind != yaml.MappingNode:
+			continue
+		case job.Anchor != "":
+			out.findings = append(out.findings, finding{Kind: findCouldNot, File: file, Line: job.Line, Job: key,
+				Detail: "the job is a YAML anchor, which other jobs may share"})
+
+			continue
+		case mappingValue(job, "<<") != nil:
+			out.findings = append(out.findings, finding{Kind: findCouldNot, File: file, Line: job.Line, Job: key,
+				Detail: "the job takes keys from another mapping with <<, which other jobs may share"})
+
 			continue
 		}
 
@@ -115,8 +145,8 @@ func rewriteWorkflow(file string, data []byte, chooser *tierChooser, recommend *
 
 		scalar := out.decideRunsOn(file, key, job, runsOn, lines, chooser)
 		if scalar != nil {
-			known = append(known, jobRunsOn{key: key, display: displayName(key, job),
-				matrix: mappingValue(mappingValue(job, "strategy"), "matrix") != nil, node: scalar})
+			known = append(known, jobRunsOn{key: key, display: displayName(key, job), matrix: hasMatrix(job),
+				node: scalar})
 		}
 	}
 
@@ -125,7 +155,81 @@ func rewriteWorkflow(file string, data []byte, chooser *tierChooser, recommend *
 	}
 	out.after = applyEdits(data, out.edits)
 
+	out.keepOnlyIfSame(&doc)
+
 	return out
+}
+
+// keepOnlyIfSame reads the result back before it is offered: it must be the same
+// workflow with exactly the edited values changed, to exactly what was meant, or the
+// file is left as it was and every rewrite in it is said not to have happened. Every
+// check before this trusts a parser's position; this one trusts nothing but the parse.
+func (r *workflowRewrite) keepOnlyIfSame(doc *yaml.Node) {
+	reason := sameWorkflowBut(doc, r.after, r.edits)
+	if reason == "" {
+		return
+	}
+	r.after = r.before
+	for i := range r.findings {
+		if r.findings[i].Kind == findRewritten {
+			r.findings[i].Kind = findCouldNot
+			r.findings[i].Detail = "the edited file did not read back as the same workflow with only its runs-on " +
+				"changed (" + reason + "), so nothing in it was changed"
+		}
+	}
+}
+
+// hasMatrix says whether a job has a matrix, true too for a strategy this cannot
+// read, such as an alias: a job whose legs might be judged apart is never moved whole.
+func hasMatrix(job *yaml.Node) bool {
+	strategy := mappingValue(job, "strategy")
+	switch {
+	case strategy == nil:
+		return false
+	case strategy.Kind != yaml.MappingNode:
+		return true
+	}
+
+	return mappingValue(strategy, "matrix") != nil
+}
+
+// sameWorkflowBut says why after is not before with exactly the edits' values changed,
+// empty when it is.
+func sameWorkflowBut(before *yaml.Node, after []byte, edits []edit) string {
+	if len(edits) == 0 {
+		return ""
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(after, &doc); err != nil {
+		return "it no longer parses"
+	}
+	want := make(map[*yaml.Node]string, len(edits))
+	for _, e := range edits {
+		want[e.node] = e.value
+	}
+
+	return sameNodeBut(before, &doc, want)
+}
+
+// sameNodeBut walks two parses together.
+func sameNodeBut(before, after *yaml.Node, want map[*yaml.Node]string) string {
+	if before.Kind != after.Kind || len(before.Content) != len(after.Content) || before.Anchor != after.Anchor {
+		return "its structure changed"
+	}
+	if value, edited := want[before]; edited {
+		if after.Kind != yaml.ScalarNode || after.Tag != "!!str" || after.Value != value {
+			return "a value did not become the label meant"
+		}
+	} else if before.Value != after.Value || before.Tag != after.Tag {
+		return "a value that was not meant to change did"
+	}
+	for i := range before.Content {
+		if reason := sameNodeBut(before.Content[i], after.Content[i], want); reason != "" {
+			return reason
+		}
+	}
+
+	return ""
 }
 
 // rootOf is the document's top mapping.
@@ -229,14 +333,14 @@ func (r *workflowRewrite) decideRunsOn(file, key string, job, runsOn *yaml.Node,
 		return nil
 	}
 
-	placed, reason := lines.place(runsOn)
+	placed, reason := lines.place(runsOn, to)
 	if reason != "" {
 		r.findings = append(r.findings, finding{Kind: findCouldNot, File: file, Line: runsOn.Line, Job: key, Text: label,
 			Detail: reason})
 
 		return nil
 	}
-	r.edits = append(r.edits, edit{start: placed.start, end: placed.end, text: to})
+	r.edits = append(r.edits, placed)
 	r.edited[runsOn] = true
 	r.findings = append(r.findings, finding{Kind: findRewritten, File: file, Line: runsOn.Line, Job: key, Text: label,
 		Detail: "to " + to + ", " + detail})
@@ -338,15 +442,39 @@ type lineIndex struct {
 	starts []int
 }
 
+// newLineIndex counts lines as yaml.v3 does: a CR LF pair is one break, and a lone
+// CR, LF, NEL, LS or PS each another. A line counted differently would put every
+// later position on another line.
 func newLineIndex(data []byte) lineIndex {
 	starts := []int{0}
-	for i, b := range data {
-		if b == '\n' {
-			starts = append(starts, i+1)
+	for i := 0; i < len(data); {
+		size := breakAt(data, i)
+		if size == 0 {
+			i++
+
+			continue
 		}
+		i += size
+		starts = append(starts, i)
 	}
 
 	return lineIndex{data: data, starts: starts}
+}
+
+// breakAt is the length of the line break at data[i], zero for none.
+func breakAt(data []byte, i int) int {
+	switch {
+	case data[i] == '\r' && i+1 < len(data) && data[i+1] == '\n':
+		return 2
+	case data[i] == '\r' || data[i] == '\n':
+		return 1
+	case bytes.HasPrefix(data[i:], []byte("\u0085")):
+		return 2
+	case bytes.HasPrefix(data[i:], []byte("\u2028")), bytes.HasPrefix(data[i:], []byte("\u2029")):
+		return 3
+	}
+
+	return 0
 }
 
 // place finds a scalar's value in the file's bytes, and refuses anything but the
@@ -355,7 +483,81 @@ func newLineIndex(data []byte) lineIndex {
 //
 // yaml.v3 COUNTS A COLUMN IN CHARACTERS, measured by the multibyte test beside this:
 // a label after a non-ASCII entry on its line is further along in bytes.
-func (l lineIndex) place(node *yaml.Node) (edit, string) {
+func (l lineIndex) place(node *yaml.Node, value string) (edit, string) {
+	placed, reason := l.span(node)
+	if reason != "" {
+		return edit{}, reason
+	}
+	text, reason := replacementText(node, value)
+	if reason != "" {
+		return edit{}, reason
+	}
+	placed.text, placed.node, placed.value = text, node, value
+
+	return placed, ""
+}
+
+// replacementText is how value is written in node's place: as it is inside the
+// quotes it already has, bare where a bare value reads back as that string, and
+// double-quoted where it would not (a tier named null, true or 1 would read as a
+// null, a boolean or a number, which GitHub does not take as the label).
+func replacementText(node *yaml.Node, value string) (string, string) {
+	switch node.Style {
+	case yaml.DoubleQuotedStyle:
+		if strings.ContainsAny(value, "\"\\") || !printableASCII(value) {
+			return "", "the label meant has a character the double quotes would need to escape"
+		}
+
+		return value, ""
+	case yaml.SingleQuotedStyle:
+		if strings.Contains(value, "'") || !printableASCII(value) {
+			return "", "the label meant has a character the single quotes would need to escape"
+		}
+
+		return value, ""
+	}
+	if !printableASCII(value) {
+		return "", "the label meant is not printable ASCII"
+	}
+	if readsBackAs(value) {
+		return value, ""
+	}
+
+	return strconv.Quote(value), ""
+}
+
+// readsBackAs says whether value written bare, alone or in a flow list, reads back as
+// the string value.
+func readsBackAs(value string) bool {
+	for _, form := range []string{"k: " + value + "\n", "k: [" + value + "]\n"} {
+		var doc yaml.Node
+		if err := yaml.Unmarshal([]byte(form), &doc); err != nil {
+			return false
+		}
+		v := mappingValue(rootOf(&doc), "k")
+		if v != nil && v.Kind == yaml.SequenceNode && len(v.Content) == 1 {
+			v = v.Content[0]
+		}
+		if v == nil || v.Kind != yaml.ScalarNode || v.Tag != "!!str" || v.Value != value || v.Style != 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+func printableASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+
+	return s != ""
+}
+
+// span is where a scalar's value lies in the file's bytes.
+func (l lineIndex) span(node *yaml.Node) (edit, string) {
 	switch node.Style {
 	case 0, yaml.DoubleQuotedStyle, yaml.SingleQuotedStyle:
 	default:
@@ -367,7 +569,7 @@ func (l lineIndex) place(node *yaml.Node) (edit, string) {
 
 	start := l.starts[node.Line-1]
 	for range node.Column - 1 {
-		if start >= len(l.data) || l.data[start] == '\n' {
+		if start >= len(l.data) || breakAt(l.data, start) > 0 {
 			return edit{}, "the parser's position for it is not in the file"
 		}
 		_, size := utf8.DecodeRune(l.data[start:])
