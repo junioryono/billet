@@ -163,7 +163,7 @@ func (p *Provider) VerifyImage(ctx context.Context, spec VerifySpec) error {
 		return err
 	}
 
-	contract, window := contractFor(arch), time.Duration(verifyWindow)
+	contract, window := contractFor(arch), verifyWindow
 
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
@@ -479,15 +479,8 @@ func verifierName(spec VerifySpec) string {
 	return base + "-verify"
 }
 
-// awaitConsoleReport polls the serial console until the verifier's own block
-// appears, and returns what it said.
-func (p *Provider) awaitConsoleReport(
-	ctx context.Context, id, nonce string, schema reportSchema,
-) (map[string]string, error) {
-	return p.awaitConsoleReportWithin(ctx, id, nonce, schema, verifyWindow)
-}
-
-// awaitConsoleReportWithin is awaitConsoleReport with a window of the caller's.
+// awaitConsoleReportWithin polls the serial console until the verifier's own block
+// appears, for at most window, and returns what it said.
 func (p *Provider) awaitConsoleReportWithin(
 	ctx context.Context, id, nonce string, schema reportSchema, window time.Duration,
 ) (map[string]string, error) {

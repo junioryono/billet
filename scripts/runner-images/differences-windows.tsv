@@ -8,7 +8,7 @@
 # scripts/windows/build-ami.ps1 runs every step not skipped, in the template's order, and
 # an entry naming no step stops the build before anything runs: it is a pin bump to
 # review, not a line to ignore.
-prepare:aws-tools	Install-PowerShellModules.ps1	Amazon's AMI carries the AWS Tools on the module path and Azure's does not, so the step's AWSPowerShell install refuses to clobber them
+prepare:aws-tools	Install-PowerShellModules.ps1	Amazon's AMI carries the modular AWS.Tools modules on every module path and Azure's carries none, so the step's AWSPowerShell install refuses to override their commands; they are moved off the path, leaving a job the AWSPowerShell module GitHub's image has
 skip	file:C:\image\scripts\docs-gen\	the software report's shared code, and billet generates no software report for a floor it says it leaves most of out
 skip	shell:d1956e4c44c4	creates the account Packer connects as over WinRM; billet's build runs as SYSTEM in a scheduled task and connects to nothing
 skip	inline:66fcb42eef59	checks the account the previous step creates

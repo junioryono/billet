@@ -152,8 +152,8 @@ func readWindowsPlan(t *testing.T, template string) []windowsStep {
 			base := windowsStep{Kind: "powershell", Env: env, ValidExitCodes: codes,
 				Elevated:    attrs.optionalOne("elevated_user") != "",
 				PauseBefore: attrs.optionalOne("pause_before")}
-			scripts := attrs.list("scripts")
-			for _, script := range scripts {
+			listed := attrs.list("scripts")
+			for _, script := range listed {
 				step := base
 				step.Script = repoPathUnder(t, "images/windows/templates", windowsValue(t, script))
 				step.ID = path.Base(step.Script)
@@ -167,7 +167,7 @@ func readWindowsPlan(t *testing.T, template string) []windowsStep {
 				step.ID = "inline:" + windowsInlineID(step.Inline)
 				add(step)
 			}
-			if len(scripts) == 0 && len(attrs.list("inline")) == 0 {
+			if len(listed) == 0 && len(attrs.list("inline")) == 0 {
 				t.Fatalf("a powershell provisioner with neither scripts nor inline commands")
 			}
 		case "windows-shell":
@@ -385,15 +385,15 @@ func TestTheWindowsScriptsParse(t *testing.T) {
 		t.Skip("no pwsh on this machine, so nothing here can read PowerShell")
 	}
 
-	scripts, err := filepath.Glob(filepath.Join("windows", "*.ps1"))
+	files, err := filepath.Glob(filepath.Join("windows", "*.ps1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(scripts) < 5 {
-		t.Fatalf("only %d scripts under windows/; the glob read nothing", len(scripts))
+	if len(files) < 5 {
+		t.Fatalf("only %d scripts under windows/; the glob read nothing", len(files))
 	}
 
-	for _, script := range scripts {
+	for _, script := range files {
 		absolute, err := filepath.Abs(script)
 		if err != nil {
 			t.Fatal(err)
@@ -1151,11 +1151,11 @@ func TestAWindowsScriptStepRunsAsPackerRunsIt(t *testing.T) {
 				Env: map[string]string{"THE_VERSION": "@image_version@"}}
 			root, env := windowsBuildFixture(t, []windowsStep{step}, "")
 
-			path := filepath.Join(root, "repo", "scripts", "runner-images", "upstream", filepath.FromSlash(relative))
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			file := filepath.Join(root, "repo", "scripts", "runner-images", "upstream", filepath.FromSlash(relative))
+			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(path, []byte(tc.script), 0o600); err != nil {
+			if err := os.WriteFile(file, []byte(tc.script), 0o600); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1479,6 +1479,83 @@ function Get-ScheduledTaskInfo {
 			}
 			if tc.wantFail && strings.Contains(string(out), "is registered at") {
 				t.Errorf("the runner's task is not at normal priority:\n%s", out)
+			}
+		})
+	}
+}
+
+// THE AWS TOOLS PREPARE TAKES AMAZON'S MODULAR SET OFF THE MODULE PATH, every one of them and
+// nothing else, and fails where one is still visible: the step after it refuses on the first.
+// A version that edited a path entry the AMI does not have passed everything but a real build.
+func TestTheAWSToolsPrepareLeavesNoneVisible(t *testing.T) {
+	t.Parallel()
+
+	pwsh, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("no pwsh on this machine, so nothing here can run the prepare")
+	}
+
+	prepare, err := filepath.Abs(filepath.Join("windows", "prepare-aws-tools.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	module := func(t *testing.T, dir, name string) {
+		t.Helper()
+
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name, name+".psm1"), []byte("function Get-"+
+			strings.ReplaceAll(name, ".", "")+" { }\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for name, tc := range map[string]struct {
+		elsewhere bool
+		wantFail  bool
+	}{
+		"Amazon's set where the AMI has it": {},
+		"one on another module path":        {elsewhere: true, wantFail: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			programFiles := t.TempDir()
+			modules := filepath.Join(programFiles, "WindowsPowerShell", "Modules")
+			for _, name := range []string{"AWS.Tools.Common", "AWS.Tools.S3Vectors", "PowerShellGet"} {
+				module(t, modules, name)
+			}
+
+			path := modules
+			if tc.elsewhere {
+				other := t.TempDir()
+				module(t, other, "AWS.Tools.EC2")
+				path += string(os.PathListSeparator) + other
+			}
+
+			cmd := exec.CommandContext(t.Context(), pwsh, "-NoProfile", "-NonInteractive", "-File", prepare)
+			cmd.Env = append(os.Environ(), "ProgramFiles="+programFiles, "PSModulePath="+path)
+
+			out, err := cmd.CombinedOutput()
+			if tc.wantFail != (err != nil) {
+				t.Fatalf("the prepare answered %v, want a failure %v:\n%s", err, tc.wantFail, out)
+			}
+			if tc.wantFail && !strings.Contains(string(out), "still on the module path") {
+				t.Errorf("it failed for another reason:\n%s", out)
+			}
+
+			for _, gone := range []string{"AWS.Tools.Common", "AWS.Tools.S3Vectors"} {
+				if _, err := os.Stat(filepath.Join(modules, gone)); !os.IsNotExist(err) {
+					t.Errorf("%s is still on the module path: %v", gone, err)
+				}
+				if _, err := os.Stat(filepath.Join(programFiles, "Amazon", "AWSToolsForPowerShell.OffModulePath", gone)); err != nil {
+					t.Errorf("%s was not kept aside: %v", gone, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(modules, "PowerShellGet")); err != nil {
+				t.Errorf("a module that is not Amazon's was moved: %v", err)
 			}
 		})
 	}

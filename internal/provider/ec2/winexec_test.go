@@ -69,9 +69,10 @@ function tar.exe { Note 'unpack'; Copy-Item -LiteralPath $env:STUB_SETTINGS -Des
 function powershell.exe { Note 'driver'; $global:LASTEXITCODE = 0 }
 `
 
-// runStubbed runs body under pwsh after the stubs, and answers its console, what the
-// stubs noted, and its exit status.
-func runStubbed(t *testing.T, dir, body string, env ...string) (string, string, int) {
+// runStubbed runs body under pwsh after the stubs, and answers its console and what the
+// stubs noted. A script ending in a non-zero status is one of its outcomes, which those
+// say; only pwsh failing to run at all fails the test here.
+func runStubbed(t *testing.T, dir, body string, env ...string) (string, string) {
 	t.Helper()
 
 	pwsh := lookPwsh(t)
@@ -89,10 +90,7 @@ func runStubbed(t *testing.T, dir, body string, env ...string) (string, string, 
 
 	out, err := cmd.CombinedOutput()
 
-	status := 0
-	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-		status = exitErr.ExitCode()
-	} else if err != nil {
+	if _, ok := errors.AsType[*exec.ExitError](err); !ok && err != nil {
 		t.Fatalf("pwsh: %v\n%s", err, out)
 	}
 
@@ -109,7 +107,7 @@ func runStubbed(t *testing.T, dir, body string, env ...string) (string, string, 
 		return string(raw)
 	}
 
-	return read(console), read(log), status
+	return read(console), read(log)
 }
 
 func stripTags(script string) string {
@@ -149,7 +147,7 @@ func TestAWindowsBootEndsTheMachineOnlyIfItsCommandFails(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			_, log, _ := runStubbed(t, dir, stripTags(script))
+			_, log := runStubbed(t, dir, stripTags(script))
 
 			if got := strings.Contains(log, "stop"); got != tc.wantStop {
 				t.Errorf("the machine stopped: %v, want %v", got, tc.wantStop)
@@ -257,7 +255,7 @@ func TestTheWindowsVerifierEarnsItsVerdict(t *testing.T) {
 					"STUB_RESULT="+filepath.Join(dir, "image", "verify", "result-"+nonce+".txt"))
 			}
 
-			console, log, _ := runStubbed(t, dir, body, env...)
+			console, log := runStubbed(t, dir, body, env...)
 
 			report, ok := parseReport(console, verifyProbeNonce, schema)
 			if !ok {
@@ -454,7 +452,7 @@ func TestTheWindowsSecondBootStartsTheDriverOnlyOnWhatItChecked(t *testing.T) {
 				}
 			}
 
-			console, log, _ := runStubbed(t, dir, body, env...)
+			console, log := runStubbed(t, dir, body, env...)
 
 			if !strings.Contains(log, "unregister") {
 				t.Errorf("the task that started this boot is still registered:\n%s", log)
@@ -527,7 +525,7 @@ func TestAWindowsFirstBootThatFailsEndsTheMachine(t *testing.T) {
 				"function Set-ItemProperty { }\nfunction Remove-ItemProperty { }\nfunction Set-CimInstance { }\n" +
 				"function Get-CimInstance { }\nfunction Remove-CimInstance { }\n" + tc.stub + stripTags(script)
 
-			_, log, _ := runStubbed(t, dir, body)
+			_, log := runStubbed(t, dir, body)
 
 			if got := strings.Contains(log, "stop"); got != tc.wantStop {
 				t.Errorf("the machine stopped: %v, want %v:\n%s", got, tc.wantStop, log)

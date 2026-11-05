@@ -642,7 +642,10 @@ func (b *windowsBuildFake) reply(action string, params url.Values) (int, string)
 			`</blockDeviceMapping><imageState>available</imageState>`+tags, 1)
 
 	case "RunInstances":
-		raw, _ := base64.StdEncoding.DecodeString(params.Get("UserData"))
+		raw, err := base64.StdEncoding.DecodeString(params.Get("UserData"))
+		if err != nil {
+			return http.StatusBadRequest, `<Response><Errors><Error><Code>InvalidParameterValue</Code></Error></Errors></Response>`
+		}
 		id := "i-builder"
 
 		if params.Get("ImageId") != "ami-base" {

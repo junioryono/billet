@@ -34,7 +34,7 @@ var windowsVerifyTools = []struct{ key, exe, args string }{
 
 // windowsToolVersion is what a declared toolcache line may be before it reaches the
 // script, in the two spellings windows-2025's declaration uses: `3.13.*` and `3.3`.
-var windowsToolVersion = regexp.MustCompile(`^[0-9]+(\.[0-9]+)*(\.\*)?$`)
+var windowsToolVersion = regexp.MustCompile(`^\d+(\.\d+)*(\.\*)?$`)
 
 // windowsVerifyScript is the user data that makes a machine booted from a Windows AMI
 // assert the contract on itself, and the report schema that goes with it.

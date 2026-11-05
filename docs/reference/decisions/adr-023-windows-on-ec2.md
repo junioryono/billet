@@ -110,7 +110,7 @@ ADR-022's rule holds: billet images a stopped builder only after reading a succe
 - **A line reaches `GetConsoleOutput` only while the port stays open.** `Close` discards what the driver has not sent, so the build holds one port throughout.
 - **`ec2launch reset --shutdown` exits 1 for a machine that then stops cleanly.** So a tail that fails is one that leaves the machine up.
 
-The build's output goes to logs under `C:\billet-ami\logs`, and on a failure a bounded tail of the failing step's log goes to the console ahead of the verdict, because a builder in an egress-only group has no other way to say why. billet logs those lines to the operator, and keeps them out of the error, since a guest wrote them. That tail named the first real build's failure at once: Amazon's AMI carries the AWS Tools on the module path, so GitHub's `Install-Module AWSPowerShell` refuses to clobber them, which never happens on Azure's image. It is one `prepare` line in the list.
+The build's output goes to logs under `C:\billet-ami\logs`, and on a failure a bounded tail of the failing step's log goes to the console ahead of the verdict, because a builder in an egress-only group has no other way to say why. billet logs those lines to the operator, and keeps them out of the error, since a guest wrote them. That tail named the first real build's failure at once: Amazon's AMI carries the modular AWS Tools, 429 `AWS.Tools.*` modules on every module path, so GitHub's `Install-Module AWSPowerShell` refuses to override their commands, which never happens on Azure's image. One `prepare` line moves them aside, and a job finds the `AWSPowerShell` module GitHub's image has.
 
 ## Consequences
 
