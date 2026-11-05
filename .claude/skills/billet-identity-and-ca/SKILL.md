@@ -30,6 +30,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The App private key is issued once, never deleted by pathname, never rendered.**
 - **Onboarding refuses everything it can before it touches GitHub.**
 - **An App that holds a permission billet never requested is refused, so a job needing a permission billet did not ask for is another App's job.**
+- **A deployment may hold no App at all (#557).**
 - **Every token billet mints is scoped to an installation, so losing the installation looks like nothing.**
 
 ### The identity directory's exclusion: [references/identity-exclusion.md](references/identity-exclusion.md)

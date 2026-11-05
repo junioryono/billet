@@ -99,7 +99,7 @@ cat >"$work/site.yml" <<'EOF'
     - name: Prove the fixture put the requested key path into the effective config
       ansible.builtin.assert:
         that:
-          - billet_config.github.private_key_path == expected_key_path
+          - (billet_config.github.private_key_path | default('')) == (expected_key_path | default(''))
         fail_msg: >-
           The fixture did not take: billet_config.github.private_key_path is
           {{ billet_config.github.private_key_path | default('undefined') }},
@@ -378,3 +378,26 @@ run_target_case "target foreign path, regular file"      "$target_foreign" no  p
 
 rm -rf "$work/operator"; mkdir -p "$work/operator"; : >"$target_foreign"
 run_target_case "target foreign path, source supplied"   "$target_foreign" yes "$target_source_says"
+
+# A DEPLOYMENT ON A TOKEN BROKER names no key anywhere, and that is the config working: the
+# github block's assertions are about a key this host is told not to have.
+rm -rf "$work/gv"; mkdir -p "$work/gv"
+awk '
+    /^[[:space:]]*private_key_path:/ { dropped++; next }
+    /^[[:space:]]*server:[[:space:]]*$/ && !added {
+        print
+        match($0, /^[[:space:]]*/)
+        indent = substr($0, 1, RLENGTH) "  "
+        printf "%stoken_broker:\n", indent
+        printf "%s  url: https://broker.internal:8443\n", indent
+        printf "%s  client_key_path: /etc/billet/broker-client.key\n", indent
+        added = 1
+        next
+    }
+    { print }
+    END { if (dropped != 1 || !added) { printf "dropped=%d added=%d\n", dropped+0, added+0 > "/dev/stderr"; exit 3 } }
+' "$work/base.yml" >"$work/gv/all.yml" || {
+    echo "key-policy-check: the broker fixture could not be built from the emitted block" >&2
+    exit 1
+}
+run_play "a broker's config names no key" pass -e expected_key_path=

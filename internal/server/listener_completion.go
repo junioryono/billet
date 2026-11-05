@@ -266,6 +266,7 @@ func (l *Listener) recordJobResult(ctx context.Context, job dispatch.Job, leaseI
 	// them the wait is unknown, never another job's.
 	if job.RunnerName == "" {
 		job.QueuedAt, job.ScaleSetAssignedAt, job.RunnerAssignedAt = time.Time{}, time.Time{}, time.Time{}
+		job.FinishedAt = time.Time{}
 	}
 	l.recordJobIdentity(ctx, leaseID, job, 0)
 }
@@ -311,6 +312,32 @@ func withCompletionIdentity(completion *state.PendingCompletion, job dispatch.Jo
 	completion.JobRepository = job.Repository
 	completion.JobWorkflowRef = job.WorkflowRef
 	completion.JobEvent = job.Event
+
+	// ONLY FROM A COMPLETION THAT NAMES ITS RUNNER, the rule recordJobResult keeps: one
+	// that names none may have found this lease by a request id another job now holds.
+	if job.RunnerName != "" {
+		completion.JobRunnerAssignedAt = completionTime(job.RunnerAssignedAt)
+		completion.JobFinishedAt = completionTime(job.FinishedAt)
+	}
+}
+
+func completionTime(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+
+	return at.UTC().Format(time.RFC3339Nano)
+}
+
+// parsedCompletionTime is zero for a time the row does not hold, which is what a job
+// says of a time the message left out.
+func parsedCompletionTime(at string) time.Time {
+	parsed, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return time.Time{}
+	}
+
+	return parsed
 }
 
 func (l *Listener) recordReleaseOnly(
@@ -624,6 +651,13 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 			Result: completion.Result, CompletionID: completion.MessageID,
 			JobID: completion.JobID, Owner: completion.JobOwner, Repository: completion.JobRepository,
 			WorkflowRef: completion.JobWorkflowRef, Event: completion.JobEvent}, completion.LeaseID)
+
+		// THE RESULT'S TIME IS NOW, AND THE JOB'S IS NOT: what a usage record bills on has to
+		// come back with the rest of what the completion said. recordJobResult drops a
+		// restored job's times because it names no runner; this row kept them only if it did.
+		l.recordJobIdentity(ctx, completion.LeaseID, dispatch.Job{JobID: completion.JobID,
+			RunnerAssignedAt: parsedCompletionTime(completion.JobRunnerAssignedAt),
+			FinishedAt:       parsedCompletionTime(completion.JobFinishedAt)}, 0)
 	}
 
 	return nil

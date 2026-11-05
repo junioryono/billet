@@ -176,6 +176,7 @@ func TestALadderRefusesEverySpellingThatMeansTwoThings(t *testing.T) {
 	for name, tierBody := range map[string]string{
 		"a ladder beside an explicit vcpu":   "    sizes: [2, 4]\n    vcpu: 2\n",
 		"a ladder beside an explicit memory": "    sizes: [2, 4]\n    memory: 8GiB\n",
+		"a ladder beside one minute weight":  "    sizes: [2, 4]\n    minute_weight: 2\n",
 		"a proportion with no ladder": "    vcpu: 2\n    memory: 4GiB\n" +
 			"    memory_per_vcpu: 2GiB\n",
 		"a size of zero":                  "    sizes: [0]\n",

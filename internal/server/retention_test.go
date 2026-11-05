@@ -1,6 +1,8 @@
 package server
 
 import (
+	"database/sql"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -10,11 +12,13 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
-// THE CONTROL PLANE DELETES JOB DETAIL PAST ITS RETENTION, as a background loop
-// in Run: what the allocator's tests prove works is used.
-func TestTheControlPlaneRunsTheJobDetailRetention(t *testing.T) {
+// THE CONTROL PLANE DELETES JOB DETAIL PAST ITS RETENTION AND NUMBERS OLD USAGE, each
+// as a background loop in Run: what the allocator's tests prove works is used.
+func TestTheControlPlaneRunsItsLedgerUpkeep(t *testing.T) {
 	t.Parallel()
 
 	fset := token.NewFileSet()
@@ -22,7 +26,7 @@ func TestTheControlPlaneRunsTheJobDetailRetention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse server.go: %v", err)
 	}
-	started := false
+	started := map[string]bool{}
 	for _, d := range file.Decls {
 		fd, ok := d.(*ast.FuncDecl)
 		if !ok || fd.Name.Name != "Run" || fd.Recv == nil {
@@ -38,15 +42,17 @@ func TestTheControlPlaneRunsTheJobDetailRetention(t *testing.T) {
 				return true
 			}
 			for _, arg := range call.Args {
-				if s, ok := arg.(*ast.SelectorExpr); ok && s.Sel.Name == "retireJobDetail" {
-					started = true
+				if s, ok := arg.(*ast.SelectorExpr); ok {
+					started[s.Sel.Name] = true
 				}
 			}
 			return true
 		})
 	}
-	if !started {
-		t.Error("(*Server).Run starts no background loop running retireJobDetail")
+	for _, loop := range []string{"retireJobDetail", "numberUsage"} {
+		if !started[loop] {
+			t.Errorf("(*Server).Run starts no background loop running %s", loop)
+		}
 	}
 }
 
@@ -105,5 +111,67 @@ func TestARetentionPassRetiresOnlyWhatIsPastIt(t *testing.T) {
 	job, err := p.a.Job(t.Context(), lease.ID)
 	if err != nil || !strings.HasPrefix(job.DetailRetiredAt, "20") {
 		t.Errorf("a pass past the retention left the job's detail_retired_at %q (%v)", job.DetailRetiredAt, err)
+	}
+}
+
+// A PASS NUMBERS MORE THAN ONE BATCH of the leases that finished before there were
+// numbers, oldest first, and the next pass has nothing to do.
+func TestAPassNumbersFinishedLeasesPastOneBatch(t *testing.T) {
+	t.Parallel()
+
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("billet-4vcpu-a")})
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	const leases = usageNumberBatch + 3
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for i := range leases {
+			if _, err := tx.ExecContext(t.Context(), fmt.Sprintf(`INSERT INTO job_history
+				(lease_id, tier, queued_at, finished_at) VALUES ('%032d', 'billet-4vcpu-a', 't', '%032d')`,
+				i, i)); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	s := New(a, &fakeProvisioner{}, nil, "test", nil)
+	s.numberUsageOnce(t.Context())
+
+	rows, err := db.UsageSince(t.Context(), 0, leases+1)
+	if err != nil {
+		t.Fatalf("UsageSince: %v", err)
+	}
+	if len(rows) != leases {
+		t.Fatalf("a pass numbered %d leases, want %d", len(rows), leases)
+	}
+	for i, r := range rows {
+		if want := fmt.Sprintf("%032d", i); r.LeaseID != want {
+			t.Fatalf("number %d went to %s, want %s", r.Sequence, r.LeaseID, want)
+		}
+	}
+
+	waiting, err := db.UsageStillNumbering(t.Context())
+	if err != nil || waiting {
+		t.Fatalf("UsageStillNumbering = %v, %v; nothing is left", waiting, err)
+	}
+
+	s.numberUsageOnce(t.Context())
+
+	again, err := db.UsageSince(t.Context(), rows[len(rows)-1].Sequence, 1)
+	if err != nil || len(again) != 0 {
+		t.Fatalf("a second pass numbered %d more (%v)", len(again), err)
 	}
 }
