@@ -29,7 +29,11 @@ type GuestAttacher interface {
 func (c *Client) DialStream(ctx context.Context, stream, token string) (io.ReadWriteCloser, error) {
 	path := c.nodePath("/streams/" + url.PathEscape(stream))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, http.NoBody)
+	// THE CONTROLLER THE NODE IS REGISTERED WITH, which is the one whose command asked for this
+	// stream and the only one holding its token.
+	at, _ := c.currentTarget()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, at.base+path, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("nodeclient: build %s: %w", path, err)
 	}
@@ -39,7 +43,7 @@ func (c *Client) DialStream(ctx context.Context, stream, token string) (io.ReadW
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", nodeapi.StreamProtocol)
 
-	resp, err := c.http.Do(req)
+	resp, err := at.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("nodeclient: dial a stream: %w", err)
 	}

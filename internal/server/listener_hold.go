@@ -157,7 +157,9 @@ func (l *Listener) parkHeld(ctx context.Context, job dispatch.Job, lease *alloc.
 
 	entry.held = true
 	entry.wait, entry.at = 0, time.Time{}
-	withdrawn := entry.withdrawn
+	// A COMPLETION PARKED FOR THE CLEANUP LOOP WAS WITHDRAWN AS IT WAS PARKED, and this is the same
+	// flag: the destroy that follows the hold then withdraws nothing again.
+	withdrawn := entry.deregistered && entry.job.CompletionID == job.CompletionID
 	l.mu.Unlock()
 
 	if withdrawn {
@@ -167,16 +169,19 @@ func (l *Listener) parkHeld(ctx context.Context, job dispatch.Job, lease *alloc.
 	l.log.Info("a failed job's VM is held, so its capacity stays charged until the hold ends",
 		"tier", l.tier, "lease", lease.ID, "until", hold.Until)
 
-	if err := l.withdrawRunner(ctx, job, lease); err != nil {
+	done, err := l.deregisterCompleted(ctx, job, lease)
+	if err != nil {
 		l.log.Warn("could not withdraw a held job's runner; trying again on the next pass",
 			"tier", l.tier, "lease", lease.ID, "error", err)
 
 		return
 	}
 
-	l.mu.Lock()
-	entry.withdrawn = true
-	l.mu.Unlock()
+	if done {
+		l.mu.Lock()
+		entry.deregistered = true
+		l.mu.Unlock()
+	}
 }
 
 // restoreHolds marks the restored completions a hold is keeping, before any pass has looked: a process

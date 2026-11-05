@@ -183,7 +183,7 @@ type LoopOptions struct {
 	// Nil is never.
 	DrainRequested func() bool
 	// Backoff is how long to wait after a failed registration or poll. Zero uses
-	// a default.
+	// five seconds, or one with several controllers (backoffFor).
 	//
 	// It governs BOTH registration and poll failures, so a caller lengthening it
 	// to calm a flapping link is not left hammering the poll endpoint.
@@ -317,10 +317,7 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		log = slog.Default()
 	}
 
-	backoff := opts.Backoff
-	if backoff <= 0 {
-		backoff = 5 * time.Second
-	}
+	backoff := backoffFor(opts, c)
 
 	if opts.Ready == nil {
 		opts.Ready = func() {}
@@ -481,8 +478,8 @@ func register(
 		// node says which protocol it is actually serving on. A fleet mid-rollout
 		// is otherwise only visible from the control plane.
 		log.Info("registered with the control plane",
-			"node", c.node, "provider", opts.Provider, "lease_ttl", c.LeaseTTL(),
-			"protocol", c.WireVersion())
+			"node", c.node, "control_plane", c.Endpoint().String(), "provider", opts.Provider,
+			"lease_ttl", c.LeaseTTL(), "protocol", c.WireVersion())
 
 		// PUBLISHED RIGHT HERE, after the acceptance and before recovery: an
 		// accepted registration whose recovery then fails is still a registration
@@ -549,6 +546,12 @@ func register(
 			continue
 		}
 
+		// AND TO A CONTROLLER THAT STOPPED ANSWERING, when there is another: the
+		// registration tries each in turn. serve said so when it returned.
+		if errors.Is(err, errControlPlaneLost) {
+			continue
+		}
+
 		log.Error("the command loop stopped; registering again", "error", err)
 
 		if !sleep(ctx, backoff) {
@@ -556,6 +559,15 @@ func register(
 		}
 	}
 }
+
+// errControlPlaneLost ends serve when the controller a node is registered with
+// has stopped answering and the node knows another: the answer is to register
+// again, which tries each controller in turn.
+var errControlPlaneLost = errors.New("nodeclient: the control plane stopped answering")
+
+// lostAfter is how many polls in a row must go unanswered before a node with
+// another controller to try registers again.
+const lostAfter = 2
 
 // drainServingDone is a test hook the drain's serving worker calls as it
 // returns; nil in production.
@@ -692,12 +704,23 @@ func stopGracefully(
 	// forgotten was, which is why this asks EverRegistered and not the wire
 	// version a forgotten registration clears. A second signal ends the attempt
 	// either way.
+	//
+	// SUPERSEDED THERE IS SUPERSEDED FOR THE REST OF THE STOP. Another process
+	// holds the name, so this one hands what it runs to custody once, here, and
+	// neither polls, registers nor withdraws again: a registration after a
+	// failover would take the name back from the process that holds it.
+	supersededBefore := false
+
 	if !recovered && (drainRequested || c.EverRegistered()) {
 		attempts := 0
 		if !drainRequested {
 			attempts = unrecoveredStopAttempts
 		}
-		recovered = recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
+		recovered, supersededBefore = recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
+	}
+
+	if supersededBefore {
+		compute.Superseded()
 	}
 
 	// A node holding nothing stops at once. The drain is for work in flight, not
@@ -710,7 +733,9 @@ func stopGracefully(
 	// Nil for the same reason as the two paths below: this is the shutdown
 	// succeeding, and the caller turns what comes back into a process exit status.
 	if !compute.Holding() {
-		withdraw(ctx, c, log, opts)
+		if !supersededBefore {
+			withdraw(ctx, c, log, opts)
+		}
 
 		// HOLDING NOTHING IS A DRAIN ONLY WHEN THIS PROCESS KNEW WHAT ITS HOST RUNS.
 		// One that never registered was given nothing; one that registered and
@@ -718,6 +743,8 @@ func stopGracefully(
 		switch {
 		case recovered:
 			opts.ended(nodeending.Drained, drainRequested)
+		case supersededBefore:
+			opts.ended(nodeending.Superseded, drainRequested)
 		case !c.EverRegistered():
 			opts.ended(nodeending.Idle, drainRequested)
 		default:
@@ -786,6 +813,8 @@ func stopGracefully(
 	// replacement, and asking would only be refused.
 	var superseded atomic.Bool
 
+	superseded.Store(supersededBefore)
+
 	serving.Add(1)
 
 	go func() {
@@ -798,7 +827,52 @@ func stopGracefully(
 			}
 		}()
 
+		// A PROCESS SUPERSEDED BEFORE THE DRAIN SERVES NOTHING: its commands go to
+		// the process that holds the name, and what it runs is custody, which
+		// the wait below tends.
+		if supersededBefore {
+			return
+		}
+
+		// register is a registration this drain still needs: once the control
+		// plane forgot this node or its controller stopped answering, it asks
+		// again until one accepts, and polls only then. Polling the controller it
+		// lost between two failed rounds would take two more unanswered polls to
+		// notice it again.
+		register := false
+
 		for drainCtx.Err() == nil {
+			if register {
+				if err := c.Register(drainCtx, opts.registration()); err != nil {
+					// SUPERSEDED BY THE REGISTRATION ITSELF IS STILL SUPERSESSION: the
+					// plane rejecting this registration because another process
+					// holds the name is the same fact a poll answers with, and is
+					// handled the same way, at once, rather than retried into a
+					// second refusal.
+					if errors.Is(err, ErrSuperseded) {
+						log.Warn("another process registered as this node while it was draining; " +
+							"keeping its leases renewed until what is running here finishes")
+						compute.Superseded()
+						superseded.Store(true)
+
+						return
+					}
+
+					log.Error("could not register again while draining", "error", err)
+
+					if !sleep(drainCtx, backoffFor(opts, c)) {
+						return
+					}
+
+					continue
+				}
+
+				// A DRAIN'S RE-REGISTRATION IS A REGISTRATION, and publishes.
+				recordRegistration(c, log, opts)
+
+				register = false
+			}
+
 			err := serve(drainCtx, c, compute, log, opts, true)
 			if drainCtx.Err() != nil {
 				return
@@ -817,39 +891,16 @@ func stopGracefully(
 				return
 			}
 
-			if errors.Is(err, ErrUnregistered) {
-				log.Warn("the control plane no longer knows this node; registering again " +
-					"so it can still be told to destroy what is running here")
+			if errors.Is(err, ErrUnregistered) || errors.Is(err, errControlPlaneLost) {
+				log.Warn("the control plane no longer knows this node, or stopped answering; registering " +
+					"again so it can still be told to destroy what is running here")
 
-				if err := c.Register(drainCtx, opts.registration()); err != nil {
-					// SUPERSEDED BY THE REGISTRATION ITSELF IS STILL SUPERSESSION: the
-					// plane rejecting this registration because another process
-					// holds the name is the same fact a poll answers with, and is
-					// handled the same way, at once, rather than retried into a
-					// second refusal.
-					if errors.Is(err, ErrSuperseded) {
-						log.Warn("another process registered as this node while it was draining; " +
-							"keeping its leases renewed until what is running here finishes")
-						compute.Superseded()
-						superseded.Store(true)
-
-						return
-					}
-
-					log.Error("could not register again while draining", "error", err)
-
-					if !sleep(drainCtx, backoffFor(opts)) {
-						return
-					}
-				} else {
-					// A DRAIN'S RE-REGISTRATION IS A REGISTRATION, and publishes.
-					recordRegistration(c, log, opts)
-				}
+				register = true
 
 				continue
 			}
 
-			if !sleep(drainCtx, backoffFor(opts)) {
+			if !sleep(drainCtx, backoffFor(opts, c)) {
 				return
 			}
 		}
@@ -1011,8 +1062,9 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 const unrecoveredStopAttempts = 3
 
 // recoverBeforeDrain registers if this process never did and recovers, until it
-// succeeds, a second signal arrives or, when attempts is positive, that many
-// attempts have failed, and says whether it recovered. The janitor starts once a
+// succeeds, a second signal arrives, another process is found to hold this
+// node's name or, when attempts is positive, that many attempts have failed,
+// and says whether it recovered and whether it was superseded. The janitor starts once a
 // registration has told it the lease TTL and before anything is recovered,
 // exactly as at an ordinary registration: recovery adopts leases, and a drain
 // can outlast their TTL many times over while Tend's provider calls are not
@@ -1020,7 +1072,7 @@ const unrecoveredStopAttempts = 3
 func recoverBeforeDrain(
 	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions,
 	startJanitor func(), attempts int,
-) bool {
+) (bool, bool) {
 	recoverCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
@@ -1034,9 +1086,16 @@ func recoverBeforeDrain(
 		}()
 	}
 
+	// lost is a controller that gave no answer to the last attempt, where the
+	// node knows another: the registration it holds is with a controller that
+	// may be gone, so it registers again, which tries every controller from that
+	// one. Without it a drain recovering across a failover asks the dead one for
+	// as long as the drain lasts.
+	lost := false
+
 	for attempt := 1; recoverCtx.Err() == nil; attempt++ {
 		var err error
-		if c.WireVersion() == 0 {
+		if c.WireVersion() == 0 || lost {
 			err = c.Register(recoverCtx, registrationWithInventory(recoverCtx, compute, log, opts))
 			if err == nil {
 				recordRegistration(c, log, opts)
@@ -1047,31 +1106,54 @@ func recoverBeforeDrain(
 			err = compute.Recover(recoverCtx)
 		}
 		if err == nil {
-			return true
+			return true, false
 		}
+
+		// SUPERSEDED IS A VERDICT, NOT AN OUTAGE. Another process holds this
+		// name, so registering again would take it back from the host that has
+		// it, and asking again would be refused for as long as the drain lasts.
+		if errors.Is(err, ErrSuperseded) {
+			log.Warn("another process registered as this node before this one knew what its host "+
+				"runs; not recovering further, and keeping what runs here in custody", "error", err)
+
+			return false, true
+		}
+
+		lost = c.Controllers() > 1 && errors.Is(err, errNoAnswer)
 
 		if attempts > 0 && attempt >= attempts {
 			log.Error("could not learn what this host runs before stopping; stopping anyway, "+
 				"and the next node process adopts what it finds", "attempts", attempt, "error", err)
 
-			return false
+			return false, false
 		}
 
 		log.Error("stopping before this process knew what its host runs; recovering before "+
 			"deciding whether it holds anything", "error", err)
 
-		if !sleep(recoverCtx, backoffFor(opts)) {
-			return false
+		if !sleep(recoverCtx, backoffFor(opts, c)) {
+			return false, false
 		}
 	}
 
-	return false
+	return false, false
 }
 
 // backoffFor is the pause after a failed registration or poll.
-func backoffFor(opts LoopOptions) time.Duration {
+//
+// A SECOND WITH SEVERAL CONTROLLERS, five with one. A failover is a node
+// registering with whichever controller serves, and every round of the backoff
+// is time after the promotion that no node is registered; a round costs little,
+// because a standby serves no wire and refuses the connection at once and a
+// controller that is gone is bounded by the dial timeout. With one controller
+// there is nowhere else to go and the pace stays what it was.
+func backoffFor(opts LoopOptions, c *Client) time.Duration {
 	if opts.Backoff > 0 {
 		return opts.Backoff
+	}
+
+	if c.Controllers() > 1 {
+		return time.Second
 	}
 
 	return 5 * time.Second
@@ -1262,6 +1344,10 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	// at once; Tend and Sweep, on this loop, read and settle the same entries.
 	// Before launches overlapped all three ran on this goroutine.
 	var custody sync.Mutex
+
+	// unanswered counts the polls in a row the controller gave no answer to.
+	unanswered := 0
+
 	tend := func() error {
 		custody.Lock()
 		defer custody.Unlock()
@@ -1312,6 +1398,30 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 				return err
 			}
 
+			// A CONTROLLER THAT TWICE GIVES NO ANSWER IS LOST, where the node knows
+			// another: it registers again, which tries every controller from this
+			// one, and the one that accepts is the one serving. Twice rather than
+			// once, so a blink costs a retry rather than a registration; with one
+			// controller there is nowhere else to go and the poll is asked again
+			// as it always was.
+			//
+			// IN A ROW MEANS WITH NO ANSWER BETWEEN THEM, and an error the
+			// controller answered with is an answer: a 503 from a controller whose
+			// ledger blinked says it is there.
+			switch {
+			case c.Controllers() > 1 && errors.Is(err, errNoAnswer):
+				unanswered++
+
+				if unanswered >= lostAfter {
+					log.Warn("lost the control plane; registering again, with whichever controller serves",
+						"control_plane", c.Endpoint().String(), "error", err)
+
+					return fmt.Errorf("%w: %w", errControlPlaneLost, err)
+				}
+			default:
+				unanswered = 0
+			}
+
 			// A POLL THAT FAILS IS ORDINARY. The control plane may be restarting or
 			// the network may have blinked, and the node's job is to keep asking.
 			log.Warn("command poll failed; retrying", "error", err, "retry_in", opts.pollBackoff())
@@ -1322,6 +1432,8 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 
 			continue
 		}
+
+		unanswered = 0
 
 		if !ok {
 			// A LONG POLL IS ALSO THE CUSTODY CLOCK. Whole-host orphan inventory is

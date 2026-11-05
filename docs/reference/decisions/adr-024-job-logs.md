@@ -1,4 +1,4 @@
-# ADR-023: A job's log is kept on its node and indexed on the control plane
+# ADR-024: A job's log is kept on its node and indexed on the control plane
 
 Accepted, 2026-11-04. Issue #534.
 

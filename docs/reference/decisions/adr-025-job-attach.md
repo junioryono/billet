@@ -1,4 +1,4 @@
-# ADR-024: Attaching to a job, and holding a failed job's VM
+# ADR-025: Attaching to a job, and holding a failed job's VM
 
 Accepted, 2026-11-04. Issue #533.
 

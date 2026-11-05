@@ -33,6 +33,10 @@ type pendingCleanup struct {
 	// retireOnly means teardown and capacity settlement are complete, but the
 	// durable tombstone still needs to be written before this id can be reused.
 	retireOnly bool
+	// deregistered means the loop withdrew this completion's GitHub registration before
+	// parking it, so the destroy need not ask GitHub a second time. In memory only: a
+	// restart asks again, which is safe because a removal is idempotent.
+	deregistered bool
 	// Doubles after each failure, up to maxRetryEvery.
 	wait time.Duration
 	// Zero means immediately, which is what a freshly recorded failure wants.
@@ -40,9 +44,6 @@ type pendingCleanup struct {
 	// held says this completion's destroy is waiting for a hold, which a shutdown leaves alone as
 	// it leaves a running job: the next process finds the completion and the hold both durable.
 	held bool
-	// withdrawn says a held job's runner was withdrawn already, which a hold does on its
-	// first pass and not on each one after.
-	withdrawn bool
 	// GitHub re-offers an unacquired job indefinitely, so the message is worth
 	// exactly once per obligation.
 	declined bool
@@ -81,8 +82,24 @@ func (p *pendingCleanup) failed(now time.Time, first, ceiling time.Duration) {
 	p.at = now.Add(p.wait)
 }
 
+// cleanupConcurrency is how many cleanup attempts one tier has out at once while its
+// launches run beside the loop. A node runs a destroy only after the launches in flight,
+// and its commands in the order they arrive. Sent one at a time, each destroy waits behind
+// whichever launches started since the last returned, so a tier's finished guests clear
+// at one per batch of launches: 30 of them would take about 20 minutes at the 30 to 65
+// seconds a batch took on a busy node (2026-10-03). Sent together, they clear behind the
+// same launches. Bounded because a node command's timeout starts when it is queued, and a
+// destroy takes seconds: this many fit well inside the 10-minute bound, and one that does
+// not is retried like any other.
+const cleanupConcurrency = 16
+
 // cleanupLoop retries cleanup obligations on its own clock.
+//
+// EVERY ATTEMPT RETURNS BEFORE THIS DOES, because joining this loop is how a teardown
+// knows no retry is still inside a destroy.
 func (l *Listener) cleanupLoop(ctx context.Context) {
+	defer l.attempts.Wait()
+
 	ticker := time.NewTicker(l.heartbeatInterval())
 	defer ticker.Stop()
 
@@ -91,6 +108,8 @@ func (l *Listener) cleanupLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			l.retryCleanup(ctx)
+		case <-l.cleanupWake:
 			l.retryCleanup(ctx)
 		}
 	}
@@ -121,13 +140,19 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 	// an hour would push the one that just recovered behind them.
 	pending := make([]dispatch.Job, 0, len(l.cleanup))
 
-	for _, entry := range l.cleanup {
-		if entry.due(now) {
+	for id, entry := range l.cleanup {
+		if entry.due(now) && !l.attempting[id] {
 			pending = append(pending, entry.job)
 		}
 	}
 
 	l.mu.Unlock()
+
+	if l.backgroundLaunches {
+		l.startAttempts(ctx, pending)
+
+		return
+	}
 
 	// NO ERROR BRANCH, because attempt has none to give. A failure records its
 	// own obligation and its own backoff before returning — the pacing lives with
@@ -135,6 +160,68 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 	// told.
 	for i := range pending {
 		l.attempt(ctx, pending[i])
+	}
+}
+
+// startAttempts runs each due attempt beside the cleanup loop, up to cleanupConcurrency,
+// so a destroy waiting on a node holds up neither the others nor a completion parked
+// after it. What finds no room is taken up when an attempt ends.
+func (l *Listener) startAttempts(ctx context.Context, pending []dispatch.Job) {
+	for i := range pending {
+		job := pending[i]
+
+		l.mu.Lock()
+		if len(l.attempting) >= cleanupConcurrency {
+			l.attemptsWaiting = true
+			l.mu.Unlock()
+
+			return
+		}
+		l.attempting[job.RequestID] = true
+		l.mu.Unlock()
+
+		l.attempts.Go(func() {
+			defer l.endAttempt(job.RequestID)
+
+			l.attempt(ctx, job)
+		})
+	}
+}
+
+// endAttempt frees an attempt's place.
+//
+// WHAT IT RELEASED IS ROOM, and a tier waiting for it buys now rather than on its next
+// poll, which is up to a long poll away. The cleanup loop is woken only for what found no
+// room.
+//
+// ONE THAT LEFT ITS OBLIGATION DUE IS PUT BACK, however it failed. Most failures set their
+// own backoff, and a tombstone or a retirement that could not be written sets none, so
+// with every place taken each end would wake the next attempt at the same failure, at
+// the speed the ledger refuses it.
+func (l *Listener) endAttempt(requestID int64) {
+	l.mu.Lock()
+	delete(l.attempting, requestID)
+
+	if entry, pending := l.cleanup[requestID]; pending && entry.due(time.Now()) {
+		entry.failed(time.Now(), l.retryFirst, l.retryMax)
+	}
+
+	waiting := l.attemptsWaiting
+	l.attemptsWaiting = false
+	l.mu.Unlock()
+
+	if waiting {
+		l.wakeCleanup()
+	}
+
+	l.wakeLoop()
+}
+
+// wakeCleanup asks the cleanup loop to look again without waiting for its tick.
+func (l *Listener) wakeCleanup() {
+	select {
+	case l.cleanupWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -161,6 +248,14 @@ func (l *Listener) attempt(ctx context.Context, job dispatch.Job) {
 
 	entry, pending := l.cleanup[job.RequestID]
 	if !pending {
+		l.mu.Unlock()
+
+		return
+	}
+
+	// A FORCE ON A LIVE LISTENER CLAIMS WHAT IT DESTROYS, and two destroys of one request
+	// would race for the node's command slot, and either's end would clear the other's mark.
+	if l.destroying[job.RequestID] {
 		l.mu.Unlock()
 
 		return

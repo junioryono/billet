@@ -31,7 +31,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A withdrawn process's leases move to the node's next process when it adopts them (#374).**
 - **Commands are a queue with a ten-minute timeout that starts when queued, and only launches run beside each other.**
 - **Placement reads do not hold the shared plane mutex.**
-- **A stream is a connection a node dials back on a command's single-use token, and neither end of the wire reads it (ADR-024).**
+- **A stream is a connection a node dials back on a command's single-use token, and neither end of the wire reads it (ADR-025).**
 
 ### Listeners, enrollment and renewal: [references/listeners-and-enrollment.md](references/listeners-and-enrollment.md)
 
@@ -40,6 +40,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Enrollment is two fingerprints compared by a person.**
 - **Renewal is authenticated by the certificate being replaced, and the subject comes from the identity.**
 - **A loopback wire has no certificates.**
+- **A node that names several controllers gives up the one it polls only on silence, and registers again from it.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 
