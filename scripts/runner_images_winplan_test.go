@@ -1528,15 +1528,15 @@ func TestTheAWSToolsPrepareLeavesNoneVisible(t *testing.T) {
 				module(t, modules, name)
 			}
 
-			path := modules
+			modulePath := modules
 			if tc.elsewhere {
 				other := t.TempDir()
 				module(t, other, "AWS.Tools.EC2")
-				path += string(os.PathListSeparator) + other
+				modulePath += string(os.PathListSeparator) + other
 			}
 
 			cmd := exec.CommandContext(t.Context(), pwsh, "-NoProfile", "-NonInteractive", "-File", prepare)
-			cmd.Env = append(os.Environ(), "ProgramFiles="+programFiles, "PSModulePath="+path)
+			cmd.Env = append(os.Environ(), "ProgramFiles="+programFiles, "PSModulePath="+modulePath)
 
 			out, err := cmd.CombinedOutput()
 			if tc.wantFail != (err != nil) {

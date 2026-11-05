@@ -90,7 +90,8 @@ func runStubbed(t *testing.T, dir, body string, env ...string) (string, string) 
 
 	out, err := cmd.CombinedOutput()
 
-	if _, ok := errors.AsType[*exec.ExitError](err); !ok && err != nil {
+	var exited *exec.ExitError
+	if err != nil && !errors.As(err, &exited) {
 		t.Fatalf("pwsh: %v\n%s", err, out)
 	}
 
