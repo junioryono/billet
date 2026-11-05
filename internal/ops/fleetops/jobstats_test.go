@@ -3,6 +3,7 @@ package fleetops
 import (
 	"bytes"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/guestreport"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/usage"
 )
 
 // reportNow is when the reports over a fixed ledger are read.
@@ -44,6 +47,66 @@ type fixedJob struct {
 	memory      int64
 	priceMicros int64
 	usage       *fixedUsage
+	// series is the host's per-sample series, as a run's busy fraction of its
+	// charged vCPUs from a second before its start to a second after its result;
+	// nil writes none. cover is how much of the run it covers, from the start, 1
+	// when zero.
+	series *float64
+	cover  float64
+	// guest is the most of its memory the job's own VM says it used, written as a
+	// report the node kept whole unless guestPartial; nil writes none.
+	guest        *float64
+	guestPartial bool
+}
+
+func fraction(v float64) *float64 { return &v }
+
+// fixedSeries is a run's series: a sample every ten seconds whose cgroup CPU grows at
+// busy of vcpu.
+func fixedSeries(t *testing.T, started time.Time, ran time.Duration, cover, busy float64, vcpu int64) []byte {
+	t.Helper()
+
+	if cover == 0 {
+		cover = 1
+	}
+	first := started.Add(-time.Second)
+	end := started.Add(time.Duration(cover*float64(ran)) + time.Second)
+	if cover < 1 {
+		end = started.Add(time.Duration(cover * float64(ran)))
+	}
+	var points []usage.Point
+	for at := first; ; at = at.Add(10 * time.Second) {
+		if at.After(end) {
+			at = end
+		}
+		elapsed := at.Sub(first)
+		points = append(points, usage.Point{OffsetMillis: elapsed.Milliseconds(),
+			CPUUsage: int64(busy * float64(vcpu) * float64(elapsed.Microseconds()))})
+		if !at.Before(end) {
+			break
+		}
+	}
+	data, _, err := usage.EncodeSeriesGaps(points, first, alloc.MaxUsageSeriesBytes)
+	if err != nil {
+		t.Fatalf("encode the series: %v", err)
+	}
+
+	return data
+}
+
+// fixedGuest is a guest report whose VM, with 4 GB, used peak of it at most.
+func fixedGuest(t *testing.T, peak float64) []byte {
+	t.Helper()
+
+	const total = 4_000_000_000
+	batch := guestreport.Batch{Seq: 1, AgentVersion: "0.15.1", TicksPerSecond: 100}
+	for i, used := range []float64{peak / 4, peak, peak / 2} {
+		u := int64(used * total)
+		batch.Samples = append(batch.Samples, guestreport.Sample{AtMillis: int64(i+1) * 1000, CPUBusyTicks: int64(i),
+			CPUTotalTicks: int64(i) * 2, MemUsedBytes: u, MemAvailableBytes: total - u})
+	}
+
+	return guestRow(t, []guestreport.Batch{batch}, alloc.GuestReport{Accepted: 1, Hello: true, FinalSeen: true}).Data
 }
 
 func fixedStamp(at time.Time) string { return at.UTC().Format("2006-01-02T15:04:05.000000000Z07:00") }
@@ -74,6 +137,22 @@ func writeFixedJobs(t *testing.T, db *state.DB, jobs []fixedJob) {
 				conclusion, j.disruption, fixedStamp(started), fixedStamp(started), queuedAt, j.vcpu,
 				j.memory, j.priceMicros); err != nil {
 				return fmt.Errorf("job %s: %w", j.lease, err)
+			}
+			if j.series != nil {
+				if _, err := tx.ExecContext(t.Context(), `INSERT INTO job_series (lease_id, codec, series) VALUES (?, ?, ?)`,
+					j.lease, usage.SeriesCodecGaps, base64.StdEncoding.EncodeToString(
+						fixedSeries(t, started, j.ran, j.cover, *j.series, j.vcpu))); err != nil {
+					return fmt.Errorf("series of %s: %w", j.lease, err)
+				}
+			}
+			if j.guest != nil {
+				if _, err := tx.ExecContext(t.Context(), `INSERT INTO job_guest_reports
+					(lease_id, node, recorded_at, agent_version, agent_schema, codec, data, accepted, refused,
+					 dropped_bytes, hello, final_seen, node_restarted)
+					VALUES (?, 'n', 't', '0.15.1', 1, ?, ?, 1, 0, 0, 1, ?, 0)`, j.lease, alloc.GuestReportCodec,
+					base64.StdEncoding.EncodeToString(fixedGuest(t, *j.guest)), !j.guestPartial); err != nil {
+					return fmt.Errorf("guest report of %s: %w", j.lease, err)
+				}
 			}
 			if j.usage == nil {
 				continue
