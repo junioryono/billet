@@ -136,7 +136,9 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 				} else {
 					h.put(ctx, req, body, &resp)
 				}
-				answers.send(resp)
+				// A failed write is kept by answers, which refuses every later one,
+				// and Run returns it at EOF or close.
+				_ = answers.send(resp) //nolint:errcheck // answers keeps the first failure and Run returns it
 			})
 		case "close":
 			// EVERY ANSWER BEFORE CLOSE'S, because the go command treats a request
