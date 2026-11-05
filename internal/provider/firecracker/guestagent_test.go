@@ -778,7 +778,12 @@ func TestARegistryMirrorAuthorityIsAnOptionalLeafBesideTheMirrors(t *testing.T) 
 		if err != nil {
 			t.Fatalf("metadata: %v", err)
 		}
-		billet := md["latest"].(map[string]any)["meta-data"].(map[string]any)["billet"].(map[string]any)
+		latest, isLatest := md["latest"].(map[string]any)
+		meta, isMeta := latest["meta-data"].(map[string]any)
+		billet, isBillet := meta["billet"].(map[string]any)
+		if !isLatest || !isMeta || !isBillet {
+			t.Fatalf("metadata has no billet document: %v", md)
+		}
 		value, ok := billet["registry-mirrors-ca-pem"].(string)
 
 		return value, ok

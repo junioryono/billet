@@ -25,11 +25,13 @@
       - billet_registry_mirror_ttl is match('^[1-9][0-9]*h\Z')
       - billet_registry_mirror_version is match('^v[0-9]+\.[0-9]+\.[0-9]+\Z')
       - billet_registry_mirror_disk_limit_percent | string is match('^[1-9][0-9]?\Z')
+      - billet_registry_mirror_discard_floor_mb | string is match('^(0|[1-9][0-9]{0,6})\Z')
     fail_msg: >-
       billet_registry_mirrors and billet_registry_mirrors_purge are true or false,
       billet_registry_mirror_ttl is a whole number of hours such as 168h,
-      billet_registry_mirror_version is a release such as v3.1.2, and
-      billet_registry_mirror_disk_limit_percent is a whole percentage from 1 to 99.
+      billet_registry_mirror_version is a release such as v3.1.2,
+      billet_registry_mirror_disk_limit_percent is a whole percentage from 1 to 99, and
+      billet_registry_mirror_discard_floor_mb is a whole number of MiB.
 
 - name: Validate the billet Ceph pools' copies
   ansible.builtin.assert:

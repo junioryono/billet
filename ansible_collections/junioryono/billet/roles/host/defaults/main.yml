@@ -133,6 +133,9 @@ billet_registry_mirrors_purge: false
 # discards all of it once /var/lib/billet-registry's filesystem is this full.
 billet_registry_mirror_ttl: 168h
 billet_registry_mirror_disk_limit_percent: 85
+# Past the limit the guard discards only when the mirrors hold at least this many
+# MiB, so a disk something else fills does not stop them every ten seconds.
+billet_registry_mirror_discard_floor_mb: 1024
 billet_registry_mirror_version: v3.1.2
 billet_registry_mirror_checksums:
   amd64: 40df2224d410f72ae425c3371873b078bbdbda3b8b612be9571f0e6751f3acc8

@@ -219,9 +219,17 @@ echo "== past the disk's limit, what they pulled is discarded and they come back
 [ "$(systemctl is-enabled billet-registry-guard.timer)" = enabled ] || fail "the disk guard's timer is not enabled"
 sudo -n /usr/local/sbin/billet-registry-guard || fail "the disk guard failed below its limit"
 sudo -n test -d /var/lib/billet-registry/docker-io/docker || fail "the disk guard discarded below its limit"
-converge -e billet_registry_mirror_disk_limit_percent=1 >"$work/guard.log" 2>&1 ||
+# A FLOOR ABOVE WHAT THEY HOLD IS SOMETHING ELSE FILLING THE DISK, and discards nothing.
+converge -e billet_registry_mirror_disk_limit_percent=1 -e billet_registry_mirror_discard_floor_mb=1048576 \
+    >"$work/guard-floor.log" 2>&1 || { cat "$work/guard-floor.log" >&2; fail "the converge raising the floor failed"; }
+sudo -n systemctl stop billet-registry-guard.timer billet-registry-guard.service
+pid=$(main_pid)
+sudo -n /usr/local/sbin/billet-registry-guard || fail "the disk guard failed past its limit under its floor"
+sudo -n test -d /var/lib/billet-registry/docker-io/docker || fail "the disk guard discarded what was under its floor"
+[ "$(main_pid)" = "$pid" ] || fail "the disk guard stopped a mirror it discarded nothing of"
+converge -e billet_registry_mirror_disk_limit_percent=1 -e billet_registry_mirror_discard_floor_mb=0 >"$work/guard.log" 2>&1 ||
     { cat "$work/guard.log" >&2; fail "the converge lowering the guard's limit failed"; }
-sudo -n systemctl stop billet-registry-guard.timer
+sudo -n systemctl stop billet-registry-guard.timer billet-registry-guard.service
 sudo -n /usr/local/sbin/billet-registry-guard || fail "the disk guard failed past its limit"
 sudo -n test ! -e /var/lib/billet-registry/docker-io/docker || fail "the disk guard did not discard past its limit"
 [ "$(systemctl is-active billet-registry@docker-io.service)" = active ] || fail "the mirror did not come back"
@@ -251,15 +259,17 @@ echo "== a certificate that names a removed bridge is reissued, under the same a
 authority=$(sudo -n sha256sum /etc/billet-registry/ca.pem)
 address_b=192.0.2.73
 sudo -n ip address add "$address_b/32" dev "$bridge_b"
+reissued_from=$(main_pid)
 converge >"$work/reissue.log" 2>&1 || { cat "$work/reissue.log" >&2; fail "the reissuing converge failed"; }
 sans=$(openssl x509 -in /etc/billet-registry/leaf.pem -noout -ext subjectAltName)
 case "$sans" in *"IP Address:$address_b"*) ;; *) fail "the certificate was not reissued: $sans" ;; esac
 case "$sans" in *"IP Address:192.0.2.72"*) fail "the certificate kept a bridge it should not: $sans" ;; esac
 [ "$(sudo -n sha256sum /etc/billet-registry/ca.pem)" = "$authority" ] || fail "reissuing replaced the authority"
+[ "$(main_pid)" != "$reissued_from" ] || fail "the mirror did not restart onto its new certificate"
 waited=0
 until [ "$(status_of "https://$address_a:7740/v2/" || true)" = 200 ]; do
     waited=$((waited + 1))
-    [ "$waited" -lt 30 ] || fail "the mirror did not restart onto its new certificate"
+    [ "$waited" -lt 30 ] || fail "the mirror did not serve on its new certificate"
     sleep 1
 done
 

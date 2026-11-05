@@ -182,11 +182,23 @@
             billet_retirement_transition_id: "{{ billet_retire_answer.transition_id }}"
           changed_when: true
 
+        # THE MIRRORS AN ORDINARY CONVERGE GAVE THIS NODE ARE IN ITS FILE, so the
+        # rendering names them as that converge did (role_registry_mirrors).
+        - name: Inspect the registry mirrors' authority before rendering the retained configuration
+          ansible.builtin.stat:
+            path: "{{ billet_registry_mirror_dir }}/ca.pem"
+          register: billet_retirement_mirror_authority
+          check_mode: false
+          become: true
+          when: billet_retirement_variant == 'retained-node'
+
         - name: Render the retained configuration after binding the reservation
           ansible.builtin.set_fact:
             billet_retirement_serverless_rendering: >-
               {{ lookup('ansible.builtin.template', 'billet.yaml.j2',
-                        template_vars={'billet_config_document': billet_config | junioryono.billet.serverless_config}) }}
+                        template_vars={'billet_config_document': billet_config | junioryono.billet.serverless_config
+                          | junioryono.billet.role_registry_mirrors(billet_registry_mirrors | bool, billet_networks,
+                              billet_registry_mirror_instances, billet_retirement_mirror_authority.stat.exists)}) }}
           no_log: true
           when: billet_retirement_variant == 'retained-node'
 

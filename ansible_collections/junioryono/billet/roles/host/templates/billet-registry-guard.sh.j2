@@ -4,14 +4,14 @@
 # ANY JOB ON THIS HOST CAN ASK A MIRROR FOR ANY PUBLIC IMAGE, and Distribution has no
 # size limit, so past this line what the mirrors pulled is discarded before it can
 # fill the disk the node's own state is on. It is only a cache: the next pull comes
-# from the registry and fills it again, and a guest whose pull this interrupts goes
-# on to the registry.
+# from the registry and fills it again.
 #
 # A READING IT CANNOT TAKE DISCARDS NOTHING: that is a failed unit, never a full disk.
 set -eu
 
 root={{ billet_registry_mirror_storage | quote }}
 limit={{ billet_registry_mirror_disk_limit_percent | int }}
+floor_kib={{ (billet_registry_mirror_discard_floor_mb | int) * 1024 }}
 
 used=$(df --output=pcent "$root" | sed -n '2s/[^0-9]//gp')
 case "$used" in
@@ -22,6 +22,21 @@ case "$used" in
 esac
 [ "$used" -ge "$limit" ] || exit 0
 
+# WHAT FILLS THE DISK MAY NOT BE THEM: guest images, job volumes or a store on the same
+# filesystem. Below the floor a discard frees nothing worth stopping the mirrors for,
+# and doing it every ten seconds would keep them from ever serving.
+held=$(du -sxk -- "$root" | cut -f1)
+case "$held" in
+'' | *[!0-9]*)
+	echo "could not read how much the registry mirrors hold under $root" >&2
+	exit 1
+	;;
+esac
+if [ "$held" -lt "$floor_kib" ]; then
+	echo "$root's filesystem is $used% full, at or past $limit%, and the registry mirrors hold only ${held} KiB of it; discarding nothing"
+	exit 0
+fi
+
 echo "$root's filesystem is $used% full, at or past $limit%; discarding what the registry mirrors pulled"
 
 # EVERY WRITER STOPS BEFORE ANYTHING IS DISCARDED, so none refills what another's
@@ -31,10 +46,13 @@ failed=0
 {% for instance in billet_registry_mirror_instances %}
 systemctl stop "billet-registry@{{ instance.name }}.service" || failed=1
 {% endfor %}
+# ONLY A MIRROR SAID TO HAVE STOPPED IS DISCARDED: one still stopping, or a manager
+# that did not answer, may still be writing.
 {% for instance in billet_registry_mirror_instances %}
-if [ "$(systemctl is-active "billet-registry@{{ instance.name }}.service" || true)" != active ]; then
-	rm -rf -- "$root/{{ instance.name }}/docker" || failed=1
-fi
+case "$(systemctl is-active "billet-registry@{{ instance.name }}.service" || true)" in
+inactive | failed) rm -rf -- "$root/{{ instance.name }}/docker" || failed=1 ;;
+*) failed=1 ;;
+esac
 {% endfor %}
 {% for instance in billet_registry_mirror_instances %}
 systemctl start "billet-registry@{{ instance.name }}.service" || failed=1

@@ -496,10 +496,16 @@
       ansible.builtin.import_tasks: needrestart.yml
       when: not billet_retirement_node_ordinary | bool
 
+    # BEFORE ANYTHING BELOW STOPS THE NODE, and never on the retained route, whose
+    # writes are admitted one destination at a time.
+    - name: Fetch the registry mirrors' release
+      ansible.builtin.import_tasks: registry-mirrors-fetch.yml
+      when: not billet_retirement_node_ordinary | bool
+
     # THE CANDIDATE WAS RESOLVED, FETCHED AND STAGED BY THE PREPARATION
-    # (stage-candidate.yml, before the hold), so by here billet_binary_upgrade and
-    # the transaction's recovery directory are settled and nothing below reaches
-    # the network for a binary.
+    # (stage-candidate.yml, before the hold), and the mirrors' release just above, so
+    # by here billet_binary_upgrade and the transaction's recovery directory are
+    # settled and nothing below reaches the network for a binary.
     - name: Configure billet account and files
       ansible.builtin.import_tasks: account.yml
 

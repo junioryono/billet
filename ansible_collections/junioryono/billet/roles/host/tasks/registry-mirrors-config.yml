@@ -16,8 +16,12 @@
 #
 # A RETAINED CONVERGE TAKES UP NOTHING NEW. Its writes are admitted one destination
 # at a time, so the mirrors' tasks do not run there and the node is held to the
-# file it started with: it keeps naming mirrors only an earlier converge installed,
-# which is what the authority's presence proves.
+# file it started with: it keeps naming mirrors only an earlier converge left their
+# authority for.
+#
+# THE RULE IS THE role_registry_mirrors FILTER'S, which a retirement's two renderings
+# of a node's file apply too: deciding it here alone refused every retirement of a
+# deployment whose nodes this role gave mirrors.
 - name: Inspect the mirrors' authority on a retained converge
   ansible.builtin.stat:
     path: "{{ billet_registry_mirror_dir }}/ca.pem"
@@ -29,24 +33,15 @@
 - name: Decide whether this role runs the registry mirrors here
   ansible.builtin.set_fact:
     billet_registry_mirrors_active: >-
-      {{ billet_registry_mirrors | bool
-         and billet_networks | length > 0
-         and billet_effective_config is mapping
-         and billet_effective_config.get('node') is mapping
-         and billet_effective_config.node.get('provider') == 'firecracker'
-         and 'registry_mirrors' not in billet_effective_config.node
-         and 'registry_mirrors_ca' not in billet_effective_config.node
-         and (not billet_retirement_node_ordinary | bool
-              or billet_registry_mirror_authority.stat.exists) }}
+      {{ billet_effective_config | junioryono.billet.role_registry_mirrors_active(
+           billet_registry_mirrors | bool, billet_networks, billet_registry_mirror_instances,
+           not billet_retirement_node_ordinary | bool or billet_registry_mirror_authority.stat.exists) }}
 
 - name: Name the mirrors this role runs in the node's configuration
   ansible.builtin.set_fact:
     billet_effective_config: >-
-      {{ billet_effective_config | combine({'node': {
-           'registry_mirrors': dict(billet_registry_mirror_instances | map(attribute='upstream')
-             | zip(billet_registry_mirror_instances | map(attribute='port') | map('string')
-                   | map('regex_replace', '^', 'https://' ~ billet_networks[0].address ~ ':')))}},
-           recursive=true) }}
+      {{ billet_effective_config | junioryono.billet.role_registry_mirrors(
+           true, billet_networks, billet_registry_mirror_instances) }}
   no_log: true
   when: billet_registry_mirrors_active | bool
 

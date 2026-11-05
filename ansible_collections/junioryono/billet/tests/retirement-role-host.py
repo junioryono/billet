@@ -243,6 +243,9 @@ def base_variables():
     return dict(billet_binary_src='', billet_enable_server=False, billet_enable_node=True,
                 billet_server_prepare_only=False,
                 billet_firecracker_enabled=True, billet_ceph_enabled=False, billet_automatic_updates=False,
+                # The mirrors download a release, which a namespace with no network cannot,
+                # and the retained leg runs none of their tasks by design.
+                billet_registry_mirrors=False,
                 billet_service_user='billetgate', billet_service_group='billetgate',
                 billet_firecracker_version='v1.16.1', billet_firecracker_stage='/var/lib/billet/firecracker-stage',
                 billet_migration_controller='control-b', billet_github_private_key_src='',
