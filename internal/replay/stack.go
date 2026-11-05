@@ -268,7 +268,8 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 		t.Fatalf("PublishAuthority: %v", err)
 	}
 
-	scheduler, err := ctl.Schedule(wire, published, app.ScheduleOptions{Hurry: hurry})
+	scheduler, err := ctl.Schedule(wire, published, app.ScheduleOptions{Hurry: hurry,
+		ForegroundLaunches: !actions.backgroundLaunches})
 	if err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}

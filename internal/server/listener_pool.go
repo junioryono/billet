@@ -33,7 +33,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	}
 
 	for i := range runners {
-		if runners[i].Status == alloc.PoolRunnerRetiring {
+		if runners[i].Status == alloc.PoolRunnerRetiring && !l.launchInFlight(runners[i].LeaseID) {
 			l.retirePoolMember(ctx, runners[i])
 		}
 	}
@@ -53,6 +53,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	admission := l.admission(ctx)
 
 	launched := false
+	slotsTaken := false
 
 	for active < desired {
 		// BOUGHT ONE AT A TIME, LAUNCHED TOGETHER. Each purchase still asks the
@@ -63,11 +64,24 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		// (2026-10-03, with 66 runners wanted on one tier).
 		var batch []poolLaunch
 
+		// ONLY WHAT MAY START NOW, WHEN A LAUNCH RUNS BESIDE THIS LOOP. The rest waits
+		// for one to end, which wakes the loop (exchange), rather than sitting bought
+		// behind them with its capacity charged and its command's clock running.
+		room := max(l.poolLaunchBatch, 1)
+		if l.backgroundLaunches {
+			room = l.launchRoom()
+			if room == 0 {
+				slotsTaken = true
+
+				break
+			}
+		}
+
 		l.mu.Lock()
 		l.batchBuying, l.batchBought = true, false
 		l.mu.Unlock()
 
-		for active < desired && len(batch) < max(l.poolLaunchBatch, 1) {
+		for active < desired && len(batch) < room {
 			// WHOSE TURN IT IS, asked before the purchase and not after: under
 			// fair the room a finished job leaves belongs to the longest-waiting
 			// tier until its shape fits, and a tier that bought first would have
@@ -124,6 +138,10 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		}
 
 		launched = true
+
+		if l.backgroundLaunches {
+			break
+		}
 	}
 
 	// COUNTED AGAIN AFTER A LAUNCH, which can fail and release its lease
@@ -169,9 +187,12 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		admission = l.admission(ctx)
 	}
 
-	if active < desired && admission.CanGrow {
+	switch {
+	case active < desired && admission.CanGrow && slotsTaken:
+		l.order.waitsOnLaunches(l.tier, admission)
+	case active < desired && admission.CanGrow:
 		l.order.waits(l.tier, admission)
-	} else {
+	default:
 		l.order.served(l.tier)
 	}
 
@@ -201,7 +222,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		if surplus == 0 {
 			break
 		}
-		if runners[i].Status != alloc.PoolRunnerIdle {
+		if runners[i].Status != alloc.PoolRunnerIdle || l.launchInFlight(runners[i].LeaseID) {
 			continue
 		}
 		if err := l.alloc.RetirePoolRunner(ctx, runners[i].LeaseID); err != nil {
@@ -262,6 +283,14 @@ func (l *Listener) endBatchBuying() {
 // Every launch is waited for even when one fails, because each has already
 // been assigned its lease and has to settle it, success or not.
 func (l *Listener) launchPool(ctx context.Context, batch []poolLaunch) error {
+	if l.backgroundLaunches {
+		for i := range batch {
+			l.startLaunch(ctx, batch[i].lease, batch[i].job)
+		}
+
+		return nil
+	}
+
 	if len(batch) == 1 {
 		return l.launch(ctx, batch[0].lease, batch[0].job)
 	}
