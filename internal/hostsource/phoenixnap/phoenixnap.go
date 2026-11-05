@@ -1,0 +1,487 @@
+// Package phoenixnap is the host source for phoenixNAP's Bare Metal Cloud (ADR-025),
+// over its REST API with a client-credentials token.
+//
+// WHAT IS PINNED TO A MEASUREMENT, AND WHAT IS NOT. On 2026-11-05 a real account
+// answered the token grant, the server catalogue, the stock per location, the quota
+// list and an empty server list, and refused an order with 403 (the bare-metal hosts
+// record). Those shapes are what this package reads and its tests serve. A server's
+// own JSON, an accepted order and a delete have not been answered by the real API
+// yet: their fields are the API reference's, and the opt-in real test is what will
+// pin them.
+//
+// STOCK AND QUOTA ARE READ BEFORE AN ORDER, NOT INFERRED FROM ITS REFUSAL, because
+// the refusal's wording for either has never been seen: the quota list says whether
+// the account may hold another server, and the availability list whether the shape
+// is in stock where it is asked for.
+package phoenixnap
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/junioryono/billet/internal/hostsource"
+)
+
+// Name is this source's kind.
+const Name = "phoenixnap"
+
+const (
+	defaultAuth = "https://auth.phoenixnap.com/auth/realms/BMC/protocol/openid-connect/token"
+	defaultAPI  = "https://api.phoenixnap.com"
+
+	// serversQuota is the quota whose limit is how many servers the account may hold
+	// (measured: `bmc.servers.max_count`, limit 1 on a new account).
+	serversQuota = "bmc.servers.max_count"
+
+	// hostnamePrefix marks a server this source ordered. The rest of the hostname is
+	// the pool's order, which is how Find reads an order back.
+	hostnamePrefix = "billet-"
+
+	// osImage is what a pool host runs: the node's install path is Ubuntu's.
+	osImage = "ubuntu/noble"
+
+	// maxBody bounds what is read of any answer; the catalogue, the largest, was 777 KB.
+	maxBody = 8 << 20
+)
+
+// Credentials are an API client's id and secret.
+type Credentials struct {
+	ClientID string
+	Secret   hostsource.Secret
+}
+
+func (c Credentials) String() string   { return "phoenixnap.Credentials{client=" + c.ClientID + "}" }
+func (c Credentials) GoString() string { return c.String() }
+
+// Format catches every verb.
+func (c Credentials) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, c.String()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps the secret out of anything that serialises it structurally.
+func (c Credentials) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue is what slog consults.
+func (c Credentials) LogValue() slog.Value { return slog.StringValue(c.String()) }
+
+// Source orders and releases phoenixNAP servers.
+type Source struct {
+	creds Credentials
+	http  *http.Client
+	auth  string
+	api   string
+	now   func() time.Time
+
+	mu      sync.Mutex
+	token   string
+	expires time.Time
+}
+
+// Option configures a Source.
+type Option func(*Source)
+
+// WithEndpoints points the source at other token and API origins, for a test.
+func WithEndpoints(auth, api string) Option {
+	return func(s *Source) { s.auth, s.api = auth, strings.TrimSuffix(api, "/") }
+}
+
+// WithHTTPClient replaces the HTTP client.
+func WithHTTPClient(c *http.Client) Option { return func(s *Source) { s.http = c } }
+
+// WithClock replaces the clock, for a test.
+func WithClock(now func() time.Time) Option { return func(s *Source) { s.now = now } }
+
+// New builds a source; it calls nothing until asked.
+func New(creds Credentials, opts ...Option) (*Source, error) {
+	if creds.ClientID == "" || creds.Secret.Empty() {
+		return nil, errors.New("phoenixnap: an API client id and secret are both required")
+	}
+	s := &Source{
+		creds: creds,
+		http:  &http.Client{Timeout: 60 * time.Second},
+		auth:  defaultAuth,
+		api:   defaultAPI,
+		now:   time.Now,
+	}
+	for _, o := range opts {
+		o(s)
+	}
+
+	return s, nil
+}
+
+var _ hostsource.Source = (*Source)(nil)
+
+// A SOURCE HOLDS THE CREDENTIALS AND A LIVE TOKEN IN UNEXPORTED FIELDS, which fmt
+// renders structurally without consulting their own methods, so it redacts itself. On
+// a pointer receiver, as awscreds.IMDS does, because it holds a mutex.
+func (s *Source) String() string { return "phoenixnap.Source{client=" + s.creds.ClientID + "}" }
+
+// GoString covers %#v.
+func (s *Source) GoString() string { return s.String() }
+
+// Format catches every verb.
+func (s *Source) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, s.String()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps a source out of anything that serialises it structurally.
+func (s *Source) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
+
+// LogValue is what slog consults.
+func (s *Source) LogValue() slog.Value { return slog.StringValue(s.String()) }
+
+// Name is the source's kind.
+func (s *Source) Name() string { return Name }
+
+// Terms are an hourly plan's: billed by the started hour, no minimum term. The lead
+// time is not measured, since no order has been accepted, so it is zero, which the
+// pool reads as unknown.
+func (s *Source) Terms(string) (hostsource.Terms, error) {
+	return hostsource.Terms{BillingUnit: time.Hour}, nil
+}
+
+type orderBody struct {
+	Hostname              string          `json:"hostname"`
+	Description           string          `json:"description"`
+	OS                    string          `json:"os"`
+	Type                  string          `json:"type"`
+	Location              string          `json:"location"`
+	PricingModel          string          `json:"pricingModel"`
+	InstallDefaultSSHKeys bool            `json:"installDefaultSshKeys"`
+	OSConfiguration       osConfiguration `json:"osConfiguration"`
+}
+
+type osConfiguration struct {
+	CloudInit cloudInit `json:"cloudInit"`
+}
+
+type cloudInit struct {
+	UserData string `json:"userData"`
+}
+
+// server is the API reference's server, not yet a measured one.
+type server struct {
+	ID                string   `json:"id"`
+	Status            string   `json:"status"`
+	Hostname          string   `json:"hostname"`
+	Type              string   `json:"type"`
+	Location          string   `json:"location"`
+	PublicIPAddresses []string `json:"publicIpAddresses"`
+}
+
+// Order checks the quota and the stock, then orders one hourly server whose first
+// boot runs req.Boot through cloud-init.
+func (s *Source) Order(ctx context.Context, req hostsource.Request) (hostsource.Host, error) {
+	if req.Order == "" || req.Shape == "" || req.Location == "" {
+		return hostsource.Host{}, errors.New("phoenixnap: an order needs its identifier, a shape and a location")
+	}
+	if err := s.checkQuota(ctx); err != nil {
+		return hostsource.Host{}, err
+	}
+	if err := s.checkStock(ctx, req.Shape, req.Location); err != nil {
+		return hostsource.Host{}, err
+	}
+	body, err := json.Marshal(orderBody{
+		Hostname:     hostnamePrefix + req.Order,
+		Description:  "billet pool order " + req.Order,
+		OS:           osImage,
+		Type:         req.Shape,
+		Location:     req.Location,
+		PricingModel: "HOURLY",
+		OSConfiguration: osConfiguration{CloudInit: cloudInit{
+			UserData: base64.StdEncoding.EncodeToString(req.Boot.Reveal()),
+		}},
+	})
+	if err != nil {
+		return hostsource.Host{}, fmt.Errorf("phoenixnap: encode the order: %w", err)
+	}
+	var got server
+	if err := s.call(ctx, http.MethodPost, "/bmc/v1/servers", body, &got); err != nil {
+		return hostsource.Host{}, err
+	}
+
+	return got.host(), nil
+}
+
+// Describe reads one server.
+func (s *Source) Describe(ctx context.Context, id string) (hostsource.Host, error) {
+	var got server
+	if err := s.call(ctx, http.MethodGet, "/bmc/v1/servers/"+url.PathEscape(id), nil, &got); err != nil {
+		return hostsource.Host{}, err
+	}
+
+	return got.host(), nil
+}
+
+// Find reads back the server an order placed, by its hostname.
+func (s *Source) Find(ctx context.Context, order string) (hostsource.Host, bool, error) {
+	var all []server
+	if err := s.call(ctx, http.MethodGet, "/bmc/v1/servers", nil, &all); err != nil {
+		return hostsource.Host{}, false, err
+	}
+	want := hostnamePrefix + order
+	var found []server
+	for _, sv := range all {
+		if sv.Hostname == want {
+			found = append(found, sv)
+		}
+	}
+	switch len(found) {
+	case 0:
+		return hostsource.Host{}, false, nil
+	case 1:
+		return found[0].host(), true, nil
+	}
+
+	return hostsource.Host{}, false, fmt.Errorf("phoenixnap: %d servers carry order %q", len(found), order)
+}
+
+// Gone proves a server present, and never proves one gone yet.
+//
+// NOT FOUND IS COULD-NOT-TELL, HOWEVER LONG IT LASTS. What the API answers for a
+// deleted server, and when, has not been measured: no order has been accepted, so no
+// delete has been seen. Elapsed time turning a 404 into "gone" is a timer authorising
+// a release, so until a delete is measured and its terminal answer pinned here, a pool
+// host on this source leaves the pool by an operator's word.
+func (s *Source) Gone(ctx context.Context, id string) (hostsource.Presence, error) {
+	var got server
+	err := s.call(ctx, http.MethodGet, "/bmc/v1/servers/"+url.PathEscape(id), nil, &got)
+	switch {
+	case err == nil:
+		return hostsource.PresencePresent, nil
+	case errors.Is(err, errNotFound):
+		return hostsource.PresenceUnknown, nil
+	}
+
+	return hostsource.PresenceUnknown, err
+}
+
+// Release deletes the server the proof names.
+func (s *Source) Release(ctx context.Context, proof hostsource.ReleaseProof) error {
+	if err := proof.For(proof.Host()); err != nil {
+		return err
+	}
+	err := s.call(ctx, http.MethodDelete, "/bmc/v1/servers/"+url.PathEscape(proof.Host()), nil, nil)
+	if errors.Is(err, errNotFound) {
+		return nil
+	}
+
+	return err
+}
+
+type quota struct {
+	ID    string `json:"id"`
+	Limit int    `json:"limit"`
+	Used  int    `json:"used"`
+}
+
+func (s *Source) checkQuota(ctx context.Context) error {
+	var quotas []quota
+	if err := s.call(ctx, http.MethodGet, "/bmc/v1/quotas", nil, &quotas); err != nil {
+		return err
+	}
+	for _, q := range quotas {
+		if q.ID != serversQuota {
+			continue
+		}
+		if q.Used >= q.Limit {
+			return fmt.Errorf("%w: phoenixnap: the account holds %d of %d servers", hostsource.ErrQuota, q.Used, q.Limit)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("phoenixnap: the quota list names no %s, so whether another server fits cannot be told", serversQuota)
+}
+
+type availability struct {
+	ProductCode string `json:"productCode"`
+	Locations   []struct {
+		Location  string `json:"location"`
+		Available bool   `json:"minQuantityAvailable"`
+		Quantity  int    `json:"availableQuantity"`
+	} `json:"locationAvailabilityDetails"`
+}
+
+func (s *Source) checkStock(ctx context.Context, shape, location string) error {
+	var all []availability
+	path := "/billing/v1/product-availability?productCategory=SERVER&showOnlyMinQuantityAvailable=true"
+	if err := s.call(ctx, http.MethodGet, path, nil, &all); err != nil {
+		return err
+	}
+	for _, a := range all {
+		if a.ProductCode != shape {
+			continue
+		}
+		for _, l := range a.Locations {
+			if l.Location == location && l.Available && l.Quantity > 0 {
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("%w: phoenixnap: no %s in %s", hostsource.ErrNoStock, shape, location)
+}
+
+func (sv server) host() hostsource.Host {
+	h := hostsource.Host{
+		ID:              sv.ID,
+		Shape:           sv.Type,
+		Location:        sv.Location,
+		PublicAddresses: sv.PublicIPAddresses,
+		State:           stateOf(sv.Status),
+	}
+	if order, ok := strings.CutPrefix(sv.Hostname, hostnamePrefix); ok {
+		h.Order = order
+	}
+
+	return h
+}
+
+// stateOf maps the API reference's statuses; anything else is could-not-tell.
+func stateOf(status string) hostsource.State {
+	switch status {
+	case "creating", "reinstalling", "resetting":
+		return hostsource.StateProvisioning
+	case "powered-on", "powered-off", "rebooting":
+		return hostsource.StateRunning
+	case "error":
+		return hostsource.StateFailed
+	case "deleting":
+		return hostsource.StateReleasing
+	}
+
+	return hostsource.StateUnknown
+}
+
+var errNotFound = errors.New("phoenixnap: not found")
+
+// apiError is a refusal the API described; only its message is kept, which the
+// measured 403 carried and nothing else.
+type apiError struct {
+	Status  int
+	Message string
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("phoenixnap: http %d: %s", e.Status, e.Message)
+}
+
+func (s *Source) call(ctx context.Context, method, path string, body []byte, out any) error {
+	token, err := s.bearer(ctx)
+	if err != nil {
+		return err
+	}
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, s.api+path, rd)
+	if err != nil {
+		return fmt.Errorf("phoenixnap: build %s %s: %w", method, path, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("phoenixnap: %s %s: %w", method, path, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return fmt.Errorf("phoenixnap: read %s %s: %w", method, path, err)
+	}
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return errNotFound
+	case resp.StatusCode == http.StatusForbidden:
+		// MEASURED 2026-11-05: an order the API client may not place is a 403 whose
+		// message says the credentials cannot access the resource. An operator acts on
+		// it; ordering again changes nothing.
+		return fmt.Errorf("%w: %w", hostsource.ErrRefused, refusal(resp.StatusCode, raw))
+	case resp.StatusCode < 200 || resp.StatusCode > 299:
+		return refusal(resp.StatusCode, raw)
+	}
+	if out == nil || len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("phoenixnap: decode %s %s: %w", method, path, err)
+	}
+
+	return nil
+}
+
+func refusal(status int, raw []byte) error {
+	var m struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &m) != nil || m.Message == "" {
+		return &apiError{Status: status, Message: http.StatusText(status)}
+	}
+
+	return &apiError{Status: status, Message: m.Message}
+}
+
+// bearer is a token from the client-credentials grant, reused until a minute before
+// it expires.
+func (s *Source) bearer(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	if s.token != "" && s.now().Before(s.expires) {
+		t := s.token
+		s.mu.Unlock()
+
+		return t, nil
+	}
+	s.mu.Unlock()
+
+	form := url.Values{"grant_type": {"client_credentials"}}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.auth, strings.NewReader(form))
+	if err != nil {
+		return "", fmt.Errorf("phoenixnap: build the token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(s.creds.ClientID, string(s.creds.Secret.Reveal()))
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("phoenixnap: token: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return "", fmt.Errorf("phoenixnap: read the token: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		// The body of a refused grant is not quoted: it is the identity provider's, and
+		// nothing here has measured that it never echoes what it was sent.
+		return "", fmt.Errorf("phoenixnap: the token grant answered http %d", resp.StatusCode)
+	}
+	var tok struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(raw, &tok); err != nil || tok.AccessToken == "" {
+		return "", errors.New("phoenixnap: the token grant answered without a token")
+	}
+	life := time.Duration(tok.ExpiresIn)*time.Second - time.Minute
+	s.mu.Lock()
+	s.token, s.expires = tok.AccessToken, s.now().Add(life)
+	s.mu.Unlock()
+
+	return tok.AccessToken, nil
+}

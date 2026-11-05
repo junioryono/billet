@@ -30,6 +30,12 @@ var ErrNoStock = errors.New("hostsource: the source has no host of that shape th
 // ErrQuota means the source said the account may not hold another host of that shape.
 var ErrQuota = errors.New("hostsource: the account's quota is reached")
 
+// ErrRefused means the source refused the request for a reason an operator has to act
+// on (a credential without the right to order, an account that may not order yet). It
+// is an answer, not could-not-tell: the pool stops ordering from that source and says
+// why, rather than reading the order back and placing it again.
+var ErrRefused = errors.New("hostsource: the source refused the request")
+
 // ErrNoProof is a release refused because its proof is missing or names another host.
 var ErrNoProof = errors.New("hostsource: a host is released only on proof it is drained and holds nothing")
 
