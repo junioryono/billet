@@ -22,7 +22,7 @@ import (
 func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet jobs show <lease> | billet jobs show --run <run id> | billet jobs wait | " +
-			"billet jobs runtimes")
+			"billet jobs runtimes | billet jobs export")
 	}
 	switch args[0] {
 	case "show":
@@ -31,9 +31,11 @@ func Jobs(ctx context.Context, env cli.Env, args []string) error {
 		return cmdJobsWait(ctx, env, args[1:])
 	case "runtimes":
 		return cmdJobsRuntimes(ctx, env, args[1:])
+	case "export":
+		return cmdJobsExport(ctx, env, args[1:])
 	}
 
-	return fmt.Errorf("unknown jobs command %q; try show, wait or runtimes", args[0])
+	return fmt.Errorf("unknown jobs command %q; try show, wait, runtimes or export", args[0])
 }
 
 // cmdJobsShow prints one job's history and what the host measured it do, or

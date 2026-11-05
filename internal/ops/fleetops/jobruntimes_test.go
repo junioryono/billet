@@ -49,7 +49,7 @@ func ranHistory(t *testing.T, stateDir string, jobs []ranHistoryJob) []string {
 		t.Fatalf("alloc.New: %v", err)
 	}
 	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
-		Name: "epyc-1", Provider: config.ProviderDocker, VCPU: 8, Memory: 32 * config.GiB,
+		Name: "epyc-1", Provider: config.ProviderDocker, VCPU: 8, Memory: 32 * config.GiB, Site: "home",
 	}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
@@ -63,17 +63,62 @@ func ranHistory(t *testing.T, stateDir string, jobs []ranHistoryJob) []string {
 		if err != nil {
 			t.Fatalf("Reserve: %v", err)
 		}
+
+		if j.escrowOnly {
+			now = j.start.Add(j.runtime)
+			if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+				t.Fatalf("Release an unused lease: %v", err)
+			}
+
+			leases = append(leases, lease.ID)
+
+			continue
+		}
 		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
 			t.Fatalf("Bind: %v", err)
 		}
-		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 4242, int64(100+i)); err != nil {
+
+		if j.poolSlot {
+			// As the pool listener assigns a slot: no run, billet's own request id.
+			if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, int64(-1-i)); err != nil {
+				t.Fatalf("Assign a pool slot: %v", err)
+			}
+
+			now = j.start.Add(j.runtime)
+			if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+				t.Fatalf("Release a pool slot: %v", err)
+			}
+
+			leases = append(leases, lease.ID)
+
+			continue
+		}
+
+		request := int64(100 + i)
+		if j.noIdentity {
+			request = int64(-1 - i)
+		}
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 4242, request); err != nil {
 			t.Fatalf("Assign: %v", err)
 		}
-		if err := a.RecordJobIdentity(t.Context(), lease.ID, alloc.HistoryJob{
-			JobID: fmt.Sprintf("job-%d", i), Owner: "acme", Repository: "api",
-			WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", Name: j.name,
-		}); err != nil {
-			t.Fatalf("RecordJobIdentity: %v", err)
+		if !j.noIdentity {
+			if err := a.RecordJobIdentity(t.Context(), lease.ID, alloc.HistoryJob{
+				JobID: fmt.Sprintf("job-%d", i), Owner: "acme", Repository: "api",
+				WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", Name: j.name, QueuedAt: j.queued,
+			}); err != nil {
+				t.Fatalf("RecordJobIdentity: %v", err)
+			}
+		}
+
+		if j.neverStarted {
+			now = j.start.Add(j.runtime)
+			if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+				t.Fatalf("Release a job that never started: %v", err)
+			}
+
+			leases = append(leases, lease.ID)
+
+			continue
 		}
 
 		now = j.start
@@ -83,7 +128,14 @@ func ranHistory(t *testing.T, stateDir string, jobs []ranHistoryJob) []string {
 			}
 		}
 
+		// GITHUB'S COMPLETION AT THE JOB'S END, then the archive, as the listener
+		// records them.
 		now = j.start.Add(j.runtime)
+		if !j.noResult {
+			if err := a.RecordJobResult(t.Context(), lease.ID, "succeeded", 0); err != nil {
+				t.Fatalf("RecordJobResult: %v", err)
+			}
+		}
 		if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
 			t.Fatalf("Release: %v", err)
 		}
@@ -107,6 +159,14 @@ type ranHistoryJob struct {
 	start   time.Time
 	runtime time.Duration
 	tier    string
+	// queued is GitHub's queue time, unrecorded when zero.
+	queued time.Time
+	// noResult archives the lease with no completion from GitHub, as a job
+	// cancelled or lost is; escrowOnly buys a lease and archives it unused;
+	// poolSlot assigns it as a direct-assignment pool slot no job reached;
+	// noIdentity runs a pool slot's job whose identity was never written;
+	// neverStarted assigns and names a job and archives it before it was busy.
+	noResult, escrowOnly, poolSlot, noIdentity, neverStarted bool
 }
 
 // runtimeHistory is three 6m runs of a job three days ago, one 3m job of

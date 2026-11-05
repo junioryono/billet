@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 // A trace survives a round trip through its file format unchanged.
@@ -184,5 +186,148 @@ func TestAFleetMustDeclareEveryTierTheTraceUses(t *testing.T) {
 	err := fleet.validate(trace)
 	if err == nil || !strings.Contains(err.Error(), "billet-96vcpu") {
 		t.Fatalf("a fleet without the trace's tier was accepted, or the refusal did not name it: %v", err)
+	}
+}
+
+// THE ADVERSARIAL GENERATORS HAVE THEIR SHAPES, and one seed is one trace.
+func TestTheAdversarialGeneratorsHaveTheirShapes(t *testing.T) {
+	t.Parallel()
+
+	within := func(name string, trace Trace, d time.Duration) {
+		t.Helper()
+
+		first, last := trace.Arrivals[0].At, trace.Arrivals[len(trace.Arrivals)-1].At
+		if last.Sub(first) > d {
+			t.Errorf("%s spreads its jobs over %s; want them within %s", name, last.Sub(first), d)
+		}
+	}
+
+	within("Burst", Burst(1, Params{Jobs: 50}), 10*time.Second)
+	within("IdleBacklog", IdleBacklog(1, Params{Jobs: 50}), 30*time.Second)
+
+	// THE QUIET TIER ARRIVES INSIDE THE BUSY ONE'S SPAN, and the busy one
+	// offers more than the fleet holds.
+	small := Fleet{
+		Hosts: []Host{{Name: "only", VCPU: 16, Memory: 64 * config.GiB}},
+		Tiers: []TierShape{{Label: "busy", VCPU: 2, Memory: 8 * config.GiB},
+			{Label: "quiet", VCPU: 4, Memory: 16 * config.GiB}},
+		MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+	}
+	quiet := QuietBesideSaturated(1, QuietParams{Params: Params{Jobs: 200}, Fleet: small})
+	counts := map[string]int{}
+
+	var busyAsked float64
+
+	var busyLast time.Time
+
+	for _, a := range quiet.Arrivals {
+		counts[a.Tier]++
+
+		if a.Tier == "busy" {
+			busyAsked += 2 * time.Duration(a.Duration).Seconds()
+			busyLast = a.At
+		}
+	}
+
+	for _, a := range quiet.Arrivals {
+		if a.Tier == "quiet" && a.At.After(busyLast) {
+			t.Errorf("a quiet job arrives at %s, after the busy stream's last at %s", a.At, busyLast)
+		}
+	}
+
+	if counts["busy"] != 180 || counts["quiet"] != 20 {
+		t.Errorf("QuietBesideSaturated put %v on its tiers; want 180 busy and 20 quiet", counts)
+	}
+
+	if load := busyAsked / (16 * busyLast.Sub(quiet.Arrivals[0].At).Seconds()); load < 1.2 || load > 2 {
+		t.Errorf("the busy tier offers a load of %.2f of the room; want it saturated, about 1.5", load)
+	}
+
+	// THE ROOM IS THE CEILING when it is below the hosts': the busy tier offers
+	// about 1.5 of eight vCPU, not of sixteen.
+	cappedSmall := small
+	cappedSmall.MaxVCPU, cappedSmall.MaxMemory = 8, 32*config.GiB
+
+	var cappedAsked float64
+
+	var cappedLast time.Time
+
+	cappedTrace := QuietBesideSaturated(1, QuietParams{Params: Params{Jobs: 200}, Fleet: cappedSmall})
+	for _, a := range cappedTrace.Arrivals {
+		if a.Tier == "busy" {
+			cappedAsked += 2 * time.Duration(a.Duration).Seconds()
+			cappedLast = a.At
+		}
+	}
+
+	if load := cappedAsked / (8 * cappedLast.Sub(cappedTrace.Arrivals[0].At).Seconds()); load < 1.2 || load > 2 {
+		t.Errorf("under an 8 vCPU ceiling the busy tier offers a load of %.2f of it; want about 1.5", load)
+	}
+
+	// THE WIDE MIX OFFERS ABOUT ITS LOAD: the vCPU-time its jobs ask for over
+	// the room times the span they arrive in, near 0.85, and about one job in
+	// twenty of the whole-host shape.
+	fleet := WideFleet()
+	wide := WideShapeMix(1, WideParams{Params: Params{Jobs: 2000}, Fleet: fleet})
+
+	vcpuOf := map[string]int{}
+	for _, s := range fleet.Tiers {
+		vcpuOf[s.Label] = s.VCPU
+	}
+
+	asked, widest := 0.0, 0
+	for _, a := range wide.Arrivals {
+		asked += float64(vcpuOf[a.Tier]) * time.Duration(a.Duration).Seconds()
+		if a.Tier == "billet-32vcpu" {
+			widest++
+		}
+	}
+
+	span := wide.Arrivals[len(wide.Arrivals)-1].At.Sub(wide.Arrivals[0].At).Seconds()
+	if load := asked / (128 * span); load < 0.7 || load > 1.0 {
+		t.Errorf("WideShapeMix offers a load of %.2f; want about 0.85", load)
+	}
+
+	if share := float64(widest) / 2000; share < 0.03 || share > 0.07 {
+		t.Errorf("WideShapeMix made %.3f of its jobs whole-host; want about 0.05", share)
+	}
+
+	// THE ROOM IS THE CEILING when it is below the hosts': half of it offers the
+	// same load to half the room, so the jobs arrive about half as fast.
+	capped := WideFleet()
+	capped.MaxVCPU, capped.MaxMemory = 64, 256*config.GiB
+	slow := WideShapeMix(1, WideParams{Params: Params{Jobs: 2000}, Fleet: capped})
+
+	slowAsked := 0.0
+	for _, a := range slow.Arrivals {
+		slowAsked += float64(vcpuOf[a.Tier]) * time.Duration(a.Duration).Seconds()
+	}
+
+	slowSpan := slow.Arrivals[len(slow.Arrivals)-1].At.Sub(slow.Arrivals[0].At).Seconds()
+	if load := slowAsked / (64 * slowSpan); load < 0.7 || load > 1.0 {
+		t.Errorf("WideShapeMix under a 64 vCPU ceiling offers a load of %.2f of it; want about 0.85", load)
+	}
+
+	// A FLEET OF ONE TIER IS ALL WIDE.
+	one := Fleet{Hosts: fleet.Hosts, Tiers: fleet.Tiers[4:], MaxVCPU: fleet.MaxVCPU, MaxMemory: fleet.MaxMemory}
+	for _, a := range WideShapeMix(2, WideParams{Params: Params{Jobs: 20}, Fleet: one}).Arrivals {
+		if a.Tier != "billet-32vcpu" {
+			t.Errorf("a one-tier wide mix put a job on %q", a.Tier)
+		}
+	}
+
+	for name, gen := range map[string]func(uint64) Trace{
+		"Burst":       func(s uint64) Trace { return Burst(s, Params{Jobs: 20}) },
+		"IdleBacklog": func(s uint64) Trace { return IdleBacklog(s, Params{Jobs: 20}) },
+		"QuietBesideSaturated": func(s uint64) Trace {
+			return QuietBesideSaturated(s, QuietParams{Params: Params{Jobs: 20}, Fleet: small})
+		},
+		"WideShapeMix": func(s uint64) Trace {
+			return WideShapeMix(s, WideParams{Params: Params{Jobs: 20}, Fleet: fleet})
+		},
+	} {
+		if !reflect.DeepEqual(gen(3), gen(3)) || reflect.DeepEqual(gen(3), gen(4)) {
+			t.Errorf("%s is not one trace per seed", name)
+		}
 	}
 }
