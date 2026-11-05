@@ -175,7 +175,7 @@ network:
 
 | Key | Meaning |
 |---|---|
-| `egress.allow` | where the tier's guests may connect, enforced on the host ([ADR-027](decisions/adr-027-host-enforced-egress.md), and [the operator page](../operating/egress.md)). `example.com` allows that name alone, `*.example.com` every name below it and not the name itself, `203.0.113.0/24` or `203.0.113.7` those addresses. At most 256 entries, and `allow: []` allows only what every list includes: GitHub's runner endpoints and the node's own services. IPv6 entries are refused, because the host refuses every IPv6 packet a listed guest sends. Only a tier whose every provider is `firecracker` may have one |
+| `egress.allow` | where the tier's guests may connect, enforced on the host ([ADR-028](decisions/adr-028-host-enforced-egress.md), and [the operator page](../operating/egress.md)). `example.com` allows that name alone, `*.example.com` every name below it and not the name itself, `203.0.113.0/24` or `203.0.113.7` those addresses. At most 256 entries, and `allow: []` allows only what every list includes: GitHub's runner endpoints and the node's own services. IPv6 entries are refused, because the host refuses every IPv6 packet a listed guest sends. Only a tier whose every provider is `firecracker` may have one |
 
 ### `tiers[].cache`
 

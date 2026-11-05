@@ -46,6 +46,7 @@
   },
   "detail_retired_at": "",
   "usage": null,
+  "prediction": null,
   "guest": null,
   "egress": null,
   "tests": {

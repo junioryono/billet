@@ -1247,7 +1247,7 @@ tiers:
       npm: { enabled: false }
 
   # A TIER THAT MAY TALK ONLY TO WHAT IT NAMES, enforced on the host and never in
-  # the guest (ADR-027, docs/operating/egress.md). The node answers these guests'
+  # the guest (ADR-028, docs/operating/egress.md). The node answers these guests'
   # DNS itself and refuses a name off the list without forwarding it, connects
   # them only to what a listed name answered and the prefixes below, and refuses
   # DNS to any other resolver and every IPv6 packet. Every list includes GitHub's

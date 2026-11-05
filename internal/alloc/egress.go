@@ -12,7 +12,7 @@ import (
 )
 
 // RecordLeaseEgress keeps what the host saw of a lease's network: the names its
-// guest resolved and what a tier's allowlist refused (ADR-027).
+// guest resolved and what a tier's allowlist refused (ADR-028).
 //
 // FENCED ON THE EPOCH, in the same transaction, as RecordLeaseUsage is: a
 // superseded holder cannot report, and a lease that has ended is refused

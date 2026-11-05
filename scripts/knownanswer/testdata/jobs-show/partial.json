@@ -90,6 +90,7 @@
     "energy_active_uj": 0,
     "energy_idle_uj": 0
   },
+  "prediction": null,
   "guest": null,
   "egress": null,
   "tests": {

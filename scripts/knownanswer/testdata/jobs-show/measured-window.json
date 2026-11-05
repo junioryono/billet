@@ -86,6 +86,7 @@
     "energy_idle_uj": 600000000,
     "energy_source": "rapl"
   },
+  "prediction": null,
   "guest": null,
   "egress": null,
   "tests": {

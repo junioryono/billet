@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/jobtrace"
 	"github.com/junioryono/billet/internal/provider/simulated"
 )
 
@@ -17,7 +18,7 @@ import (
 // registration is minted; a trace's per-job repository and workflow ride on
 // the messages and are not checked against them, exactly as GitHub does not.
 const (
-	DefaultOwner = "acme"
+	DefaultOwner = jobtrace.DefaultOwner
 	RunnerGroup  = "billet-replay"
 	Workflow     = "acme/replay/.github/workflows/ci.yml@refs/heads/main"
 
@@ -45,6 +46,9 @@ type TierShape struct {
 	Label  string
 	VCPU   int
 	Memory config.ByteSize
+	// Node pins the tier to one host, as a tier's `node` does; empty places it
+	// anywhere.
+	Node string
 }
 
 // Fleet is the deployment a trace is replayed against.
@@ -57,9 +61,48 @@ type Fleet struct {
 	MaxMemory config.ByteSize
 	// Placement is server.placement; empty means pack, as it does in a config.
 	Placement config.PlacementPolicy
+	// AdmissionOrder is server.admission_order; empty means fair, as it does in
+	// a config.
+	AdmissionOrder config.AdmissionOrder
 	// Boot is the modelled time between a mint and the runner taking a job. Zero
 	// means DefaultBoot.
 	Boot time.Duration
+}
+
+// pinByBackend is the host a tier must be pinned to, so it lands only where its own
+// backend runs.
+//
+// EVERY HOST OF A REPLAY IS SIMULATED, so nothing else keeps a Linux tier off a Mac:
+// left unpinned it would spill onto a host the deployment could never run it on,
+// and the replay would model more room than there is. A tier on every host needs no
+// pin; on one, a pin says it; on some of several, a pin cannot say it, and a replay
+// that pretended would measure another fleet, so it is refused by name.
+func pinByBackend(t jobtrace.Tier, declared []jobtrace.Host, kept []Host) (string, error) {
+	if t.Node != "" || len(t.Providers) == 0 {
+		return t.Node, nil
+	}
+
+	var eligible []string
+
+	for _, h := range declared {
+		running := slices.ContainsFunc(kept, func(k Host) bool { return k.Name == h.Name })
+		if running && (h.Provider == "" || slices.Contains(t.Providers, h.Provider)) {
+			eligible = append(eligible, h.Name)
+		}
+	}
+
+	switch len(eligible) {
+	case len(kept):
+		return "", nil
+	case 0:
+		return "", fmt.Errorf("replay: tier %q runs on %v, which no host the simulated backend can model runs",
+			t.Label, t.Providers)
+	case 1:
+		return eligible[0], nil
+	default:
+		return "", fmt.Errorf("replay: tier %q runs on %v of %d hosts, and a replay can pin a tier to one or none",
+			t.Label, eligible, len(kept))
+	}
 }
 
 // validate refuses a fleet the trace cannot be replayed against.
@@ -92,6 +135,10 @@ func (f Fleet) validate(trace Trace) error {
 		errs = append(errs, fmt.Errorf("replay: %w", err))
 	}
 
+	if err := f.AdmissionOrder.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("replay: %w", err))
+	}
+
 	labels := map[string]bool{}
 
 	for i, t := range f.Tiers {
@@ -103,6 +150,11 @@ func (f Fleet) validate(trace Trace) error {
 
 		if t.VCPU <= 0 || t.Memory <= 0 {
 			errs = append(errs, fmt.Errorf("replay: tier %q needs positive vcpu and memory", t.Label))
+		}
+
+		if t.Node != "" && !seen[t.Node] {
+			errs = append(errs, fmt.Errorf("replay: tier %q is pinned to %q, which the fleet does not declare",
+				t.Label, t.Node))
 		}
 	}
 
@@ -152,10 +204,76 @@ func (f Fleet) tiers(trace Trace) []config.Tier {
 			Trust:       config.WorkloadTrusted,
 			Workflows:   []string{Workflow},
 			Command:     simulated.RunFor(trace.LongestDuration(shape.Label) + f.boot() + time.Hour),
+			Node:        shape.Node,
 		})
 	}
 
 	return out
+}
+
+// FleetFromDocument is the fleet a trace's document describes (billet jobs
+// export writes one), ready to replay against: every host simulated, every
+// tier on the simulated backend at its charged shape. It returns the hosts it
+// left out, by name, for the replay's record to say.
+//
+// A REMOTE BACKEND IS LEFT OUT. The simulated backend runs work on a host it
+// holds, so an EC2 or CodeBuild node, whose capacity is a catalogue of shapes
+// bought per job, cannot be modelled as one, and a replay that pretended to
+// would measure a fleet the deployment never had; the jobs it served are
+// replayed on the hosts that remain. A tier pinned to a host left out cannot
+// be replayed at all, and is refused by name.
+func FleetFromDocument(doc jobtrace.Fleet) (Fleet, []string, error) {
+	if err := doc.Validate(); err != nil {
+		return Fleet{}, nil, err
+	}
+
+	f := Fleet{
+		MaxVCPU: doc.MaxVCPU, MaxMemory: doc.MaxMemory, Placement: doc.Placement,
+		AdmissionOrder: doc.AdmissionOrder,
+	}
+
+	var dropped []string
+
+	for _, h := range doc.Hosts {
+		if h.Provider != "" && !h.Provider.RunsOnHost() {
+			dropped = append(dropped, fmt.Sprintf("%s (%s)", h.Name, h.Provider))
+
+			continue
+		}
+
+		f.Hosts = append(f.Hosts, Host{Name: h.Name, VCPU: h.VCPU, Memory: h.Memory, Site: h.Site})
+	}
+
+	var errs []error
+
+	for _, t := range doc.Tiers {
+		if t.Node != "" && !slices.ContainsFunc(f.Hosts, func(h Host) bool { return h.Name == t.Node }) {
+			errs = append(errs, fmt.Errorf("replay: tier %q is pinned to %q, a remote host the simulated backend "+
+				"cannot model", t.Label, t.Node))
+
+			continue
+		}
+
+		node, err := pinByBackend(t, doc.Hosts, f.Hosts)
+		if err != nil {
+			errs = append(errs, err)
+
+			continue
+		}
+
+		f.Tiers = append(f.Tiers, TierShape{Label: t.Label, VCPU: t.VCPU, Memory: t.Memory, Node: node})
+	}
+
+	if err := errors.Join(errs...); err != nil {
+		return Fleet{}, nil, err
+	}
+
+	if len(f.Hosts) == 0 {
+		return Fleet{}, nil, fmt.Errorf("replay: every host of the fleet is remote (%v), and the simulated "+
+			"backend cannot model one", dropped)
+	}
+
+	return f, dropped, nil
 }
 
 // cost prices one record, and says which rate did it.

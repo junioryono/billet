@@ -1,5 +1,5 @@
 // Package egress is the host side of a guest's network policy: where a job's
-// guest may connect, what names it asked for, and what was refused (ADR-027).
+// guest may connect, what names it asked for, and what was refused (ADR-028).
 //
 // The guest is untrusted, so nothing here runs in it or believes it. Two things
 // make what it does unforgeable:

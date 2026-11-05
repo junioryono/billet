@@ -21,7 +21,7 @@ const (
 )
 
 // JobEgress is what the host saw of a job's network, from its guest's resolver and
-// the firewall on its interface (ADR-027). It is reported once, as the job's compute
+// the firewall on its interface (ADR-028). It is reported once, as the job's compute
 // goes, beside and apart from what the host measured it do, because a tier's list
 // is enforced whether or not the node samples anything.
 //
