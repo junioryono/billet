@@ -225,3 +225,66 @@ func TestTheStateBlockRefusesWhatItCannotHonour(t *testing.T) {
 		})
 	}
 }
+
+// THE BUDGET IS THE ARITHMETIC THE ERROR STATES: the writer, the claim and at
+// least one reader, with the pool getting what those leave and never more than
+// the default it always had.
+func TestAPostgresConnectionBudgetSizesTheReaderPool(t *testing.T) {
+	block := func(budget string) string {
+		return serverWith("  identity_dir: /srv/billet\n  state:\n    backend: postgres\n" +
+			"    postgres:\n      dsn_env: BILLET_STATE_DSN\n" + budget)
+	}
+
+	for name, tc := range map[string]struct {
+		budget       string
+		readers, all int
+	}{
+		"no budget keeps the default": {"", DefaultLedgerReaderConnections, 6},
+		"the smallest budget":         {"      max_connections: 3\n", 1, 3},
+		"a budget inside the default": {"      max_connections: 4\n", 2, 4},
+		"exactly the default":         {"      max_connections: 6\n", 4, 6},
+		"more than a plane can use":   {"      max_connections: 50\n", 4, 6},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := loadServer(t, block(tc.budget))
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+
+			if got := cfg.Server.LedgerReaderConnections(); got != tc.readers {
+				t.Errorf("readers = %d, want %d", got, tc.readers)
+			}
+
+			if got := cfg.Server.LedgerConnections(); got != tc.all {
+				t.Errorf("connections = %d, want %d", got, tc.all)
+			}
+		})
+	}
+
+	for _, budget := range []string{"0", "2", "1", "-1"} {
+		t.Run("refuses "+budget, func(t *testing.T) {
+			_, err := loadServer(t, block("      max_connections: "+budget+"\n"))
+			if err == nil || !strings.Contains(err.Error(), "needs at least 3: the writer, the controller "+
+				"claim's session and one reader") {
+				t.Fatalf("max_connections %s answered %v, want the arithmetic", budget, err)
+			}
+		})
+	}
+}
+
+// A SQLITE LEDGER IS A FILE: it has no connections to budget, and no block to put
+// a budget in.
+func TestASQLiteLedgerCountsNoServerConnections(t *testing.T) {
+	cfg, err := loadServer(t, serverWith("  state_dir: "+t.TempDir()+"\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if got := cfg.Server.LedgerConnections(); got != 0 {
+		t.Errorf("connections = %d on a SQLite ledger, want 0", got)
+	}
+
+	if got := cfg.Server.LedgerReaderConnections(); got != DefaultLedgerReaderConnections {
+		t.Errorf("readers = %d, want the default", got)
+	}
+}
