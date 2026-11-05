@@ -27,6 +27,14 @@ func WithPoolLaunchBatch(n int) Option {
 	return func(l *Listener) { l.poolLaunchBatch = max(n, 1) }
 }
 
+// WithBackgroundLaunches runs a bought lease's launch beside the poll goroutine, so
+// that a slow node does not stop this tier hearing from GitHub (listener_flight.go).
+// The scheduler sets it for every tier; off, handle and reconcilePool return with
+// their launches done.
+func WithBackgroundLaunches() Option {
+	return func(l *Listener) { l.backgroundLaunches = true }
+}
+
 func WithRunner(r dispatch.Runner) Option {
 	return func(l *Listener) { l.runner = r }
 }
