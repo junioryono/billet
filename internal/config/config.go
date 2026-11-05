@@ -490,6 +490,7 @@ func (c *Config) Validate() error {
 		errs = append(errs, TargetShareErrors(c.TargetShares(), c.Tiers,
 			c.Server.MaxVCPU, c.Server.MaxMemory)...)
 	}
+	errs = append(errs, c.validateTargetWeights()...)
 	errs = append(errs, c.validateNode()...)
 	errs = append(errs, c.validateMetrics()...)
 	errs = append(errs, c.validateNoTestOnlyBackend()...)

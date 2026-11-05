@@ -29,6 +29,18 @@ const (
 	// blocking costs more than it buys, or one that would rather keep every core
 	// busy and accepts that its largest shape may wait indefinitely.
 	AdmissionFill AdmissionOrder = "fill"
+
+	// AdmissionHold holds one host for a shape that fits on none, chosen by when its
+	// running work is predicted to end, and starts anything else that fits elsewhere.
+	//
+	// Where fair holds freed room on every host a wide waiter could use, this holds
+	// one, so every other host stays open to every tier; where fill lets a wide
+	// shape wait without bound, the held host empties. A wrong prediction picks a
+	// worse host, and a job that runs far past its kind puts the waiter back in the
+	// line as under fair, so neither is a wrong outcome. Chosen rather than the
+	// default, because on a deployment with one host a waiter closes all of it until
+	// its shape fits.
+	AdmissionHold AdmissionOrder = "hold"
 )
 
 // Or returns the order, or fair when nothing was chosen.
@@ -47,11 +59,11 @@ func (o AdmissionOrder) Or() AdmissionOrder {
 // chose fill deliberately would never learn their fleet was holding the line.
 func (o AdmissionOrder) Validate() error {
 	switch o {
-	case "", AdmissionFair, AdmissionFill:
+	case "", AdmissionFair, AdmissionFill, AdmissionHold:
 		return nil
 	default:
-		return fmt.Errorf("server.admission_order is %q; it must be %q or %q",
-			o, AdmissionFair, AdmissionFill)
+		return fmt.Errorf("server.admission_order is %q; it must be %q, %q or %q",
+			o, AdmissionFair, AdmissionFill, AdmissionHold)
 	}
 }
 

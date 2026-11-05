@@ -264,6 +264,46 @@ func TestTheAdversarialGeneratorsHaveTheirShapes(t *testing.T) {
 		t.Errorf("under an 8 vCPU ceiling the busy tier offers a load of %.2f of it; want about 1.5", load)
 	}
 
+	// EACH CONTENDED STREAM ALONE OFFERS MORE THAN THE FLEET HOLDS, in its own
+	// target's owner, and a tier named idle has none.
+	contest := twoTargets(2, 1)
+	streams := ContendedTargets(1, ContendedParams{Params: Params{Jobs: 200}, Fleet: contest})
+
+	owners := map[string]map[string]bool{}
+	offered, lastAt := map[string]float64{}, map[string]time.Time{}
+
+	for _, a := range streams.Arrivals {
+		if owners[a.Tier] == nil {
+			owners[a.Tier] = map[string]bool{}
+		}
+
+		owners[a.Tier][a.Owner] = true
+		offered[a.Tier] += 2 * time.Duration(a.Duration).Seconds()
+		lastAt[a.Tier] = a.At
+
+		if !strings.HasPrefix(a.WorkflowRef, a.Owner+"/") {
+			t.Errorf("a job of %s runs workflow %s", a.Owner, a.WorkflowRef)
+		}
+	}
+
+	if len(streams.Arrivals) != 400 || !owners["billet-first"][DefaultOwner] || !owners["billet-second"]["second"] {
+		t.Errorf("%d contended jobs, owners %v; want 200 a stream, each in its target's owner", len(streams.Arrivals), owners)
+	}
+
+	for label, vcpuSeconds := range offered {
+		load := vcpuSeconds / (32 * lastAt[label].Sub(streams.Arrivals[0].At).Seconds())
+		if load < 1.2 || load > 2 {
+			t.Errorf("stream %s offers a load of %.2f of the room; want about 1.5", label, load)
+		}
+	}
+
+	alone := ContendedTargets(1, ContendedParams{Params: Params{Jobs: 20}, Fleet: contest, Idle: []string{"billet-second"}})
+	for _, a := range alone.Arrivals {
+		if a.Tier != "billet-first" {
+			t.Errorf("an idle tier has a job: %+v", a)
+		}
+	}
+
 	// THE WIDE MIX OFFERS ABOUT ITS LOAD: the vCPU-time its jobs ask for over
 	// the room times the span they arrive in, near 0.85, and about one job in
 	// twenty of the whole-host shape.
