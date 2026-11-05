@@ -454,3 +454,30 @@ func TestAFewThousandJobsReplayInMinutes(t *testing.T) {
 		t.Fatalf("the ledger records an overcommit: %v", report.Violations)
 	}
 }
+
+// NOTHING A TRACE ASKS FOR IS LOST WITH LAUNCHES BESIDE THE LOOP, as a deployment runs
+// them, whether its jobs are offered or assigned. Replays are compared with launches
+// waited for, because a listener parked with one out is not quiet, so this asserts what
+// it can of the deployment's own path: every job started and finished, and the ledger's
+// charges prove no overcommit.
+func TestNoTraceJobIsLostWithLaunchesBesideTheLoop(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		t.Run(map[bool]string{false: "offered", true: "assigned"}[direct], func(t *testing.T) {
+			trace := MorningBurst(7, Params{Jobs: 24})
+
+			report := Run(t, twoHosts(config.PlacementPack), trace,
+				Options{BackgroundLaunches: true, DirectAssignment: direct})
+
+			if len(report.Missing) != 0 || len(report.Unstarted) != 0 || len(report.Unfinished) != 0 {
+				t.Fatalf("missing %v, never started %v, never finished %v",
+					report.Missing, report.Unstarted, report.Unfinished)
+			}
+			if len(report.Records) != len(trace.Arrivals) {
+				t.Fatalf("recorded %d jobs for a trace of %d", len(report.Records), len(trace.Arrivals))
+			}
+			if len(report.Violations) != 0 {
+				t.Fatalf("the ledger records an overcommit: %v", report.Violations)
+			}
+		})
+	}
+}
