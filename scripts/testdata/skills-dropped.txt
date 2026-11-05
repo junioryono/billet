@@ -168,6 +168,7 @@ e29c5205f066 The Makefile is gone (#78); the sentence names the script under scr
 f2b09ff92300 The Makefile is gone (#78); the sentence names the script under scripts/gates/ (or the command) that replaced its target.
 1c37e966cf7d The Makefile is gone (#78); the scenario tests run through scripts/gates/scenario.sh NAME, and the rule says so.
 e1d3650f30ef #93 records a runner's owner on the lease and the binding when it is minted, and the plane resolves removal and recovery from it; the gap is closed and the sentence now states the rule and what an unrecorded runner still does.
+92cfa4916791 The promotion rehearsal no longer partitions with `docker network disconnect`, which also stops the name resolving and so never measured the dial timeout (#529); the sentence now says it drops the leader's packets, kills the next leader and records each failover segment by segment.
 0294906e817a The provisioning script and its installers left user data for the staged payload (ADR-022); builds-and-installers.md now says what user data carries.
 08bef6648548 toolcache_gate_test.go went with the toolcache installers (ADR-022); the list now names amibuild_test.go, verifyscript_test.go and scripts/ami_build_test.go.
 0d03f4d5e99d The unpublished record went with install-toolcache.sh (ADR-022); GitHub's template and its tests now decide the toolcache.
@@ -198,4 +199,4 @@ f9290014add1 The provisioning script became the AMI build (ADR-022); the related
 f8453d8ae0f0 #689 moves the helper's local cache into the go command's own GOCACHE and layout; the sentence now says so, with why.
 14fc6250db7e #694 records a blob leg that fails locally as `unavailable`; the sentence now says which blob legs observe and why.
 188c30ea22f0 #694 lets the Actions half's `unavailable` replace an earlier value in the ledger and the node's record; the sentence now says so, with why.
-c98615d09bc8 ADR-023 serves `actions/cache` on EC2 tiers too; the sentence now says so and names the two files that hold the object path.
+c98615d09bc8 ADR-024 serves `actions/cache` on EC2 tiers too; the sentence now says so and names the two files that hold the object path.

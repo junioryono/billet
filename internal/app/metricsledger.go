@@ -8,6 +8,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/metrics"
+	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -28,6 +29,9 @@ var _ state.Observer = (*metrics.LedgerObserver)(nil)
 
 // And the queue waits through alloc.QueueWaitObserver, the same way.
 var _ alloc.QueueWaitObserver = (*metrics.QueueWaitObserver)(nil)
+
+// And the listeners' times through server.ListenerObserver, the same way.
+var _ server.ListenerObserver = (*metrics.ListenerObserver)(nil)
 
 // ledgerScrapeTimeout bounds one scrape's reads of the ledger.
 const ledgerScrapeTimeout = 5 * time.Second
@@ -72,7 +76,30 @@ var ledgerFamilies = []metrics.Family{
 // pool, never the writer slot scheduling uses; and how the writes themselves
 // went, told by the ledger as they happen.
 func (cp *ControlPlane) LedgerMetrics() MetricsSource {
-	return ledgerSource(cp.allocator, cp.db, cp.cfg.Tiers)
+	return withListenerTimings(ledgerSource(cp.allocator, cp.db, cp.cfg.Tiers), cp.listenerTimings)
+}
+
+// withListenerTimings has a source also serve how long the listeners' loops take, told
+// by the listeners as it happens.
+func withListenerTimings(source MetricsSource, timings *server.ListenerTimings) MetricsSource {
+	attach := source.attach
+
+	source.attach = func(reg *metrics.Registry) error {
+		if err := attach(reg); err != nil {
+			return err
+		}
+
+		o, err := reg.ListenerObserver()
+		if err != nil {
+			return err
+		}
+
+		timings.Observe(o)
+
+		return nil
+	}
+
+	return source
 }
 
 func ledgerSource(a *alloc.Allocator, db *state.DB, tiers []config.Tier) MetricsSource {

@@ -57,7 +57,7 @@ func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 		{name: "the relay never became ready", endpoint: node, ipDir: withBridge,
 			startFails: true, want: node, wantRun: true},
 		{name: "there is no docker bridge to bind", endpoint: node, ipDir: noBridge, want: node},
-		// THE RELAY DOES THE TLS (ADR-023), so an EC2 guest's clients name it too.
+		// THE RELAY DOES THE TLS (ADR-024), so an EC2 guest's clients name it too.
 		{name: "an https endpoint goes through the relay", endpoint: "https://10.0.0.5:7718",
 			ipDir: withBridge, want: relayed, wantRun: true},
 		{name: "an https endpoint whose relay did not start is left direct",

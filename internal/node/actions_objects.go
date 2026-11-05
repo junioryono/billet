@@ -17,7 +17,7 @@ import (
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
-// THE ACTIONS CACHE ON A STORE THAT KEEPS WHOLE OBJECTS (ADR-023). The three calls,
+// THE ACTIONS CACHE ON A STORE THAT KEEPS WHOLE OBJECTS (ADR-024). The three calls,
 // the signed URLs, the kill switch and the fail-open rule are the same as on a store
 // of volumes; what differs is only where an archive's bytes are. Nothing is mounted,
 // so a block goes straight to the store, a commit assembles them inside it, and a

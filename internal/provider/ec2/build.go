@@ -45,7 +45,7 @@ import (
 // components images.accept named that the template offers, recorded in
 // /etc/billet-image-components and in the components tag.
 //
-// 5: and the image carries the guest half of every cache the node serves (ADR-023):
+// 5: and the image carries the guest half of every cache the node serves (ADR-024):
 // the library cut from the firecracker guest's agent, the passthrough and the
 // container resolver, the docker shim and the container hook, and billet itself for
 // the Go and Bazel helpers. An older image ignores what the boot script exports for

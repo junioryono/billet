@@ -18,7 +18,6 @@ import (
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/durablefile"
-	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/retirement"
@@ -265,7 +264,7 @@ func repairNodeUnit(ctx context.Context, m repairMode) (any, *endpointRefusal) {
 		return nil, endpointRefuse(endpointReasonConfig, "no configuration is installed at "+installed.path, "", stateNothing)
 	}
 
-	installedEP, hasNode, err := nodeEndpointOf(installed.cfg)
+	installedSet, hasNode, err := nodeEndpointsOf(installed.cfg)
 	if err != nil {
 		return nil, endpointRefuse(endpointReasonConfig, "the installed configuration's node endpoint: "+err.Error(), "",
 			stateNothing)
@@ -357,7 +356,7 @@ func repairNodeUnit(ctx context.Context, m repairMode) (any, *endpointRefusal) {
 			"judgement and the locks; nothing was stopped", "converge again", stateNothing)
 	}
 
-	return repairUnderLock(ctx, m, insp, installed, installedEP, identity, again)
+	return repairUnderLock(ctx, m, insp, installed, installedSet, identity, again)
 }
 
 // repairGuard takes the transaction lock and requires this converge's guard, as
@@ -467,7 +466,7 @@ func predictRepairRetirementRefusal() *endpointRefusal {
 // repairUnderLock is the stop, the unit, the start and the record, under the
 // locks.
 func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector, installed *installedConfigObservation,
-	installedEP endpoint.Endpoint, identity registrationIdentity, judged repairJudgement,
+	installedSet controllerSet, identity registrationIdentity, judged repairJudgement,
 ) (any, *endpointRefusal) {
 	unitBody, br := judged.body, judged.br
 
@@ -636,10 +635,10 @@ func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector,
 			newBr.obs.MainPID, newBr.obs.InvocationID), "", stateStarted)
 	}
 
-	recordEP, err := endpoint.ParseCanonical(newBr.record.Endpoint)
-	if err != nil || !recordEP.Equal(installedEP) {
+	recordEP, dials, err := recordControllers(newBr.record)
+	if err != nil || !dials.sameControllers(installedSet) {
 		return nil, endpointUnknown(endpointReasonUnproved, fmt.Sprintf("the started node dials %s, not the installed "+
-			"endpoint %s", newBr.record.Endpoint, installedEP.String()), "", stateStarted)
+			"endpoint %s", dialling(newBr.record), installedSet.text()), "", stateStarted)
 	}
 
 	// (13) THE CLOSE: the configuration still the one judged, the process
@@ -662,7 +661,7 @@ func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector,
 
 	return repairEvidence{
 		Schema: endpointSchema, Outcome: outcomeRepaired, Node: newBr.record.Node, Deployment: newBr.record.Deployment,
-		Endpoint: installedEP.String(), UnitPath: repairUnitPath, BeforeSHA256: digestHex(unitBody),
+		Endpoint: recordEP.String(), UnitPath: repairUnitPath, BeforeSHA256: digestHex(unitBody),
 		AfterSHA256: digestHex(repaired), FromInvocation: br.obs.InvocationID, InvocationID: newBr.record.InvocationID,
 		Incarnation: newBr.record.Incarnation, RegisteredAt: newBr.record.RegisteredAt, Stopped: stopped,
 	}, nil

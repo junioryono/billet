@@ -4,7 +4,7 @@ Billet can serve `actions/cache` from the same site's store as a Firecracker or 
 
 ## Enable it
 
-The Actions cache requires one Linux provider, Firecracker on the site's Ceph store or EC2 on its `ebs-s3` store, and a configured `node.cache` listener. A tier that turns it on explicitly anywhere else (Docker, CodeBuild, macOS, a mixed-provider fallback tier, a node without its cache endpoint) is refused rather than accepted with work that can land where the local archive does not exist. [ADR-023](../reference/decisions/adr-023-caches-off-firecracker.md) says why, backend by backend.
+The Actions cache requires one Linux provider, Firecracker on the site's Ceph store or EC2 on its `ebs-s3` store, and a configured `node.cache` listener. A tier that turns it on explicitly anywhere else (Docker, CodeBuild, macOS, a mixed-provider fallback tier, a node without its cache endpoint) is refused rather than accepted with work that can land where the local archive does not exist. [ADR-024](../reference/decisions/adr-024-caches-off-firecracker.md) says why, backend by backend.
 
 ```yaml
 tiers:
@@ -73,7 +73,7 @@ Grant the organization's App `actions: read` before adding the scope. Publicatio
 
 ## On EC2
 
-Everything above holds, and the bytes are in a different place. An archive is one immutable object in the site's S3 bucket: a block streams from the guest straight to a staged object, the finalization assembles the blocks inside S3 in the order the client committed them, and a condition on that last step means the first writer of a key wins and a second one is told it lost. Nothing is mounted, and no volume or snapshot is made for an archive. A download reads through the node, which fetches ahead, because the official client reads anything but Azure on one connection. [ADR-023](../reference/decisions/adr-023-caches-off-firecracker.md) records why, and [the probes](../reference/records/ec2-cache-probes.md) what chose it.
+Everything above holds, and the bytes are in a different place. An archive is one immutable object in the site's S3 bucket: a block streams from the guest straight to a staged object, the finalization assembles the blocks inside S3 in the order the client committed them, and a condition on that last step means the first writer of a key wins and a second one is told it lost. Nothing is mounted, and no volume or snapshot is made for an archive. A download reads through the node, which fetches ahead, because the official client reads anything but Azure on one connection. [ADR-024](../reference/decisions/adr-024-caches-off-firecracker.md) records why, and [the probes](../reference/records/ec2-cache-probes.md) what chose it.
 
 The guest is the same too: the image carries the firecracker guest's own mechanism, and its passthroughs reach the node through a relay on the docker gateway that does the TLS to the listener, so everything else in the guest speaks what it speaks on a Firecracker bridge. A relay that does not start leaves interception off and the job on GitHub's cache.
 

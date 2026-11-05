@@ -149,7 +149,7 @@ func dialRelay(t *testing.T, relay string) *net.TCPConn {
 	return client
 }
 
-// AN EC2 GUEST'S RELAY DOES THE TLS ITSELF (ADR-023), so everything in the guest keeps
+// AN EC2 GUEST'S RELAY DOES THE TLS ITSELF (ADR-024), so everything in the guest keeps
 // speaking plain bytes to its bridge. What goes in comes out, both ways, and more of
 // it than one TLS record holds.
 //

@@ -225,3 +225,44 @@ func TestAGuestReportsArrivalsCrossTheWireInUTC(t *testing.T) {
 		})
 	}
 }
+
+// A REPORT'S TEST RESULTS REACH ONLY A PLANE THAT KNOWS THEM: an older plane's strict
+// decoder would refuse the whole report over the field. LITERAL VERSIONS, so moving
+// the constant cannot move the boundary the fleet already runs.
+func TestATestResultsFieldReachesOnlyAPlaneThatKnowsIt(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		version int
+		carried bool
+	}{{37, false}, {38, true}} {
+		plane := &guestPlane{version: tc.version}
+		c := registeredAt(t, plane)
+
+		report := aGuestReport()
+		report.TestsCodec, report.Tests = alloc.TestResultsCodec, []byte{7}
+		if err := c.RecordGuestReport(t.Context(), "l1", 7, report); err != nil {
+			t.Fatalf("at wire %d: RecordGuestReport: %v", tc.version, err)
+		}
+
+		plane.mu.Lock()
+		if len(plane.got) != 1 {
+			plane.mu.Unlock()
+			t.Fatalf("at wire %d the plane was sent %d reports, want the report without or with them",
+				tc.version, len(plane.got))
+		}
+		sent := plane.got[0].Report
+		plane.mu.Unlock()
+
+		if got := len(sent.Tests) == 1 && sent.TestsCodec == alloc.TestResultsCodec; got != tc.carried {
+			t.Errorf("at wire %d the plane was sent tests %v under codec %d, want carried %t", tc.version,
+				sent.Tests, sent.TestsCodec, tc.carried)
+		}
+		if sent.Accepted != report.Accepted {
+			t.Errorf("at wire %d the rest of the report did not arrive: %+v", tc.version, sent)
+		}
+		if report.TestsCodec != alloc.TestResultsCodec || len(report.Tests) != 1 {
+			t.Errorf("at wire %d the caller's report was changed", tc.version)
+		}
+	}
+}

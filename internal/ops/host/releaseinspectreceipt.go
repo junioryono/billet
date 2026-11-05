@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/junioryono/billet/internal/cli"
@@ -44,22 +45,46 @@ var receiptPath = endpointReceiptPathFor(cli.HostOS)
 // maxReceiptBytes bounds the receipt: a longer file is not one billet wrote.
 const maxReceiptBytes = 4096
 
-// receiptSchema is the receipt's schema number.
-const receiptSchema = 1
+// The receipt's schema numbers: a node naming one controller, and several.
+const (
+	receiptSchema        = 1
+	receiptSeveralSchema = 2
+)
 
-// endpointReceipt is the receipt's ten members, exactly.
+// endpointReceipt is the receipt's ten members, exactly. A NODE NAMING SEVERAL
+// CONTROLLERS writes schema 2, whose list replaces installed_endpoint, and an
+// older reader refuses it rather than reading a list as one endpoint; a node
+// naming one keeps schema 1 byte for byte. effective_endpoint is the controller
+// the node was on when the receipt was written, which a failover moves: the next
+// converge's refresh says so.
 type endpointReceipt struct {
-	Schema            int    `json:"schema"`
-	Run               string `json:"run"`
-	Node              string `json:"node"`
-	Deployment        string `json:"deployment"`
-	InstalledSHA256   string `json:"installed_sha256"`
-	InstalledEndpoint string `json:"installed_endpoint"`
-	EffectiveEndpoint string `json:"effective_endpoint"`
-	InvocationID      string `json:"invocation_id"`
-	Incarnation       string `json:"incarnation"`
-	WrittenAt         string `json:"written_at"`
+	Schema             int      `json:"schema"`
+	Run                string   `json:"run"`
+	Node               string   `json:"node"`
+	Deployment         string   `json:"deployment"`
+	InstalledSHA256    string   `json:"installed_sha256"`
+	InstalledEndpoint  string   `json:"installed_endpoint,omitempty"`
+	InstalledEndpoints []string `json:"installed_endpoints,omitempty"`
+	EffectiveEndpoint  string   `json:"effective_endpoint"`
+	InvocationID       string   `json:"invocation_id"`
+	Incarnation        string   `json:"incarnation"`
+	WrittenAt          string   `json:"written_at"`
 }
+
+// withInstalled is the receipt naming the controllers installed, under the
+// schema that many controllers take.
+func (r endpointReceipt) withInstalled(set controllerSet) endpointReceipt {
+	r.Schema, r.InstalledEndpoint, r.InstalledEndpoints = receiptSchema, set.text(), nil
+
+	if len(set) > 1 {
+		r.Schema, r.InstalledEndpoint, r.InstalledEndpoints = receiptSeveralSchema, "", set.texts()
+	}
+
+	return r
+}
+
+// receiptSeveralField is the member schema 2 names instead of installed_endpoint.
+const receiptSeveralField = "installed_endpoints"
 
 // receiptFields is the allowlist a receipt's members are validated against
 // by name.
@@ -71,7 +96,7 @@ var receiptFields = []string{"schema", "run", "node", "deployment", "installed_s
 func (r endpointReceipt) evidentialEqual(o endpointReceipt) bool {
 	return r.Schema == o.Schema && r.Node == o.Node && r.Deployment == o.Deployment &&
 		r.InstalledSHA256 == o.InstalledSHA256 && r.InstalledEndpoint == o.InstalledEndpoint &&
-		r.EffectiveEndpoint == o.EffectiveEndpoint && r.InvocationID == o.InvocationID && r.Incarnation == o.Incarnation
+		slices.Equal(r.InstalledEndpoints, o.InstalledEndpoints) && r.EffectiveEndpoint == o.EffectiveEndpoint && r.InvocationID == o.InvocationID && r.Incarnation == o.Incarnation
 }
 
 // The reader's seams, wrapping the executed operations as the registration
@@ -274,9 +299,10 @@ func readEndpointReceipt(path string) receiptEvidence {
 
 // decodeEndpointReceipt decodes the receipt's bytes under the exact member
 // set: one JSON object, no duplicate member, no trailing bytes, exactly the
-// ten names, schema 1, every other member a non-empty string, the two
-// identifiers 32 lowercase hex characters, the digest 64, the endpoints
-// canonical, the time RFC 3339.
+// ten names, every other member a non-empty string, the two identifiers 32
+// lowercase hex characters, the digest 64, the endpoints canonical, the time
+// RFC 3339. Schema 1 names installed_endpoint; schema 2 names installed_endpoints
+// in its place, two or more controllers, each once, holding the effective one.
 func decodeEndpointReceipt(body []byte) (*endpointReceipt, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -323,37 +349,44 @@ func decodeEndpointReceipt(body []byte) (*endpointReceipt, error) {
 		return nil, errors.New("bytes follow the object")
 	}
 
-	for _, name := range receiptFields {
+	schema, present := members["schema"]
+	if !present {
+		return nil, errors.New(`the member "schema" is missing`)
+	}
+
+	rec := &endpointReceipt{}
+	fields := receiptFields
+	text := map[string]*string{
+		"run": &rec.Run, "node": &rec.Node, "deployment": &rec.Deployment, "installed_sha256": &rec.InstalledSHA256,
+		"effective_endpoint": &rec.EffectiveEndpoint, "invocation_id": &rec.InvocationID, "incarnation": &rec.Incarnation,
+		"written_at": &rec.WrittenAt,
+	}
+
+	switch string(bytes.TrimSpace(schema)) {
+	case "1":
+		rec.Schema = receiptSchema
+		text["installed_endpoint"] = &rec.InstalledEndpoint
+	case "2":
+		rec.Schema = receiptSeveralSchema
+		fields = slices.Clone(fields)
+		fields[slices.Index(fields, "installed_endpoint")] = receiptSeveralField
+	default:
+		return nil, fmt.Errorf("schema is %s, want 1 or 2", string(schema))
+	}
+
+	for _, name := range fields {
 		if _, ok := members[name]; !ok {
 			return nil, fmt.Errorf("the member %q is missing", name)
 		}
 	}
 
 	for name := range members {
-		known := false
-
-		for _, want := range receiptFields {
-			if name == want {
-				known = true
-			}
-		}
-
-		if !known {
+		if !slices.Contains(fields, name) {
 			return nil, fmt.Errorf("the member %q is not one billet writes", name)
 		}
 	}
 
-	if string(bytes.TrimSpace(members["schema"])) != "1" {
-		return nil, fmt.Errorf("schema is %s, want 1", string(members["schema"]))
-	}
-
-	rec := &endpointReceipt{Schema: receiptSchema}
-
-	for name, into := range map[string]*string{
-		"run": &rec.Run, "node": &rec.Node, "deployment": &rec.Deployment, "installed_sha256": &rec.InstalledSHA256,
-		"installed_endpoint": &rec.InstalledEndpoint, "effective_endpoint": &rec.EffectiveEndpoint,
-		"invocation_id": &rec.InvocationID, "incarnation": &rec.Incarnation, "written_at": &rec.WrittenAt,
-	} {
+	for name, into := range text {
 		if bytes.Equal(bytes.TrimSpace(members[name]), []byte("null")) {
 			return nil, fmt.Errorf("the member %q is null", name)
 		}
@@ -386,9 +419,21 @@ func decodeEndpointReceipt(body []byte) (*endpointReceipt, error) {
 		return nil, errors.New("the installed_sha256 is not 64 lowercase hex digits")
 	}
 
-	for name, text := range map[string]string{"installed_endpoint": rec.InstalledEndpoint, "effective_endpoint": rec.EffectiveEndpoint} {
-		if _, err := endpoint.ParseCanonical(text); err != nil {
-			return nil, fmt.Errorf("%s is not a canonical endpoint: %w", name, err)
+	if _, err := endpoint.ParseCanonical(rec.EffectiveEndpoint); err != nil {
+		return nil, fmt.Errorf("effective_endpoint is not a canonical endpoint: %w", err)
+	}
+
+	if rec.Schema == receiptSchema {
+		if _, err := endpoint.ParseCanonical(rec.InstalledEndpoint); err != nil {
+			return nil, fmt.Errorf("installed_endpoint is not a canonical endpoint: %w", err)
+		}
+	} else {
+		if err := json.Unmarshal(members[receiptSeveralField], &rec.InstalledEndpoints); err != nil || rec.InstalledEndpoints == nil {
+			return nil, fmt.Errorf("the member %q is not a list of strings", receiptSeveralField)
+		}
+
+		if err := checkControllerTexts(rec.InstalledEndpoints, rec.EffectiveEndpoint); err != nil {
+			return nil, fmt.Errorf("%s: %w", receiptSeveralField, err)
 		}
 	}
 

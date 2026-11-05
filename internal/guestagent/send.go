@@ -32,7 +32,6 @@ const (
 	maxRetryAfter   = 60 * time.Second
 	requestTimeout  = 10 * time.Second
 	maxIntervalMS   = int64(time.Hour / time.Millisecond)
-	schemaSpoken    = 1
 	firstBackoff    = time.Second
 	maxLimitBackoff = time.Minute
 )
@@ -60,6 +59,8 @@ const (
 type limits struct {
 	interval time.Duration
 	maxBody  int
+	// cases says the node takes a batch's test cases (guestreport.SchemaCases).
+	cases bool
 }
 
 // limitsAnswer is GET /v1/guest/limits's body, read leniently: a field the agent
@@ -151,7 +152,7 @@ func readLimits(body []byte) (limits, verdict) {
 		return limits{}, unknown
 	}
 
-	if !slices.Contains(a.Schemas, schemaSpoken) {
+	if !slices.Contains(a.Schemas, guestreport.SchemaBase) {
 		return limits{}, stop
 	}
 
@@ -162,6 +163,7 @@ func readLimits(body []byte) (limits, verdict) {
 	return limits{
 		interval: time.Duration(*a.IntervalMS) * time.Millisecond,
 		maxBody:  int(min(*a.MaxBody, guestreport.MaxBatchBytes)),
+		cases:    slices.Contains(a.Schemas, guestreport.SchemaCases),
 	}, accepted
 }
 

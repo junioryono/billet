@@ -239,7 +239,7 @@ func TestTheLimitsAreTheContractsAndAskingIsTheHello(t *testing.T) {
 			response.Header().Get("Content-Type"))
 	}
 	if got, want := strings.TrimSpace(response.Body.String()),
-		`{"schemas":[1],"interval_ms":10000,"max_body":65536}`; got != want {
+		`{"schemas":[1,2],"interval_ms":10000,"max_body":65536}`; got != want {
 		t.Errorf("the limits are %s, want %s", got, want)
 	}
 
@@ -1264,5 +1264,60 @@ func TestADestroyWaitsABoundedTimeForADecodeSlot(t *testing.T) {
 	if recorded.Accepted != 1 || len(recorded.Data) != 0 || recorded.DroppedBytes != int64(len(data)) {
 		t.Errorf("the ledger keeps accepted %d, %d bytes, %d dropped; want 1, none and %d",
 			recorded.Accepted, len(recorded.Data), recorded.DroppedBytes, len(data))
+	}
+}
+
+// A JOB'S TEST CASES LEAVE THE NODE BESIDE ITS REPORT AND NOT IN IT: the report is the
+// one the node always wrote, and the cases are an encoding of their own for the
+// ledger's own row.
+func TestAGuestBatchsCasesLeaveInTheirOwnEncoding(t *testing.T) {
+	t.Parallel()
+
+	service, _, token, _ := guestService(t)
+
+	millis := int64(12)
+	suite := guestreport.SuiteCases{Name: "pkg", Tests: 2, Failures: 1, Complete: true, Cases: []guestreport.CaseResult{
+		{Name: "pkg.TestA", Status: guestreport.CaseFailed, DurationMillis: &millis, Message: "wanted 1"},
+		{Name: "pkg.TestB", Status: guestreport.CasePassed},
+	}}
+	data, err := guestreport.EncodeBatch(guestreport.Batch{Seq: 1, AgentVersion: "v0.15.0", TicksPerSecond: 100,
+		AgentCPUTicks: 1, Cases: []guestreport.SuiteCases{suite}})
+	if err != nil {
+		t.Fatalf("EncodeBatch: %v", err)
+	}
+	if got := postBatch(t, service, token, guestFinal, data).Code; got != http.StatusNoContent {
+		t.Fatalf("a final batch of schema 2 answered %d, want 204", got)
+	}
+
+	report := takeGuest(t, service, "billet-one")
+	if report.TestsCodec != alloc.TestResultsCodec || report.Schema != 1 {
+		t.Fatalf("the report's tests are codec %d and its schema %d, want %d and 1", report.TestsCodec, report.Schema,
+			alloc.TestResultsCodec)
+	}
+	if err := report.Validate(); err != nil {
+		t.Fatalf("the report does not validate: %v", err)
+	}
+
+	got, err := guestreport.DecodeTestResults(report.Tests)
+	if err != nil {
+		t.Fatalf("the tests do not decode: %v", err)
+	}
+	if len(got.Suites) != 1 || !reflect.DeepEqual(got.Suites[0], suite) {
+		t.Errorf("the tests read back %+v, want %+v", got.Suites, suite)
+	}
+}
+
+// A JOB THAT REPORTED NO CASES CARRIES NONE, which an older plane's wire needs of it.
+func TestAGuestReportWithNoCasesNamesNoTests(t *testing.T) {
+	t.Parallel()
+
+	service, _, token, _ := guestService(t)
+	if got := postBatch(t, service, token, guestFinal, guestBatch(t, 1, "Build")).Code; got != http.StatusNoContent {
+		t.Fatalf("a batch answered %d, want 204", got)
+	}
+
+	report := takeGuest(t, service, "billet-one")
+	if report.TestsCodec != 0 || report.Tests != nil {
+		t.Errorf("the report names tests %v under codec %d, want none", report.Tests, report.TestsCodec)
 	}
 }

@@ -202,7 +202,7 @@ var ErrArchiveSize = errors.New("store: the staged blocks are not the declared s
 
 // ArchiveStore keeps a cache whose unit is a file rather than a filesystem as
 // whole objects, on a store where a volume per file would cost more than the file
-// saves (ADR-023). Optional: a store without it serves archives from volumes.
+// saves (ADR-024). Optional: a store without it serves archives from volumes.
 //
 // The first commit of a key wins and an archive never changes, so there is no
 // pointer, no writer lease and no fence: two writers of one key cannot publish
@@ -244,7 +244,7 @@ type BlobRef struct {
 	Digest string
 }
 
-// BlobStore keeps a content-addressed cache as one object per entry (ADR-023).
+// BlobStore keeps a content-addressed cache as one object per entry (ADR-024).
 // Optional: a store without it serves these caches from a mounted volume.
 //
 // AN ENTRY'S NAME IS WHAT IT HOLDS, or a job's claim that first-writer-wins keeps,

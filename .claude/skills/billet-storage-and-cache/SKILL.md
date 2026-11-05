@@ -7,7 +7,7 @@ description: "Load when touching sites, internal/store (generations, writer leas
 
 ## What this area is
 
-A site is a place where compute and its storage share a fast network (`sites[]`, `store: ceph | ebs-s3`). A node reports its site at registration, a tier may pin one, and the control plane refuses a node whose provider cannot use the site's store. `internal/store` is the contract every cache implementation satisfies: immutable named generations, copy-on-write clones held under active leases, a writer lease for publication and a fenced pointer advanced by compare-and-swap. `internal/store/ceph` drives RBD through the `rbd` command for firecracker sites; `internal/store/ebss3` uses EBS snapshots and an S3 pointer for EC2 sites. On the node, `internal/node/actions_cache.go`, `actions_proxy.go` and `actions_volume.go` intercept `actions/cache` traffic for Linux firecracker and EC2 tiers, with `actions_objects.go` and `casblobs.go` where the store keeps whole objects (ADR-023). `actions/stickydisk`, `setup-docker-builder`, `stop-docker-builder` and `build-push-action` are the published actions. `docs/reference/decisions/adr-003-ceph-rbd.md` records the cluster and its measurements; `docs/operating/actions-cache.md` is the operator page.
+A site is a place where compute and its storage share a fast network (`sites[]`, `store: ceph | ebs-s3`). A node reports its site at registration, a tier may pin one, and the control plane refuses a node whose provider cannot use the site's store. `internal/store` is the contract every cache implementation satisfies: immutable named generations, copy-on-write clones held under active leases, a writer lease for publication and a fenced pointer advanced by compare-and-swap. `internal/store/ceph` drives RBD through the `rbd` command for firecracker sites; `internal/store/ebss3` uses EBS snapshots and an S3 pointer for EC2 sites. On the node, `internal/node/actions_cache.go`, `actions_proxy.go` and `actions_volume.go` intercept `actions/cache` traffic for Linux firecracker and EC2 tiers, with `actions_objects.go` and `casblobs.go` where the store keeps whole objects (ADR-024). `actions/stickydisk`, `setup-docker-builder`, `stop-docker-builder` and `build-push-action` are the published actions. `docs/reference/decisions/adr-003-ceph-rbd.md` records the cluster and its measurements; `docs/operating/actions-cache.md` is the operator page.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -25,6 +25,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A candidate is verified as it is published, not only as it was written.**
 - **A discard is storage, not compute, and never runs on the node's command path (#223).**
 - **On Ceph, a discard moves to the trash and the node's sweep deletes (#280, #292).**
+- **A compaction is a clone and a flatten, never `rbd cp`.**
 - **Every cache image carries object-map, and every command that changes one keeps the kernel client (#394).**
 - **Storage background work yields to jobs (#394).**
 - **An intact orphan volume is reclaimed by an operator, on proof, through the trash (#301).**
@@ -66,6 +67,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A mirror is refreshed by only what moved and repacked after a refresh, never on a request; pruning has the mirror alone, and removes an unreachable object no sooner than fourteen days after the first pass that set it aside (`gitmaintain.go`).**
 - **A guest reaches its build caches through a relay that waits out a node restart (#374).**
 - **What each build cache did is observed like the image store.**
+- **The sticky-disk action adds the guest's system bundle to what Node trusts by default, and on a contract 4 AMI it works on an EC2 guest.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

@@ -1,6 +1,6 @@
 # A store of whole objects, on EC2
 
-Part of the `billet-storage-and-cache` skill. Each rule is stated in full, with the measurement or incident behind it. [ADR-023](../../../../docs/reference/decisions/adr-023-caches-off-firecracker.md) holds the decision and [EC2 cache probes](../../../../docs/reference/records/ec2-cache-probes.md) the numbers.
+Part of the `billet-storage-and-cache` skill. Each rule is stated in full, with the measurement or incident behind it. [ADR-024](../../../../docs/reference/decisions/adr-024-caches-off-firecracker.md) holds the decision and [EC2 cache probes](../../../../docs/reference/records/ec2-cache-probes.md) the numbers.
 
 **On `ebs-s3`, a cache whose unit is a file is objects, not volumes, and that was measured.** `store.ArchiveStore` and `store.BlobStore` are optional capabilities of the store contract, and the node asks for them (`CacheService.archiveStore`, `blobStore`) before it reaches for a volume, so Ceph and Firecracker take the path they always took. On 2026-11-04, from a `c7i.2xlarge` through a gateway endpoint, a volume per archive cost 20 s before its first byte, 18 to 47 MiB/s lazily reading from its snapshot, and 332 s of snapshot per save, against an instance's 32 attachments; S3 read 360 to 730 MiB/s on 8 streams with no wait, and GitHub's own store gave the same host 54 to 64 MiB/s on 8. Sticky disks and the Docker image store stay EBS: they are filesystems a job mounts. `max_size` bounds what one job adds here, because there is no volume to fill, and retention bounds what a key holds.
 

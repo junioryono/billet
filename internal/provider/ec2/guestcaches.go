@@ -9,7 +9,7 @@ import (
 	"github.com/junioryono/billet/scripts"
 )
 
-// EVERY CACHE THE NODE SERVES TO A GUEST, ON AN EC2 GUEST (ADR-023).
+// EVERY CACHE THE NODE SERVES TO A GUEST, ON AN EC2 GUEST (ADR-024).
 //
 // The firecracker guest's agent is where the mechanism lives: the DNS remap and the
 // node's authority, the passthroughs, the container resolver, the relay and each

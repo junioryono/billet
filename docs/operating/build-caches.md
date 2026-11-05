@@ -1,6 +1,6 @@
 # Build caches
 
-A Firecracker or EC2 node serves seven caches from the site's store, beside the compute that uses them ([which backends, and why](../reference/decisions/adr-023-caches-off-firecracker.md)): the Docker image store, sticky disks, the Actions cache, a Git mirror, a Bazel and Buck2 remote cache, and the Go build and test cache. Every one is on by default where the tier can have it, every one can be turned off per tier or by the central kill switch, and every one reports what it did for each job. An eighth, the npm registry cache, is served from the node's own disk and, since 2026-10-25, is on by default too; a tier whose jobs run a client in the runner's own process that ignores `NODE_EXTRA_CA_CERTS` and the system store fails TLS through it, and turns it off with `cache.npm.enabled: false`.
+A Firecracker or EC2 node serves seven caches from the site's store, beside the compute that uses them ([which backends, and why](../reference/decisions/adr-024-caches-off-firecracker.md)): the Docker image store, sticky disks, the Actions cache, a Git mirror, a Bazel and Buck2 remote cache, and the Go build and test cache. Every one is on by default where the tier can have it, every one can be turned off per tier or by the central kill switch, and every one reports what it did for each job. An eighth, the npm registry cache, is served from the node's own disk and, since 2026-10-25, is on by default too; a tier whose jobs run a client in the runner's own process that ignores `NODE_EXTRA_CA_CERTS` and the system store fails TLS through it, and turns it off with `cache.npm.enabled: false`.
 
 This page is the operator's view: what each cache is, what a tier gets without asking, how publication is decided, and how to see and stop a cache. [Trust and isolation](../concepts/trust-and-isolation.md) says what a cache can leak and to whom, and [ADR-013](../reference/decisions/adr-013-branch-protected-caches.md) records why publication is decided the way it is.
 
@@ -39,7 +39,7 @@ Publication happens off the node's command path, after the compute is gone, jour
 
 ## The caches
 
-**Docker image store.** Each job's `/var/lib/docker` is a clone of the newest generation for its deployment, site and architecture, attached before the runner starts so service containers are pulled from it. `cache.docker.max_size` (100 GiB) bounds the clone; a baseline larger than that is not cloned, and the job starts cold at its own size.
+**Docker image store.** Each job's `/var/lib/docker` is a clone of the newest generation for its deployment, site and architecture, attached before the runner starts so service containers are pulled from it. The guest waits for it at most 260 seconds, just past the node's four-minute bound on the steps toward that answer, and starts Docker on its root disk if the store has not arrived, so a slow store costs a cold job rather than a runner GitHub lists offline ([How long a guest waits for its Docker image store](../reference/records/image-store-wait.md)). `cache.docker.max_size` (100 GiB) bounds the clone; a baseline larger than that is not cloned, and the job starts cold at its own size.
 
 **Sticky disks.** `actions/stickydisk` attaches a volume by key; it is committed when the job ends and published under the tier's rule. Under `default-branch` the commit is deferred to the completion, which decides it. `cache.sticky_disks.max_size` clamps what a job may ask for.
 
@@ -116,4 +116,4 @@ During a rollout such a tier waits for the first of its own hosts to upgrade, an
 
 The npm cache needs no newer node: one below wire 31 ignores `cache.npm`, which leaves the tier's npm traffic going to the registry, as it always did.
 
-An EC2 node below wire 38 cannot serve a guest's caches, so it runs the tier with them off, including any you turned on by name: its jobs use GitHub's cache and build cold, and the control plane logs a warning naming the tier and the node for each such launch. `billet status` still shows the tier's configuration, so that warning is where to look during a rollout.
+An EC2 node below wire 39 cannot serve a guest's caches, so it runs the tier with them off, including any you turned on by name: its jobs use GitHub's cache and build cold, and the control plane logs a warning naming the tier and the node for each such launch. `billet status` still shows the tier's configuration, so that warning is where to look during a rollout.

@@ -459,7 +459,7 @@ func (t Tier) ReservationErrors(where string) []error {
 //
 // THE SAME RULE HOLDS FOR EVERY CACHE THE NODE SERVES TO A GUEST IT CONTROLS: the
 // Actions cache, the Git proxy and the Bazel and Go caches. Each backend's answer and
-// its reason are ADR-023.
+// its reason are ADR-024.
 func (t Tier) InterceptionErrors(where string) []error {
 	cache := t.EffectiveCache()
 	explicit := t.explicitGuestCaches()
@@ -490,12 +490,12 @@ func (t Tier) InterceptionErrors(where string) []error {
 }
 
 // serveGuestCaches reports whether a backend's guest can be served the node's caches
-// (ADR-023).
+// (ADR-024).
 func serveGuestCaches(p ProviderKind) bool {
 	return p == ProviderFirecracker || p == ProviderEC2
 }
 
-// guestCacheRefusal says why a backend's guest cannot be, in ADR-023's terms.
+// guestCacheRefusal says why a backend's guest cannot be, in ADR-024's terms.
 func guestCacheRefusal(p ProviderKind) string {
 	switch p {
 	case ProviderCodeBuild:

@@ -18,7 +18,7 @@ const (
 	IAMS3GetObject  = "s3:GetObject"
 	IAMS3PutObject  = "s3:PutObject"
 	IAMS3ListBucket = "s3:ListBucket"
-	// The archives and entries of a cache whose unit is a file (ADR-023) are evicted
+	// The archives and entries of a cache whose unit is a file (ADR-024) are evicted
 	// by the node itself, by how recently a job used them, which no lifecycle rule
 	// can see, and a commit that dies leaves a multipart upload only these end.
 	IAMS3DeleteObject     = "s3:DeleteObject"

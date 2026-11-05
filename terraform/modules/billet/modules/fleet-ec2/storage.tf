@@ -1,7 +1,7 @@
 # THE CACHE STORE. S3 holds the small fenced pointer and lease state of the caches a
 # job mounts, whose block generations are EBS volumes billet creates at runtime, and
 # the whole objects of the caches the node serves, Actions archives and Go and Bazel
-# entries (ADR-023). Those reach the node through the VPC's S3 endpoint when it has
+# entries (ADR-024). Those reach the node through the VPC's S3 endpoint when it has
 # one, which is yours to add to an adopted network: without one they cross a NAT.
 
 resource "aws_kms_key" "cache" {

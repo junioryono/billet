@@ -404,7 +404,7 @@ func stagedUpload(
 
 // ON A STORE OF WHOLE OBJECTS THE THREE CALLS ARE THE SAME AND NOTHING IS MOUNTED: a
 // client sees what it sees on Firecracker, and no volume is created, cloned or
-// snapshotted for an archive. This is what ADR-023 measured the other shape against.
+// snapshotted for an archive. This is what ADR-024 measured the other shape against.
 func TestAnActionsArchiveOnAStoreOfObjectsTouchesNoVolume(t *testing.T) {
 	t.Parallel()
 	service, storage, volumes := objectService(t)

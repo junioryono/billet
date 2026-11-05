@@ -35,8 +35,8 @@ func ec2CacheTiers(t *testing.T, lines string) string {
 	return withLines
 }
 
-// EVERY CACHE THE NODE SERVES MAY BE TURNED ON ON A LINUX EC2 TIER (ADR-023), with the
-// reverse held in the refusals' own test: a backend ADR-023 refuses stays refused.
+// EVERY CACHE THE NODE SERVES MAY BE TURNED ON ON A LINUX EC2 TIER (ADR-024), with the
+// reverse held in the refusals' own test: a backend ADR-024 refuses stays refused.
 func TestAnEC2TierMayNameEveryCacheTheNodeServes(t *testing.T) {
 	t.Parallel()
 	for _, kind := range []string{"git", "bazel", "go", "npm"} {

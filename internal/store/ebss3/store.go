@@ -71,7 +71,7 @@ type Store struct {
 	blocks  blockAPI
 	objects objectAPI
 	// bulk reaches whole objects: the half of the store for a cache whose unit is a
-	// file (archive.go, ADR-023).
+	// file (archive.go, ADR-024).
 	bulk bulkAPI
 	// readAhead is a slot per read allowed to hold chunks in memory.
 	readAhead chan struct{}

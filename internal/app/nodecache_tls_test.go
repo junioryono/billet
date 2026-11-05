@@ -61,7 +61,7 @@ func closeServer(t *testing.T, server *http.Server) {
 	}
 }
 
-// THE EC2 LISTENER CARRIES WHAT A FIRECRACKER GUEST'S BRIDGE CARRIES (ADR-023).
+// THE EC2 LISTENER CARRIES WHAT A FIRECRACKER GUEST'S BRIDGE CARRIES (ADR-024).
 // Bazel's and Buck2's gRPC arrives as HTTP/2 with prior knowledge through the guest's
 // relay, inside TLS the relay did, and http.Server takes that only from a connection
 // that is not a *tls.Conn. So this dials as the relay does: TLS to the listener, then

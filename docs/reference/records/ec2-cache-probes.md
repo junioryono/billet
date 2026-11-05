@@ -1,6 +1,6 @@
 # EC2 cache probes
 
-What was measured on 2026-11-04 to decide where the caches a node serves keep their bytes on per-job EC2 ([ADR-023](../decisions/adr-023-caches-off-firecracker.md)). A node had to keep each Actions archive in one of two places: a store volume per archive, as a Firecracker node does on Ceph, or a whole object in the site's S3 bucket. These are the numbers that chose.
+What was measured on 2026-11-04 to decide where the caches a node serves keep their bytes on per-job EC2 ([ADR-024](../decisions/adr-024-caches-off-firecracker.md)). A node had to keep each Actions archive in one of two places: a store volume per archive, as a Firecracker node does on Ceph, or a whole object in the site's S3 bucket. These are the numbers that chose.
 
 ## Where it ran
 

@@ -171,7 +171,7 @@ fi
 # the npm packages the bundle was built from; a pin bump rewrites both.
 #
 # BILLET_SHARED_INSTALL_BEGIN: this function and install_cache_sudoers are also what
-# the EC2 image runs, extracted from here by scripts.GuestImageBlock (ADR-023).
+# the EC2 image runs, extracted from here by scripts.GuestImageBlock (ADR-024).
 install_container_hook() {
 	local rootfs=$1
 	local pin="$SCRIPT_DIR/../internal/guestassets/container-hook.pin"
@@ -1545,7 +1545,7 @@ fi
 # BILLET_SHARED_PREPARE_BEGIN: from here to its end, and BILLET_SHARED_START,
 # BILLET_CACHE_RELAY and BILLET_SHARED_ENV below, are also what the EC2 image runs at
 # a job's boot. `billet ami build` extracts them from this file (scripts.GuestImageBlock,
-# ec2.guestCachesLibrary), so a guest has one mechanism however it boots (ADR-023).
+# ec2.guestCachesLibrary), so a guest has one mechanism however it boots (ADR-024).
 # Nothing in them may assume MMDS beyond `fetch`, which the EC2 image answers from
 # its user data.
 # THE BUILD CACHES THE TIER ENABLES, a comma-separated list the node derives from

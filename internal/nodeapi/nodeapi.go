@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 38
+	Version = 39
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -509,15 +509,26 @@ const (
 	// naming one is refused to a node below this at dispatch and again at delivery.
 	VersionArchitectures = 37
 
+	// VersionJobTests is the version from which a guest report may carry the job's
+	// test suites and cases (lease.GuestReport's tests, #536), which the ledger keeps
+	// past the report's own retention and `billet tests stats` ranks.
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT, because
+	// an older plane decodes the request strictly and would refuse the whole report
+	// over the field: below it the node sends the rest. CHECKED WHERE IT IS READ too,
+	// so a pairing that negotiated below it and sends them anyway has the report kept
+	// without them.
+	VersionJobTests = 38
+
 	// VersionEC2GuestCaches is the version from which an EC2 node carries the caches
-	// it serves to a guest into that guest's boot script (ADR-023).
+	// it serves to a guest into that guest's boot script (ADR-024).
 	//
 	// REPORTED BY DOING LESS, WHERE THE LAUNCH IS SENT: an older EC2 node refuses a
 	// launch that names a guest cache, which would fail every job on a tier that
 	// merely has them by default. So the plane sends it the tier's cache block with
 	// them off, and its job runs as it did before them. Delivery holds a launch that
 	// names them to a node at this version or above.
-	VersionEC2GuestCaches = 38
+	VersionEC2GuestCaches = 39
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

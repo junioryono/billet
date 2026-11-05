@@ -1,4 +1,4 @@
-# ADR-023: Which backends the node's caches serve, and how EC2 keeps them
+# ADR-024: Which backends the node's caches serve, and how EC2 keeps them
 
 Accepted, 2026-11-04. Issue #26. Extends the interception of [ADR-020](adr-020-npm-registry-interception.md) and the publication rule of [ADR-013](adr-013-branch-protected-caches.md) past Firecracker. Measurements are in [EC2 cache probes](../records/ec2-cache-probes.md).
 

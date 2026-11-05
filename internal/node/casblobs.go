@@ -23,7 +23,7 @@ import (
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
-// THE GO AND BAZEL CACHES ON A STORE THAT KEEPS WHOLE OBJECTS (ADR-023). A session's
+// THE GO AND BAZEL CACHES ON A STORE THAT KEEPS WHOLE OBJECTS (ADR-024). A session's
 // volume is a directory on the node's own disk, which is what its writes land in and
 // what publication uploads from. An entry the session did not write comes from the
 // store through a read cache on the same disk, shared by the sessions of one key, so a

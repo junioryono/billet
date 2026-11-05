@@ -49,7 +49,7 @@ An https endpoint (an EC2 guest's, whose bearer crosses a VPC) is reached over T
 this relay does itself, checked against the system's roots, where the image bakes the
 listener's issuer. Everything else in the guest keeps speaking what it speaks on a
 Firecracker guest's bridge, CONNECT tunnels included, which is what keeps a client's
-own TLS out of a second TLS session Python's sockets cannot nest (ADR-023).
+own TLS out of a second TLS session Python's sockets cannot nest (ADR-024).
 
 BOTH MODES ARE ONE FILE because they are one mechanism: the CONNECT tunnel, the
 header reader, the fail-open dial and the timeouts are shared, and a second copy

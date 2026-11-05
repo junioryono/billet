@@ -196,7 +196,7 @@ func TestEveryNodeServedCacheRequiresAHostBackedCacheNode(t *testing.T) {
 			t.Errorf("%s without a node cache: %v", kind, err)
 		}
 
-		// EACH BACKEND ADR-023 REFUSES IS REFUSED FOR ITS OWN REASON.
+		// EACH BACKEND ADR-024 REFUSES IS REFUSED FOR ITS OWN REASON.
 		for provider, reason := range map[string]string{
 			"codebuild": "not scrubbed", "tart": "no site store", "docker": "for trials",
 		} {
