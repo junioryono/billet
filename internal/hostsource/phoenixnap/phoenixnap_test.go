@@ -2,6 +2,7 @@ package phoenixnap
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -528,5 +529,49 @@ func TestAMalformedRedirectQuotesNothing(t *testing.T) {
 	_, err := source(t, srv).Order(t.Context(), request())
 	if err == nil || strings.Contains(err.Error(), "token-9QX") {
 		t.Fatalf("order = %v", err)
+	}
+}
+
+// STOCK ENTRIES THAT NAME NO PRODUCT cannot say what is in stock, so they order nothing
+// and are not reported as no stock.
+func TestStockEntriesWithoutAProductCannotBeRead(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{`[{}]`, `[null]`,
+		`[{"locationAvailabilityDetails":[{"location":"CHI","minQuantityAvailable":true,"availableQuantity":9}]}]`} {
+		f, srv := newFake(t)
+		f.mu.Lock()
+		f.stock = body
+		f.mu.Unlock()
+		f.order = func(http.ResponseWriter) { t.Errorf("%s: an order was placed", body) }
+		_, err := source(t, srv).Order(t.Context(), request())
+		if err == nil || errors.Is(err, hostsource.ErrNoStock) {
+			t.Errorf("stock %s: %v, want could-not-tell", body, err)
+		}
+	}
+}
+
+// A DECODE ERROR REPEATS PART OF THE ANSWER, so it is not quoted: a number too large
+// for its field would carry a decimal-encoded credential straight into the error.
+func TestADecodeErrorQuotesNothing(t *testing.T) {
+	t.Parallel()
+	f, srv := newFake(t)
+	f.quotas = `[{"id":"bmc.servers.max_count","limit":77777777777777777777777777777,"used":0}]`
+	f.order = func(http.ResponseWriter) { t.Error("an order was placed") }
+	_, err := source(t, srv).Order(t.Context(), request())
+	if err == nil || strings.Contains(err.Error(), "77777777777777777777777777777") {
+		t.Fatalf("order = %v", err)
+	}
+}
+
+// A TRANSPORT OR READ FAILURE KEEPS ITS CLASSIFICATION AND NOTHING ELSE.
+func TestWithheldKeepsOnlyTheClassification(t *testing.T) {
+	t.Parallel()
+	if err := withheld(errors.New("malformed trailer line token-9QX")); !errors.Is(err, errWithheld) || strings.Contains(err.Error(), "token-9QX") {
+		t.Errorf("a read failure = %v", err)
+	}
+	for _, ctxErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		if err := withheld(fmt.Errorf("Post: %w", ctxErr)); !errors.Is(err, ctxErr) || !errors.Is(err, errWithheld) {
+			t.Errorf("%v lost its classification: %v", ctxErr, err)
+		}
 	}
 }

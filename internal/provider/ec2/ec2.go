@@ -1765,8 +1765,10 @@ func withoutMessage(err error) error {
 	// so a reply that puts the echoed request body in <Code> instead of <Message>
 	// would walk straight through a function whose whole job is to stop that. A
 	// real code is a short identifier; anything else is not one, whatever it is.
+	// AND ONLY A CODE BILLET KNOWS IS RENDERED. A short token fits an identifier's
+	// shape as well as a code does, so the shape alone let `<Code>token</Code>` through.
 	code := apiErr.Code
-	if !awsErrorCode.MatchString(code) {
+	if !awsErrorCode.MatchString(code) || !knownLaunchCodes[code] {
 		code = "(unrecognised error code)"
 	}
 
@@ -1796,6 +1798,23 @@ func withheldFailure(err error) error {
 	}
 
 	return errWithheld
+}
+
+// knownLaunchCodes are the EC2 codes a refused launch may name: the ones billet
+// branches on, and the ones that tell an operator what to fix. Any other code is
+// rendered as unrecognised, because a launch carries a credential and an unknown
+// "code" is text whoever answered chose.
+var knownLaunchCodes = map[string]bool{
+	"InsufficientInstanceCapacity": true, "UnfulfillableCapacity": true, "InsufficientHostCapacity": true,
+	"Unsupported": true, "VcpuLimitExceeded": true, "InstanceLimitExceeded": true,
+	"UnauthorizedOperation": true, "AuthFailure": true, "InvalidClientTokenId": true,
+	"SignatureDoesNotMatch": true, "OptInRequired": true, "PendingVerification": true, "Blocked": true,
+	"InvalidParameterValue": true, "InvalidParameterCombination": true, "InvalidParameter": true,
+	"MissingParameter": true, "InvalidAMIID.NotFound": true, "InvalidAMIID.Malformed": true,
+	"InvalidSubnetID.NotFound": true, "InvalidGroup.NotFound": true, "InvalidBlockDeviceMapping": true,
+	"InvalidInstanceID.NotFound": true, "IdempotentParameterMismatch": true,
+	"InsufficientFreeAddressesInSubnet": true, "RequestLimitExceeded": true, "Throttling": true,
+	"InternalError": true, "InternalFailure": true, "Unavailable": true, "ServiceUnavailable": true,
 }
 
 // awsErrorCode is the shape of an EC2 error code — a short identifier, never

@@ -386,6 +386,9 @@ func (s *Source) checkStock(ctx context.Context, shape, location string) error {
 		return err
 	}
 	for _, a := range all {
+		if a.ProductCode == "" {
+			return fmt.Errorf("phoenixnap: the stock list holds an entry without a product, so the stock of %s cannot be told", shape)
+		}
 		if a.ProductCode != shape {
 			continue
 		}
@@ -498,7 +501,7 @@ func (s *Source) call(ctx context.Context, method, path string, body []byte, out
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
-		return fmt.Errorf("phoenixnap: read %s %s: %w", method, path, err)
+		return fmt.Errorf("phoenixnap: read %s %s: %w", method, path, withheld(err))
 	}
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
@@ -520,7 +523,8 @@ func (s *Source) call(ctx context.Context, method, path string, body []byte, out
 		return fmt.Errorf("phoenixnap: %s %s answered nothing, which cannot be read", method, path)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("phoenixnap: decode %s %s: %w", method, path, err)
+		// NOT QUOTED: a decode error repeats part of the answer.
+		return fmt.Errorf("phoenixnap: %s %s: the answer would not parse, and is not quoted", method, path)
 	}
 
 	return nil
@@ -563,7 +567,7 @@ func (s *Source) bearer(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
-		return "", fmt.Errorf("phoenixnap: read the token: %w", err)
+		return "", fmt.Errorf("phoenixnap: read the token: %w", withheld(err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		// The body of a refused grant is not quoted: it is the identity provider's, and

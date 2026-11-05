@@ -166,13 +166,14 @@ func (h *Hosts) Find(ctx context.Context, order string) (HostRecord, bool, error
 	var live []HostRecord
 	var ended *HostRecord
 	for _, item := range items {
+		// AN INSTANCE THE FILTER RETURNED THAT IS NOT A WELL-FORMED POOL HOST is not
+		// skipped, whatever its order tag says: a list read as none licenses ordering
+		// again, and a missing order tag is not a different order.
+		if !h.isPoolHost(item) {
+			return HostRecord{}, false, fmt.Errorf("%w: %s was listed for order %s", ErrNotAPoolHost, item.InstanceID, order)
+		}
 		if v, _ := item.tag(poolOrderTag); v != order {
 			continue
-		}
-		// AN INSTANCE THAT CARRIES THIS ORDER AND IS NOT A POOL HOST is not skipped: a
-		// list read as none licenses ordering again.
-		if !h.isPoolHost(item) {
-			return HostRecord{}, false, fmt.Errorf("%w: %s carries order %s", ErrNotAPoolHost, item.InstanceID, order)
 		}
 		rec := hostRecord(item)
 		if rec.State == "terminated" {

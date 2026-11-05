@@ -252,12 +252,15 @@ func TestAnInstanceWithConflictingOrMissingPoolTagsIsNotAPoolHost(t *testing.T) 
 			t.Errorf("%s: %d calls reached a non-pool instance", name, n)
 		}
 	}
-	f := newFakeEC2(t)
-	f.respond = func(string, url.Values) (int, string) {
-		return http.StatusOK, describeReply("", jobAndPoolTaggedXML("i-1"))
-	}
-	if _, ok, err := newTestProvider(t, f, nil).Hosts().Find(t.Context(), "o-1"); !errors.Is(err, ErrNotAPoolHost) || ok {
-		t.Fatalf("find over a job instance carrying the order = %t, %v", ok, err)
+	for name, item := range map[string]string{
+		"job and pool tags":  jobAndPoolTaggedXML("i-1"),
+		"pool tag, no order": poolOwnerOnlyXML("i-1"),
+	} {
+		f := newFakeEC2(t)
+		f.respond = func(string, url.Values) (int, string) { return http.StatusOK, describeReply("", item) }
+		if _, ok, err := newTestProvider(t, f, nil).Hosts().Find(t.Context(), "o-1"); !errors.Is(err, ErrNotAPoolHost) || ok {
+			t.Errorf("%s: find = %t, %v", name, ok, err)
+		}
 	}
 }
 
@@ -322,6 +325,56 @@ func TestAHostLaunchIsRedactedOnEveryRenderingPath(t *testing.T) {
 	for _, out := range []string{text.String(), asJSON.String()} {
 		if !strings.Contains(out, "user data redacted") || strings.Contains(out, "token-9QX") {
 			t.Errorf("slog = %s", out)
+		}
+	}
+}
+
+// A SHORT TOKEN FITS AN ERROR CODE'S SHAPE, so a launch refusal names only a code billet
+// knows, and still keeps the ones it branches on.
+func TestALaunchRefusalNamesOnlyKnownCodes(t *testing.T) {
+	t.Parallel()
+	for code, keep := range map[string]bool{"tokenQX9ABCDEF": false, "VcpuLimitExceeded": true, "InsufficientInstanceCapacity": true} {
+		f := newFakeEC2(t)
+		f.respond = func(action string, _ url.Values) (int, string) {
+			if action == "RunInstances" {
+				return http.StatusBadRequest, apiFailure(code)
+			}
+
+			return http.StatusOK, defaultReply(action)
+		}
+		_, err := newTestProvider(t, f, nil).Hosts().Launch(t.Context(), hostLaunch())
+		got, ok := codeOf(err)
+		switch {
+		case keep && (!ok || got != code):
+			t.Errorf("%s: the code was lost: %v", code, err)
+		case !keep && strings.Contains(err.Error(), code):
+			t.Errorf("%s: an unknown code was rendered: %v", code, err)
+		}
+	}
+}
+
+// WHAT ANSWERED IS NOT QUOTED ON ANY CALL: an unparsable Location fails before any
+// redirect policy runs and net/http renders it, and an XML error repeats the answer.
+func TestNoCallQuotesWhatAnswered(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		status   int
+		reply    string
+		location string
+	}{
+		"malformed redirect": {http.StatusTemporaryRedirect, ``, "/%zz/token-9QX"},
+		"unparsable answer":  {http.StatusOK, `<DescribeInstancesResponse><token-9QX></DescribeInstancesResponse>`, ""},
+	} {
+		f := newFakeEC2(t)
+		f.redirectTo = c.location
+		f.respond = func(string, url.Values) (int, string) { return c.status, c.reply }
+		h := newTestProvider(t, f, nil).Hosts()
+		_, err := h.Describe(t.Context(), "i-1")
+		if err == nil || strings.Contains(err.Error(), "token-9QX") {
+			t.Errorf("%s: describe = %v", name, err)
+		}
+		if _, _, err := h.Find(t.Context(), "o-1"); err == nil || strings.Contains(err.Error(), "token-9QX") {
+			t.Errorf("%s: find = %v", name, err)
 		}
 	}
 }

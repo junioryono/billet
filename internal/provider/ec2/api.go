@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -251,7 +252,9 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 				return nil
 			}
 
-			err = fmt.Errorf("ec2: parse the api response: %w", err)
+			// NOT QUOTED: an XML syntax error repeats part of the answer, and an
+			// answer can carry the request back.
+			err = errUnparsable
 		}
 
 		lastErr = err
@@ -332,7 +335,7 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 			return nil, err
 		}
 
-		return nil, fmt.Errorf("ec2: call the api: %w", err)
+		return nil, fmt.Errorf("ec2: call the api: %w", transportFailure(err))
 	}
 
 	defer func() { _ = resp.Body.Close() }()
@@ -341,7 +344,7 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 	// unbounded read is an allocation sized by whatever answered.
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, fmt.Errorf("ec2: read the api response: %w", err)
+		return nil, fmt.Errorf("ec2: read the api response: %w", transportFailure(err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -349,6 +352,33 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 	}
 
 	return payload, nil
+}
+
+// errUnparsable is an answer that would not parse. Its text is not kept.
+var errUnparsable = errors.New("ec2: parse the api response: the answer would not parse, and is not quoted")
+
+// errAnswerWithheld is a failure made of what answered (a Location that would not
+// parse, a body or trailer that would not read), whose text is not kept.
+var errAnswerWithheld = errors.New("the answer could not be read, and is not quoted")
+
+// transportFailure keeps what the network said and drops what the answer said. A
+// dial, a reset or a DNS failure names only the configured endpoint; an error built
+// from the answer (net/http quotes an unparsable Location before any redirect policy
+// runs, and a malformed trailer line) can carry the request, and its session token,
+// back. A cancelled or expired context stays itself.
+func transportFailure(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	}
+	if opErr, ok := errors.AsType[*net.OpError](err); ok {
+		return opErr
+	}
+	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
+		return dnsErr
+	}
+
+	return errAnswerWithheld
 }
 
 // errorResponse is the shape the query API uses for a refusal.
