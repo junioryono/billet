@@ -30,9 +30,15 @@
       - "'hostvars[item].billet_config' in billet_gate_node_hosts_source"
       - "'billet_effective_config' not in billet_gate_node_hosts_source"
       - "'billet_retirement_collect_vars.billet_config.node' in billet_gate_collect_host_source"
+      # The node's own document, with the mirrors the role gave it named as the
+      # ordinary converge names them (role_registry_mirrors), and nothing else.
       - >-
-        "template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config}"
+        "template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config\n"
         in billet_gate_collect_host_source
+      - >-
+        "| junioryono.billet.role_registry_mirrors(" in
+        (billet_gate_collect_host_source.split("template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config\n")[1]
+         .split('}) }}')[0].split() | join(' '))
       - "'billet_effective_config' not in billet_gate_collect_source"
       - "'billet_effective_config' not in billet_gate_collect_host_source"
       - >-
