@@ -173,7 +173,7 @@ func (p *Provider) VerifyImage(ctx context.Context, spec VerifySpec) error {
 	nonce := hex.EncodeToString(raw)
 
 	// THE IMAGE SAYS WHICH SCRIPT, and which contract it answers to: x86_64 is as true
-	// of a Windows AMI as of a Linux one (ADR-024).
+	// of a Windows AMI as of a Linux one (ADR-026).
 	var (
 		script string
 		schema reportSchema

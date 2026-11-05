@@ -252,7 +252,7 @@ type BuildSpec struct {
 	CACertPEM string
 
 	// Windows says BaseImage is a Windows AMI and the image is built from GitHub's
-	// windows-2025 template rather than its ubuntu-24.04 one (ADR-024). The operator
+	// windows-2025 template rather than its ubuntu-24.04 one (ADR-026). The operator
 	// says so and launchBuilder holds it to what the base image reports, both ways.
 	Windows bool
 

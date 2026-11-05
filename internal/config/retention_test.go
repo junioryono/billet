@@ -51,3 +51,46 @@ func TestJobDetailRetentionDefaultsAndIsCheckedOnLoad(t *testing.T) {
 		}
 	}
 }
+
+// A JOB'S TEST RESULTS HAVE THEIR OWN RETENTION AND A BOUND ON THEIR SIZE, each with a
+// default and checked when the file is read, in both directions.
+func TestTestResultsRetentionAndBoundAreCheckedOnLoad(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load(writeConfig(t, validConfig))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, err := cfg.Server.TestResultsRetentionDuration(); err != nil || got != 14*24*time.Hour {
+		t.Errorf("absent, the retention is %s (%v), want 14 days", got, err)
+	}
+	if got, err := cfg.Server.TestResultsBound(); err != nil || got != 128*MiB {
+		t.Errorf("absent, the bound is %s (%v), want 128MiB", got, err)
+	}
+
+	cfg, err = Load(writeConfig(t, withServerKey("test_results_retention: 1h")))
+	if err != nil {
+		t.Fatalf("Load with a retention of an hour: %v", err)
+	}
+	if got, err := cfg.Server.TestResultsRetentionDuration(); err != nil || got != time.Hour {
+		t.Errorf("1h reads as %s (%v)", got, err)
+	}
+	cfg, err = Load(writeConfig(t, withServerKey("test_results_max_bytes: 1MiB")))
+	if err != nil {
+		t.Fatalf("Load with a bound of 1MiB: %v", err)
+	}
+	if got, err := cfg.Server.TestResultsBound(); err != nil || got != MiB {
+		t.Errorf("1MiB reads as %s (%v)", got, err)
+	}
+
+	for _, tc := range []struct{ key, says string }{
+		{"test_results_retention: 59m", "shorter than an hour"},
+		{"test_results_retention: 14d", "not a duration"},
+		{"test_results_max_bytes: 1KiB", "is under"},
+	} {
+		_, err := Load(writeConfig(t, withServerKey(tc.key)))
+		if err == nil || !strings.Contains(err.Error(), tc.says) {
+			t.Errorf("%s: %v, want a refusal saying %q", tc.key, err, tc.says)
+		}
+	}
+}

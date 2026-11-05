@@ -33,8 +33,8 @@ type nodeRow struct {
 const CacheAuthorityWireVersion = 23
 
 // WindowsGuestsWireVersion is the oldest wire a node boots a Windows guest on,
-// mirrored from nodeapi.VersionWindowsGuests for the same reason (ADR-024).
-const WindowsGuestsWireVersion = 38
+// mirrored from nodeapi.VersionWindowsGuests for the same reason (ADR-026).
+const WindowsGuestsWireVersion = 39
 
 // guestWireFloor is the oldest wire a host can start the tier's guest on at all,
 // which no report asks what the tier would have without.

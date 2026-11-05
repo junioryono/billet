@@ -133,7 +133,7 @@ type Spec struct {
 	Arch config.Arch
 	// GuestOS is what the lease boots, as it was snapshotted at reservation, and
 	// empty means Linux, which every lease from before it recorded one is. Only ec2
-	// reads it: the boot script is a different language on Windows (ADR-024), and
+	// reads it: the boot script is a different language on Windows (ADR-026), and
 	// its AMI is asked whether it agrees.
 	GuestOS config.GuestOS
 	// AuthorizeShape atomically changes that charge before EC2 attempts a

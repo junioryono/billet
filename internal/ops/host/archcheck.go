@@ -53,7 +53,7 @@ func ec2TierArchMismatch(cfg *config.Config, images []ec2.ImageInfo) error {
 
 // ec2TierGuestOSMismatch reports each EC2 tier whose guest_os and AMI disagree, either
 // way: every launch of such a tier is refused, so the operator hears it here rather
-// than from a queue (ADR-024). An image not found says nothing, and is reported above.
+// than from a queue (ADR-026). An image not found says nothing, and is reported above.
 func ec2TierGuestOSMismatch(cfg *config.Config, images []ec2.ImageInfo) error {
 	known := make(map[string]bool, len(images))
 	stock := make(map[string]bool, len(images))

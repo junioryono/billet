@@ -73,7 +73,7 @@ The builder checks the Actions runner tarball against the sha256 billet pins for
 
 ## Windows jobs
 
-An `ec2` tier can run Windows jobs on an AMI billet builds in your account from Amazon's license-included Windows Server 2025 image ([ADR-024](../reference/decisions/adr-024-windows-on-ec2.md)).
+An `ec2` tier can run Windows jobs on an AMI billet builds in your account from Amazon's license-included Windows Server 2025 image ([ADR-026](../reference/decisions/adr-026-windows-on-ec2.md)).
 
 ```bash
 BASE=$(aws ssm get-parameter --region us-west-2 \
@@ -98,7 +98,7 @@ tiers:
 
 The trust rules are the Linux instance's: untrusted work needs `untrusted_security_group_ids`, gets no instance profile, and the metadata service is IMDSv2 with one hop. The job's runner runs as the local administrator `runner`, as GitHub's runs as `runneradmin`, so a job can install software; the instance is the boundary, and it is destroyed with the job.
 
-A Windows image carries what the floor in ADR-024 lists, not what GitHub's hosted `windows-2025` carries: no Visual Studio, no Docker, no Java or .NET SDK beyond what Windows ships, no Windows updates past the base image's month. `actions/setup-*` downloads what is missing. `differences-windows.tsv` lists every step of GitHub's template the build leaves out and why. billet's caches have no client in a Windows guest, so a Windows tier sets no `cache`, `intercept` or `cache_scope`.
+A Windows image carries what the floor in ADR-026 lists, not what GitHub's hosted `windows-2025` carries: no Visual Studio, no Docker, no Java or .NET SDK beyond what Windows ships, no Windows updates past the base image's month. `actions/setup-*` downloads what is missing. `differences-windows.tsv` lists every step of GitHub's template the build leaves out and why. billet's caches have no client in a Windows guest, so a Windows tier sets no `cache`, `intercept` or `cache_scope`.
 
 A first boot is the slow part: a job started about two minutes after its launch where a Linux one takes under one, so count that against a tier's wait. GitHub takes back an assignment left unstarted after five minutes, so every Windows launch asks EBS to read the image's snapshot at a provisioned 200 MiB/s. AWS charges that once per launch on the snapshot's full size, about $0.09 on a 36 GiB image, on top of the instance and its volume. Linux containers inside a Windows guest are out of scope.
 

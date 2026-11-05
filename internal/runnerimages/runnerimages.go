@@ -65,7 +65,7 @@ var toolset []byte
 var toolsetArm64 []byte
 
 // toolsetWindows2025 is GitHub's declaration of the windows-2025 image, verbatim
-// (ADR-024).
+// (ADR-026).
 //
 //go:embed toolset-2025.json
 var toolsetWindows2025 []byte
@@ -115,7 +115,7 @@ const (
 
 // Windows2025 names the windows-2025 declaration wherever an architecture names an
 // ubuntu-24.04 one. GitHub publishes it for x64 alone at the pinned commit, so one
-// name is the whole of what a Windows AMI's build has to choose (ADR-024).
+// name is the whole of what a Windows AMI's build has to choose (ADR-026).
 const Windows2025 = "windows-2025"
 
 // PinnedSHA256For is the digest the vendored toolset of arch must have, or an

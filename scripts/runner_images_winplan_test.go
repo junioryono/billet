@@ -321,7 +321,7 @@ func TestEveryWindowsDifferenceNamesAStepAndEveryUnrunnableStepIsOne(t *testing.
 	}
 }
 
-// windowsFloor is the declaration floor ADR-024 records: what a job on a Windows AMI
+// windowsFloor is the declaration floor ADR-026 records: what a job on a Windows AMI
 // finds, each by the step of GitHub's that installs it. A step dropped from here or
 // skipped in the list is a claim in that record gone false.
 var windowsFloor = []string{
@@ -353,7 +353,7 @@ func TestTheWindowsFloorRunsAndWhatItLeavesOutDoesNot(t *testing.T) {
 			t.Fatalf("the plan has no step %s", id)
 		}
 		if _, skipped := skips[id]; skipped {
-			t.Errorf("%s is the floor ADR-024 records, and is skipped", id)
+			t.Errorf("%s is the floor ADR-026 records, and is skipped", id)
 		}
 		if at < last {
 			t.Errorf("%s runs earlier than the floor's order says", id)
@@ -376,7 +376,7 @@ func TestTheWindowsFloorRunsAndWhatItLeavesOutDoesNot(t *testing.T) {
 // EVERY SCRIPT BILLET WRITES PARSES, by PowerShell's own parser, on a machine that has
 // one. THAT PARSER IS PowerShell 7's, which accepts syntax the Windows PowerShell 5.1 these
 // scripts run under does not, so this catches what is broken in both and not what is
-// new in 7: a real build on Windows is what proves that (ADR-024).
+// new in 7: a real build on Windows is what proves that (ADR-026).
 func TestTheWindowsScriptsParse(t *testing.T) {
 	t.Parallel()
 

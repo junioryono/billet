@@ -262,6 +262,11 @@ type openMode struct {
 	// existingLocal refuses local preparation and opens only an existing lock.
 	existingLocal bool
 
+	// readerConns sizes the reader pool, zero meaning defaultReaderConns, and
+	// readerIdle is how long an idle reader stays, zero meaning readerIdleTime.
+	readerConns int
+	readerIdle  time.Duration
+
 	// release is the billet opening the ledger, for the release watermark, or
 	// empty for a caller that named none and gets neither the check nor the
 	// record. See WithRunningRelease.
@@ -291,6 +296,44 @@ func (m openMode) budget() time.Duration {
 // nothing to undo.
 func (m openMode) records() bool {
 	return !m.admin && !m.maintenanceProbe && !m.standby && !m.inspect && !m.completion
+}
+
+// defaultReaderConns is the reader pool of an open that names no size, and
+// readerIdleTime how long a reader nothing has borrowed stays connected.
+//
+// maxIdleReaders is how many of a burst's readers are kept for the next one. KEPT TO
+// database/sql's own two: keeping all four raised fifty idle control planes' highest sample
+// from 200 PostgreSQL connections to 226 and left what they settled at, four each, unchanged
+// (2026-11-04, docs/reference/records/idle-control-plane.md).
+const (
+	defaultReaderConns = 4
+	maxIdleReaders     = 2
+	readerIdleTime     = time.Minute
+)
+
+// readers is the size of this open's reader pool.
+func (m openMode) readers() int {
+	if m.readerConns > 0 {
+		return m.readerConns
+	}
+
+	return defaultReaderConns
+}
+
+// idleReaders is how long a reader nothing has borrowed stays connected.
+func (m openMode) idleReaders() time.Duration {
+	if m.readerIdle > 0 {
+		return m.readerIdle
+	}
+
+	return readerIdleTime
+}
+
+// WithReaderConns sizes the reader pool, which is how a deployment's connection
+// budget reaches an open. Never the writer's: one writer within the process is
+// what serializes an allocation decision, and no option can widen it.
+func WithReaderConns(n int) OpenOption {
+	return func(m *openMode) { m.readerConns = n }
 }
 
 // with applies the caller's options to a mode.
@@ -417,7 +460,14 @@ func openDir(
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("open state db (reader): %w", err), w.Close(), lock.release())
 	}
-	r.SetMaxOpenConns(4)
+	// AN IDLE DEPLOYMENT HOLDS ONLY THE READERS ITS OWN CADENCE KEEPS IN USE, and a
+	// busy one keeps every reader it has between bursts, rather than reconnecting
+	// on each. What this saves is measured in
+	// docs/reference/records/idle-control-plane.md.
+	readers := mode.readers()
+	r.SetMaxOpenConns(readers)
+	r.SetMaxIdleConns(min(readers, maxIdleReaders))
+	r.SetConnMaxIdleTime(mode.idleReaders())
 
 	db := &DB{
 		w:                 w,
@@ -597,6 +647,11 @@ func openDir(
 			// lock: verify, re-verify inside every transaction, and refuse only if
 			// it would have had to write. A control plane is refused outright.
 			if !admin || !errors.Is(err, ErrControllerHeld) {
+				return nil, errors.Join(err, db.Close())
+			}
+
+			// THE SESSION IT ASKED ON GOES WITH THE ANSWER. Only a standby asks again.
+			if err := be.releaseController(); err != nil {
 				return nil, errors.Join(err, db.Close())
 			}
 

@@ -41,7 +41,7 @@ billet is pre-alpha. This page says what has actually run, by backend, against r
 
 ## Not built
 
-A dashboard; keeping and searching job logs ([#534](https://github.com/junioryono/billet/issues/534)) and attaching to a running job ([#533](https://github.com/junioryono/billet/issues/533)), each decided in its own issue (a job's timeline, from the run id GitHub shows, is `billet jobs show --run`); a billet node running on Windows, or Windows on a host you own ([ADR-024](decisions/adr-024-windows-on-ec2.md) runs Windows jobs on EC2 and records what either would cost); a Terraform provider (deferred by [ADR-004](decisions/adr-004-terraform-provider.md)); billet-built macOS guest images; an Apple Silicon cache.
+A dashboard; keeping and searching job logs ([#534](https://github.com/junioryono/billet/issues/534)) and attaching to a running job ([#533](https://github.com/junioryono/billet/issues/533)), each decided in its own issue (a job's timeline, from the run id GitHub shows, is `billet jobs show --run`); a billet node running on Windows, or Windows on a host you own ([ADR-026](decisions/adr-026-windows-on-ec2.md) runs Windows jobs on EC2 and records what either would cost); a Terraform provider (deferred by [ADR-004](decisions/adr-004-terraform-provider.md)); billet-built macOS guest images; an Apple Silicon cache.
 
 ## Compatibility caveats
 

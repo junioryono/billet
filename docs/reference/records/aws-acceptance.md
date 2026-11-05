@@ -612,7 +612,7 @@ So an on-demand Linux build is a per-job boundary the way an `ec2` instance is: 
 
 ## Windows jobs (2026-11-05)
 
-Three Windows jobs ran end to end through a billet tier on 2026-11-05 ([ADR-024](../decisions/adr-024-windows-on-ec2.md), #532), on an AMI `billet ami build --os windows` built from `ami-018876cb673bc1709` (`Windows_Server-2025-English-Full-Base-2026.10.14`) in us-west-2.
+Three Windows jobs ran end to end through a billet tier on 2026-11-05 ([ADR-026](../decisions/adr-026-windows-on-ec2.md), #532), on an AMI `billet ami build --os windows` built from `ami-018876cb673bc1709` (`Windows_Server-2025-English-Full-Base-2026.10.14`) in us-west-2.
 
 **The build.** Run from an orchestrator instance whose role held what `billet init iam --account-wide --builder --payload-bucket …` printed, and AWS's `AmazonSSMManagedInstanceCore` to reach the instance, so the build ran under billet's own IAM and not an administrator's. The builder, a `c7i.4xlarge` with its 150 GiB default root, reported `verdict=ok` 50 minutes after launch and stopped itself with `Client.InstanceInitiatedShutdown` a minute and a half later; the image took 34 minutes to become available and the verifier 8 min 30 s, after which billet stamped `ami-05233187db2ea237a` with Windows AMI contract 1. The verifier's report, read as `runner`, through a scheduled task set as the runner's is:
 
@@ -625,7 +625,7 @@ tc_ruby=3.2.11 3.3.13 3.4.12 4.0.9 tc_pypy=3.9.19 3.10.16
 page_file_mb=1408 priority=Normal root_used_gib=25.6 root_free_gib=123.9
 ```
 
-Getting there took four real builds, each of which found what no test off Windows could: the AWS Tools on Amazon's AMI were not where the first prepare looked, SYSTEM has no `Documents` folder and so no profile for PowerHTML, the page file left in the image cost every job its assignment, and a job's first reads needed a provisioned rate on top. ADR-024 has each, measured.
+Getting there took four real builds, each of which found what no test off Windows could: the AWS Tools on Amazon's AMI were not where the first prepare looked, SYSTEM has no `Documents` folder and so no profile for PowerHTML, the page file left in the image cost every job its assignment, and a job's first reads needed a provisioned rate on top. ADR-026 has each, measured.
 
 **The jobs.** `billet acceptance up` from a config holding one untrusted `ec2` tier on that AMI (`c7i.xlarge`, the egress-only group as its untrusted group), then three dispatches of the testbed's `windows` workflow at once. Each launched within four seconds of its dispatch and each succeeded, and the ledger agrees:
 
@@ -639,7 +639,7 @@ Every step passed in all three: `actions/checkout`, a `pwsh` step reporting Powe
 
 **Before the provisioned rate**, on the debug image of the same build, two `queue` jobs had each been launched, booted for five minutes, had their assignment cancelled by GitHub unstarted, and been withdrawn and destroyed by billet, with the lease released and the sweep clean, which is the path a slow boot takes. A third, after the page file was gone, started 311 s after launch, 14 s inside the window.
 
-**What it does not prove.** Visual Studio, Docker and the rest of what ADR-024's parity table leaves out were not exercised, because the image does not carry them. A tier at scale, Spot, and a node below wire 38 meeting a Windows tier are covered by tests and not by this run. The jobs were three; a fleet's cold-start distribution is not.
+**What it does not prove.** Visual Studio, Docker and the rest of what ADR-026's parity table leaves out were not exercised, because the image does not carry them. A tier at scale, Spot, and a node below wire 39 meeting a Windows tier are covered by tests and not by this run. The jobs were three; a fleet's cold-start distribution is not.
 
 ## What this does not prove
 

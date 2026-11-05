@@ -130,6 +130,12 @@ type Tier struct {
 	VCPU   int      `yaml:"vcpu"`
 	Memory ByteSize `yaml:"memory"`
 
+	// MinuteWeight is what one minute of this tier counts as in `billet usage
+	// export`, in minutes of a 2 vCPU Linux runner. Absent, it is the vCPU charged
+	// over two. It reports and decides nothing: no scheduling code reads it, and
+	// TestNoSchedulerReadsAMinuteWeight holds that.
+	MinuteWeight MinuteWeight `yaml:"minute_weight,omitempty"`
+
 	// Sizes expands this entry into one tier per vCPU count, most operators'
 	// single largest source of hand-written YAML.
 	//
@@ -373,7 +379,7 @@ const DefaultMacOSVMLimit = 2
 const MinMacOSGuestMemory ByteSize = 4 * GiB
 
 // WindowsRunnerCommand is what starts the runner on a Windows AMI `billet ami build`
-// made, and the path that build installs it at (ADR-024).
+// made, and the path that build installs it at (ADR-026).
 const WindowsRunnerCommand = `C:\billet\billet-runner.ps1`
 
 const (
@@ -526,12 +532,12 @@ func (t Tier) GuestOSProviderErrors(where string) []error {
 				"EC2 AMI, so a codebuild Windows tier would start a build that registers "+
 				"nothing", where))
 
-		// EC2 IS THE ONE BACKEND WITH A WINDOWS RUNNER (ADR-024). Firecracker boots no
+		// EC2 IS THE ONE BACKEND WITH A WINDOWS RUNNER (ADR-026). Firecracker boots no
 		// Windows guest and docker's are Linux containers, so a tier that could land
 		// on either would bind there and start something that never registers.
 		case t.GuestOS == GuestWindows && p != ProviderEC2:
 			errs = append(errs, fmt.Errorf("%s: guest_os windows runs only on the ec2 provider "+
-				"(ADR-024), and this tier also accepts %q", where, p))
+				"(ADR-026), and this tier also accepts %q", where, p))
 		}
 	}
 
@@ -827,6 +833,9 @@ func (c *Config) validateTiers() []error {
 		if t.VCPU <= 0 {
 			errs = append(errs, fmt.Errorf("%s: vcpu must be positive", where))
 		}
+		if t.MinuteWeight < 0 {
+			errs = append(errs, fmt.Errorf("%s: minute_weight must be positive", where))
+		}
 		if t.Memory <= 0 {
 			errs = append(errs, fmt.Errorf("%s: memory must be positive", where))
 		}
@@ -1117,7 +1126,7 @@ func (t Tier) windowsTierErrors(where string) []error {
 
 	if t.Cache != nil || t.Intercept || t.CacheScope != nil {
 		errs = append(errs, fmt.Errorf("%s: a Windows guest has no client for billet's caches "+
-			"(ADR-024), so cache, intercept and cache_scope would do nothing here; remove them",
+			"(ADR-026), so cache, intercept and cache_scope would do nothing here; remove them",
 			where))
 	}
 

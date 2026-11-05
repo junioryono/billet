@@ -453,6 +453,20 @@ func (c *Config) validateTargetKeyPaths() []error {
 		return nil
 	}
 
+	// A BROKER HOLDS THE KEYS, so a path beside it is a key this host was told it
+	// does not hold, and nothing would read it.
+	if c.Server.TokenBroker != nil {
+		for _, t := range c.GitHubTargets() {
+			if t.PrivateKeyPath != "" {
+				errs = append(errs, fmt.Errorf("%s.private_key_path is written and server.token_broker is "+
+					"set. A deployment taking its tokens from a broker holds no App key: remove the path, and "+
+					"remove the file", t.Where()))
+			}
+		}
+
+		return errs
+	}
+
 	// ONE KEY FILE PER TARGET. Two targets naming one path would load one App's
 	// key for both identities, and a backup would archive the same bytes as two
 	// credentials; the restore planner would then publish one and refuse the

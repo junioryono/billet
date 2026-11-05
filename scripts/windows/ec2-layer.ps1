@@ -1,4 +1,4 @@
-# ec2-layer.ps1: billet's layer over GitHub's steps on a Windows AMI (ADR-024): the
+# ec2-layer.ps1: billet's layer over GitHub's steps on a Windows AMI (ADR-026): the
 # runner, checked against its pinned digest before it is unpacked, the `runner` account
 # and the entry points a tier names. Run by build-ami.ps1 as one step, as SYSTEM.
 #

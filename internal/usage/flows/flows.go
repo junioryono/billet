@@ -19,6 +19,7 @@ package flows
 
 import (
 	"cmp"
+	"maps"
 	"net/netip"
 	"slices"
 	"sync"
@@ -41,6 +42,46 @@ const MaxFlows = 1 << 16
 // guest asks DHCP for its address after it boots, the node reads the lease up
 // to an interval later, and the tracker reports a flow's end only once.
 const MaxUnclaimed = 4096
+
+// MaxDroppedSources is how many sources the unclaimed ring's drops are told
+// apart for. Past it they are folded into one record, which any job granted
+// before its times may have lost a flow to, so a host seeing connections from
+// more addresses than this costs jobs a wider mark and the node no more memory.
+const MaxDroppedSources = 4096
+
+// Why a job's result is Incomplete, as Result.IncompleteWhy names it.
+const (
+	// WhyEventsGap: the tracker's events were not all read while the job held
+	// its address.
+	WhyEventsGap = "events_gap"
+	// WhyDropped: the unclaimed ring dropped a flow from the job's own address
+	// that it may have owned, before the node had learned that address.
+	WhyDropped = "unclaimed_dropped"
+	// WhyDroppedUntold: the ring dropped a flow since the grant whose source was
+	// no longer told apart, past MaxDroppedSources.
+	WhyDroppedUntold = "unclaimed_dropped_untold"
+	// WhyNoStart: a flow from the job's address carried no start time.
+	WhyNoStart = "no_start_time"
+	// WhyTooManyFlows: the job opened more than MaxFlows.
+	WhyTooManyFlows = "too_many_flows"
+	// WhyInherited: the guest sent on an entry its address's previous holder left.
+	WhyInherited = "inherited_entry"
+	// WhyAddressChanged: the guest's lease came to name another address.
+	WhyAddressChanged = "address_changed"
+	// WhyLeaseUnread: the guest's lease could not be read back once its address
+	// was known.
+	WhyLeaseUnread = "lease_unread"
+	// WhyTableUnread: the tracker's table could not be read for the job's address.
+	WhyTableUnread = "table_unread"
+	// WhyGrantAmbiguous: the grant fell in the launch's own second, so it could
+	// be the previous guest's renewal.
+	WhyGrantAmbiguous = "grant_ambiguous"
+	// WhyGrantLate: the grant came over half a lease after the launch, so it may
+	// be a renewal hiding earlier flows.
+	WhyGrantLate = "grant_late"
+	// WhySyncUnproved: the end of the job's flows could not be proved read.
+	WhySyncUnproved = "sync_unproved"
+)
 
 // SlowReply is the wait for a flow's first packet back past which it is slow:
 // TCP's initial retransmission timeout (RFC 6298), so a connect slower than it
@@ -146,6 +187,9 @@ type Result struct {
 	// guest's traffic joined an entry its address's previous holder left, or
 	// its address changed. The totals are then a lower bound, and say so.
 	Incomplete bool
+	// IncompleteWhy names each reason it is Incomplete, sorted, from the Why
+	// constants; empty when it is not.
+	IncompleteWhy []string
 	// UnansweredUnknown says a flow of the job's, or an entry its address's
 	// previous holder left, carried no packet counts in either direction, which
 	// no flow has while the tracker keeps them, so no destination's Unanswered
@@ -165,20 +209,16 @@ type Accountant struct {
 	byKey  map[string]*watch
 	byAddr map[netip.Addr]*watch
 	// unclaimed is a ring of the latest flows no watched job held, replayed to
-	// a job when its address is learned, and evictedStart the latest start of
-	// a flow the ring has dropped: a job whose time began before it may have
-	// lost a flow to the ring.
-	unclaimed    []Flow
-	next         int
-	evictedStart time.Time
-	// evictedUnstamped is when the ring last dropped a flow with no start
-	// time: whose it was cannot be told, so every job granted before then may
-	// have lost it.
-	evictedUnstamped time.Time
-	// evictedCounterless is the latest start of a flow the ring dropped that
-	// carried no packet counts, or when it dropped one with no start: a job
-	// granted its address at or before it may have lost a stall with it.
-	evictedCounterless time.Time
+	// a job when its address is learned.
+	unclaimed []Flow
+	next      int
+	// droppedFrom says, by source, what the ring has dropped. A flow is a job's
+	// only if its source is the job's address, so a drop from any other source
+	// is no flow that job lost, however busy the host. droppedUntold is what was
+	// folded out of it past MaxDroppedSources, whose sources are no longer told
+	// apart, so any job may have lost those.
+	droppedFrom   map[netip.Addr]dropped
+	droppedUntold dropped
 	// down says the tracker's events are not being read now, and lossEnded
 	// when the latest such gap closed: a job whose time overlaps either may be
 	// missing flows.
@@ -194,6 +234,39 @@ type Accountant struct {
 	now func() time.Time
 }
 
+// dropped is what the unclaimed ring has dropped.
+type dropped struct {
+	// start is the latest start of a flow it dropped: a job whose time began at
+	// or before it may have lost that flow.
+	start time.Time
+	// unstamped is when it last dropped a flow with no start time, which could
+	// have been opened at any time before then.
+	unstamped time.Time
+	// counterless is the latest start of a flow it dropped that carried no packet
+	// counts, or when it dropped one with no start: a job granted its address at
+	// or before it may have lost a stall with it.
+	counterless time.Time
+}
+
+// lost says a job granted its address at since may have lost a flow to d.
+func (d dropped) lost(since time.Time) bool {
+	return !d.start.Before(since) || !d.unstamped.Before(since)
+}
+
+// merged is d and other's latest times.
+func (d dropped) merged(other dropped) dropped {
+	return dropped{start: later(d.start, other.start), unstamped: later(d.unstamped, other.unstamped),
+		counterless: later(d.counterless, other.counterless)}
+}
+
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+
+	return a
+}
+
 type watch struct {
 	addr netip.Addr
 	// since and until bound the flows that are this job's by when they
@@ -207,8 +280,10 @@ type watch struct {
 	// readings they had when the job began. Traffic the guest sends on one of
 	// those tuples is added to the old entry, whose start is the old holder's,
 	// so it cannot be counted, only noticed.
-	inherited  map[entry]Flow
-	incomplete bool
+	inherited map[entry]Flow
+	// why holds each reason the job's result is incomplete, from the Why
+	// constants: nil while there is none.
+	why map[string]struct{}
 	// unansweredUnknown says a flow that could be the job's and was not
 	// counted carried no packet counts: an entry the previous holder left open,
 	// whose tuple the guest could reuse unnoticed, a flow with no start time,
@@ -223,6 +298,14 @@ type watch struct {
 	generations map[generationKey]generation
 }
 
+// mark says the job's result is incomplete, and why.
+func (w *watch) mark(why string) {
+	if w.why == nil {
+		w.why = map[string]struct{}{}
+	}
+	w.why[why] = struct{}{}
+}
+
 // generation is one flow of an id as its events told it: when its new event
 // was read, and, once its first reply was, how long it waited.
 type generation struct {
@@ -234,7 +317,7 @@ type generation struct {
 // NewAccountant returns an Accountant watching nothing.
 func NewAccountant() *Accountant {
 	return &Accountant{byKey: map[string]*watch{}, byAddr: map[netip.Addr]*watch{}, now: time.Now,
-		repliesDown: true}
+		droppedFrom: map[netip.Addr]dropped{}, repliesDown: true}
 }
 
 // Watch starts attributing flows from addr to the job named key, counting only
@@ -264,13 +347,19 @@ func (a *Accountant) Watch(key string, addr netip.Addr, since time.Time, open []
 	w := &watch{addr: addr, since: since, counted: map[entry]Flow{}, inherited: map[entry]Flow{},
 		generations: map[generationKey]generation{}}
 
-	// A GAP IN THE EVENTS, OR A FLOW THE RING DROPPED, SINCE THE GRANT: either
-	// may have been this guest's.
-	if a.down || !a.lossEnded.Before(since) || !a.evictedStart.Before(since) ||
-		!a.evictedUnstamped.Before(since) {
-		w.incomplete = true
+	// A GAP IN THE EVENTS, OR A FLOW THE RING DROPPED FROM THIS ADDRESS, SINCE THE
+	// GRANT: either may have been this guest's.
+	if a.down || !a.lossEnded.Before(since) {
+		w.mark(WhyEventsGap)
 	}
-	if !a.evictedCounterless.Before(since) {
+	own := a.droppedFrom[addr]
+	if own.lost(since) {
+		w.mark(WhyDropped)
+	}
+	if a.droppedUntold.lost(since) {
+		w.mark(WhyDroppedUntold)
+	}
+	if !own.counterless.Before(since) || !a.droppedUntold.counterless.Before(since) {
 		w.unansweredUnknown = true
 	}
 	if a.repliesDown || !a.repliesLossEnded.Before(since) {
@@ -341,7 +430,7 @@ func (a *Accountant) observe(f Flow, ended bool) {
 	// NO START TIME, NO OWNER. The flow could be this guest's or the previous
 	// holder's, and counting it either way would be a guess.
 	if f.Start.IsZero() {
-		w.incomplete = true
+		w.mark(WhyNoStart)
 		w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&f)
 
 		return
@@ -360,7 +449,7 @@ func (a *Accountant) observe(f Flow, ended bool) {
 		// the guest can send on.
 		if base, inherited := w.inherited[key]; inherited {
 			if f.OrigPackets > base.OrigPackets {
-				w.incomplete = true
+				w.mark(WhyInherited)
 			}
 			w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&base)
 		}
@@ -375,7 +464,7 @@ func (a *Accountant) observe(f Flow, ended bool) {
 
 	prev, seen := w.counted[key]
 	if !seen && len(w.counted) >= MaxFlows {
-		w.incomplete = true
+		w.mark(WhyTooManyFlows)
 		w.unansweredUnknown = w.unansweredUnknown || uncountedPackets(&f)
 
 		return
@@ -459,25 +548,37 @@ func (a *Accountant) keepUnclaimed(f Flow) {
 		return
 	}
 
-	evicted := &a.unclaimed[a.next]
-	switch dropped := evicted.Start; {
-	case dropped.IsZero():
-		a.evictedUnstamped = a.now()
-	case dropped.After(a.evictedStart):
-		a.evictedStart = dropped
+	a.noteDropped(&a.unclaimed[a.next])
+	a.unclaimed[a.next] = f
+	a.next = (a.next + 1) % MaxUnclaimed
+}
+
+// noteDropped records that the ring dropped f, under its source.
+func (a *Accountant) noteDropped(f *Flow) {
+	held, known := a.droppedFrom[f.Source]
+	switch {
+	case f.Start.IsZero():
+		held.unstamped = a.now()
+	case f.Start.After(held.start):
+		held.start = f.Start
 	}
-	if uncountedPackets(evicted) {
-		at := evicted.Start
+	if uncountedPackets(f) {
+		at := f.Start
 		if at.IsZero() {
 			at = a.now()
 		}
-		if at.After(a.evictedCounterless) {
-			a.evictedCounterless = at
-		}
+		held.counterless = later(held.counterless, at)
 	}
 
-	a.unclaimed[a.next] = f
-	a.next = (a.next + 1) % MaxUnclaimed
+	// PAST THE BOUND EVERY SOURCE IS FOLDED INTO ONE RECORD, which errs toward a
+	// job marked for a flow that was not its own and never away from one it lost.
+	if !known && len(a.droppedFrom) >= MaxDroppedSources {
+		for _, d := range a.droppedFrom {
+			a.droppedUntold = a.droppedUntold.merged(d)
+		}
+		clear(a.droppedFrom)
+	}
+	a.droppedFrom[f.Source] = held
 }
 
 // Down says the tracker's events stopped being read at the moment it is
@@ -490,7 +591,8 @@ func (a *Accountant) Down() {
 	a.down, a.repliesDown = true, true
 
 	for _, w := range a.byKey {
-		w.incomplete, w.untimed = true, true
+		w.mark(WhyEventsGap)
+		w.untimed = true
 	}
 }
 
@@ -518,14 +620,14 @@ func (a *Accountant) MarkUntimed(key string) {
 	}
 }
 
-// MarkIncomplete says key's flows can no longer all be told apart: its address
-// changed, or the end of its flows could not be proved read.
-func (a *Accountant) MarkIncomplete(key string) {
+// MarkIncomplete says key's flows can no longer all be told apart, for the
+// reason why names: one of the Why constants.
+func (a *Accountant) MarkIncomplete(key, why string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if w, ok := a.byKey[key]; ok {
-		w.incomplete = true
+		w.mark(why)
 	}
 }
 
@@ -619,7 +721,10 @@ func summarize(w *watch) Result {
 		return x.Addr.Compare(y.Addr)
 	})
 
-	r := Result{Incomplete: w.incomplete, UnansweredUnknown: unknown, RepliesTimed: !w.untimed}
+	r := Result{Incomplete: len(w.why) > 0, UnansweredUnknown: unknown, RepliesTimed: !w.untimed}
+	if r.Incomplete {
+		r.IncompleteWhy = slices.Sorted(maps.Keys(w.why))
+	}
 
 	if len(all) > MaxDestinations {
 		for _, d := range all[MaxDestinations:] {

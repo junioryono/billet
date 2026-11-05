@@ -7,7 +7,7 @@ import (
 )
 
 // A WINDOWS TIER RUNS ON EC2 AND NOWHERE ELSE: every other backend would bind it and
-// start something that never registers (ADR-024).
+// start something that never registers (ADR-026).
 func TestAWindowsTierRunsOnEC2AndNowhereElse(t *testing.T) {
 	t.Parallel()
 

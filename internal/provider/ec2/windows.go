@@ -104,7 +104,7 @@ func psQuote(value string) (string, error) {
 //
 // A CACHE FIELD IS REFUSED, NOT DROPPED. The node prepares no bearer for a Windows lease,
 // so one arriving here is a caller believing a cache exists; dropping it would be a job
-// that reads cold for a reason nothing says (ADR-024).
+// that reads cold for a reason nothing says (ADR-026).
 func windowsUserData(spec provider.Spec, launchEpochNS int64) (string, error) {
 	switch {
 	case spec.CacheEndpoint != "", spec.CacheToken != "", spec.ActionsProxy != "", spec.NpmProxy != "",

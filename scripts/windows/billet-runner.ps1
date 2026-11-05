@@ -1,4 +1,4 @@
-# billet-runner.ps1: the entry point a Windows tier names (ADR-024). EC2Launch runs
+# billet-runner.ps1: the entry point a Windows tier names (ADR-026). EC2Launch runs
 # billet's user data as the local Administrator, measured on Windows Server 2025, with
 # the registration in this process's environment, and this starts the runner as the
 # local administrator `runner`, GitHub's runneradmin in all but name.

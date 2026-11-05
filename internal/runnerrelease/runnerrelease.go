@@ -58,7 +58,7 @@ import (
 //
 // A SECOND BACKEND IS WHY THE TABLE EXISTS. A CodeBuild macOS build needs
 // `osx-arm64`, an arm64 Linux build needs `linux-arm64` and a Windows AMI needs
-// `win-x64` (a zip, not a tarball; ADR-024), and none of them was pinned
+// `win-x64` (a zip, not a tarball; ADR-026), and none of them was pinned
 // — so the alternative to this table was a constant somewhere else, which is the
 // two-pins problem wearing different clothes.
 //
