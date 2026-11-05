@@ -1021,62 +1021,80 @@ func (l *Listener) complete(ctx context.Context, job dispatch.Job) {
 	}
 }
 
+// deregisterCompleted withdraws a runner's GitHub registration and stops counting its
+// lease as a runner GitHub could still route a job to. It reports whether both are done:
+// a mark that failed is no error, since it only leaves the lease counted, but it is not
+// finished either, and a later attempt has to write it.
+func (l *Listener) deregisterCompleted(ctx context.Context, job dispatch.Job, lease *alloc.Lease) (bool, error) {
+	if l.registry == nil {
+		return true, nil
+	}
+
+	var binding alloc.PoolRunner
+	var err error
+	if lease != nil && lease.ID != "" {
+		binding, err = l.alloc.PoolRunnerByLease(ctx, lease.ID)
+	} else if job.RunnerName != "" {
+		binding, err = l.alloc.PoolRunnerByName(ctx, job.RunnerName)
+	}
+	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+		return false, fmt.Errorf("server: resolve runner registration before teardown: %w", err)
+	}
+	if errors.Is(err, alloc.ErrLeaseNotFound) && lease != nil && lease.ID != "" {
+		binding.RunnerName = provider.InstanceName(lease.ID)
+		err = nil
+	}
+	// Withdraw the registration by whatever identity is available: prefer the
+	// durable binding, fall back to the identity the completion itself carries
+	// (an id-only completion never populates the binding, which is resolved
+	// from the lease and runner name). Skip removal only when there is
+	// genuinely no registration to withdraw anywhere — no binding, no lease,
+	// no runner id or name — because RemoveRunner(0, "") is refused "needs an
+	// id or name" every time and would wedge the completion's capacity in an
+	// unbounded teardown retry. An absent registration needs no removal.
+	removeID, removeName := binding.RunnerID, binding.RunnerName
+	if removeID == 0 && removeName == "" {
+		removeID, removeName = job.RunnerID, job.RunnerName
+	}
+	// AN ID THE JOB CARRIES FOR THE SAME NAME IS KEPT, so the removal refuses a
+	// registration that has since taken the name under another id. An offline
+	// member's row has a name and no id, and the id its retirement withdrew
+	// arrives here only on the job.
+	if removeID == 0 && job.RunnerID > 0 && removeName == job.RunnerName {
+		removeID = job.RunnerID
+	}
+	if err == nil && (removeID > 0 || removeName != "") {
+		if err := l.registry.RemoveRunner(ctx, removeID, removeName); err != nil {
+			return false, fmt.Errorf("server: remove runner %q before teardown: %w", removeName, err)
+		}
+		// The runner is gone from GitHub. Stop counting this lease as a live
+		// runner even if the compute-destroy below retries, so a lingering
+		// teardown does not over-count against the assignment deficit. The
+		// mark is unfenced on purpose: a reap may quarantine this lease before
+		// we get here, and the runner is gone regardless. A failure here only
+		// leaves it counted, which is the safe direction.
+		if lease != nil && lease.ID != "" {
+			if err := l.alloc.MarkDeregistered(ctx, lease.ID); err != nil {
+				l.log.Warn("could not record runner deregistration; the lease stays counted until it terminalizes",
+					"tier", l.tier, "lease", lease.ID, "error", err)
+
+				return false, nil
+			}
+		}
+	}
+
+	return true, nil
+}
+
 func (l *Listener) destroyCompleted(
 	ctx context.Context,
 	job dispatch.Job,
 	lease *alloc.Lease,
 	outcome alloc.Phase,
 ) error {
-	if l.registry != nil {
-		var binding alloc.PoolRunner
-		var err error
-		if lease != nil && lease.ID != "" {
-			binding, err = l.alloc.PoolRunnerByLease(ctx, lease.ID)
-		} else if job.RunnerName != "" {
-			binding, err = l.alloc.PoolRunnerByName(ctx, job.RunnerName)
-		}
-		if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
-			return fmt.Errorf("server: resolve runner registration before teardown: %w", err)
-		}
-		if errors.Is(err, alloc.ErrLeaseNotFound) && lease != nil && lease.ID != "" {
-			binding.RunnerName = provider.InstanceName(lease.ID)
-			err = nil
-		}
-		// Withdraw the registration by whatever identity is available: prefer the
-		// durable binding, fall back to the identity the completion itself carries
-		// (an id-only completion never populates the binding, which is resolved
-		// from the lease and runner name). Skip removal only when there is
-		// genuinely no registration to withdraw anywhere — no binding, no lease,
-		// no runner id or name — because RemoveRunner(0, "") is refused "needs an
-		// id or name" every time and would wedge the completion's capacity in an
-		// unbounded teardown retry. An absent registration needs no removal.
-		removeID, removeName := binding.RunnerID, binding.RunnerName
-		if removeID == 0 && removeName == "" {
-			removeID, removeName = job.RunnerID, job.RunnerName
-		}
-		// AN ID THE JOB CARRIES FOR THE SAME NAME IS KEPT, so the removal refuses a
-		// registration that has since taken the name under another id. An offline
-		// member's row has a name and no id, and the id its retirement withdrew
-		// arrives here only on the job.
-		if removeID == 0 && job.RunnerID > 0 && removeName == job.RunnerName {
-			removeID = job.RunnerID
-		}
-		if err == nil && (removeID > 0 || removeName != "") {
-			if err := l.registry.RemoveRunner(ctx, removeID, removeName); err != nil {
-				return fmt.Errorf("server: remove runner %q before teardown: %w", removeName, err)
-			}
-			// The runner is gone from GitHub. Stop counting this lease as a live
-			// runner even if the compute-destroy below retries, so a lingering
-			// teardown does not over-count against the assignment deficit. The
-			// mark is unfenced on purpose: a reap may quarantine this lease before
-			// we get here, and the runner is gone regardless. A failure here only
-			// leaves it counted, which is the safe direction.
-			if lease != nil && lease.ID != "" {
-				if err := l.alloc.MarkDeregistered(ctx, lease.ID); err != nil {
-					l.log.Warn("could not record runner deregistration; the lease stays counted until it terminalizes",
-						"tier", l.tier, "lease", lease.ID, "error", err)
-				}
-			}
+	if !l.deregisteredWhenParked(job) {
+		if _, err := l.deregisterCompleted(ctx, job, lease); err != nil {
+			return err
 		}
 	}
 	if outcome == "" {

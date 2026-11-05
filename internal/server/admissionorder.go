@@ -380,6 +380,33 @@ func (q *admissionQueue) waits(tier string, where alloc.TierAdmission) {
 	q.waiting[tier] = waitingTier{since: now, where: where, progress: now}
 }
 
+// waitsOnLaunches records a tier that could not even try to buy, because every launch
+// slot it has is taken. It keeps the tier's place and is NOT progress: a launch in
+// flight never was (see the type's comment), and a listener with its launches beside
+// its loop passes here every poll, so dating it would let launches stuck on a node hold
+// every tier sharing it for as long as they stay stuck. A launch beginning or ending
+// still dates it.
+func (q *admissionQueue) waitsOnLaunches(tier string, where alloc.TierAdmission) {
+	if q == nil {
+		return
+	}
+
+	where.Nodes = slices.Clone(where.Nodes)
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if previous, ok := q.waiting[tier]; ok {
+		previous.where = where
+		q.waiting[tier] = previous
+
+		return
+	}
+
+	now := q.now()
+	q.waiting[tier] = waitingTier{since: now, where: where, progress: now}
+}
+
 // progressed requires q.mu. It dates a waiter's admission progress and says so
 // when that ends a stall other tiers were let past.
 func (q *admissionQueue) progressed(tier string, waiter waitingTier) {
