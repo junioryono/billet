@@ -84,7 +84,7 @@ What it does not say:
 
 ## Holding one host: `hold`, and `tightest` (#527)
 
-`hold` gives a waiter whose shape fits nowhere the host its running work is predicted to free soonest, keeps the room its shape needs there from every tier behind it, and leaves every other host open (ADR-024, and `billet-capacity`'s admission reference for the rule in full). These were replayed on 2026-11-04 and 2026-11-05 on the same two workloads, the hold at the rule this PR ships.
+`hold` gives a waiter whose shape fits nowhere the host its running work is predicted to free soonest, keeps the room its shape needs there from every tier behind it, and leaves every other host open (ADR-026, and `billet-capacity`'s admission reference for the rule in full). These were replayed on 2026-11-04 and 2026-11-05 on the same two workloads, the hold at the rule this PR ships.
 
 ### The whole-host mix, over four seeds
 

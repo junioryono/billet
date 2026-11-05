@@ -23,6 +23,8 @@ image-store-wait
 docker-published-ports
 untrusted-fork-tart
 untrusted-fork-ec2
+ec2-cache-probes
+idle-control-plane
 runtime-predictions
 replay-policies
 target-weights
@@ -31,6 +33,7 @@ target-weights
 | Record | Covers |
 |---|---|
 | [AWS acceptance](aws-acceptance.md) | cold end-to-end jobs on EC2 from a private repository, the `billet acceptance` command that turned the hand procedure into one, spot interruption, same-label failover, and what the CodeBuild API actually does |
+| [EC2 cache probes](ec2-cache-probes.md) | what chose where an EC2 node keeps a cache's bytes: a store volume per archive against whole objects in S3 against GitHub's own store, from one host in one VPC |
 | [Site acceptance](site-acceptance.md) | the site boundary proved on real hosts: three nodes, two sites, one deployment, and the two defects only a real AWS could show |
 | [Restore rehearsal](restore-rehearsal.md) | why the two CI rehearsal legs exist, what each proves that the other cannot, and what neither proves |
 | [Host rehearsals](host-rehearsals.md) | the rollout, recover, CA rotation and promotion rehearsals on packaged hosts under real systemd, what the first run found, and what has and has not run |
@@ -48,6 +51,7 @@ target-weights
 | [Docker's published ports, with and without the userland proxy](docker-published-ports.md) | what turning Docker's userland proxy off did on a billet EC2 guest on 2026-10-25: the published port nearly as fast as the container's own address (select-only up 53%), and `localhost` broken for Node 18 and `[::1]` for every client, so billet's images keep the proxy, which GitHub's runner image template also leaves at Docker's default (#163) |
 | [An untrusted fork pull request on Tart](untrusted-fork-tart.md) | a fork's pull request run twice on an untrusted Tart tier on a development Mac on 2026-10-25 (a Linux arm64 guest): softnet with `@host` kept it from the LAN's router and another LAN host, both of which answered the Mac, while the internet worked; a VM booted with billet's flags reached neither of the Mac's own addresses where a listener answered a VM on tart's NAT, no cache and no billet authority reached it, and the outside evidence agreed; plus the two defects only the real run found, an isolated launch that did not wait for the guest agent and a cleanup that killed `tart delete` part-way (#23) |
 | [An untrusted fork pull request on EC2](untrusted-fork-ec2.md) | a fork's pull request run on an untrusted EC2 tier in the CI account on 2026-10-25: the untrusted security group and no instance profile seen from inside the job and from outside it, no interception, and the pool's own image store published by default-branch jobs, read by the fork and never published from it, proved by a tag each job wrote; and on 2026-11-04, on an AMI built from GitHub's template, the same proof for sticky disks: read warm by the fork, its own key cold again on its re-run, and what it wrote to the default branch's disk absent from that re-run and from the next default-branch job (#23) |
+| [What an idle control plane costs](idle-control-plane.md) | fifty idle control planes on one host, measured 2026-11-04: memory, CPU, connections to PostgreSQL and what a limit does to them, and what a restart waits for on real GitHub |
 | [Runtime predictions](runtime-predictions.md) | how well a job's runtime is predicted from the deployment's own history, measured on the reference deployment's fortnight to 2026-10-25: 30,253 jobs graded as an hourly-refreshing controller would have predicted them, 78% within 2x and 99.4% from the job's own runs, the wide shapes best (84 to 96% within 2x), the 2 vCPU tiers close in seconds and loose in ratio, and what the record does not grade |
 | [Admission orders on replay](replay-policies.md) | `fair`, `fill` and `hold` replayed through billet's real scheduler: on a whole-host shape beside smaller ones over four seeds, `hold` beating `fair` on every smaller shape (8 vCPU p99 40m to 1h38m against 2h26m to 6h37m) and `fill` on the widest (49m to 1h03m against 1h46m to 3h27m); on the reference deployment's own week of 19,757 jobs, `hold` cutting the 2 and 4 vCPU p99 to about 12 minutes and leaving the 16 vCPU p99 at 1h43m, between `fair`'s 11m and `fill`'s 3h59m. |
 | [Weights between targets](target-weights.md) | `targets[].weight` replayed through billet's real scheduler on 2026-11-04: two saturating targets at 2:1 holding 64% to 66% of the contested vCPU (1.83:1 on 16 slots, 1.94:1 on 64, the gap the size of a lease), about 1:1 with no weight, an idle target's rival holding the whole fleet, and the two starvations a replay of equal shapes could not show |

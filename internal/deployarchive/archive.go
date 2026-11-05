@@ -69,16 +69,23 @@ import (
 // that carries one is written at 4: every other archive is written at 3, which
 // every billet since the targets release reads, so the bump costs an older
 // restore nothing it could read before. See schemaFor.
-const Schema = 4
+//
+// 5 ADDS A DEPLOYMENT WHOSE APP KEYS ARE HELD BY A TOKEN BROKER, whose archive carries
+// none, and only such an archive is written at 5. Earlier schemas require the keys, so
+// an older billet refuses this one by version rather than as incomplete.
+const Schema = 5
 
 // schemaFor is the schema an archive with this ledger is written at: the lowest
 // that can express it.
-func schemaFor(l LedgerFacts) int {
-	if l.Dump != nil {
+func schemaFor(l LedgerFacts, keysWithBroker bool) int {
+	switch {
+	case keysWithBroker:
+		return 5
+	case l.Dump != nil:
 		return 4
+	default:
+		return 3
 	}
-
-	return 3
 }
 
 // readableSchemas is every version this build can restore FROM.
@@ -94,7 +101,7 @@ func schemaFor(l LedgerFacts) int {
 // identity-only archive would meet "an archive is not an archive without
 // ledger/billet.db" and send an operator looking for a file that was never
 // supposed to be there.
-var readableSchemas = map[int]bool{1: true, 2: true, 3: true, 4: true}
+var readableSchemas = map[int]bool{1: true, 2: true, 3: true, 4: true, 5: true}
 
 // externalBackends is every engine an archive may name as holding its ledger.
 //
