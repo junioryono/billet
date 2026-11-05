@@ -1,4 +1,4 @@
-// Package phoenixnap is the host source for phoenixNAP's Bare Metal Cloud (ADR-026),
+// Package phoenixnap is the host source for phoenixNAP's Bare Metal Cloud (ADR-028),
 // over its REST API with a client-credentials token.
 //
 // WHAT IS PINNED TO A MEASUREMENT, AND WHAT IS NOT. On 2026-11-05 a real account

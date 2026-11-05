@@ -77,6 +77,7 @@ func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string
 		// what `up` picked a port on.
 		setup.RemoveScalar(server, "bootstrap_listen")
 		setup.RemoveScalar(server, "node_tls_hosts")
+		setup.RemoveScalar(server, "tls_router")
 	}
 
 	if node := mappingValue(root, "node"); node != nil {

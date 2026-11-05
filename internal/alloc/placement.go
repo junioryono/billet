@@ -43,6 +43,8 @@ type placer struct {
 	rank map[string]int
 	// policy decides between hosts that preference cannot separate.
 	policy config.PlacementPolicy
+	// sizes is each host's whole size, read only under tightest.
+	sizes map[string]nodeRow
 	// committed is what every open lease in the deployment holds, from the
 	// fleet this placer was made from (fleet.committedVCPU).
 	committed Usage
@@ -287,7 +289,7 @@ func (f *fleet) floorLeases(ctx context.Context, tx querier, a *Allocator) (map[
 // SHARED ON PURPOSE: whatever one tier's floor takes is gone from the machines
 // every other tier is offered, because they are the same machines.
 func (f *fleet) forTier(a *Allocator, t config.Tier) *placer {
-	nodes := a.eligibleFrom(f.rows, t, t.NeedsCacheAwareNode())
+	nodes := a.eligibleFrom(f.rows, t, wireFloor(t))
 
 	p := &placer{
 		order:            nodes,
@@ -306,6 +308,13 @@ func (f *fleet) forTier(a *Allocator, t config.Tier) *placer {
 		cost, ok := n.cost(t)
 		if ok {
 			p.cost[n.name] = cost
+		}
+	}
+
+	if p.policy == config.PlacementTightest {
+		p.sizes = make(map[string]nodeRow, len(nodes))
+		for _, n := range nodes {
+			p.sizes[n.name] = n
 		}
 	}
 
@@ -346,6 +355,31 @@ func (p *placer) rankBy(t config.Tier) {
 
 	for _, n := range p.order {
 		p.rank[n.name] = slices.Index(accepts, n.provider)
+	}
+}
+
+// avoid takes hosts out of what this placer will choose, and out of what it reports
+// room on, because a host with no cost has none.
+func (p *placer) avoid(hosts []string) {
+	for _, host := range hosts {
+		delete(p.cost, host)
+	}
+}
+
+// keepFor leaves a held host's room to its owner: all of it until the owner's shape fits,
+// because room short of it reads as none, and that much once it does, so the rest is for
+// sale. An owner the catalogue does not know keeps the whole host.
+func (p *placer) keepFor(holds map[string]string, tiers map[string]config.Tier) {
+	for host, owner := range holds {
+		shape, known := tiers[owner]
+		if !known {
+			p.avoid([]string{host})
+
+			continue
+		}
+
+		p.freeVCPU[host] -= shape.VCPU
+		p.freeMemory[host] -= shape.Memory
 	}
 }
 
@@ -561,11 +595,37 @@ func (p *placer) clone() *placer {
 	return &clone
 }
 
+// leftOver is what a host would have free after one more lease, in shares of its
+// own size, vCPU and memory together, so a large host and a small one compare.
+func (p *placer) leftOver(node string) float64 {
+	cost, size := p.cost[node], p.sizes[node]
+
+	var out float64
+
+	if size.vcpu > 0 {
+		out += float64(p.freeVCPU[node]-cost.vcpu) / float64(size.vcpu)
+	}
+
+	if size.memory > 0 {
+		out += float64(p.freeMemory[node]-cost.memory) / float64(size.memory)
+	}
+
+	return out
+}
+
 // better reports whether a, with roomA left for the tier, should be chosen over
 // b, with roomB.
 func (p *placer) better(a string, roomA int, b string, roomB int) bool {
 	if p.rank[a] != p.rank[b] {
 		return p.rank[a] < p.rank[b]
+	}
+
+	if p.policy == config.PlacementTightest {
+		if leftA, leftB := p.leftOver(a), p.leftOver(b); leftA != leftB {
+			return leftA < leftB
+		}
+
+		return a < b
 	}
 
 	if roomA != roomB {

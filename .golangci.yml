@@ -265,7 +265,7 @@ linters:
             - pkg: "github.com/junioryono/billet/internal/hostsource"
               desc: "A host source may use a provider's client; a provider never reaches up to a host source."
 
-        # A host source rents the machine a node runs on (ADR-026). It answers the
+        # A host source rents the machine a node runs on (ADR-028). It answers the
         # pool and nothing above it, and it writes no ledger: the pool reads what a
         # release needs and hands the source a proof.
         hostsource:
@@ -349,6 +349,18 @@ linters:
           list-mode: strict
           files:
             - "${config-path}/internal/lease/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+
+        # THE WORKLOAD FORMAT IS A FORMAT, NOT A LAYER (#526). `billet jobs export`
+        # writes it from the ledger and the replay harness reads it, so whatever it
+        # imported both sides would; it may use the standard library and
+        # internal/config, and nothing else.
+        jobtrace:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/jobtrace/**"
           allow:
             - $gostd
             - github.com/junioryono/billet/internal/config$
@@ -762,7 +774,7 @@ linters:
             - pkg: "github.com/junioryono/billet/internal/provider"
               desc: "The ledger is a lower layer than compute; a provider call inside a transaction holds the single writer slot across a remote API."
             - pkg: "github.com/junioryono/billet/internal/hostsource"
-              desc: "A host source calls a provider's API (ADR-026): the release proof is built inside the transaction, and the source is called after it commits."
+              desc: "A host source calls a provider's API (ADR-028): the release proof is built inside the transaction, and the source is called after it commits."
             - pkg: "github.com/junioryono/billet/internal/store"
               desc: "The ledger is a lower layer than site storage; an rbd call inside a transaction holds the single writer slot."
             - pkg: "github.com/junioryono/billet/internal/tokenbroker"

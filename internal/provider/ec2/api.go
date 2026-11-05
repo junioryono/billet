@@ -512,6 +512,8 @@ type describeImagesResponse struct {
 		// Mappings with no <ebs> child, and any with no device name, are not
 		// restated; the root is stated by setBlockDevices rather than from here.
 		BlockDevices []imageMapping `xml:"blockDeviceMapping>item"`
+		// Platform is "windows" on a Windows AMI and absent on every other.
+		Platform string `xml:"platform"`
 		// Tags carry provenance: which billet built the image, and which AMIContract
 		// it satisfies. An image built before billet stamped its output has neither,
 		// which is the pre-contract case rather than a passing one.

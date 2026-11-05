@@ -541,3 +541,51 @@ SELECT lease_id FROM job_history
  WHERE github_run_id = @run_id OR (github_run_id = 0 AND run_id = @run_id)
  ORDER BY COALESCE(assigned_at, queued_at), lease_id
  LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ListJobRuntimes :many
+-- The jobs that started in [since, until) and finished before until, with the
+-- names their runtime is learned under, newest start first, bounded: a window
+-- past the bound loses its oldest jobs, never the newest.
+--
+-- FINISHED BEFORE until, because a job still running at until was not known to
+-- have finished then: a prediction made at until could not have used it, and a
+-- backtest that did would be graded against its own answer. The runtime is
+-- finished_at less started_at, both billet's clock: the archive is when the
+-- lease's room comes back, which is what a host freeing up means.
+SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name,
+       COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at
+  FROM job_history
+ WHERE started_at IS NOT NULL AND started_at >= @since AND started_at < @until
+   AND finished_at IS NOT NULL AND finished_at < @until
+ ORDER BY started_at DESC, lease_id DESC
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ListJobsForExport :many
+-- The jobs assigned in [since, until), with what a trace of the deployment's
+-- own history is made of, oldest assignment first, bounded: a window past the
+-- bound loses its newest jobs, and the export says so.
+--
+-- WINDOWED ON queued_at, billet's clock when the job was assigned, which every
+-- row has and the index covers; a job GitHub queued before the window and
+-- billet was assigned inside it belongs to it, as its wait does. ONLY ROWS A
+-- JOB WAS ASSIGNED TO: the archive of a lease bought and never used writes a
+-- row too, with no assigned_at, and so does a pool slot billet started for
+-- GitHub's assigned count and retired before a job reached it, with
+-- assigned_at but neither GitHub's job id nor its request id nor a start;
+-- either would take the bound from real jobs. A start keeps a row whose
+-- identity was never written: started_at is set only when the lease reached
+-- busy, so only when GitHub started a job on it. result_at is when billet handled the
+-- completion, so a job's runtime as GitHub ran it is result_at less
+-- started_at, without the teardown finished_at includes; a completion
+-- redelivered after an outage makes it longer than the job ran.
+SELECT lease_id, tier, COALESCE(repo, '') AS repo, workflow_ref, job_name, github_job_id,
+       COALESCE(request_id, 0) AS request_id,
+       CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
+            AS BIGINT) AS run_id,
+       github_queued_at, queued_at, COALESCE(started_at, '') AS started_at,
+       result_at, COALESCE(finished_at, '') AS finished_at, result
+  FROM job_history
+ WHERE queued_at >= @since AND queued_at < @until AND assigned_at IS NOT NULL
+   AND (github_job_id != '' OR COALESCE(request_id, 0) > 0 OR started_at IS NOT NULL)
+ ORDER BY queued_at, lease_id
+ LIMIT CAST(@max_rows AS BIGINT);

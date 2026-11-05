@@ -17,7 +17,6 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/initconfig"
-	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -470,7 +469,7 @@ func cmdCAShow(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "  billet node --enroll --ca-fingerprint %s%s\n",
 		ca.Fingerprint(), enrollAddrFlag(cfg))
 
-	if cfg.Server.BootstrapListen == "" && !nodeplane.LoopbackOnly(cfg.Server.Listen) {
+	if cfg.Server.BootstrapListen == "" && cfg.Server.WireServesTLS() {
 		fmt.Fprintf(env.Stdout, "\nThis control plane serves no enrollment address, so that command has\n")
 		fmt.Fprintf(env.Stdout, "nowhere to ask: its node wire requires a certificate an enrolling machine\n")
 		fmt.Fprintf(env.Stdout, "does not have yet. Either issue the bundle here and copy it out of band:\n\n")

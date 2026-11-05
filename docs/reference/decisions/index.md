@@ -30,7 +30,9 @@ adr-022-every-linux-image-from-githubs-template
 adr-023-fleet-envelope
 adr-024-caches-off-firecracker
 adr-025-installation-tokens-from-a-broker
-adr-026-rented-bare-metal-pool
+adr-026-windows-on-ec2
+adr-027-scheduling-from-measured-history
+adr-028-rented-bare-metal-pool
 ```
 
 | Record | Decides |
@@ -60,4 +62,6 @@ adr-026-rented-bare-metal-pool
 | [ADR-023](adr-023-fleet-envelope.md) | the fleet one control plane must schedule, 256 hosts and 4,096 open leases, and what each of its writes may take of the ledger's one writer slot; why a listener renews its leases in one commit a pass, why placement is counted a preference rank at a time, and why the commit's speed is the operator's |
 | [ADR-024](adr-024-caches-off-firecracker.md) | which backends the node's caches serve and which are refused for good; why an EC2 node keeps an Actions archive and a build cache as whole objects in S3 rather than a store volume, reached through a relay in the guest; and why the AMI's guest half is cut from the firecracker agent's own text |
 | [ADR-025](adr-025-installation-tokens-from-a-broker.md) | why a deployment may hold no App key: a broker over mutual TLS mints only what its registration names, knowing a caller by its key's fingerprint, and how a token reaches a vendored client that only takes a fixed one |
-| [ADR-026](adr-026-rented-bare-metal-pool.md) | how billet rents bare metal for Firecracker from a dedicated-server provider and from AWS behind one host-source contract; the pool's shape, where its caches live so it can shrink to its floor, why it grows ahead of demand and shrinks only by drain on proof, why a pool host is never spot, how an ordered host joins without a person only where its source vouches for its key, what a returned host keeps, and why a guest's traffic is policed on the host |
+| [ADR-026](adr-026-windows-on-ec2.md) | why the first Windows backend is EC2, with what a KVM guest on a Linux node and a billet node on Windows measured; what a Windows AMI carries against GitHub's `windows-2025` image, built by GitHub's own steps; how the build reports through COM1 |
+| [ADR-027](adr-027-scheduling-from-measured-history.md) | why scheduling learns each job's runtime from the deployment's own history, under which key and with which fallbacks, why an overdue job is never predicted to end soon, and why a prediction may choose a host but never decides whether capacity is bought, held or released |
+| [ADR-028](adr-028-rented-bare-metal-pool.md) | how billet rents bare metal for Firecracker from a dedicated-server provider and from AWS behind one host-source contract; the pool's shape, where its caches live so it can shrink to its floor, why it grows ahead of demand and shrinks only by drain on proof, why a pool host is never spot, how an ordered host joins without a person only where its source vouches for its key, what a returned host keeps, and why a guest's traffic is policed on the host |
