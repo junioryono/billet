@@ -2,7 +2,6 @@ package alloc
 
 import (
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +107,11 @@ func TestAStoreReportBilletWouldNotWriteIsRefused(t *testing.T) {
 	t.Parallel()
 
 	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil)
+	if _, err := a.RegisterNode(t.Context(), NodeRegistration{
+		Name: "n1", Provider: config.ProviderDocker, VCPU: 2, Memory: 8 * config.GiB,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
 	for name, report := range map[string]CacheStoreReport{
 		"an unknown store":  {Store: "zfs", State: CacheStoreClosed, Since: time.Now()},
 		"an unknown state":  {Store: "ceph", State: "half", Since: time.Now()},
@@ -115,9 +119,13 @@ func TestAStoreReportBilletWouldNotWriteIsRefused(t *testing.T) {
 		"no time":           {Store: "ceph", State: CacheStoreClosed},
 		"negative failures": {Store: "ceph", State: CacheStoreOpen, Since: time.Now(), Failures: -1},
 	} {
+		// THE REPORT'S OWN REFUSAL, NOT THE FENCE'S: the node is there, under this process.
 		if err := a.RecordCacheStoreState(t.Context(), "n1", "", report); err == nil ||
-			strings.Contains(err.Error(), "no such node") {
+			errors.Is(err, ErrCacheStoreStale) {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+	if rows, err := a.NodeCacheStores(t.Context()); err != nil || len(rows) != 0 {
+		t.Fatalf("after reports refused: %+v, %v", rows, err)
 	}
 }

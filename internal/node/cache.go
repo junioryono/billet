@@ -2017,17 +2017,21 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	// THE CLONE STAYS IN THE SESSION'S CUSTODY for its cleanup, and the generation
-	// this job started from stays published. Before the discard below too, which would
-	// otherwise wait on the store with the job waiting behind it.
-	if !s.breaker.admit() {
+	// this job started from stays published.
+	storeNotAsked := func() {
 		writeCacheJSON(w, http.StatusOK, map[string]any{
 			"published": false, "reason": "the site's store is not answering",
 		})
-
-		return
 	}
 
 	if session.trust != provider.TrustTrusted || sessionPolicy(session) == config.CachePublishOff {
+		// NOT WAITED ON WITH THE JOB WAITING BEHIND IT, and no trial: a discard settles
+		// nothing.
+		if !s.breaker.allow() {
+			storeNotAsked()
+
+			return
+		}
 		reason := "untrusted"
 		if session.trust == provider.TrustTrusted {
 			reason = "publication is off"
@@ -2045,6 +2049,12 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 			return
 		}
 		writeCacheJSON(w, http.StatusOK, map[string]any{"published": false, "reason": reason})
+
+		return
+	}
+
+	if !s.breaker.admit() {
+		storeNotAsked()
 
 		return
 	}

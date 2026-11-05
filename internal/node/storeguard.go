@@ -307,9 +307,13 @@ func (s *CacheService) handOver(
 // refusal here is as likely about the candidate as the store (a filesystem that is not
 // clean, a key another writer holds), and sending every job cold over one job's bad
 // write would make a bad build everyone's outage.
+//
+// NOT THROUGH outcome, WHICH READS A CONFLICT ANYWHERE IN THE CHAIN AS AN ANSWER: a retried
+// publication joins its first call's conflict to its second's timeout, and the timeout is
+// the last thing the store did.
 func (s *CacheService) countedPublication(session, op string, err error) {
-	if errors.Is(err, context.DeadlineExceeded) {
-		s.breaker.outcome(storeCall{op: op, who: session}, err)
+	if s.breaker != nil && errors.Is(err, context.DeadlineExceeded) {
+		s.breaker.failed(storeCall{op: op, who: session}, lease.CacheStoreTimeout)
 	}
 }
 

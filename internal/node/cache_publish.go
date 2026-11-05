@@ -132,6 +132,7 @@ func (s *CacheService) publishDeferred(
 			return false, err
 		}
 		candidate, err := s.store.Snapshot(ctx, attachment.Volume)
+		s.countedPublication(session.instance, "a cache snapshot", err)
 		if err != nil {
 			// RETRIED ON THE NEXT PASS. A failed Snapshot leaves the pointer
 			// unchanged, which is all the contract promises; if it also consumed
@@ -175,6 +176,7 @@ func (s *CacheService) publishDeferred(
 
 	candidate := *journal.Candidate
 	current, currentErr := s.store.Current(ctx, key)
+	s.countedPublication(session.instance, "a cache lookup", currentErr)
 	if currentErr == nil && current == candidate.Generation {
 		// A publication a crash interrupted after the pointer moved.
 		journal.Phase = phasePublished

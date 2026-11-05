@@ -1275,6 +1275,151 @@ func TestOnlyAPublicationsTimeoutCountsAgainstTheStore(t *testing.T) {
 	}
 }
 
+// A MOUNTED VOLUME IS NOT READ EITHER: a read of one whose OSDs have gone waits in the
+// kernel, and on probation it decides nothing.
+func TestAMountedContentAddressedVolumeIsNotReadUntilTheBreakerCloses(t *testing.T) {
+	t.Parallel()
+
+	for name, put := range map[string]func(*storeBreaker){
+		"open":      failThree,
+		"probation": onProbation,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			storage := &fakeCacheStore{}
+			service, _, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+			service.GuardStore("ceph", testStoreDeadline)
+			ours := "our object"
+			path := "/v1/cas/go/cas/" + digestOf(ours)
+			if got := casRequest(t, service, token, http.MethodPut, path, ours); got.Code != http.StatusOK {
+				t.Fatalf("PUT = %d %s", got.Code, got.Body.String())
+			}
+			put(service.breaker)
+
+			if got := casRequest(t, service, token, http.MethodGet, path, ""); got.Code != http.StatusServiceUnavailable {
+				t.Fatalf("GET = %d, want the 503 its helper reads as a miss", got.Code)
+			}
+			session := service.sessionOf(instance)
+			session.mu.Lock()
+			noted := session.building[config.CacheGo]
+			session.mu.Unlock()
+			if noted != alloc.BuildCacheBypassed {
+				t.Fatalf("noted %q", noted)
+			}
+		})
+	}
+}
+
+// NOTHING WAS ASKED, SO THERE IS NOTHING TO BACK OFF FROM: with another job's trial out a
+// job's Go cache goes without, says why, and asks again as soon as it can.
+func TestAContentAddressedRequestRefusedATrialDoesNotBackOff(t *testing.T) {
+	t.Parallel()
+
+	storage := newHangingStore()
+	service := guardedService(t, storage)
+	session, token := anActionsSession(t, service, "billet-no-backoff")
+	onProbation(service.breaker)
+	if !service.breaker.admit() {
+		t.Fatal("no trial to take")
+	}
+
+	const digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/cas/go/cas/"+digest, http.NoBody)
+	request.Header.Set("Authorization", "Bearer "+token)
+	recorder := httptest.NewRecorder()
+	service.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if noted := session.building[config.CacheGo]; noted != alloc.BuildCacheBypassed {
+		t.Fatalf("noted %q", noted)
+	}
+	if _, backing := session.casRetryAt[config.CacheGo]; backing {
+		t.Fatal("a request that asked nothing backed off")
+	}
+}
+
+// A RETRIED PUBLICATION'S CONFLICT DOES NOT HIDE ITS TIMEOUT: the timeout is the last thing
+// the store did, and the error carries both.
+func TestAConflictBesideATimeoutStillCounts(t *testing.T) {
+	t.Parallel()
+
+	service := guardedService(t, newHangingStore())
+	joined := errors.Join(storecontract.ErrConflict, fmt.Errorf("rbd: %w", context.DeadlineExceeded))
+	for i := range breakerFailures {
+		service.countedPublication(fmt.Sprintf("job-%d", i), "a cache publication", joined)
+	}
+	if !service.breaker.isOpen() {
+		t.Fatal("three publications that timed out left the breaker closed")
+	}
+}
+
+// A JOB THAT MAY NOT PUBLISH SETTLES NOTHING, so its discard takes no trial and waits for
+// the verdict like anything else that decides nothing.
+func TestACommitThatWouldOnlyDiscardTakesNoTrial(t *testing.T) {
+	t.Parallel()
+
+	storage := newHangingStore()
+	service := guardedService(t, storage)
+	credentials, err := service.PrepareScoped("billet-untrusted", CacheSessionScope{Trust: provider.TrustUntrusted})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	if got := cacheRequest(t, service, credentials.Token, "/v1/volumes", map[string]any{
+		"key": "disk", "size_bytes": 1 << 20,
+	}); got.Code != http.StatusCreated {
+		t.Fatalf("attach: status %d: %s", got.Code, got.Body.String())
+	}
+	onProbation(service.breaker)
+
+	got := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/commit", nil)
+	if !strings.Contains(got.Body.String(), "not answering") {
+		t.Fatalf("a commit on probation: %s", got.Body.String())
+	}
+	if storage.discards() != 0 {
+		t.Fatal("a discard asked the store on probation")
+	}
+	if !service.breaker.admit() {
+		t.Fatal("a commit that publishes nothing held the trial")
+	}
+}
+
+// A FULL GENERATION'S REPLACEMENT IS A VOLUME LIKE ANY OTHER, for the deadline and for the
+// trial: past the deadline the job goes on without its cache and holds the session no
+// longer, and with another job's trial out it is not asked for.
+func TestAFreshStartAsksForItsVolumeThroughTheGuard(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := newHangingStore()
+		service := guardedService(t, storage)
+		if _, err := service.PrepareScoped("billet-fresh", CacheSessionScope{Trust: provider.TrustTrusted}); err != nil {
+			t.Fatalf("PrepareScoped: %v", err)
+		}
+		session := service.sessionOf("billet-fresh")
+		session.mu.Lock()
+		defer session.mu.Unlock()
+
+		hv := &hostVolume{Kind: config.CacheGo, Volume: storecontract.Volume{Key: "k", Handle: "pool/full"}}
+
+		onProbation(service.breaker)
+		if !service.breaker.admit() {
+			t.Fatal("no trial to take")
+		}
+		asked := storage.volumesAsked()
+		if err := service.startFresh(t.Context(), session, hv, "k", 1<<20); !errors.Is(err, errStoreOpen) {
+			t.Fatalf("with another job's trial out: %v", err)
+		}
+		if storage.volumesAsked() != asked {
+			t.Fatal("a volume was asked for with another job's trial out")
+		}
+	})
+}
+
 // A GUEST THAT HANGS UP GOES ON WITHOUT THE STORE AT ONCE, and the call goes on.
 func TestAGuestHangingUpEndsItsWaitAndNotTheCall(t *testing.T) {
 	t.Parallel()
@@ -1339,19 +1484,6 @@ func TestARequestsOwnDeadlineDoesNotCountAgainstTheStore(t *testing.T) {
 			if got.Code != http.StatusServiceUnavailable {
 				t.Fatalf("status %d: %s", got.Code, got.Body.String())
 			}
-
-			// THE SAME OF A LOOKUP, WHICH THE REQUEST'S DEADLINE DOES CUT SHORT.
-			session, _ := anActionsSession(t, service, fmt.Sprintf("billet-lookup-%d", i))
-			lookupCtx, cancelLookup := context.WithTimeout(t.Context(), time.Second)
-			response, handled, err := service.actionsResponse(twirp(t, actionsDownloadPath,
-				`{"key":"npm","restore_keys":[],"version":"v1"}`).WithContext(lookupCtx), session)
-			cancelLookup()
-			if response != nil {
-				response.Body.Close()
-			}
-			if !handled || !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("a lookup past its request's deadline: handled %v, %v", handled, err)
-			}
 		}
 
 		// THE STORE ANSWERS, INSIDE ITS OWN DEADLINE, EVERY CALL THE REQUESTS LEFT BEHIND.
@@ -1365,6 +1497,43 @@ func TestARequestsOwnDeadlineDoesNotCountAgainstTheStore(t *testing.T) {
 		if failures != 0 {
 			t.Fatalf("requests' own deadlines counted %d failures against the store", failures)
 		}
+	})
+}
+
+// THE SAME OF A LOOKUP, WHICH THE REQUEST'S DEADLINE DOES CUT SHORT.
+func TestALookupItsRequestsDeadlineEndedDoesNotCount(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		storage := newHangingStore()
+		service := guardedService(t, storage)
+		service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+			return true, nil
+		}))
+		storage.hanging.Store(true)
+
+		for i := range breakerFailures {
+			session, _ := anActionsSession(t, service, fmt.Sprintf("billet-lookup-%d", i))
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			response, handled, err := service.actionsResponse(twirp(t, actionsDownloadPath,
+				`{"key":"npm","restore_keys":[],"version":"v1"}`).WithContext(ctx), session)
+			cancel()
+			if response != nil {
+				response.Body.Close()
+			}
+			if !handled || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("a lookup past its request's deadline: handled %v, %v", handled, err)
+			}
+		}
+		time.Sleep(2 * testStoreDeadline)
+		synctest.Wait()
+		service.breaker.mu.Lock()
+		failures := len(service.breaker.failures)
+		service.breaker.mu.Unlock()
+		if failures != 0 || service.breaker.isOpen() {
+			t.Fatalf("requests' own deadlines counted %d failures against the store", failures)
+		}
+		close(storage.release)
 	})
 }
 
