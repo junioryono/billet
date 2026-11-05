@@ -352,7 +352,7 @@ func x86Kernel() []byte {
 
 // arm64Kernel is as much of an arm64 Image as the writer reads: its magic at offset 56.
 func arm64Kernel() []byte {
-	header := make([]byte, 60)
+	header := make([]byte, 60, 60+len(kernelBanner))
 	copy(header[56:], "ARM\x64")
 
 	return append(header, kernelBanner...)

@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -256,8 +257,8 @@ func TestTheGuestBilletIsBuiltForTheMachine(t *testing.T) {
 			record := filepath.Join(t.TempDir(), "go-env")
 			goStub := "#!/bin/sh\nprintf '%s %s %s\\n' \"$0\" \"$GOOS\" \"$GOARCH\" >" + record + "\n" +
 				"while [ $# -gt 0 ]; do [ \"$1\" = -o ] && : >\"$2\"; shift; done\n"
-			writeFile(t, filepath.Join(root, "opt/hostedtoolcache/go/1.26.0", tc.toolcache, "bin/go"), goStub, 0o755)
-			writeFile(t, filepath.Join(root, "opt/hostedtoolcache/go/1.27.0", tc.other, "bin/go"), goStub, 0o755)
+			writeFile(t, filepath.Join(root, "opt", "hostedtoolcache", "go", "1.26.0", tc.toolcache, "bin", "go"), goStub, 0o755)
+			writeFile(t, filepath.Join(root, "opt", "hostedtoolcache", "go", "1.27.0", tc.other, "bin", "go"), goStub, 0o755)
 
 			script := "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=" + here + "\nWORK=" + t.TempDir() +
 				"\nTOOLCACHE_DIR=/opt/hostedtoolcache\nTOOLCACHE_ARCH=" + tc.toolcache + "\nGUEST_GOARCH=" + tc.goarch + "\n" +
@@ -369,7 +370,7 @@ func TestTheBaseFilesystemAndItsSourceAreChosenByTheMachine(t *testing.T) {
 				t.Errorf("downloaded %s, want %s", url, want.file)
 			}
 
-			sources := string(readBytes(t, filepath.Join(rootfs, "etc/apt/sources.list.d/ubuntu.sources")))
+			sources := string(readBytes(t, filepath.Join(rootfs, "etc", "apt", "sources.list.d", "ubuntu.sources")))
 			if !strings.Contains(sources, want.uris) {
 				t.Errorf("the image's apt source is:\n%s\nwant %s", sources, want.uris)
 			}
@@ -1192,7 +1193,7 @@ func TestEachMachineBuildsTheKernelItsVMMLoads(t *testing.T) {
 				t.Errorf("vmlinux-billet holds %q, want %q", got, want.kernel)
 			}
 
-			if got, base := readBytes(t, filepath.Join(out, "vmlinux-billet.config")), readBytes(t, want.base); string(got) != string(base) {
+			if got, base := readBytes(t, filepath.Join(out, "vmlinux-billet.config")), readBytes(t, want.base); !bytes.Equal(got, base) {
 				t.Errorf("the kernel was not built from %s", want.base)
 			}
 
