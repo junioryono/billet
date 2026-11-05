@@ -4,7 +4,7 @@
 
 ## Where
 
-- **The node.** An EC2 m8i.4xlarge (16 vCPU, 64 GiB) in a test account, Ubuntu 24.04, under nested virtualization, with single-host Ceph on four 150 GB gp3 OSDs. It is the host of [A store that stops answering](cache-breaker.md).
+- **The node.** An EC2 m8i.4xlarge (16 vCPU, 64 GiB) in a test account, Ubuntu 24.04, under nested virtualization, with single-host Ceph on four 150 GB gp3 OSDs. It is the host the store breaker was rehearsed on (#741).
 - **The guests.** 4 vCPU and 10 GiB per job on an untrusted tier publishing under `default-branch`, at most three at once because the control plane's ceiling was 14 vCPU.
 - **Pulls.** The node ran its Docker Hub mirror (#543), but neither the guests' Docker nor the builders trusted it (the image predates that), so every pull went to Docker Hub.
 - **The project.** A private repository of four apps, each with its own Dockerfile:
@@ -49,17 +49,20 @@ Every backend ran three series (48 jobs each). The table gives the median second
 | python | persistent | 141 (0) | 2 (7) | 2 (5) | 12 (3) |
 
 **What it shows:**
-- **The persistent builder is the only one that saves a change.** After a source edit or a lockfile bump it built in 2 to 28 seconds where the others took most of a cold build. The registry and gha caches carry layers and not cache mounts, so once a change invalidates the step that compiles, its module, crate and pip caches are gone with it, and the step compiles from nothing. The persistent builder's whole state includes the cache mounts.
-- **A registry cache is as good on an unchanged build** (5 s, against 1 or 2 for the persistent builder). Python's source edit (19 s) is the one change it absorbed, because there the compile is in a layer before the source is copied.
+- **The persistent builder saved the most after a change.** After a source edit or a lockfile bump it built in 2 to 28 seconds, and the other backends took most of a cold build, with one exception.
+  - **Why:** the registry and gha caches carry layers and not cache mounts. Once a change invalidates the step that compiles, that step's module, crate and pip caches are gone with it, and it compiles from nothing. The persistent builder's whole state includes the cache mounts.
+  - **The exception is python's source edit** (19 s with a registry cache, 96 s with gha). That Dockerfile installs its dependencies in a layer before it copies the source, so an edit to the source does not reach that layer.
+  - **How much a layer cache saves depends on where a Dockerfile puts its compile.** The persistent builder's saving depends on that less.
+- **A registry cache is as good on an unchanged build** (5 s, against 1 or 2 for the persistent builder).
 - **`type=gha` through billet's Actions cache cost more than it saved.** Its cold builds took 1.5 to 5 times as long as no cache, and its changed builds were slower than no cache except python's source edit. Exporting the cache was most of it: one go cold build spent 144 s in `sending cache export`. Billet's Actions cache serves `actions/cache` saves of one archive well ([Transparent Actions cache](../../operating/actions-cache.md)), and BuildKit's exporter writes many blobs, one reservation each. Why that is slow here was not looked into.
 - **One of the three warm persistent builds missed** for go (48 s), node (26 s) and python (141 s): the warm job did not find its cold job's state, so the median is the honest figure and the worst case is a cold build. Whether the warm job started before the cold job's deferred publication had landed, or that publication failed (#743), was not established.
 - **One gha series failed** (go, series 1): its export's finalize was refused by an unmap #743 describes, and the build failed. Its other two series are the medians above.
 
-**Plain `docker build` in the Docker image store** was measured too, and is left out of the table. The image store is one generation per repository and architecture, and every job of the repository publishes it when it ends. During these hours ten of its publications succeeded and most failed on #743, so what each job found depended on which publication had last succeeded rather than on the build.
+**Plain `docker build` in the Docker image store** was measured too, and is left out of the table. The image store is one generation per repository and architecture. A successful job whose store changed, and which may publish under `default-branch`, publishes it after its compute is gone. During these hours ten of those publications succeeded and most failed on #743. So what each job found depended on which publication had last succeeded, not on the build.
 
 ## Two Dockerfiles on one key
 
-`setup-docker-builder`'s `cache-key` defaults to the constant `Dockerfile`, so every Dockerfile a repository builds with it shares one state. Two of the apps above built through it on the default key:
+`setup-docker-builder`'s `cache-key` defaults to the constant `Dockerfile`, and its sticky disk's key is `<repository>-buildkit-<cache-key>-<runner arch>`, which the node then scopes by trust class. So every Dockerfile a repository builds through it on the default key, on one architecture and trust class, shares one state. Two of the apps above built through it on the default key:
 
 | Order | Builds | Seconds | Cached steps |
 |---|---|---|---|

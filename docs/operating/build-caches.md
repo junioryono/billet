@@ -45,7 +45,7 @@ Publication happens off the node's command path, after the compute is gone, jour
 
 **Docker builds.** `setup-docker-builder` keeps a job's whole BuildKit state on a sticky disk, cache mounts included, so a build after a source edit or a lockfile bump reuses the compile's caches. Measured on 2026-11-05 for four projects ([What a Docker build's cache saves](../reference/records/docker-builder.md)):
 - **Unchanged builds:** 1 to 2 seconds with the persistent builder, and about 5 with a registry cache.
-- **After a source edit or a lockfile bump:** 2 to 28 seconds with the persistent builder, against most of a cold build for a registry or `type=gha` cache, because those keep layers and not cache mounts.
+- **After a source edit or a lockfile bump:** 2 to 28 seconds with the persistent builder. A registry or `type=gha` cache usually took most of a cold build, because those keep layers and not cache mounts. The exception was a Dockerfile that installs its dependencies before it copies its source.
 - **`type=gha` through billet's Actions cache** cost more than it saved: a cold build took 1.5 to 5 times as long as no cache.
 - **Keys:** give each Dockerfile its own `cache-key` when they build at the same time. One key shared by builds one at a time stayed warm for both. Two writing at once on one key was not settled.
 
