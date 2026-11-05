@@ -16,7 +16,7 @@ import (
 // A WRITABLE VOLUME IS MAPPED ONCE, BY Create OR Clone, under a name they give
 // it then by this host's clock, and is unmapped only to be snapshotted or
 // discarded; nothing maps one again. Its custody record follows within the
-// cache handler's bound (under 13 minutes), after at most a lineage copy
+// cache handler's bound (under 13 minutes), after at most a lineage's compaction
 // (cacheCompactionLimit) and a map (MapTimeout), so a mapping this much older
 // than its name that no record names will never be named by one. Six hours is
 // the node's eviction cadence, which is what runs the sweep.

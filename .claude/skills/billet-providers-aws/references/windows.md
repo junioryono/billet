@@ -1,6 +1,6 @@
 # Windows on EC2
 
-Part of the `billet-providers-aws` skill. The decision and its measurements are [ADR-023](../../../../docs/reference/decisions/adr-023-windows-on-ec2.md).
+Part of the `billet-providers-aws` skill. The decision and its measurements are [ADR-024](../../../../docs/reference/decisions/adr-024-windows-on-ec2.md).
 
 **A lease's guest OS decides the boot script, and the AMI is held to it in both directions.** `provider.Spec.GuestOS` comes from the lease, an empty one is Linux, and `checkGuestOS` refuses a disagreement before anything is sent. Either boot script is text nothing on the other image runs, so the instance would boot, look healthy, register nothing and hold its lease. `billet ami build --os` is held to the base image the same way in `launchBuilder`, and `billet check` fails a tier whose `guest_os` and AMI disagree (`ec2TierGuestOSMismatch`).
 
@@ -16,7 +16,7 @@ Part of the `billet-providers-aws` skill. The decision and its measurements are 
 
 **A Windows launch asks for a provisioned read of its snapshot.** With no page file a real job still started 311 s after launch, its assignment taken up 14 s inside GitHub's five minutes, because every file the listener loads is the first read of its blocks. With `VolumeInitializationRate` 200 the same job started 121 s after launch (`launch_to_runner_ms` 85969, `runner_to_job_start_ms` 35244, c7i.xlarge, 2026-11-04). It is charged per launch on the snapshot's full size, the same from 100 to 200 MiB/s, about $0.09 on a 36 GiB image, so 200 is the top of the cheaper band (`windowsVolumeInitRate`). A builder and a verifier do not ask, since neither has an assignment to lose.
 
-**A Windows image is `reset`, not sysprepped.** Both run their own user data on a new instance and both keep EMS off. Launch to the first line of a new instance's user data on c7i.xlarge, two samples each, 2026-11-04: the stock AMI about 62 s, an image made after `reset` about 113 s, an image made after `sysprep` about 247 s. ADR-023 has what a generalised image would buy.
+**A Windows image is `reset`, not sysprepped.** Both run their own user data on a new instance and both keep EMS off. Launch to the first line of a new instance's user data on c7i.xlarge, two samples each, 2026-11-04: the stock AMI about 62 s, an image made after `reset` about 113 s, an image made after `sysprep` about 247 s. ADR-024 has what a generalised image would buy.
 
 **The scheduled task needs an explicit execution limit and priority.** `New-ScheduledTaskSettingsSet`'s default stops a task after three days, which would end a runner under a job still running, and its default priority of 7 is below normal, which every process of every job would inherit, so the runner's asks for 4 and the verifier's check refuses anything but `Normal`. A task inherits nothing from the process that starts it, which is why the registration travels in a file the service script reads and deletes before any step exists.
 

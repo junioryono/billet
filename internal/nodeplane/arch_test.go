@@ -267,7 +267,7 @@ func TestARegistrationWithNoIncarnationDoesNotReplaceTheArchitectures(t *testing
 }
 
 // A WINDOWS LEASE IS NOT SENT TO A NODE THAT WOULD WRITE ITS BOOT SCRIPT FOR LINUX: on a
-// Windows AMI that boots, looks healthy, registers nothing and holds the lease (ADR-023).
+// Windows AMI that boots, looks healthy, registers nothing and holds the lease (ADR-024).
 // A LINUX LEASE ON THE SAME NODE IS AS IT WAS, and a current node takes either.
 func TestAWindowsLeaseIsNotLaunchedOnAnOlderNode(t *testing.T) {
 	t.Parallel()

@@ -24,7 +24,7 @@ import (
 var amiBuild embed.FS
 
 // amiBuildWindows is every file the EC2 builder runs on a Windows build, at its path
-// under scripts/ (ADR-023): the entry points and driver billet writes, the Windows tree
+// under scripts/ (ADR-024): the entry points and driver billet writes, the Windows tree
 // of GitHub's template, the plan derived from it and what billet does differently.
 //
 //go:embed windows/build-ami.ps1 windows/ec2-layer.ps1 windows/billet-runner.ps1

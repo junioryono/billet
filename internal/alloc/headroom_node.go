@@ -33,7 +33,7 @@ type nodeRow struct {
 const CacheAuthorityWireVersion = 23
 
 // WindowsGuestsWireVersion is the oldest wire a node boots a Windows guest on,
-// mirrored from nodeapi.VersionWindowsGuests for the same reason (ADR-023).
+// mirrored from nodeapi.VersionWindowsGuests for the same reason (ADR-024).
 const WindowsGuestsWireVersion = 38
 
 // guestWireFloor is the oldest wire a host can start the tier's guest on at all,
@@ -56,12 +56,19 @@ func guestWireFloor(t config.Tier) int {
 // placement. An unordered candidate set makes the same fleet produce different
 // answers on different runs, which is untestable and unexplainable in a log.
 func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier) ([]nodeRow, error) {
+	return a.eligibleNodesFor(ctx, tx, t, wireFloor(t))
+}
+
+// wireFloor is the oldest wire a host may be on to be placed the tier: the one that boots
+// its guest, and the one that honours its cache block. Every placement path asks it, so a
+// Windows tier is never charged to a host the plane will refuse to send it to.
+func wireFloor(t config.Tier) int {
 	floor := guestWireFloor(t)
 	if t.NeedsCacheAwareNode() {
 		floor = max(floor, CacheAuthorityWireVersion)
 	}
 
-	return a.eligibleNodesFor(ctx, tx, t, floor)
+	return floor
 }
 
 // WaitsForCacheAwareHost reports whether a tier is placed nowhere only because
@@ -120,21 +127,23 @@ func (n nodeRow) holdsOne(t config.Tier) bool {
 func (a *Allocator) eligibleNodesFor(
 	ctx context.Context, tx querier, t config.Tier, minWire int,
 ) ([]nodeRow, error) {
-	rows, err := state.ReadQueries(tx).ListPlaceableNodes(ctx)
+	rows, err := a.liveNodes(ctx, tx)
 	if err != nil {
-		return nil, fmt.Errorf("alloc: list nodes for tier %s: %w", t.Label, err)
+		return nil, err
 	}
 
+	return a.eligibleFrom(rows, t, minWire), nil
+}
+
+// eligibleFrom is the hosts of rows a tier could be placed on: the filter
+// eligibleNodesFor applies to the ledger, applied to rows already read, so a
+// question that measured the fleet once asks it of every tier.
+func (a *Allocator) eligibleFrom(rows []nodeRow, t config.Tier, minWire int) []nodeRow {
 	accepts := t.AcceptableProviders()
 
 	var out []nodeRow
 
-	for i := range rows {
-		n, err := nodeRowFrom(&rows[i])
-		if err != nil {
-			return nil, err
-		}
-
+	for _, n := range rows {
 		// A PIN IS AN ALLOWLIST OF ONE, and it is checked first because it is the
 		// operator's explicit instruction rather than an inference.
 		if t.Node != "" && n.name != t.Node {
@@ -179,13 +188,10 @@ func (a *Allocator) eligibleNodesFor(
 		out = append(out, n)
 	}
 
-	return out, nil
+	return out
 }
 
 // nodeRowFrom maps one placeable-host row onto what the arithmetic works with.
-//
-// SHARED BY eligibleNodes AND liveNodes, which read the same statement and
-// differ only in what they do with the rows.
 func nodeRowFrom(row *ledgerdb.ListPlaceableNodesRow) (nodeRow, error) {
 	n := nodeRow{
 		name:     row.Name,

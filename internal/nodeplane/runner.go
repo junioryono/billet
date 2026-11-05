@@ -92,7 +92,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 	}
 
 	// NOR A WINDOWS LEASE, whose boot script an older node would write for Linux, on an
-	// AMI that does not run it (ADR-023).
+	// AMI that does not run it (ADR-024).
 	if lease.GuestOS == config.GuestWindows && wire < nodeapi.VersionWindowsGuests {
 		return fmt.Errorf("%w: lease %s boots Windows, which node %s would not start: it speaks "+
 			"wire %d and a Windows guest needs %d, so upgrade the node",

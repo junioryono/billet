@@ -511,7 +511,7 @@ const (
 
 	// VersionWindowsGuests is the version from which a node reads a lease's guest OS
 	// to choose its boot script, so a Windows lease reaches only a node that will
-	// boot it (ADR-023). The lease has carried the guest OS since long before this,
+	// boot it (ADR-024). The lease has carried the guest OS since long before this,
 	// and no wire struct changes: the step is in what a node does with it.
 	//
 	// REFUSED WHERE IT IS SENT. A node below it sends a Linux boot script to a Windows

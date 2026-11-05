@@ -1,5 +1,5 @@
 # build-ami.ps1: build a Windows runner AMI on the EC2 builder by running the steps of
-# GitHub's windows-2025 template that billet carries, then billet's EC2 layer (ADR-023).
+# GitHub's windows-2025 template that billet carries, then billet's EC2 layer (ADR-024).
 #
 # Started by the bootstrap in user data on the builder's second boot, the first with
 # COM1, and it ends in one of two ways, each a block on the console, where billet reads
@@ -411,7 +411,7 @@ for ($round = 0; $round -lt $dwellRounds; $round++) {
 
 # GUEST-INITIATED, WHICH IS WHAT BILLET READS A FINISHED BUILD'S STOP BY.
 #
-# reset, NOT sysprep: ADR-023 has what each costs a job's first boot. Either way an
+# reset, NOT sysprep: ADR-024 has what each costs a job's first boot. Either way an
 # instance launched from the image runs its own user data (2026-11-04).
 #
 # ITS EXIT STATUS SAYS NOTHING: EC2Launch answered 1 and "Shutdown was initiated but did

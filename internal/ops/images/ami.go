@@ -60,7 +60,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		"AMI to provision from (an EBS-backed Ubuntu 24.04 image, or Windows Server 2025 with --os windows)")
 	osName := fs.String("os", string(config.GuestLinux),
 		"the image's operating system: linux, from GitHub's ubuntu-24.04 template, or windows, from "+
-			"the steps of its windows-2025 template billet carries (ADR-023)")
+			"the steps of its windows-2025 template billet carries (ADR-024)")
 	shape := fs.String("instance-type", "",
 		"shape of the BUILDER, not of your jobs; a Nitro shape, whose live console billet "+
 			"reads the build's verdict from (default: "+ec2.DefaultBuilderType("x64")+" for x64, "+
@@ -186,7 +186,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	// NOTHING TO COMPLETE A WINDOWS IMAGE WITH: images.accept names what a Linux
-	// template leaves out, and billet installs none of it on Windows (ADR-023).
+	// template leaves out, and billet installs none of it on Windows (ADR-024).
 	var accept []string
 
 	if !windows {

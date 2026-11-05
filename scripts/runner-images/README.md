@@ -12,7 +12,7 @@ The guest image is built by running GitHub's own runner-images template (#250): 
 
 ## Windows
 
-The Windows AMI runs a declared part of GitHub's `windows-2025` template ([ADR-023](../../docs/reference/decisions/adr-023-windows-on-ec2.md)), held the same way and driven by `scripts/windows/build-ami.ps1` rather than by the runner above.
+The Windows AMI runs a declared part of GitHub's `windows-2025` template ([ADR-024](../../docs/reference/decisions/adr-024-windows-on-ec2.md)), held the same way and driven by `scripts/windows/build-ami.ps1` rather than by the runner above.
 
 - `upstream/images/windows/` is GitHub's tree at the same commit, its files in `BLOBS` and `TREES` with the rest. The toolset it reads is `internal/runnerimages/toolset-2025.json`, not vendored twice.
 - `plan-windows-2025.json` is the template's provisioner list, derived by the same reader (`go test ./scripts -run TheWindowsPlanIsTheTemplates -update-plan`).

@@ -502,7 +502,7 @@ func (r *Runner) Launch(
 	var buildKitCacheMountLimit config.ByteSize
 	var guestCaches []provider.GuestCache
 	// NO BEARER FOR A GUEST WITH NOTHING TO SPEND IT: every cache's client is in a
-	// Linux guest, and config refuses a cache block on a Windows tier (ADR-023).
+	// Linux guest, and config refuses a cache block on a Windows tier (ADR-024).
 	if r.cache != nil && lease.GuestOS != config.GuestWindows {
 		var credentials CacheCredentials
 		scope := CacheSessionScope{

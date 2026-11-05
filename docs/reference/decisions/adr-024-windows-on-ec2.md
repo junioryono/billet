@@ -1,4 +1,4 @@
-# ADR-023: Windows jobs run on EC2 first, from GitHub's own steps
+# ADR-024: Windows jobs run on EC2 first, from GitHub's own steps
 
 Accepted, 2026-11-04. Issue #532. Extends [ADR-002](adr-002-cloud-compute-backend.md) to a second guest operating system, and departs from [ADR-022](adr-022-every-linux-image-from-githubs-template.md) in how much of GitHub's template one image runs.
 

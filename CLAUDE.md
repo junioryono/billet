@@ -156,4 +156,4 @@ This repository also supports OpenAI Codex, which reads the cross-tool standard 
 
 ## Platform support
 
-A billet role runs on Linux (amd64, arm64) and macOS (arm64). A billet node on Windows needs an equivalent of the `flock`-based state lock and more; [ADR-023](docs/reference/decisions/adr-023-windows-on-ec2.md) counts what. Windows jobs run on EC2, launched from one of those.
+A billet role runs on Linux (amd64, arm64) and macOS (arm64). A billet node on Windows needs an equivalent of the `flock`-based state lock and more; [ADR-024](docs/reference/decisions/adr-024-windows-on-ec2.md) counts what. Windows jobs run on EC2, launched from one of those.

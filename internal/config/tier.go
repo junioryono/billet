@@ -373,7 +373,7 @@ const DefaultMacOSVMLimit = 2
 const MinMacOSGuestMemory ByteSize = 4 * GiB
 
 // WindowsRunnerCommand is what starts the runner on a Windows AMI `billet ami build`
-// made, and the path that build installs it at (ADR-023).
+// made, and the path that build installs it at (ADR-024).
 const WindowsRunnerCommand = `C:\billet\billet-runner.ps1`
 
 const (
@@ -526,12 +526,12 @@ func (t Tier) GuestOSProviderErrors(where string) []error {
 				"EC2 AMI, so a codebuild Windows tier would start a build that registers "+
 				"nothing", where))
 
-		// EC2 IS THE ONE BACKEND WITH A WINDOWS RUNNER (ADR-023). Firecracker boots no
+		// EC2 IS THE ONE BACKEND WITH A WINDOWS RUNNER (ADR-024). Firecracker boots no
 		// Windows guest and docker's are Linux containers, so a tier that could land
 		// on either would bind there and start something that never registers.
 		case t.GuestOS == GuestWindows && p != ProviderEC2:
 			errs = append(errs, fmt.Errorf("%s: guest_os windows runs only on the ec2 provider "+
-				"(ADR-023), and this tier also accepts %q", where, p))
+				"(ADR-024), and this tier also accepts %q", where, p))
 		}
 	}
 
@@ -1117,7 +1117,7 @@ func (t Tier) windowsTierErrors(where string) []error {
 
 	if t.Cache != nil || t.Intercept || t.CacheScope != nil {
 		errs = append(errs, fmt.Errorf("%s: a Windows guest has no client for billet's caches "+
-			"(ADR-023), so cache, intercept and cache_scope would do nothing here; remove them",
+			"(ADR-024), so cache, intercept and cache_scope would do nothing here; remove them",
 			where))
 	}
 

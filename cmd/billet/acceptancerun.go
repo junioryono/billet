@@ -9,7 +9,10 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/ops/fleetops"
+	"github.com/junioryono/billet/internal/state"
 
 	"github.com/junioryono/billet/internal/cli"
 )
@@ -104,6 +107,10 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 
 	dir := filepath.Dir(ws.ConfigPath)
 
+	if err := refuseASealedWorkspace(ctx, env, ws); err != nil {
+		return err
+	}
+
 	server, err := startAcceptanceService(ctx, env, self, "server", ws.ConfigPath, dir)
 	if err != nil {
 		// NOTHING TO TEAR DOWN. The server never came up, so it created no scale
@@ -191,6 +198,70 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 	// did not finish" are two things an operator has to know and only one of them
 	// is what they came for.
 	return errors.Join(waitErr, proofErr, downErr)
+}
+
+// refuseASealedWorkspace stops a run before it starts anything on a deployment that
+// is sealed, which an earlier run with --no-teardown leaves behind. Otherwise the run
+// starts its services and waits out --wait with a listener saying the deployment is
+// no longer taking new work, assigned nothing (2026-10-25).
+//
+// IT WRITES NOTHING, and lifts no seal, not even a run's own. Another run may still be
+// draining this workspace behind that seal, and a drain an operator ran over it reads
+// the same. `billet resume` is a person's statement that neither holds. The ledger is
+// opened to inspect it, because the operator's open migrates, and a run that refuses
+// must not have moved the schema out from under the binary that wrote it.
+//
+// A LEDGER BEHIND THIS BINARY CANNOT BE READ WITHOUT THAT MIGRATION, so whether it is
+// sealed cannot be told. The server's start migrates it anyway, so the run goes on, and
+// says so, because a seal in there would then mean a run assigned nothing.
+//
+// BEFORE THE SERVER STARTS, because a refusal here has nothing to tear down. A
+// workspace with no ledger, or an empty file where one will be, has never run and has
+// no seal, and is left as it is for the server to initialise.
+func refuseASealedWorkspace(ctx context.Context, env cli.Env, ws acceptanceWorkspace) error {
+	stateDir := filepath.Join(filepath.Dir(ws.ConfigPath), "server")
+	info, err := os.Stat(state.LedgerPath(stateDir))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("look for this run's ledger: %w", err)
+	}
+	if info.Size() == 0 {
+		return nil
+	}
+
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read this run's config: %w", err)
+	}
+
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerInspect)
+	if errors.Is(err, state.ErrSchemaBehind) {
+		fmt.Fprintf(env.Stderr, "acceptance: this workspace's ledger is behind this binary, so whether "+
+			"it is sealed cannot be read until the server migrates it. If no job is assigned, "+
+			"`billet resume --config %s` is the first thing to try.\n", ws.ConfigPath)
+
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open this run's ledger: %w", err)
+	}
+
+	defer db.Close()
+
+	current, err := db.Admission(ctx)
+	if err != nil {
+		return fmt.Errorf("read admission: %w", err)
+	}
+
+	if current.Sealed() {
+		return fmt.Errorf("this workspace's deployment is sealed (%q, by %q), and a run on a sealed "+
+			"deployment is assigned nothing. If nothing is still draining it, "+
+			"`billet resume --config %s` reopens it", current.Reason, current.Actor, ws.ConfigPath)
+	}
+
+	return nil
 }
 
 // proveAcceptanceComputeClear seals the run and waits for every host to say it is

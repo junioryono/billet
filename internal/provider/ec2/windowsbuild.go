@@ -17,7 +17,7 @@ import (
 
 // WindowsAMIContract is what a Windows runner AMI must satisfy for this billet to use
 // it, and goes up whenever one has to carry a newly required property. It counts apart
-// from AMIContract, whose every number is about a Linux image (ADR-023).
+// from AMIContract, whose every number is about a Linux image (ADR-024).
 //
 // 1: the image is the steps of GitHub's windows-2025 template that
 // differences-windows.tsv leaves in, with billet's EC2 layer after them, and a process
@@ -64,7 +64,7 @@ func PinnedWindowsRunnerSHA256() (string, bool) {
 }
 
 // buildWindowsImage is BuildImage for a Windows base image: everything before the
-// builder is launched differs, and everything after it is the one path (ADR-023).
+// builder is launched differs, and everything after it is the one path (ADR-024).
 func (p *Provider) buildWindowsImage(ctx context.Context, spec BuildSpec) (string, error) {
 	switch {
 	case spec.Arch != "x64":
@@ -75,7 +75,7 @@ func (p *Provider) buildWindowsImage(ctx context.Context, spec BuildSpec) (strin
 			"has no client for billet's caches")
 	case len(spec.Accept) > 0:
 		return "", fmt.Errorf("ec2: images.accept completes a Linux image with what its template " +
-			"leaves out, and a Windows image is built with none of them (ADR-023)")
+			"leaves out, and a Windows image is built with none of them (ADR-024)")
 	case !runnerVersionPattern.MatchString(spec.RunnerVersion):
 		return "", fmt.Errorf("ec2: %q is not an actions/runner release version", spec.RunnerVersion)
 	case !runnerDigestPattern.MatchString(spec.RunnerSHA256):
