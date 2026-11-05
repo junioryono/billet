@@ -24,6 +24,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **One target, one connection, so the connection is health-checked.**
 - **A poll that fails past the client's retries is one tier's trouble, and the listener reopens its session rather than stopping the deployment (#207).**
 - **The policy client owns its HTTP client, and no request it makes is unbounded.**
+- **When a job message arrives is not when it happened: measure a job with the times the messages carry (#559).**
 
 ### Targets, trust, onboarding and cache authority: [references/targets-and-trust.md](references/targets-and-trust.md)
 

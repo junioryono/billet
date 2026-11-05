@@ -1152,6 +1152,10 @@ tiers:
     # grows past this size. Defaults to 20GiB; at most 100GiB.
     buildkit_cache_mount_limit: 20GiB
 
+  # minute_weight says what one minute of a tier counts as in `billet usage
+  # export`, in minutes of a 2 vCPU Linux runner. Absent, it is the vCPU charged
+  # over two, so this tier counts double. Set it where vCPU alone does not say
+  # what a minute is worth, such as a macOS tier. It reports and decides nothing.
   - label: billet-4vcpu-ubuntu-2404
     provider: firecracker
     # Omitted trust safely defaults to untrusted. Interception needs a trusted

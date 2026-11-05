@@ -116,3 +116,67 @@ func (a *Allocator) RetireJobDetail(ctx context.Context, leaseIDs []string) (Ret
 
 	return out, err
 }
+
+// UnnumberedUsage lists at most limit leases that finished before they could be
+// numbered, oldest first. It is a read, and that work stays outside the writer's
+// transaction.
+func (a *Allocator) UnnumberedUsage(ctx context.Context, limit int) ([]string, error) {
+	var out []string
+
+	err := a.db.View(ctx, func(q querier) error {
+		rows, err := state.ReadQueries(q).ListUnnumberedUsage(ctx, int64(limit))
+		if err != nil {
+			return fmt.Errorf("alloc: list leases waiting for a usage number: %w", err)
+		}
+
+		out = rows
+
+		return nil
+	})
+
+	return out, err
+}
+
+// NumberUsage gives each of leaseIDs its place in the order `billet usage export`
+// reads, in one transaction, in the order it was handed them, and answers how many
+// took one. The numbers come from the counter a closing lease takes one from, so a
+// reader's rule holds for these as for those: no number commits after a higher one.
+func (a *Allocator) NumberUsage(ctx context.Context, leaseIDs []string) (int, error) {
+	if len(leaseIDs) == 0 {
+		return 0, nil
+	}
+
+	packed, err := packLeaseIDs(leaseIDs)
+	if err != nil {
+		return 0, err
+	}
+
+	mark, err := newUsageMark()
+	if err != nil {
+		return 0, err
+	}
+
+	numbered := 0
+
+	err = a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+
+		last, err := q.TakeUsageSeqs(ctx, int64(len(leaseIDs)))
+		if err != nil {
+			return fmt.Errorf("alloc: take usage numbers: %w", err)
+		}
+
+		rows, err := q.NumberUsage(ctx, ledgerdb.NumberUsageParams{
+			Packed: packed, Base: last - int64(len(leaseIDs)), Mark: mark,
+		})
+		if err != nil {
+			return fmt.Errorf("alloc: number %d leases' usage: %w", len(leaseIDs), err)
+		}
+
+		numbered = int(rows)
+
+		return nil
+	})
+
+	return numbered, err
+}

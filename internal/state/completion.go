@@ -34,6 +34,10 @@ type PendingCompletion struct {
 	JobRepository  string
 	JobWorkflowRef string
 	JobEvent       string
+	// JobRunnerAssignedAt and JobFinishedAt are GitHub's times for a completion that
+	// named its runner, RFC 3339 on GitHub's clock. Empty is not recorded.
+	JobRunnerAssignedAt string
+	JobFinishedAt       string
 }
 
 // PendingCompletionDisposition says whether an incoming delivery may perform teardown.
@@ -81,23 +85,25 @@ func (db *DB) PutPendingCompletion(
 		}
 
 		if err := q.UpsertPendingCompletion(ctx, ledgerdb.UpsertPendingCompletionParams{
-			Tier:           completion.Tier,
-			RequestID:      completion.RequestID,
-			RunID:          completion.RunID,
-			Result:         completion.Result,
-			LeaseID:        completion.LeaseID,
-			LeaseEpoch:     completion.LeaseEpoch,
-			LeaseNode:      completion.LeaseNode,
-			Outcome:        completion.Outcome,
-			ReleaseOnly:    boolInt(completion.ReleaseOnly),
-			MessageID:      completion.MessageID,
-			Retired:        boolInt(completion.Retired),
-			Acknowledged:   boolInt(completion.Acknowledged),
-			JobID:          completion.JobID,
-			JobOwner:       completion.JobOwner,
-			JobRepository:  completion.JobRepository,
-			JobWorkflowRef: completion.JobWorkflowRef,
-			JobEvent:       completion.JobEvent,
+			Tier:                completion.Tier,
+			RequestID:           completion.RequestID,
+			RunID:               completion.RunID,
+			Result:              completion.Result,
+			LeaseID:             completion.LeaseID,
+			LeaseEpoch:          completion.LeaseEpoch,
+			LeaseNode:           completion.LeaseNode,
+			Outcome:             completion.Outcome,
+			ReleaseOnly:         boolInt(completion.ReleaseOnly),
+			MessageID:           completion.MessageID,
+			Retired:             boolInt(completion.Retired),
+			Acknowledged:        boolInt(completion.Acknowledged),
+			JobID:               completion.JobID,
+			JobOwner:            completion.JobOwner,
+			JobRepository:       completion.JobRepository,
+			JobWorkflowRef:      completion.JobWorkflowRef,
+			JobEvent:            completion.JobEvent,
+			JobRunnerAssignedAt: completion.JobRunnerAssignedAt,
+			JobFinishedAt:       completion.JobFinishedAt,
 		}); err != nil {
 			return fmt.Errorf("state: record pending completion for %s request %d: %w",
 				completion.Tier, completion.RequestID, err)
@@ -199,23 +205,25 @@ func (db *DB) PendingCompletions(ctx context.Context, tier string) ([]PendingCom
 			r := &rows[i]
 
 			completions = append(completions, PendingCompletion{
-				Tier:           r.Tier,
-				RequestID:      r.RequestID,
-				RunID:          r.RunID,
-				Result:         r.Result,
-				LeaseID:        r.LeaseID,
-				LeaseEpoch:     r.LeaseEpoch,
-				LeaseNode:      r.LeaseNode,
-				Outcome:        r.Outcome,
-				ReleaseOnly:    intBool(r.ReleaseOnly),
-				MessageID:      r.MessageID,
-				Retired:        intBool(r.Retired),
-				Acknowledged:   intBool(r.Acknowledged),
-				JobID:          r.JobID,
-				JobOwner:       r.JobOwner,
-				JobRepository:  r.JobRepository,
-				JobWorkflowRef: r.JobWorkflowRef,
-				JobEvent:       r.JobEvent,
+				Tier:                r.Tier,
+				RequestID:           r.RequestID,
+				RunID:               r.RunID,
+				Result:              r.Result,
+				LeaseID:             r.LeaseID,
+				LeaseEpoch:          r.LeaseEpoch,
+				LeaseNode:           r.LeaseNode,
+				Outcome:             r.Outcome,
+				ReleaseOnly:         intBool(r.ReleaseOnly),
+				MessageID:           r.MessageID,
+				Retired:             intBool(r.Retired),
+				Acknowledged:        intBool(r.Acknowledged),
+				JobID:               r.JobID,
+				JobOwner:            r.JobOwner,
+				JobRepository:       r.JobRepository,
+				JobWorkflowRef:      r.JobWorkflowRef,
+				JobEvent:            r.JobEvent,
+				JobRunnerAssignedAt: r.JobRunnerAssignedAt,
+				JobFinishedAt:       r.JobFinishedAt,
 			})
 		}
 
