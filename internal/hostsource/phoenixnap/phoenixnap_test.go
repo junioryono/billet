@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -573,5 +576,78 @@ func TestWithheldKeepsOnlyTheClassification(t *testing.T) {
 		if err := withheld(fmt.Errorf("Post: %w", ctxErr)); !errors.Is(err, ctxErr) || !errors.Is(err, errWithheld) {
 			t.Errorf("%v lost its classification: %v", ctxErr, err)
 		}
+	}
+}
+
+// A WELL-FORMED ANSWER CAN CARRY THE REQUEST BACK IN A FIELD: a server described under
+// another id is refused naming the id asked for, not the one that answered.
+func TestARefusalNamesTheServerAskedFor(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			_, _ = io.WriteString(w, `{"access_token":"tok-1","expires_in":300}`) //nolint:errcheck // the client's error is the assertion
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"token-9QX","status":"powered-on"}`) //nolint:errcheck // as above
+	}))
+	t.Cleanup(srv.Close)
+	s := source(t, srv)
+	if _, err := s.Describe(t.Context(), "srv-1"); err == nil || strings.Contains(err.Error(), "token-9QX") {
+		t.Errorf("describe = %v", err)
+	}
+	if p, err := s.Gone(t.Context(), "srv-1"); err == nil || p != hostsource.PresenceUnknown || strings.Contains(err.Error(), "token-9QX") {
+		t.Errorf("gone = %v, %v", p, err)
+	}
+}
+
+// A BODY THAT FAILS WHILE IT IS READ is quoted by net/http, a malformed trailer line
+// included, so the failure keeps its classification and none of its text, for the API
+// and for the token grant alike.
+func TestABodyThatFailsToReadQuotesNothing(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"/token", "/bmc/v1/servers"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/token" && path != "/token" {
+				_, _ = io.WriteString(w, `{"access_token":"tok-1","expires_in":300}`) //nolint:errcheck // the client's error is the assertion
+				return
+			}
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("the test server cannot hijack")
+
+				return
+			}
+			conn, buf, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+
+				return
+			}
+			defer conn.Close()
+			_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + //nolint:errcheck // as above
+				"2\r\n[]\r\n0\r\ntoken-9QX\r\n\r\n")
+			if err := buf.Flush(); err != nil {
+				t.Errorf("flush: %v", err)
+			}
+		}))
+		_, _, err := source(t, srv).Find(t.Context(), "o-1")
+		srv.Close()
+		if err == nil || strings.Contains(err.Error(), "token-9QX") || !errors.Is(err, errWithheld) {
+			t.Errorf("%s: find = %v", path, err)
+		}
+	}
+}
+
+// A NETWORK FAILURE WHOSE CAUSE IS THE SYSTEM'S IS KEPT, so an operator reads a reset
+// as a reset.
+func TestWithheldKeepsASystemCause(t *testing.T) {
+	t.Parallel()
+	reset := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
+	if err := withheld(fmt.Errorf("Get: %w", reset)); !errors.Is(err, syscall.ECONNRESET) {
+		t.Errorf("a reset lost its cause: %v", err)
+	}
+	proxied := &net.OpError{Op: "proxyconnect", Net: "tcp", Err: errors.New("x509: certificate is valid for token-9QX")}
+	if err := withheld(proxied); !errors.Is(err, errWithheld) || strings.Contains(err.Error(), "token-9QX") {
+		t.Errorf("a certificate's text survived: %v", err)
 	}
 }

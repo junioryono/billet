@@ -170,7 +170,7 @@ func (h *Hosts) Find(ctx context.Context, order string) (HostRecord, bool, error
 		// skipped, whatever its order tag says: a list read as none licenses ordering
 		// again, and a missing order tag is not a different order.
 		if !h.isPoolHost(item) {
-			return HostRecord{}, false, fmt.Errorf("%w: %s was listed for order %s", ErrNotAPoolHost, item.InstanceID, order)
+			return HostRecord{}, false, fmt.Errorf("%w: an instance listed for order %s", ErrNotAPoolHost, order)
 		}
 		if v, _ := item.tag(poolOrderTag); v != order {
 			continue

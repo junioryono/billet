@@ -2,14 +2,19 @@ package ec2
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -376,5 +381,78 @@ func TestNoCallQuotesWhatAnswered(t *testing.T) {
 		if _, _, err := h.Find(t.Context(), "o-1"); err == nil || strings.Contains(err.Error(), "token-9QX") {
 			t.Errorf("%s: find = %v", name, err)
 		}
+	}
+}
+
+// badTrailerEC2 answers with a body whose chunked trailer is a line net/http quotes in
+// the read error it returns.
+func badTrailerEC2(t *testing.T) *fakeEC2 {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("the test server cannot hijack")
+
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+
+			return
+		}
+		defer conn.Close()
+		if _, err := buf.WriteString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+			"2\r\n<a\r\n0\r\ntoken-9QX\r\n\r\n"); err != nil {
+			t.Errorf("write: %v", err)
+		}
+		if err := buf.Flush(); err != nil {
+			t.Errorf("flush: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	return &fakeEC2{Server: srv}
+}
+
+// A BODY THAT FAILS WHILE IT IS READ is quoted by net/http, a trailer line included, so
+// the failure keeps its classification and none of its text.
+func TestABodyThatFailsToReadQuotesNothing(t *testing.T) {
+	t.Parallel()
+	h := newTestProvider(t, badTrailerEC2(t), nil).Hosts()
+	_, err := h.Describe(t.Context(), "i-1")
+	if err == nil || strings.Contains(err.Error(), "token-9QX") || !errors.Is(err, errAnswerWithheld) {
+		t.Fatalf("describe = %v", err)
+	}
+}
+
+// A WELL-FORMED ANSWER CAN STILL CARRY THE REQUEST BACK IN A FIELD, so a refusal over
+// it names what was asked for, not what answered.
+func TestARefusalNamesTheOrderNotTheAnswer(t *testing.T) {
+	t.Parallel()
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusOK, describeReply("", poolOwnerOnlyXML("token-9QX"))
+	}
+	_, _, err := newTestProvider(t, f, nil).Hosts().Find(t.Context(), "o-1")
+	if !errors.Is(err, ErrNotAPoolHost) || strings.Contains(err.Error(), "token-9QX") {
+		t.Fatalf("find = %v", err)
+	}
+}
+
+// ONLY A NETWORK ERROR WHOSE CAUSE IS THE SYSTEM'S IS KEPT: a TLS failure through a
+// proxy is an OpError too, and its certificate chose its text.
+func TestTransportFailureKeepsOnlySystemCauses(t *testing.T) {
+	t.Parallel()
+	reset := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
+	if got := transportFailure(fmt.Errorf("Post: %w", reset)); !errors.Is(got, syscall.ECONNRESET) {
+		t.Errorf("a reset lost its cause: %v", got)
+	}
+	proxied := &net.OpError{Op: "proxyconnect", Net: "tcp", Err: errors.New("x509: certificate is valid for token-9QX")}
+	if got := transportFailure(proxied); !errors.Is(got, errAnswerWithheld) || strings.Contains(got.Error(), "token-9QX") {
+		t.Errorf("a certificate's text survived: %v", got)
+	}
+	if got := transportFailure(fmt.Errorf("Post: %w", context.DeadlineExceeded)); !errors.Is(got, context.DeadlineExceeded) {
+		t.Errorf("a deadline lost its classification: %v", got)
 	}
 }

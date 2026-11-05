@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -366,13 +367,21 @@ var errAnswerWithheld = errors.New("the answer could not be read, and is not quo
 // from the answer (net/http quotes an unparsable Location before any redirect policy
 // runs, and a malformed trailer line) can carry the request, and its session token,
 // back. A cancelled or expired context stays itself.
+//
+// A NETWORK ERROR IS KEPT ONLY WHEN ITS CAUSE IS THE SYSTEM'S: a syscall that failed
+// (refused, reset, unreachable) or a timeout. net.OpError also wraps a TLS failure
+// through an HTTPS proxy, whose x509 error renders names a certificate chose.
 func transportFailure(err error) error {
 	switch {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return err
 	}
 	if opErr, ok := errors.AsType[*net.OpError](err); ok {
-		return opErr
+		if sysErr, sys := errors.AsType[*os.SyscallError](opErr.Err); (sys && sysErr.Err != nil) || opErr.Timeout() {
+			return opErr
+		}
+
+		return errAnswerWithheld
 	}
 	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
 		return dnsErr

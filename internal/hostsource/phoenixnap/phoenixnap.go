@@ -24,8 +24,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -273,7 +275,7 @@ func (s *Source) Describe(ctx context.Context, id string) (hostsource.Host, erro
 		return hostsource.Host{}, err
 	}
 	if got.ID != id {
-		return hostsource.Host{}, fmt.Errorf("phoenixnap: asked for server %s and was answered about %q", id, got.ID)
+		return hostsource.Host{}, fmt.Errorf("phoenixnap: asked for server %s and was answered about another, which is not quoted", id)
 	}
 
 	return got.host(), nil
@@ -319,7 +321,7 @@ func (s *Source) Gone(ctx context.Context, id string) (hostsource.Presence, erro
 	case err == nil && got.ID == id:
 		return hostsource.PresencePresent, nil
 	case err == nil:
-		return hostsource.PresenceUnknown, fmt.Errorf("phoenixnap: asked for server %s and was answered about %q", id, got.ID)
+		return hostsource.PresenceUnknown, fmt.Errorf("phoenixnap: asked for server %s and was answered about another, which is not quoted", id)
 	case errors.Is(err, errNotFound):
 		return hostsource.PresenceUnknown, nil
 	}
@@ -453,12 +455,22 @@ var errWithheld = errors.New("the request failed and its error is withheld: a re
 // withheld keeps only the classification of a transport failure. net/http's error
 // renders the URL it was answered with, a malformed redirect's Location included,
 // before any redirect policy runs, and that can carry the request back.
+//
+// A NETWORK FAILURE WHOSE CAUSE IS THE SYSTEM'S (a syscall refused, reset or
+// unreachable, or a timeout) is kept: it names only this API's address. The rule is
+// the ec2 client's transportFailure, kept apart because neither package may import the
+// other's internals.
 func withheld(err error) error {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return fmt.Errorf("%w: %w", errWithheld, context.Canceled)
 	case errors.Is(err, context.DeadlineExceeded):
 		return fmt.Errorf("%w: %w", errWithheld, context.DeadlineExceeded)
+	}
+	if opErr, ok := errors.AsType[*net.OpError](err); ok {
+		if sysErr, sys := errors.AsType[*os.SyscallError](opErr.Err); (sys && sysErr.Err != nil) || opErr.Timeout() {
+			return opErr
+		}
 	}
 
 	return errWithheld
