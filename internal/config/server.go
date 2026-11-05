@@ -275,6 +275,12 @@ type ServerConfig struct {
 	// destinations and guest report; a job's usage summary is kept. A Go
 	// duration string, at least an hour; absent, 72 hours. See retention.go.
 	JobDetailRetention string `yaml:"job_detail_retention,omitempty"`
+	// TestResultsRetention is how long the ledger keeps a job's test suites and
+	// cases, and TestResultsMaxBytes how much of them it keeps in all, the oldest
+	// deleted first. A Go duration string, at least an hour, and a byte size, at
+	// least 1MiB; absent, 14 days and 128MiB. See retention.go.
+	TestResultsRetention string   `yaml:"test_results_retention,omitempty"`
+	TestResultsMaxBytes  ByteSize `yaml:"test_results_max_bytes,omitempty"`
 	// Metrics serves the control plane's Prometheus metrics. Absent, nothing is
 	// served: there is no default address.
 	Metrics *MetricsConfig `yaml:"metrics,omitempty"`
@@ -719,6 +725,12 @@ func (c *Config) validateServer() []error {
 		errs = append(errs, err)
 	}
 	if _, err := c.Server.JobDetailRetentionDuration(); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := c.Server.TestResultsRetentionDuration(); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := c.Server.TestResultsBound(); err != nil {
 		errs = append(errs, err)
 	}
 	return errs

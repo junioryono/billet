@@ -41,7 +41,7 @@ The readers get what the writer and the claim leave, up to four, so unset is six
 
 ## One App across deployments: the token broker
 
-An operator running many deployments under one GitHub App would otherwise put its one key on every control plane, and a compromise of any of them could mint tokens for every installation of that App. A broker holds the key instead, and a deployment on one holds none. [ADR-024](../reference/decisions/adr-024-installation-tokens-from-a-broker.md) says why it is shaped this way.
+An operator running many deployments under one GitHub App would otherwise put its one key on every control plane, and a compromise of any of them could mint tokens for every installation of that App. A broker holds the key instead, and a deployment on one holds none. [ADR-025](../reference/decisions/adr-025-installation-tokens-from-a-broker.md) says why it is shaped this way.
 
 **On each control-plane host,** add the block, name no key on any target, and make the key this host proves its deployment with:
 

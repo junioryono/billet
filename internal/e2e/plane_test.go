@@ -398,6 +398,9 @@ type stack struct {
 	// test happened to do it second.
 	hurry     chan struct{}
 	hurryOnce sync.Once
+
+	// timings is where this stack's listeners report how long their loops take.
+	timings *server.ListenerTimings
 }
 
 func newStack(t *testing.T, opts ...stackOpt) *stack {
@@ -919,8 +922,9 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	}
 
 	return &stack{
-		hurry: hurry,
-		dir:   dir, closeDB: c.close, plane: p, second: secondPlane, alloc: a, db: c.ctl.Ledger(),
+		timings: c.ctl.ListenerTimings(),
+		hurry:   hurry,
+		dir:     dir, closeDB: c.close, plane: p, second: secondPlane, alloc: a, db: c.ctl.Ledger(),
 		runner: runner, scheduler: scheduler, provider: prov, kind: kind, backend: sc.backend,
 		node: host, tiers: tiers,
 		wire: wire, stopNode: stopNode, wireAddr: wireAddr, guestCache: guestCache,

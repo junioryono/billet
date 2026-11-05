@@ -19,7 +19,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `controllers` | no | `single` (default) or `active-passive`; refused on SQLite |
 | `tls_router.node_addr` | behind a router | the `host:port` nodes dial through a TLS-passthrough router, a DNS name because a client sends no SNI for an IP. With it, `listen` stays on loopback and serves mutual TLS, and `node_tls_hosts` is refused ([Many deployments on one host](../deploying/many-deployments.md)) |
 | `tls_router.enroll_addr` | with `bootstrap_listen` behind a router | the `host:port` an enrolling machine dials, by a name of its own |
-| `token_broker.url` | with a broker | where this deployment takes its installation tokens from, https only, naming only a scheme and a host. With it, no target names a `private_key_path` and this host holds no App key ([ADR-024](decisions/adr-024-installation-tokens-from-a-broker.md)) |
+| `token_broker.url` | with a broker | where this deployment takes its installation tokens from, https only, naming only a scheme and a host. With it, no target names a `private_key_path` and this host holds no App key ([ADR-025](decisions/adr-025-installation-tokens-from-a-broker.md)) |
 | `token_broker.client_key_path` | with a broker | the key this host proves its deployment with, absolute and outside `identity_dir`; `billet broker client-key` creates it |
 | `token_broker.ca_file` | no | the PEM bundle the broker's certificate is verified against; absent, the system's roots |
 | `identity.backend` | no | `file` (default) or `aws-ssm` |
@@ -28,6 +28,8 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `placement` | no | `pack` (default) or `spread` |
 | `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
+| `test_results_retention` | no | how long the ledger keeps a job's test suites and cases, which `billet tests stats` ranks and `billet jobs show` prints (default `336h`, at least `1h`); they are kept apart from the guest report and past it |
+| `test_results_max_bytes` | no | how much of them the ledger keeps in all, the oldest deleted first (a byte size, default `128MiB`, at least `1MiB`); the control plane reads the whole ledger at every start, and this bounds what they add to that |
 | `job_detail_retention` | no | how long the ledger keeps a finished job's per-sample series, destinations and guest report (default `72h`, at least `1h`); past it they are deleted and `billet jobs show` says the job's detail was retired. The usage summary is kept |
 | `metrics.listen` | with `metrics` | the control plane's Prometheus endpoint (`/metrics`); absent block, no endpoint. A literal loopback address (`127.0.0.1` or `[::1]`, not `localhost`) unless `metrics.allow_remote`; may not share a socket with any other listener in the file, however it is spelled. See [Metrics](../operating/metrics.md) |
 | `metrics.allow_remote` | no | admits a non-loopback `metrics.listen`; the endpoint has no authentication |
