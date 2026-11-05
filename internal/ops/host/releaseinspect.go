@@ -342,6 +342,10 @@ type inspectHost struct {
 	// installed configuration's node endpoint as the one representation.
 	Registration      maybe `json:"registration"`
 	InstalledEndpoint maybe `json:"installed_endpoint"`
+	// InstalledEndpoints is the list a node naming several controllers names,
+	// beside an InstalledEndpoint that says there is no one endpoint; absent
+	// otherwise.
+	InstalledEndpoints []string `json:"installed_endpoints,omitempty"`
 	// EndpointReceipt is the durable migration receipt, typed by presence
 	// (releaseinspectreceipt.go), judged whether or not the node runs.
 	EndpointReceipt maybe `json:"endpoint_receipt"`
@@ -500,6 +504,7 @@ func inspectHostRelease(ctx context.Context, configPath string) inspectReport {
 	report.Host.Registration = hostRegistration(report.Services["node"], regID)
 	report.Host.EndpointReceipt = hostEndpointReceipt()
 	report.Host.InstalledEndpoint = installedEndpoint(cfg, report.Config.Readable)
+	report.Host.InstalledEndpoints = installedEndpoints(cfg, report.Config.Readable)
 	report.Transaction = inspectTransactionSection()
 	if inspectBeforeClose != nil {
 		inspectBeforeClose()

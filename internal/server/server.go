@@ -73,6 +73,8 @@ type Server struct {
 	reapEvery time.Duration
 	// hurry, when closed, ends every listener's drain wait early.
 	hurry <-chan struct{}
+	// foregroundLaunches is set by WithForegroundLaunches.
+	foregroundLaunches bool
 	// restartHandoff makes an unsealed stop a handoff; see WithRestartHandoff.
 	restartHandoff bool
 
@@ -267,6 +269,15 @@ func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
 // WithHurrySignal for what a listener does with it.
 func WithHurry(c <-chan struct{}) ControlPlaneOption {
 	return func(s *Server) { s.hurry = c }
+}
+
+// WithForegroundLaunches makes every listener wait for each launch, which only a
+// harness wants: a deployment's listener must go on hearing GitHub through a slow launch
+// (listener_flight.go), but a replay delivers one event at a time to quiescence so that
+// goroutine order cannot decide what a run did, and a listener parked on its poll with
+// a launch still out is not quiet.
+func WithForegroundLaunches() ControlPlaneOption {
+	return func(s *Server) { s.foregroundLaunches = true }
 }
 
 // WithStopHandoff makes every listener hand over to the next control plane, rather
@@ -633,11 +644,15 @@ func (s *Server) reconcile(ctx context.Context) (map[string]*ScaleSet, map[strin
 //
 // A PACE, NOT A LIMIT. What is being waited for is GitHub expiring a session an
 // abandoned control plane left behind, and asking more often does not make that
-// happen sooner.
+// happen sooner; but asking less often opens it later, by up to the whole pace
+// after GitHub let it go, and after a promotion every tier waits here. Ten
+// seconds is at most ten seconds of that, for about nine more requests a tier
+// across the 60 to 92 seconds measured (2026-09-04), and a session opened is
+// one request whatever the pace.
 //
 // A VAR SO A TEST CAN DRIVE THE RETRY WITHOUT WAITING, which is the same seam
 // every other pace in this repository uses.
-var sessionRetryFor = 30 * time.Second
+var sessionRetryFor = 10 * time.Second
 
 // ErrSessionHeld means a message session for this scale set is already
 // outstanding, held by a control plane that did not close it.
@@ -685,6 +700,9 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 			return s.openSession(ctx, t, set, prov)
 		}),
 		WithPoolLaunchBatch(poolLaunchBatchFor(t)))
+	if !s.foregroundLaunches {
+		opts = append(opts, WithBackgroundLaunches())
+	}
 	if target, ok := s.targetFor(t); ok {
 		opts = append(opts, WithGitHubTarget(target.Config.Path()))
 	}
@@ -717,6 +735,8 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 // measurement rather than a promise, which is why this is a loop and not a
 // sleep, and why nothing here assumes the redelivery.
 func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet, prov Provisioner) (Session, error) {
+	began := time.Now()
+
 	for attempt := 1; ; attempt++ {
 		// BEFORE EVERY ATTEMPT, because a listener's recovery waits here too, and
 		// a process that is no longer the controller opens nothing.
@@ -726,7 +746,11 @@ func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet,
 
 		session, err := prov.Session(ctx, set.ID, s.owner)
 		if err == nil {
-			s.log.Info("message session open", "tier", t.Label, "attempt", attempt)
+			// SAID WHEN IT OPENS, and how long GitHub held it: after a promotion
+			// this is the one part of the failover billet does not own, and the
+			// rehearsal measures it from this line.
+			s.log.Info("opened this tier's message session", "tier", t.Label, "runs_on", t.ScaleSetName(),
+				"attempts", attempt, "waited", time.Since(began).Round(time.Millisecond))
 
 			return session, nil
 		}
