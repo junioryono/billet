@@ -393,6 +393,7 @@ func TestTheWindowsPayloadLaysOutWhatTheDriverReads(t *testing.T) {
 		"billet-ami/repo/scripts/windows/billet-runner-service.ps1",
 		"billet-ami/repo/scripts/windows/billet-job-started.ps1",
 		"billet-ami/repo/scripts/windows/prepare-aws-tools.ps1",
+		"billet-ami/repo/scripts/windows/prepare-documents.ps1",
 		"billet-ami/repo/scripts/runner-images/plan-windows-2025.json",
 		"billet-ami/repo/scripts/runner-images/differences-windows.tsv",
 		"billet-ami/repo/scripts/runner-images/upstream/images/windows/scripts/build/Install-Toolset.ps1",

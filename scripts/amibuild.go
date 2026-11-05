@@ -29,6 +29,7 @@ var amiBuild embed.FS
 //
 //go:embed windows/build-ami.ps1 windows/ec2-layer.ps1 windows/billet-runner.ps1
 //go:embed windows/billet-runner-service.ps1 windows/billet-job-started.ps1 windows/prepare-aws-tools.ps1
+//go:embed windows/prepare-documents.ps1
 //go:embed runner-images/upstream/images/windows/assets runner-images/upstream/images/windows/scripts
 //go:embed runner-images/plan-windows-2025.json runner-images/differences-windows.tsv
 //go:embed runner-images/LICENSE

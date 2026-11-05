@@ -50,7 +50,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The scheduled task needs an explicit execution limit and priority.**
 - **A step's preference does not cross a process.**
 - **Amazon's AMI is not Azure's.**
-- **GitHub's steps read the account's profile.**
+- **GitHub's steps read the account's profile, and SYSTEM has none to read.**
 - **EC2Launch keeps the user data it ran.**
 - **A failed start ends the instance's charge, not the lease.**
 - **A build's own output reaches the console only as a bounded tail on failure.**
