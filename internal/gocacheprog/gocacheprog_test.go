@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -50,9 +51,12 @@ type fakeNode struct {
 	// held: work a served build should not have repeated. The go command
 	// rewrites some empty marker entries on every build, and those are not work.
 	redone atomic.Int64
+	// delay is how long every request takes, as one fetched from S3 does.
+	delay time.Duration
 }
 
 func (f *fakeNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(f.delay)
 	if r.Header.Get("Authorization") != "Bearer token" {
 		http.Error(w, "unauthorised", http.StatusUnauthorized)
 
@@ -201,8 +205,64 @@ func exchange(t *testing.T, cfg Config, requests ...any) []response {
 		}
 		answers = append(answers, answer)
 	}
+	// CLOSE IS ANSWERED LAST, after everything it closes; the rest come as they are
+	// ready, so they are put back in the order asked.
+	if n := len(answers); n > 0 && answers[n-1].ID != closeID(requests) {
+		t.Fatalf("close was not answered last: %+v", answers)
+	}
+	slices.SortStableFunc(answers, func(a, b response) int { return int(a.ID - b.ID) })
 
 	return answers
+}
+
+// closeID is the ID of the close among requests, or -1 for none.
+func closeID(requests []any) int64 {
+	for _, r := range requests {
+		if req, ok := r.(request); ok && req.Command == "close" {
+			return req.ID
+		}
+	}
+
+	return -1
+}
+
+// A BUILD'S REQUESTS ARE ANSWERED SIDE BY SIDE. The go command sends them without
+// waiting, and answered one at a time a warm build on EC2, where an entry the node
+// lacks is fetched from S3, took 114 s against 45 s cold (2026-11-05).
+func TestRequestsAreAnsweredSideBySide(t *testing.T) {
+	t.Parallel()
+
+	const actions = 16
+	fake := &fakeNode{objects: map[string][]byte{}, delay: 50 * time.Millisecond}
+	node := httptest.NewServer(fake)
+	t.Cleanup(node.Close)
+	var requests []any
+	for i := range actions {
+		action := bytes.Repeat([]byte{byte(i + 1)}, 32)
+		body := []byte(fmt.Sprintf("output %d", i))
+		output := digest(body)
+		fake.objects["cas/"+output] = body
+		fake.objects["ac/"+hex.EncodeToString(action)] = entry{output: output, size: int64(len(body)), at: time.Unix(1, 0)}.encode()
+		requests = append(requests, request{ID: int64(i + 1), Command: "get", ActionID: action})
+	}
+	requests = append(requests, request{ID: actions + 1, Command: "close"})
+
+	started := time.Now()
+	answers := exchange(t, Config{Dir: t.TempDir(), Endpoint: node.URL, Token: "token"}, requests...)
+	took := time.Since(started)
+	if len(answers) != actions+1 {
+		t.Fatalf("%d answers, want %d", len(answers), actions+1)
+	}
+	for _, answer := range answers[:actions] {
+		if answer.Miss || answer.DiskPath == "" {
+			t.Fatalf("request %d was not served: %+v", answer.ID, answer)
+		}
+	}
+	// ONE AT A TIME IS TWO REQUESTS OF 50 ms FOR EACH OF 16, 1.6 s. Eight at once is
+	// four rounds; the bound leaves a loaded host three times that.
+	if serial := 2 * actions * fake.delay; took > serial*3/8 {
+		t.Fatalf("16 gets took %s, near the %s one at a time takes", took, serial)
+	}
 }
 
 // AN OBJECT THE NODE SERVES IS KEPT ONLY WHEN IT IS WHAT ITS ENTRY NAMES. A

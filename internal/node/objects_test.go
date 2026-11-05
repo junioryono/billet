@@ -1152,6 +1152,7 @@ func TestAnEntrysSizeComesFromTheListing(t *testing.T) {
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	clearReadCache(t, service)
 
 	objectCAS(t, service, "asker")
 	session := service.sessionOf(provider.InstanceName("asker"))
@@ -1197,6 +1198,7 @@ func TestReadingACachedEntryMarksItUsed(t *testing.T) {
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	clearReadCache(t, service)
 
 	reader := objectCAS(t, service, "reader")
 	read := func() {
@@ -1233,6 +1235,7 @@ func TestAFullDiskCostsNoRequest(t *testing.T) {
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	clearReadCache(t, service)
 	service.casFill = -1
 
 	reader := objectCAS(t, service, "reader")
@@ -1283,6 +1286,7 @@ func TestAnEntryIsOnlySaidToBeThereIfItCanBeRead(t *testing.T) {
 			if err := service.RetryClosed(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			clearReadCache(t, service)
 			objectCAS(t, service, "asker")
 			handle, err := service.openCASHandle(t.Context(), service.sessionOf(provider.InstanceName("asker")), config.CacheGo, false)
 			if err != nil {
@@ -1313,6 +1317,7 @@ func TestAFullDiskDoesNotHideWhatTheReadCacheHolds(t *testing.T) {
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	clearReadCache(t, service)
 	reader := objectCAS(t, service, "reader")
 	if got := casRequest(t, service, reader, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), ""); got.Code != http.StatusOK {
 		t.Fatalf("GET = %d", got.Code)
@@ -1591,6 +1596,7 @@ func TestAnEntryForgottenBesideReadersIsNotARace(t *testing.T) {
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	clearReadCache(t, service)
 
 	objectCAS(t, service, "asker")
 	handle, err := service.openCASHandle(t.Context(), service.sessionOf(provider.InstanceName("asker")), config.CacheGo, false)
@@ -1881,9 +1887,23 @@ func TestAPublishedEntryIsReadThroughTheStoreOnceThenFromTheNodesDisk(t *testing
 		t.Fatal(err)
 	}
 
+	// THE NODE THAT PUBLISHED IT KEEPS IT: the next job here makes no request at all.
 	second := objectCAS(t, service, "second")
+	if got := casRequest(t, service, second, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), ""); got.Code != http.StatusOK || got.Body.String() != body {
+		t.Fatalf("GET on the node that published = %d %q", got.Code, got.Body.String())
+	}
+	storage.mu.Lock()
+	kept := storage.reads
+	storage.mu.Unlock()
+	if kept != 0 {
+		t.Fatalf("the node that published the entry read it from the store %d times", kept)
+	}
+
+	// A NODE WITHOUT IT READS IT ONCE, and then from its own disk.
+	clearReadCache(t, service)
+	third := objectCAS(t, service, "third")
 	for range 3 {
-		got := casRequest(t, service, second, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), "")
+		got := casRequest(t, service, third, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), "")
 		if got.Code != http.StatusOK || got.Body.String() != body {
 			t.Fatalf("GET = %d %q", got.Code, got.Body.String())
 		}
@@ -1895,18 +1915,46 @@ func TestAPublishedEntryIsReadThroughTheStoreOnceThenFromTheNodesDisk(t *testing
 	if reads != 1 {
 		t.Fatalf("the store was read %d times for one entry", reads)
 	}
-	if listings != 1 {
-		t.Fatalf("the store was listed %d times for one job", listings)
+	if listings != 2 {
+		t.Fatalf("the store was listed %d times for two jobs", listings)
 	}
 
 	// A MISS COSTS NO REQUEST: the listing already said.
-	if got := casRequest(t, service, second, http.MethodGet, "/v1/cas/go/cas/"+digestOf("absent"), ""); got.Code != http.StatusNotFound {
+	if got := casRequest(t, service, third, http.MethodGet, "/v1/cas/go/cas/"+digestOf("absent"), ""); got.Code != http.StatusNotFound {
 		t.Fatalf("GET absent = %d", got.Code)
 	}
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
 	if storage.reads != 1 {
 		t.Fatalf("a miss cost %d reads", storage.reads-1)
+	}
+}
+
+// clearReadCache empties the node's read cache, as a job landing on another node finds it.
+func clearReadCache(t *testing.T, service *CacheService) {
+	t.Helper()
+	if err := os.RemoveAll(filepath.Join(service.rootState, casCacheDirectory)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// AN UNPUBLISHED JOB'S WRITES ARE NOT KEPT, whatever kept a published one's: they reach
+// no other job, through the read cache or otherwise.
+func TestAnUnpublishedJobsWritesAreNotKept(t *testing.T) {
+	t.Parallel()
+	service, _, _ := objectService(t)
+	token := objectCAS(t, service, scopedLease)
+	body := "never published"
+	if code := putObject(t, service, token, body); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	closeAndRetry(t, service, provider.InstanceName(scopedLease))
+	reader := objectCAS(t, service, "reader")
+	if got := casRequest(t, service, reader, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), ""); got.Code != http.StatusNotFound {
+		t.Fatalf("another job read an unpublished entry: %d", got.Code)
+	}
+	if entries, err := os.ReadDir(filepath.Join(service.rootState, casCacheDirectory)); err == nil && len(entries) != 0 {
+		t.Fatalf("the read cache holds %v", entries)
 	}
 }
 

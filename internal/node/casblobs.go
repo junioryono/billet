@@ -382,8 +382,42 @@ func (s *CacheService) releaseBlobVolume(
 				"it may be evicted early", "instance", session.instance, "kind", hv.Kind, "error", err)
 		}
 	}
+	if journal.Phase == phasePublished {
+		s.keepPublished(hv, root, written)
+	}
 
 	return done()
+}
+
+// keepPublished moves what a published job wrote into the read cache, which is on the
+// same disk, so the next job of the key on this node reads it there rather than from
+// the store: a warm build asks for thousands of entries, and each one fetched is a
+// request (114 s against 45 s cold for `go build std` on EC2, 2026-11-05).
+//
+// ONLY ONCE IT IS PUBLISHED, so what reaches the next job is what the store holds or
+// another answer the store would equally give: an output is named by its bytes, and of
+// two action results either is valid. What cannot be moved is fetched as before.
+func (s *CacheService) keepPublished(hv *hostVolume, root string, written []storecontract.BlobRef) {
+	kept := 0
+	for _, ref := range written {
+		if s.readCacheFull() != nil {
+			break
+		}
+		target := s.casCachePath(hv.Volume.Key, reapi.Table(ref.Table), ref.Digest)
+		if _, err := os.Lstat(target); err == nil {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			break
+		}
+		if err := os.Rename(filepath.Join(root, string(ref.Table), ref.Digest[:2], ref.Digest), target); err != nil {
+			continue
+		}
+		kept++
+	}
+	if kept > 0 {
+		s.log.Debug("kept a published job's entries on this node", "kind", hv.Kind, "entries", kept)
+	}
 }
 
 // writtenBlobs is every entry a session's directory holds, which is what it wrote: a
