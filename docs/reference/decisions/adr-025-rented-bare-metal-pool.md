@@ -23,7 +23,7 @@ A new package, `internal/hostsource`, holds the contract a source implements, be
 - **Release** a host, which the scaler asks only after the node's drain is proved and the host holds no lease and no custody.
 - **Terms**: lead time, billing granularity and minimum term, per shape, which decide whether a source covers the floor or bursts.
 
-The AWS source, `internal/hostsource/awsmetal`, launches, describes and terminates through the same EC2 client the `ec2` provider uses, moved out of it into a package both import, so there is one EC2 client as there is one signer. The phoenixNAP source, `internal/hostsource/phoenixnap`, uses the BMC API with a client-credentials token. Each source's credentials are redacting types read from the environment or the identity store, never from argv, and never logged.
+The AWS source, `internal/hostsource/awsmetal`, launches, describes and terminates through the same EC2 client the `ec2` provider uses, with its retry ladder, its error codes and its redaction, so there is one EC2 client as there is one signer; a second copy is one that is wrong. The phoenixNAP source, `internal/hostsource/phoenixnap`, uses the BMC API with a client-credentials token. Each source's credentials are redacting types read from the environment or the identity store, never from argv, and never logged.
 
 ### Shape
 
@@ -64,7 +64,7 @@ A hosting provider locks a server that scans, mines or sends packets at a high r
 
 - An operator can rent capacity from two kinds of source behind one contract, and a third source is a package that implements it.
 - A pool on phoenixNAP needs a monthly storage tier before its caches turn on, and a new account's one-server quota must be raised before it can grow.
-- The EC2 client leaves the `ec2` provider for a package both it and the metal source import.
+- The metal source shares the `ec2` provider's EC2 client rather than growing its own.
 - The ledger grows two tables, orders and hosts, through the migration rules of `billet-state`.
 
 ## What was rejected
