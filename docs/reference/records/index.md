@@ -23,11 +23,13 @@ image-store-wait
 docker-published-ports
 untrusted-fork-tart
 untrusted-fork-ec2
+ec2-cache-probes
 ```
 
 | Record | Covers |
 |---|---|
 | [AWS acceptance](aws-acceptance.md) | cold end-to-end jobs on EC2 from a private repository, the `billet acceptance` command that turned the hand procedure into one, spot interruption, same-label failover, and what the CodeBuild API actually does |
+| [EC2 cache probes](ec2-cache-probes.md) | what chose where an EC2 node keeps a cache's bytes: a store volume per archive against whole objects in S3 against GitHub's own store, from one host in one VPC |
 | [Site acceptance](site-acceptance.md) | the site boundary proved on real hosts: three nodes, two sites, one deployment, and the two defects only a real AWS could show |
 | [Restore rehearsal](restore-rehearsal.md) | why the two CI rehearsal legs exist, what each proves that the other cannot, and what neither proves |
 | [Host rehearsals](host-rehearsals.md) | the rollout, recover, CA rotation and promotion rehearsals on packaged hosts under real systemd, what the first run found, and what has and has not run |
