@@ -91,6 +91,13 @@ func TestAFleetThatDescribesNoDeploymentIsRefused(t *testing.T) {
 		{"no ceiling", func(f *Fleet) { f.MaxMemory = 0 }, "positive deployment ceiling"},
 		{"an unknown placement", func(f *Fleet) { f.Placement = "binpack" }, "server.placement"},
 		{"an unknown order", func(f *Fleet) { f.AdmissionOrder = "fifo" }, "server.admission_order"},
+		{"a duplicate target", func(f *Fleet) { f.Targets = []Target{{Name: "a"}, {Name: "a"}} }, "targets[1] needs a unique name"},
+		{"a target with no name", func(f *Fleet) { f.Targets = []Target{{}} }, "targets[0] needs a unique name"},
+		{"a negative weight", func(f *Fleet) { f.Targets = []Target{{Name: "a", Weight: -1}} }, `target "a" has weight -1`},
+		{"too large a weight", func(f *Fleet) { f.Targets = []Target{{Name: "a", Weight: config.MaxTargetWeight + 1}} },
+			`target "a" has weight`},
+		{"a tier of an unlisted target", func(f *Fleet) { f.Tiers[0].Target = "gone" },
+			`belongs to target "gone", which the fleet does not list`},
 	} {
 		f := goodFleet()
 		c.change(&f)

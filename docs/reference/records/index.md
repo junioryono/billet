@@ -27,6 +27,7 @@ ec2-cache-probes
 idle-control-plane
 runtime-predictions
 replay-policies
+target-weights
 ```
 
 | Record | Covers |
@@ -53,3 +54,4 @@ replay-policies
 | [What an idle control plane costs](idle-control-plane.md) | fifty idle control planes on one host, measured 2026-11-04: memory, CPU, connections to PostgreSQL and what a limit does to them, and what a restart waits for on real GitHub |
 | [Runtime predictions](runtime-predictions.md) | how well a job's runtime is predicted from the deployment's own history, measured on the reference deployment's fortnight to 2026-10-25: 30,253 jobs graded as an hourly-refreshing controller would have predicted them, 78% within 2x and 99.4% from the job's own runs, the wide shapes best (84 to 96% within 2x), the 2 vCPU tiers close in seconds and loose in ratio, and what the record does not grade |
 | [Admission orders on replay](replay-policies.md) | `fair` against `fill` replayed through billet's real scheduler: on a whole-host shape beside smaller ones, `fill` starving the 32 vCPU jobs (p99 1h46m against 28m) and `fair` making every smaller shape wait behind them (8 vCPU p99 5h12m against 19m), and on the reference deployment's own week of 19,757 jobs, `fill` making the 16 vCPU jobs wait (p99 3h59m against 11m) and `fair` the 8 vCPU ones (p99 2h30m against 56m). |
+| [Weights between targets](target-weights.md) | `targets[].weight` replayed through billet's real scheduler on 2026-11-04: two saturating targets at 2:1 holding 64% to 66% of the contested vCPU (1.83:1 on 16 slots, 1.94:1 on 64, the gap the size of a lease), about 1:1 with no weight, an idle target's rival holding the whole fleet, and the two starvations a replay of equal shapes could not show |

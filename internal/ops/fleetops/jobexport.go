@@ -119,7 +119,12 @@ func exportDeployment(ctx context.Context, a *alloc.Allocator, cfg *config.Confi
 	for i := range cfg.Tiers {
 		t := &cfg.Tiers[i]
 		fleet.Tiers = append(fleet.Tiers, jobtrace.Tier{Label: t.Label, VCPU: t.VCPU, Memory: t.Memory, Node: t.Node,
-			Providers: t.AcceptableProviders()})
+			Target: config.ShareTarget(*t), Providers: t.AcceptableProviders()})
+	}
+
+	weights := cfg.TargetWeights()
+	for _, target := range cfg.GitHubTargets() {
+		fleet.Targets = append(fleet.Targets, jobtrace.Target{Name: target.Name, Weight: weights[target.Name]})
 	}
 
 	if err := fleet.Validate(); err != nil {

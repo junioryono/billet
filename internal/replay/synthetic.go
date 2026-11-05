@@ -409,6 +409,74 @@ func WideShapeMix(seed uint64, p WideParams) Trace {
 	return t
 }
 
+// ContendedParams shape ContendedTargets.
+type ContendedParams struct {
+	Params
+	// Fleet's tiers are the streams, one per tier, in the owner of the tier's own
+	// target; a tier in Idle gets none.
+	Fleet Fleet
+	Idle  []string
+	// Saturation is the share of the fleet's vCPU room each stream offers alone,
+	// on average; zero means 1.5, so every stream that runs has more work than the
+	// whole fleet holds.
+	Saturation float64
+}
+
+// ContendedTargets is a stream of jobs on each of the fleet's tiers, each of them
+// alone more than the fleet holds, for as long as it has jobs: the shape on which
+// what the admission order gives each target is all that decides what it holds.
+// Jobs is per stream. Every job runs around busyMedian.
+func ContendedTargets(seed uint64, p ContendedParams) Trace {
+	if p.Saturation <= 0 {
+		p.Saturation = 1.5
+	}
+
+	p.Tiers = nil
+	for _, shape := range p.Fleet.Tiers {
+		p.Tiers = append(p.Tiers, shape.Label)
+	}
+
+	g := newGenerator(seed, p.Params)
+
+	room := 0
+	for _, h := range p.Fleet.Hosts {
+		room += h.VCPU
+	}
+
+	room = min(room, p.Fleet.MaxVCPU)
+	mean := float64(busyMedian) * math.Exp(busySigma*busySigma/2)
+
+	var t Trace
+
+	for i, shape := range p.Fleet.Tiers {
+		if slices.Contains(p.Idle, shape.Label) {
+			continue
+		}
+
+		owner := DefaultOwner
+		if shape.Target != "" {
+			owner = ownerOf(shape.Target)
+		}
+
+		gap := float64(shape.VCPU) * mean / (p.Saturation * float64(room))
+		at := g.p.Start
+
+		for j := range g.p.Jobs {
+			at = at.Add(time.Duration(g.r.ExpFloat64() * gap))
+
+			a := g.arrival(at, shape.Label, g.pick(g.p.Repositories), int64(50000+1000*i+j),
+				g.lognormal(busyMedian, busySigma))
+			a.Owner = owner
+			a.WorkflowRef = fmt.Sprintf("%s/%s/.github/workflows/ci.yml@refs/heads/main", owner, a.Repository)
+			t.Arrivals = append(t.Arrivals, a)
+		}
+	}
+
+	t.Normalize()
+
+	return t
+}
+
 // WideFleet is four 32 vCPU hosts with tiers of 2, 4, 8 and 16 vCPU and a
 // whole-host tier of 32, at 4 GiB a vCPU, under a ceiling the hosts add up to.
 func WideFleet() Fleet {

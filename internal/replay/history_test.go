@@ -390,7 +390,10 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 		},
 		MaxVCPU: 192, MaxMemory: 544 * config.GiB, AdmissionOrder: config.AdmissionFill,
 		Placement: config.PlacementSpread,
+		Targets:   []jobtrace.Target{{Name: config.DefaultTargetName, Weight: 2}},
 	}
+	doc.Tiers[0].Target = config.DefaultTargetName
+	doc.Tiers[1].Target = config.DefaultTargetName
 
 	f, dropped, err := FleetFromDocument(doc)
 	if err != nil || len(dropped) != 0 {
@@ -400,10 +403,11 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 	want := Fleet{
 		Hosts: []Host{{Name: "ubuntu-01", VCPU: 180, Memory: 480 * config.GiB, Site: "home"},
 			{Name: "macos-01", VCPU: 12, Memory: 64 * config.GiB}},
-		Tiers: []TierShape{{Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB},
-			{Label: "billet-macos", VCPU: 6, Memory: 24 * config.GiB, Node: "macos-01"}},
+		Tiers: []TierShape{{Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB, Target: config.DefaultTargetName},
+			{Label: "billet-macos", VCPU: 6, Memory: 24 * config.GiB, Node: "macos-01", Target: config.DefaultTargetName}},
 		MaxVCPU: 192, MaxMemory: 544 * config.GiB, AdmissionOrder: config.AdmissionFill,
 		Placement: config.PlacementSpread,
+		Targets:   []TargetShape{{Name: config.DefaultTargetName, Weight: 2}},
 	}
 	if !reflect.DeepEqual(f, want) {
 		t.Errorf("the fleet is\n%+v\nwant\n%+v", f, want)
@@ -487,6 +491,275 @@ func TestAFleetDocumentBecomesAReplayableFleet(t *testing.T) {
 	shapeless.Tiers = []jobtrace.Tier{{Label: "billet-none"}}
 	if _, _, err := FleetFromDocument(shapeless); err == nil || !strings.Contains(err.Error(), "billet-none") {
 		t.Errorf("a tier with no shape gave %v; want it refused by name", err)
+	}
+}
+
+// twoTargets is one tier per target on hosts with room for sixteen of its jobs,
+// each target at the weight given; a weight of zero is none written.
+func twoTargets(first, second int) Fleet {
+	return Fleet{
+		Hosts: []Host{
+			{Name: "host-a", VCPU: 16, Memory: 64 * config.GiB},
+			{Name: "host-b", VCPU: 16, Memory: 64 * config.GiB},
+		},
+		Tiers: []TierShape{
+			{Label: "billet-first", VCPU: 2, Memory: 8 * config.GiB, Target: config.DefaultTargetName},
+			{Label: "billet-second", VCPU: 2, Memory: 8 * config.GiB, Target: "second"},
+		},
+		Targets: []TargetShape{{Name: config.DefaultTargetName, Weight: first}, {Name: "second", Weight: second}},
+		MaxVCPU: 32, MaxMemory: 128 * config.GiB,
+	}
+}
+
+// laterShare is the first target's share of what the two held over the second half
+// of their contested window, past the start when both bought as they arrived.
+func laterShare(t *testing.T, r *Report) float64 {
+	t.Helper()
+
+	from, to, ok := r.ContestedWindow()
+	if !ok {
+		t.Fatal("the two targets never contended")
+	}
+
+	charged := r.ChargedByTarget(from.Add(to.Sub(from)/2), to)
+
+	total := charged[config.DefaultTargetName].VCPUSeconds + charged["second"].VCPUSeconds
+	if total == 0 {
+		t.Fatal("neither target held anything in the contested window")
+	}
+
+	return charged[config.DefaultTargetName].VCPUSeconds / total
+}
+
+// CONTENDED ROOM IS DIVIDED BY WEIGHT (#530): two targets each with more work than
+// the fleet holds converge to what their weights say, the same trace with no
+// weight divides evenly, and with one target idle the other takes all the room.
+// Under direct assignment, the protocol on which a tier is ever recorded waiting
+// (#686). BILLET_REPLAY_JOBS and BILLET_REPLAY_HOSTS size it for the record, the
+// table then being kept under -replay.out.
+func TestContendedRoomIsDividedByWeight(t *testing.T) {
+	t.Parallel()
+
+	jobs := 80
+	if n := os.Getenv("BILLET_REPLAY_JOBS"); n != "" {
+		if _, err := fmt.Sscan(n, &jobs); err != nil || jobs <= 0 {
+			t.Fatalf("BILLET_REPLAY_JOBS=%q is not a positive count", n)
+		}
+	}
+
+	hosts := 2
+	if n := os.Getenv("BILLET_REPLAY_HOSTS"); n != "" {
+		if _, err := fmt.Sscan(n, &hosts); err != nil || hosts <= 0 {
+			t.Fatalf("BILLET_REPLAY_HOSTS=%q is not a positive count", n)
+		}
+	}
+
+	sized := func(f Fleet) Fleet {
+		f.Hosts = nil
+		for i := range hosts {
+			f.Hosts = append(f.Hosts, Host{Name: fmt.Sprintf("host-%d", i), VCPU: 16, Memory: 64 * config.GiB})
+		}
+
+		f.MaxVCPU, f.MaxMemory = 16*hosts, config.ByteSize(hosts)*64*config.GiB
+
+		return f
+	}
+
+	opts := Options{DirectAssignment: true, Log: discardLogger()}
+	weighted, even := sized(twoTargets(2, 1)), sized(twoTargets(0, 0))
+	room, slots := float64(weighted.MaxVCPU), weighted.MaxVCPU/2
+	params := ContendedParams{Params: Params{Jobs: jobs}, Fleet: weighted}
+
+	// keep writes a replay's table beside the records, when they are kept.
+	keep := func(t *testing.T, part, body string) {
+		t.Helper()
+
+		if *outDir == "" {
+			return
+		}
+
+		if err := os.MkdirAll(*outDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		name := fmt.Sprintf("target-weights-%dhosts-%s.md", hosts, part)
+		if err := os.WriteFile(filepath.Join(*outDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// THE THREE REPLAYS RUN SIDE BY SIDE, each on a stack of its own: one after another
+	// they took nine minutes of the package's thirty-five under -race in CI.
+	t.Run("weighted", func(t *testing.T) {
+		t.Parallel()
+
+		report := Run(t, weighted, ContendedTargets(1, params), opts)
+		if why := report.unspeakable(); why != "" {
+			t.Fatal(why)
+		}
+
+		if share := laterShare(t, report); share < 0.60 || share > 0.73 {
+			t.Errorf("weighted 2:1, the first target held %.3f of the contested vCPU; want about 2/3\n%s", share,
+				report.TargetTable(4))
+		}
+
+		keep(t, "weighted", "## Weighted 2:1\n\n"+report.TargetTable(8))
+	})
+
+	t.Run("no weight", func(t *testing.T) {
+		t.Parallel()
+
+		control := Run(t, even, ContendedTargets(1, params), opts)
+		if why := control.unspeakable(); why != "" {
+			t.Fatal(why)
+		}
+
+		if share := laterShare(t, control); share < 0.42 || share > 0.58 {
+			t.Errorf("with no weight, the first target held %.3f of the contested vCPU; want about half\n%s", share,
+				control.TargetTable(4))
+		}
+
+		keep(t, "even", "## No weight\n\n"+control.TargetTable(8))
+	})
+
+	// THE SECOND TARGET'S WEIGHT CLAIMS NOTHING WHILE IT WAITS FOR NOTHING. Its one
+	// rival holds the fleet, measured from the start that filled the room to its
+	// last, before it drained.
+	t.Run("the other idle", func(t *testing.T) {
+		t.Parallel()
+
+		idleParams := params
+		idleParams.Idle = []string{"billet-second"}
+
+		alone := Run(t, weighted, ContendedTargets(1, idleParams), opts)
+		if why := alone.unspeakable(); why != "" {
+			t.Fatal(why)
+		}
+
+		starts := make([]time.Time, 0, len(alone.Records))
+		for i := range alone.Records {
+			starts = append(starts, alone.Records[i].StartedAt)
+		}
+
+		slices.SortFunc(starts, time.Time.Compare)
+
+		if len(starts) <= slots {
+			t.Fatalf("%d jobs cannot fill the room", len(starts))
+		}
+
+		from, to := starts[slots], starts[len(starts)-1]
+		mean := alone.ChargedByTarget(from, to)[config.DefaultTargetName].VCPUSeconds / to.Sub(from).Seconds()
+
+		if mean < 0.95*room {
+			t.Errorf("with the other target idle, the first held a mean of %.1f of %.0f vCPU; want all of it", mean, room)
+		}
+
+		keep(t, "idle", fmt.Sprintf("## The second target idle\n\nThe first held a mean of %.1f of %.0f vCPU.\n", mean, room))
+	})
+}
+
+// A FLOOR ABOVE A TARGET'S WEIGHTED SHARE IS STILL KEPT (#530): a tier of weight 1
+// reserved half the fleet beside a target of weight 2. Ranked alone, the second
+// target stayed head with its room held by that floor, the floor's tier could buy
+// only ahead of it, and the reserved room sat idle.
+func TestAFloorAboveAWeightedShareIsKept(t *testing.T) {
+	t.Parallel()
+
+	fleet := twoTargets(1, 2)
+	fleet.Tiers[0].Reserved = 8
+
+	trace := ContendedTargets(1, ContendedParams{Params: Params{Jobs: 80}, Fleet: fleet})
+
+	report := Run(t, fleet, trace, Options{DirectAssignment: true, Log: discardLogger()})
+	if why := report.unspeakable(); why != "" {
+		t.Fatal(why)
+	}
+
+	if share := laterShare(t, report); share < 0.48 {
+		t.Errorf("the tier reserved half the fleet held %.3f of the contested vCPU; want its floor kept\n%s", share,
+			report.TargetTable(4))
+	}
+
+	// AND THE ROOM IS NOT LEFT IDLE while both have work.
+	from, to, _ := report.ContestedWindow()
+
+	total := 0.0
+	for _, c := range report.ChargedByTarget(from, to) {
+		total += c.VCPUSeconds
+	}
+
+	if mean := total / to.Sub(from).Seconds(); mean < 0.9*32 {
+		t.Errorf("the two targets held a mean of %.1f of 32 vCPU while both had work\n%s", mean, report.TargetTable(4))
+	}
+}
+
+// A WIDE SHAPE STILL GETS ITS TURN UNDER WEIGHTS (#530): a tier half a host wide,
+// at twice the weight of a stream of small jobs that offers more than the host
+// holds. Its second lease needs half the host free. Ranked alone, the stream's
+// target was behind again each time one of its jobs ended and bought the room back,
+// so the wide tier held its first lease and never fitted a second while the stream
+// ran, with a quarter of the host idle. Kept at the head, it accumulates the room.
+func TestAWideShapeGetsItsTurnUnderWeights(t *testing.T) {
+	t.Parallel()
+
+	fleet := Fleet{
+		Hosts: []Host{{Name: "only", VCPU: 128, Memory: 512 * config.GiB}},
+		Tiers: []TierShape{
+			{Label: "billet-wide", VCPU: 64, Memory: 256 * config.GiB, Target: config.DefaultTargetName},
+			{Label: "billet-stream", VCPU: 2, Memory: 8 * config.GiB, Target: "second"},
+		},
+		Targets: []TargetShape{{Name: config.DefaultTargetName, Weight: 2}, {Name: "second", Weight: 1}},
+		MaxVCPU: 128, MaxMemory: 512 * config.GiB,
+	}
+
+	job := func(at time.Time, tier string, d time.Duration) Arrival {
+		owner := DefaultOwner
+		if tier == "billet-stream" {
+			owner = "second"
+		}
+
+		return Arrival{
+			At: at, Tier: tier, Owner: owner, Repository: "web", Duration: Duration(d),
+			WorkflowRef: owner + "/web/.github/workflows/ci.yml@refs/heads/main",
+		}
+	}
+
+	var trace Trace
+
+	for i := range 240 {
+		trace.Arrivals = append(trace.Arrivals, job(DefaultStart.Add(time.Duration(i)*15*time.Second), "billet-stream",
+			8*time.Minute))
+	}
+
+	for i := range 3 {
+		trace.Arrivals = append(trace.Arrivals, job(DefaultStart.Add(time.Duration(i)*time.Minute), "billet-wide",
+			40*time.Minute))
+	}
+
+	trace.Normalize()
+
+	report := Run(t, fleet, trace, Options{DirectAssignment: true, Log: discardLogger()})
+	if why := report.unspeakable(); why != "" {
+		t.Fatal(why)
+	}
+
+	var first, second time.Time
+
+	for i := range report.Records {
+		if rec := &report.Records[i]; rec.Tier == "billet-wide" {
+			switch {
+			case first.IsZero() || rec.StartedAt.Before(first):
+				first, second = rec.StartedAt, first
+			case second.IsZero() || rec.StartedAt.Before(second):
+				second = rec.StartedAt
+			}
+		}
+	}
+
+	// Before the first has ended: the two ran together, beside the stream.
+	if second.IsZero() || !second.Before(first.Add(40*time.Minute)) {
+		t.Errorf("the wide tier's second job started %s after its first, which ran 40m; want them together",
+			second.Sub(first))
 	}
 }
 

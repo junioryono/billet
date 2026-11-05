@@ -208,6 +208,52 @@ func TestAComparisonPrintsEachPolicysSpan(t *testing.T) {
 	}
 }
 
+// WHAT A TARGET HELD IS CUT TO THE INTERVAL ASKED FOR, a lease the ledger never
+// ended running to its end, and the contested window is when both were holding
+// room and had a job left to start.
+func TestChargesPerTargetAndTheContestedWindow(t *testing.T) {
+	t.Parallel()
+
+	start := DefaultStart
+	hour := func(n float64) time.Time { return start.Add(time.Duration(n * float64(time.Hour))) }
+	fleet := Fleet{Tiers: []TierShape{{Label: "a", Target: "first"}, {Label: "b", Target: "second"}}}
+
+	r := &Report{Fleet: fleet, Records: []Record{
+		{Tier: "a", VCPU: 4, Memory: 8 * config.GiB, ChargedFrom: hour(0), StartedAt: hour(0), FinishedAt: hour(2)},
+		{Tier: "a", VCPU: 4, Memory: 8 * config.GiB, ChargedFrom: hour(3), StartedAt: hour(3), FinishedAt: hour(4)},
+		{Tier: "b", VCPU: 2, Memory: 4 * config.GiB, ChargedFrom: hour(1), StartedAt: hour(1)},
+		{Tier: "b", VCPU: 2, Memory: 4 * config.GiB, ChargedFrom: hour(2), StartedAt: hour(2), FinishedAt: hour(5)},
+	}}
+
+	from, to, ok := r.ContestedWindow()
+	if !ok || !from.Equal(hour(1)) || !to.Equal(hour(2)) {
+		t.Errorf("the contested window is %s to %s (%v); want the second's first charge to its last start",
+			from, to, ok)
+	}
+
+	got := r.ChargedByTarget(hour(1), hour(3.5))
+
+	// a: an hour of the first lease and half of the second. b: 2.5 hours of the
+	// open lease and 1.5 of the other.
+	if want := (TargetCharge{VCPUSeconds: 4 * 1.5 * 3600, GiBSeconds: 8 * 1.5 * 3600}); got["first"] != want {
+		t.Errorf("the first target held %+v; want %+v", got["first"], want)
+	}
+
+	if want := (TargetCharge{VCPUSeconds: 2 * 4 * 3600, GiBSeconds: 4 * 4 * 3600}); got["second"] != want {
+		t.Errorf("the second target held %+v; want %+v", got["second"], want)
+	}
+
+	if _, _, ok := (&Report{Fleet: fleet, Records: r.Records[:2]}).ContestedWindow(); ok {
+		t.Error("one target alone has a contested window")
+	}
+
+	table := r.TargetTable(2)
+	if !strings.Contains(table, "Contested for 1h0m0s.") || !strings.Contains(table, "| first | 0 | 4.0 | 8.0 | 67% | 67% |") ||
+		!strings.Contains(table, "| second | 0 | 2.0 | 4.0 | 33% | 33% |") {
+		t.Errorf("the table is\n%s", table)
+	}
+}
+
 // A SHAPE THAT STARTED NOTHING SHOWS NO WAITS, and its backlog at the horizon
 // is in the table beside the waits it leaves out.
 func TestTheComparisonTableShowsAStarvedShapesBacklog(t *testing.T) {

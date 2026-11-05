@@ -50,7 +50,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	}
 
 	// READ ONCE, so every purchase in this loop and the record below judge the
-	// tier as it stood at one instant.
+	// tier as it stood at one instant, unless targets are weighted (below).
 	admission := l.admission(ctx)
 
 	launched := false
@@ -120,6 +120,13 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			}
 			batch = append(batch, poolLaunch{lease: lease, job: job})
 			active++
+
+			// A WEIGHTED ORDER IS JUDGED ON WHAT THE LAST PURCHASE HELD: a target
+			// behind by one lease's worth would otherwise buy its whole backlog on
+			// the rank it had when it was behind.
+			if admission.TargetRank != nil {
+				admission = l.admission(ctx)
+			}
 		}
 
 		l.endBatchBuying()

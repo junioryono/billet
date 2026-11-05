@@ -167,6 +167,12 @@ type Limits struct {
 	// config.Config.TargetShares: a ceiling inside MaxVCPU/MaxMemory that the
 	// tiers of one target buy from together. A target absent from it has none.
 	Shares map[string]config.TargetShare
+
+	// Weights is each target's weight by target name, from
+	// config.Config.TargetWeights: empty unless some target writes one, and then
+	// what the admission order ranks waiting targets by (TierAdmission.TargetRank).
+	// It decides nothing inside a purchase.
+	Weights map[string]int
 }
 
 // Usage is the vector of what is currently held.
@@ -299,6 +305,12 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 	}
 
 	limits.Shares = maps.Clone(limits.Shares)
+
+	if errs := config.TargetWeightErrors(limits.Weights); len(errs) > 0 {
+		return nil, fmt.Errorf("alloc: %w", errors.Join(errs...))
+	}
+
+	limits.Weights = maps.Clone(limits.Weights)
 
 	// THE ARCHITECTURE RULE, re-applied as every catalogue rule is here: a
 	// catalogue built in code that names arch on some tiers would place the rest
