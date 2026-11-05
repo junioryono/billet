@@ -85,7 +85,7 @@ Real private-repository jobs have launched on EC2, registered through JIT config
 
 ## Cost
 
-Declared prices report exposure; they do not gate admission. `billet check` reports one node's conservative peak; `billet status` reports the deployment-wide peak across registered cloud nodes under the shared ceiling, disconnected registrations included because their instances may still be billable. An AWS budget is the account-wide backstop. `billet decommission --yes` removes the instances and the EBS+S3 cache billet made outside Terraform; run it before `terraform destroy`.
+Declared prices report exposure; they do not gate admission. `billet check` reports one node's conservative peak; `billet status` reports the deployment-wide peak across registered cloud nodes under the shared ceiling, disconnected registrations included because their instances may still be billable. An AWS budget is the account-wide backstop. `billet decommission --yes` removes the instances and the EBS+S3 cache billet made outside Terraform; run it before `terraform destroy`, on the node's host (it finds the deployment's identity in the node's state directory) and with a credential that may delete every object under the cache prefix. The node's own role may not: the policy billet renders lets it delete what eviction removes and never the state objects, so under that role decommission removes the snapshots and the archives and then stops with `AccessDenied` on the first state object (measured 2026-11-05, [site acceptance](../reference/records/site-acceptance.md)).
 
 ## Everything in AWS
 
