@@ -26,8 +26,9 @@ const (
 	// the one query the agent's last batch adds.
 	guestBatchType = "application/vnd.billet.guest-batch"
 	guestFinal     = "final=1"
-	// guestSchema is the batch schema this node decodes (guestreport, codec 1).
-	guestSchema = 1
+	// guestSchema is the schema of the report this node writes (guestreport, codec
+	// 1), which a batch's later schemas add nothing to.
+	guestSchema = guestreport.SchemaBase
 )
 
 // The limits the node holds whatever a guest sends.
@@ -173,7 +174,7 @@ func (s *CacheService) guestHello(w http.ResponseWriter, session *cacheSession) 
 	}
 
 	writeCacheJSON(w, http.StatusOK, guestLimits{
-		Schemas:    []int{guestSchema},
+		Schemas:    []int{guestreport.SchemaBase, guestreport.SchemaCases},
 		IntervalMS: guestreport.BatchInterval.Milliseconds(),
 		MaxBody:    guestreport.MaxBatchBytes,
 	})
@@ -438,6 +439,8 @@ func (s *CacheService) encodeGuestReport(ctx context.Context, report *alloc.Gues
 		decoded = append(decoded, b)
 	}
 
+	s.encodeGuestTests(report, decoded)
+
 	merged, err := guestreport.Merge(decoded)
 	if err != nil {
 		return err
@@ -461,18 +464,38 @@ func (s *CacheService) encodeGuestReport(ctx context.Context, report *alloc.Gues
 	return nil
 }
 
+// encodeGuestTests puts the test cases the batches carried on report, for the
+// ledger's own row. What cannot be encoded costs the job's cases and nothing else.
+func (s *CacheService) encodeGuestTests(report *alloc.GuestReport, batches []guestreport.Batch) {
+	tests, ok := guestreport.TestResultsOf(batches)
+	if !ok {
+		return
+	}
+
+	_, data, err := guestreport.EncodeTestResults(tests, alloc.MaxTestResultsBytes)
+	if err != nil {
+		s.log.Warn("could not keep the test results a job's guest reported", "error", err)
+
+		return
+	}
+
+	report.TestsCodec, report.Tests = alloc.TestResultsCodec, data
+}
+
 // The bytes one decoded element holds at least: its fixed fields (eight bytes a
 // number, sixteen a string's header, twenty-four a slice's), its text counted
 // apart. A batch is charged twice its own, for its place in an array that grows
 // by doubling.
 const (
-	batchBytes         = 2 * (8 + 16 + 8 + 8 + 4*24)
+	batchBytes         = 2 * (8 + 16 + 8 + 8 + 5*24 + 2*8)
 	sampleBytes        = 10 * 8
 	processSampleBytes = 8 + 24 + 5*8 + 8
 	processRowBytes    = 16 + 5*8
 	stepBytes          = 16 + 8
 	suiteBytes         = 16 + 4*8 + 24
 	failedNameBytes    = 16
+	caseSuiteBytes     = 16 + 4*8 + 8 + 24
+	caseBytes          = 16 + 16 + 8 + 8 + 16
 )
 
 // decodedSize is about what b holds in memory once decoded: its fixed fields and
@@ -495,6 +518,15 @@ func decodedSize(b *guestreport.Batch) int {
 		n += suiteBytes + len(t.Name)
 		for _, name := range t.Failed {
 			n += failedNameBytes + len(name)
+		}
+	}
+
+	for i := range b.Cases {
+		suite := &b.Cases[i]
+		n += caseSuiteBytes + len(suite.Name)
+
+		for j := range suite.Cases {
+			n += caseBytes + len(suite.Cases[j].Name) + len(suite.Cases[j].Status) + len(suite.Cases[j].Message)
 		}
 	}
 

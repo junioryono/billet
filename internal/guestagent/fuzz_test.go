@@ -136,7 +136,7 @@ func FuzzJUnitParse(f *testing.F) {
 
 		b := guestreport.Batch{Seq: 1, AgentVersion: "v", TicksPerSecond: 100, Tests: suites}
 
-		body, err := fit(&b, guestreport.MaxBatchBytes)
+		body, err := fit(&b, guestreport.MaxBatchBytes, time.Time{})
 		if err != nil {
 			t.Fatalf("the suites of %q do not fit a batch: %v", data, err)
 		}

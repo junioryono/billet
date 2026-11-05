@@ -87,6 +87,12 @@
     "energy_source": "rapl"
   },
   "guest": null,
+  "tests": {
+    "notice": "Reported by the job's own VM. The job runs as root there and can change any of it; billet does not act on it.",
+    "results": null
+  },
+  "head_sha": "",
+  "head_branch": "",
   "window": {
     "from": "2026-10-09T10:00:30Z",
     "to": "2026-10-09T10:01:31Z",
