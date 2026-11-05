@@ -39,3 +39,54 @@ func (s *ServerConfig) JobDetailRetentionDuration() (time.Duration, error) {
 
 	return d, nil
 }
+
+// DefaultTestResultsRetention is how long a job's test suites and cases are kept
+// when server.test_results_retention is absent: the two weeks `billet tests stats`
+// reads by default, long past job detail because a flaky test shows itself over
+// many runs.
+const DefaultTestResultsRetention = 14 * 24 * time.Hour
+
+// DefaultTestResultsMaxBytes is how much of them is kept in all when
+// server.test_results_max_bytes is absent. A BOUND ON THE TABLE, AND NOT ONLY ON
+// TIME, because a busy deployment's rows could otherwise take back the ledger job
+// detail's retention freed, and the startup integrity scan reads all of it: 55 s for
+// 740 MB against an 80 s bound (#572). 128 MiB costs that scan about 10 s, and at the
+// most one job can keep, 87 KiB, it holds about 1,500 jobs.
+const DefaultTestResultsMaxBytes = 128 * MiB
+
+// minTestResultsMaxBytes is the smallest bound accepted: it holds a dozen jobs at
+// the most one can keep.
+const minTestResultsMaxBytes = MiB
+
+// TestResultsRetentionDuration parses server.test_results_retention, reporting the
+// default when unset.
+func (s *ServerConfig) TestResultsRetentionDuration() (time.Duration, error) {
+	if s == nil || strings.TrimSpace(s.TestResultsRetention) == "" {
+		return DefaultTestResultsRetention, nil
+	}
+	raw := s.TestResultsRetention
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("server.test_results_retention: %q is not a duration such as \"336h\": %w", raw, err)
+	}
+	if d < minJobDetailRetention {
+		return 0, fmt.Errorf("server.test_results_retention: %s is shorter than an hour, which would delete a job's "+
+			"test results before anyone could read them; give at least \"1h\"", d)
+	}
+
+	return d, nil
+}
+
+// TestResultsBound is server.test_results_max_bytes, reporting the default when
+// unset.
+func (s *ServerConfig) TestResultsBound() (ByteSize, error) {
+	if s == nil || s.TestResultsMaxBytes == 0 {
+		return DefaultTestResultsMaxBytes, nil
+	}
+	if s.TestResultsMaxBytes < minTestResultsMaxBytes {
+		return 0, fmt.Errorf("server.test_results_max_bytes: %s is under %s, which holds too few jobs to rank any "+
+			"test by", s.TestResultsMaxBytes, minTestResultsMaxBytes)
+	}
+
+	return s.TestResultsMaxBytes, nil
+}

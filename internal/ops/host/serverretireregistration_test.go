@@ -1,6 +1,7 @@
 package host
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,6 +34,30 @@ func requireRetireRegistrationReady(t *testing.T, f *requestFixture) {
 	t.Helper()
 	if fact := retireNodeUnitFact(t.Context(), endpointInspector(), f.cfg); fact != retirement.NodeReady {
 		t.Fatalf("the earlier node-unit fact was not accepted: %s", fact)
+	}
+}
+
+// A PROCESS STILL DIALLING THE RETIRING CONTROLLER IS NOT READY, though it is on the
+// survivor and the file now names the survivor alone: it would dial that controller
+// after it is gone. Comparing only the controller it is on calls it ready.
+func TestRetirementANodeThatStillKnowsTheRetiringControllerIsNotReady(t *testing.T) {
+	f := newRequestFixture(t)
+	f.retainANode(t)
+	requireRetireRegistrationReady(t, f)
+
+	var rec map[string]any
+
+	mustOK(t, json.Unmarshal([]byte(mustRead(t, registrationRecordPath)), &rec))
+
+	rec["schema"] = 2
+	rec["endpoints"] = []any{rec["endpoint"], "https://retiring.example:7717"}
+
+	body, err := json.Marshal(rec)
+	mustOK(t, err)
+	mustOK(t, os.WriteFile(registrationRecordPath, body, 0o600))
+
+	if fact := retireNodeUnitFact(t.Context(), endpointInspector(), f.cfg); fact != retirement.NodeUnknown {
+		t.Fatalf("a node still dialling the retiring controller is %s", fact)
 	}
 }
 

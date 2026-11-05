@@ -1425,20 +1425,27 @@ func advertise(t *testing.T, node *httptest.Server, token, repo string) {
 
 // advertiseErr is advertise for a goroutine other than the test's.
 func advertiseErr(ctx context.Context, node *httptest.Server, token, repo string) error {
+	_, err := advertisementFrom(ctx, node, token, repo)
+
+	return err
+}
+
+// advertisementFrom asks the node for repo's advertisement and returns it.
+func advertisementFrom(ctx context.Context, node *httptest.Server, token, repo string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		node.URL+"/v1/git/github.com/acme/"+repo+".git/info/refs?service=git-upload-pack", http.NoBody)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.SetBasicAuth(token, githubBasic)
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = io.Copy(io.Discard, resp.Body)
+	body, err := io.ReadAll(resp.Body)
 
-	return errors.Join(err, resp.Body.Close())
+	return body, errors.Join(err, resp.Body.Close())
 }
 
 func scriptedNode(t *testing.T) (*CacheService, *scriptedGitHub, *httptest.Server, string) {

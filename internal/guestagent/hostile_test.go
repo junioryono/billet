@@ -173,7 +173,8 @@ func TestADirectoryTheJobReplacedWithAFIFOIsNotWaitedOn(t *testing.T) {
 
 	go func() {
 		newTailer(fifo, log).poll()
-		done <- collectJUnit([]string{fifo, "testdata/junit"}, unhurried, log)
+		suites, _ := collectJUnit([]string{fifo, "testdata/junit"}, unhurried, log)
+		done <- suites
 	}()
 
 	timer := time.NewTimer(10 * time.Second)

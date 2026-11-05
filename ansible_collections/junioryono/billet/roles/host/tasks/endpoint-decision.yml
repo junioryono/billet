@@ -177,8 +177,8 @@
           - not billet_endpoint_planned_now or (billet_migration_controller | default('') | length > 0)
         fail_msg: >-
           This converge would move the node's endpoint from
-          {{ billet_endpoint_answer.from | default('none', true) }} to
-          {{ billet_endpoint_answer.to | default('none', true) }}, and cannot:
+          {{ (billet_endpoint_answer.from_endpoints | join(', ')) if billet_endpoint_answer.from_endpoints is defined else (billet_endpoint_answer.from | default('none', true)) }} to
+          {{ (billet_endpoint_answer.to_endpoints | join(', ')) if billet_endpoint_answer.to_endpoints is defined else (billet_endpoint_answer.to | default('none', true)) }}, and cannot:
           {{ 'it is inside a binary upgrade, whose transaction restarts the node without the migration protocol; converge the binary first, then the endpoint;'
              if billet_binary_upgrade | default(false) | bool else '' }}
           {{ 'it runs the legacy upgrade protocol, which cannot migrate an endpoint; pin a release that carries the converge guard;'
@@ -205,8 +205,8 @@
     - name: Take the endpoint decision as this run's facts
       ansible.builtin.set_fact:
         billet_endpoint_planned: "{{ billet_endpoint_answer.planned | bool }}"
-        billet_endpoint_from: "{{ billet_endpoint_answer.from | default('', true) }}"
-        billet_endpoint_to: "{{ billet_endpoint_answer.to | default('', true) }}"
+        billet_endpoint_from: "{{ (billet_endpoint_answer.from_endpoints | join(', ')) if billet_endpoint_answer.from_endpoints is defined else (billet_endpoint_answer.from | default('', true)) }}"
+        billet_endpoint_to: "{{ (billet_endpoint_answer.to_endpoints | join(', ')) if billet_endpoint_answer.to_endpoints is defined else (billet_endpoint_answer.to | default('', true)) }}"
         billet_endpoint_record: "{{ billet_endpoint_answer.record }}"
       when: billet_endpoint_answerer | length > 0
 
