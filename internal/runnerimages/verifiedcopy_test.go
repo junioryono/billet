@@ -10,14 +10,17 @@ import (
 func TestAToolsetThatIsNotItsPinIsRefusedNamingItsSource(t *testing.T) {
 	t.Parallel()
 
-	for _, arch := range []string{ArchX64, ArchArm64} {
+	for _, arch := range []string{ArchX64, ArchArm64, Windows2025} {
 		want, err := PinnedSHA256For(arch)
 		if err != nil {
 			t.Fatal(err)
 		}
 		data := toolset
-		if arch == ArchArm64 {
+		switch arch {
+		case ArchArm64:
 			data = toolsetArm64
+		case Windows2025:
+			data = toolsetWindows2025
 		}
 		tampered := append(append([]byte{}, data...), ' ')
 		if _, err := verifiedCopy(arch, tampered, want); err == nil {
@@ -41,10 +44,13 @@ func TestAToolsetThatIsNotItsPinIsRefusedNamingItsSource(t *testing.T) {
 // architecture. Not parallel: it swaps the package's embedded bytes, and Go runs
 // every parallel test only after the sequential ones have returned.
 func TestToolsetBytesForRefusesAnEmbeddedDeclarationThatIsNotItsPin(t *testing.T) {
-	for _, arch := range []string{ArchX64, ArchArm64} {
+	for _, arch := range []string{ArchX64, ArchArm64, Windows2025} {
 		embedded := &toolset
-		if arch == ArchArm64 {
+		switch arch {
+		case ArchArm64:
 			embedded = &toolsetArm64
+		case Windows2025:
+			embedded = &toolsetWindows2025
 		}
 		original := *embedded
 		*embedded = append(append([]byte{}, original...), ' ')

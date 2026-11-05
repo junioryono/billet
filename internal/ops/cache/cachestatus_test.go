@@ -34,6 +34,32 @@ func TestCacheStatusRendersWhatTheCachesDid(t *testing.T) {
 	}
 }
 
+// A BUILD CACHE THAT KEEPS GOING COLD AND NEVER WARMS IS NAMED, and only that: one
+// warm job, too few cold ones, or a cache the warning is not about says nothing.
+func TestABuildCacheThatNeverWarmsIsNamed(t *testing.T) {
+	t.Parallel()
+
+	got := neverWarmed(map[string]map[string]map[string]int{
+		"always-cold":  {"go": {"cold": neverWarmAfter}},
+		"bazel-cold":   {"bazel": {"cold": neverWarmAfter + 1, "unused": 3}, "go": {"unused": 20}},
+		"warmed-once":  {"go": {"cold": 100, "warm": 1}},
+		"just-started": {"go": {"cold": neverWarmAfter - 1}},
+		"git-cold":     {"git": {"cold": 100}},
+	}, 200, 1000, 24*time.Hour)
+
+	if len(got) != 2 || !strings.Contains(got[0], "always-cold's go cache was cold in 10 job(s)") ||
+		!strings.Contains(got[1], "bazel-cold's bazel cache was cold in 11 job(s)") {
+		t.Fatalf("neverWarmed = %q", got)
+	}
+
+	// A READ THAT STOPPED AT ITS LIMIT MAY NOT HAVE REACHED THE WARM JOB.
+	if got := neverWarmed(map[string]map[string]map[string]int{
+		"always-cold": {"go": {"cold": neverWarmAfter}},
+	}, 1000, 1000, 24*time.Hour); len(got) != 0 {
+		t.Fatalf("a read that reached its limit named %q", got)
+	}
+}
+
 // THE KILL SWITCH'S KINDS ARE THE CACHES CONFIG KNOWS, plus all, and nothing
 // else reaches the ledger.
 func TestTheKillSwitchKindIsACacheOrAll(t *testing.T) {

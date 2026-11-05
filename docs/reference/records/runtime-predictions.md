@@ -1,6 +1,6 @@
 # Runtime predictions on the reference deployment
 
-How well a job's runtime is predicted from the deployment's own history (#524, ADR-026), measured on the reference deployment's ledger on 2026-10-25 at 15:42 UTC. The reference controller then ran v0.28.0. The report was `billet jobs runtimes --since 336h --json`, from a binary built from #524's branch, whose ledger schema is v0.28.0's. It ran beside the live control plane as the billet user, with the ledger opened as a report (nothing created, locked, claimed or migrated), and took 8 seconds. The binary was removed afterwards.
+How well a job's runtime is predicted from the deployment's own history (#524, ADR-027), measured on the reference deployment's ledger on 2026-10-25 at 15:42 UTC. The reference controller then ran v0.28.0. The report was `billet jobs runtimes --since 336h --json`, from a binary built from #524's branch, whose ledger schema is v0.28.0's. It ran beside the live control plane as the billet user, with the ledger opened as a report (nothing created, locked, claimed or migrated), and took 8 seconds. The binary was removed afterwards.
 
 ## What was graded
 
