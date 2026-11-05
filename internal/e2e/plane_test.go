@@ -925,6 +925,9 @@ type nodeProcess struct {
 	// guestReports gives the node a guest cache service that takes its guests'
 	// own reports; see stackConfig.guestReports.
 	guestReports bool
+	// controllers, when set, are every control-plane address the node dials
+	// (node.server_addrs), in place of the one startNodeLoop is given.
+	controllers []string
 }
 
 // nodeLoop is one running node process: its runner, the incarnation it minted,
@@ -949,9 +952,15 @@ type nodeLoop struct {
 func startNodeLoop(t *testing.T, log *slog.Logger, addr string, np nodeProcess) *nodeLoop {
 	t.Helper()
 
-	nc, err := app.NewNodeClient(&config.Config{Node: &config.NodeConfig{
-		Name: np.host, ServerAddr: "http://" + addr,
-	}}, nil)
+	nodeCfg := &config.NodeConfig{Name: np.host, ServerAddr: "http://" + addr}
+	if np.controllers != nil {
+		nodeCfg.ServerAddr = ""
+		for _, a := range np.controllers {
+			nodeCfg.ServerAddrs = append(nodeCfg.ServerAddrs, "http://"+a)
+		}
+	}
+
+	nc, err := app.NewNodeClient(&config.Config{Node: nodeCfg}, nil)
 	if err != nil {
 		t.Fatalf("app.NewNodeClient: %v", err)
 	}
