@@ -35,6 +35,12 @@ const (
 	// npmStaleWindow is how long past its expiry an entry may answer a request
 	// the registry gave no answer to.
 	npmStaleWindow = time.Hour
+	// npmVersionLifetime is how long a version document the registry gave no
+	// lifetime is fresh: the 300 s it gives the same document of an unscoped
+	// package, and every package document. Measured 2026-11-04, five scoped
+	// version documents carried no Cache-Control and no validator, and five
+	// unscoped ones max-age=300, so without it every job fetched a scoped one again.
+	npmVersionLifetime = 5 * time.Minute
 	// npmEntryLimit bounds one entry's metadata file on disk.
 	npmEntryLimit = 64 << 10
 )
@@ -56,7 +62,8 @@ type npmEntry struct {
 	// revalidated, and InitialAge its age then, as RFC 9111 corrects it.
 	Received   time.Time     `json:"received"`
 	InitialAge time.Duration `json:"initial_age"`
-	// Lifetime is the registry's own: s-maxage when it named one, else max-age.
+	// Lifetime is the registry's own, s-maxage when it named one, else max-age;
+	// or npmVersionLifetime for a version document it said nothing of.
 	Lifetime     time.Duration `json:"lifetime"`
 	SharedMaxAge bool          `json:"shared_max_age,omitempty"`
 	// MustRevalidate is must-revalidate or proxy-revalidate.
@@ -70,7 +77,8 @@ func (e npmEntry) age(now time.Time) time.Duration {
 	return e.InitialAge + max(0, now.Sub(e.Received))
 }
 
-// registryFresh reports whether the registry's own lifetime still holds.
+// registryFresh reports whether the entry's Lifetime still holds: the registry's
+// own, or npmVersionLifetime for a version document it said nothing of.
 func (e npmEntry) registryFresh(now time.Time) bool { return e.age(now) < e.Lifetime }
 
 // expiry is when the store stops serving the entry without asking: the
@@ -178,6 +186,15 @@ func npmFreshness(entry *npmEntry, header http.Header, requested, received time.
 		entry.Lifetime, entry.SharedMaxAge = cc.maxAge, false
 	default:
 		entry.Lifetime, entry.SharedMaxAge = 0, false
+		// ONLY WHERE THE REGISTRY SAID NOTHING: a lifetime it stated, 0 among them,
+		// an Expires, and a must-revalidate it set, are its own to give. A validator
+		// keeps it off too: an answer with one is cheap to ask about again, and a
+		// 304 to one never carries all that its 200 said.
+		said := func(name string) bool { return len(header.Values(name)) > 0 }
+		if entry.Object == npmVersionDocument && !cc.mustRevalidate &&
+			!said("Expires") && !said("ETag") && !said("Last-Modified") {
+			entry.Lifetime = npmVersionLifetime
+		}
 	}
 	entry.MustRevalidate = cc.mustRevalidate
 	entry.CacheControl = strings.Join(header.Values("Cache-Control"), ", ")

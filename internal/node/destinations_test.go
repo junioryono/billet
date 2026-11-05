@@ -126,7 +126,7 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 		{Sent: 5, Received: 6, Connections: 1, Unanswered: 1},
 	}, Other: flows.Destination{Sent: 1, Received: 2, Connections: 3, Unanswered: 2}}
 
-	got := jobDestinationsOf(res, tapComparison{tapKnown: true, tapSent: -1, tapReceived: 4})
+	got, _ := jobDestinationsOf(res, tapComparison{tapKnown: true, tapSent: -1, tapReceived: 4})
 	want := &alloc.JobDestinations{
 		Destinations: []alloc.JobDestination{{Addr: "10.0.0.1", SentBytes: math.MaxInt64, ReceivedBytes: 1,
 			Connections: 2, Unanswered: 1}},
@@ -150,7 +150,7 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 			SlowestReply: 1500*time.Millisecond + 900*time.Microsecond},
 		{Connections: 2, TimedReplies: 2, SlowReplies: 1, SlowestReply: 4 * time.Second},
 	}, Other: flows.Destination{Connections: 1, TimedReplies: 1, SlowestReply: 30 * time.Millisecond}}
-	got = jobDestinationsOf(timed, tapComparison{})
+	got, _ = jobDestinationsOf(timed, tapComparison{})
 	if !got.RepliesTimed || len(got.Destinations) != 1 ||
 		got.Destinations[0] != (alloc.JobDestination{Addr: "10.0.0.1", Connections: 3, Unanswered: 1,
 			TimedReplies: 2, SlowReplies: 2, SlowestReplyMillis: 1500}) ||
@@ -162,7 +162,7 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 		t.Errorf("a timed report does not validate: %v", err)
 	}
 	timed.RepliesTimed = false
-	if got = jobDestinationsOf(timed, tapComparison{}); got.RepliesTimed || got.Destinations[0].TimedReplies != 0 ||
+	if got, _ = jobDestinationsOf(timed, tapComparison{}); got.RepliesTimed || got.Destinations[0].TimedReplies != 0 ||
 		got.Other.SlowestReplyMillis != 0 {
 		t.Errorf("a result that did not time replies reports %+v", got)
 	}
@@ -170,7 +170,7 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 	// A RESULT THAT CANNOT TELL WHAT WENT UNANSWERED REPORTS IT NOT COUNTED,
 	// with no count left on any destination, rather than as the counts it saw.
 	res.UnansweredUnknown = true
-	got = jobDestinationsOf(res, tapComparison{tapKnown: true, tapSent: -1, tapReceived: 4})
+	got, _ = jobDestinationsOf(res, tapComparison{tapKnown: true, tapSent: -1, tapReceived: 4})
 	if got.UnansweredCounted || got.Destinations[0].Unanswered != 0 || got.Other.Unanswered != 0 {
 		t.Errorf("a result that could not tell what went unanswered reports %+v", got)
 	}
@@ -185,7 +185,7 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 		res.Destinations = append(res.Destinations, flows.Destination{
 			Addr: netip.AddrFrom4([4]byte{10, 1, byte(i / 256), byte(i % 256)}), Sent: 1, Connections: 1})
 	}
-	got = jobDestinationsOf(res, tapComparison{tapKnown: true, tapSent: 3, tapReceived: 4})
+	got, _ = jobDestinationsOf(res, tapComparison{tapKnown: true, tapSent: 3, tapReceived: 4})
 	if len(got.Destinations) != alloc.MaxJobDestinations || got.Other.SentBytes != math.MaxInt64 ||
 		got.Other.Connections != 1 || !got.Incomplete {
 		t.Errorf("past the bound the report names %d with Other %+v, incomplete %v", len(got.Destinations),
@@ -195,7 +195,7 @@ func TestTheReportsDestinationsAreWhatTheLedgerCanKeep(t *testing.T) {
 		t.Errorf("tap = %+v, want 3 sent and 4 received", got.Tap)
 	}
 
-	if got := jobDestinationsOf(flows.Result{}, tapComparison{}); got.Tap != nil || got.Incomplete ||
+	if got, _ := jobDestinationsOf(flows.Result{}, tapComparison{}); got.Tap != nil || got.Incomplete ||
 		got.Destinations != nil {
 		t.Errorf("a job with no flows and no tap reports %+v", got)
 	}

@@ -188,9 +188,10 @@ type gitProxy struct {
 	// measured 2026-10-22), and a pass that finds it taken is skipped.
 	maintaining chan struct{}
 	// beforeRepackWait runs as an advertisement starts to wait for a repack to
-	// free its mirror's refresh slot; a seam so a test can end the repack only
-	// once a request waits for it. Nil in production.
-	beforeRepackWait func()
+	// free its mirror's refresh slot, and is given what ends that request's
+	// deadline; a seam so a test can end the repack, or the wait, only once a
+	// request is in it. Nil in production.
+	beforeRepackWait func(expire context.CancelFunc)
 	reaping          atomic.Bool
 	// observer is what the proxy reports to (SetGitObserver).
 	observer atomic.Pointer[GitObserver]
@@ -1295,7 +1296,7 @@ func (s *CacheService) refreshMirror(
 		// within the same deadline as a refresh is.
 		if last != nil && last.maintaining {
 			if s.git.beforeRepackWait != nil {
-				s.git.beforeRepackWait()
+				s.git.beforeRepackWait(cancel)
 			}
 			select {
 			case <-last.idle:

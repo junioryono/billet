@@ -1,6 +1,13 @@
 package nodeclient
 
-import "io"
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/netip"
+	"time"
+)
 
 // The record writer's two seams, for the fixtures in the external test
 // package. Each returns the function that restores the default; the fixtures
@@ -42,3 +49,29 @@ func SetDrainServingDoneForTest(f func()) func() {
 
 	return func() { drainServingDone = saved }
 }
+
+// BackoffForTest is the pause the loop takes after a failed registration.
+func BackoffForTest(opts LoopOptions, c *Client) time.Duration { return backoffFor(opts, c) }
+
+// DialerForTest is the dialer the transport of a built client's controller at
+// index i dials with, so a test can hold its bounds to the ones a failover
+// depends on.
+func DialerForTest(c *Client, i int) *net.Dialer { return c.targets[i].dialer }
+
+// IsNoAnswerForTest reports whether an error says the controller gave no answer.
+func IsNoAnswerForTest(err error) bool { return errors.Is(err, errNoAnswer) }
+
+// SetLookupForTest replaces how the controller at index i of a client of
+// several looks its name up.
+func SetLookupForTest(c *Client, i int, f func(ctx context.Context, network, host string) ([]netip.Addr, error)) {
+	c.targets[i].resolving.lookup = f
+}
+
+// SetConnectForTest replaces how the controller at index i of a client of
+// several connects to one address its name was looked up to.
+func SetConnectForTest(c *Client, i int, f func(ctx context.Context, network, address string) (net.Conn, error)) {
+	c.targets[i].resolving.connect = f
+}
+
+// AddrsInForTest is addrsIn: a lookup's answer in a network, zones kept.
+func AddrsInForTest(ips []net.IPAddr, network string) []netip.Addr { return addrsIn(ips, network) }

@@ -67,7 +67,10 @@ UPDATE job_history
                                THEN CAST(@github_runner_assigned_at AS TEXT)
                                ELSE github_runner_assigned_at END,
        github_run_id = CASE WHEN github_run_id = 0 THEN CAST(@github_run_id AS BIGINT)
-                            ELSE github_run_id END
+                            ELSE github_run_id END,
+       head_sha    = CASE WHEN head_sha = '' THEN CAST(@head_sha AS TEXT) ELSE head_sha END,
+       head_branch = CASE WHEN head_branch = '' THEN CAST(@head_branch AS TEXT) ELSE head_branch END,
+       run_attempt = CASE WHEN run_attempt = 0 THEN CAST(@run_attempt AS BIGINT) ELSE run_attempt END
  WHERE lease_id = @lease_id
    AND (github_job_id = '' OR github_job_id = CAST(@github_job_id AS TEXT));
 
@@ -96,9 +99,10 @@ SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: ListJobsAwaitingQueueTime :many
--- The jobs that started since a moment and still have no GitHub queue time,
--- with what finds each in GitHub's REST record of its run: the repository, the
--- run and GitHub's job id (the lease names the runner). Newest start first,
+-- The jobs that started since a moment and still have no GitHub queue time or no
+-- commit, both of which GitHub's list of a run's jobs gives in one read, with what
+-- finds each in that list: the repository, the run and GitHub's job id (the lease
+-- names the runner). Newest start first,
 -- bounded, so a backlog is worked from the jobs an operator is looking at now.
 --
 -- THE RUN IS THE ONE THAT STARTED: github_run_id, which the JobStarted wrote
@@ -118,7 +122,7 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        github_job_id, COALESCE(started_at, '') AS started_at, github_scale_set_assigned_at
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= @since
-   AND github_queued_at = '' AND github_job_id != '' AND COALESCE(repo, '') != ''
+   AND (github_queued_at = '' OR head_sha = '') AND github_job_id != '' AND COALESCE(repo, '') != ''
    AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
    AND (CAST(@before_started AS TEXT) = ''
         OR started_at < CAST(@before_started AS TEXT)
@@ -429,7 +433,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
-       holder_incarnation
+       holder_incarnation, head_sha, head_branch, run_attempt
   FROM job_history WHERE lease_id = @lease_id;
 
 -- name: ListJobsOfRun :many
