@@ -73,6 +73,8 @@ type Server struct {
 	reapEvery time.Duration
 	// hurry, when closed, ends every listener's drain wait early.
 	hurry <-chan struct{}
+	// foregroundLaunches is set by WithForegroundLaunches.
+	foregroundLaunches bool
 	// restartHandoff makes an unsealed stop a handoff; see WithRestartHandoff.
 	restartHandoff bool
 
@@ -267,6 +269,15 @@ func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
 // WithHurrySignal for what a listener does with it.
 func WithHurry(c <-chan struct{}) ControlPlaneOption {
 	return func(s *Server) { s.hurry = c }
+}
+
+// WithForegroundLaunches makes every listener wait for each launch, which only a
+// harness wants: a deployment's listener must go on hearing GitHub through a slow launch
+// (listener_flight.go), but a replay delivers one event at a time to quiescence so that
+// goroutine order cannot decide what a run did, and a listener parked on its poll with
+// a launch still out is not quiet.
+func WithForegroundLaunches() ControlPlaneOption {
+	return func(s *Server) { s.foregroundLaunches = true }
 }
 
 // WithStopHandoff makes every listener hand over to the next control plane, rather
@@ -689,6 +700,9 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 			return s.openSession(ctx, t, set, prov)
 		}),
 		WithPoolLaunchBatch(poolLaunchBatchFor(t)))
+	if !s.foregroundLaunches {
+		opts = append(opts, WithBackgroundLaunches())
+	}
 	if target, ok := s.targetFor(t); ok {
 		opts = append(opts, WithGitHubTarget(target.Config.Path()))
 	}

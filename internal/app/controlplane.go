@@ -511,6 +511,10 @@ type ScheduleOptions struct {
 	// that runs the node runtime in process against the allocator; the wire is
 	// still served. Nil in a deployment.
 	NodeRunner dispatch.Runner
+	// ForegroundLaunches makes every listener wait for each launch, for the replay
+	// harness, whose determinism needs a parked listener to mean a quiet one. False in
+	// a deployment.
+	ForegroundLaunches bool
 }
 
 // Schedule assembles everything that schedules: the liveness and barrier loops,
@@ -548,6 +552,10 @@ func (c *Controller) Schedule(
 	serverOpts = append(serverOpts, server.WithHurry(opts.Hurry), server.WithLeadershipLost(cp.db.LeadershipLost),
 		server.WithCompletionLedger(cp.db), server.WithTargets(cp.targets...),
 		server.WithStopHandoff(), server.WithHeartbeatOverrun(c.heartbeatOverrun))
+
+	if opts.ForegroundLaunches {
+		serverOpts = append(serverOpts, server.WithForegroundLaunches())
+	}
 
 	if opts.DryRun {
 		serverOpts = append(serverOpts, server.AdvertiseNothing())

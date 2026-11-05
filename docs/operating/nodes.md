@@ -97,7 +97,7 @@ A node that stops cleanly (`systemctl stop billet-node`, `billet local down`, SI
 
 ## Keeping a node when its controller retires
 
-A host in a PostgreSQL active-passive pair can retire its controller and keep its installed node, and the rules that decide whether it may are the retirement's, not this page's. What a node operator has to know before planning one: a node still dialling the controller being removed cannot be retained until its endpoint moves to the survivor in an ordinary converge, and retention is not a promise of uninterrupted node uptime, because the transition stops and starts the node on the serverless configuration before it completes. [Retiring a controller that keeps its node](upgrades.md) states both rules and the refusals that enforce them; do not restate them here.
+A host in a PostgreSQL active-passive pair can retire its controller and keep its installed node, and the rules that decide whether it may are the retirement's, not this page's. What a node operator has to know before planning one: a node still dialling the controller being removed, or naming several controllers in `node.server_addrs`, cannot be retained until an ordinary converge moves it to the survivor alone, and retention is not a promise of uninterrupted node uptime, because the transition stops and starts the node on the serverless configuration before it completes. [Retiring a controller that keeps its node](upgrades.md) states both rules and the refusals that enforce them; do not restate them here.
 
 ## Decommissioning
 

@@ -2,21 +2,22 @@
 # Copyright (c) 2026 junioryono
 # Apache-2.0
 
-"""Decide whether two configurations name different node endpoints.
+"""Decide whether two configurations name different node controllers.
 
 THE COMPATIBILITY RULE'S ONE COMPARISON: a converge that has no executable to
 ask (a release before the converge guard, with no candidate that carries it)
 cannot migrate an endpoint, so the role compares the pre-render configuration's
-node endpoint with the rendering's through the one endpoint representation
+node controllers with the rendering's through the one endpoint representation
 (`module_utils/endpoint.py`, held to the same vector table as the Go one) and
-refuses a difference before anything is stopped. Each side's endpoint is
-derived as billet's config loader derives it: `node.server_addr` when it is
-written (or `node.server_addrs` when it names exactly one controller; a node
-that names several is not moved by an endpoint migration, and is refused),
-else the server section's `listen` (which itself defaults to 127.0.0.1:7717)
-when a server section exists, else none; the scheme is `node.tls`'s. A CHANGE IS TWO ENDPOINTS THAT DIFFER: a side without a node
-section (no node installed yet, or the node removed) names none, and a node's
-first start or its removal is not a migration, so those compare as unchanged.
+refuses a difference before anything is stopped. Each side's controllers are
+derived as billet's config loader derives them: `node.server_addrs`, or
+`node.server_addr` as a list of one, else the server section's `listen` (which
+itself defaults to 127.0.0.1:7717) when a server section exists, else none; the
+scheme is `node.tls`'s. A CHANGE IS TWO SETS THAT DIFFER, in any order, as the Go
+judgement has it, since an order matters only when a process starts: a side
+without a node section (no node installed yet, or the node removed) names none,
+and a node's first start or its removal is not a migration, so those compare as
+unchanged.
 
 Everything arrives parsed: the role reads the installed file and renders the
 desired one on the controller, so this module needs no YAML on the host and
@@ -33,9 +34,9 @@ from ansible_collections.junioryono.billet.plugins.module_utils.endpoint import 
 DOCUMENTATION = r"""
 ---
 module: endpoint_change
-short_description: Decide whether two billet configurations name different node endpoints
+short_description: Decide whether two billet configurations name different node controllers
 description:
-  - Derives each configuration's node endpoint as billet's loader does and compares the two
+  - Derives each configuration's node controllers as billet's loader does and compares the two
     through the collection's endpoint representation.
 options:
   installed:
@@ -51,15 +52,15 @@ author: junioryono
 
 RETURN = r"""
 changed_endpoint:
-  description: Whether the two configurations name different endpoints.
+  description: Whether the two configurations name different controllers.
   type: bool
   returned: always
 installed_endpoint:
-  description: The pre-render configuration's endpoint in canonical text, or null.
+  description: The pre-render configuration's controllers in canonical text, comma-separated, or null.
   type: str
   returned: always
 desired_endpoint:
-  description: The rendering's endpoint in canonical text, or null.
+  description: The rendering's controllers in canonical text, comma-separated, or null.
   type: str
   returned: always
 """
@@ -79,8 +80,8 @@ def _mapping(value, where):
     return value
 
 
-def endpoint_of(cfg, where):
-    """The configuration's node endpoint, or None without a node section."""
+def controllers_of(cfg, where):
+    """The configuration's node controllers in order, or None without a node section."""
     cfg = _mapping(cfg, where)
     node = cfg.get("node")
     if node is None:
@@ -89,35 +90,43 @@ def endpoint_of(cfg, where):
     addr = node.get("server_addr")
     addrs = node.get("server_addrs")
     if addrs is not None:
-        # EVERY CONTROLLER OF A PAIR IS NOT ONE ENDPOINT, and an endpoint
-        # migration moves a node between two. A list of one is that one.
-        if not isinstance(addrs, list) or len(addrs) != 1:
-            raise Refusal("%s.node.server_addrs names %s; a node that dials several controllers is not "
-                          "moved by an endpoint migration (#684)" % (where, addrs if isinstance(addrs, list) else "no list"))
+        if not isinstance(addrs, list) or len(addrs) == 0:
+            raise Refusal("%s.node.server_addrs names %s" % (where, "no controller" if isinstance(addrs, list) else "no list"))
         if addr not in (None, ""):
             raise Refusal("%s.node sets both server_addr and server_addrs" % where)
-        addr = addrs[0]
-    if addr is None or addr == "":
+    elif addr is None or addr == "":
         if "server" in cfg and cfg["server"] is not None:
             server = _mapping(cfg["server"], where + ".server")
             listen = server.get("listen")
-            addr = listen if listen not in (None, "") else DEFAULT_LISTEN
+            addrs = [listen if listen not in (None, "") else DEFAULT_LISTEN]
         else:
             raise Refusal("%s.node names no server_addr and there is no server section to take one from" % where)
-    if not isinstance(addr, str):
-        raise Refusal("%s.node.server_addr is not text" % where)
+    else:
+        addrs = [addr]
     tls = node.get("tls") is not None
-    try:
-        return parse(addr, tls)
-    except EndpointError as exc:
-        raise Refusal("%s.node.server_addr %r: %s" % (where, addr, exc))
+    out = []
+    for one in addrs:
+        if not isinstance(one, str):
+            raise Refusal("%s.node.server_addr is not text" % where)
+        try:
+            parsed = parse(one, tls)
+        except EndpointError as exc:
+            raise Refusal("%s.node.server_addr %r: %s" % (where, one, exc))
+        if parsed in out:
+            raise Refusal("%s.node.server_addrs names %s twice" % (where, parsed.canonical()))
+        out.append(parsed)
+    return out
+
+
+def _text(controllers):
+    return ", ".join(c.canonical() for c in controllers) if controllers is not None else None
 
 
 def compare(installed, desired):
-    a = endpoint_of(installed, "the installed configuration")
-    b = endpoint_of(desired, "the rendering")
-    changed = a is not None and b is not None and a != b
-    return changed, (a.canonical() if a is not None else None), (b.canonical() if b is not None else None)
+    a = controllers_of(installed, "the installed configuration")
+    b = controllers_of(desired, "the rendering")
+    changed = a is not None and b is not None and set(a) != set(b)
+    return changed, _text(a), _text(b)
 
 
 def main():

@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -245,7 +246,7 @@ func TestReleaseInspectRegistrationIsCurrentOnlyForTheNodesInvocation(t *testing
 	r := f.report(t)
 	rec := registrationOf(t, r)
 
-	if rec != (registrationReport{Node: "node-a", Deployment: "1234567890abcdef1234567890abcdef", Incarnation: testIncarnation,
+	if !reflect.DeepEqual(rec, registrationReport{Node: "node-a", Deployment: "1234567890abcdef1234567890abcdef", Incarnation: testIncarnation,
 		InvocationID: nodeInvocation, Endpoint: "https://10.0.0.5:7717", RegisteredAt: "2026-09-09T12:00:00Z"}) {
 		t.Errorf("host.registration = %+v", rec)
 	}
