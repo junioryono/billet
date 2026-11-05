@@ -31,6 +31,13 @@ type HistoryJob struct {
 	// runner may differ from the run its lease was assigned; zero is unknown.
 	// Only a JobStarted gives it.
 	RunID int64
+	// HeadSHA and HeadBranch are the commit and branch the job ran on, from GitHub's
+	// REST record of it, which no scale-set message carries; empty is not recorded.
+	HeadSHA    string
+	HeadBranch string
+	// RunAttempt is which attempt of its run the job was, from the same record; zero
+	// is not recorded.
+	RunAttempt int64
 }
 
 // Repo is the job's repository as owner/name, or whichever half is known.
@@ -74,6 +81,9 @@ func (a *Allocator) RecordJobIdentity(ctx context.Context, leaseID string, job H
 			GithubScaleSetAssignedAt: stamp(job.ScaleSetAssignedAt),
 			GithubRunnerAssignedAt:   stamp(job.RunnerAssignedAt),
 			GithubRunID:              max(job.RunID, 0),
+			HeadSha:                  job.HeadSHA,
+			HeadBranch:               job.HeadBranch,
+			RunAttempt:               max(job.RunAttempt, 0),
 			LeaseID:                  leaseID,
 		}); err != nil {
 			return fmt.Errorf("alloc: record the job lease %s ran: %w", leaseID, err)
@@ -184,7 +194,8 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			LeaseID: row.LeaseID, Tier: row.Tier, Node: row.Node, RunID: row.RunID,
 			RequestID: row.RequestID,
 			Job: HistoryJob{JobID: row.GithubJobID, WorkflowRef: row.WorkflowRef,
-				Name: row.JobName, Event: row.Event},
+				Name: row.JobName, Event: row.Event, HeadSHA: row.HeadSha, HeadBranch: row.HeadBranch,
+				RunAttempt: row.RunAttempt},
 			Repo: row.Repo, Conclusion: row.Conclusion, FailureReason: row.FailureReason,
 			Result: row.Result, Disruption: row.Disruption, QueuedAt: row.QueuedAt,
 			AssignedAt: row.AssignedAt, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt,

@@ -4,6 +4,7 @@ tier       billet-2vcpu on epyc-1 (docker, 2 vCPU, 8.0 GiB)
 job        "build (ubuntu, go 1.26)" (github job "51000000007", run 4242, request 77)
 repository "acme/api"
 workflow   "acme/api/.github/workflows/ci.yml@refs/heads/main"
+commit     not recorded on branch not recorded
 event      "push"
 result     github "succeeded"; billet done
 times      queued 2026-10-09T11:59:57.000000000Z, assigned 2026-10-09T11:59:57.000000000Z, started 2026-10-09T12:00:00.000000000Z, finished 2026-10-09T12:02:51.000000000Z
@@ -110,6 +111,8 @@ step 4     "Test", 38 process samples, ending 2026-10-09T12:01:31.750Z to 2026-1
 step 5     "Post Run actions/checkout@v5", no process sample ended inside it
 suite      "api/internal/store": 214 tests, 0 failures, 0 errors, 3 skipped
 suite      "api/cmd/server": 12 tests, 0 failures, 0 errors, 0 skipped
+
+tests      no test cases recorded (the agent found none, the node or its VM's image is older than this, or they were deleted past server.test_results_retention)
 == billet jobs show --html, the guest section ==
 <section id="guest">
 <h2>What the job's own VM reported</h2>

@@ -75,6 +75,8 @@ const (
 	SlowReplyMillis         = lease.SlowReplyMillis
 	GuestReportCodec        = lease.GuestReportCodec
 	MaxGuestReportBytes     = lease.MaxGuestReportBytes
+	TestResultsCodec        = lease.TestResultsCodec
+	MaxTestResultsBytes     = lease.MaxTestResultsBytes
 )
 
 // ErrLeaseNotFound means the lease does not exist, or is already terminal.

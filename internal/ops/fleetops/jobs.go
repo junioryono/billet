@@ -245,7 +245,8 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator,
 			wj = windowJSONOf(tl, unaligned, *w)
 		}
 
-		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest, wj)
+		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest,
+			readJobTests(ctx, a, leaseID), wj)
 	}
 	steps := jobSteps{measured: measured, runner: provider.InstanceName(rec.LeaseID),
 		none: "not read for a run's jobs, which would ask GitHub once for each; `billet jobs show " +
@@ -265,6 +266,7 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator,
 	renderSeries(out, tl, unaligned, measured)
 	renderSteps(out, steps)
 	renderGuest(out, retiredGuest(guestViewOf(guest, measured, steps), guest, rec))
+	renderJobTests(out, readJobTests(ctx, a, leaseID))
 
 	return rec.DetailRetiredAt, nil
 }
@@ -339,6 +341,11 @@ type jobJSON struct {
 	PredictionUnavailable string `json:"prediction_unavailable,omitempty"`
 	// Guest is what the job's own VM reported, null when no row was recorded.
 	Guest *guestJSON `json:"guest"`
+	// Tests is the test suites and cases the job's own VM reported.
+	Tests testsJSON `json:"tests"`
+	// HeadSHA and HeadBranch are the commit and branch from GitHub's record of the job.
+	HeadSHA    string `json:"head_sha"`
+	HeadBranch string `json:"head_branch"`
 	// Window is present only when --window asked for one.
 	Window *windowJSON `json:"window,omitempty"`
 }
@@ -378,6 +385,7 @@ var usageGroups = []string{alloc.UsageCPU, alloc.UsageThreads, alloc.UsageMemory
 // never a report of zeros.
 func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl *usage.Timeline, unaligned string,
 	g *jobGuest,
+	tests jobTests,
 	win *windowJSON,
 ) error {
 	out := jobJSON{
@@ -386,7 +394,8 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 		RequestID: max(rec.RequestID, 0), JobName: rec.Job.Name, Repository: rec.Repo,
 		WorkflowRef: rec.Job.WorkflowRef, Event: rec.Job.Event, Result: rec.Result,
 		Conclusion: rec.Conclusion, QueuedAt: rec.QueuedAt, AssignedAt: rec.AssignedAt,
-		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Window: win,
+		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Tests: testsJSONOf(tests),
+		Window: win, HeadSHA: rec.Job.HeadSHA, HeadBranch: rec.Job.HeadBranch,
 		Prediction: predictionJSONOf(rec), PredictionUnavailable: rec.NotPredicted,
 		GitHubQueuedAt: rec.GitHubQueuedAt, GitHubScaleSetAssignedAt: rec.GitHubScaleSetAssignedAt,
 		GitHubRunnerAssignedAt: rec.GitHubRunnerAssignedAt, BoughtAt: rec.BoughtAt,
@@ -455,6 +464,7 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		quoted(rec.Job.JobID), runOf(rec), request)
 	line("repository", "%s", quoted(rec.Repo))
 	line("workflow", "%s", quoted(rec.Job.WorkflowRef))
+	line("commit", "%s on branch %s", quoted(rec.Job.HeadSHA), quoted(rec.Job.HeadBranch))
 	line("event", "%s", quoted(rec.Job.Event))
 	line("result", "github %s; billet %s", quoted(rec.Result), orUnknown(rec.Conclusion))
 	line("times", "queued %s, assigned %s, started %s, finished %s", orUnknown(rec.QueuedAt),

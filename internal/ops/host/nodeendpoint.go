@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/cli"
@@ -320,19 +321,168 @@ func readRendering(env cli.Env, source string, strict bool) ([]byte, *config.Con
 	return body, cfg, nil
 }
 
-// nodeEndpointOf is a configuration's node endpoint as the one
-// representation, and whether the configuration has a node section at all.
-func nodeEndpointOf(cfg *config.Config) (endpoint.Endpoint, bool, error) {
+// controllerSet is the controllers a node names or a process dials, in the order
+// named, each as the one representation. One is what node.server_addr is.
+type controllerSet []endpoint.Endpoint
+
+// nodeEndpointsOf is a configuration's controllers, and whether it has a node
+// section at all. A list naming one controller twice under two spellings, which
+// the configuration's own comparison cannot see, is refused: the node would
+// refuse it at its start.
+func nodeEndpointsOf(cfg *config.Config) (controllerSet, bool, error) {
 	if cfg == nil || cfg.Node == nil {
-		return endpoint.Endpoint{}, false, nil
+		return nil, false, nil
 	}
 
-	e, err := endpoint.Parse(cfg.Node.ServerAddr, cfg.Node.TLS != nil)
+	addrs := cfg.Node.ControlPlanes()
+	if len(addrs) == 0 {
+		addrs = []string{""}
+	}
+
+	set := make(controllerSet, 0, len(addrs))
+
+	for _, addr := range addrs {
+		e, err := endpoint.Parse(addr, cfg.Node.TLS != nil)
+		if err != nil {
+			return nil, true, err
+		}
+
+		if set.contains(e) {
+			return nil, true, fmt.Errorf("%s is named twice in node.server_addrs", e.String())
+		}
+
+		set = append(set, e)
+	}
+
+	return set, true, nil
+}
+
+// nodeEndpointOf is a configuration's one node endpoint, for what only a node
+// with one controller can answer: A RETIREMENT, which leaves one controller, so
+// a node must name the survivor alone before one begins, and whose evidence
+// follows one endpoint from the receipt to the record. A node that names several
+// is errSeveralControllers.
+func nodeEndpointOf(cfg *config.Config) (endpoint.Endpoint, bool, error) {
+	set, hasNode, err := nodeEndpointsOf(cfg)
+	if err != nil || !hasNode {
+		return endpoint.Endpoint{}, hasNode, err
+	}
+
+	if len(set) > 1 {
+		return endpoint.Endpoint{}, true, fmt.Errorf("%w: %s", errSeveralControllers, set.text())
+	}
+
+	return set[0], true, nil
+}
+
+// errSeveralControllers is a node configuration that names several controllers
+// where the answer needs one.
+var errSeveralControllers = errors.New("the node names several controllers in node.server_addrs, so it has no one endpoint")
+
+// contains says whether e is one of the controllers.
+func (s controllerSet) contains(e endpoint.Endpoint) bool {
+	return slices.ContainsFunc(s, e.Equal)
+}
+
+// sameControllers says whether two sets name the same controllers in any order:
+// the order a process tries them in matters only when it starts, so a reorder is
+// no migration. The ordinary restart a changed node section takes applies it.
+func (s controllerSet) sameControllers(o controllerSet) bool {
+	if len(s) != len(o) {
+		return false
+	}
+
+	for _, e := range s {
+		if !o.contains(e) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// sameOrder says whether two sets name the same controllers in the same order,
+// which is what one rendering installed from another is held to.
+func (s controllerSet) sameOrder(o controllerSet) bool {
+	return slices.EqualFunc(s, o, endpoint.Endpoint.Equal)
+}
+
+// texts is the canonical text of each controller.
+func (s controllerSet) texts() []string {
+	out := make([]string, len(s))
+	for i, e := range s {
+		out[i] = e.String()
+	}
+
+	return out
+}
+
+// text is the controllers as one line, for a message.
+func (s controllerSet) text() string { return strings.Join(s.texts(), ", ") }
+
+// severalTexts is the texts of a set naming several, and nil otherwise: the
+// answers carry a list only for a node that names several, so everything said
+// about a node with one controller stays what it always was.
+func (s controllerSet) severalTexts() []string {
+	if len(s) < 2 {
+		return nil
+	}
+
+	return s.texts()
+}
+
+// severalPair is severalTexts for the two sides of a move: both lists when
+// either side names several, so an answer never carries half of one.
+func severalPair(from, to controllerSet) ([]string, []string) {
+	if len(from) < 2 && len(to) < 2 {
+		return nil, nil
+	}
+
+	return from.texts(), to.texts()
+}
+
+// parseControllerTexts reads a list of canonical endpoints.
+func parseControllerTexts(texts []string) (controllerSet, error) {
+	set := make(controllerSet, 0, len(texts))
+
+	for _, text := range texts {
+		e, err := endpoint.ParseCanonical(text)
+		if err != nil {
+			return nil, err
+		}
+
+		if set.contains(e) {
+			return nil, fmt.Errorf("%s is named twice", text)
+		}
+
+		set = append(set, e)
+	}
+
+	return set, nil
+}
+
+// checkControllerTexts holds a recorded list to what a writer of one writes: two
+// or more canonical endpoints, each once, holding the one named beside it.
+func checkControllerTexts(texts []string, current string) error {
+	if len(texts) < 2 {
+		return fmt.Errorf("names %d controllers; a list names several", len(texts))
+	}
+
+	set, err := parseControllerTexts(texts)
 	if err != nil {
-		return endpoint.Endpoint{}, true, err
+		return err
 	}
 
-	return e, true, nil
+	e, err := endpoint.ParseCanonical(current)
+	if err != nil {
+		return err
+	}
+
+	if !set.contains(e) {
+		return fmt.Errorf("does not name %s, the controller named beside it", current)
+	}
+
+	return nil
 }
 
 // unitObservation is one `systemctl show` of the node unit, the properties

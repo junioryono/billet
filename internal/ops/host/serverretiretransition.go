@@ -19,7 +19,6 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
 
-	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/retirement"
@@ -656,8 +655,11 @@ func retireNodeUnitFact(ctx context.Context, insp *lifeops.Inspector, configPath
 		return retirement.NodeUnknown
 	}
 
-	dialled, err := endpoint.ParseCanonical(ev.record.Endpoint)
-	if err != nil || !dialled.Equal(want) {
+	// WHAT THE PROCESS DIALS, not only the controller it is on: one still knowing the
+	// retiring controller would dial it after it is gone, though it is on the survivor
+	// and the file now names the survivor alone.
+	dials, err := ev.record.controllers()
+	if err != nil || !dials.sameControllers(controllerSet{want}) {
 		return retirement.NodeUnknown
 	}
 
