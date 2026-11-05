@@ -86,7 +86,7 @@ func (s *Source) Terms(shape string) (hostsource.Terms, error) {
 		return hostsource.Terms{}, fmt.Errorf("awsmetal: %s is not a declared shape", shape)
 	}
 
-	return hostsource.Terms{LeadTime: time.Minute, BillingUnit: time.Second}, nil
+	return hostsource.Terms{LeadTime: time.Minute, BillingUnit: time.Second, Idempotent: true}, nil
 }
 
 // Order launches one host of a declared shape in this source's zone.

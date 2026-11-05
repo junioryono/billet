@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
 )
 
@@ -37,12 +38,14 @@ type fakeBMC struct {
 
 	mu      sync.Mutex
 	grants  int
-	ordered []orderBody
+	ordered []map[string]any
 	quotas  string
 	order   func(w http.ResponseWriter)
 	servers string
 	status  int
-	deleted []string
+	// redirected counts requests that reached the redirect's target.
+	redirected int
+	deleted    []string
 }
 
 func newFake(t *testing.T) (*fakeBMC, *httptest.Server) {
@@ -80,7 +83,7 @@ func (f *fakeBMC) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/billing/v1/product-availability":
 		f.write(w, stock)
 	case r.Method == http.MethodPost && r.URL.Path == "/bmc/v1/servers":
-		var body orderBody
+		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			f.t.Errorf("order body: %v", err)
 		}
@@ -88,6 +91,8 @@ func (f *fakeBMC) serve(w http.ResponseWriter, r *http.Request) {
 		f.order(w)
 	case r.Method == http.MethodGet && r.URL.Path == "/bmc/v1/servers":
 		f.write(w, f.servers)
+	case r.URL.Path == "/elsewhere":
+		f.redirected++
 	case strings.HasPrefix(r.URL.Path, "/bmc/v1/servers/"):
 		id := strings.TrimPrefix(r.URL.Path, "/bmc/v1/servers/")
 		if r.Method == http.MethodDelete {
@@ -105,11 +110,11 @@ func (f *fakeBMC) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (f *fakeBMC) snapshot() (grants int, ordered []orderBody, deleted []string) {
+func (f *fakeBMC) snapshot() (grants int, ordered []map[string]any, deleted []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	return f.grants, append([]orderBody(nil), f.ordered...), append([]string(nil), f.deleted...)
+	return f.grants, append([]map[string]any(nil), f.ordered...), append([]string(nil), f.deleted...)
 }
 
 func (f *fakeBMC) set(status int) {
@@ -128,12 +133,27 @@ func (f *fakeBMC) write(w io.Writer, body string) {
 func source(t *testing.T, srv *httptest.Server, opts ...Option) *Source {
 	t.Helper()
 	opts = append([]Option{WithEndpoints(srv.URL+"/token", srv.URL), WithHTTPClient(srv.Client())}, opts...)
-	s, err := New(Credentials{ClientID: clientID, Secret: hostsource.NewSecret([]byte(clientSecret))}, opts...)
+	s, err := New(Credentials{ClientID: clientID, Secret: hostsource.NewSecret([]byte(clientSecret))},
+		[]Shape{{Type: "s2.c2.small", Arch: config.ArchX64}}, opts...)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
 
 	return s
+}
+
+// field walks a decoded JSON document by its keys, nil where any key is missing.
+func field(doc map[string]any, keys ...string) any {
+	var cur any = doc
+	for _, k := range keys {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = m[k]
+	}
+
+	return cur
 }
 
 func request() hostsource.Request {
@@ -157,14 +177,24 @@ func TestAnOrderIsAnHourlyServerThatBootsThePayload(t *testing.T) {
 	if len(ordered) != 1 {
 		t.Fatalf("ordered %d servers", len(ordered))
 	}
+	// THE WIRE'S OWN KEYS, read without the production struct, so a renamed JSON tag
+	// fails here rather than changing the encoder and this reader together.
 	got := ordered[0]
-	boot, err := base64.StdEncoding.DecodeString(got.OSConfiguration.CloudInit.UserData)
+	userData, ok := field(got, "osConfiguration", "cloudInit", "userData").(string)
+	if !ok {
+		t.Fatalf("the order has no osConfiguration.cloudInit.userData: %v", got)
+	}
+	boot, err := base64.StdEncoding.DecodeString(userData)
 	if err != nil || string(boot) != bootPayload {
 		t.Fatalf("the cloud-init payload is %q (%v), want the boot payload", boot, err)
 	}
-	if got.Hostname != "billet-o-1" || got.Type != "s2.c2.small" || got.Location != "CHI" ||
-		got.PricingModel != "HOURLY" || got.OS != osImage || got.InstallDefaultSSHKeys {
-		t.Fatalf("order body = %+v", got)
+	for key, want := range map[string]any{
+		"hostname": "billet-o-1", "type": "s2.c2.small", "location": "CHI",
+		"pricingModel": "HOURLY", "os": "ubuntu/noble", "installDefaultSshKeys": false,
+	} {
+		if got[key] != want {
+			t.Errorf("%s = %v, want %v", key, got[key], want)
+		}
 	}
 }
 
@@ -320,7 +350,9 @@ func TestTheTokenIsReusedUntilItExpires(t *testing.T) {
 	}
 }
 
-// THE SOURCE AND ITS CREDENTIALS REDACT THEMSELVES on every rendering path.
+// THE SOURCE AND ITS CREDENTIALS REDACT THEMSELVES on every rendering path, each to
+// exactly its safe text, so a rendering that panicked and was recovered by fmt does not
+// pass for one that redacted.
 func TestTheCredentialsAreRedactedOnEveryRenderingPath(t *testing.T) {
 	t.Parallel()
 	_, srv := newFake(t)
@@ -329,22 +361,126 @@ func TestTheCredentialsAreRedactedOnEveryRenderingPath(t *testing.T) {
 		t.Fatalf("find: %v", err)
 	}
 	creds := Credentials{ClientID: clientID, Secret: hostsource.NewSecret([]byte(clientSecret))}
-	var buf bytes.Buffer
-	text := slog.New(slog.NewTextHandler(&buf, nil))
-	asJSON := slog.New(slog.NewJSONHandler(&buf, nil))
-	for _, v := range []any{s, creds} {
-		buf.Reset()
-		text.Info("x", "v", v)
-		asJSON.Info("x", "v", v)
-		b, err := json.Marshal(v)
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
-		out := fmt.Sprintf("%v %+v %#v %s %x %q", v, v, v, v, v, v) + string(b) + buf.String()
-		for _, secret := range []string{clientSecret, "tok-1", fmt.Sprintf("%x", clientSecret)} {
-			if strings.Contains(out, secret) {
-				t.Errorf("%T leaked %q: %s", v, secret, out)
+	for _, c := range []struct {
+		v    any
+		safe string
+	}{
+		{s, "phoenixnap.Source{client=client-1}"},
+		{creds, "phoenixnap.Credentials{client=client-1}"},
+	} {
+		for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%x", "%q"} {
+			if got := fmt.Sprintf(verb, c.v); got != c.safe {
+				t.Errorf("%T %s = %q, want %q", c.v, verb, got, c.safe)
 			}
 		}
+		b, err := json.Marshal(c.v)
+		if err != nil || string(b) != `"`+c.safe+`"` {
+			t.Errorf("%T json = %s (%v)", c.v, b, err)
+		}
+		var text, asJSON bytes.Buffer
+		slog.New(slog.NewTextHandler(&text, nil)).Info("x", "v", c.v)
+		slog.New(slog.NewJSONHandler(&asJSON, nil)).Info("x", "v", c.v)
+		for name, out := range map[string]string{"slog text": text.String(), "slog json": asJSON.String()} {
+			if !strings.Contains(out, c.safe) || strings.Contains(out, clientSecret) || strings.Contains(out, "tok-1") {
+				t.Errorf("%T %s = %s", c.v, name, out)
+			}
+		}
+	}
+}
+
+// AN ANSWER THAT SAYS NOTHING IS NOT AN ANSWER: an empty or null list does not prove an
+// order was never placed, an order answered without an id did not prove one was, and a
+// quota or stock entry missing its numbers cannot say whether another server fits.
+func TestAnswersMissingWhatTheyMustSayAreCouldNotTell(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{``, `null`, ` `} {
+		f, srv := newFake(t)
+		f.mu.Lock()
+		f.servers = body
+		f.mu.Unlock()
+		if _, ok, err := source(t, srv).Find(t.Context(), "o-1"); err == nil || ok {
+			t.Errorf("a server list of %q: %t, %v", body, ok, err)
+		}
+	}
+	f, srv := newFake(t)
+	f.order = func(w http.ResponseWriter) { f.write(w, `{"status":"creating"}`) }
+	if _, err := source(t, srv).Order(t.Context(), request()); err == nil {
+		t.Error("an order answered without a server id succeeded")
+	}
+	for name, quotas := range map[string]string{
+		"no used":  `[{"id":"bmc.servers.max_count","limit":1}]`,
+		"no limit": `[{"id":"bmc.servers.max_count","used":0}]`,
+	} {
+		f, srv := newFake(t)
+		f.quotas = quotas
+		f.order = func(http.ResponseWriter) { t.Errorf("%s: an order was placed", name) }
+		_, err := source(t, srv).Order(t.Context(), request())
+		if err == nil || errors.Is(err, hostsource.ErrQuota) {
+			t.Errorf("%s: %v, want could-not-tell", name, err)
+		}
+	}
+}
+
+// THE API'S OWN TEXT IS NOT QUOTED unless it is the measured refusal: a validation
+// answer could echo the order's body, which carries the join token.
+func TestARefusalNeverQuotesWhatTheAPISentBack(t *testing.T) {
+	t.Parallel()
+	encoded := base64.StdEncoding.EncodeToString([]byte(bootPayload))
+	f, srv := newFake(t)
+	f.order = func(w http.ResponseWriter) {
+		w.WriteHeader(http.StatusBadRequest)
+		f.write(w, `{"message":"invalid userData `+encoded+` token-9QX","validationErrors":["`+encoded+`"]}`)
+	}
+	_, err := source(t, srv).Order(t.Context(), request())
+	if err == nil || strings.Contains(err.Error(), "token-9QX") || strings.Contains(err.Error(), encoded) {
+		t.Fatalf("order = %v", err)
+	}
+}
+
+// NO REDIRECT IS FOLLOWED: an order's body would be sent again to wherever it pointed.
+func TestARedirectIsAnsweredNotFollowed(t *testing.T) {
+	t.Parallel()
+	f, srv := newFake(t)
+	f.order = func(w http.ResponseWriter) {
+		w.Header().Set("Location", srv.URL+"/elsewhere")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}
+	if _, err := source(t, srv).Order(t.Context(), request()); err == nil {
+		t.Fatal("a redirected order succeeded")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.redirected != 0 {
+		t.Fatalf("the order was sent on %d times", f.redirected)
+	}
+}
+
+// AN ORDER THIS SOURCE CANNOT HONOUR AS ASKED is refused before anything is called.
+func TestAnOrderOutsideTheDeclaredShapesOrdersNothing(t *testing.T) {
+	t.Parallel()
+	for name, mutate := range map[string]func(*hostsource.Request){
+		"undeclared shape":   func(r *hostsource.Request) { r.Shape = "a1.c5.large" },
+		"wrong architecture": func(r *hostsource.Request) { r.Arch = config.ArchARM64 },
+		"no location":        func(r *hostsource.Request) { r.Location = "" },
+		"order not a name":   func(r *hostsource.Request) { r.Order = "O 1" },
+	} {
+		f, srv := newFake(t)
+		f.order = func(http.ResponseWriter) { t.Errorf("%s: an order was placed", name) }
+		req := request()
+		mutate(&req)
+		if _, err := source(t, srv).Order(t.Context(), req); err == nil {
+			t.Errorf("%s: ordered", name)
+		}
+	}
+}
+
+// NO IDEMPOTENCY KEY, SO NOT IDEMPOTENT: an order whose answer was lost waits for a
+// person rather than being placed again on an absent hostname.
+func TestAnOrderHereIsNotIdempotent(t *testing.T) {
+	t.Parallel()
+	_, srv := newFake(t)
+	terms, err := source(t, srv).Terms("s2.c2.small")
+	if err != nil || terms.Idempotent || terms.BillingUnit != time.Hour {
+		t.Fatalf("terms = %+v, %v", terms, err)
 	}
 }

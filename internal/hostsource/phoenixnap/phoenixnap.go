@@ -26,10 +26,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
 )
 
@@ -53,7 +55,22 @@ const (
 
 	// maxBody bounds what is read of any answer; the catalogue, the largest, was 777 KB.
 	maxBody = 8 << 20
+
+	// measuredRefusal is the one API message quoted back, as the real API answered an
+	// order on 2026-11-05. Every other message is the API's text and may echo what it
+	// was sent, so it is not quoted.
+	measuredRefusal = "The request failed since this resource cannot be accessed by the provided credentials."
 )
+
+// orderPattern bounds an order identifier, which becomes the server's hostname.
+var orderPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,47}$`)
+
+// Shape is one server type a pool may order, with its architecture, which the API's
+// catalogue does not say in a field.
+type Shape struct {
+	Type string
+	Arch config.Arch
+}
 
 // Credentials are an API client's id and secret.
 type Credentials struct {
@@ -77,11 +94,12 @@ func (c Credentials) LogValue() slog.Value { return slog.StringValue(c.String())
 
 // Source orders and releases phoenixNAP servers.
 type Source struct {
-	creds Credentials
-	http  *http.Client
-	auth  string
-	api   string
-	now   func() time.Time
+	creds  Credentials
+	shapes map[string]config.Arch
+	http   *http.Client
+	auth   string
+	api    string
+	now    func() time.Time
 
 	mu      sync.Mutex
 	token   string
@@ -102,21 +120,38 @@ func WithHTTPClient(c *http.Client) Option { return func(s *Source) { s.http = c
 // WithClock replaces the clock, for a test.
 func WithClock(now func() time.Time) Option { return func(s *Source) { s.now = now } }
 
-// New builds a source; it calls nothing until asked.
-func New(creds Credentials, opts ...Option) (*Source, error) {
+// New builds a source that orders only the shapes named; it calls nothing until asked.
+func New(creds Credentials, shapes []Shape, opts ...Option) (*Source, error) {
 	if creds.ClientID == "" || creds.Secret.Empty() {
 		return nil, errors.New("phoenixnap: an API client id and secret are both required")
 	}
+	byType := make(map[string]config.Arch, len(shapes))
+	for _, sh := range shapes {
+		if sh.Type == "" || sh.Arch == "" {
+			return nil, fmt.Errorf("phoenixnap: shape %+v needs a type and an architecture", sh)
+		}
+		byType[sh.Type] = sh.Arch
+	}
+	if len(byType) == 0 {
+		return nil, errors.New("phoenixnap: a source needs at least one shape")
+	}
 	s := &Source{
-		creds: creds,
-		http:  &http.Client{Timeout: 60 * time.Second},
-		auth:  defaultAuth,
-		api:   defaultAPI,
-		now:   time.Now,
+		creds:  creds,
+		shapes: byType,
+		http:   &http.Client{Timeout: 60 * time.Second},
+		auth:   defaultAuth,
+		api:    defaultAPI,
+		now:    time.Now,
 	}
 	for _, o := range opts {
 		o(s)
 	}
+	// NO REDIRECT IS FOLLOWED, on the default client or one a caller handed in. An
+	// order's body carries the join token, and a 307 or 308 would send it again to
+	// wherever the answer pointed; a redirect is answered as the refusal it is.
+	c := *s.http
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	s.http = &c
 
 	return s, nil
 }
@@ -147,8 +182,13 @@ func (s *Source) Name() string { return Name }
 
 // Terms are an hourly plan's: billed by the started hour, no minimum term. The lead
 // time is not measured, since no order has been accepted, so it is zero, which the
-// pool reads as unknown.
-func (s *Source) Terms(string) (hostsource.Terms, error) {
+// pool reads as unknown. An order is NOT idempotent: the API takes no idempotency key,
+// so an order whose answer was lost is never placed again without a person.
+func (s *Source) Terms(shape string) (hostsource.Terms, error) {
+	if _, ok := s.shapes[shape]; !ok {
+		return hostsource.Terms{}, fmt.Errorf("phoenixnap: %s is not a declared shape", shape)
+	}
+
 	return hostsource.Terms{BillingUnit: time.Hour}, nil
 }
 
@@ -184,8 +224,16 @@ type server struct {
 // Order checks the quota and the stock, then orders one hourly server whose first
 // boot runs req.Boot through cloud-init.
 func (s *Source) Order(ctx context.Context, req hostsource.Request) (hostsource.Host, error) {
-	if req.Order == "" || req.Shape == "" || req.Location == "" {
-		return hostsource.Host{}, errors.New("phoenixnap: an order needs its identifier, a shape and a location")
+	arch, declared := s.shapes[req.Shape]
+	switch {
+	case !orderPattern.MatchString(req.Order):
+		return hostsource.Host{}, fmt.Errorf("phoenixnap: order %q is not 1 to 48 lowercase letters, digits and dashes", req.Order)
+	case req.Location == "":
+		return hostsource.Host{}, errors.New("phoenixnap: an order needs a location")
+	case !declared:
+		return hostsource.Host{}, fmt.Errorf("phoenixnap: %s is not a declared shape", req.Shape)
+	case req.Arch != "" && req.Arch != arch:
+		return hostsource.Host{}, fmt.Errorf("phoenixnap: %s is %s, not %s", req.Shape, arch, req.Arch)
 	}
 	if err := s.checkQuota(ctx); err != nil {
 		return hostsource.Host{}, err
@@ -211,6 +259,9 @@ func (s *Source) Order(ctx context.Context, req hostsource.Request) (hostsource.
 	if err := s.call(ctx, http.MethodPost, "/bmc/v1/servers", body, &got); err != nil {
 		return hostsource.Host{}, err
 	}
+	if got.ID == "" {
+		return hostsource.Host{}, errors.New("phoenixnap: the order was answered without a server id, so whether a server was ordered cannot be told")
+	}
 
 	return got.host(), nil
 }
@@ -220,6 +271,9 @@ func (s *Source) Describe(ctx context.Context, id string) (hostsource.Host, erro
 	var got server
 	if err := s.call(ctx, http.MethodGet, "/bmc/v1/servers/"+url.PathEscape(id), nil, &got); err != nil {
 		return hostsource.Host{}, err
+	}
+	if got.ID != id {
+		return hostsource.Host{}, fmt.Errorf("phoenixnap: asked for server %s and was answered about %q", id, got.ID)
 	}
 
 	return got.host(), nil
@@ -234,6 +288,9 @@ func (s *Source) Find(ctx context.Context, order string) (hostsource.Host, bool,
 	want := hostnamePrefix + order
 	var found []server
 	for _, sv := range all {
+		if sv.ID == "" {
+			return hostsource.Host{}, false, errors.New("phoenixnap: the server list holds a server without an id, so the list cannot be read")
+		}
 		if sv.Hostname == want {
 			found = append(found, sv)
 		}
@@ -259,8 +316,10 @@ func (s *Source) Gone(ctx context.Context, id string) (hostsource.Presence, erro
 	var got server
 	err := s.call(ctx, http.MethodGet, "/bmc/v1/servers/"+url.PathEscape(id), nil, &got)
 	switch {
-	case err == nil:
+	case err == nil && got.ID == id:
 		return hostsource.PresencePresent, nil
+	case err == nil:
+		return hostsource.PresenceUnknown, fmt.Errorf("phoenixnap: asked for server %s and was answered about %q", id, got.ID)
 	case errors.Is(err, errNotFound):
 		return hostsource.PresenceUnknown, nil
 	}
@@ -283,8 +342,8 @@ func (s *Source) Release(ctx context.Context, proof hostsource.ReleaseProof) err
 
 type quota struct {
 	ID    string `json:"id"`
-	Limit int    `json:"limit"`
-	Used  int    `json:"used"`
+	Limit *int   `json:"limit"`
+	Used  *int   `json:"used"`
 }
 
 func (s *Source) checkQuota(ctx context.Context) error {
@@ -296,8 +355,11 @@ func (s *Source) checkQuota(ctx context.Context) error {
 		if q.ID != serversQuota {
 			continue
 		}
-		if q.Used >= q.Limit {
-			return fmt.Errorf("%w: phoenixnap: the account holds %d of %d servers", hostsource.ErrQuota, q.Used, q.Limit)
+		if q.Limit == nil || q.Used == nil {
+			return fmt.Errorf("phoenixnap: the %s quota came without its limit or use, so whether another server fits cannot be told", serversQuota)
+		}
+		if *q.Used >= *q.Limit {
+			return fmt.Errorf("%w: phoenixnap: the account holds %d of %d servers", hostsource.ErrQuota, *q.Used, *q.Limit)
 		}
 
 		return nil
@@ -310,8 +372,8 @@ type availability struct {
 	ProductCode string `json:"productCode"`
 	Locations   []struct {
 		Location  string `json:"location"`
-		Available bool   `json:"minQuantityAvailable"`
-		Quantity  int    `json:"availableQuantity"`
+		Available *bool  `json:"minQuantityAvailable"`
+		Quantity  *int   `json:"availableQuantity"`
 	} `json:"locationAvailabilityDetails"`
 }
 
@@ -326,7 +388,13 @@ func (s *Source) checkStock(ctx context.Context, shape, location string) error {
 			continue
 		}
 		for _, l := range a.Locations {
-			if l.Location == location && l.Available && l.Quantity > 0 {
+			if l.Location != location {
+				continue
+			}
+			if l.Available == nil || l.Quantity == nil {
+				return fmt.Errorf("phoenixnap: the stock of %s in %s came without its quantity, so it cannot be told", shape, location)
+			}
+			if *l.Available && *l.Quantity > 0 {
 				return nil
 			}
 		}
@@ -368,8 +436,9 @@ func stateOf(status string) hostsource.State {
 
 var errNotFound = errors.New("phoenixnap: not found")
 
-// apiError is a refusal the API described; only its message is kept, which the
-// measured 403 carried and nothing else.
+// apiError is a refusal the API answered. Its message is the API's only when it is the
+// one measured refusal; otherwise it is the status's own text, because the API's could
+// echo the order's body, which carries the join token.
 type apiError struct {
 	Status  int
 	Message string
@@ -417,8 +486,13 @@ func (s *Source) call(ctx context.Context, method, path string, body []byte, out
 	case resp.StatusCode < 200 || resp.StatusCode > 299:
 		return refusal(resp.StatusCode, raw)
 	}
-	if out == nil || len(bytes.TrimSpace(raw)) == 0 {
+	if out == nil {
 		return nil
+	}
+	// AN EMPTY OR NULL ANSWER IS NOT AN EMPTY LIST. Decoded as one, a list of servers
+	// that said nothing would prove an order was never placed.
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return fmt.Errorf("phoenixnap: %s %s answered nothing, which cannot be read", method, path)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("phoenixnap: decode %s %s: %w", method, path, err)
@@ -431,11 +505,11 @@ func refusal(status int, raw []byte) error {
 	var m struct {
 		Message string `json:"message"`
 	}
-	if json.Unmarshal(raw, &m) != nil || m.Message == "" {
-		return &apiError{Status: status, Message: http.StatusText(status)}
+	if json.Unmarshal(raw, &m) == nil && m.Message == measuredRefusal {
+		return &apiError{Status: status, Message: m.Message}
 	}
 
-	return &apiError{Status: status, Message: m.Message}
+	return &apiError{Status: status, Message: http.StatusText(status)}
 }
 
 // bearer is a token from the client-credentials grant, reused until a minute before
