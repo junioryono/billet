@@ -71,6 +71,37 @@ billet ami build --config billet.yaml --region us-west-2 --subnet subnet-… --s
 
 The builder checks the Actions runner tarball against the sha256 billet pins for it, the same digest the Firecracker guest image is checked with, and stops before unpacking anything that does not match. The pin covers one release, the one `--runner-version` defaults to; to build another, pass `--runner-sha256` with the sha256 of `actions-runner-linux-<arch>-<version>.tar.gz` from that release's page, or the build is refused before a builder launches.
 
+## Windows jobs
+
+An `ec2` tier can run Windows jobs on an AMI billet builds in your account from Amazon's license-included Windows Server 2025 image ([ADR-026](../reference/decisions/adr-026-windows-on-ec2.md)).
+
+```bash
+BASE=$(aws ssm get-parameter --region us-west-2 \
+  --name /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base \
+  --query Parameter.Value --output text)
+billet ami build --os windows --config billet.yaml --base-image "$BASE" --payload-bucket my-bucket \
+  --region us-west-2 --subnet subnet-… --security-group sg-… --public-ip
+```
+
+```yaml
+tiers:
+  - label: windows-2025
+    provider: ec2
+    guest_os: windows
+    trust: untrusted
+    vcpu: 4
+    memory: 8GiB
+    image: ami-…
+```
+
+`--os windows` is held to what the base image reports, in both directions, and so is a tier's `guest_os` against its AMI, at `billet check` and again before a launch sends anything.
+
+The trust rules are the Linux instance's: untrusted work needs `untrusted_security_group_ids`, gets no instance profile, and the metadata service is IMDSv2 with one hop. The job's runner runs as the local administrator `runner`, as GitHub's runs as `runneradmin`, so a job can install software; the instance is the boundary, and it is destroyed with the job.
+
+A Windows image carries what the floor in ADR-026 lists, not what GitHub's hosted `windows-2025` carries: no Visual Studio, no Docker, no Java or .NET SDK beyond what Windows ships, no Windows updates past the base image's month. `actions/setup-*` downloads what is missing. `differences-windows.tsv` lists every step of GitHub's template the build leaves out and why. billet's caches have no client in a Windows guest, so a Windows tier sets no `cache`, `intercept` or `cache_scope`.
+
+A first boot is the slow part: a job started about two minutes after its launch where a Linux one takes under one, so count that against a tier's wait. GitHub takes back an assignment left unstarted after five minutes, so every Windows launch asks EBS to read the image's snapshot at a provisioned 200 MiB/s. AWS charges that once per launch on the snapshot's full size, about $0.09 on a 36 GiB image, on top of the instance and its volume. Linux containers inside a Windows guest are out of scope.
+
 ## Spot
 
 Off by default. With `spot: true` the node needs `interruption_queue_url`, one queue per node whose basename equals the node's name: the router resolves the warned instance's `sh.billet.node` tag and targets only that node's queue, because a shared queue hides a message for the visibility timeout, which can consume the whole two-minute warning. The module creates one queue with `enable_spot`, whose node is `spot_node_name`; for several spot nodes, name the others in `spot_node_names`, and each gets a queue named exactly it, with the node grant, the router grant and the set of names the router serves all widened from that one list. Every node's queue is then in `interruption_queue_urls`, keyed by the `node.name` that consumes it. A warning records the reclaim reason durably and starts teardown without waiting for lease expiry. GitHub does not requeue a job that already started, so an interruption fails the build; use Spot for explicitly retryable work. The router throws a warning away only on one of four proofs that it is not the router's to place: the instance is present and carries no `sh.billet.node` tag, EC2 says the instance is already gone, the tag cannot be a legal queue name, or the tag names a queue outside the set the router was told it serves *and* SQS answers `AccessDenied` or `AWS.SimpleQueueService.NonExistentQueue` for it (a queue the router is granted but was not told about forwards normally). Anything else it cannot complete — including `AccessDenied` for a served queue, which is equally what AWS answers while a grant is still propagating — is a failed invocation and a retry, reported by the module's `spot_router_errors` alarm. Point that alarm somewhere with the module's `spot_router_alarm_actions`, because a lost warning is otherwise a two-minute reclaim nobody hears about.

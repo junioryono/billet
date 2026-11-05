@@ -64,6 +64,12 @@ var toolset []byte
 //go:embed toolset-2404-arm64.json
 var toolsetArm64 []byte
 
+// toolsetWindows2025 is GitHub's declaration of the windows-2025 image, verbatim
+// (ADR-026).
+//
+//go:embed toolset-2025.json
+var toolsetWindows2025 []byte
+
 // aptAliases maps a declared package name to one apt can actually install.
 //
 // BILLET'S OWN FILE, DELIBERATELY NOT THE VENDORED ONE. The toolset is upstream's
@@ -79,7 +85,7 @@ var toolsetArm64 []byte
 //go:embed apt-aliases.json
 var aptAliases []byte
 
-// PinnedCommit is the actions/runner-images revision both vendored toolsets came from.
+// PinnedCommit is the actions/runner-images revision every vendored toolset came from.
 func PinnedCommit() string {
 	commit, _, _ := strings.Cut(strings.TrimSpace(pinned), " ")
 
@@ -107,21 +113,26 @@ const (
 	ArchArm64 = "arm64"
 )
 
+// Windows2025 names the windows-2025 declaration wherever an architecture names an
+// ubuntu-24.04 one. GitHub publishes it for x64 alone at the pinned commit, so one
+// name is the whole of what a Windows AMI's build has to choose (ADR-026).
+const Windows2025 = "windows-2025"
+
 // PinnedSHA256For is the digest the vendored toolset of arch must have, or an
 // error for an architecture billet vendors no declaration for.
 func PinnedSHA256For(arch string) (string, error) {
 	switch arch {
 	case ArchX64:
 		return PinnedSHA256(), nil
-	case ArchArm64:
+	case ArchArm64, Windows2025:
 		for _, line := range strings.Split(strings.TrimSpace(pinned), "\n")[1:] {
 			name, sum, ok := strings.Cut(strings.TrimSpace(line), " ")
-			if ok && name == ArchArm64 {
+			if ok && name == arch {
 				return strings.TrimSpace(sum), nil
 			}
 		}
 
-		return "", fmt.Errorf("runnerimages: pinned.txt names no digest for the arm64 toolset")
+		return "", fmt.Errorf("runnerimages: pinned.txt names no digest for the %s toolset", arch)
 	default:
 		return "", fmt.Errorf("runnerimages: %q is not an architecture billet vendors a toolset for", arch)
 	}
@@ -134,6 +145,8 @@ func ToolsetFileFor(arch string) (string, error) {
 		return "toolset-2404.json", nil
 	case ArchArm64:
 		return "toolset-2404-arm64.json", nil
+	case Windows2025:
+		return "toolset-2025.json", nil
 	default:
 		return "", fmt.Errorf("runnerimages: %q is not an architecture billet vendors a toolset for", arch)
 	}
@@ -143,8 +156,12 @@ func ToolsetFileFor(arch string) (string, error) {
 // returned as a copy.
 func ToolsetBytesFor(arch string) ([]byte, error) {
 	data := toolset
-	if arch == ArchArm64 {
+
+	switch arch {
+	case ArchArm64:
 		data = toolsetArm64
+	case Windows2025:
+		data = toolsetWindows2025
 	}
 
 	want, err := PinnedSHA256For(arch)
@@ -199,8 +216,13 @@ func SourceURLFor(arch string) (string, error) {
 		return "", err
 	}
 
+	image := "ubuntu"
+	if arch == Windows2025 {
+		image = "windows"
+	}
+
 	return "https://raw.githubusercontent.com/actions/runner-images/" + PinnedCommit() +
-		"/images/ubuntu/toolsets/" + file, nil
+		"/images/" + image + "/toolsets/" + file, nil
 }
 
 // Toolset is the half of GitHub's declaration billet acts on.
@@ -434,6 +456,36 @@ func LoadFor(arch string) (Toolset, error) {
 
 	if err := json.Unmarshal(data, &out); err != nil {
 		return Toolset{}, fmt.Errorf("runnerimages: parse the vendored %s toolset: %w", arch, err)
+	}
+
+	return out, nil
+}
+
+// WindowsToolset is the part of the windows-2025 declaration billet's verifier
+// asks a booted image about: what GitHub's scripts read from the rest of the file
+// they read for themselves, on the builder.
+//
+// A TYPE OF ITS OWN, because the two declarations share a name and not a shape:
+// Windows' `docker.components` is an object where ubuntu's is a list, so decoding
+// this file into Toolset fails on a section nothing here reads.
+type WindowsToolset struct {
+	Toolcache  []ToolcacheEntry `json:"toolcache"`
+	PowerShell Version          `json:"pwsh"`
+}
+
+// LoadWindows is the vendored windows-2025 declaration, verified against its pin
+// and parsed.
+func LoadWindows() (WindowsToolset, error) {
+	data, err := ToolsetBytesFor(Windows2025)
+	if err != nil {
+		return WindowsToolset{}, err
+	}
+
+	var out WindowsToolset
+
+	if err := json.Unmarshal(data, &out); err != nil {
+		return WindowsToolset{}, fmt.Errorf("runnerimages: parse the vendored %s toolset: %w",
+			Windows2025, err)
 	}
 
 	return out, nil
