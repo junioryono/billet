@@ -110,7 +110,7 @@ func TestAnOrderOutsideTheDeclaredShapesIsRefused(t *testing.T) {
 		"another zone":       {Order: "o-1", Shape: "m7gd.metal", Location: "us-west-2b"},
 	} {
 		f := &fakeHosts{}
-		if _, err := newTestSource(t, f).Order(t.Context(), req); err == nil {
+		if _, err := newTestSource(t, f).Order(t.Context(), req); !errors.Is(err, hostsource.ErrNotSent) {
 			t.Errorf("%s: ordered", name)
 		}
 		if len(f.launched) != 0 {
@@ -225,5 +225,16 @@ func TestTermsGiveTheClientTokenWindow(t *testing.T) {
 	}
 	if _, err := s.Terms("c7i.metal-24xl"); err == nil {
 		t.Fatal("an undeclared shape has terms")
+	}
+}
+
+// A LAUNCH THE PROVIDER REFUSED BEFORE RUNINSTANCES SENT NOTHING, so the source says
+// so, and the pool records it as refused rather than reading it back.
+func TestALaunchRefusedLocallyIsNotSent(t *testing.T) {
+	t.Parallel()
+	f := &fakeHosts{launchErr: fmt.Errorf("%w: too long", ec2.ErrLaunchNotSent)}
+	_, err := newTestSource(t, f).Order(t.Context(), hostsource.Request{Order: "o-1", Shape: "m7gd.metal"})
+	if !errors.Is(err, hostsource.ErrNotSent) {
+		t.Fatalf("order = %v", err)
 	}
 }

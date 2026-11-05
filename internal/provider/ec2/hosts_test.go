@@ -116,7 +116,7 @@ func TestAnOrderThatCannotBeATokenOrAFilterIsRefused(t *testing.T) {
 	for _, order := range []string{"", "o-*", "O-1", "o 1", strings.Repeat("a", 49)} {
 		l := hostLaunch()
 		l.Order = order
-		if _, err := h.Launch(t.Context(), l); err == nil {
+		if _, err := h.Launch(t.Context(), l); !errors.Is(err, ErrLaunchNotSent) {
 			t.Errorf("order %q was launched", order)
 		}
 		if _, _, err := h.Find(t.Context(), order); err == nil {

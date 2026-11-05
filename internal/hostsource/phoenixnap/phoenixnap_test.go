@@ -234,7 +234,7 @@ func TestAQuotaListWithoutTheServersQuotaOrdersNothing(t *testing.T) {
 	f.quotas = `[]`
 	f.order = func(http.ResponseWriter) { t.Error("an order was placed") }
 	_, err := source(t, srv).Order(t.Context(), request())
-	if err == nil || errors.Is(err, hostsource.ErrQuota) || errors.Is(err, hostsource.ErrNoStock) {
+	if !errors.Is(err, hostsource.ErrNotSent) || errors.Is(err, hostsource.ErrQuota) || errors.Is(err, hostsource.ErrNoStock) {
 		t.Fatalf("order = %v, want could-not-tell", err)
 	}
 }
@@ -473,7 +473,7 @@ func TestAnOrderOutsideTheDeclaredShapesOrdersNothing(t *testing.T) {
 		f.order = func(http.ResponseWriter) { t.Errorf("%s: an order was placed", name) }
 		req := request()
 		mutate(&req)
-		if _, err := source(t, srv).Order(t.Context(), req); err == nil {
+		if _, err := source(t, srv).Order(t.Context(), req); !errors.Is(err, hostsource.ErrNotSent) {
 			t.Errorf("%s: ordered", name)
 		}
 	}
