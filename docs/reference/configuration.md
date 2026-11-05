@@ -25,8 +25,8 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `identity.backend` | no | `file` (default) or `aws-ssm` |
 | `identity.aws_ssm` | for `aws-ssm` | `region`, `prefix` (isolates one deployment in an account), `kms_key_id` |
 | `max_vcpu`, `max_memory` | yes, positive | the deployment ceiling across every tier |
-| `placement` | no | `pack` (default) or `spread` |
-| `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
+| `placement` | no | `pack` (default), `spread` or `tightest` (the host left with the least free room, whatever the tier) |
+| `admission_order` | no | `fair` (default), `fill` or `hold`; which waiting tier takes the room a finished job leaves. [Admission orders on replay](records/replay-policies.md) measures all three |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
 | `test_results_retention` | no | how long the ledger keeps a job's test suites and cases, which `billet tests stats` ranks and `billet jobs show` prints (default `336h`, at least `1h`); they are kept apart from the guest report and past it |
 | `test_results_max_bytes` | no | how much of them the ledger keeps in all, the oldest deleted first (a byte size, default `128MiB`, at least `1MiB`); the control plane reads the whole ledger at every start, and this bounds what they add to that |

@@ -200,9 +200,9 @@ func TestAComparisonPrintsEachPolicysSpan(t *testing.T) {
 	table := Comparison{Policies: []Policy{{Name: "soon"}, {Name: "late"}, {Name: "idle"}},
 		Reports: []*Report{soon, late, idle}}.Markdown()
 
-	if !strings.Contains(table, "| soon | 0 | 0 | 0 | 50% | 25% | 0.0 | 1.00 |") ||
-		!strings.Contains(table, "| late | 0 | 0 | 0 | 50% | 25% | 0.0 | 2.00 |") ||
-		!strings.Contains(table, "| idle | 0 | 0 | 0 | — | — | — | — |") {
+	if !strings.Contains(table, "| soon | 0 | 0 | 0 | 50% | 25% | 0.0 | 0.0 | 1.00 |") ||
+		!strings.Contains(table, "| late | 0 | 0 | 0 | 50% | 25% | 0.0 | 0.0 | 2.00 |") ||
+		!strings.Contains(table, "| idle | 0 | 0 | 0 | — | — | — | — | — |") {
 		t.Errorf("the table is\n%s\nwant each policy's figures over its own span, one hour and two, and none "+
 			"for a replay that charged nothing", table)
 	}
@@ -251,6 +251,114 @@ func TestChargesPerTargetAndTheContestedWindow(t *testing.T) {
 	if !strings.Contains(table, "Contested for 1h0m0s.") || !strings.Contains(table, "| first | 0 | 4.0 | 8.0 | 67% | 67% |") ||
 		!strings.Contains(table, "| second | 0 | 2.0 | 4.0 | 33% | 33% |") {
 		t.Errorf("the table is\n%s", table)
+	}
+}
+
+// WHAT COUNTS AS WAITING FOR AN EMPTY HOST: memory binds as vCPU does, a job that never started
+// waits from its arrival on, and overlapping waits are one wait.
+func TestEmptyWhileQueuedReadsTheWaitsTheyAre(t *testing.T) {
+	t.Parallel()
+
+	hour := func(n float64) time.Time { return DefaultStart.Add(time.Duration(n * float64(time.Hour))) }
+	running := Record{Tier: "t", Node: "only", VCPU: 8, Memory: 32 * config.GiB, Arrival: hour(0), ChargedFrom: hour(0),
+		StartedAt: hour(0), FinishedAt: hour(2)}
+	fleet := func(spareMemory config.ByteSize) Fleet {
+		return Fleet{
+			Hosts:   []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}, {Name: "spare", VCPU: 8, Memory: spareMemory}},
+			MaxVCPU: 16, MaxMemory: 32*config.GiB + spareMemory,
+		}
+	}
+	later := func(arrival float64) Record {
+		return Record{Tier: "t", Node: "only", VCPU: 4, Memory: 16 * config.GiB, Arrival: hour(arrival), ChargedFrom: hour(2),
+			StartedAt: hour(2), FinishedAt: hour(3)}
+	}
+
+	// A host too short of memory for the job is not room it was denied.
+	short := &Report{Fleet: fleet(8 * config.GiB), Records: []Record{running, later(0)}}
+	if got := short.EmptyWhileQueuedHours(); got != 0 {
+		t.Errorf("%.3f host-hours on a host short of memory; want none", got)
+	}
+
+	// Two waits overlapping count their union.
+	both := &Report{Fleet: fleet(32 * config.GiB), Records: []Record{running, later(0), later(1)}}
+	if got := both.EmptyWhileQueuedHours(); math.Abs(got-2) > 1e-9 {
+		t.Errorf("%.3f host-hours for waits from 0h and 1h to 2h; want 2", got)
+	}
+
+	// A job that never started waits to the end of the span.
+	never := later(1)
+	never.ChargedFrom, never.StartedAt, never.FinishedAt = time.Time{}, time.Time{}, time.Time{}
+
+	stuck := &Report{Fleet: fleet(32 * config.GiB), Records: []Record{running, later(2), never}}
+	if got := stuck.EmptyWhileQueuedHours(); math.Abs(got-2) > 1e-9 {
+		t.Errorf("%.3f host-hours for a job waiting from 1h to the end at 3h; want 2", got)
+	}
+}
+
+// EMPTY WHILE A JOB WAITED COUNTS ONLY A HOST THAT JOB FITS ON, and only while it waited:
+// a host idle because nothing asked is not room a shape was denied.
+func TestEmptyWhileQueuedCountsOnlyHostsTheWaitingJobFits(t *testing.T) {
+	t.Parallel()
+
+	start := DefaultStart
+	hour := func(n float64) time.Time { return start.Add(time.Duration(n * float64(time.Hour))) }
+
+	r := &Report{
+		Fleet: Fleet{Hosts: []Host{
+			{Name: "only", VCPU: 8, Memory: 32 * config.GiB},
+			{Name: "tiny", VCPU: 2, Memory: 8 * config.GiB},
+		}, MaxVCPU: 10, MaxMemory: 40 * config.GiB},
+		Records: []Record{
+			// Ran at once from 0h to 1h: "only" is charged, and nothing waits.
+			{Tier: "billet-4vcpu", Node: "only", VCPU: 4, Memory: 8 * config.GiB, Arrival: hour(0), ChargedFrom: hour(0),
+				StartedAt: hour(0), FinishedAt: hour(1)},
+			// Waits from 2h to 3h, then runs to 4h. 4 vCPU fits "only", empty from 1h to
+			// 3h, for the hour it waited, and not "tiny", empty throughout.
+			{Tier: "billet-4vcpu", Node: "only", VCPU: 4, Memory: 8 * config.GiB, Arrival: hour(2), ChargedFrom: hour(3),
+				StartedAt: hour(3), FinishedAt: hour(4)},
+		},
+	}
+
+	if got := r.EmptyWhileQueuedHours(); math.Abs(got-1) > 1e-9 {
+		t.Errorf("%.3f host-hours empty while a job waited; want the hour on the host it fits", got)
+	}
+
+	// A JOB PINNED ELSEWHERE IS NOT ROOM THIS HOST DENIED, though the host is empty for
+	// the whole of its wait. Of a tier free to run there, it would be. And a job still
+	// queued that the ledger never recorded counts too.
+	waited := func(tier string) *Report {
+		return &Report{
+			Fleet: Fleet{
+				Hosts: []Host{{Name: "only", VCPU: 8, Memory: 32 * config.GiB}, {Name: "spare", VCPU: 8, Memory: 32 * config.GiB}},
+				Tiers: []TierShape{
+					{Label: "pinned", VCPU: 8, Memory: 32 * config.GiB, Node: "only"},
+					{Label: "free", VCPU: 8, Memory: 32 * config.GiB},
+				},
+				MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+			},
+			Records: []Record{
+				{Tier: "pinned", Node: "only", VCPU: 8, Memory: 32 * config.GiB, Arrival: hour(0),
+					ChargedFrom: hour(0), StartedAt: hour(0), FinishedAt: hour(2)},
+				{Tier: tier, Node: "only", VCPU: 8, Memory: 32 * config.GiB, Arrival: hour(0),
+					ChargedFrom: hour(2), StartedAt: hour(2), FinishedAt: hour(3)},
+			},
+		}
+	}
+
+	if got := waited("free").EmptyWhileQueuedHours(); math.Abs(got-2) > 1e-9 {
+		t.Errorf("%.3f host-hours empty while a job free to run there waited; want its two hours", got)
+	}
+
+	pinned := waited("pinned")
+
+	if got := pinned.EmptyWhileQueuedHours(); got != 0 {
+		t.Errorf("%.3f host-hours empty while a job pinned elsewhere waited; want none", got)
+	}
+
+	pinned.queued = map[int64]Arrival{7: {Seq: 7, At: hour(1), Tier: "free"}}
+
+	if got := pinned.EmptyWhileQueuedHours(); math.Abs(got-2) > 1e-9 {
+		t.Errorf("%.3f host-hours empty while an unrecorded job waited; want hours 1 to 3 of the spare host", got)
 	}
 }
 

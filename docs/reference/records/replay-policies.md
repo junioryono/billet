@@ -1,6 +1,6 @@
 # Admission orders on replay
 
-How `fair` and `fill` divide room between shapes that share hosts (#526), replayed through billet's real listener, allocator, placer and node over the simulated backend at compressed time: the synthetic mix on 2026-10-25, the reference deployment's week on 2026-11-04. Two workloads: a synthetic mix with a whole-host shape beside smaller ones, and the reference deployment's own week, exported from its ledger with `billet jobs export`. Both ran on the shared Linux test host, one replay per policy: the synthetic mix under the host's heavy lock, and the reference week beside other work at low priority, which changes how long a replay takes and not what it measures, because a replay's clock is virtual. The last section says how to repeat them. This is the baseline #527's `hold` order is judged against.
+How `fair`, `fill` and `hold` divide room between shapes that share hosts (#526, #527), replayed through billet's real listener, allocator, placer and node over the simulated backend at compressed time: the synthetic mix on 2026-10-25, the reference deployment's week on 2026-11-04. Two workloads: a synthetic mix with a whole-host shape beside smaller ones, and the reference deployment's own week, exported from its ledger with `billet jobs export`. Both ran on the shared Linux test host, one replay per policy: the synthetic mix under the host's heavy lock, and the reference week beside other work at low priority, which changes how long a replay takes and not what it measures, because a replay's clock is virtual. The last section says how to repeat them. The last section measures #527's `hold` order, and the `tightest` placement, against them.
 
 ## How it was replayed, and what that leaves out
 
@@ -82,6 +82,68 @@ What it does not say:
 - The replayed waits are not checked against the waits the deployment measured that week (`billet jobs wait`). The harness's boot, its event-ordered waiters and its absence of real teardown make them a comparison between policies, not a prediction of either.
 - The empty host-hours include a host idle while the last jobs finish and the macOS host between its few jobs; the quantity #527 is judged on, host-hours empty while a job of a shape it fits was queued, is #527's to measure.
 
+## Holding one host: `hold`, and `tightest` (#527)
+
+`hold` gives a waiter whose shape fits nowhere the host its running work is predicted to free soonest, keeps the room its shape needs there from every tier behind it, and leaves every other host open (ADR-027, and `billet-capacity`'s admission reference for the rule in full). These were replayed on 2026-11-04 and 2026-11-05 on the same two workloads, the hold at the rule this PR ships.
+
+### The whole-host mix, over four seeds
+
+One seed's p99 of a hundred whole-host jobs is mostly noise, so the mix was replayed with seeds 1 to 4 (`BILLET_REPLAY_SEED`), each 2,000 jobs on the four 32 vCPU hosts. The p99 queue wait for each seed in turn:
+
+| Shape | fair | fill | hold | hold, tightest |
+|---|---|---|---|---|
+| 2 vCPU | 1h12m, 51m, 44m, 44m | 8m, 7m, 27m, 14m | 18m, 17m, 10m, 14m | 26m, 13m, 17m, 17m |
+| 4 vCPU | 1h15m, 2h06m, 1h58m, 55m | 9m, 15m, 34m, 20m | 1h02m, 26m, 21m, 32m | 40m, 23m, 38m, 36m |
+| 8 vCPU | 5h12m, 6h37m, 2h35m, 2h26m | 19m, 17m, 54m, 33m | 1h38m, 59m, 1h09m, 40m | 2h22m, 1h12m, 35m, 41m |
+| 16 vCPU | 2h57m, 3h16m, 5h26m, 2h16m | 25m, 29m, 1h12m, 21m | 1h38m, 50m, 2h47m, 1h03m | 1h14m, 1h06m, 3h00m, 56m |
+| 32 vCPU | 29m, 49m, 36m, 35m | 1h46m, 1h50m, 3h27m, 2h02m | 57m, 1h03m, 1h00m, 49m | 1h11m, 1h01m, 1h00m, 1h14m |
+
+| Policy | vCPU charged | Empty host-hours | Empty while a job that fits waited | Over (hours) |
+|---|---|---|---|---|
+| fair | 79 to 83% | 0.5 to 1.8 | 0.1 to 0.7 | 20.4 to 21.3 |
+| fill | 83 to 91% | 1.0 to 1.5 | 0.4 to 0.7 | 18.9 to 19.7 |
+| hold | 83 to 89% | 0.5 to 1.6 | 0.1 to 0.7 | 19.4 to 20.2 |
+| hold, tightest | 83 to 89% | 0.5 to 1.5 | 0.1 to 0.6 | 19.4 to 20.1 |
+
+**Empty while a job that fits waited** is the host-hours a host held nothing while a job that could run there was queued, the waste #527 names, counted for a job the ledger never recorded too and for a tier pinned elsewhere not at all.
+
+What it says:
+
+- **In every seed `hold` beats `fair` on every shape below the widest, and `fill` on the widest.** The 8 vCPU p99 falls from 2h26m to 6h37m under `fair` to 40 minutes to 1h38m, and the whole-host p99 from 1h46m to 3h27m under `fill` to 49 minutes to 1h03m. It charges what `fill` does, and the same jobs take about as long.
+- **It gives the widest shape a longer wait than `fair`,** about an hour against half an hour, and the smaller shapes still wait longer than under `fill`. That is the trade, and it is the operator's to choose.
+- **`tightest` shows no reliable gain over `pack`,** under `hold` or under `fill`: the seeds disagree on which is better for every shape, so it is offered as a placement and not made the default.
+
+### The reference deployment's week
+
+The same week as above, on the same patched fleet:
+
+| Shape | fair | fill | hold |
+|---|---|---|---|
+| 2 vCPU | 1h12m49s | 45m40s | 11m39s |
+| 4 vCPU | 35m12s | 51m03s | 13m04s |
+| 6 vCPU (macOS) | 30s | 30s | 30s |
+| 8 vCPU | 2h29m38s | 55m59s | 2h02m38s |
+| 16 vCPU | 10m58s | 3h58m59s | 1h43m06s |
+
+Under `hold` 10,797 jobs were refused at least once, against 11,880 under `fair` and 10,933 under `fill`; charged shares and span are those of the other two (37% of vCPU, 54% of memory, 166 hours), and no host was empty while a job that fit it waited.
+
+What it says:
+
+- **On this deployment `hold` trades the widest shape's tail for the small shapes'.** The 2 and 4 vCPU p99 fall to about 12 minutes, under either other order's, and the 8 vCPU p99 sits between them. The 16 vCPU p99 is 1h43m, ten times `fair`'s and less than half `fill`'s.
+- **One Linux host is the case `hold` helps least.** A waiter's host is the whole of the room every Linux tier shares, so keeping a 16 vCPU job's room there is close to what `fair` does, without `fair`'s line. `hold-tightest` gave the same table to the second, because with one host placement has nothing to choose. The deployment's configuration keeps `fair`, and `hold` stays opt-in, as was decided before this was measured.
+- **The first measurement of this week under `hold` gave the 16 vCPU tier a p99 of 4h09m,** as under `fill`. A waiter behind a lease as large, on a host wide enough for several, holds back only buyers as wide, and the room each such lease left went to narrower work before the waiter read it. A purchase now leaves such a waiter the room it fits in (`Purchase.Keep`), which gave the table above.
+
+### What else was measured, and not shipped
+
+- **Simpler rules for whom a waiter holds back,** each replayed on the whole-host mix with seed 1 and each found wanting. Letting every waiter out of the line starved a shape as large as what the hosts run. Keeping every waiter with no host in it cost the small shapes more than `fair` (2 vCPU p99 3h40m against 1h12m). Moving a hold to whichever host was predicted ready soonest threw away the room it had accumulated and cost the widest shape its turn. Holding the line once a job runs late was measured at two, three, six and twelve times its kind's median: two and three cost the 8 and 16 vCPU tiers, six and twelve gave the same table, so the factor is six (`alloc.HoldLateFactor`).
+- **`align`,** placing a job beside others predicted to end with it so a host empties at once, measured on 2026-11-03 against an earlier `hold`: the whole-host p99 went from 29m to 43m and the 4 vCPU p99 from 1h19m to 1h32m, and under `fill` it changed nothing that mattered (1h46m against 1h44m). It did not ship.
+
+What it does not say:
+
+- **A tier spanning a local host and a remote backend** can buy remote while its held host empties, which spends money the hold was meant to save; neither workload has one.
+- **Under GHES's offers no tier is recorded waiting** (#686), so `hold`, like `fair`, does nothing there.
+- **The replay polls every tier at one virtual instant,** so it cannot show room waiting on a listener that has not woken, and its queue on wall time never reaches the stall or the late rule's timing against a real clock.
+
 ## Reproducing it
 
-Each comparison is `TestComparePolicies` in `internal/replay`, run by hand: `BILLET_REPLAY_COMPARE=wide` for the synthetic mix (`BILLET_REPLAY_JOBS` sizes it), or `BILLET_REPLAY_COMPARE=file` with `BILLET_REPLAY_TRACE` and `BILLET_REPLAY_FLEET` naming what `billet jobs export` wrote. `BILLET_REPLAY_PROTOCOL=offer` replays under GHES's offers instead, and `BILLET_REPLAY_POLICY` replays one policy alone, so the policies of a long comparison can run as processes side by side. With `-replay.out DIR` the table is written to `DIR/compare-<mode>[-<policy>].md`. The wide comparison took 21 minutes on the shared host's 16 vCPU. A replay is bound by its ledger's fsyncs, not its CPU: with the ledger on the host's disk the reference week took about five hours a policy, and with `TMPDIR` on tmpfs and the two policies side by side about three, or nearly five (4h46m for `fill`, 5h09m for `fair`) with other replays beside them at low priority.
+Each comparison is `TestComparePolicies` in `internal/replay`, run by hand: `BILLET_REPLAY_COMPARE=wide` for the synthetic mix (`BILLET_REPLAY_JOBS` sizes it), or `BILLET_REPLAY_COMPARE=file` with `BILLET_REPLAY_TRACE` and `BILLET_REPLAY_FLEET` naming what `billet jobs export` wrote. `BILLET_REPLAY_PROTOCOL=offer` replays under GHES's offers instead, and `BILLET_REPLAY_POLICY` replays one policy alone (`fair`, `fill`, `hold`, or any of them with `-tightest`), `BILLET_REPLAY_SEED` seeds the synthetic mix, so the policies of a long comparison can run as processes side by side. With `-replay.out DIR` the table is written to `DIR/compare-<mode>[-<policy>].md`. The wide comparison took 21 minutes on the shared host's 16 vCPU. A replay is bound by its ledger's fsyncs, not its CPU: with the ledger on the host's disk the reference week took about five hours a policy, and with `TMPDIR` on tmpfs and the two policies side by side about three, or nearly five (4h46m for `fill`, 5h09m for `fair`) with other replays beside them at low priority.

@@ -16,7 +16,7 @@ import (
 // ranked is a tier's admission on one shared host under ranks.
 func ranked(target string, ranks map[string]float64) alloc.TierAdmission {
 	where := on("host")
-	where.Target, where.TargetRank = target, ranks
+	where.VCPU, where.Target, where.TargetRank = 2, target, ranks
 
 	return where
 }

@@ -249,6 +249,12 @@ server:
   # your builds are IO-heavy and you would rather fit less work than have them
   # contend.
   #
+  # `tightest` prefers the host left with the least free room, in shares of its own
+  # size, whatever the tier: pack counts how many more of this tier fit, so two
+  # hosts holding the same number of a small tier look alike though one has twice
+  # the other's room left. On replay it did not reliably beat pack
+  # (docs/reference/records/replay-policies.md), so it is a choice.
+  #
   # Provider preference always wins over this: `providers: [firecracker, ec2]`
   # means the machine at home before the cloud, whichever policy is set.
   #
@@ -269,6 +275,15 @@ server:
   # `fill` starts anything that fits instead: more work runs, and your largest
   # shape may wait indefinitely on a fleet that is never idle. Reach for it when
   # your tiers are close enough in size that the wait costs more than it buys.
+  #
+  # `hold` holds one host for a shape that fits nowhere, the one its running work
+  # is predicted to free soonest, and leaves the others open, unless that shape's
+  # job there runs far past its kind. On replay with
+  # several hosts every smaller shape waited far less than under `fair` and the
+  # widest far less than under `fill`, though more than under `fair`
+  # (docs/reference/records/replay-policies.md). On a deployment with one host a
+  # waiter closes all of it until its shape fits, so there it does little that
+  # `fair` does not. Under GHES's offers no tier is recorded waiting, so no hold forms.
   #
   # admission_order: fair
 
