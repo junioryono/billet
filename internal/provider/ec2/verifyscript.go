@@ -440,6 +440,14 @@ func verifyScript(arch string, contract int, nonce string) (string, reportSchema
 
 	if contract >= 5 {
 		writeVerifyGuestCaches(&b, step)
+
+		// THE RECORD NAMES THE RUNNER THAT RUNS, because the cache conformance
+		// workflow refuses a candidate image by it, and a record of another version
+		// would pass an image that is not the one under test. Here, under the root
+		// the components step set, so a test points it at a fixture.
+		step("image record")
+		b.WriteString("test \"$(sed -n 's/^RUNNER_VERSION=//p' \"$billet_root\"" + imageRecordPath +
+			")\" = \"$billet_runner\"\n")
 	}
 
 	step("done")

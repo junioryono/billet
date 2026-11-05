@@ -847,6 +847,9 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 const (
 	toolcacheDir = "/opt/hostedtoolcache"
 	imageEnvFile = "/etc/billet-image-env"
+	// imageRecordPath is what the image says it carries, by the name the Firecracker
+	// image writes it under.
+	imageRecordPath = "/etc/billet-image"
 )
 
 // privilegeDrop is how the runner stops being root, written ONCE.
@@ -1310,6 +1313,13 @@ func layerScript(spec BuildSpec) (string, error) {
 	b.WriteString("fi\n")
 	b.WriteString("tar xzf runner.tar.gz\n")
 	b.WriteString("rm runner.tar.gz\n")
+	// THE SAME RECORD THE FIRECRACKER IMAGE CARRIES, written where the runner was
+	// verified and unpacked, the one point where what was downloaded and what was
+	// installed are the same fact. The cache conformance workflow reads it to refuse
+	// a candidate image that is not the one under test.
+	b.WriteString("printf 'RUNNER_VERSION=%s\\nBUILT_AT=%s\\n' '" + spec.RunnerVersion +
+		"' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > " + imageRecordPath + "\n")
+	b.WriteString("chmod 0644 " + imageRecordPath + "\n")
 	b.WriteString("cat > /opt/actions-runner/billet-runner-service <<'BILLETRUNNEREOF'\n")
 	b.WriteString(guestassets.RunnerServiceScript)
 	if !strings.HasSuffix(guestassets.RunnerServiceScript, "\n") {

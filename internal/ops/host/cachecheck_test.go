@@ -365,9 +365,11 @@ func TestCheckRefusesAnEBSStoreWithNoCacheListener(t *testing.T) {
 		}
 	}
 	printedOnce(t, out, "cache    NONE: node.ebs_s3 names a cache store")
-	// THE NPM FINDING IS THE COMMAND'S, said once after the tiers it is about.
-	printedOnce(t, out, "npm      NO NPM CACHE: no tier has the npm cache")
-	if strings.Index(out, "npm      NO NPM CACHE") < strings.Index(out, "tiers    ") {
+	// THE NPM FINDING IS THE COMMAND'S, said once after the tiers it is about. An EC2
+	// tier has the npm cache by default since ADR-023, and a node without the listener
+	// that would serve it is what the line goes on to say.
+	printedOnce(t, out, "npm      1 of 1 tiers enable the npm cache")
+	if strings.Index(out, "npm      1 of 1") < strings.Index(out, "tiers    ") {
 		t.Errorf("the npm finding was printed before the tiers it is about:\n%s", out)
 	}
 	if !strings.Contains(out, "instance's ROOT VOLUME") {

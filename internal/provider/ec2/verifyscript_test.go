@@ -151,6 +151,9 @@ type verifyProbe struct {
 	// closedNDK leaves it where the runner cannot enter it.
 	noNDK     bool
 	closedNDK bool
+	// imageRecord, when set, is what /etc/billet-image holds in place of the runner's
+	// own version; "missing" leaves it out.
+	imageRecord string
 	// brokenRunner makes Runner.Listener exit non-zero, which is what a missing
 	// libicu looks like from here.
 	brokenRunner bool
@@ -349,6 +352,16 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 
 	if !p.noAbsenceEnv {
 		writeFile(t, croot+envFile, env+stray, 0o644)
+	}
+	if err := os.MkdirAll(filepath.Dir(croot+imageRecordPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	switch p.imageRecord {
+	case "missing":
+	case "":
+		writeFile(t, croot+imageRecordPath, "RUNNER_VERSION=2.328.0\nBUILT_AT=2026-11-04T00:00:00Z\n", 0o644)
+	default:
+		writeFile(t, croot+imageRecordPath, "RUNNER_VERSION="+p.imageRecord+"\n", 0o644)
 	}
 
 	script = substitute(t, script, "du -sk "+toolcacheDir, "du -sk "+tcDir)
@@ -993,6 +1006,17 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			name:     "the runner does not execute",
 			probe:    verifyProbe{brokenRunner: true},
 			wantStep: "runner",
+		},
+		{
+			// THE CONFORMANCE WORKFLOW CHECKS A CANDIDATE BY THIS RECORD.
+			name:     "the image record names another runner",
+			probe:    verifyProbe{imageRecord: "2.300.0"},
+			wantStep: "image record",
+		},
+		{
+			name:     "the image has no record",
+			probe:    verifyProbe{imageRecord: "missing"},
+			wantStep: "image record",
 		},
 		{
 			// A FILE OF THE GUEST'S CACHES THAT IS NOT WHAT THIS BILLET INSTALLS: a job
