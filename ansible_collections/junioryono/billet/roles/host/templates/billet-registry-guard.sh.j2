@@ -25,7 +25,12 @@ esac
 # WHAT FILLS THE DISK MAY NOT BE THEM: guest images, job volumes or a store on the same
 # filesystem. Below the floor a discard frees nothing worth stopping the mirrors for,
 # and doing it every ten seconds would keep them from ever serving.
-held=$(du -sxk -- "$root" | cut -f1)
+# du's own status, not a pipe's: a walk that failed part-way prints a partial total.
+held=$(du -sxk -- "$root") || {
+	echo "could not read how much the registry mirrors hold under $root" >&2
+	exit 1
+}
+held=${held%%[[:space:]]*}
 case "$held" in
 '' | *[!0-9]*)
 	echo "could not read how much the registry mirrors hold under $root" >&2

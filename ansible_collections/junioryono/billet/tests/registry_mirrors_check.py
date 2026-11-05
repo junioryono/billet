@@ -69,6 +69,15 @@ def main():
         if active(config, enabled, networks, INSTANCES, proved):
             failures.append("%s: said to be active" % name)
 
+    # AN INSTANCE IT CANNOT READ IS SAID SO, not a KeyError.
+    from ansible.errors import AnsibleFilterError
+    try:
+        render(firecracker(), True, NETWORKS, [{"name": "docker-io", "upstream": "docker.io"}], True)
+        failures.append("an instance with no port was accepted")
+    except AnsibleFilterError as exc:
+        if "names no upstream and port" not in str(exc):
+            failures.append("an instance with no port was refused as %r" % exc)
+
     # EVERY RENDERING OF A NODE'S FILE APPLIES IT.
     for name, pattern in {
         "registry-mirrors-config.yml": r"junioryono\.billet\.role_registry_mirrors\(",

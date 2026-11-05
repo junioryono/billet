@@ -189,7 +189,18 @@
             path: "{{ billet_registry_mirror_dir }}/ca.pem"
           register: billet_retirement_mirror_authority
           check_mode: false
+          ignore_unreachable: true
+          failed_when: false
           become: true
+          when: billet_retirement_variant == 'retained-node'
+
+        - name: Require an answered registry mirror authority observation
+          ansible.builtin.assert:
+            that:
+              - not billet_retirement_mirror_authority.unreachable | default(false) | bool
+              - not billet_retirement_mirror_authority.failed | default(false) | bool
+              - billet_retirement_mirror_authority.stat.exists | default(none) is boolean
+            fail_msg: This host could not say whether it holds a registry mirror authority, so its retained configuration cannot be rendered.
           when: billet_retirement_variant == 'retained-node'
 
         - name: Render the retained configuration after binding the reservation

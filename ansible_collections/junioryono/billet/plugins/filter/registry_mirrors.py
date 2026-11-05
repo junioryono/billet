@@ -35,7 +35,9 @@ def _decide(config, enabled, networks, instances, proved):
     if not isinstance(address, str) or not address:
         raise AnsibleFilterError('the first guest network has no address for the mirrors to serve on')
     mirrors = {}
-    for instance in instances:
+    for index, instance in enumerate(instances):
+        if not isinstance(instance, Mapping) or not instance.get('upstream') or not instance.get('port'):
+            raise AnsibleFilterError('registry mirror instance %d names no upstream and port: %r' % (index, instance))
         mirrors[instance['upstream']] = 'https://%s:%s' % (address, instance['port'])
     out = dict(config)
     out['node'] = dict(node)
