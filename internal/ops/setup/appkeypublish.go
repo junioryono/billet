@@ -84,6 +84,11 @@ func githubAppStoreKey(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	if cfg.Server.TokenBroker != nil {
+		return fmt.Errorf("this deployment holds no App key: server.token_broker says the broker at %s does, "+
+			"so that is where this one belongs", cfg.Server.TokenBroker.URL)
+	}
+
 	if cfg.Server.IdentityBackendKind() != config.IdentitySSM {
 		return fmt.Errorf(
 			"this deployment keeps its App key as a file (server.identity.backend is %s), so "+

@@ -311,6 +311,9 @@ func TestARestoredCompletionRecordsTheResultItsCrashLost(t *testing.T) {
 		// AND WHICH JOB IT WAS, which the same crash kept off the history row.
 		JobID: "job-91", JobOwner: "acme", JobRepository: "api", JobEvent: "push",
 		JobWorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+		// AND GITHUB'S TIMES, which are all a usage record can bill on once the result's
+		// own time is this restart.
+		JobRunnerAssignedAt: "2026-11-04T09:48:27Z", JobFinishedAt: "2026-11-04T09:52:30Z",
 	}); err != nil {
 		t.Fatalf("PutPendingCompletion: %v", err)
 	}
@@ -340,6 +343,44 @@ func TestARestoredCompletionRecordsTheResultItsCrashLost(t *testing.T) {
 	if history.Job.JobID != "job-91" || history.Repo != "acme/api" || history.Job.Event != "push" {
 		t.Errorf("recovery recorded job %+v in %q, want the identity the completion persisted",
 			history.Job, history.Repo)
+	}
+	if !strings.HasPrefix(history.GitHubRunnerAssignedAt, "2026-11-04T09:48:27") ||
+		!strings.HasPrefix(history.GitHubFinishedAt, "2026-11-04T09:52:30") {
+		t.Errorf("recovery recorded GitHub's times as %q and %q, want those the completion persisted",
+			history.GitHubRunnerAssignedAt, history.GitHubFinishedAt)
+	}
+}
+
+// ONLY A COMPLETION THAT NAMES ITS RUNNER PERSISTS GITHUB'S TIMES. One that names none may
+// have found this lease by a request id another job now holds, and a restart would then
+// bill the lease for that other job.
+func TestACompletionPersistsGitHubsTimesOnlyWhenItNamesItsRunner(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2026, 11, 4, 9, 48, 27, 0, time.UTC)
+	job := dispatch.Job{JobID: "job-91", RunnerAssignedAt: at, FinishedAt: at.Add(time.Minute)}
+
+	var unnamed state.PendingCompletion
+
+	withCompletionIdentity(&unnamed, job)
+
+	if unnamed.JobID != "job-91" || unnamed.JobRunnerAssignedAt != "" || unnamed.JobFinishedAt != "" {
+		t.Errorf("a completion naming no runner persisted %+v", unnamed)
+	}
+
+	job.RunnerName = "billet-lease"
+
+	var named state.PendingCompletion
+
+	withCompletionIdentity(&named, job)
+
+	if !parsedCompletionTime(named.JobRunnerAssignedAt).Equal(at) ||
+		!parsedCompletionTime(named.JobFinishedAt).Equal(at.Add(time.Minute)) {
+		t.Errorf("a completion naming its runner persisted %q and %q", named.JobRunnerAssignedAt, named.JobFinishedAt)
+	}
+
+	if got := parsedCompletionTime(""); !got.IsZero() {
+		t.Errorf("no time on the row read as %v", got)
 	}
 }
 
