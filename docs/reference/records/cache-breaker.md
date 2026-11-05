@@ -77,4 +77,4 @@ So with no monitors, as with no cache pool, the outage is capacity's and not the
 - **A bare host.** Every timing here is under nested virtualization.
 - **The metric.** `billet_cache_breaker_open` was not scraped, because the node had no metrics address. The breaker's report reached `billet status` through the ledger.
 - **Warm Docker image stores.** The tier was untrusted, so it published no image store, and every attach was a fresh volume. Sticky disks were warm, and those were clones.
-- **One thing seen and not investigated.** After the OSD leg, deferred sticky-disk publications kept failing `identify /dev/rbd0: exit status 2` while that device held a root disk's filesystem. They were abandoned at their window.
+- **One thing seen and not fixed here.** After the OSD leg and a restart, deferred sticky-disk publications verified device paths that by then held other images, a guest's root disk among them, and each failed closed until its window ended: #743.
