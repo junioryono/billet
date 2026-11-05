@@ -40,4 +40,4 @@ The first version of the order ranked every waiter on every ask, and equal shape
 
 ## Reproducing it
 
-`BILLET_REPLAY_JOBS=1000 BILLET_REPLAY_HOSTS=2 go test -run '^TestContendedRoomIsDividedByWeight$' ./internal/replay -args -replay.out DIR` writes the tables to `DIR/target-weights-2hosts.md`. With `TMPDIR` on tmpfs the two-host run took 5 minutes and the eight-host run 34.
+`BILLET_REPLAY_JOBS=1000 BILLET_REPLAY_HOSTS=2 go test -run '^TestContendedRoomIsDividedByWeight$' ./internal/replay -args -replay.out DIR` writes the tables to `DIR/target-weights-2hosts-weighted.md`, `-even.md` and `-idle.md`, the three replays running side by side. With `TMPDIR` on tmpfs the two-host run took 5 minutes and the eight-host run 34, one after another.
