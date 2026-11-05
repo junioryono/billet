@@ -91,12 +91,12 @@ The `RE-RUN` column of `billet leases failures`, and the `failure` line of `bill
 | Decision | What it means |
 |---|---|
 | `requested` | GitHub accepted a request that covers this job |
-| `unconfirmed` | a request that covers this job may have landed, and GitHub could not be read to say for over a day; it is counted as one that did |
+| `unconfirmed` | a request that covers this job may have landed, and GitHub could not be read to say: a read failed after a day, or the run went unread, or refused or throttled, for two; it is counted as one that did |
 | `unproven` | GitHub's record does not show a lost runner, so the job may have failed on its own |
 | `mixed` | several jobs were proved beside a job that failed on its own, and neither of GitHub's two requests can run them without it |
 | `limit` | the run already had every re-run the tiers of the jobs it would run again allow |
 | `superseded` | the run's latest attempt is a later one than the job's: a person re-ran it, or a request of billet's own made before the job's result arrived |
-| `expired` | nothing could be decided within a day of the job's result, or a request was not sent within a day of being decided |
+| `expired` | nothing could be decided within a day of the job's result, or a request was not sent within a day of being decided, or a tier it covers stopped asking for re-runs and asked again before it was sent |
 | `failed` | GitHub did not accept the request in five sends, read the run after each; the log says why |
 
 A dash is nothing decided: a tier that did not ask, or a run that has not finished. A run is decided only once every job of it has finished, because GitHub refuses a re-run of one still going, and a failed request is retried with a backoff and never holds up scheduling. `billet_job_reruns{tier,decision}` counts the last day's decisions.

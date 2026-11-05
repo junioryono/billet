@@ -72,7 +72,8 @@ var ledgerFamilies = []metrics.Family{
 		Help: "Registered hosts by state: live, offline, or decommissioned."},
 	{Name: familyJobReruns, Labels: []string{"tier", "decision"},
 		Help: "Jobs billet disrupted in the last day, by tier and what was decided about re-running them; " +
-			"failed is a re-run GitHub never accepted. Absent where nothing was decided."},
+			"failed is a re-run GitHub never accepted, and unconfirmed one it could not be read to confirm. " +
+			"Absent where nothing was decided."},
 }
 
 // LedgerMetrics is the control plane's ledger as metrics: each tier's capacity

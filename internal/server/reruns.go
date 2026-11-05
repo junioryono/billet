@@ -141,6 +141,16 @@ type rerunWork struct {
 	target       string
 	installation string
 	client       RunReruns
+	// doubt is the run's request in doubt, which a pass that cannot read the run
+	// settles once it is two days old.
+	doubt *alloc.RerunRequest
+}
+
+// rerunOverdue says whether a request in doubt is past twice the window, after which
+// one whose run is not read is settled without a read: a paused, exhausted or
+// refusing installation must not hold its jobs for ever.
+func rerunOverdue(request *alloc.RerunRequest, now time.Time) bool {
+	return request != nil && !request.Created.IsZero() && now.Sub(request.Created) > 2*rerunWindow
 }
 
 // rerunLimits is each tier's retry.disrupted, for the tiers that set one.
@@ -234,6 +244,8 @@ func (s *Server) rerunOnce(ctx context.Context, targets map[string]Target, limit
 			return
 		}
 		if read[w.installation] == rerunRunsPerInstallation || now.Before(sweep.paused[w.installation]) {
+			s.settleOverdue(ctx, w, now, "its installation could not read its run within two days")
+
 			continue
 		}
 		if remaining, limit, reset, low := inReserve(budgets[w.installation], now); low {
@@ -243,6 +255,8 @@ func (s *Server) rerunOnce(ctx context.Context, targets map[string]Target, limit
 					"again when GitHub's next hour begins", "target", w.target, "installation", w.installation,
 					"remaining", remaining, "limit", limit, "reset", reset)
 			}
+			s.settleOverdue(ctx, w, now, "its installation's REST budget kept it from being read within two days")
+
 			continue
 		}
 		delete(sweep.reserved, w.installation)
@@ -250,6 +264,14 @@ func (s *Server) rerunOnce(ctx context.Context, targets map[string]Target, limit
 		sweep.tried[w.run] = now
 
 		s.afterRerun(ctx, w, s.decideRerun(ctx, w, limits, sweep, now), sweep, now)
+	}
+}
+
+// settleOverdue settles, without a read, the request in doubt of a run this pass does
+// not read, once it is two days old. One whose run is read is settled from the read.
+func (s *Server) settleOverdue(ctx context.Context, w *rerunWork, now time.Time, why string) {
+	if rerunOverdue(w.doubt, now) {
+		s.settleUnread(ctx, *w.doubt, why)
 	}
 }
 
@@ -313,6 +335,13 @@ func (set *rerunWorkSet) add(run rerunRun, tiers ...string) bool {
 	}
 
 	return false
+}
+
+// doubt records the request in doubt of a run the set holds.
+func (set *rerunWorkSet) doubt(run rerunRun, request alloc.RerunRequest) {
+	if i, ok := set.index[run]; ok {
+		set.work[i].doubt = &request
+	}
 }
 
 // gatherRerunWork finds the runs worth reading this pass: those with a request in
@@ -435,15 +464,18 @@ func (s *Server) bringUpOpenRerun(ctx context.Context, set *rerunWorkSet, reques
 ) {
 	run := rerunRun{repository: request.Repository, run: request.RunID}
 
-	// PAST TWICE THE WINDOW IT IS SETTLED HERE, with no read: a paused or exhausted
-	// installation, or one that refuses every read, must not hold its jobs for ever.
-	if !request.Created.IsZero() && now.Sub(request.Created) > 2*rerunWindow {
-		s.settleUnread(ctx, request.RerunRequest, "its run could not be read within two days")
+	if waiting(run) {
+		// A RUN WHOSE READS KEEP FAILING waits between them, and is not read past two
+		// days either.
+		if rerunOverdue(&request.RerunRequest, now) {
+			s.settleUnread(ctx, request.RerunRequest, "its run could not be read within two days")
+		}
 
 		return
 	}
+	if set.add(run, request.Tier) {
+		set.doubt(run, request.RerunRequest)
 
-	if waiting(run) || set.add(run, request.Tier) {
 		return
 	}
 
@@ -456,6 +488,8 @@ func (s *Server) bringUpOpenRerun(ctx context.Context, set *rerunWorkSet, reques
 		return
 	}
 	if set.add(run, tiers...) {
+		set.doubt(run, request.RerunRequest)
+
 		return
 	}
 
@@ -555,9 +589,10 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 		// A RUN THAT CANNOT BE READ, OR READ SENSIBLY, holds a request in doubt only
 		// until the window: a run deleted at GitHub must not hold its jobs for ever. A
 		// throttle or a refusal is the installation's and may pass, so it holds until
-		// the gathering settles it, unread, at twice the window.
+		// twice the window.
+		transient := errors.Is(err, ErrRerunThrottled) || errors.Is(err, ErrRerunRefused)
 		if doubted && s.rerunWindowPassed(open, now) && ctx.Err() == nil &&
-			!errors.Is(err, ErrRerunThrottled) && !errors.Is(err, ErrRerunRefused) {
+			(!transient || rerunOverdue(&open, now)) {
 			s.settleUnread(ctx, open, rerunDetail(err))
 
 			return nil
@@ -611,6 +646,25 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 		return nil
 	}
 
+	// THE WINDOW ON THE CLOCK AS IT IS NOW, after the reads, so no job is asked about
+	// past it however slow GitHub was. A job past it is decided alone and the others go
+	// on, as they would had it expired before the pass: it is then a failed job the
+	// request does not ask for.
+	clock := sweep.clock(now)
+	inWindow := make([]provedJob, 0, len(proved))
+	for i := range proved {
+		if clock.Sub(proved[i].candidate.ResultAt) > rerunWindow {
+			s.decideJob(ctx, proved[i].candidate, alloc.RerunExpired, attempt.Attempt)
+
+			continue
+		}
+		inWindow = append(inWindow, proved[i])
+	}
+	if len(inWindow) == 0 {
+		return nil
+	}
+	proved = inWindow
+
 	used, err := s.alloc.RunReruns(ctx, w.run.repository, w.run.run)
 	if err != nil {
 		return err
@@ -628,15 +682,8 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 		return nil
 	}
 
-	// THE WINDOW ON THE CLOCK AS IT IS NOW, after the reads, so no job is asked about
-	// past it however slow GitHub was.
 	leases := make([]string, 0, len(proved))
 	for i := range proved {
-		if sweep.clock(now).Sub(proved[i].candidate.ResultAt) > rerunWindow {
-			s.decideAll(ctx, proved, alloc.RerunExpired, attempt.Attempt)
-
-			return nil
-		}
 		leases = append(leases, proved[i].candidate.LeaseID)
 	}
 	if err := s.alloc.BeginRerun(ctx, request, leases); err != nil {

@@ -355,7 +355,7 @@ func TestARequestIsRecordedBeforeItLeavesAndOncePerAttempt(t *testing.T) {
 }
 
 // A SETTLED REQUEST IS ON EVERY JOB BOUND TO IT AND NO OTHER, COUNTS AGAINST THE LIMIT
-// ONLY IF GITHUB ACCEPTED IT, and is no longer in doubt.
+// ONLY IF GITHUB ACCEPTED IT OR MAY HAVE, and is no longer in doubt.
 func TestSettlingARequestRecordsItOnItsJobsAndCountsIt(t *testing.T) {
 	t.Parallel()
 
@@ -381,6 +381,10 @@ func TestSettlingARequestRecordsItOnItsJobsAndCountsIt(t *testing.T) {
 			request := RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 2, Kind: RerunOneJob, JobID: 77}
 			if err := a.BeginRerun(t.Context(), request, []string{"bound"}); err != nil {
 				t.Fatalf("BeginRerun: %v", err)
+			}
+			// IN DOUBT IT HAS COME TO NOTHING YET, though it was asked.
+			if got, _, asked, err := a.RerunOfAttempt(t.Context(), "acme/api", 31, 2); err != nil || !asked || got != "" {
+				t.Errorf("a request in doubt = %q, %v, %v, want asked and undecided", got, asked, err)
 			}
 			// THE SAME ATTEMPT NUMBER ON OTHER RUNS, which a settlement must not reach.
 			for _, lease := range []string{"another-run", "another-repo"} {
@@ -440,6 +444,9 @@ func TestSettlingARequestRecordsItOnItsJobsAndCountsIt(t *testing.T) {
 			}
 			if rec, err := a.Job(t.Context(), "bound"); err != nil || rec.RerunDecision != tc.decision {
 				t.Errorf("after a second settlement the job = %q, %v", rec.RerunDecision, err)
+			}
+			if got, _, _, err := a.RerunOfAttempt(t.Context(), "acme/api", 31, 2); err != nil || got != tc.decision {
+				t.Errorf("after a second settlement the request = %q, %v", got, err)
 			}
 		})
 	}

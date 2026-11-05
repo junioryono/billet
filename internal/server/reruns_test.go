@@ -1474,7 +1474,8 @@ func TestARunThatCannotBeReadHoldsARequestOnlyUntilTheWindow(t *testing.T) {
 }
 
 // AN INSTALLATION THAT REFUSES EVERY READ HOLDS A REQUEST IN DOUBT ONLY UNTIL TWICE THE
-// WINDOW: a refusal may pass, so a day is not enough, and two are.
+// WINDOW: a refusal may pass, so a day is not enough, and two are. An installation
+// paused at that moment is not read, and its request is settled without a read.
 func TestARefusedInstallationHoldsARequestOnlyUntilTwiceTheWindow(t *testing.T) {
 	t.Parallel()
 
@@ -1491,12 +1492,68 @@ func TestARefusedInstallationHoldsARequestOnlyUntilTwiceTheWindow(t *testing.T) 
 		t.Fatalf("a refusal past one window = %s, want it held", got)
 	}
 
-	r.after(rerunWindow).pass()
+	r.after(rerunWindow)
+	r.sweep.paused[installationOf(r.targets[rerunTier])] = r.now.Add(time.Hour)
+	reads := r.reads()
+	r.pass()
+
 	if got := r.decision("lost"); got != alloc.RerunUnconfirmed {
 		t.Errorf("past twice the window = %q", got)
 	}
+	if got := r.reads(); got != reads {
+		t.Errorf("read GitHub %d times to settle it", got-reads)
+	}
 	if r.github.asked() != 0 {
 		t.Error("sent")
+	}
+	if used, err := r.a.RunReruns(t.Context(), "acme/api", 31); err != nil || used != 1 {
+		t.Errorf("counted %d against the limit (%v), want 1", used, err)
+	}
+}
+
+// PAST TWO DAYS A RUN THAT CAN BE READ IS SETTLED FROM THE READ, and only one that
+// cannot is settled without it: a request GitHub never took, found after a long
+// outage, is given up rather than counted, and a refusal at the read still ends it.
+func TestAnOverdueRequestIsSettledFromAReadWhereThereIsOne(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		readErr error
+		want    alloc.RerunDecision
+		counted int64
+	}{
+		{"the run is read", nil, alloc.RerunExpired, 0},
+		{"the read is refused", fmt.Errorf("HTTP 403: %w", ErrRerunRefused), alloc.RerunUnconfirmed, 1},
+		{"the read is throttled", fmt.Errorf("HTTP 429: %w", ErrRerunThrottled), alloc.RerunUnconfirmed, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRerunStack(t)
+			r.job("lost", 31, 10*time.Minute)
+			if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+				Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+				t.Fatal(err)
+			}
+			r.lists(1)
+			r.github.readErr = tc.readErr
+
+			r.after(2*rerunWindow + time.Hour).pass()
+
+			if got := r.reads(); got != 1 {
+				t.Errorf("%d reads, want the one that settles it", got)
+			}
+			if got := r.decision("lost"); got != tc.want {
+				t.Errorf("decision = %q, want %q", got, tc.want)
+			}
+			if r.github.asked() != 0 {
+				t.Error("sent")
+			}
+			if used, err := r.a.RunReruns(t.Context(), "acme/api", 31); err != nil || used != tc.counted {
+				t.Errorf("counted %d (%v), want %d", used, err, tc.counted)
+			}
+		})
 	}
 }
 
@@ -1532,13 +1589,16 @@ func TestTheWindowIsCheckedAfterTheRead(t *testing.T) {
 }
 
 // A JOB FIRST ASKED ABOUT IS HELD TO THE SAME CLOCK: a job an hour inside the window
-// when the pass began, and past it once a slow read has returned, is not sent.
+// when the pass began, and past it once a slow read has returned, is not sent. It is
+// decided alone: a younger job of the run is still asked for, by itself, since the
+// expired one is now a failed job the request must not run again.
 func TestAFreshJobIsCheckedAgainstTheWindowAfterTheRead(t *testing.T) {
 	t.Parallel()
 
 	r := newRerunStack(t)
 	r.job("lost", 31, rerunWindow-time.Hour)
-	r.lists(1, listed("lost", 77, true))
+	r.job("young", 31, 10*time.Minute)
+	r.lists(1, listed("lost", 77, true), listed("young", 88, true))
 
 	r.sweep.began = time.Now().Add(-2 * time.Hour)
 	w := rerunWork{run: rerunRun{repository: "acme/api", run: 31}, target: "default", installation: "i",
@@ -1547,11 +1607,14 @@ func TestAFreshJobIsCheckedAgainstTheWindowAfterTheRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if r.github.asked() != 0 {
-		t.Error("sent past the window")
+	if len(r.github.failedAsk) != 0 || len(r.github.jobAsk) != 1 || r.github.jobAsk[0] != 88 {
+		t.Errorf("asked failed-jobs %v, jobs %v, want job 88 alone", r.github.failedAsk, r.github.jobAsk)
 	}
 	if got := r.decision("lost"); got != alloc.RerunExpired {
-		t.Errorf("decision = %q", got)
+		t.Errorf("the job past the window = %q", got)
+	}
+	if got := r.decision("young"); got != alloc.RerunRequested {
+		t.Errorf("the job inside it = %q", got)
 	}
 }
 
