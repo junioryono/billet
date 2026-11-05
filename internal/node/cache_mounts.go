@@ -3,6 +3,8 @@ package node
 import (
 	"context"
 	"time"
+
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 // restoreMountLimit bounds asking about and remounting one recovered volume. A
@@ -19,8 +21,8 @@ const restoreMountLimit = 30 * time.Second
 // mount point and wrote what they sent into the host's state directory.
 //
 // A volume that is already mounted here is left alone; one that is not is
-// mounted from its recorded device the way it was first mounted. One that cannot
-// be asked about or mounted is marked lost for this process and refused like a
+// mounted from the device it is mapped to now, the way it was first mounted. One
+// that cannot be asked about or mounted is marked lost for this process and refused like a
 // volume that was never mounted, which every cache treats as a miss; the record
 // is not changed, so cleanup and publication, which work from the device, and
 // the next process, which tries again, see what was there. A closed session is
@@ -50,7 +52,7 @@ func (s *CacheService) restoreSessionMounts(ctx context.Context, session *cacheS
 		if !hv.Mounted {
 			continue
 		}
-		if err := s.ensureMounted(ctx, s.actionIO.MountWritable, hv.Volume.Device,
+		if err := s.ensureMounted(ctx, s.actionIO.MountWritable, hv.Volume,
 			s.casMountPath(session, kind)); err != nil {
 			hv.lost = true
 			s.log.Warn("a recovered cache volume could not be mounted again; the job's "+
@@ -67,7 +69,7 @@ func (s *CacheService) restoreSessionMounts(ctx context.Context, session *cacheS
 		if archive.Mode == actionsModeDownload {
 			mount = s.actionIO.MountReadOnly
 		}
-		if err := s.ensureMounted(ctx, mount, archive.Volume.Device,
+		if err := s.ensureMounted(ctx, mount, archive.Volume,
 			s.actionsMountPath(session, archive)); err != nil {
 			archive.lost = true
 			s.log.Warn("a recovered Actions cache archive could not be mounted again; it is "+
@@ -77,12 +79,13 @@ func (s *CacheService) restoreSessionMounts(ctx context.Context, session *cacheS
 	}
 }
 
-// ensureMounted mounts device at target unless something already is, asking
+// ensureMounted mounts volume at target unless something already is, asking
 // first so a mount this process made is never stacked on.
 func (s *CacheService) ensureMounted(
 	ctx context.Context,
 	mount func(ctx context.Context, device, target string) error,
-	device, target string,
+	volume storecontract.Volume,
+	target string,
 ) error {
 	ctx, cancel := context.WithTimeout(ctx, restoreMountLimit)
 	defer cancel()
@@ -94,6 +97,22 @@ func (s *CacheService) ensureMounted(
 	if mounted {
 		return nil
 	}
+	device, err := s.provenDevice(ctx, volume)
+	if err != nil {
+		return err
+	}
 
 	return mount(ctx, device, target)
+}
+
+// provenDevice is the device volume is mapped to now. A recorded number outlives
+// its mapping across a reboot, and the kernel may have given it to another job's
+// disk, which mounted here would be served or merged from as this job's.
+func (s *CacheService) provenDevice(ctx context.Context, volume storecontract.Volume) (string, error) {
+	prover, ok := s.store.(storecontract.DeviceProver)
+	if !ok {
+		return volume.Device, nil
+	}
+
+	return prover.MappedDevice(ctx, volume)
 }
