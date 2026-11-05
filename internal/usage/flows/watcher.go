@@ -157,9 +157,13 @@ func (w *Watcher) resolve(key string, p *pending) {
 		// old one may now be another guest's and the new one's traffic was
 		// never followed.
 		if err != nil || addr != known {
+			why := WhyAddressChanged
+			if err != nil {
+				why = WhyLeaseUnread
+			}
 			w.mu.Lock()
 			if w.pending[key] == p {
-				w.acct.MarkIncomplete(p.acctKey)
+				w.acct.MarkIncomplete(p.acctKey, why)
 			}
 			w.mu.Unlock()
 		}
@@ -197,8 +201,14 @@ func (w *Watcher) resolve(key string, p *pending) {
 	// SECOND could be the previous guest's renewal; A GRANT HALF A LEASE AFTER
 	// THE LAUNCH may be a renewal hiding earlier flows. Each is a job whose
 	// flows cannot all be told apart.
-	if dumpErr != nil || ambiguous || grant.Sub(p.launched) > w.leaseTime/2 {
-		w.acct.MarkIncomplete(p.acctKey)
+	if dumpErr != nil {
+		w.acct.MarkIncomplete(p.acctKey, WhyTableUnread)
+	}
+	if ambiguous {
+		w.acct.MarkIncomplete(p.acctKey, WhyGrantAmbiguous)
+	}
+	if grant.Sub(p.launched) > w.leaseTime/2 {
+		w.acct.MarkIncomplete(p.acctKey, WhyGrantLate)
 	}
 }
 
@@ -235,7 +245,7 @@ func (w *Watcher) Final(ctx context.Context, key string, until time.Time) (Resul
 	if readErr != nil {
 		// The flows still open could not be read, so the ones already counted
 		// are a lower bound.
-		w.acct.MarkIncomplete(p.acctKey)
+		w.acct.MarkIncomplete(p.acctKey, WhyTableUnread)
 	}
 
 	syncCtx, cancel := context.WithTimeout(ctx, syncLimit)
@@ -246,7 +256,7 @@ func (w *Watcher) Final(ctx context.Context, key string, until time.Time) (Resul
 	// ONE SOCKET CARRIES BOTH, so an end that cannot be proved read proves
 	// neither the bytes nor the first replies.
 	if syncErr != nil {
-		w.acct.MarkIncomplete(p.acctKey)
+		w.acct.MarkIncomplete(p.acctKey, WhySyncUnproved)
 		w.acct.MarkUntimed(p.acctKey)
 	}
 

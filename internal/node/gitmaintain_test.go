@@ -254,6 +254,11 @@ func TestRequestsWhileAMirrorIsPrunedAreGitHubs(t *testing.T) {
 // runs beside it. One that ends within the advertisement's wait is followed by
 // a refresh and served from the mirror; one that does not leaves the request to
 // GitHub, counted under why.
+//
+// NO WALL CLOCK DECIDES EITHER CASE. Everything a request does before and after
+// the repack is real git work inside one deadline, and a 2 s one was lost to a
+// loaded machine (#700), so the deadline outlives every guard here, and the wait
+// that runs out is ended from inside it.
 func TestARequestWhileTheMirrorIsRepackedWaitsForIt(t *testing.T) {
 	t.Parallel()
 
@@ -263,14 +268,7 @@ func TestARequestWhileTheMirrorIsRepackedWaitsForIt(t *testing.T) {
 
 			upstream := newGitUpstream(t)
 			service, node, token := gitNode(t, upstream)
-			// WITHIN THE WAIT BY CONSTRUCTION: the repack ends as soon as the request
-			// is seen waiting, so the wait only has to outlast a loaded machine. Two
-			// seconds did not (#700), and the request went to GitHub instead. Half the
-			// guard, so that a wait running out is told from nothing bounding it.
-			service.git.refreshWait = 2 * time.Second
-			if ends {
-				service.git.refreshWait = gitGuard / 2
-			}
+			service.git.refreshWait = 5 * gitGuard
 			if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
 				"https://github.com/acme/api.git", "c"); err != nil {
 				t.Fatalf("clone: %v\n%s", err, output)
@@ -278,6 +276,11 @@ func TestARequestWhileTheMirrorIsRepackedWaitsForIt(t *testing.T) {
 			key := "untrusted/acme/api"
 			awaitIdleMirror(t, service, key)
 			mirror := service.git.mirror(key)
+			// THE CLONE LEFT A MIRROR, or what follows is a first fetch and no refresh.
+			if refs, _, err := service.heldRefs(t.Context(), mirror, service.git.mirrorPath(key)); err != nil ||
+				len(refs) == 0 {
+				t.Fatalf("the clone left a mirror with %d refs: %v", len(refs), err)
+			}
 			repacking := &gitRefresh{done: make(chan struct{}), idle: make(chan struct{}), maintaining: true}
 			close(repacking.done)
 			mirror.mu.Lock()
@@ -291,20 +294,30 @@ func TestARequestWhileTheMirrorIsRepackedWaitsForIt(t *testing.T) {
 			}
 			observer := &recordingGitObserver{}
 			service.SetGitObserver(observer)
-			upstream.commitTo(t, "main", map[string]string{"m": "1\n"})
+			commit := upstream.commitTo(t, "main", map[string]string{"m": "1\n"})
 
 			// THE REPACK ENDS ONLY ONCE THE REQUEST WAITS FOR IT, and no refresh
-			// starts until it has.
+			// starts until it has. Past the wait, its deadline ends there instead.
 			waiting := make(chan struct{}, 1)
-			service.git.beforeRepackWait = func() {
+			service.git.beforeRepackWait = func(expire context.CancelFunc) {
+				if !ends {
+					expire()
+				}
 				select {
 				case waiting <- struct{}{}:
 				default:
 				}
 			}
 			fetches := upstream.mirrorFetches.Load()
-			advertised := make(chan error, 1)
-			go func() { advertised <- advertiseErr(t.Context(), node, token, "api") }()
+			type answer struct {
+				body []byte
+				err  error
+			}
+			advertised := make(chan answer, 1)
+			go func() {
+				body, err := advertisementFrom(t.Context(), node, token, "api")
+				advertised <- answer{body, err}
+			}()
 			gitWithin(t, "the request waiting for the repack", func() struct{} {
 				<-waiting
 
@@ -314,12 +327,20 @@ func TestARequestWhileTheMirrorIsRepackedWaitsForIt(t *testing.T) {
 				t.Fatal("a refresh fetched beside the repack")
 			}
 			if ends {
+				// NOTHING IS ANSWERED WHILE THE REPACK HOLDS THE SLOT. An answer here is
+				// a defect whatever the timing, so a slow machine can only miss one.
+				select {
+				case got := <-advertised:
+					t.Fatalf("the request was answered while the repack held its slot: %v", got.err)
+				case <-time.After(200 * time.Millisecond):
+				}
 				free()
 			} else {
 				t.Cleanup(free)
 			}
-			if err := gitWithin(t, "the advertisement", func() error { return <-advertised }); err != nil {
-				t.Fatal(err)
+			got := gitWithin(t, "the advertisement", func() answer { return <-advertised })
+			if got.err != nil {
+				t.Fatal(got.err)
 			}
 			requests := gitWithin(t, "the counted advertisement", func() []string {
 				for t.Context().Err() == nil {
@@ -337,6 +358,14 @@ func TestARequestWhileTheMirrorIsRepackedWaitsForIt(t *testing.T) {
 			}
 			if !slices.Equal(requests, want) {
 				t.Fatalf("the advertisement was counted as %v, want %v", requests, want)
+			}
+			// THE REFRESH RAN, and the mirror answered with what it fetched; past the
+			// wait none ran, and GitHub answered with the same commit.
+			if fetched := upstream.mirrorFetches.Load() != fetches; fetched != ends {
+				t.Errorf("a refresh after the repack fetched: %v, want %v", fetched, ends)
+			}
+			if !strings.Contains(string(got.body), commit) {
+				t.Errorf("the advertisement does not name the new commit %s:\n%s", commit, got.body)
 			}
 		})
 	}

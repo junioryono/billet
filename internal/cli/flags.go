@@ -4,6 +4,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // NewFlagSet returns a FlagSet whose help output goes to out and which does
@@ -67,4 +71,39 @@ func ParseWithName(fs *flag.FlagSet, args []string) (string, error) {
 	}
 
 	return name, nil
+}
+
+// ParseSpan is a span of time as an operator writes one on a command line: a whole
+// number of days such as 14d, or a Go duration such as 36h. It is refused unless it is
+// positive.
+func ParseSpan(s string) (time.Duration, error) {
+	var d time.Duration
+
+	if days, ok := strings.CutSuffix(s, "d"); ok {
+		n, err := strconv.ParseInt(days, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%q is not a number of days such as 14d", s)
+		}
+
+		// CHECKED BEFORE THE MULTIPLICATION, whose overflow can land on a positive
+		// span that is nothing the operator asked for, from either direction.
+		if n <= 0 || n > int64(math.MaxInt64/(24*time.Hour)) {
+			return 0, fmt.Errorf("%q is not a positive span a duration can hold", s)
+		}
+
+		d = time.Duration(n) * 24 * time.Hour
+	} else {
+		parsed, err := time.ParseDuration(s)
+		if err != nil {
+			return 0, fmt.Errorf("%q is not a span of time such as 14d or 36h", s)
+		}
+
+		d = parsed
+	}
+
+	if d <= 0 {
+		return 0, fmt.Errorf("%q is not positive", s)
+	}
+
+	return d, nil
 }

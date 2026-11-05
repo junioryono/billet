@@ -46,5 +46,11 @@
   },
   "detail_retired_at": "",
   "usage": null,
-  "guest": null
+  "guest": null,
+  "tests": {
+    "notice": "Reported by the job's own VM. The job runs as root there and can change any of it; billet does not act on it.",
+    "results": null
+  },
+  "head_sha": "",
+  "head_branch": ""
 }
