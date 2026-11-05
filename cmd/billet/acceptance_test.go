@@ -658,6 +658,9 @@ server:
   bootstrap_listen: 10.0.0.5:7718
   node_tls_hosts:
     - billet.internal
+  tls_router:
+    node_addr: a.nodes.example.com:443
+    enroll_addr: a.enroll.example.com:443
 node:
   name: box-one
   server_addr: 10.0.0.5:7717
@@ -687,6 +690,7 @@ tiers:
 	}{
 		{mappingValue(root, "server"), "bootstrap_listen"},
 		{mappingValue(root, "server"), "node_tls_hosts"},
+		{mappingValue(root, "server"), "tls_router"},
 		{mappingValue(root, "node"), "tls"},
 	} {
 		if mappingValue(present.section, present.key) == nil {
@@ -712,6 +716,8 @@ tiers:
 				"have presented nothing"},
 		{server, "node_tls_hosts",
 			"a certificate minted for names this loopback run never serves"},
+		{server, "tls_router",
+			"mutual TLS on a loopback wire, which the plain node this run derives could not reach"},
 		{node, "tls",
 			"mTLS against a loopback listener, which billet refuses at load"},
 	} {

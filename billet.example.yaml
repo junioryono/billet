@@ -91,6 +91,15 @@ server:
   #
   # bootstrap_listen: 0.0.0.0:7718
 
+  # BEHIND A TLS-PASSTHROUGH ROUTER, with many deployments at one address. listen and
+  # bootstrap_listen stay on loopback and serve mutual TLS, and these are the names nodes
+  # dial, which a certificate carries and a router routes by. See
+  # docs/deploying/many-deployments.md.
+  #
+  # tls_router:
+  #   node_addr: a.nodes.billet.example:443
+  #   enroll_addr: a.enroll.billet.example:443
+
   # The names and addresses nodes will DIAL this control plane by. They become
   # the subject names of the certificate it serves.
   #

@@ -8,8 +8,8 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 
 | Key | Required | Meaning |
 |---|---|---|
-| `listen` | yes | the address nodes dial. A loopback address serves plain HTTP with no certificates; anything else requires mTLS |
-| `bootstrap_listen` | no | a second address serving only `/v1/ca` and `/v1/enroll`, for a machine that has no certificate yet. Absent means no network enrollment (`billet ca issue` is the way in). Refused against a loopback `listen` |
+| `listen` | yes | the address nodes dial. A loopback address serves plain HTTP with no certificates, unless `tls_router` says a router fronts it; anything else requires mTLS |
+| `bootstrap_listen` | no | a second address serving only `/v1/ca` and `/v1/enroll`, for a machine that has no certificate yet. Absent means no network enrollment (`billet ca issue` is the way in). Refused against a loopback `listen`, unless `tls_router` says a router fronts it |
 | `node_tls_hosts` | when `listen` is a wildcard | every name and address a node will dial, including the one it dials `bootstrap_listen` by; both listeners present one certificate |
 | `state_dir` | one of `state_dir` or `identity_dir`+`state` | shorthand for `identity_dir: <dir>` plus `state: {backend: sqlite}`; must be local storage |
 | `identity_dir` | with `state` | the deployment identity, the node-wire CA and its rotation state, the process lock and the maintenance fence |
@@ -17,6 +17,8 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `state.postgres.dsn_env` | for `postgres` | the name of the environment variable holding the DSN, never the DSN |
 | `state.postgres.max_connections` | no | the most connections one process of this deployment holds: the writer, the controller claim's session, and readers, which get what those two leave, up to 4. At least 3; absent, 6. A transaction-mode pooler cannot carry them ([Many deployments on one host](../deploying/many-deployments.md)) |
 | `controllers` | no | `single` (default) or `active-passive`; refused on SQLite |
+| `tls_router.node_addr` | behind a router | the `host:port` nodes dial through a TLS-passthrough router, a DNS name because a client sends no SNI for an IP. With it, `listen` stays on loopback and serves mutual TLS, and `node_tls_hosts` is refused ([Many deployments on one host](../deploying/many-deployments.md)) |
+| `tls_router.enroll_addr` | with `bootstrap_listen` behind a router | the `host:port` an enrolling machine dials, by a name of its own |
 | `token_broker.url` | with a broker | where this deployment takes its installation tokens from, https only, naming only a scheme and a host. With it, no target names a `private_key_path` and this host holds no App key ([ADR-025](decisions/adr-025-installation-tokens-from-a-broker.md)) |
 | `token_broker.client_key_path` | with a broker | the key this host proves its deployment with, absolute and outside `identity_dir`; `billet broker client-key` creates it |
 | `token_broker.ca_file` | no | the PEM bundle the broker's certificate is verified against; absent, the system's roots |
@@ -76,7 +78,7 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `provider` | yes | `docker`, `firecracker`, `tart`, `ec2`, `codebuild`; `simulated` is billet's own test-only backend and is refused anywhere in a configuration |
 | `site` | no | one of the control plane's `sites`; required with `ebs_s3`; refused on `codebuild` |
 | `max_vcpu`, `max_memory` | for `ec2` and `codebuild` | what this host contributes; detected on a host backend when unset |
-| `tls.cert`, `tls.key`, `tls.ca` | for any non-loopback controller address | from `billet ca issue` or enrollment; refused against a loopback server |
+| `tls.cert`, `tls.key`, `tls.ca` | for any non-loopback controller address | from `billet ca issue` or enrollment; refused against a loopback server, unless `tls_router` says a router fronts it |
 | `lock_dir`, `allow_unlocked_deployment` | no | the host-wide deployment lock; a shared directory must be setgid; failing to place the lock is an error unless opted out |
 | `state_dir` | yes | generation pointers, image cache, the node's identity |
 | `max_custody` | no | a bound on compute billet is holding without a completion; empty means none, and a job killed by it is archived failed |

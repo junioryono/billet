@@ -265,6 +265,16 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 	if cfg.Server != nil {
 		fmt.Fprintf(env.Stdout, "listen   %s\n", cfg.Server.Listen)
 
+		// WHAT A NODE DIALS IS NOT WHAT THIS BINDS, behind a router, and the router's
+		// own table is outside anything this can read.
+		if router := cfg.Server.TLSRouter; router != nil {
+			fmt.Fprintf(env.Stdout, "router   nodes dial %s through a TLS-passthrough router", router.NodeAddr)
+			if router.EnrollAddr != "" {
+				fmt.Fprintf(env.Stdout, ", and enroll at %s", router.EnrollAddr)
+			}
+			fmt.Fprintln(env.Stdout)
+		}
+
 		// SAID OUT LOUD BECAUSE ITS ABSENCE IS A DECISION. A control plane with no
 		// enrollment address does not admit machines over the network at all, and
 		// an operator meets that as a handshake failure on the far side of the
