@@ -128,7 +128,7 @@ type Spec struct {
 	// InstanceType is the EC2 shape selected and charged at escrow. Empty for
 	// host-backed providers.
 	InstanceType string
-	// Egress is the guest's network policy (ADR-024): listed, watched only, or nil
+	// Egress is the guest's network policy (ADR-026): listed, watched only, or nil
 	// for neither. Only a backend that enforces one on the host may be given one,
 	// and any other refuses it (EgressEnforcer); a backend that ignored it would
 	// run a listed tier's job open.

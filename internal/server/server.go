@@ -79,6 +79,8 @@ type Server struct {
 	hurry <-chan struct{}
 	// foregroundLaunches is set by WithForegroundLaunches.
 	foregroundLaunches bool
+	// listenerTimings is set by WithListenerTimings.
+	listenerTimings *ListenerTimings
 	// restartHandoff makes an unsealed stop a handoff; see WithRestartHandoff.
 	restartHandoff bool
 
@@ -290,6 +292,11 @@ func WithForegroundLaunches() ControlPlaneOption {
 	return func(s *Server) { s.foregroundLaunches = true }
 }
 
+// WithListenerTimings has every listener report how long its loop's steps take.
+func WithListenerTimings(t *ListenerTimings) ControlPlaneOption {
+	return func(s *Server) { s.listenerTimings = t }
+}
+
 // WithStopHandoff makes every listener hand over to the next control plane, rather
 // than drain, when it is stopped while the deployment admits work. See the
 // listener's WithRestartHandoff.
@@ -495,6 +502,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.
 	group.Background("job detail retention", s.retireJobDetail)
 	group.Background("test results retention", s.retireTestResults)
+	group.Background("usage numbering", s.numberUsage)
 
 	// Cancelled together. One listener failing takes the others down rather than
 	// leaving a control plane that is advertising for some tiers and silent for
@@ -818,6 +826,10 @@ func (s *Server) listenerOpts(prov Provisioner) []Option {
 	// listeners, so a control plane that handed some of them a queue and not
 	// others would be fair about part of its fleet.
 	opts = append(opts, WithAdmissionQueue(s.order))
+
+	if s.listenerTimings != nil {
+		opts = append(opts, WithTimings(s.listenerTimings))
+	}
 
 	if s.runner != nil {
 		opts = append(opts, WithRunner(s.runner))

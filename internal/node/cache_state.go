@@ -311,7 +311,7 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 		return fmt.Errorf("node: install cache custody for %s: %w", session.instance, err)
 	}
 
-	return syncDirectory(s.stateDir)
+	return s.syncDir(s.stateDir)
 }
 
 func writeAndSync(file *os.File, body []byte) error {

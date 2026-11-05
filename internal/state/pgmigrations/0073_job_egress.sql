@@ -1,6 +1,6 @@
--- migration 72: job_egress, for PostgreSQL
+-- migration 73: job_egress, for PostgreSQL
 --
--- The twin of migrations/0072_job_egress.sql.
+-- The twin of migrations/0073_job_egress.sql.
 --
 -- It carries that file's statements with SQLite's spellings translated and
 -- nothing else changed, so the two read side by side. The reasoning lives

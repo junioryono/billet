@@ -522,7 +522,7 @@ const (
 
 	// VersionEgress is the version from which a launch can carry a tier's allowlist
 	// (TierSpec's egress) and a node can report what the host saw of a job's network
-	// (POST /v1/nodes/{node}/leases/{lease}/egress, a lease.JobEgress) (ADR-024).
+	// (POST /v1/nodes/{node}/leases/{lease}/egress, a lease.JobEgress) (ADR-026).
 	//
 	// THE TWO DIRECTIONS GO DIFFERENT WAYS, because they mean different things.
 	// REFUSED WHERE A LAUNCH IS SENT: an older node ignores TierSpec's egress and

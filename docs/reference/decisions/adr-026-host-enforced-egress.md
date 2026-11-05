@@ -1,4 +1,4 @@
-# ADR-024: A job's network is named and restricted on the host, by its interface and a resolver of its own
+# ADR-026: A job's network is named and restricted on the host, by its interface and a resolver of its own
 
 Accepted, 2026-11-04. Issue #540, and #510's workspaces build on it. Measurements are in [the egress record](../records/egress-allowlist.md).
 

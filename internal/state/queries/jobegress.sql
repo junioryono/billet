@@ -1,5 +1,5 @@
 -- What the host saw of a job's network: the names its guest asked for, what they
--- answered, and what a tier's allowlist refused (migration 72).
+-- answered, and what a tier's allowlist refused (migration 73).
 
 -- name: RecordJobEgress :execrows
 -- Keep the first egress report for a lease.

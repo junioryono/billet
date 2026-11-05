@@ -68,8 +68,11 @@ type Config struct {
 	ClientID string
 	// InstallationID is the installation the App was installed as.
 	InstallationID int64
-	// PrivateKey is the App private key, PEM encoded.
+	// PrivateKey is the App private key, PEM encoded. Exactly one of this and
+	// Tokens: a deployment holds its key, or a broker holds it.
 	PrivateKey string
+	// Tokens is where a deployment holding no key takes its installation tokens.
+	Tokens billetgithub.TokenSource
 	// AppID authenticates policy reads against GitHub's REST API.
 	AppID int64
 	// APIURL overrides GitHub.com's REST base for GitHub Enterprise Server.
@@ -95,6 +98,9 @@ type Client struct {
 	policy billetgithub.RunnerGroupPolicyClient
 	log    *slog.Logger
 	target billetgithub.Target
+	// tokens remembers why a token source could not answer, nil on a client holding
+	// its App key.
+	tokens *tokenFailures
 
 	// openMessageSession is the vendored client's session call, as a field so a
 	// test can drive Session itself rather than the recognition underneath it.
@@ -127,15 +133,34 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 	quiet := slog.New(quieten(log.Handler()))
 	httpClient := newValidatedRetryableHTTPClient()
 
-	c, err := gh.NewClientWithGitHubApp(gh.ClientWithGitHubAppConfig{
-		GitHubConfigURL: cfg.configURL(),
-		GitHubAppAuth: gh.GitHubAppAuth{
-			ClientID:       cfg.ClientID,
-			InstallationID: cfg.InstallationID,
-			PrivateKey:     cfg.PrivateKey,
-		},
-		SystemInfo: systemInfo(),
-	}, gh.WithRetryableHTTPClint(httpClient), gh.WithLogger(quiet))
+	var (
+		c        *gh.Client
+		err      error
+		failures *tokenFailures
+	)
+
+	switch {
+	case cfg.Tokens != nil && cfg.PrivateKey != "":
+		return nil, fmt.Errorf("scaleset: build client: both an App key and a token source were given")
+	case cfg.Tokens != nil:
+		failures = &tokenFailures{}
+		httpClient.RequestLogHook = sourceInstallationToken(cfg.Tokens, failures, log)
+		c, err = gh.NewClientWithPersonalAccessToken(gh.NewClientWithPersonalAccessTokenConfig{
+			GitHubConfigURL:     cfg.configURL(),
+			PersonalAccessToken: tokenPlaceholder,
+			SystemInfo:          systemInfo(),
+		}, gh.WithRetryableHTTPClint(httpClient), gh.WithLogger(quiet))
+	default:
+		c, err = gh.NewClientWithGitHubApp(gh.ClientWithGitHubAppConfig{
+			GitHubConfigURL: cfg.configURL(),
+			GitHubAppAuth: gh.GitHubAppAuth{
+				ClientID:       cfg.ClientID,
+				InstallationID: cfg.InstallationID,
+				PrivateKey:     cfg.PrivateKey,
+			},
+			SystemInfo: systemInfo(),
+		}, gh.WithRetryableHTTPClint(httpClient), gh.WithLogger(quiet))
+	}
 	if err != nil {
 		// NOT wrapped with the config: GitHubAppAuth holds the private key, and a
 		// validation error that renders the struct it validated would put it in
@@ -152,12 +177,17 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 	// with a refusal there, and runner recovery still needs it to list the
 	// repository's runners.
 	var policy billetgithub.RunnerGroupPolicyClient
-	if cfg.AppID > 0 {
+	switch {
+	case cfg.AppID <= 0:
+	case cfg.Tokens != nil:
+		policy = billetgithub.NewRunnerGroupPolicyClientWith(cfg.APIURL, cfg.Target, cfg.AppID,
+			cfg.InstallationID, cfg.Tokens)
+	default:
 		policy = billetgithub.NewRunnerGroupPolicyClientAt(cfg.APIURL, cfg.Target, cfg.AppID,
 			cfg.InstallationID, []byte(cfg.PrivateKey))
 	}
 
-	client := &Client{gh: c, policy: policy, log: log, target: cfg.Target}
+	client := &Client{gh: c, policy: policy, log: log, target: cfg.Target, tokens: failures}
 	client.openMessageSession = func(ctx context.Context, id int, owner string) (
 		*gh.MessageSessionClient, error,
 	) {
@@ -172,7 +202,8 @@ func (c *Client) Target() billetgithub.Target { return c.target }
 
 // session adapts *gh.MessageSessionClient to server.Session.
 type session struct {
-	gh *gh.MessageSessionClient
+	gh     *gh.MessageSessionClient
+	tokens *tokenFailures
 }
 
 // Session opens a message session for one scale set and adapts it to the
@@ -185,10 +216,10 @@ func (c *Client) Session(ctx context.Context, scaleSetID int, owner string) (ser
 				server.ErrSessionHeld, scaleSetID, err)
 		}
 
-		return nil, fmt.Errorf("scaleset: open session for scale set %d: %w", scaleSetID, err)
+		return nil, fmt.Errorf("scaleset: open session for scale set %d: %w", scaleSetID, c.tokens.named(err))
 	}
 
-	return &session{gh: s}, nil
+	return &session{gh: s, tokens: c.tokens}, nil
 }
 
 // sessionConflictStatus is the STRUCTURED status fragment the upstream client
@@ -264,7 +295,7 @@ func (s *session) Statistics() *server.Statistics {
 func (s *session) GetMessage(ctx context.Context, lastMessageID int64, maxCapacity int) (*server.Message, error) {
 	msg, err := s.gh.GetMessage(ctx, int(lastMessageID), maxCapacity)
 	if err != nil {
-		return nil, fmt.Errorf("scaleset: get message: %w", err)
+		return nil, fmt.Errorf("scaleset: get message: %w", s.tokens.named(err))
 	}
 
 	// The upstream client reports a timed-out long poll as (nil, nil). That is
@@ -280,7 +311,7 @@ func (s *session) GetMessage(ctx context.Context, lastMessageID int64, maxCapaci
 
 func (s *session) DeleteMessage(ctx context.Context, messageID int64) error {
 	if err := s.gh.DeleteMessage(ctx, int(messageID)); err != nil {
-		return fmt.Errorf("scaleset: delete message %d: %w", messageID, err)
+		return fmt.Errorf("scaleset: delete message %d: %w", messageID, s.tokens.named(err))
 	}
 
 	return nil
@@ -289,7 +320,7 @@ func (s *session) DeleteMessage(ctx context.Context, messageID int64) error {
 func (s *session) AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error) {
 	acquired, err := s.gh.AcquireJobs(ctx, requestIDs)
 	if err != nil {
-		return nil, fmt.Errorf("scaleset: acquire jobs: %w", err)
+		return nil, fmt.Errorf("scaleset: acquire jobs: %w", s.tokens.named(err))
 	}
 
 	return acquired, nil
@@ -297,7 +328,7 @@ func (s *session) AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64,
 
 func (s *session) Close(ctx context.Context) error {
 	if err := s.gh.Close(ctx); err != nil {
-		return fmt.Errorf("scaleset: close session: %w", err)
+		return fmt.Errorf("scaleset: close session: %w", s.tokens.named(err))
 	}
 
 	return nil
@@ -358,6 +389,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 
 		job := jobOf(&j.JobMessageBase)
 		job.Result = j.Result
+		job.FinishedAt = j.FinishTime
 		job.RunnerID, job.RunnerName = int64(j.RunnerID), j.RunnerName
 		out.Completed = append(out.Completed, job)
 	}
