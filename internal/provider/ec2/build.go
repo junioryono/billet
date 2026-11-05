@@ -1531,7 +1531,12 @@ func entryPointScript() string {
 	b.WriteString("billet_guest_caches_probe\n")
 	b.WriteString("billet_guest_caches_through_relay\n")
 	b.WriteString("billet_guest_caches_start\n")
+	// THE CONFIGURATION IT WRITES IS EVERY TOOL'S, read as the runner: the boot script's
+	// umask keeps the registration to root, and a bazelrc made under it is one Bazel
+	// refuses to start with (measured 2026-11-05: errno 13, exit 37). Only for this.
+	b.WriteString("umask 022\n")
 	b.WriteString("billet_guest_caches_env\n")
+	b.WriteString("umask 077\n")
 	b.WriteString("runner_started=$(date +%s%N 2>/dev/null || true)\n")
 
 	// ONE INVOCATION, SHARED WITH THE VALIDATION BELOW, so a change here cannot

@@ -90,7 +90,10 @@ func TestTheEntryPointRunsTheGuestCachesInOrder(t *testing.T) {
 		"billet_guest_caches_probe\n",
 		"billet_guest_caches_through_relay\n",
 		"billet_guest_caches_start\n",
+		// UNDER A UMASK THE RUNNER CAN READ WHAT IT WRITES BY, and back afterwards.
+		"umask 022\n",
 		"billet_guest_caches_env\n",
+		"umask 077\n",
 	} {
 		next := strings.Index(script[at:], step)
 		if next < 0 {
