@@ -86,6 +86,21 @@ func TestAnOlderEC2NodeIsSentATierWithoutItsGuestCaches(t *testing.T) {
 	}
 }
 
+// THE BOUNDARY IS PINNED BY NUMBER, not by the constant, so moving the constant cannot
+// move the boundary the fleet already runs: 38 is a released wire without them.
+func TestTheEC2GuestCachesBoundaryIsWire39(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		wire int
+		sent bool
+	}{{38, false}, {39, true}} {
+		spec := launchOn(t, ec2CacheTier(), c.wire).Tier.Cache
+		if got := spec != nil && spec.Go.Enabled; got != c.sent {
+			t.Errorf("wire %d: guest caches sent = %t, want %t", c.wire, got, c.sent)
+		}
+	}
+}
+
 // INTERCEPTION GOES WITH THE CACHES IT SERVES: an older node would otherwise open a
 // session for a proxy no guest of its can use.
 func TestOnlyACurrentEC2NodeIsToldToIntercept(t *testing.T) {
