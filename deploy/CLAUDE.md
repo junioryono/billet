@@ -6,5 +6,6 @@ The packaged systemd units, launchd plists, the packaged `billet.yaml` template 
 - The package enables and starts nothing, except `billet-upgrade.timer` and `billet-images-refresh.timer`.
 - needrestart must never restart a billet service, and the package seeds the exclusion.
 - The Ansible role renders its own copies of the units: change both, and `scripts/gates/scenario.sh unit-parity` compares them.
+- `router/haproxy.cfg` is the reference router for many deployments behind one address. It is not packaged, it holds no key and no default route, and `internal/e2e` runs that file on HAProxy, so an edit to it is an edit to what was tested.
 
 Gates (CI runs them on every push; locally, `scripts/gates/verify.sh`): `scripts/gates/check.sh`. A unit or package-script change runs against real systemd in `scripts/gates/dist.sh && scripts/test-systemd-lifecycle.sh`, and every unit under `ProtectSystem=strict` is started under its real sandbox by `scripts/gates/dist.sh && scripts/test-unit-sandboxes.sh`, which needs no App and runs in CI; a unit added under a strict sandbox gets a declaration of its command's paths in `internal/ops/host/unitpaths.go`; a plist change runs against real launchd only on a Mac, in `internal/lifeops/launchd`'s `reallaunchd_test.go`.

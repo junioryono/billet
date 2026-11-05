@@ -91,6 +91,15 @@ server:
   #
   # bootstrap_listen: 0.0.0.0:7718
 
+  # BEHIND A TLS-PASSTHROUGH ROUTER, with many deployments at one address. listen and
+  # bootstrap_listen stay on loopback and serve mutual TLS, and these are the names nodes
+  # dial, which a certificate carries and a router routes by. See
+  # docs/deploying/many-deployments.md.
+  #
+  # tls_router:
+  #   node_addr: a.nodes.billet.example:443
+  #   enroll_addr: a.enroll.billet.example:443
+
   # The names and addresses nodes will DIAL this control plane by. They become
   # the subject names of the certificate it serves.
   #
@@ -193,7 +202,7 @@ server:
   # This control plane's index of what jobs wrote, where a tier sets logs.keep: a file
   # of its own a day under identity_dir, not in the ledger, about three times the text
   # it covers. The text stays on the node that ran the job. At least 1h and 64MiB;
-  # absent, 336h and 32GiB. See ADR-026.
+  # absent, 336h and 32GiB. See ADR-028.
   #
   # logs:
   #   retention: 336h
@@ -1076,7 +1085,7 @@ node:
 
   # What this node keeps of its jobs' step logs, where a tier sets logs.keep: compressed
   # under state_dir, the oldest jobs evicted whole. At least 1h, 64MiB and 1MiB; absent, 336h,
-  # 64GiB and 64MiB. Only a node with monitoring.guest receives any. See ADR-026.
+  # 64GiB and 64MiB. Only a node with monitoring.guest receives any. See ADR-028.
   #
   # logs:
   #   retention: 336h

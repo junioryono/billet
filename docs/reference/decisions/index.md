@@ -30,8 +30,9 @@ adr-022-every-linux-image-from-githubs-template
 adr-023-fleet-envelope
 adr-024-caches-off-firecracker
 adr-025-installation-tokens-from-a-broker
-adr-026-job-logs
-adr-027-job-attach
+adr-026-windows-on-ec2
+adr-028-job-logs
+adr-029-job-attach
 ```
 
 | Record | Decides |
@@ -61,5 +62,6 @@ adr-027-job-attach
 | [ADR-023](adr-023-fleet-envelope.md) | the fleet one control plane must schedule, 256 hosts and 4,096 open leases, and what each of its writes may take of the ledger's one writer slot; why a listener renews its leases in one commit a pass, why placement is counted a preference rank at a time, and why the commit's speed is the operator's |
 | [ADR-024](adr-024-caches-off-firecracker.md) | which backends the node's caches serve and which are refused for good; why an EC2 node keeps an Actions archive and a build cache as whole objects in S3 rather than a store volume, reached through a relay in the guest; and why the AMI's guest half is cut from the firecracker agent's own text |
 | [ADR-025](adr-025-installation-tokens-from-a-broker.md) | why a deployment may hold no App key: a broker over mutual TLS mints only what its registration names, knowing a caller by its key's fingerprint, and how a token reaches a vendored client that only takes a fixed one |
-| [ADR-026](adr-026-job-logs.md) | why a job's log is kept on its node and indexed on the control plane, in a file a day of its own, and read back through the node wire |
-| [ADR-027](adr-027-job-attach.md) | why a terminal reaches a job's VM over a stream the node dials back, and why a hold on a failed job's VM delays a destroy and never authorises one |
+| [ADR-026](adr-026-windows-on-ec2.md) | why the first Windows backend is EC2, with what a KVM guest on a Linux node and a billet node on Windows measured; what a Windows AMI carries against GitHub's `windows-2025` image, built by GitHub's own steps; how the build reports through COM1 |
+| [ADR-028](adr-028-job-logs.md) | why a job's log is kept on its node and indexed on the control plane, in a file a day of its own, and read back through the node wire |
+| [ADR-029](adr-029-job-attach.md) | why a terminal reaches a job's VM over a stream the node dials back, and why a hold on a failed job's VM delays a destroy and never authorises one |

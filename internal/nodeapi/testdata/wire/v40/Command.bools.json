@@ -97,8 +97,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -132,11 +131,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.cache_authority.publish_default": {
@@ -237,8 +231,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -272,11 +265,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.cache_authority.write_own_ref": {
@@ -377,8 +365,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -412,11 +399,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.lease.ForceRelease": {
@@ -517,8 +499,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -552,11 +533,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.lease.MacOSSlot": {
@@ -657,8 +633,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -692,152 +667,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
-    }
-  },
-  "Command.tier.attach": {
-    "id": "Command.id",
-    "kind": "Command.kind",
-    "lease": {
-      "ID": "Command.lease.ID",
-      "Tier": "Command.lease.Tier",
-      "Node": "Command.lease.Node",
-      "TargetNode": "Command.lease.TargetNode",
-      "MacOSSlot": false,
-      "GuestOS": "Command.lease.GuestOS",
-      "Provider": "Command.lease.Provider",
-      "Providers": [
-        "Command.lease.Providers[0]"
-      ],
-      "Phase": "Command.lease.Phase",
-      "VCPU": 1342267962,
-      "Memory": 749741625,
-      "RequestedVCPU": 571468409,
-      "RequestedMemory": 1439553657,
-      "InstanceType": "Command.lease.InstanceType",
-      "Site": "Command.lease.Site",
-      "PriceUSDPerHour": 373758905,
-      "ImageCache": "Command.lease.ImageCache",
-      "CacheGeneration": "Command.lease.CacheGeneration",
-      "ActionsCache": "Command.lease.ActionsCache",
-      "sticky_cache": "Command.lease.sticky_cache",
-      "git_cache": "Command.lease.git_cache",
-      "bazel_cache": "Command.lease.bazel_cache",
-      "go_cache": "Command.lease.go_cache",
-      "npm_cache": "Command.lease.npm_cache",
-      "PreferenceRank": 1923556909,
-      "HeldSince": "Command.lease.HeldSince",
-      "HolderIncarnation": "Command.lease.HolderIncarnation",
-      "ForceRelease": false,
-      "FailureReason": "Command.lease.FailureReason",
-      "Disruption": "Command.lease.Disruption",
-      "DisruptedAt": "Command.lease.DisruptedAt",
-      "Epoch": 731923539,
-      "RunID": 1899830853,
-      "RequestID": 1543293657
-    },
-    "job": {
-      "request_id": 1777570422,
-      "run_id": 449950365,
-      "event": "Command.job.event",
-      "owner": "Command.job.owner",
-      "repository": "Command.job.repository",
-      "workflow_ref": "Command.job.workflow_ref",
-      "job_id": "Command.job.job_id"
-    },
-    "tier": {
-      "label": "Command.tier.label",
-      "image": "Command.tier.image",
-      "trust": "Command.tier.trust",
-      "command": [
-        "Command.tier.command[0]"
-      ],
-      "disk": 821693241,
-      "shm": 1410973446,
-      "runner_group": "Command.tier.runner_group",
-      "workflows": [
-        "Command.tier.workflows[0]"
-      ],
-      "buildkit_cache_mount_limit": 1665992414,
-      "cache_scope": {
-        "Owner": "Command.tier.cache_scope.Owner",
-        "Repository": "Command.tier.cache_scope.Repository",
-        "WorkflowRef": "Command.tier.cache_scope.WorkflowRef"
-      },
-      "cache": {
-        "publish": "Command.tier.cache.publish",
-        "owner": "Command.tier.cache.owner",
-        "repository": "Command.tier.cache.repository",
-        "docker": {
-          "enabled": false,
-          "max_size": 78852675
-        },
-        "sticky_disks": {
-          "enabled": false,
-          "max_size": 109913157
-        },
-        "actions": {
-          "enabled": false,
-          "max_size": 1310306133
-        },
-        "git": {
-          "enabled": false,
-          "max_size": 1002217463
-        },
-        "bazel": {
-          "enabled": false,
-          "max_size": 2022652119
-        },
-        "go": {
-          "enabled": false,
-          "max_size": 156615474
-        }
-      },
-      "arch": "Command.tier.arch",
-      "attach": true,
-      "hold_on_failure": "Command.tier.hold_on_failure"
-    },
-    "barrier_id": "Command.barrier_id",
-    "request_id": 341765293,
-    "job_result": "Command.job_result",
-    "cache_authority": {
-      "lease_id": "Command.cache_authority.lease_id",
-      "job_id": "Command.cache_authority.job_id",
-      "run_id": 72942523,
-      "owner": "Command.cache_authority.owner",
-      "repository": "Command.cache_authority.repository",
-      "event": "Command.cache_authority.event",
-      "ref": "Command.cache_authority.ref",
-      "base_ref": "Command.cache_authority.base_ref",
-      "default_ref": "Command.cache_authority.default_ref",
-      "proven": false,
-      "write_own_ref": false,
-      "publish_default": false
-    },
-    "upgrade": {
-      "version": "Command.upgrade.version",
-      "manifest_sha256": "Command.upgrade.manifest_sha256",
-      "rollout_id": "Command.upgrade.rollout_id",
-      "generation": 711021661
-    },
-    "log_read": {
-      "lease": "Command.log_read.lease",
-      "ranges": [
-        {
-          "first": 1791624903,
-          "last": 907745063
-        }
-      ],
-      "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.cache.actions.enabled": {
@@ -938,8 +767,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -973,11 +801,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.cache.bazel.enabled": {
@@ -1078,8 +901,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1113,11 +935,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.cache.docker.enabled": {
@@ -1218,8 +1035,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1253,11 +1069,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.cache.git.enabled": {
@@ -1358,8 +1169,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1393,11 +1203,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.cache.go.enabled": {
@@ -1498,8 +1303,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1533,11 +1337,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.cache.go_test_results": {
@@ -1639,8 +1438,7 @@
         },
         "go_test_results": true
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1674,11 +1472,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.cache.keep_logs": {
@@ -1780,8 +1573,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1815,11 +1607,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.cache.npm": {
@@ -1921,8 +1708,7 @@
         },
         "npm": true
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1956,11 +1742,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.cache.sticky_disks.enabled": {
@@ -2061,8 +1842,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -2096,11 +1876,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   },
   "Command.tier.intercept": {
@@ -2202,8 +1977,7 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch",
-      "hold_on_failure": "Command.tier.hold_on_failure"
+      "arch": "Command.tier.arch"
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -2237,11 +2011,6 @@
         }
       ],
       "max_bytes": 1378189617
-    },
-    "attach": {
-      "lease": "Command.attach.lease",
-      "stream": "Command.attach.stream",
-      "token": "Command.attach.token"
     }
   }
 }

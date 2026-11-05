@@ -57,7 +57,8 @@ import (
 //	...
 //
 // A SECOND BACKEND IS WHY THE TABLE EXISTS. A CodeBuild macOS build needs
-// `osx-arm64` and an arm64 Linux build needs `linux-arm64`, and neither was pinned
+// `osx-arm64`, an arm64 Linux build needs `linux-arm64` and a Windows AMI needs
+// `win-x64` (a zip, not a tarball; ADR-026), and none of them was pinned
 // — so the alternative to this table was a constant somewhere else, which is the
 // two-pins problem wearing different clothes.
 //
@@ -98,7 +99,7 @@ func PinnedSHA256() string {
 // cannot name a platform must refuse the launch, not proceed unverified.
 //
 // The platform is actions/runner's OWN asset spelling — `linux-x64`, `linux-arm64`,
-// `osx-arm64` — and not billet's, or dpkg's, or the tool-cache's. Not one of those
+// `osx-arm64`, `win-x64` — and not billet's, or dpkg's, or the tool-cache's. Not one of those
 // naming schemes is derivable from another (see install-toolcache.sh, where six
 // translations disagree), which is why a caller maps its own concept onto this one
 // explicitly rather than assembling a name.

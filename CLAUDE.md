@@ -29,7 +29,7 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 | `internal/lifeops` (+ `launchd`), `internal/deployarchive`, `internal/archivestore`, `internal/durablefile`, `internal/regularfile` | The local service lifecycle on systemd and macOS; backup, restore and recover; the no-delete S3 hop; the one fsync ordering for installing a file; the one open of a file by pathname that waits on no FIFO and opens no device, and the one answer to whether an open file is on its directory's mount. |
 | `internal/hostauthority` | What a command holds before it touches an identity directory: the exclusion the host's metadata requires (the global lock on a prepared host, the inner lock otherwise), the lock beside a directory a fresh initialisation creates, the lifecycle lock between two lifecycle commands, and the hand-back of what a privileged command created to the service account. |
 | `internal/guestreport`, `internal/joblog`, `internal/guestagent` | What the in-VM agent reports, the guest's own unverified view that no billet decision reads, and its one codec; a chunk of a job's step log and its codec, which the index reads and nothing decides from; the agent itself (`billet guest monitor`): the guest's `/proc`, the runner's step marks, step logs and JUnit results, sent to the node's guest-facing service. |
-| `internal/relay`, `internal/guestattach` | An operator's terminal in a job's VM: the frames its two ends speak, and the copy that joins two streams between them, which neither the node nor the plane reads; the server in the guest (`billet guest attach-serve`), on vsock, whose every byte is the guest's (ADR-027). |
+| `internal/relay`, `internal/guestattach` | An operator's terminal in a job's VM: the frames its two ends speak, and the copy that joins two streams between them, which neither the node nor the plane reads; the server in the guest (`billet guest attach-serve`), on vsock, whose every byte is the guest's (ADR-029). |
 | `internal/peercred` | Who is at the far end of a Unix socket, as the kernel recorded it: the one build-tagged file `internal/app` needs, apart from what its assembly audit reads. |
 | `internal/metrics` | The one Prometheus registry and the endpoint that serves it (ADR-016): off unless a role's `metrics` block names an address, loopback unless `allow_remote`, the profiler only on loopback. The only importer of the Prometheus client and `net/http/pprof`. |
 | `internal/flightrecorder` | The controller's opt-in execution-trace window (`server.flight_recorder`): written under the identity directory when a heartbeat pass overruns or the claim is lost, at most once per reason every ten minutes, the newest four kept. The one place the runtime's flight recorder is started. |
@@ -47,7 +47,7 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 | `ansible_collections/junioryono/billet` | The `host` and `development_host` roles and their scenario tests. |
 | `terraform/modules` | The AWS infrastructure modules. |
 | `actions/` | The published Actions: `stickydisk`, `setup-docker-builder`, `stop-docker-builder`, `build-push-action`, and `converge-fleet`, which runs the collection from its own checkout. |
-| `scripts/` | Guest image and kernel builds, release tooling, `install.sh`, rehearsals, repository gates, and the Go tests that execute those scripts. |
+| `scripts/` | Guest image and kernel builds, the AMI builds (`ami/`, and `windows/`, the PowerShell a Windows AMI's build runs), release tooling, `install.sh`, rehearsals, repository gates, and the Go tests that execute those scripts. |
 | `tools/lint` | billet's own analyzers (`parallelshared`, `rawsql`), a nested module so `go/analysis` never ships in the binary. |
 | `docs/` | The Sphinx site: getting started, concepts, deploying, operating, reference (CLI, configuration, decisions, records). |
 
@@ -159,4 +159,4 @@ This repository also supports OpenAI Codex, which reads the cross-tool standard 
 
 ## Platform support
 
-Linux (amd64, arm64) and macOS (arm64). A Windows port needs an equivalent of the `flock`-based state lock.
+A billet role runs on Linux (amd64, arm64) and macOS (arm64). A billet node on Windows needs an equivalent of the `flock`-based state lock and more; [ADR-026](docs/reference/decisions/adr-026-windows-on-ec2.md) counts what. Windows jobs run on EC2, launched from one of those.

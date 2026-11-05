@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 40
+	Version = 41
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -520,6 +520,19 @@ const (
 	// without them.
 	VersionJobTests = 38
 
+	// VersionWindowsGuests is the version from which a node reads a lease's guest OS
+	// to choose its boot script, so a Windows lease reaches only a node that will
+	// boot it (ADR-026). The lease has carried the guest OS since long before this,
+	// and no wire struct changes: the step is in what a node does with it.
+	//
+	// REFUSED WHERE IT IS SENT. A node below it sends a Linux boot script to a Windows
+	// AMI, which boots, looks healthy, registers nothing and holds its lease, so
+	// placement passes over one (alloc.WindowsGuestsWireVersion, which a test holds
+	// equal) and a Windows lease is refused to one at dispatch and again at delivery,
+	// as an architecture is. The job waits for a node that can run it, and `billet
+	// status` says so. A Linux lease is as it always was.
+	VersionWindowsGuests = 39
+
 	// VersionJobLogs is the version from which a node can send a job's step logs to be
 	// indexed (POST /v1/nodes/{node}/logs, LogChunkRequest), a registration's answer names
 	// the index (RegisterResponse's log_index_id), and the plane can ask a node for lines
@@ -530,7 +543,7 @@ const (
 	// an unknown command after a wait, and no log_index_id. CHECKED WHERE IT IS READ: a
 	// chunk from a pairing below it is refused, and an id below it is no index. Its text
 	// stays on the node either way, so what an older pairing loses is finding it.
-	VersionJobLogs = 39
+	VersionJobLogs = 40
 
 	// VersionJobAttach is the version from which the plane can ask a node for a stream to a
 	// lease's guest (CommandAttach), which the node dials back on
@@ -542,7 +555,7 @@ const (
 	// so. NEITHER REFUSED NOR REPORTED for the tier's word: an older node decodes it leniently
 	// and starts a guest with no terminal, which an attach then says, and which costs the job
 	// nothing.
-	VersionJobAttach = 40
+	VersionJobAttach = 41
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

@@ -10,7 +10,7 @@ import (
 // tier says, because a log is as sensitive as its workflow makes it.
 type TierLogs struct {
 	// Keep keeps the step logs of this tier's jobs on the node that ran them and indexes
-	// them on the control plane (ADR-026).
+	// them on the control plane (ADR-028).
 	Keep bool `yaml:"keep,omitempty"`
 }
 

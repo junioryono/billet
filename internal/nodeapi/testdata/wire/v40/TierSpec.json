@@ -50,7 +50,5 @@
     "go_test_results": true,
     "npm": true
   },
-  "arch": "TierSpec.arch",
-  "attach": true,
-  "hold_on_failure": "TierSpec.hold_on_failure"
+  "arch": "TierSpec.arch"
 }
