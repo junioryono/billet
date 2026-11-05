@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 38
+	Version = 39
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -509,6 +509,17 @@ const (
 	// naming one is refused to a node below this at dispatch and again at delivery.
 	VersionArchitectures = 37
 
+	// VersionJobTests is the version from which a guest report may carry the job's
+	// test suites and cases (lease.GuestReport's tests, #536), which the ledger keeps
+	// past the report's own retention and `billet tests stats` ranks.
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT, because
+	// an older plane decodes the request strictly and would refuse the whole report
+	// over the field: below it the node sends the rest. CHECKED WHERE IT IS READ too,
+	// so a pairing that negotiated below it and sends them anyway has the report kept
+	// without them.
+	VersionJobTests = 38
+
 	// VersionCustodyClaim is the version from which a superseded process may claim
 	// the leases it holds in custody on the controller that serves now
 	// (ClaimCustodyRequest), because a controller's ownership record does not
@@ -521,7 +532,7 @@ const (
 	// which then waits as it always did. A node asks whatever it negotiated, since
 	// that was with another controller and the answer settles it with this one. An
 	// older node never asks, and the plane needs no gate.
-	VersionCustodyClaim = 38
+	VersionCustodyClaim = 39
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

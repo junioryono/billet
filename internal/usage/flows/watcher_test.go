@@ -166,7 +166,7 @@ func TestAGrantInTheLaunchsOwnSecondIsAmbiguous(t *testing.T) {
 	w, _ := newTestWatcher(&fakeTable{}, l)
 	w.Watch("lease-1", guestMACAddr, "leases", launchedMid)
 
-	if r, measured, err := w.Final(t.Context(), "lease-1", ended); !measured || !r.Incomplete || err != nil {
+	if r, measured, err := w.Final(t.Context(), "lease-1", ended); !measured || !saysWhy(r, WhyGrantAmbiguous) || err != nil {
 		t.Errorf("a grant in the launch's second gave %+v, measured %v, %v; want measured and incomplete", r, measured, err)
 	}
 }
@@ -188,7 +188,7 @@ func TestALeaseUnreadableAfterTheAddressIsKnownMarksTheJob(t *testing.T) {
 
 	w.Resolve()
 
-	if r, measured, err := w.Final(t.Context(), "lease-1", ended); !measured || !r.Incomplete || err != nil {
+	if r, measured, err := w.Final(t.Context(), "lease-1", ended); !measured || !saysWhy(r, WhyLeaseUnread) || err != nil {
 		t.Errorf("a lease unreadable after resolution gave %+v, measured %v, %v; want incomplete", r, measured, err)
 	}
 }
@@ -347,7 +347,7 @@ func TestFinalCountsOpenFlowsOrSaysItCouldNot(t *testing.T) {
 
 	w.Watch("lease-2", guestMACAddr, "leases", launched)
 
-	if r, measured, err = w.Final(t.Context(), "lease-2", ended); !measured || err == nil || !r.Incomplete {
+	if r, measured, err = w.Final(t.Context(), "lease-2", ended); !measured || err == nil || !saysWhy(r, WhySyncUnproved) {
 		t.Errorf("an unproved sync gave %+v, measured %v, %v; want a measured, incomplete result and the error", r, measured, err)
 	}
 
@@ -357,7 +357,7 @@ func TestFinalCountsOpenFlowsOrSaysItCouldNot(t *testing.T) {
 
 	table.err = errors.New("netlink: permission denied")
 
-	if r, measured, err = w.Final(t.Context(), "lease-3", ended); !measured || err == nil || !r.Incomplete {
+	if r, measured, err = w.Final(t.Context(), "lease-3", ended); !measured || err == nil || !saysWhy(r, WhyTableUnread) {
 		t.Errorf("an unreadable table gave %+v, measured %v, %v; want a measured, incomplete result and the error", r, measured, err)
 	}
 }
@@ -409,7 +409,7 @@ func TestAnAddressThatChangesMarksTheJobIncomplete(t *testing.T) {
 	l.set(leaseLine(began.Add(30*time.Minute), other))
 	w.Resolve()
 
-	if r, _, err := w.Final(t.Context(), "lease-1", ended); !r.Incomplete || err != nil {
+	if r, _, err := w.Final(t.Context(), "lease-1", ended); !saysWhy(r, WhyAddressChanged) || err != nil {
 		t.Errorf("a job whose address changed gave %+v, %v; want incomplete", r, err)
 	}
 
@@ -435,7 +435,7 @@ func TestAFirstGrantLongAfterTheLaunchIsIncomplete(t *testing.T) {
 	w, _ := newTestWatcher(&fakeTable{}, l)
 	w.Watch("lease-1", guestMACAddr, "leases", launched)
 
-	if r, measured, err := w.Final(t.Context(), "lease-1", ended); !measured || !r.Incomplete || err != nil {
+	if r, measured, err := w.Final(t.Context(), "lease-1", ended); !measured || !saysWhy(r, WhyGrantLate) || err != nil {
 		t.Errorf("a first grant half a lease after the launch gave %+v, measured %v, %v; want incomplete", r, measured, err)
 	}
 }
@@ -461,7 +461,7 @@ func TestTheInheritedEntriesAreReadWhenTheAddressIsLearned(t *testing.T) {
 
 	table.set(guest)
 
-	if r, _, err := w.Final(t.Context(), "lease-1", ended); !r.Incomplete || err != nil {
+	if r, _, err := w.Final(t.Context(), "lease-1", ended); !saysWhy(r, WhyInherited) || err != nil {
 		t.Errorf("traffic on an entry the previous holder left gave %+v, %v; want incomplete", r, err)
 	}
 }

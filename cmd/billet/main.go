@@ -61,6 +61,8 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: fleetops.Leases},
 		{Name: "jobs", Summary: "show which GitHub job a lease, or every lease of a run, ran, how it lived and what it did to the host",
 			Run: fleetops.Jobs},
+		{Name: "tests", Summary: "rank the tests jobs reported: the slowest, the most often failing and the flaky",
+			Run: fleetops.Tests},
 		{Name: "cache", Summary: "manage transparent Actions caching and install its conformance gate",
 			Run: cache.Run},
 		{Name: "check", Summary: "validate the config and state directory, then exit",

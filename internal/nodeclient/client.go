@@ -1231,6 +1231,11 @@ func (c *Client) RecordGuestReport(ctx context.Context, leaseID string, epoch in
 	// The caller's report is not changed.
 	report.FirstReceived, report.LastReceived = report.FirstReceived.UTC(), report.LastReceived.UTC()
 
+	// AN OLDER PLANE'S STRICT DECODER would refuse the whole report over the field.
+	if wire < nodeapi.VersionJobTests {
+		report = report.WithoutTests()
+	}
+
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/guest"),
 		nodeapi.GuestReportRequest{Epoch: epoch, Report: report}, nil)
 }

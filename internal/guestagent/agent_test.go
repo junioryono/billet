@@ -527,7 +527,7 @@ func TestABatchThatCannotFitIsRefusedNotCut(t *testing.T) {
 
 	b := guestreport.Batch{Seq: 1, AgentVersion: "v", TicksPerSecond: 100, Samples: []guestreport.Sample{fixtureSample}}
 
-	if _, err := fit(&b, 10); err == nil {
+	if _, err := fit(&b, 10, time.Time{}); err == nil {
 		t.Fatal("a batch over its limit with nothing to give way was encoded")
 	}
 

@@ -1,4 +1,0 @@
-ClaimCustodyResponse.version int
-ClaimCustodyResponse.held tag omitempty
-ClaimCustodyResponse.held slice
-ClaimCustodyResponse.held[] string
