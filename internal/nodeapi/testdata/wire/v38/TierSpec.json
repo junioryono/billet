@@ -49,10 +49,5 @@
     "go_test_results": true,
     "npm": true
   },
-  "arch": "TierSpec.arch",
-  "egress": {
-    "allow": [
-      "TierSpec.egress.allow[0]"
-    ]
-  }
+  "arch": "TierSpec.arch"
 }

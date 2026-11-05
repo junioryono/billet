@@ -25,7 +25,7 @@ func TestTheJUnitSearchReadsTheJobsResultFiles(t *testing.T) {
 	t.Parallel()
 
 	log, _ := discardLog()
-	got := collectJUnit([]string{"testdata/junit", filepath.Join(t.TempDir(), "absent")}, unhurried, log)
+	got, _ := collectJUnit([]string{"testdata/junit", filepath.Join(t.TempDir(), "absent")}, unhurried, log)
 
 	want := []guestreport.SuiteResult{
 		{Name: "github.com/acme/widget/internal/parse", Tests: 4, Failures: 1, Skipped: 1,
@@ -69,7 +69,7 @@ func TestTheJUnitSearchFollowsNoSymlinkOutOfARoot(t *testing.T) {
 	writeFile(t, filepath.Join(root, "inside.xml"), `<testsuite name="inside" tests="1"><testcase name="x"/></testsuite>`)
 
 	log, _ := discardLog()
-	got := collectJUnit([]string{root}, unhurried, log)
+	got, _ := collectJUnit([]string{root}, unhurried, log)
 
 	if len(got) != 1 || got[0].Name != "inside" {
 		t.Fatalf("suites %+v, want the one inside the root alone", got)
@@ -116,7 +116,7 @@ func TestTheJUnitSearchKeepsItsBounds(t *testing.T) {
 		writeFile(t, filepath.Join(root, "small.xml"), suite("small"))
 
 		log, _ := discardLog()
-		got := collectJUnit([]string{root}, unhurried, log)
+		got, _ := collectJUnit([]string{root}, unhurried, log)
 
 		if len(got) != 1 || got[0].Name != "small" {
 			t.Fatalf("suites %+v, want the small one alone", got)
@@ -136,7 +136,7 @@ func TestTheJUnitSearchKeepsItsBounds(t *testing.T) {
 		}
 
 		log, _ := discardLog()
-		got := collectJUnit([]string{"testdata/junit"}, tick, log)
+		got, _ := collectJUnit([]string{"testdata/junit"}, tick, log)
 
 		if len(got) != 0 {
 			t.Fatalf("a search past its budget kept %+v", got)
@@ -193,7 +193,7 @@ func TestTheSuitesKeptAreABatchsWorthFailingFirst(t *testing.T) {
 	writeFile(t, filepath.Join(root, "fail.xml"), `<testsuite name="fail">`+cases.String()+`</testsuite>`)
 
 	log, _ := discardLog()
-	got := collectJUnit([]string{root}, unhurried, log)
+	got, _ := collectJUnit([]string{root}, unhurried, log)
 
 	if len(got) != guestreport.MaxBatchSuites || got[0].Name != "fail" {
 		first := ""

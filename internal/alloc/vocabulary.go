@@ -83,6 +83,8 @@ const (
 	MaxEgressNamedAddrs     = lease.MaxEgressNamedAddrs
 	MaxEgressNamesPerAddr   = lease.MaxEgressNamesPerAddr
 	MaxGuestReportBytes     = lease.MaxGuestReportBytes
+	TestResultsCodec        = lease.TestResultsCodec
+	MaxTestResultsBytes     = lease.MaxTestResultsBytes
 )
 
 // ErrLeaseNotFound means the lease does not exist, or is already terminal.

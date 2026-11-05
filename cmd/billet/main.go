@@ -61,6 +61,8 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: fleetops.Leases},
 		{Name: "jobs", Summary: "show which GitHub job a lease, or every lease of a run, ran, how it lived and what it did to the host",
 			Run: fleetops.Jobs},
+		{Name: "tests", Summary: "rank the tests jobs reported: the slowest, the most often failing and the flaky",
+			Run: fleetops.Tests},
 		{Name: "cache", Summary: "manage transparent Actions caching and install its conformance gate",
 			Run: cache.Run},
 		{Name: "check", Summary: "validate the config and state directory, then exit",
@@ -216,8 +218,8 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 		return fmt.Errorf("%s has no node section", *cfgPath)
 	}
 
-	if cfg.Node.ServerAddr == "" {
-		return fmt.Errorf("%s has no node.server_addr, so this host does not know which "+
+	if len(cfg.Node.ControlPlanes()) == 0 {
+		return fmt.Errorf("%s has no node.server_addr or node.server_addrs, so this host does not know which "+
 			"control plane to dial", *cfgPath)
 	}
 

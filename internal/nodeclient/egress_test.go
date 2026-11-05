@@ -106,16 +106,16 @@ func TestAnEgressReportIsNotSentToAPlaneTooOldForIt(t *testing.T) { //nolint:par
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
-	plane := &versionedPlane{version: 37}
+	plane := &versionedPlane{version: 38}
 	c := registeredAt(t, plane)
 
-	if got := c.WireVersion(); got != 37 {
-		t.Fatalf("negotiated %d, want the older plane's 37", got)
+	if got := c.WireVersion(); got != 38 {
+		t.Fatalf("negotiated %d, want the older plane's 38", got)
 	}
 
 	for range 3 {
 		if err := c.RecordLeaseEgress(t.Context(), "l1", 7, anEgressReport()); err != nil {
-			t.Fatalf("RecordLeaseEgress against a wire-37 plane = %v, want nil", err)
+			t.Fatalf("RecordLeaseEgress against a wire-38 plane = %v, want nil", err)
 		}
 	}
 

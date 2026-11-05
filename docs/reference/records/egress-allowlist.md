@@ -1,6 +1,6 @@
 # The egress allowlist
 
-What [ADR-023](../decisions/adr-023-host-enforced-egress.md)'s rules did in a real Firecracker guest and on a real kernel, measured on 2026-11-04. Each rule below was run, not read; what was not run is listed at the end.
+What [ADR-024](../decisions/adr-024-host-enforced-egress.md)'s rules did in a real Firecracker guest and on a real kernel, measured on 2026-11-04. Each rule below was run, not read; what was not run is listed at the end.
 
 ## Where it ran
 

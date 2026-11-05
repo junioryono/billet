@@ -95,6 +95,57 @@ UPDATE leases SET vcpu = @vcpu, memory = @memory, instance_type = @instance_type
 UPDATE leases SET heartbeat_at = @heartbeat_at, expires_at = @expires_at
  WHERE id = @id AND epoch = @epoch;
 
+-- name: HeartbeatLeases :many
+-- Push out the expiry of every lease named, at the epoch named beside it, that
+-- is still open and that no operator has asked to be released, and return the
+-- ones it renewed; the caller says why each other one was not, as one renewal
+-- would (internal/alloc HeartbeatMany).
+--
+-- ONE STATEMENT FOR A WHOLE PASS, because a renewal's cost is its commit: on a
+-- ledger whose commit waits for network block storage, one transaction a lease
+-- held the writer slot for 3.0 to 4.1 ms each on either engine (2026-10-25,
+-- docs/reference/records/ledger-write-budget.md), and a control plane renews
+-- every open lease once a third of its TTL. The leases are packed into one
+-- string of fixed-width records, the id space-padded to 64 characters and the
+-- epoch as 19 zero-padded digits (internal/alloc packLeaseRefs).
+--
+-- CUT IN HALVES, NOT ONE RECORD OFF THE FRONT. The destinations' statement
+-- (RecordJobDestinations) carries the rest of its string at every step, which
+-- copies it once a row; for 256 renewals that was 30 ms a statement on SQLite
+-- against 3.5 ms halving it, each part split into its first half of records and
+-- the rest until every part is one record (measured 2026-10-25 on an M2 Max).
+-- One recursive reference, joined to the two halves, because PostgreSQL refuses
+-- a recursive term that names the query twice. Only a string of whole records
+-- is cut at all, and only a part of at least two records is split, so each
+-- half is whole records and shorter than its part: a string that is not whole
+-- records renews nothing, rather than its valid prefix or a split that never
+-- shrinks. A string of whole records the packer did not write can still fail
+-- the statement where an epoch is not digits (PostgreSQL refuses the cast),
+-- which fails its batch and renews nothing. The packer admits only printable
+-- ASCII and zero-padded epochs, so a length is the same
+-- count of characters on both engines; SQLite's length() stops at a NUL, so a
+-- string holding one is refused by its length not growing by the character
+-- appended to it (PostgreSQL refuses a NUL in text before the statement runs).
+--
+-- THE ROW VALUE KEEPS EACH EPOCH BESIDE THE ID IT CAME WITH, for an id named
+-- twice, and the IN still narrows by the primary key.
+WITH RECURSIVE part (rec) AS (
+    SELECT CAST(@packed AS TEXT)
+     WHERE length(CAST(@packed AS TEXT)) >= 83 AND length(CAST(@packed AS TEXT)) % 83 = 0
+       AND length(CAST(@packed AS TEXT) || 'x') = length(CAST(@packed AS TEXT)) + 1
+    UNION ALL
+    SELECT CASE h.side WHEN 0 THEN substr(rec, 1, length(rec) / 166 * 83)
+                       ELSE substr(rec, length(rec) / 166 * 83 + 1) END
+      FROM part CROSS JOIN (SELECT 0 AS side UNION ALL SELECT 1) AS h
+     WHERE length(rec) >= 166
+)
+UPDATE leases SET heartbeat_at = @heartbeat_at, expires_at = @expires_at
+ WHERE phase NOT IN ('done','failed')
+   AND force_release = 0
+   AND (id, epoch) IN (SELECT rtrim(substr(rec, 1, 64)), CAST(substr(rec, 65, 19) AS BIGINT)
+                         FROM part WHERE length(rec) = 83)
+RETURNING id, epoch;
+
 -- name: MarkLeaseFailure :exec
 -- Record why a still-open lease is destined to fail.
 --

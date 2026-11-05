@@ -91,5 +91,11 @@
     "energy_idle_uj": 0
   },
   "guest": null,
-  "egress": null
+  "egress": null,
+  "tests": {
+    "notice": "Reported by the job's own VM. The job runs as root there and can change any of it; billet does not act on it.",
+    "results": null
+  },
+  "head_sha": "",
+  "head_branch": ""
 }

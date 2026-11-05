@@ -230,7 +230,7 @@ type binding struct {
 // public address would pass them and reach the peer, which could relay it under a
 // broader policy. No peer's frame reaches it either. What the host itself sends is not
 // held to this: a guest that claims a peer's MAC or address on the bridge can be sent
-// what the host meant for that peer (ADR-023).
+// what the host meant for that peer (ADR-024).
 //
 // AN OPEN GUEST'S CHAIN ONLY MARKS DNS, and falls through to the base chain's
 // accept.

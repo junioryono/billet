@@ -95,6 +95,14 @@ type JobGuestReport struct {
 	LastReceivedAt  sql.NullString
 }
 
+type JobTestResult struct {
+	LeaseID      string
+	RecordedAt   string
+	Codec        int64
+	EncodedBytes int64
+	Data         string
+}
+
 type JobUsage struct {
 	LeaseID                string
 	Node                   string

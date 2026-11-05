@@ -58,8 +58,8 @@ func TestAnEgressReportFromAWireThatDoesNotCarryItIsRefused(t *testing.T) {
 		status  int
 		kept    int
 	}{
-		{37, http.StatusBadRequest, 0},
-		{38, http.StatusNoContent, 1},
+		{38, http.StatusBadRequest, 0},
+		{39, http.StatusNoContent, 1},
 	} {
 		store := &egressStore{fakeStore: &fakeStore{}}
 		_, base := serve(t, store)
@@ -72,7 +72,7 @@ func TestAnEgressReportFromAWireThatDoesNotCarryItIsRefused(t *testing.T) {
 		}
 
 		if tc.status != http.StatusNoContent {
-			want := fmt.Sprintf("needs wire 38 and this node negotiated %d", tc.version)
+			want := fmt.Sprintf("needs wire 39 and this node negotiated %d", tc.version)
 			if refusal.Code != nodeapi.CodeRefused || !strings.Contains(refusal.Message, want) {
 				t.Errorf("at wire %d the refusal is %+v, want %q saying %q", tc.version, refusal,
 					nodeapi.CodeRefused, want)

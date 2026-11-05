@@ -368,9 +368,14 @@ func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time, s
 	}
 
 	c := compareWithTap(res, sum, sampled)
+	destinations, saturated := jobDestinationsOf(res, c)
+	why := res.IncompleteWhy
+	if saturated {
+		why = append(slices.Clone(why), "total_too_large")
+	}
 
 	attrs := []any{"runner", name, "destinations", len(res.Destinations), "sent", c.sent,
-		"received", c.received, "incomplete", res.Incomplete, "error", err}
+		"received", c.received, "incomplete", destinations.Incomplete, "incomplete_why", why, "error", err}
 
 	if c.tapKnown {
 		attrs = append(attrs, "tap_sent", c.tapSent, "tap_received", c.tapReceived,
@@ -380,7 +385,7 @@ func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time, s
 
 	r.log.Info("a job's traffic by destination", attrs...)
 
-	return jobDestinationsOf(res, c)
+	return destinations
 }
 
 // replies sets dest's reply times to what a report may say of them: no more
@@ -406,18 +411,21 @@ func replies(dest *alloc.JobDestination, timed, slow int64, slowest time.Duratio
 // INCOMPLETE, so it reads as the lower bound it then is; and traffic to an
 // address that is not one (which the tracker never reports) is counted under
 // Other rather than lost.
-func jobDestinationsOf(res flows.Result, c tapComparison) *alloc.JobDestinations {
+//
+// It also reports whether a total was so kept, which the tracker never knew of.
+func jobDestinationsOf(res flows.Result, c tapComparison) (*alloc.JobDestinations, bool) {
 	out := &alloc.JobDestinations{Incomplete: res.Incomplete}
+	saturated := false
 	clamp := func(v uint64) int64 {
 		if v > math.MaxInt64 {
-			out.Incomplete = true
+			saturated = true
 			return math.MaxInt64
 		}
 		return int64(v)
 	}
 	add := func(a, b int64) int64 {
 		if a > math.MaxInt64-b {
-			out.Incomplete = true
+			saturated = true
 			return math.MaxInt64
 		}
 		return a + b
@@ -448,6 +456,7 @@ func jobDestinationsOf(res flows.Result, c tapComparison) *alloc.JobDestinations
 		out.Destinations = append(out.Destinations, dest)
 	}
 	out.Other = other
+	out.Incomplete = out.Incomplete || saturated
 	out.RepliesTimed = true
 	if res.UnansweredUnknown {
 		*out = out.WithoutUnanswered()
@@ -459,7 +468,7 @@ func jobDestinationsOf(res flows.Result, c tapComparison) *alloc.JobDestinations
 		out.Tap = &alloc.TapTotals{SentBytes: c.tapSent, ReceivedBytes: c.tapReceived}
 	}
 
-	return out
+	return out, saturated
 }
 
 // tapComparison is what a job's destinations attributed, beside its tap's own

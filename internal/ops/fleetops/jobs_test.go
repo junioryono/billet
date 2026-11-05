@@ -42,6 +42,8 @@ type jobSeed struct {
 	usage     *alloc.JobUsage
 	series    *alloc.UsageSeries
 	egress    *alloc.JobEgress
+	// tests is the job's kept test results, as the node encodes them.
+	tests []byte
 }
 
 // seedJob stages a job through the real allocator and returns its lease.
@@ -91,6 +93,13 @@ func seedJob(t *testing.T, stateDir string, seed jobSeed) string {
 	if seed.egress != nil {
 		if err := a.RecordLeaseEgress(t.Context(), lease.ID, lease.Epoch, *seed.egress); err != nil {
 			t.Fatalf("RecordLeaseEgress: %v", err)
+		}
+	}
+	if seed.tests != nil {
+		if err := a.RecordGuestReport(t.Context(), lease.ID, lease.Epoch, alloc.GuestReport{
+			Codec: alloc.GuestReportCodec, TestsCodec: alloc.TestResultsCodec, Tests: seed.tests,
+		}); err != nil {
+			t.Fatalf("RecordGuestReport: %v", err)
 		}
 	}
 	if seed.usage != nil {
@@ -401,8 +410,8 @@ func TestTheKnownAnswerFixturesAreJobsShowsOwn(t *testing.T) {
 		"measured-window": {usage: measured, window: window}, "gapped-window": {usage: measured, window: &gapped}}
 	for _, name := range slices.Sorted(maps.Keys(shapes)) {
 		var out bytes.Buffer
-		if err := renderJobJSON(&out, record, shapes[name].usage, nil, "the usage report came with no series", nil, jobEgress{},
-			shapes[name].window); err != nil {
+		if err := renderJobJSON(&out, record, shapes[name].usage, nil, "the usage report came with no series", nil,
+			jobEgress{}, jobTests{}, shapes[name].window); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		path := filepath.Join(knownAnswerFixtures, name+".json")

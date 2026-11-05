@@ -193,7 +193,7 @@ func TestTheJSONRecordCarriesTheReportOrSaysWhyNot(t *testing.T) {
 
 	decode := func(network jobEgress) map[string]any {
 		var out bytes.Buffer
-		if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, nil, nil, "", nil, network, nil); err != nil {
+		if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, nil, nil, "", nil, network, jobTests{}, nil); err != nil {
 			t.Fatal(err)
 		}
 

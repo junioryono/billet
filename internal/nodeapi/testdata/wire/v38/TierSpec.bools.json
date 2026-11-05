@@ -47,12 +47,7 @@
         "max_size": 2065315820
       }
     },
-    "arch": "TierSpec.arch",
-    "egress": {
-      "allow": [
-        "TierSpec.egress.allow[0]"
-      ]
-    }
+    "arch": "TierSpec.arch"
   },
   "TierSpec.cache.bazel.enabled": {
     "label": "TierSpec.label",
@@ -102,12 +97,7 @@
         "max_size": 2065315820
       }
     },
-    "arch": "TierSpec.arch",
-    "egress": {
-      "allow": [
-        "TierSpec.egress.allow[0]"
-      ]
-    }
+    "arch": "TierSpec.arch"
   },
   "TierSpec.cache.docker.enabled": {
     "label": "TierSpec.label",
@@ -157,12 +147,7 @@
         "max_size": 2065315820
       }
     },
-    "arch": "TierSpec.arch",
-    "egress": {
-      "allow": [
-        "TierSpec.egress.allow[0]"
-      ]
-    }
+    "arch": "TierSpec.arch"
   },
   "TierSpec.cache.git.enabled": {
     "label": "TierSpec.label",
@@ -212,12 +197,7 @@
         "max_size": 2065315820
       }
     },
-    "arch": "TierSpec.arch",
-    "egress": {
-      "allow": [
-        "TierSpec.egress.allow[0]"
-      ]
-    }
+    "arch": "TierSpec.arch"
   },
   "TierSpec.cache.go.enabled": {
     "label": "TierSpec.label",
@@ -267,12 +247,7 @@
         "max_size": 2065315820
       }
     },
-    "arch": "TierSpec.arch",
-    "egress": {
-      "allow": [
-        "TierSpec.egress.allow[0]"
-      ]
-    }
+    "arch": "TierSpec.arch"
   },
   "TierSpec.cache.go_test_results": {
     "label": "TierSpec.label",
@@ -323,12 +298,7 @@
       },
       "go_test_results": true
     },
-    "arch": "TierSpec.arch",
-    "egress": {
-      "allow": [
-        "TierSpec.egress.allow[0]"
-      ]
-    }
+    "arch": "TierSpec.arch"
   },
   "TierSpec.cache.npm": {
     "label": "TierSpec.label",
@@ -379,12 +349,7 @@
       },
       "npm": true
     },
-    "arch": "TierSpec.arch",
-    "egress": {
-      "allow": [
-        "TierSpec.egress.allow[0]"
-      ]
-    }
+    "arch": "TierSpec.arch"
   },
   "TierSpec.cache.sticky_disks.enabled": {
     "label": "TierSpec.label",
@@ -434,12 +399,7 @@
         "max_size": 2065315820
       }
     },
-    "arch": "TierSpec.arch",
-    "egress": {
-      "allow": [
-        "TierSpec.egress.allow[0]"
-      ]
-    }
+    "arch": "TierSpec.arch"
   },
   "TierSpec.intercept": {
     "label": "TierSpec.label",
@@ -490,11 +450,6 @@
         "max_size": 2065315820
       }
     },
-    "arch": "TierSpec.arch",
-    "egress": {
-      "allow": [
-        "TierSpec.egress.allow[0]"
-      ]
-    }
+    "arch": "TierSpec.arch"
   }
 }

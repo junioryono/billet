@@ -78,11 +78,6 @@
       "go": {
         "enabled": false
       }
-    },
-    "egress": {
-      "allow": [
-        ""
-      ]
     }
   },
   "cache_authority": {

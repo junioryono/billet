@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 38
+	Version = 39
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -509,9 +509,20 @@ const (
 	// naming one is refused to a node below this at dispatch and again at delivery.
 	VersionArchitectures = 37
 
+	// VersionJobTests is the version from which a guest report may carry the job's
+	// test suites and cases (lease.GuestReport's tests, #536), which the ledger keeps
+	// past the report's own retention and `billet tests stats` ranks.
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT, because
+	// an older plane decodes the request strictly and would refuse the whole report
+	// over the field: below it the node sends the rest. CHECKED WHERE IT IS READ too,
+	// so a pairing that negotiated below it and sends them anyway has the report kept
+	// without them.
+	VersionJobTests = 38
+
 	// VersionEgress is the version from which a launch can carry a tier's allowlist
 	// (TierSpec's egress) and a node can report what the host saw of a job's network
-	// (POST /v1/nodes/{node}/leases/{lease}/egress, a lease.JobEgress) (ADR-023).
+	// (POST /v1/nodes/{node}/leases/{lease}/egress, a lease.JobEgress) (ADR-024).
 	//
 	// THE TWO DIRECTIONS GO DIFFERENT WAYS, because they mean different things.
 	// REFUSED WHERE A LAUNCH IS SENT: an older node ignores TierSpec's egress and
@@ -522,7 +533,7 @@ const (
 	// bare 404, so a node negotiated below this drops it as success and says so
 	// once. A pairing that negotiated below this and sends one anyway is refused.
 	// MinVersion does not move.
-	VersionEgress = 38
+	VersionEgress = 39
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

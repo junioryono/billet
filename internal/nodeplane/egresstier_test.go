@@ -42,7 +42,7 @@ func TestAListedTierIsNotLaunchedOnAnOlderNode(t *testing.T) {
 	t.Parallel()
 
 	req := archNode("n1-1")
-	req.Version = 37
+	req.Version = 38
 
 	p := listedPlane(t, req)
 
@@ -51,8 +51,8 @@ func TestAListedTierIsNotLaunchedOnAnOlderNode(t *testing.T) {
 
 	err := p.NewRunner().Launch(ctx, testLease(), dispatch.Job{RequestID: 7})
 	if !errors.Is(err, ErrNoNode) || !strings.Contains(err.Error(), "egress allowlist") ||
-		!strings.Contains(err.Error(), "wire 37") ||
-		!strings.Contains(err.Error(), "an allowlist needs 38") {
+		!strings.Contains(err.Error(), "wire 38") ||
+		!strings.Contains(err.Error(), "an allowlist needs 39") {
 		t.Fatalf("launch = %v, want ErrNoNode naming the allowlist and the wire", err)
 	}
 
@@ -98,7 +98,7 @@ func TestAnOpenTierIsStillLaunchedOnAnOlderNode(t *testing.T) {
 	tier.Network = nil
 
 	req := archNode("n1-1")
-	req.Version = 37
+	req.Version = 38
 
 	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
 		WithTierCatalog([]config.Tier{tier}), WithRegistrar(&recordingRegistrar{}),
@@ -144,7 +144,7 @@ func TestAnOlderProcessDoesNotTakeAListedLaunchQueuedBeforeIt(t *testing.T) {
 	waitForQueued(t, p, "n1")
 
 	older := archNode("n1-2")
-	older.Version = 37
+	older.Version = 38
 
 	if _, err := p.Register(t.Context(), older); err != nil {
 		t.Fatalf("re-register: %v", err)

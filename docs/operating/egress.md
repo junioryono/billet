@@ -1,6 +1,6 @@
 # Naming and restricting where jobs connect
 
-A node can tell you which names a job's traffic went to, and a tier can say which names its jobs may reach. Both are enforced and recorded on the host, because a job is root in its guest. Firecracker tiers only. The decision is [ADR-023](../reference/decisions/adr-023-host-enforced-egress.md).
+A node can tell you which names a job's traffic went to, and a tier can say which names its jobs may reach. Both are enforced and recorded on the host, because a job is root in its guest. Firecracker tiers only. The decision is [ADR-024](../reference/decisions/adr-024-host-enforced-egress.md).
 
 ## Names
 
@@ -76,7 +76,7 @@ complete   yes
 
 ## Before the first list
 
-1. **Upgrade every node and then the control plane's tiers.** A listed tier is refused to a node older than wire 38, which would ignore the block and run the job open; the job waits for a node that can honour it.
+1. **Upgrade every node and then the control plane's tiers.** A listed tier is refused to a node older than wire 39, which would ignore the block and run the job open; the job waits for a node that can honour it.
 2. **Converge the host role** from the same release. It adds one rule to the guest firewall, so redirected DNS is not dropped, and that is a change to guest networking, which drains the node once.
 3. **Run `billet check`**, as root. The `egress` line says whether this host can apply a list, or why not, and it fails the check if a tier here has one and it cannot.
 
@@ -90,7 +90,7 @@ Read what the job was refused in `billet jobs show <lease>`: a name in `refused`
 
 **A stock guest asks for things of its own.** Before a job's first step, the Ubuntu runner image asks for `ntp.ubuntu.com` (160 times in the minute measured), `entropy.ubuntu.com`, `api.snapcraft.io` and `registry.npmjs.org`. Those appear in `refused` on a job that succeeded; list them only if a job needs them.
 
-**A shared address is shared.** If a listed name resolves to a CDN's address, that address is open to the job for any site it serves, and the list cannot tell them apart. See [what a list does not do](../reference/decisions/adr-023-host-enforced-egress.md#what-this-does-not-do).
+**A shared address is shared.** If a listed name resolves to a CDN's address, that address is open to the job for any site it serves, and the list cannot tell them apart. See [what a list does not do](../reference/decisions/adr-024-host-enforced-egress.md#what-this-does-not-do).
 
 ## If something removes the rules
 
