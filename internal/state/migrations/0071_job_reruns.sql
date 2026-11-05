@@ -20,6 +20,11 @@
 -- SQLite cannot extend a column CHECK in place. rerun_attempt is the attempt the
 -- job was part of when it was decided, zero for none; GitHub numbers them from 1.
 --
+-- rerun_tiers is when each tier started asking. A tier that opts in is about the
+-- jobs that end from then on: a job a tier did not ask about when it went red is
+-- not re-run hours later because an operator changed the config, and a tier that
+-- stops asking loses its row, so asking again starts again.
+--
 -- The index serves the metric, which reads the decisions of the last day, and is
 -- partial because a decision is rare.
 --
@@ -39,6 +44,13 @@ CREATE TABLE job_reruns (
     settled_at TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo, run_id, run_attempt)
+) STRICT
+-- +billet:end
+
+-- +billet:statement
+CREATE TABLE rerun_tiers (
+    tier TEXT PRIMARY KEY NOT NULL,
+    asked_since TEXT NOT NULL
 ) STRICT
 -- +billet:end
 

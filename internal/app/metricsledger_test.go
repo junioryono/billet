@@ -547,6 +547,17 @@ func TestTheRerunGaugeReadsTheDecisions(t *testing.T) {
 		t.Errorf("samples = %+v", got)
 	}
 
+	// THE WINDOW RUNS BACK FROM THE SCRAPE: an hour before it closes, both still count.
+	closing := ledgerSnapshot(a, []config.Tier{tier}, func() time.Time { return now.Add(jobRerunWindow - time.Hour) })
+
+	snap, err = closing(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snap[familyJobReruns]; len(got) != 1 || got[0].Value != 2 {
+		t.Errorf("an hour before the day ends = %+v", got)
+	}
+
 	later := ledgerSnapshot(a, []config.Tier{tier}, func() time.Time { return now.Add(jobRerunWindow + time.Hour) })
 
 	snap, err = later(t.Context())

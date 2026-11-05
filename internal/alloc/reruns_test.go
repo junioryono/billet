@@ -2,6 +2,7 @@ package alloc
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -82,6 +83,7 @@ func TestOnlyAJobOfACauseThatRanAndWentRedIsACandidate(t *testing.T) {
 
 	for _, r := range []rerunRow{
 		{lease: "node-forgotten", disruption: string(DisruptionNodeForgotten)},
+		{lease: "held-past-limit", disruption: string(DisruptionHeldPastLimit)},
 		{lease: "another-word", disruption: "something-newer"},
 		{lease: "succeeded", result: resultSucceeded},
 		{lease: "already-decided", decision: string(RerunUnproven)},
@@ -115,7 +117,7 @@ func TestOnlyAJobOfACauseThatRanAndWentRedIsACandidate(t *testing.T) {
 	seedRerunRow(t, a, rerunRow{lease: "assigned-run"})
 	exec(`UPDATE job_history SET github_run_id = 0, run_id = 44 WHERE lease_id = $1`, "assigned-run")
 
-	got, err := a.RerunCandidates(t.Context(), time.Now().Add(-48*time.Hour), 100)
+	got, err := a.RerunCandidates(t.Context(), time.Now().Add(-48*time.Hour), RerunCursor{}, 100)
 	if err != nil {
 		t.Fatalf("RerunCandidates: %v", err)
 	}
@@ -125,13 +127,13 @@ func TestOnlyAJobOfACauseThatRanAndWentRedIsACandidate(t *testing.T) {
 		byLease[c.LeaseID] = c
 	}
 
-	want := []string{"cause-held-past-limit", "cause-reclaimed", "cause-guest-absent", "assigned-run"}
+	want := []string{"cause-reclaimed", "cause-guest-absent", "assigned-run"}
 	for _, lease := range want {
 		if _, ok := byLease[lease]; !ok {
 			t.Errorf("%s is not a candidate", lease)
 		}
 	}
-	for _, lease := range []string{"node-forgotten", "another-word", "succeeded", "already-decided", "too-old",
+	for _, lease := range []string{"node-forgotten", "held-past-limit", "another-word", "succeeded", "already-decided", "too-old",
 		"never-started", "no-result", "no-disruption", "no-job", "no-repo", "no-run"} {
 		if _, ok := byLease[lease]; ok {
 			t.Errorf("%s is a candidate", lease)
@@ -151,8 +153,9 @@ func TestOnlyAJobOfACauseThatRanAndWentRedIsACandidate(t *testing.T) {
 	}
 }
 
-// THE LIST OF CAUSES IS WRITTEN DOWN IN ONE PLACE, and the issue's own words are
-// held to it: a host that merely went silent may still be running the job.
+// THE LIST OF CAUSES IS WRITTEN DOWN IN ONE PLACE, and held to it: a host that merely
+// went silent may still be running the job, and a custody bound is an operator's
+// choice that a job which hangs would meet again.
 func TestTheCausesAreTheClosedList(t *testing.T) {
 	t.Parallel()
 
@@ -160,33 +163,117 @@ func TestTheCausesAreTheClosedList(t *testing.T) {
 		if !cause.Valid() {
 			t.Errorf("%q is not a token billet writes", cause)
 		}
-		if cause == DisruptionNodeForgotten {
-			t.Error("a host that went silent may still be running the job, so it is not proof")
+		if cause == DisruptionNodeForgotten || cause == DisruptionHeldPastLimit {
+			t.Errorf("%q is not proof billet's infrastructure ended a job", cause)
 		}
 	}
-	if len(RerunCauses) != 3 {
+	if len(RerunCauses) != 2 {
 		t.Errorf("there are %d causes; a new one is a decision for ADR-023", len(RerunCauses))
 	}
 }
 
-// THE LIST IS NEWEST FIRST AND BOUNDED, and a limit that could not bound it is refused.
-func TestRerunCandidatesAreNewestFirstAndBounded(t *testing.T) {
+// THE LIST IS NEWEST FIRST, PAGED FROM ITS CURSOR TO THE END, and a limit that could
+// not bound it is refused. Two rows sharing a result time are told apart by lease.
+func TestRerunCandidatesArePagedNewestFirst(t *testing.T) {
 	t.Parallel()
 
 	a := newRerunAllocator(t)
 	now := time.Now()
 	seedRerunRow(t, a, rerunRow{lease: "old", resultAt: now.Add(-3 * time.Hour)})
-	seedRerunRow(t, a, rerunRow{lease: "new", resultAt: now.Add(-time.Hour)})
+	seedRerunRow(t, a, rerunRow{lease: "new-b", resultAt: now.Add(-time.Hour)})
+	seedRerunRow(t, a, rerunRow{lease: "new-a", resultAt: now.Add(-time.Hour)})
 
-	got, err := a.RerunCandidates(t.Context(), now.Add(-48*time.Hour), 1)
-	if err != nil {
-		t.Fatalf("RerunCandidates: %v", err)
+	var (
+		seen   []string
+		cursor RerunCursor
+	)
+	for range 5 {
+		page, err := a.RerunCandidates(t.Context(), now.Add(-48*time.Hour), cursor, 1)
+		if err != nil {
+			t.Fatalf("RerunCandidates: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		seen = append(seen, page[0].LeaseID)
+		cursor = page[0].Cursor
 	}
-	if len(got) != 1 || got[0].LeaseID != "new" {
-		t.Errorf("got %+v, want only the newest", got)
+	if fmt.Sprint(seen) != "[new-b new-a old]" {
+		t.Errorf("pages = %v", seen)
 	}
-	if _, err := a.RerunCandidates(t.Context(), now, 0); err == nil {
+
+	if _, err := a.RerunCandidates(t.Context(), now, RerunCursor{}, 0); err == nil {
 		t.Error("a limit of 0 was accepted")
+	}
+}
+
+// A JOB A REQUEST IN DOUBT COVERS SAYS SO, which is what keeps it from expiring.
+func TestACandidateSaysItsRequestInDoubt(t *testing.T) {
+	t.Parallel()
+
+	a := newRerunAllocator(t)
+	seedRerunRow(t, a, rerunRow{lease: "bound"})
+	if err := a.BeginRerun(t.Context(), RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 3,
+		Kind: RerunFailedJobs}, []string{"bound"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := a.RerunCandidates(t.Context(), time.Now().Add(-48*time.Hour), RerunCursor{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Bound != 3 {
+		t.Errorf("candidates = %+v", got)
+	}
+
+	open, err := a.OpenReruns(t.Context(), OpenRerunCursor{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tiers, err := a.BoundRerunTiers(t.Context(), open[0].RerunRequest); err != nil ||
+		fmt.Sprint(tiers) != "[billet-2vcpu]" {
+		t.Errorf("the bound tiers = %v, %v", tiers, err)
+	}
+	if len(open) != 1 || open[0].Attempt != 3 || open[0].RunID != 31 ||
+		open[0].Repository != "acme/api" || open[0].Kind != RerunFailedJobs || open[0].Tries != 1 {
+		t.Errorf("open = %+v", open)
+	}
+
+	if err := a.SettleRerun(t.Context(), open[0].RerunRequest, RerunRequested, ""); err != nil {
+		t.Fatal(err)
+	}
+	if open, err := a.OpenReruns(t.Context(), OpenRerunCursor{}, 10); err != nil || len(open) != 0 {
+		t.Errorf("after settling, open = %+v, %v", open, err)
+	}
+}
+
+// A TIER'S ASKING STARTS ONCE AND IS KEPT, a tier that stops loses it, and asking again
+// starts again.
+func TestATiersAskingIsKeptUntilItStops(t *testing.T) {
+	t.Parallel()
+
+	clock := &struct{ now time.Time }{now: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)}
+	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, []config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu:24.04",
+	}}, WithClock(func() time.Time { return clock.now }))
+	first := clock.now
+
+	asked, err := a.AskReruns(t.Context(), []string{"a", "b"})
+	if err != nil || len(asked) != 2 || !asked["a"].Equal(first) {
+		t.Fatalf("asked = %v, %v", asked, err)
+	}
+
+	clock.now = clock.now.Add(time.Hour)
+	asked, err = a.AskReruns(t.Context(), []string{"a"})
+	if err != nil || len(asked) != 1 || !asked["a"].Equal(first) {
+		t.Fatalf("after b stopped = %v, %v", asked, err)
+	}
+
+	clock.now = clock.now.Add(time.Hour)
+	asked, err = a.AskReruns(t.Context(), []string{"a", "b"})
+	if err != nil || !asked["a"].Equal(first) || !asked["b"].Equal(clock.now) {
+		t.Errorf("after b asked again = %v, %v", asked, err)
 	}
 }
 
@@ -213,7 +300,7 @@ func TestARerunDecisionIsWrittenOnce(t *testing.T) {
 		t.Errorf("job = decision %q, attempt %d, at %q", rec.RerunDecision, rec.RerunAttempt, rec.RerunDecidedAt)
 	}
 
-	got, err := a.RerunCandidates(t.Context(), time.Now().Add(-48*time.Hour), 10)
+	got, err := a.RerunCandidates(t.Context(), time.Now().Add(-48*time.Hour), RerunCursor{}, 10)
 	if err != nil {
 		t.Fatalf("RerunCandidates: %v", err)
 	}
@@ -274,12 +361,12 @@ func TestSettlingARequestRecordsItOnItsJobsAndCountsIt(t *testing.T) {
 
 	for _, tc := range []struct {
 		name     string
-		accepted bool
 		decision RerunDecision
 		counted  int64
 	}{
-		{"accepted", true, RerunRequested, 1},
-		{"never accepted", false, RerunFailed, 0},
+		{"accepted", RerunRequested, 1},
+		{"never accepted", RerunFailed, 0},
+		{"refused by a lowered limit", RerunLimit, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -305,7 +392,7 @@ func TestSettlingARequestRecordsItOnItsJobsAndCountsIt(t *testing.T) {
 				}
 			}
 
-			if err := a.SettleRerun(t.Context(), request, tc.accepted, "GitHub said no"); err != nil {
+			if err := a.SettleRerun(t.Context(), request, tc.decision, "GitHub said no"); err != nil {
 				t.Fatalf("SettleRerun: %v", err)
 			}
 
@@ -329,20 +416,32 @@ func TestSettlingARequestRecordsItOnItsJobsAndCountsIt(t *testing.T) {
 				t.Errorf("a settled request is still in doubt: %v, %v", doubted, err)
 			}
 
-			got, asked, err := a.RerunOfAttempt(t.Context(), "acme/api", 31, 2)
-			if err != nil || !asked || got != tc.decision {
-				t.Errorf("RerunOfAttempt = %q, %v, %v, want %q", got, asked, err, tc.decision)
+			want := tc.decision
+			if want == RerunLimit {
+				want = RerunFailed
 			}
-			if _, asked, err := a.RerunOfAttempt(t.Context(), "acme/api", 31, 3); err != nil || asked {
+			got, kind, asked, err := a.RerunOfAttempt(t.Context(), "acme/api", 31, 2)
+			if err != nil || !asked || got != want || kind != RerunOneJob {
+				t.Errorf("RerunOfAttempt = %q, %q, %v, %v, want %q of one job", got, kind, asked, err, want)
+			}
+			if _, _, asked, err := a.RerunOfAttempt(t.Context(), "acme/api", 31, 3); err != nil || asked {
 				t.Errorf("an attempt never asked about = %v, %v", asked, err)
 			}
 
-			// A SETTLED REQUEST'S ANSWER STANDS, whatever comes after.
-			if err := a.SettleRerun(t.Context(), request, !tc.accepted, "too late"); err != nil {
+			// A SETTLED REQUEST'S ANSWER STANDS, whatever comes after, on the row and on
+			// the job.
+			other := RerunRequested
+			if tc.decision == RerunRequested {
+				other = RerunFailed
+			}
+			if err := a.SettleRerun(t.Context(), request, other, "too late"); err != nil {
 				t.Fatalf("a second settlement: %v", err)
 			}
 			if count, err := a.RunReruns(t.Context(), "acme/api", 31); err != nil || count != tc.counted {
 				t.Errorf("after a second settlement RunReruns = %d, %v", count, err)
+			}
+			if rec, err := a.Job(t.Context(), "bound"); err != nil || rec.RerunDecision != tc.decision {
+				t.Errorf("after a second settlement the job = %q, %v", rec.RerunDecision, err)
 			}
 		})
 	}
@@ -359,7 +458,7 @@ func TestAcceptedRerunsAreCountedAcrossAttempts(t *testing.T) {
 		if err := a.BeginRerun(t.Context(), request, nil); err != nil {
 			t.Fatalf("BeginRerun: %v", err)
 		}
-		if err := a.SettleRerun(t.Context(), request, true, ""); err != nil {
+		if err := a.SettleRerun(t.Context(), request, RerunRequested, ""); err != nil {
 			t.Fatalf("SettleRerun: %v", err)
 		}
 	}
@@ -429,5 +528,107 @@ func TestTheFailuresReportCarriesTheDecision(t *testing.T) {
 	}
 	if len(failures) != 1 || failures[0].RerunDecision != RerunMixed || failures[0].RerunAttempt != 2 {
 		t.Errorf("failures = %+v", failures)
+	}
+}
+
+// A SETTLEMENT REACHES A JOB WHOSE RUN IS ITS ASSIGNED ONE, which a row written before
+// the run that started was recorded has, as ListJobsOfRun reads it.
+func TestASettlementReachesAJobByItsAssignedRun(t *testing.T) {
+	t.Parallel()
+
+	a := newRerunAllocator(t)
+	seedRerunRow(t, a, rerunRow{lease: "assigned"})
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET github_run_id = 0, run_id = 31 WHERE lease_id = 'assigned'`)
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	request := RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: RerunFailedJobs}
+	if err := a.BeginRerun(t.Context(), request, []string{"assigned"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SettleRerun(t.Context(), request, RerunRequested, ""); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := a.Job(t.Context(), "assigned"); err != nil || rec.RerunDecision != RerunRequested {
+		t.Errorf("the job = %q, %v", rec.RerunDecision, err)
+	}
+}
+
+// THE REQUESTS IN DOUBT ARE PAGED IN THE ORDER THEY WERE MADE, each once, and a
+// settled one is not among them.
+func TestOpenRerunsArePagedOldestFirst(t *testing.T) {
+	t.Parallel()
+
+	a := newRerunAllocator(t)
+	for _, run := range []int64{31, 32, 33} {
+		if err := a.BeginRerun(t.Context(), RerunRequest{Repository: "acme/api", RunID: run, Attempt: 1,
+			Kind: RerunFailedJobs}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settled := RerunRequest{Repository: "acme/api", RunID: 34, Attempt: 1, Kind: RerunFailedJobs}
+	if err := a.BeginRerun(t.Context(), settled, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SettleRerun(t.Context(), settled, RerunRequested, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		seen   []int64
+		cursor OpenRerunCursor
+	)
+	for range 5 {
+		page, err := a.OpenReruns(t.Context(), cursor, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		seen = append(seen, page[0].RunID)
+		cursor = page[0].Cursor
+	}
+	if fmt.Sprint(seen) != "[31 32 33]" {
+		t.Errorf("pages = %v", seen)
+	}
+}
+
+// A REQUEST'S TIERS ARE THOSE OF THE JOBS IT STILL COVERS: a job of its attempt decided
+// some other way is not one it is limited by.
+func TestABoundTierIsOneOfAnUndecidedJob(t *testing.T) {
+	t.Parallel()
+
+	a := newRerunAllocator(t)
+	seedRerunRow(t, a, rerunRow{lease: "covered"})
+	seedRerunRow(t, a, rerunRow{lease: "decided"})
+	if err := a.RecordRerunDecision(t.Context(), "decided", RerunUnproven, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET tier = 'other' WHERE lease_id = 'decided'`)
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	request := RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 2, Kind: RerunOneJob, JobID: 7}
+	if err := a.BeginRerun(t.Context(), request, []string{"covered"}); err != nil {
+		t.Fatal(err)
+	}
+
+	tiers, err := a.BoundRerunTiers(t.Context(), request)
+	if err != nil || fmt.Sprint(tiers) != "[billet-2vcpu]" {
+		t.Errorf("tiers = %v, %v", tiers, err)
+	}
+
+	got, err := a.RunRerunCandidates(t.Context(), "acme/api", 31, 10)
+	if err != nil || len(got) != 1 || got[0].LeaseID != "covered" || got[0].Bound != 2 {
+		t.Errorf("the run's candidates = %+v, %v", got, err)
 	}
 }

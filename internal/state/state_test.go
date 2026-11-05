@@ -1136,6 +1136,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 			`ALTER TABLE job_history DROP COLUMN rerun_decided_at`,
 			`ALTER TABLE job_history DROP COLUMN rerun_attempt`,
 			`DROP TABLE job_reruns`,
+			`DROP TABLE rerun_tiers`,
 			`ALTER TABLE nodes DROP COLUMN architectures`,
 			`ALTER TABLE leases DROP COLUMN npm_cache`,
 			`ALTER TABLE job_history DROP COLUMN npm_cache`,

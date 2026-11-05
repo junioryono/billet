@@ -281,6 +281,49 @@ func TestRerunColumnSaysWhatWasDecided(t *testing.T) {
 	}
 }
 
+// THE REPORT CARRIES WHAT WAS DECIDED ABOUT A JOB, from the ledger, on the job's row:
+// the decision is the third fact beside GitHub's and billet's.
+func TestLeaseFailuresShowsTheRerunDecision(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeCAConfig(t, stateDir)
+	lease := seedAttributedFailure(t, stateDir, "failed", 77)
+
+	db, err := state.Open(t.Context(), stateDir)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, []config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu:24.04",
+	}})
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+	if err := a.RecordRerunDecision(t.Context(), lease, alloc.RerunUnproven, 1); err != nil {
+		t.Fatalf("RecordRerunDecision: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the ledger: %v", err)
+	}
+
+	out := capture(t, func() {
+		if err := Leases(t.Context(), processEnv(), []string{"failures", "--config", cfg}); err != nil {
+			t.Errorf("billet leases failures: %v", err)
+		}
+	})
+
+	var row string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, lease) {
+			row = line
+		}
+	}
+	if !strings.Contains(row, " unproven ") {
+		t.Errorf("the job's row does not carry its decision:\n%s", out)
+	}
+}
+
 // `billet jobs show` CARRIES IT TOO, with the attempt it was against.
 func TestDescribeFailureSaysTheRerun(t *testing.T) {
 	t.Parallel()

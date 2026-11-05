@@ -72,8 +72,10 @@ func (g *githubRuns) serve(w http.ResponseWriter, r *http.Request) {
 	defer g.mu.Unlock()
 
 	parts := strings.Split(r.URL.Path, "/")
-	id := func(segment int) int64 {
-		n, err := strconv.ParseInt(parts[segment], 10, 64)
+	// `/api/v3/repos/{owner}/{repository}/actions/{runs|jobs}/{id}[/{what}]`: the id
+	// is the ninth segment.
+	id := func() int64 {
+		n, err := strconv.ParseInt(parts[8], 10, 64)
 		if err != nil {
 			g.t.Errorf("%s: %v", r.URL.Path, err)
 		}
@@ -81,23 +83,22 @@ func (g *githubRuns) serve(w http.ResponseWriter, r *http.Request) {
 		return n
 	}
 
-	// `/api/v3/repos/{owner}/{repository}/actions/{runs|jobs}/{id}[/{what}]`
 	switch tail := parts[7:]; {
 	case r.Method == http.MethodGet && len(tail) == 2 && tail[0] == "runs":
-		run := id(8)
+		run := id()
 		fakeactions.WriteJSON(g.t, w, map[string]any{"id": run, "status": g.status[run], "run_attempt": g.attempt[run]})
 	case r.Method == http.MethodGet && len(tail) == 3 && tail[0] == "runs" && tail[2] == "jobs":
-		jobs := g.jobs[id(8)]
+		jobs := g.jobs[id()]
 		fakeactions.WriteJSON(g.t, w, map[string]any{"total_count": len(jobs), "jobs": jobs})
 	case r.Method == http.MethodPost && len(tail) == 3 && tail[0] == "runs" && tail[2] == "rerun-failed-jobs":
-		run := id(8)
+		run := id()
 		g.failed[run]++
 		// MEASURED: the run is `queued` on its attempt from the moment GitHub accepts.
 		g.status[run] = "queued"
 		w.WriteHeader(http.StatusCreated)
 		fakeactions.WriteJSON(g.t, w, map[string]any{})
 	case r.Method == http.MethodPost && len(tail) == 3 && tail[0] == "jobs" && tail[2] == "rerun":
-		g.oneJob[id(8)]++
+		g.oneJob[id()]++
 		w.WriteHeader(http.StatusCreated)
 		fakeactions.WriteJSON(g.t, w, map[string]any{})
 	default:
@@ -252,8 +253,10 @@ func TestADisruptedJobIsRerunOnceAndOneThatFailedOnItsOwnIsLeftAlone(t *testing.
 		record: func(runner string) { runs.record(602, 1, 7002, runner, ownFailureSteps) }})
 	awaitRerunDecision(t, s, own, alloc.RerunUnproven)
 
-	// AND A JOB BILLET DID NOTHING TO, which is never even read about.
-	plain := runJobToItsEnd(t, s, redJob{request: 6003, run: 603})
+	// AND A JOB BILLET DID NOTHING TO, whose run GitHub records as a lost runner's: no
+	// disruption, so it is never even read about.
+	plain := runJobToItsEnd(t, s, redJob{request: 6003, run: 603,
+		record: func(runner string) { runs.record(603, 1, 7003, runner, lostRunnerSteps) }})
 	last := runJobToItsEnd(t, s, redJob{request: 6004, run: 604, disrupt: reclaim(t, s),
 		record: func(runner string) { runs.record(604, 1, 7004, runner, ownFailureSteps) }})
 	awaitRerunDecision(t, s, last, alloc.RerunUnproven)
@@ -270,6 +273,9 @@ func TestADisruptedJobIsRerunOnceAndOneThatFailedOnItsOwnIsLeftAlone(t *testing.
 		if got := runs.requests(run); got != want {
 			t.Errorf("run %d: %d requests, want %d", run, got, want)
 		}
+	}
+	if calls := s.plane.Calls("/actions/runs/603"); len(calls) != 0 {
+		t.Errorf("the run of a job billet did nothing to was read: %+v", calls)
 	}
 	if calls := s.plane.Calls("/rerun"); len(calls) != 1 {
 		t.Errorf("%d re-run requests reached GitHub, want 1: %+v", len(calls), calls)

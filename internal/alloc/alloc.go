@@ -393,6 +393,9 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: %w",
 				errors.Join(t.ImageOptionErrors(fmt.Sprintf("tier %q", t.Label))...))
 
+		case len(t.RetryErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
+			return nil, fmt.Errorf("alloc: %w",
+				errors.Join(t.RetryErrors(fmt.Sprintf("tier %q", t.Label))...))
 		case len(t.GuestOSProviderErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
 			return nil, fmt.Errorf("alloc: %w",
 				errors.Join(t.GuestOSProviderErrors(fmt.Sprintf("tier %q", t.Label))...))

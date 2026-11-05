@@ -4,12 +4,13 @@
 -- name: ListRerunCandidates :many
 -- The jobs that ended red on a lease a cause from the closed list disrupted, that
 -- GitHub saw start, and that no re-run decision has been recorded for yet. Newest
--- result first and bounded, so a backlog loses its oldest, which are also the
--- ones past their window.
+-- result first and paged from a cursor, (before_result, before_lease), the last
+-- row of the page before, an empty before_result being the newest: the rows of a
+-- tier that does not ask are never decided, so a page they fill is paged past.
 --
 -- `disruption != ''` IS WRITTEN OUT so the planner can use the partial index
 -- migration 35 made for this table's rare rows: it does not derive that from the
--- list. The three causes are parameters so the one list is alloc's.
+-- list. The causes are parameters so the one list is alloc's.
 --
 -- STARTED, because `launching` admits a disruption to a lease whose guest never
 -- ran a job, and a job that never ran has nothing to re-run.
@@ -18,18 +19,77 @@
 SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       disruption, result_at
+       disruption, result_at, rerun_attempt
   FROM job_history
  WHERE disruption != ''
-   AND disruption IN (CAST(@cause_one AS TEXT), CAST(@cause_two AS TEXT), CAST(@cause_three AS TEXT))
+   AND disruption IN (CAST(@cause_one AS TEXT), CAST(@cause_two AS TEXT))
    AND started_at IS NOT NULL
    AND result != '' AND result != @succeeded
    AND result_at >= @since
    AND rerun_decision = ''
    AND github_job_id != '' AND COALESCE(repo, '') != ''
    AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
+   AND (CAST(@before_result AS TEXT) = ''
+        OR result_at < CAST(@before_result AS TEXT)
+        OR (result_at = CAST(@before_result AS TEXT) AND lease_id < CAST(@before_lease AS TEXT)))
  ORDER BY result_at DESC, lease_id DESC
  LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ListOpenReruns :many
+-- The requests that may have landed, whatever became of the jobs that made them,
+-- oldest first and paged from a cursor, (after_created, after_repo, after_run), the
+-- last row of the page before, an empty after_created being the oldest. Paged so a
+-- request waiting on a long run is passed rather than read before every other.
+SELECT repo, run_id, run_attempt, kind, github_job_id, tries, created_at
+  FROM job_reruns
+ WHERE state = 'asking'
+   AND (CAST(@after_created AS TEXT) = ''
+        OR created_at > CAST(@after_created AS TEXT)
+        OR (created_at = CAST(@after_created AS TEXT)
+            AND (repo > CAST(@after_repo AS TEXT)
+                 OR (repo = CAST(@after_repo AS TEXT) AND run_id > CAST(@after_run AS BIGINT)))))
+ ORDER BY created_at, repo, run_id
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ListBoundRerunTiers :many
+-- The tiers of the jobs one request covers and that it has not yet decided: which
+-- Apps can read its run, and whose limits it must still fit.
+SELECT DISTINCT tier FROM job_history
+ WHERE COALESCE(repo, '') = CAST(@repo AS TEXT) AND rerun_attempt = @run_attempt AND rerun_decision = ''
+   AND (github_run_id = @run_id OR (github_run_id = 0 AND run_id = @run_id))
+ ORDER BY tier;
+
+-- name: ListRerunCandidatesOfRun :many
+-- ListRerunCandidates for one run, every candidate of it, which is what a run is
+-- decided from: the pages that brought the run up may not have held all of them.
+SELECT lease_id, tier, COALESCE(repo, '') AS repo,
+       CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
+            AS BIGINT) AS run_id,
+       disruption, result_at, rerun_attempt
+  FROM job_history
+ WHERE (github_run_id = @run_id OR (github_run_id = 0 AND run_id = @run_id))
+   AND COALESCE(repo, '') = CAST(@repo AS TEXT)
+   AND disruption != ''
+   AND disruption IN (CAST(@cause_one AS TEXT), CAST(@cause_two AS TEXT))
+   AND started_at IS NOT NULL
+   AND result != '' AND result != @succeeded
+   AND rerun_decision = ''
+   AND github_job_id != ''
+ ORDER BY result_at DESC, lease_id DESC
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: AskRerunsForTier :exec
+-- Record when a tier started asking, and keep the first time.
+INSERT INTO rerun_tiers (tier, asked_since) VALUES (@tier, @asked_since)
+ON CONFLICT (tier) DO NOTHING;
+
+-- name: ListRerunTiers :many
+-- Every tier that asks, and since when.
+SELECT tier, asked_since FROM rerun_tiers ORDER BY tier;
+
+-- name: ForgetRerunTier :exec
+-- A tier that stopped asking, so asking again starts from then.
+DELETE FROM rerun_tiers WHERE tier = @tier;
 
 -- name: ReadOpenRerun :one
 -- The request of one run that may have landed, newest attempt first. sql.ErrNoRows
@@ -41,10 +101,10 @@ SELECT run_attempt, kind, github_job_id, tries
  LIMIT 1;
 
 -- name: ReadRerunOfAttempt :one
--- How the request about one attempt of a run ended. sql.ErrNoRows is an attempt
--- not asked about; a job that finished late finds here what its attempt's request
--- already came to, since the key allows that attempt no second one.
-SELECT state FROM job_reruns
+-- How the request about one attempt of a run ended, and what it asked for.
+-- sql.ErrNoRows is an attempt not asked about; a job that finished late finds here
+-- what its attempt's request came to, since the key allows that attempt no second.
+SELECT state, kind FROM job_reruns
  WHERE repo = @repo AND run_id = @run_id AND run_attempt = @run_attempt;
 
 -- name: CountRunReruns :one

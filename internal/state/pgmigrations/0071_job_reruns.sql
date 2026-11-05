@@ -22,6 +22,13 @@ CREATE TABLE job_reruns (
 -- +billet:end
 
 -- +billet:statement
+CREATE TABLE rerun_tiers (
+    tier text PRIMARY KEY NOT NULL,
+    asked_since text NOT NULL
+);
+-- +billet:end
+
+-- +billet:statement
 ALTER TABLE job_history ADD COLUMN rerun_decision text NOT NULL DEFAULT '';
 -- +billet:end
 

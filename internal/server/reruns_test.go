@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -15,9 +17,13 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
-const rerunTier = "billet-4vcpu-a"
+const (
+	rerunTier  = "billet-4vcpu-a"
+	rerunTierB = "billet-4vcpu-b"
+)
 
-// rerunGitHub answers what a test says GitHub would, and keeps every request.
+// rerunGitHub answers what a test says GitHub would, and keeps every request with
+// the repository it named.
 type rerunGitHub struct {
 	*fakeProvisioner
 
@@ -28,7 +34,7 @@ type rerunGitHub struct {
 	reads     int
 	failedAsk []int64
 	jobAsk    []int64
-	owners    []string
+	asks      []string
 	// remaining and limit are the installation's REST budget, when limit is set.
 	remaining, limit int64
 	// onAsk runs inside a request, for a run whose state a request changes.
@@ -40,16 +46,19 @@ func (g *rerunGitHub) LatestAttempt(_ context.Context, owner, repository string,
 	defer g.mu.Unlock()
 
 	g.reads++
-	g.owners = append(g.owners, owner+"/"+repository)
+	if owner != "acme" || repository != "api" {
+		return RunAttempt{}, fmt.Errorf("read %s/%s", owner, repository)
+	}
 
 	return g.attempt, g.readErr
 }
 
-func (g *rerunGitHub) RerunFailedJobs(_ context.Context, _, _ string, runID int64) error {
+func (g *rerunGitHub) RerunFailedJobs(_ context.Context, owner, repository string, runID int64) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	g.failedAsk = append(g.failedAsk, runID)
+	g.asks = append(g.asks, owner+"/"+repository)
 	if g.onAsk != nil {
 		g.onAsk(g)
 	}
@@ -57,11 +66,12 @@ func (g *rerunGitHub) RerunFailedJobs(_ context.Context, _, _ string, runID int6
 	return g.askErr
 }
 
-func (g *rerunGitHub) RerunJob(_ context.Context, _, _ string, jobID int64) error {
+func (g *rerunGitHub) RerunJob(_ context.Context, owner, repository string, jobID int64) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	g.jobAsk = append(g.jobAsk, jobID)
+	g.asks = append(g.asks, owner+"/"+repository)
 	if g.onAsk != nil {
 		g.onAsk(g)
 	}
@@ -81,7 +91,8 @@ func (g *rerunGitHub) asked() int {
 }
 
 // rerunStack is a real allocator over a real ledger, seeded with red jobs, and the
-// loop's own pass driven at a clock the test holds.
+// loop's own pass driven at a clock the test holds. Its tiers asked for re-runs a
+// few days before the clock, so the jobs a test seeds are theirs.
 type rerunStack struct {
 	t       *testing.T
 	s       *Server
@@ -92,31 +103,49 @@ type rerunStack struct {
 	limits  map[string]int64
 	sweep   *rerunSweep
 	now     time.Time
+	ledger  *time.Time
 }
 
 func newRerunStack(t *testing.T) *rerunStack {
 	t.Helper()
 
 	db := openState(t)
-	tiers := []config.Tier{tier(rerunTier)}
-	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+	tiers := []config.Tier{tier(rerunTier), tier(rerunTierB)}
+	now := time.Now()
+	ledger := now.Add(-72 * time.Hour)
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithClock(func() time.Time { return ledger }))
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
 
 	github := &rerunGitHub{fakeProvisioner: &fakeProvisioner{}, attempt: RunAttempt{Completed: true, Attempt: 1}}
+	target := Target{Config: config.GitHubTarget{Name: "default", Org: "acme", InstallationID: 7}, Provisioner: github}
 
-	return &rerunStack{t: t, s: New(a, nil, tiers, "owner", nil), a: a, db: db, github: github,
-		targets: map[string]Target{rerunTier: {
-			Config:      config.GitHubTarget{Name: "default", Org: "acme", InstallationID: 7},
-			Provisioner: github,
-		}},
-		limits: map[string]int64{rerunTier: 1}, sweep: newRerunSweep(), now: time.Now()}
+	r := &rerunStack{t: t, s: New(a, nil, tiers, "owner", nil), a: a, db: db, github: github,
+		targets: map[string]Target{rerunTier: target, rerunTierB: target},
+		limits:  map[string]int64{rerunTier: 1}, sweep: newRerunSweep(), now: now, ledger: &ledger}
+
+	asked, err := a.AskReruns(t.Context(), []string{rerunTier, rerunTierB})
+	if err != nil {
+		t.Fatalf("AskReruns: %v", err)
+	}
+	r.sweep.asked = asked
+	ledger = now
+
+	return r
 }
 
-// job seeds one red job whose lease a cause on the list disrupted, its result in
-// the past by age.
+// job seeds one red job on rerunTier whose lease a cause on the list disrupted, its
+// result age before the clock.
 func (r *rerunStack) job(lease string, run int64, age time.Duration) {
+	r.t.Helper()
+
+	r.jobOn(rerunTier, lease, run, age)
+}
+
+func (r *rerunStack) jobOn(tier, lease string, run int64, age time.Duration) {
 	r.t.Helper()
 
 	at := stamp(r.now.Add(-age))
@@ -125,7 +154,7 @@ func (r *rerunStack) job(lease string, run int64, age time.Duration) {
 			(lease_id, tier, queued_at, started_at, repo, github_job_id, github_run_id,
 			 disruption, disrupted_at, result, result_at)
 			VALUES ($1, $2, $3, $3, 'acme/api', $4, $5, 'reclaimed', $3, 'failed', $3)`,
-			lease, rerunTier, at, "guid-"+lease, run)
+			lease, tier, at, "guid-"+lease, run)
 
 		return err
 	}); err != nil {
@@ -133,16 +162,31 @@ func (r *rerunStack) job(lease string, run int64, age time.Duration) {
 	}
 }
 
-// listed is a job of the attempt, on the runner a lease's name gives.
-func listed(lease string, id int64, lost, failed bool) AttemptJob {
-	return AttemptJob{ID: id, RunnerName: provider.InstanceName(lease), RunnerLost: lost, Failed: failed}
+// listed is a failed job of the attempt, on the runner a lease's name gives.
+func listed(lease string, id int64, lost bool) AttemptJob {
+	return AttemptJob{ID: id, RunnerName: provider.InstanceName(lease), RunnerLost: lost, Failed: true}
+}
+
+// lists is what GitHub says the run is now: completed on attempt, with these jobs,
+// each of the attempt unless it says otherwise.
+func (r *rerunStack) lists(attempt int64, jobs ...AttemptJob) {
+	for i := range jobs {
+		if jobs[i].Attempt == 0 {
+			jobs[i].Attempt = attempt
+		}
+	}
+
+	r.github.mu.Lock()
+	r.github.attempt = RunAttempt{Completed: true, Attempt: attempt, Jobs: jobs}
+	r.github.mu.Unlock()
 }
 
 func (r *rerunStack) pass() { r.s.rerunOnce(r.t.Context(), r.targets, r.limits, r.sweep, r.now) }
 
-// after moves the test's clock past every wait a pass could have left.
+// after moves the test's clock, and the ledger's with it.
 func (r *rerunStack) after(d time.Duration) *rerunStack {
 	r.now = r.now.Add(d)
+	*r.ledger = r.now
 
 	return r
 }
@@ -158,41 +202,48 @@ func (r *rerunStack) decision(lease string) alloc.RerunDecision {
 	return rec.RerunDecision
 }
 
-func (r *rerunStack) requestState(attempt int64) (state string, tries int64, detail string) {
+func (r *rerunStack) request(attempt int64) (settled string, tries int64, detail string) {
 	r.t.Helper()
 
 	if err := r.db.Reader().QueryRowContext(r.t.Context(),
 		`SELECT state, tries, detail FROM job_reruns WHERE repo = 'acme/api' AND run_id = 31 AND run_attempt = $1`,
-		attempt).Scan(&state, &tries, &detail); err != nil {
+		attempt).Scan(&settled, &tries, &detail); err != nil {
 		r.t.Fatalf("read the request of attempt %d: %v", attempt, err)
 	}
 
-	return state, tries, detail
+	return settled, tries, detail
 }
 
-// A JOB BILLET PROVED IT ENDED IS RE-RUN ONCE. The run's only failed job is proved, so
-// the whole request is exact; the job carries the outcome, and the next pass, with
-// nothing left undecided, asks nothing.
+func (r *rerunStack) reads() int {
+	r.github.mu.Lock()
+	defer r.github.mu.Unlock()
+
+	return r.github.reads
+}
+
+// A JOB BILLET PROVED IT ENDED IS RE-RUN ONCE, in its own repository. The run's only
+// failed job is proved, so the whole request is exact; the job carries the outcome,
+// and the next pass, with nothing left undecided, asks nothing.
 func TestAProvedJobIsRerunOnce(t *testing.T) {
 	t.Parallel()
 
 	r := newRerunStack(t)
 	r.job("lost", 31, 10*time.Minute)
-	r.github.attempt.Jobs = []AttemptJob{listed("lost", 77, true, true)}
+	r.lists(1, listed("lost", 77, true))
 
 	r.pass()
 
 	if len(r.github.failedAsk) != 1 || r.github.failedAsk[0] != 31 || len(r.github.jobAsk) != 0 {
 		t.Fatalf("asked failed-jobs %v, jobs %v, want run 31's failed jobs once", r.github.failedAsk, r.github.jobAsk)
 	}
-	if r.github.owners[0] != "acme/api" {
-		t.Errorf("read %q", r.github.owners[0])
+	if r.github.asks[0] != "acme/api" {
+		t.Errorf("asked about %q", r.github.asks[0])
 	}
 	if got := r.decision("lost"); got != alloc.RerunRequested {
 		t.Errorf("decision = %q", got)
 	}
-	if state, tries, _ := r.requestState(1); state != "requested" || tries != 1 {
-		t.Errorf("request = %s, %d tries", state, tries)
+	if got, tries, _ := r.request(1); got != "requested" || tries != 1 {
+		t.Errorf("request = %s, %d tries", got, tries)
 	}
 
 	r.after(time.Hour).pass()
@@ -209,7 +260,7 @@ func TestAJobWhoseRecordShowsItsOwnFailureIsLeftAlone(t *testing.T) {
 
 	r := newRerunStack(t)
 	r.job("own", 31, 10*time.Minute)
-	r.github.attempt.Jobs = []AttemptJob{listed("own", 77, false, true)}
+	r.lists(1, listed("own", 77, false))
 
 	r.pass()
 
@@ -222,37 +273,84 @@ func TestAJobWhoseRecordShowsItsOwnFailureIsLeftAlone(t *testing.T) {
 }
 
 // THE LIMIT HOLDS ACROSS ATTEMPTS. Attempt 1 was re-run; attempt 2 lost its runner
-// too, and a tier allowing one re-run leaves it red and says why.
+// too, and a tier allowing one re-run leaves it red and says why. A tier allowing two
+// asks again, so the refusal is the limit's.
 func TestTheLimitHoldsAcrossAttempts(t *testing.T) {
 	t.Parallel()
 
-	r := newRerunStack(t)
-	r.job("first", 31, 10*time.Minute)
-	r.github.attempt.Jobs = []AttemptJob{listed("first", 77, true, true)}
-	r.pass()
+	for _, tc := range []struct {
+		limit    int64
+		requests int
+		second   alloc.RerunDecision
+	}{
+		{1, 1, alloc.RerunLimit},
+		{2, 2, alloc.RerunRequested},
+	} {
+		t.Run(fmt.Sprint(tc.limit), func(t *testing.T) {
+			t.Parallel()
 
-	r.job("second", 31, 10*time.Minute)
-	r.github.attempt = RunAttempt{Completed: true, Attempt: 2, Jobs: []AttemptJob{listed("second", 88, true, true)}}
-	r.after(time.Hour).pass()
+			r := newRerunStack(t)
+			r.limits[rerunTier] = tc.limit
+			r.job("first", 31, 10*time.Minute)
+			r.lists(1, listed("first", 77, true))
+			r.pass()
 
-	if got := r.github.asked(); got != 1 {
-		t.Errorf("%d requests, want the limit's 1", got)
+			r.job("second", 31, 10*time.Minute)
+			r.lists(2, listed("second", 88, true))
+			r.after(time.Hour).pass()
+
+			if got := r.github.asked(); got != tc.requests {
+				t.Errorf("%d requests, want %d", got, tc.requests)
+			}
+			if got := r.decision("second"); got != tc.second {
+				t.Errorf("decision = %q, want %q", got, tc.second)
+			}
+		})
 	}
-	if got := r.decision("second"); got != alloc.RerunLimit {
-		t.Errorf("decision = %q", got)
-	}
+}
 
-	// AND A TIER ALLOWING TWO ASKS AGAIN, so the refusal above is the limit's.
-	r = newRerunStack(t)
-	r.limits[rerunTier] = 2
-	r.job("first", 31, 10*time.Minute)
-	r.github.attempt.Jobs = []AttemptJob{listed("first", 77, true, true)}
-	r.pass()
-	r.job("second", 31, 10*time.Minute)
-	r.github.attempt = RunAttempt{Completed: true, Attempt: 2, Jobs: []AttemptJob{listed("second", 88, true, true)}}
-	r.after(time.Hour).pass()
-	if got := r.github.asked(); got != 2 {
-		t.Errorf("%d requests, want 2 under a limit of 2", got)
+// THE LIMIT IS THE SMALLEST OF THE TIERS WHOSE JOBS A REQUEST WOULD RUN AGAIN. A run
+// already re-run once has room on a tier allowing two and none on one allowing one.
+func TestTheLimitIsThatOfTheJobsRerun(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		jobs     map[string]string
+		requests int
+		want     alloc.RerunDecision
+	}{
+		{"a job of the tier allowing two", map[string]string{"b": rerunTierB}, 2, alloc.RerunRequested},
+		{"jobs of both tiers", map[string]string{"a": rerunTier, "b": rerunTierB}, 1, alloc.RerunLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRerunStack(t)
+			r.limits[rerunTierB] = 2
+			r.job("first", 31, 10*time.Minute)
+			r.lists(1, listed("first", 77, true))
+			r.pass()
+
+			var jobs []AttemptJob
+			id := int64(100)
+			for lease, tier := range tc.jobs {
+				r.jobOn(tier, lease, 31, 10*time.Minute)
+				jobs = append(jobs, listed(lease, id, true))
+				id++
+			}
+			r.lists(2, jobs...)
+			r.after(time.Hour).pass()
+
+			if got := r.github.asked(); got != tc.requests {
+				t.Errorf("%d requests, want %d", got, tc.requests)
+			}
+			for lease := range tc.jobs {
+				if got := r.decision(lease); got != tc.want {
+					t.Errorf("%s = %q, want %q", lease, got, tc.want)
+				}
+			}
+		})
 	}
 }
 
@@ -271,7 +369,7 @@ func TestTheRequestRunsExactlyTheProvedJobs(t *testing.T) {
 		{
 			name: "every failed job proved is one request for them all",
 			jobs: []AttemptJob{
-				listed("one", 77, true, true), listed("two", 78, true, true),
+				listed("one", 77, true), listed("two", 78, true),
 				{ID: 90, RunnerName: "hosted", Failed: false},
 			},
 			wantRun:   1,
@@ -280,7 +378,7 @@ func TestTheRequestRunsExactlyTheProvedJobs(t *testing.T) {
 		{
 			name: "one proved beside a job that failed on its own is that job alone",
 			jobs: []AttemptJob{
-				listed("one", 77, true, true), listed("two", 78, false, true),
+				listed("one", 77, true), listed("two", 78, false),
 				{ID: 91, RunnerName: "hosted", Failed: true},
 			},
 			wantJob:   []int64{77},
@@ -289,7 +387,7 @@ func TestTheRequestRunsExactlyTheProvedJobs(t *testing.T) {
 		{
 			name: "two proved beside one that failed on its own is left for a person",
 			jobs: []AttemptJob{
-				listed("one", 77, true, true), listed("two", 78, true, true),
+				listed("one", 77, true), listed("two", 78, true),
 				{ID: 91, RunnerName: "hosted", Failed: true},
 			},
 			decisions: map[string]alloc.RerunDecision{"one": alloc.RerunMixed, "two": alloc.RerunMixed},
@@ -301,7 +399,7 @@ func TestTheRequestRunsExactlyTheProvedJobs(t *testing.T) {
 			r := newRerunStack(t)
 			r.job("one", 31, 10*time.Minute)
 			r.job("two", 31, 10*time.Minute)
-			r.github.attempt.Jobs = tc.jobs
+			r.lists(1, tc.jobs...)
 
 			r.pass()
 
@@ -339,34 +437,77 @@ func TestARunNotFinishedWaits(t *testing.T) {
 	}
 
 	r.after(rerunUnfinishedEvery - time.Second).pass()
-	if r.github.reads != 1 {
-		t.Errorf("read %d times inside its wait", r.github.reads)
+	if r.reads() != 1 {
+		t.Errorf("read %d times inside its wait", r.reads())
 	}
 
 	r.after(2 * time.Second)
-	r.github.attempt = RunAttempt{Completed: true, Attempt: 1, Jobs: []AttemptJob{listed("lost", 77, true, true)}}
+	r.lists(1, listed("lost", 77, true))
 	r.pass()
-	if r.github.reads != 2 || r.github.asked() != 1 {
-		t.Errorf("reads %d, requests %d, want it decided once the run finished", r.github.reads, r.github.asked())
+	if r.reads() != 2 || r.github.asked() != 1 {
+		t.Errorf("reads %d, requests %d, want it decided once the run finished", r.reads(), r.github.asked())
 	}
 }
 
 // THE RUN MOVED PAST THE JOB WITHOUT BILLET: a person re-ran it, and billet does not
-// add a second attempt on top of theirs.
+// add an attempt of its own on top of theirs. It moved past when its latest attempt
+// does not list the job, or lists it from an earlier attempt.
 func TestARunThatMovedOnIsSuperseded(t *testing.T) {
 	t.Parallel()
 
-	r := newRerunStack(t)
-	r.job("lost", 31, 10*time.Minute)
-	r.github.attempt = RunAttempt{Completed: true, Attempt: 2, Jobs: []AttemptJob{listed("another-lease", 88, true, true)}}
+	for name, jobs := range map[string][]AttemptJob{
+		"not listed":                   {listed("another-lease", 88, true)},
+		"listed from an older attempt": {{ID: 77, RunnerName: provider.InstanceName("lost"), Attempt: 1, RunnerLost: true, Failed: true}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	r.pass()
+			r := newRerunStack(t)
+			r.job("lost", 31, 10*time.Minute)
+			r.lists(2, jobs...)
 
-	if got := r.decision("lost"); got != alloc.RerunSuperseded {
-		t.Errorf("decision = %q", got)
+			r.pass()
+
+			if got := r.decision("lost"); got != alloc.RerunSuperseded {
+				t.Errorf("decision = %q", got)
+			}
+			if r.github.asked() != 0 {
+				t.Error("asked about a run a person already re-ran")
+			}
+		})
 	}
-	if r.github.asked() != 0 {
-		t.Error("asked about a run a person already re-ran")
+}
+
+// NOTHING CAN HAVE SUPERSEDED THE FIRST ATTEMPT, so a job its list does not show is
+// could-not-tell: nothing is decided, and it is read again after a backoff. Neither is
+// anything decided from a list naming one runner twice.
+func TestAListThatCannotBeTrustedDecidesNothing(t *testing.T) {
+	t.Parallel()
+
+	for name, jobs := range map[string][]AttemptJob{
+		"the first attempt without the job": {listed("another-lease", 88, true)},
+		"a runner named twice":              {listed("lost", 77, true), listed("lost", 78, false)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRerunStack(t)
+			r.job("lost", 31, 10*time.Minute)
+			r.lists(1, jobs...)
+
+			r.pass()
+			if got := r.decision("lost"); got != "" {
+				t.Errorf("decided %q", got)
+			}
+			if r.github.asked() != 0 {
+				t.Error("asked")
+			}
+
+			r.after(rerunRetryFirst - time.Second).pass()
+			if r.reads() != 1 {
+				t.Errorf("read %d times inside the backoff", r.reads())
+			}
+		})
 	}
 }
 
@@ -378,11 +519,11 @@ func TestARunWithAResultStillSettlingWaits(t *testing.T) {
 	r := newRerunStack(t)
 	r.job("older", 31, time.Hour)
 	r.job("newest", 31, rerunSettle/2)
-	r.github.attempt.Jobs = []AttemptJob{listed("older", 77, true, true), listed("newest", 78, true, true)}
+	r.lists(1, listed("older", 77, true), listed("newest", 78, true))
 
 	r.pass()
-	if r.github.reads != 0 {
-		t.Fatalf("read a run whose newest result is still settling: %d", r.github.reads)
+	if r.reads() != 0 {
+		t.Fatalf("read a run whose newest result is still settling: %d", r.reads())
 	}
 
 	r.after(rerunSettle).pass()
@@ -391,6 +532,39 @@ func TestARunWithAResultStillSettlingWaits(t *testing.T) {
 	}
 	if r.decision("older") != alloc.RerunRequested || r.decision("newest") != alloc.RerunRequested {
 		t.Errorf("decisions = %q, %q", r.decision("older"), r.decision("newest"))
+	}
+}
+
+// A SIBLING BILLET HAS NOT HEARD FROM HOLDS THE RUN: its completion may be on its way,
+// and it may be one more job billet proves. Another deployment's runner does not.
+func TestASiblingNotYetHeardFromHoldsTheRun(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, 10*time.Minute)
+	if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `INSERT INTO job_history (lease_id, tier, queued_at, started_at, repo)
+			VALUES ('unheard', $1, '', $2, 'acme/api')`, rerunTier, stamp(r.now))
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r.lists(1, listed("lost", 77, true), listed("unheard", 78, true), listed("another-deployments", 79, false))
+
+	r.pass()
+	if r.github.asked() != 0 || r.decision("lost") != "" {
+		t.Fatalf("decided with a sibling unheard: %d requests, %q", r.github.asked(), r.decision("lost"))
+	}
+
+	if err := r.a.RecordJobResult(t.Context(), "unheard", "succeeded", 31); err != nil {
+		t.Fatal(err)
+	}
+	r.lists(1, listed("lost", 77, true), AttemptJob{ID: 78, RunnerName: provider.InstanceName("unheard")},
+		listed("another-deployments", 79, false))
+	r.after(rerunUnfinishedEvery + time.Second).pass()
+	if got := r.decision("lost"); got != alloc.RerunRequested || len(r.github.jobAsk) != 1 || r.github.jobAsk[0] != 77 {
+		t.Errorf("once heard: %q, job requests %v", got, r.github.jobAsk)
 	}
 }
 
@@ -405,61 +579,93 @@ func TestAJobPastItsWindowExpiresAndATierNotOptedInIsLeftAlone(t *testing.T) {
 	if got := r.decision("old"); got != alloc.RerunExpired {
 		t.Errorf("decision = %q", got)
 	}
-	if r.github.reads != 0 {
-		t.Errorf("GitHub was read %d times about an expired job", r.github.reads)
+	if r.reads() != 0 {
+		t.Errorf("GitHub was read %d times about an expired job", r.reads())
 	}
 
 	r = newRerunStack(t)
 	delete(r.limits, rerunTier)
 	r.job("not-opted-in", 31, 10*time.Minute)
-	r.github.attempt.Jobs = []AttemptJob{listed("not-opted-in", 77, true, true)}
+	r.lists(1, listed("not-opted-in", 77, true))
 	r.pass()
 	if got := r.decision("not-opted-in"); got != "" {
 		t.Errorf("a tier that did not opt in was decided: %q", got)
 	}
-	if r.github.reads != 0 || r.github.asked() != 0 {
-		t.Errorf("reads %d, requests %d about a tier that did not opt in", r.github.reads, r.github.asked())
+	if r.reads() != 0 || r.github.asked() != 0 {
+		t.Errorf("reads %d, requests %d about a tier that did not opt in", r.reads(), r.github.asked())
 	}
 }
 
-// A FAILURE TO ASK IS REPORTED, AND NEVER RETRIED FOREVER. The request is in doubt
-// across every try, the tries are bounded, and it settles failed with GitHub's words.
+// A JOB THAT WENT RED BEFORE ITS TIER ASKED IS NOT RE-RUN BECAUSE THE CONFIG CHANGED,
+// through the loop's own first pass, which records when each tier started asking.
+func TestAJobFromBeforeItsTierAskedIsLeftAlone(t *testing.T) {
+	t.Parallel()
+
+	// TIER A HAS ASKED FOR DAYS AND TIER B STARTS NOW, so the ledger is read from A's
+	// start and only the per-tier rule keeps B's older job out.
+	r := newRerunStack(t)
+	r.limits[rerunTierB] = 1
+	r.sweep = newRerunSweep()
+	if _, err := r.a.AskReruns(t.Context(), []string{rerunTier}); err != nil {
+		t.Fatal(err)
+	}
+	r.jobOn(rerunTierB, "before", 31, 10*time.Minute)
+	r.lists(1, listed("before", 77, true))
+
+	r.pass()
+
+	if r.sweep.asked[rerunTierB].IsZero() || !r.sweep.asked[rerunTier].Before(r.sweep.asked[rerunTierB]) {
+		t.Fatalf("the first pass recorded %v", r.sweep.asked)
+	}
+	if r.reads() != 0 || r.decision("before") != "" {
+		t.Errorf("a job from before the tier asked: %d reads, %q", r.reads(), r.decision("before"))
+	}
+
+	r.jobOn(rerunTierB, "after", 32, -time.Minute)
+	r.after(rerunSettle + time.Minute).pass()
+	if r.reads() != 1 {
+		t.Errorf("a job after the tier asked was read %d times", r.reads())
+	}
+}
+
+// A FAILURE TO ASK IS REPORTED, AND NEVER RETRIED FOREVER. Five sends, each in doubt
+// until the run is read again; the run, still on its attempt, is then given up on
+// with GitHub's words, and nothing is sent after.
 func TestAFailedRequestIsBoundedAndReported(t *testing.T) {
 	t.Parallel()
 
 	r := newRerunStack(t)
 	r.job("lost", 31, 10*time.Minute)
-	r.github.attempt.Jobs = []AttemptJob{listed("lost", 77, true, true)}
+	r.lists(1, listed("lost", 77, true))
 	r.github.askErr = errors.New("HTTP 500: GitHub had a bad moment")
 
-	for try := 1; try <= rerunMaxTries; try++ {
+	for try := 1; try <= 5; try++ {
 		r.pass()
 		if got := r.github.asked(); got != try {
 			t.Fatalf("after pass %d: %d requests", try, got)
 		}
-
-		if try < rerunMaxTries {
-			if state, tries, _ := r.requestState(1); state != "asking" || tries != int64(try) {
-				t.Errorf("try %d: request = %s, %d tries", try, state, tries)
-			}
-			if got := r.decision("lost"); got != "" {
-				t.Errorf("try %d: decided %q while a try remains", try, got)
-			}
+		if got, tries, _ := r.request(1); got != "asking" || tries != int64(try) {
+			t.Errorf("try %d: request = %s, %d tries", try, got, tries)
+		}
+		if got := r.decision("lost"); got != "" {
+			t.Errorf("try %d: decided %q while the run may yet show it landed", try, got)
 		}
 
 		r.after(rerunRetryMost + time.Minute)
 	}
 
-	state, tries, detail := r.requestState(1)
-	if state != "failed" || tries != rerunMaxTries || detail != "HTTP 500: GitHub had a bad moment" {
-		t.Errorf("request = %s, %d tries, detail %q", state, tries, detail)
+	r.pass()
+
+	got, tries, detail := r.request(1)
+	if got != "failed" || tries != 5 || detail != "HTTP 500: GitHub had a bad moment" {
+		t.Errorf("request = %s, %d tries, detail %q", got, tries, detail)
 	}
 	if got := r.decision("lost"); got != alloc.RerunFailed {
 		t.Errorf("decision = %q", got)
 	}
 
-	r.pass()
-	if got := r.github.asked(); got != rerunMaxTries {
+	r.after(rerunRetryMost + time.Minute).pass()
+	if got := r.github.asked(); got != 5 {
 		t.Errorf("%d requests after it settled", got)
 	}
 
@@ -469,9 +675,42 @@ func TestAFailedRequestIsBoundedAndReported(t *testing.T) {
 	}
 }
 
+// AN ANSWER LOST ON THE WAY BACK IS NOT A REFUSAL, on the fifth try as on the first:
+// the run read next says it landed, and it is counted.
+func TestAnAnswerLostOnTheLastTryIsSettledByTheRun(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, 10*time.Minute)
+	r.lists(1, listed("lost", 77, true))
+	r.github.askErr = errors.New("connection reset")
+
+	for range 4 {
+		r.pass()
+		r.after(rerunRetryMost + time.Minute)
+	}
+
+	r.github.onAsk = func(g *rerunGitHub) { g.attempt = RunAttempt{Completed: false, Attempt: 1} }
+	r.pass()
+	if got, tries, _ := r.request(1); got != "asking" || tries != 5 {
+		t.Fatalf("after the fifth = %s, %d tries", got, tries)
+	}
+
+	r.after(rerunRetryMost + time.Minute).pass()
+	if got, _, _ := r.request(1); got != "requested" {
+		t.Errorf("request = %s, want it settled as landed", got)
+	}
+	if got := r.decision("lost"); got != alloc.RerunRequested {
+		t.Errorf("decision = %q", got)
+	}
+	if used, err := r.a.RunReruns(t.Context(), "acme/api", 31); err != nil || used != 1 {
+		t.Errorf("RunReruns = %d, %v, want it counted", used, err)
+	}
+}
+
 // A REFUSAL PAUSES THE WHOLE APP INSTALLATION and says what the App needs, and a
 // throttle pauses it for less: neither spends a request per run on an answer that will
-// not change.
+// not change, and each pause ends.
 func TestARefusalOrAThrottlePausesTheInstallation(t *testing.T) {
 	t.Parallel()
 
@@ -489,18 +728,22 @@ func TestARefusalOrAThrottlePausesTheInstallation(t *testing.T) {
 			r := newRerunStack(t)
 			r.job("one", 31, 10*time.Minute)
 			r.job("other", 32, 10*time.Minute)
-			r.github.attempt.Jobs = []AttemptJob{listed("one", 77, true, true), listed("other", 78, true, true)}
+			r.lists(1, listed("one", 77, true), listed("other", 78, true))
 			r.github.askErr = tc.err
 
 			r.pass()
-			first := r.github.asked()
-			if first != 1 {
-				t.Fatalf("%d requests in the pass GitHub refused, want it to stop at the first", first)
+			if got := r.github.asked(); got != 1 {
+				t.Fatalf("%d requests in the pass GitHub refused, want it to stop at the first", got)
 			}
 
 			r.after(tc.wait - time.Second).pass()
-			if got := r.github.asked(); got != first {
+			if got := r.github.asked(); got != 1 {
 				t.Errorf("%d requests inside the pause", got)
+			}
+
+			r.after(2 * time.Second).pass()
+			if got := r.reads(); got <= 1 {
+				t.Errorf("the pause did not end: %d reads", got)
 			}
 		})
 	}
@@ -513,15 +756,13 @@ func TestARequestInDoubtIsSettledByTheRun(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name     string
-		attempt  RunAttempt
-		asked    int
-		state    string
-		decision alloc.RerunDecision
+		name    string
+		attempt RunAttempt
+		asked   int
 	}{
-		{"the run is going, so it landed", RunAttempt{Completed: false, Attempt: 1}, 0, "requested", alloc.RerunRequested},
-		{"the run finished a later attempt, so it landed", RunAttempt{Completed: true, Attempt: 2}, 0, "requested", alloc.RerunRequested},
-		{"the run finished the same attempt, so it did not", RunAttempt{Completed: true, Attempt: 1}, 1, "requested", alloc.RerunRequested},
+		{"the run is going, so it landed", RunAttempt{Completed: false, Attempt: 1}, 0},
+		{"the run finished a later attempt, so it landed", RunAttempt{Completed: true, Attempt: 2}, 0},
+		{"the run finished the same attempt, so it did not, and is sent again", RunAttempt{Completed: true, Attempt: 1}, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -540,17 +781,115 @@ func TestARequestInDoubtIsSettledByTheRun(t *testing.T) {
 			if got := r.github.asked(); got != tc.asked {
 				t.Errorf("%d requests, want %d", got, tc.asked)
 			}
-			if state, _, _ := r.requestState(1); state != tc.state {
-				t.Errorf("request = %s, want %s", state, tc.state)
+			if got, _, _ := r.request(1); got != "requested" {
+				t.Errorf("request = %s", got)
 			}
-			if got := r.decision("lost"); got != tc.decision {
-				t.Errorf("decision = %q, want %q", got, tc.decision)
+			if got := r.decision("lost"); got != alloc.RerunRequested {
+				t.Errorf("decision = %q", got)
 			}
 		})
 	}
 }
 
-// THE KIND A REQUEST WAS WRITTEN WITH IS THE KIND SENT AGAIN, its job with it.
+// A RUN ON AN EARLIER ATTEMPT THAN ONE BILLET ASKED ABOUT IS NOT A RUN BILLET
+// UNDERSTANDS: nothing is sent or settled.
+func TestARunBehindItsRequestDecidesNothing(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, 10*time.Minute)
+	if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 2,
+		Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+		t.Fatal(err)
+	}
+	r.lists(1)
+
+	r.pass()
+
+	if r.github.asked() != 0 {
+		t.Error("asked about a run behind its request")
+	}
+	if got, tries, _ := r.request(2); got != "asking" || tries != 1 {
+		t.Errorf("request = %s, %d tries", got, tries)
+	}
+}
+
+// A REQUEST IN DOUBT IS SETTLED WHEN NOTHING ELSE BRINGS ITS RUN UP: its job is past
+// its window, and its tier no longer asks. The job is not expired while it waits.
+func TestARequestInDoubtIsSettledOnItsOwn(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("old", 31, rerunWindow+time.Hour)
+	if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+		Kind: alloc.RerunFailedJobs}, []string{"old"}); err != nil {
+		t.Fatal(err)
+	}
+	r.limits = map[string]int64{rerunTierB: 1}
+	r.github.attempt = RunAttempt{Completed: false, Attempt: 1}
+
+	r.pass()
+
+	if got, _, _ := r.request(1); got != "requested" {
+		t.Errorf("request = %s, want it settled", got)
+	}
+	if got := r.decision("old"); got != alloc.RerunRequested {
+		t.Errorf("decision = %q, want the request's, never expired", got)
+	}
+
+	// AND WHILE ITS TIER STILL ASKS, the job past its window is not expired under its
+	// request: it waits for the request's answer, which is its own.
+	asking := newRerunStack(t)
+	asking.job("old", 31, rerunWindow+time.Hour)
+	if err := asking.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+		Kind: alloc.RerunFailedJobs}, []string{"old"}); err != nil {
+		t.Fatal(err)
+	}
+	asking.github.attempt = RunAttempt{Completed: false, Attempt: 1}
+
+	asking.pass()
+
+	if got := asking.decision("old"); got != alloc.RerunRequested {
+		t.Errorf("with its tier asking, decision = %q, want the request's, never expired", got)
+	}
+}
+
+// A LIMIT LOWERED WHILE A REQUEST WAS IN DOUBT HOLDS: one GitHub never heard is not
+// sent again past it, and says why.
+func TestALimitLoweredUnderARequestInDoubtHolds(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	first := alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: alloc.RerunFailedJobs}
+	if err := r.a.BeginRerun(t.Context(), first, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.a.SettleRerun(t.Context(), first, alloc.RerunRequested, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	r.job("lost", 31, 10*time.Minute)
+	if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 2,
+		Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+		t.Fatal(err)
+	}
+	r.lists(2)
+
+	r.pass()
+
+	if r.github.asked() != 0 {
+		t.Error("sent past a lowered limit")
+	}
+	if got, _, detail := r.request(2); got != "failed" || !strings.Contains(detail, "retry.disrupted") {
+		t.Errorf("request = %s, %q", got, detail)
+	}
+	if got := r.decision("lost"); got != alloc.RerunLimit {
+		t.Errorf("decision = %q", got)
+	}
+}
+
+// THE KIND A REQUEST WAS WRITTEN WITH IS THE KIND SENT AGAIN, its job with it, and a
+// kind this binary does not know is never sent, and runs out of tries.
 func TestARequestInDoubtIsSentAgainAsItWasWritten(t *testing.T) {
 	t.Parallel()
 
@@ -561,15 +900,33 @@ func TestARequestInDoubtIsSentAgainAsItWasWritten(t *testing.T) {
 	}, []string{"lost"}); err != nil {
 		t.Fatalf("BeginRerun: %v", err)
 	}
-	r.github.attempt = RunAttempt{Completed: true, Attempt: 1}
+	r.lists(1)
 
 	r.pass()
 
 	if len(r.github.jobAsk) != 1 || r.github.jobAsk[0] != 77 || len(r.github.failedAsk) != 0 {
 		t.Errorf("job requests %v, failed-jobs requests %v", r.github.jobAsk, r.github.failedAsk)
 	}
-	if state, tries, _ := r.requestState(1); state != "requested" || tries != 2 {
-		t.Errorf("request = %s, %d tries", state, tries)
+	if got, tries, _ := r.request(1); got != "requested" || tries != 2 {
+		t.Errorf("request = %s, %d tries", got, tries)
+	}
+
+	newer := newRerunStack(t)
+	newer.job("lost", 31, 10*time.Minute)
+	if err := newer.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+		Kind: "from-a-newer-billet"}, []string{"lost"}); err != nil {
+		t.Fatal(err)
+	}
+	newer.lists(1)
+	for range 6 {
+		newer.pass()
+		newer.after(rerunRetryMost + time.Minute)
+	}
+	if newer.github.asked() != 0 {
+		t.Errorf("a kind this binary does not know was sent %d times", newer.github.asked())
+	}
+	if got, _, _ := newer.request(1); got != "failed" {
+		t.Errorf("request = %s, want it given up", got)
 	}
 }
 
@@ -584,20 +941,20 @@ func TestARequestInDoubtPastItsTriesSettlesFailedUnasked(t *testing.T) {
 	if err := r.a.BeginRerun(t.Context(), request, []string{"lost"}); err != nil {
 		t.Fatalf("BeginRerun: %v", err)
 	}
-	for range rerunMaxTries - 1 {
+	for range 4 {
 		if err := r.a.RetryRerun(t.Context(), request); err != nil {
 			t.Fatalf("RetryRerun: %v", err)
 		}
 	}
-	r.github.attempt = RunAttempt{Completed: true, Attempt: 1}
+	r.lists(1)
 
 	r.pass()
 
 	if got := r.github.asked(); got != 0 {
 		t.Errorf("%d requests past the tries", got)
 	}
-	if state, _, detail := r.requestState(1); state != "failed" || detail == "" {
-		t.Errorf("request = %s, detail %q", state, detail)
+	if got, _, detail := r.request(1); got != "failed" || detail == "" {
+		t.Errorf("request = %s, detail %q", got, detail)
 	}
 	if got := r.decision("lost"); got != alloc.RerunFailed {
 		t.Errorf("decision = %q", got)
@@ -605,25 +962,30 @@ func TestARequestInDoubtPastItsTriesSettlesFailedUnasked(t *testing.T) {
 }
 
 // A RUN STARTED BY SOMEBODY ELSE BETWEEN THE READ AND THE REQUEST: GitHub's refusal
-// is not a failed try's report, and the next pass finds the run going and settles it,
-// counting it, which only makes billet ask less.
+// waits on the unfinished pace, not a failed try's backoff, and the next read finds
+// the run going and settles it, counting it, which only makes billet ask less.
 func TestARunThatStartedUnderARequestIsSettledNotRetried(t *testing.T) {
 	t.Parallel()
 
 	r := newRerunStack(t)
 	r.job("lost", 31, 10*time.Minute)
-	r.github.attempt.Jobs = []AttemptJob{listed("lost", 77, true, true)}
+	r.lists(1, listed("lost", 77, true))
 	r.github.askErr = fmt.Errorf("taken: %w", ErrRerunRunning)
 	r.github.onAsk = func(g *rerunGitHub) { g.attempt = RunAttempt{Completed: false, Attempt: 1} }
 
 	r.pass()
-	if state, _, _ := r.requestState(1); state != "asking" {
-		t.Errorf("request = %s, want it in doubt", state)
+	if got, _, _ := r.request(1); got != "asking" {
+		t.Errorf("request = %s, want it in doubt", got)
 	}
 
-	r.after(rerunUnfinishedEvery + time.Second).pass()
-	if state, _, _ := r.requestState(1); state != "requested" {
-		t.Errorf("request = %s, want it settled by the run going", state)
+	r.after(rerunRetryFirst + 30*time.Second).pass()
+	if got := r.reads(); got != 1 {
+		t.Errorf("read %d times inside the unfinished pace", got)
+	}
+
+	r.after(rerunUnfinishedEvery).pass()
+	if got, _, _ := r.request(1); got != "requested" {
+		t.Errorf("request = %s, want it settled by the run going", got)
 	}
 	if got := r.github.asked(); got != 1 {
 		t.Errorf("%d requests", got)
@@ -640,13 +1002,13 @@ func TestALateJobTakesItsAttemptsAnswer(t *testing.T) {
 	if err := r.a.BeginRerun(t.Context(), request, nil); err != nil {
 		t.Fatalf("BeginRerun: %v", err)
 	}
-	if err := r.a.SettleRerun(t.Context(), request, false, "GitHub said no"); err != nil {
+	if err := r.a.SettleRerun(t.Context(), request, alloc.RerunFailed, "GitHub said no"); err != nil {
 		t.Fatalf("SettleRerun: %v", err)
 	}
 
 	r.limits[rerunTier] = 2
 	r.job("late", 31, 10*time.Minute)
-	r.github.attempt.Jobs = []AttemptJob{listed("late", 77, true, true)}
+	r.lists(1, listed("late", 77, true))
 
 	r.pass()
 
@@ -667,8 +1029,8 @@ func TestTheLoopLeavesTheReserveAndTakesItsShare(t *testing.T) {
 	r.github.remaining, r.github.limit = 100, 5000
 	r.job("lost", 31, 10*time.Minute)
 	r.pass()
-	if r.github.reads != 0 {
-		t.Errorf("read %d times on an installation down to its reserve", r.github.reads)
+	if r.reads() != 0 {
+		t.Errorf("read %d times on an installation down to its reserve", r.reads())
 	}
 
 	r = newRerunStack(t)
@@ -677,13 +1039,13 @@ func TestTheLoopLeavesTheReserveAndTakesItsShare(t *testing.T) {
 	}
 	r.github.attempt = RunAttempt{Completed: false, Attempt: 1}
 	r.pass()
-	if r.github.reads != rerunRunsPerInstallation {
-		t.Errorf("%d reads in one pass, want the share's %d", r.github.reads, rerunRunsPerInstallation)
+	if r.reads() != rerunRunsPerInstallation {
+		t.Errorf("%d reads in one pass, want the share's %d", r.reads(), rerunRunsPerInstallation)
 	}
 }
 
 // A READ THAT FAILS DECIDES NOTHING. Could not tell is not unproven: the job is asked
-// about again after a backoff, and the window is what ends it.
+// about again after a backoff that doubles, and the window is what ends it.
 func TestAReadThatFailsDecidesNothing(t *testing.T) {
 	t.Parallel()
 
@@ -697,18 +1059,24 @@ func TestAReadThatFailsDecidesNothing(t *testing.T) {
 	}
 
 	r.after(rerunRetryFirst - time.Second).pass()
-	if r.github.reads != 1 {
-		t.Errorf("read %d times inside the backoff", r.github.reads)
+	if r.reads() != 1 {
+		t.Errorf("read %d times inside the backoff", r.reads())
 	}
 
 	r.after(2 * time.Second).pass()
-	if r.github.reads != 2 {
-		t.Errorf("read %d times after the backoff", r.github.reads)
+	if r.reads() != 2 {
+		t.Errorf("read %d times after the backoff", r.reads())
+	}
+
+	// DOUBLED: the second backoff is two minutes.
+	r.after(2*rerunRetryFirst - time.Second).pass()
+	if r.reads() != 2 {
+		t.Errorf("read %d times inside the doubled backoff", r.reads())
 	}
 }
 
-// THE LOOP RUNS ON THE PACE IT WAS GIVEN UNTIL IT IS STOPPED, on the ticker it really
-// runs on, and a read that never answers holds up only itself: a stop ends it.
+// A STOP ENDS THE LOOP, even with GitHub's read hung, bounded so a loop that ignored
+// it would fail here rather than hang the suite.
 func TestTheLoopStopsWhenAskedEvenWithGitHubHanging(t *testing.T) {
 	t.Parallel()
 
@@ -727,9 +1095,18 @@ func TestTheLoopStopsWhenAskedEvenWithGitHubHanging(t *testing.T) {
 		r.s.rerunDisrupted(ctx, r.targets, r.limits)
 	}()
 
-	<-hung.entered
+	select {
+	case <-hung.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the loop never read the run")
+	}
 	cancel()
-	<-done
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("a stop did not end the loop")
+	}
 }
 
 // hangingReruns answers no read until its caller gives up.
@@ -760,5 +1137,166 @@ func TestRerunLimitsAreTheTiersThatAsk(t *testing.T) {
 	limits := s.rerunLimits()
 	if len(limits) != 1 || limits["asks"] != 3 {
 		t.Errorf("limits = %v", limits)
+	}
+}
+
+// WHAT A FAILED REQUEST RECORDS IS BOUNDED AND STAYS TEXT POSTGRESQL TAKES, even cut
+// through a character.
+func TestARerunsDetailIsBoundedAndValid(t *testing.T) {
+	t.Parallel()
+
+	// THREE BYTES A CHARACTER, so the bound falls inside one.
+	long := strings.Repeat("€", rerunDetailBytes)
+	got := rerunDetail(errors.New(long))
+	if len(got) > rerunDetailBytes || !utf8.ValidString(got) || got == "" {
+		t.Errorf("detail of %d bytes, valid %v", len(got), utf8.ValidString(got))
+	}
+	if got := rerunDetail(errors.New("short")); got != "short" {
+		t.Errorf("a short detail = %q", got)
+	}
+}
+
+// A REQUEST IN DOUBT IS LIMITED BY EVERY TIER IT STILL COVERS: one whose tier now
+// allows none is not sent again, whichever of its jobs the ledger lists first.
+func TestARequestInDoubtFitsEveryTierItCovers(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.limits[rerunTier] = 2
+	first := alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: alloc.RerunFailedJobs}
+	if err := r.a.BeginRerun(t.Context(), first, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.a.SettleRerun(t.Context(), first, alloc.RerunRequested, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	r.job("a", 31, 10*time.Minute)
+	r.jobOn(rerunTierB, "b", 31, 10*time.Minute)
+	if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 2,
+		Kind: alloc.RerunFailedJobs}, []string{"a", "b"}); err != nil {
+		t.Fatal(err)
+	}
+	r.lists(2)
+
+	r.pass()
+
+	if r.github.asked() != 0 {
+		t.Error("sent past the limit of a tier it covers")
+	}
+	if got := r.decision("b"); got != alloc.RerunLimit {
+		t.Errorf("decision = %q", got)
+	}
+}
+
+// A JOB OF THE ATTEMPT DECIDED SOME OTHER WAY DOES NOT LIMIT A REQUEST IT IS NOT IN.
+func TestADecidedJobDoesNotLimitARequestItIsNotIn(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.limits[rerunTierB] = 2
+	first := alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: alloc.RerunFailedJobs}
+	if err := r.a.BeginRerun(t.Context(), first, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.a.SettleRerun(t.Context(), first, alloc.RerunRequested, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	r.job("own", 31, 10*time.Minute)
+	if err := r.a.RecordRerunDecision(t.Context(), "own", alloc.RerunUnproven, 2); err != nil {
+		t.Fatal(err)
+	}
+	r.jobOn(rerunTierB, "lost", 31, 10*time.Minute)
+	if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 2,
+		Kind: alloc.RerunOneJob, JobID: 88}, []string{"lost"}); err != nil {
+		t.Fatal(err)
+	}
+	r.lists(2)
+
+	r.pass()
+
+	if len(r.github.jobAsk) != 1 || r.github.jobAsk[0] != 88 {
+		t.Errorf("job requests = %v, want the one in doubt sent again", r.github.jobAsk)
+	}
+}
+
+// A JOB LATE TO AN ATTEMPT ASKED ABOUT FOR ANOTHER JOB ALONE WAS NOT RE-RUN, and is
+// left for a person rather than given that request's answer.
+func TestALateJobOfAnAttemptAskedAboutForOneJobIsMixed(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.limits[rerunTier] = 2
+	request := alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: alloc.RerunOneJob, JobID: 99}
+	if err := r.a.BeginRerun(t.Context(), request, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.a.SettleRerun(t.Context(), request, alloc.RerunRequested, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	r.job("late", 31, 10*time.Minute)
+	r.lists(1, listed("late", 77, true))
+
+	r.pass()
+
+	if r.github.asked() != 0 {
+		t.Error("asked again for an attempt already asked about")
+	}
+	if got := r.decision("late"); got != alloc.RerunMixed {
+		t.Errorf("decision = %q", got)
+	}
+}
+
+// TWO READS THAT DISAGREE ABOUT THE LATEST ATTEMPT DECIDE NOTHING: a job listed on an
+// attempt later than the run's is not one the run moved past.
+func TestAJobOnALaterAttemptThanTheRunsIsNotSuperseded(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, 10*time.Minute)
+	r.lists(2, AttemptJob{ID: 77, RunnerName: provider.InstanceName("lost"), Attempt: 3, RunnerLost: true, Failed: true})
+
+	r.pass()
+
+	if got := r.decision("lost"); got != "" {
+		t.Errorf("decided %q", got)
+	}
+}
+
+// A RUN IS DECIDED FROM ALL ITS CANDIDATES, not the ones the page that brought it up
+// held, and its newest result is the one that must have settled.
+func TestARunIsDecidedFromAllItsCandidates(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("one", 31, 10*time.Minute)
+	r.job("two", 31, 10*time.Minute)
+	r.lists(1, listed("one", 77, true), listed("two", 78, true))
+
+	w := rerunWork{run: rerunRun{repository: "acme/api", run: 31}, target: "default", installation: "i",
+		client: r.github}
+	if err := r.s.decideRerun(t.Context(), &w, r.limits, r.sweep, r.now); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.github.failedAsk) != 1 || r.decision("one") != alloc.RerunRequested || r.decision("two") != alloc.RerunRequested {
+		t.Errorf("requests %v, decisions %q %q", r.github.failedAsk, r.decision("one"), r.decision("two"))
+	}
+}
+
+// WHERE NO TIER ASKS, THAT IS RECORDED, so a tier that asks again later starts then.
+func TestNoTierAskingForgetsWhenOneDid(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.s.forgetRerunTiers(t.Context())
+
+	asked, err := r.a.AskReruns(t.Context(), []string{rerunTier})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !asked[rerunTier].Equal(*r.ledger) {
+		t.Errorf("asked since %s, want the moment it asked again, %s", asked[rerunTier], *r.ledger)
 	}
 }

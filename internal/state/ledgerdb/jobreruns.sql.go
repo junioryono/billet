@@ -26,6 +26,22 @@ func (q *Queries) AddRerunTry(ctx context.Context, arg AddRerunTryParams) error 
 	return err
 }
 
+const askRerunsForTier = `-- name: AskRerunsForTier :exec
+INSERT INTO rerun_tiers (tier, asked_since) VALUES ($1, $2)
+ON CONFLICT (tier) DO NOTHING
+`
+
+type AskRerunsForTierParams struct {
+	Tier       string
+	AskedSince string
+}
+
+// Record when a tier started asking, and keep the first time.
+func (q *Queries) AskRerunsForTier(ctx context.Context, arg AskRerunsForTierParams) error {
+	_, err := q.db.ExecContext(ctx, askRerunsForTier, arg.Tier, arg.AskedSince)
+	return err
+}
+
 const bindJobToRerun = `-- name: BindJobToRerun :exec
 UPDATE job_history SET rerun_attempt = $1
  WHERE lease_id = $2 AND rerun_decision = ''
@@ -62,6 +78,16 @@ func (q *Queries) CountRunReruns(ctx context.Context, arg CountRunRerunsParams) 
 	return count, err
 }
 
+const forgetRerunTier = `-- name: ForgetRerunTier :exec
+DELETE FROM rerun_tiers WHERE tier = $1
+`
+
+// A tier that stopped asking, so asking again starts from then.
+func (q *Queries) ForgetRerunTier(ctx context.Context, tier string) error {
+	_, err := q.db.ExecContext(ctx, forgetRerunTier, tier)
+	return err
+}
+
 const insertRerunIntent = `-- name: InsertRerunIntent :exec
 INSERT INTO job_reruns (repo, run_id, run_attempt, kind, github_job_id, state, tries, created_at)
 VALUES ($1, $2, $3, $4, $5, 'asking', 1, $6)
@@ -90,53 +116,167 @@ func (q *Queries) InsertRerunIntent(ctx context.Context, arg InsertRerunIntentPa
 	return err
 }
 
+const listBoundRerunTiers = `-- name: ListBoundRerunTiers :many
+SELECT DISTINCT tier FROM job_history
+ WHERE COALESCE(repo, '') = CAST($1 AS TEXT) AND rerun_attempt = $2 AND rerun_decision = ''
+   AND (github_run_id = $3 OR (github_run_id = 0 AND run_id = $3))
+ ORDER BY tier
+`
+
+type ListBoundRerunTiersParams struct {
+	Repo       string
+	RunAttempt int64
+	RunID      int64
+}
+
+// The tiers of the jobs one request covers and that it has not yet decided: which
+// Apps can read its run, and whose limits it must still fit.
+func (q *Queries) ListBoundRerunTiers(ctx context.Context, arg ListBoundRerunTiersParams) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listBoundRerunTiers, arg.Repo, arg.RunAttempt, arg.RunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var tier string
+		if err := rows.Scan(&tier); err != nil {
+			return nil, err
+		}
+		items = append(items, tier)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOpenReruns = `-- name: ListOpenReruns :many
+SELECT repo, run_id, run_attempt, kind, github_job_id, tries, created_at
+  FROM job_reruns
+ WHERE state = 'asking'
+   AND (CAST($1 AS TEXT) = ''
+        OR created_at > CAST($1 AS TEXT)
+        OR (created_at = CAST($1 AS TEXT)
+            AND (repo > CAST($2 AS TEXT)
+                 OR (repo = CAST($2 AS TEXT) AND run_id > CAST($3 AS BIGINT)))))
+ ORDER BY created_at, repo, run_id
+ LIMIT CAST($4 AS BIGINT)
+`
+
+type ListOpenRerunsParams struct {
+	AfterCreated string
+	AfterRepo    string
+	AfterRun     int64
+	MaxRows      int64
+}
+
+type ListOpenRerunsRow struct {
+	Repo        string
+	RunID       int64
+	RunAttempt  int64
+	Kind        string
+	GithubJobID int64
+	Tries       int64
+	CreatedAt   string
+}
+
+// The requests that may have landed, whatever became of the jobs that made them,
+// oldest first and paged from a cursor, (after_created, after_repo, after_run), the
+// last row of the page before, an empty after_created being the oldest. Paged so a
+// request waiting on a long run is passed rather than read before every other.
+func (q *Queries) ListOpenReruns(ctx context.Context, arg ListOpenRerunsParams) ([]ListOpenRerunsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listOpenReruns,
+		arg.AfterCreated,
+		arg.AfterRepo,
+		arg.AfterRun,
+		arg.MaxRows,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListOpenRerunsRow
+	for rows.Next() {
+		var i ListOpenRerunsRow
+		if err := rows.Scan(
+			&i.Repo,
+			&i.RunID,
+			&i.RunAttempt,
+			&i.Kind,
+			&i.GithubJobID,
+			&i.Tries,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRerunCandidates = `-- name: ListRerunCandidates :many
 
 SELECT lease_id, tier, COALESCE(repo, '') AS repo,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       disruption, result_at
+       disruption, result_at, rerun_attempt
   FROM job_history
  WHERE disruption != ''
-   AND disruption IN (CAST($1 AS TEXT), CAST($2 AS TEXT), CAST($3 AS TEXT))
+   AND disruption IN (CAST($1 AS TEXT), CAST($2 AS TEXT))
    AND started_at IS NOT NULL
-   AND result != '' AND result != $4
-   AND result_at >= $5
+   AND result != '' AND result != $3
+   AND result_at >= $4
    AND rerun_decision = ''
    AND github_job_id != '' AND COALESCE(repo, '') != ''
    AND (github_run_id > 0 OR COALESCE(run_id, 0) > 0)
+   AND (CAST($5 AS TEXT) = ''
+        OR result_at < CAST($5 AS TEXT)
+        OR (result_at = CAST($5 AS TEXT) AND lease_id < CAST($6 AS TEXT)))
  ORDER BY result_at DESC, lease_id DESC
- LIMIT CAST($6 AS BIGINT)
+ LIMIT CAST($7 AS BIGINT)
 `
 
 type ListRerunCandidatesParams struct {
-	CauseOne   string
-	CauseTwo   string
-	CauseThree string
-	Succeeded  string
-	Since      string
-	MaxRows    int64
+	CauseOne     string
+	CauseTwo     string
+	Succeeded    string
+	Since        string
+	BeforeResult string
+	BeforeLease  string
+	MaxRows      int64
 }
 
 type ListRerunCandidatesRow struct {
-	LeaseID    string
-	Tier       string
-	Repo       string
-	RunID      int64
-	Disruption string
-	ResultAt   string
+	LeaseID      string
+	Tier         string
+	Repo         string
+	RunID        int64
+	Disruption   string
+	ResultAt     string
+	RerunAttempt int64
 }
 
 // Re-running a job billet disrupted (#541): what the loop asks of the ledger, and
 // what it records on the original job. ADR-023 holds the rule these serve.
 // The jobs that ended red on a lease a cause from the closed list disrupted, that
 // GitHub saw start, and that no re-run decision has been recorded for yet. Newest
-// result first and bounded, so a backlog loses its oldest, which are also the
-// ones past their window.
+// result first and paged from a cursor, (before_result, before_lease), the last
+// row of the page before, an empty before_result being the newest: the rows of a
+// tier that does not ask are never decided, so a page they fill is paged past.
 //
 // `disruption != ”` IS WRITTEN OUT so the planner can use the partial index
 // migration 35 made for this table's rare rows: it does not derive that from the
-// list. The three causes are parameters so the one list is alloc's.
+// list. The causes are parameters so the one list is alloc's.
 //
 // STARTED, because `launching` admits a disruption to a lease whose guest never
 // ran a job, and a job that never ran has nothing to re-run.
@@ -146,9 +286,10 @@ func (q *Queries) ListRerunCandidates(ctx context.Context, arg ListRerunCandidat
 	rows, err := q.db.QueryContext(ctx, listRerunCandidates,
 		arg.CauseOne,
 		arg.CauseTwo,
-		arg.CauseThree,
 		arg.Succeeded,
 		arg.Since,
+		arg.BeforeResult,
+		arg.BeforeLease,
 		arg.MaxRows,
 	)
 	if err != nil {
@@ -165,6 +306,84 @@ func (q *Queries) ListRerunCandidates(ctx context.Context, arg ListRerunCandidat
 			&i.RunID,
 			&i.Disruption,
 			&i.ResultAt,
+			&i.RerunAttempt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRerunCandidatesOfRun = `-- name: ListRerunCandidatesOfRun :many
+SELECT lease_id, tier, COALESCE(repo, '') AS repo,
+       CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
+            AS BIGINT) AS run_id,
+       disruption, result_at, rerun_attempt
+  FROM job_history
+ WHERE (github_run_id = $1 OR (github_run_id = 0 AND run_id = $1))
+   AND COALESCE(repo, '') = CAST($2 AS TEXT)
+   AND disruption != ''
+   AND disruption IN (CAST($3 AS TEXT), CAST($4 AS TEXT))
+   AND started_at IS NOT NULL
+   AND result != '' AND result != $5
+   AND rerun_decision = ''
+   AND github_job_id != ''
+ ORDER BY result_at DESC, lease_id DESC
+ LIMIT CAST($6 AS BIGINT)
+`
+
+type ListRerunCandidatesOfRunParams struct {
+	RunID     int64
+	Repo      string
+	CauseOne  string
+	CauseTwo  string
+	Succeeded string
+	MaxRows   int64
+}
+
+type ListRerunCandidatesOfRunRow struct {
+	LeaseID      string
+	Tier         string
+	Repo         string
+	RunID        int64
+	Disruption   string
+	ResultAt     string
+	RerunAttempt int64
+}
+
+// ListRerunCandidates for one run, every candidate of it, which is what a run is
+// decided from: the pages that brought the run up may not have held all of them.
+func (q *Queries) ListRerunCandidatesOfRun(ctx context.Context, arg ListRerunCandidatesOfRunParams) ([]ListRerunCandidatesOfRunRow, error) {
+	rows, err := q.db.QueryContext(ctx, listRerunCandidatesOfRun,
+		arg.RunID,
+		arg.Repo,
+		arg.CauseOne,
+		arg.CauseTwo,
+		arg.Succeeded,
+		arg.MaxRows,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRerunCandidatesOfRunRow
+	for rows.Next() {
+		var i ListRerunCandidatesOfRunRow
+		if err := rows.Scan(
+			&i.LeaseID,
+			&i.Tier,
+			&i.Repo,
+			&i.RunID,
+			&i.Disruption,
+			&i.ResultAt,
+			&i.RerunAttempt,
 		); err != nil {
 			return nil, err
 		}
@@ -217,6 +436,34 @@ func (q *Queries) ListRerunDecisions(ctx context.Context, since string) ([]ListR
 	return items, nil
 }
 
+const listRerunTiers = `-- name: ListRerunTiers :many
+SELECT tier, asked_since FROM rerun_tiers ORDER BY tier
+`
+
+// Every tier that asks, and since when.
+func (q *Queries) ListRerunTiers(ctx context.Context) ([]RerunTier, error) {
+	rows, err := q.db.QueryContext(ctx, listRerunTiers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RerunTier
+	for rows.Next() {
+		var i RerunTier
+		if err := rows.Scan(&i.Tier, &i.AskedSince); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const readOpenRerun = `-- name: ReadOpenRerun :one
 SELECT run_attempt, kind, github_job_id, tries
   FROM job_reruns
@@ -252,7 +499,7 @@ func (q *Queries) ReadOpenRerun(ctx context.Context, arg ReadOpenRerunParams) (R
 }
 
 const readRerunOfAttempt = `-- name: ReadRerunOfAttempt :one
-SELECT state FROM job_reruns
+SELECT state, kind FROM job_reruns
  WHERE repo = $1 AND run_id = $2 AND run_attempt = $3
 `
 
@@ -262,14 +509,19 @@ type ReadRerunOfAttemptParams struct {
 	RunAttempt int64
 }
 
-// How the request about one attempt of a run ended. sql.ErrNoRows is an attempt
-// not asked about; a job that finished late finds here what its attempt's request
-// already came to, since the key allows that attempt no second one.
-func (q *Queries) ReadRerunOfAttempt(ctx context.Context, arg ReadRerunOfAttemptParams) (string, error) {
+type ReadRerunOfAttemptRow struct {
+	State string
+	Kind  string
+}
+
+// How the request about one attempt of a run ended, and what it asked for.
+// sql.ErrNoRows is an attempt not asked about; a job that finished late finds here
+// what its attempt's request came to, since the key allows that attempt no second.
+func (q *Queries) ReadRerunOfAttempt(ctx context.Context, arg ReadRerunOfAttemptParams) (ReadRerunOfAttemptRow, error) {
 	row := q.db.QueryRowContext(ctx, readRerunOfAttempt, arg.Repo, arg.RunID, arg.RunAttempt)
-	var state string
-	err := row.Scan(&state)
-	return state, err
+	var i ReadRerunOfAttemptRow
+	err := row.Scan(&i.State, &i.Kind)
+	return i, err
 }
 
 const recordJobRerunDecision = `-- name: RecordJobRerunDecision :exec

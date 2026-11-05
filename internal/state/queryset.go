@@ -89,7 +89,11 @@ type ReadOps interface {
 	ListRerunCandidates(ctx context.Context, arg ledgerdb.ListRerunCandidatesParams) ([]ledgerdb.ListRerunCandidatesRow, error)
 	ListRerunDecisions(ctx context.Context, since string) ([]ledgerdb.ListRerunDecisionsRow, error)
 	ReadOpenRerun(ctx context.Context, arg ledgerdb.ReadOpenRerunParams) (ledgerdb.ReadOpenRerunRow, error)
-	ReadRerunOfAttempt(ctx context.Context, arg ledgerdb.ReadRerunOfAttemptParams) (string, error)
+	ListOpenReruns(ctx context.Context, arg ledgerdb.ListOpenRerunsParams) ([]ledgerdb.ListOpenRerunsRow, error)
+	ListBoundRerunTiers(ctx context.Context, arg ledgerdb.ListBoundRerunTiersParams) ([]string, error)
+	ListRerunCandidatesOfRun(ctx context.Context, arg ledgerdb.ListRerunCandidatesOfRunParams) ([]ledgerdb.ListRerunCandidatesOfRunRow, error)
+	ListRerunTiers(ctx context.Context) ([]ledgerdb.RerunTier, error)
+	ReadRerunOfAttempt(ctx context.Context, arg ledgerdb.ReadRerunOfAttemptParams) (ledgerdb.ReadRerunOfAttemptRow, error)
 	CountRunReruns(ctx context.Context, arg ledgerdb.CountRunRerunsParams) (int64, error)
 	ListBarrierRuns(ctx context.Context, barrierID string) ([]ledgerdb.ListBarrierRunsRow, error)
 	ListCacheBlocks(ctx context.Context) ([]ledgerdb.CacheBlock, error)
@@ -274,6 +278,8 @@ type WriteOps interface {
 	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
 	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error
 	InsertRerunIntent(ctx context.Context, arg ledgerdb.InsertRerunIntentParams) error
+	AskRerunsForTier(ctx context.Context, arg ledgerdb.AskRerunsForTierParams) error
+	ForgetRerunTier(ctx context.Context, tier string) error
 	AddRerunTry(ctx context.Context, arg ledgerdb.AddRerunTryParams) error
 	SettleRerun(ctx context.Context, arg ledgerdb.SettleRerunParams) error
 	BindJobToRerun(ctx context.Context, arg ledgerdb.BindJobToRerunParams) error

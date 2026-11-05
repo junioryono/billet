@@ -164,6 +164,11 @@ type PoolRunner struct {
 	GithubTarget       string
 }
 
+type RerunTier struct {
+	Tier       string
+	AskedSince string
+}
+
 type RevokedCert struct {
 	Serial    string
 	Node      string

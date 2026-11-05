@@ -209,10 +209,10 @@ const MaxDisruptedReruns = 5
 
 // TierRetry is the re-run policy of one tier.
 type TierRetry struct {
-	// Disrupted is how many times billet asks GitHub to re-run a workflow run
-	// whose job on this tier it proved its own infrastructure ended. Zero, the
-	// default, is never. ADR-023 holds what counts as that proof, and the App
-	// must hold `actions: write` for a tier that sets it.
+	// Disrupted is how many times billet asks GitHub to re-run a workflow run whose
+	// job on this tier it proved its own infrastructure ended, counted across the
+	// run's attempts. Zero, the default, is never. ADR-023 holds what counts as that
+	// proof, and the App must hold `actions: write` for a tier that sets it.
 	Disrupted int `yaml:"disrupted"`
 }
 

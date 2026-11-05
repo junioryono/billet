@@ -53,7 +53,7 @@ type AttemptJob struct {
 //
 // MEASURED, 2026-11-04. A runner killed mid-step left that step `in_progress`
 // with no conclusion and no "Complete job" step, and GitHub concluded the job
-// about nine minutes later. A job failing on its own leaves its failing step
+// ten minutes after it started. A job failing on its own leaves its failing step
 // concluded `failure` and a finished "Complete job". A person's cancellation
 // concludes `cancelled`.
 //
@@ -73,7 +73,9 @@ func (j AttemptJob) RunnerLost() bool {
 			return false
 		}
 
-		if step.Status != RunStatusCompleted {
+		// A STEP WHOSE STATUS IS NOT SAID is no evidence of anything: LatestAttempt
+		// refuses such a record, and this does not read one as unfinished.
+		if step.Status != RunStatusCompleted && step.Status != "" {
 			unfinished = true
 		}
 	}
@@ -155,8 +157,8 @@ func (c *runnerGroupPolicyClient) LatestAttempt(
 		if err != nil {
 			return err
 		}
-		if record.Status == nil {
-			return fmt.Errorf("github: job %d does not say its status", job.ID)
+		if err := rerunEvidence(record); err != nil {
+			return fmt.Errorf("github: job %d: %w", job.ID, err)
 		}
 		listed := AttemptJob{WorkflowJob: job, RunnerName: name, Status: *record.Status}
 		if record.Conclusion != nil {
@@ -171,6 +173,32 @@ func (c *runnerGroupPolicyClient) LatestAttempt(
 	}
 
 	return attempt, nil
+}
+
+// rerunEvidence refuses a job record that does not say what a re-run is decided
+// from. A field left out is could-not-tell, never a field that says nothing: an
+// absent step status would otherwise read as a step that never finished, and an
+// absent conclusion as one that did not fail, which together are the proof.
+func rerunEvidence(record jobRecord) error {
+	switch {
+	case record.Status == nil:
+		return errors.New("the record does not say the job's status")
+	case record.RunAttempt == nil || *record.RunAttempt <= 0:
+		return errors.New("the record does not say the job's attempt")
+	case *record.Status == RunStatusCompleted && record.Conclusion == nil:
+		return errors.New("the record of a completed job does not say how it ended")
+	}
+
+	for _, step := range *record.Steps {
+		switch {
+		case step.Status == nil:
+			return errors.New("a step does not say its status")
+		case *step.Status == RunStatusCompleted && step.Conclusion == nil:
+			return errors.New("a completed step does not say how it ended")
+		}
+	}
+
+	return nil
 }
 
 // RerunFailedJobs asks GitHub to run every failed job of a completed run again,
@@ -228,11 +256,13 @@ func (c *runnerGroupPolicyClient) rerun(ctx context.Context, endpoint, operation
 	if !errors.Is(err, errNotSent) {
 		c.rest.answered(operation, status, header, time.Now())
 	}
-	if err != nil {
-		return fmt.Errorf("github: %s: %w", operation, err)
-	}
+	// THE STATUS FIRST: a 201 whose body broke off was still accepted, and reading it
+	// as a failed try would ask again for a run already going.
 	if status == http.StatusCreated {
 		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("github: %s: %w", operation, err)
 	}
 
 	refused := apiErrorWithout(status, body, token)

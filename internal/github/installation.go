@@ -176,7 +176,7 @@ func (i *Installation) PermissionMismatches(scope Scope, actions ActionsAccess) 
 	for name, want := range permissions {
 		got, ok := i.Permissions[name]
 		if !ok {
-			problems = append(problems, fmt.Sprintf("%s: want %s, not granted", name, want))
+			problems = append(problems, fmt.Sprintf("%s: want %s, not granted%s", name, want, actionsHint(name)))
 			continue
 		}
 
@@ -185,7 +185,7 @@ func (i *Installation) PermissionMismatches(scope Scope, actions ActionsAccess) 
 		// falsifies the credential-isolation claim exactly the way an extra
 		// permission does. (It used to be accepted as "write implies read".)
 		if got != want {
-			problems = append(problems, fmt.Sprintf("%s: want %s, granted %s", name, want, got))
+			problems = append(problems, fmt.Sprintf("%s: want %s, granted %s%s", name, want, got, actionsHint(name)))
 		}
 	}
 
@@ -202,12 +202,23 @@ func (i *Installation) PermissionMismatches(scope Scope, actions ActionsAccess) 
 			continue
 		}
 		problems = append(problems,
-			fmt.Sprintf("%s: granted %s, but billet never requested it", name, got))
+			fmt.Sprintf("%s: granted %s, but billet never requested it%s", name, got, actionsHint(name)))
 	}
 
 	sort.Strings(problems)
 
 	return problems
+}
+
+// actionsHint says what asks for each level of `actions`, which is the one permission
+// a config, rather than the target's scope, decides.
+func actionsHint(name string) string {
+	if name != actionsPermission {
+		return ""
+	}
+
+	return " (billet asks for read where a tier publishes caches from a default branch, and write where " +
+		"a tier sets retry.disrupted)"
 }
 
 // ErrAppUnverifiable wraps failures that say NOTHING about the credential —

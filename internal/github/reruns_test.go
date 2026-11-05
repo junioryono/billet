@@ -140,9 +140,17 @@ func TestALostRunnerIsToldFromEverythingElseGitHubRecords(t *testing.T) {
 func TestAJobWithNoConclusionYetIsNotLost(t *testing.T) {
 	t.Parallel()
 
-	job := AttemptJob{Status: "in_progress", WorkflowJob: WorkflowJob{Steps: []JobStep{{Status: "in_progress"}}}}
+	job := AttemptJob{Status: "in_progress", Conclusion: "failure",
+		WorkflowJob: WorkflowJob{Steps: []JobStep{{Status: "in_progress"}}}}
 	if job.RunnerLost() {
 		t.Error("a running job read as a lost runner")
+	}
+
+	// AND A STEP WHOSE STATUS IS NOT SAID IS NOT AN UNFINISHED ONE.
+	unsaid := AttemptJob{Status: RunStatusCompleted, Conclusion: "failure",
+		WorkflowJob: WorkflowJob{Steps: []JobStep{{Status: ""}}}}
+	if unsaid.RunnerLost() {
+		t.Error("a step with no status read as one that never finished")
 	}
 }
 
@@ -178,10 +186,33 @@ func TestAnIncompleteAnswerAboutAnAttemptIsRefused(t *testing.T) {
 		"no attempt":   {run: `{"id":31,"status":"completed"}`, want: "incomplete"},
 		"attempt zero": {run: `{"id":31,"status":"completed","run_attempt":0}`, want: "incomplete"},
 		"another run":  {run: `{"id":32,"status":"completed","run_attempt":1}`, want: "answered with 32"},
+		"no id":        {run: `{"status":"completed","run_attempt":1}`, want: "incomplete"},
 		"a job with no status": {
 			run:  `{"id":31,"status":"completed","run_attempt":1}`,
-			jobs: `{"total_count":1,"jobs":[{"id":77,"name":"hold","runner_name":"r","steps":[]}]}`,
-			want: "does not say its status",
+			jobs: `{"total_count":1,"jobs":[{"id":77,"name":"hold","run_attempt":1,"runner_name":"r","steps":[]}]}`,
+			want: "does not say the job's status",
+		},
+		"a job with no attempt": {
+			run:  `{"id":31,"status":"completed","run_attempt":1}`,
+			jobs: `{"total_count":1,"jobs":[{"id":77,"name":"hold","status":"completed","conclusion":"failure","runner_name":"r","steps":[]}]}`,
+			want: "does not say the job's attempt",
+		},
+		"a completed job that does not say how it ended": {
+			run:  `{"id":31,"status":"completed","run_attempt":1}`,
+			jobs: `{"total_count":1,"jobs":[{"id":77,"name":"hold","run_attempt":1,"status":"completed","runner_name":"r","steps":[]}]}`,
+			want: "does not say how it ended",
+		},
+		"a step with no status": {
+			run: `{"id":31,"status":"completed","run_attempt":1}`,
+			jobs: `{"total_count":1,"jobs":[{"id":77,"name":"hold","run_attempt":1,"status":"completed","conclusion":"failure",
+				"runner_name":"r","steps":[{"number":1,"name":"x","conclusion":null}]}]}`,
+			want: "a step does not say its status",
+		},
+		"a completed step that does not say how it ended": {
+			run: `{"id":31,"status":"completed","run_attempt":1}`,
+			jobs: `{"total_count":1,"jobs":[{"id":77,"name":"hold","run_attempt":1,"status":"completed","conclusion":"failure",
+				"runner_name":"r","steps":[{"number":1,"name":"x","status":"completed"}]}]}`,
+			want: "a completed step does not say how it ended",
 		},
 		"a list shorter than its count": {
 			run:  `{"id":31,"status":"completed","run_attempt":1}`,
@@ -295,11 +326,15 @@ func TestARerunWithNothingToAskAboutSendsNothing(t *testing.T) {
 	t.Parallel()
 
 	s := newRerunServer(t)
-	if err := s.RerunJob(t.Context(), "acme", "api", 0); err == nil {
-		t.Error("job 0 was asked about")
+	if err := s.RerunJob(t.Context(), "acme", "api", 0); err == nil || !strings.Contains(err.Error(), "positive id") {
+		t.Errorf("job 0 = %v", err)
 	}
-	if err := s.RerunFailedJobs(t.Context(), "acme", "api", -1); err == nil {
-		t.Error("run -1 was asked about")
+	if err := s.RerunFailedJobs(t.Context(), "acme", "api", -1); err == nil ||
+		!strings.Contains(err.Error(), "positive id") {
+		t.Errorf("run -1 = %v", err)
+	}
+	if _, err := s.LatestAttempt(t.Context(), "acme", "api", 0); err == nil || !strings.Contains(err.Error(), "positive id") {
+		t.Errorf("run 0 = %v", err)
 	}
 	if err := s.RerunFailedJobs(t.Context(), "acme", "../other", 31); err == nil {
 		t.Error("a repository segment that is not one was asked about")
@@ -310,6 +345,9 @@ func TestARerunWithNothingToAskAboutSendsNothing(t *testing.T) {
 
 	var none *runnerGroupPolicyClient
 	if err := none.RerunJob(t.Context(), "acme", "api", 77); !errors.Is(err, ErrRunEvidenceUnavailable) {
+		t.Errorf("a client with no App = %v", err)
+	}
+	if err := none.RerunFailedJobs(t.Context(), "acme", "api", 31); !errors.Is(err, ErrRunEvidenceUnavailable) {
 		t.Errorf("a client with no App = %v", err)
 	}
 	if _, err := none.LatestAttempt(t.Context(), "acme", "api", 31); !errors.Is(err, ErrRunEvidenceUnavailable) {
@@ -362,6 +400,42 @@ func TestTheManifestCarriesTheActionsLevel(t *testing.T) {
 		m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed", ScopeOrganization, level)
 		if got := m.Permissions["actions"]; got != want {
 			t.Errorf("level %d asked for actions %q, want %q", level, got, want)
+		}
+	}
+}
+
+// A 201 WHOSE BODY BROKE OFF WAS STILL ACCEPTED: reading it as a failed try would ask
+// again for a run already going.
+func TestA201WhoseBodyBrokeOffIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	s := newRerunServer(t)
+	s.answer = func(w http.ResponseWriter) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, "{")
+	}
+
+	if err := s.RerunFailedJobs(t.Context(), "acme", "api", 31); err != nil {
+		t.Errorf("a 201 cut short = %v, want it accepted", err)
+	}
+}
+
+// A MISMATCH ON ACTIONS SAYS WHAT ASKS FOR EACH LEVEL, and no other permission's does.
+func TestAnActionsMismatchSaysWhatAsksForIt(t *testing.T) {
+	t.Parallel()
+
+	got := (&Installation{Permissions: Permissions(ScopeOrganization, ActionsWrite)}).
+		PermissionMismatches(ScopeOrganization, ActionsNone)
+	if len(got) != 1 || !strings.Contains(got[0], "retry.disrupted") {
+		t.Errorf("mismatches = %v", got)
+	}
+
+	other := (&Installation{Permissions: map[string]string{"metadata": "read"}}).
+		PermissionMismatches(ScopeOrganization, ActionsNone)
+	for _, problem := range other {
+		if strings.Contains(problem, "retry.disrupted") {
+			t.Errorf("a mismatch of another permission names actions' hint: %q", problem)
 		}
 	}
 }

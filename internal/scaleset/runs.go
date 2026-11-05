@@ -102,7 +102,7 @@ func (c *Client) LatestAttempt(ctx context.Context, owner, repository string, ru
 	out := server.RunAttempt{Completed: attempt.Status == billetgithub.RunStatusCompleted, Attempt: attempt.Attempt}
 	for i := range attempt.Jobs {
 		job := &attempt.Jobs[i]
-		out.Jobs = append(out.Jobs, server.AttemptJob{ID: job.ID, RunnerName: job.RunnerName,
+		out.Jobs = append(out.Jobs, server.AttemptJob{ID: job.ID, RunnerName: job.RunnerName, Attempt: job.RunAttempt,
 			RunnerLost: job.RunnerLost(), Failed: job.Failed()})
 	}
 

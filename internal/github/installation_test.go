@@ -61,7 +61,7 @@ func TestPermissionMismatches(t *testing.T) {
 			granted: map[string]string{
 				"metadata": "read", "organization_self_hosted_runners": "write", "actions": "write",
 			},
-			want: []string{"actions: granted write, but billet never requested it"},
+			want: []string{"actions: granted write, but billet never requested it" + actionsHint("actions")},
 		},
 	}
 

@@ -52,8 +52,8 @@ func TestRetryDisruptedIsBounded(t *testing.T) {
 	}
 }
 
-// THE RULE IS THE EXPORTED ONE alloc.New CAN CALL, and it sees a tier that never
-// came through Load.
+// THE RULE IS THE EXPORTED ONE alloc.New CALLS, and it sees a tier that never came
+// through Load. That alloc.New does is held by alloc's own tests.
 func TestRetryErrorsJudgesATierThatNeverWentThroughLoad(t *testing.T) {
 	t.Parallel()
 
