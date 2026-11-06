@@ -902,6 +902,50 @@ func TestARegistrationsActionsReadReachesTheScope(t *testing.T) {
 	}
 }
 
+// TWO DEPLOYMENTS SHARING AN INSTALLATION, one re-running jobs and one not, are each
+// served: the installation is proved against the write the first needs, and each token
+// carries only what its own registration grants.
+func TestASharedInstallationServesEachRegistrationItsOwnScope(t *testing.T) {
+	t.Parallel()
+
+	gh := newFakeGitHub(t)
+	gh.lookup = func(w http.ResponseWriter, _ *http.Request) {
+		answerJSON(w, map[string]any{
+			"id": 22, "account": map[string]string{"login": "acme", "type": "Organization"},
+			"permissions": map[string]string{
+				"metadata": "read", "organization_self_hosted_runners": "write", "actions": "write",
+			},
+		})
+	}
+	writer, writerPrint := testClient(t)
+	reader, readerPrint := testClient(t)
+
+	write, read := org(22), org(22)
+	write.ActionsWrite, read.ActionsRead = true, true
+
+	broker := newTestBroker(t, gh, []config.BrokerDeployment{
+		{ID: deploymentA, Clients: []string{writerPrint}, Installations: []config.BrokerInstallation{write}},
+		{ID: deploymentB, Clients: []string{readerPrint}, Installations: []config.BrokerInstallation{read}},
+	})
+
+	for name, tc := range map[string]struct {
+		cert tls.Certificate
+		want string
+	}{
+		"the deployment re-running jobs": {writer, "write"},
+		"the deployment reading only":    {reader, "read"},
+	} {
+		token, err := broker.client(t, tc.cert, nil).Tokens(github.OrganizationTarget("acme"), appID, 22).
+			InstallationToken(t.Context())
+		if err != nil {
+			t.Fatalf("%s: token: %v", name, err)
+		}
+		if got := token.Permissions()["actions"]; got != tc.want {
+			t.Errorf("%s: the token holds actions %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
 // A HOST WHOSE KEY IS REGISTERED UNDER ANOTHER DEPLOYMENT finds out from its first
 // answer, and uses nothing it was handed.
 func TestAHostRefusesATokenMintedForAnotherDeployment(t *testing.T) {

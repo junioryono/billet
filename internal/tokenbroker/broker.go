@@ -99,9 +99,13 @@ type installation struct {
 	appID          int64
 	installationID int64
 	target         github.Target
-	actions        github.ActionsAccess
-	key            github.AppKey
-	base           string
+	// actions is what this registration's tokens carry, and installationActions the
+	// most any registration of the same installation asks: what the installation
+	// itself must hold, since it is one grant whoever shares it.
+	actions             github.ActionsAccess
+	installationActions github.ActionsAccess
+	key                 github.AppKey
+	base                string
 
 	tokens github.TokenSource
 
@@ -191,6 +195,20 @@ func NewServer(cfg *config.BrokerConfig, log *slog.Logger) (*Server, error) {
 					github.ScopeFor(target, actionsOf(reg)), mintFresh),
 			}
 		}
+	}
+
+	// AN INSTALLATION IS VERIFIED AGAINST WHAT EVERY REGISTRATION OF IT ASKS: two
+	// deployments may share one, and the grant one of them needs, write for a re-run,
+	// is then the installation's, while each token still carries only its own
+	// registration's. Verified against its own, a read-only deployment would be refused
+	// an installation another deployment's write had widened.
+	most := map[[2]int64]github.ActionsAccess{}
+	for _, inst := range s.installations {
+		id := [2]int64{inst.appID, inst.installationID}
+		most[id] = max(most[id], inst.actions)
+	}
+	for _, inst := range s.installations {
+		inst.installationActions = most[[2]int64{inst.appID, inst.installationID}]
 	}
 
 	return s, nil
@@ -467,7 +485,7 @@ func (s *Server) proved(r *http.Request, inst *installation) (int, string, strin
 
 func verifyInstallation(r *http.Request, inst *installation) error {
 	_, err := github.VerifyAppAt(r.Context(), nil, inst.base, inst.appID, inst.key, inst.target,
-		inst.installationID, inst.actions)
+		inst.installationID, inst.installationActions)
 
 	return err //nolint:wrapcheck // read through by proved, and logged whole.
 }
