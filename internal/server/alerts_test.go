@@ -263,6 +263,24 @@ func (r *alertStack) marked() int {
 	return len(marks)
 }
 
+// outcome is what a rule's judgement of a job on a condition came to, as the ledger
+// holds it, empty where it holds none: what tells an unknown from a miss.
+func (r *alertStack) outcome(lease, condition string) string {
+	r.t.Helper()
+
+	var outcome string
+	err := r.db.Reader().QueryRowContext(r.t.Context(),
+		`SELECT outcome FROM alert_marks WHERE lease_id = $1 AND alert_condition = $2`, lease, condition).Scan(&outcome)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ""
+	}
+	if err != nil {
+		r.t.Fatalf("read the judgement of %s on %s: %v", lease, condition, err)
+	}
+
+	return outcome
+}
+
 // atRule is the rule the tests use unless they say otherwise.
 func atRule(mutate ...func(*config.AlertRule)) config.AlertRule {
 	rule := config.AlertRule{Name: "deploys", On: config.AlertConditions{Failed: true}, Notify: []string{"hook"}, Cooldown: "1h"}
@@ -481,6 +499,9 @@ func TestAJobNothingCanReadIsUnknownAtOnce(t *testing.T) {
 	if got := r.marked(); got != 2 {
 		t.Errorf("%d marks, want the orphan judged unknown and the later job judged", got)
 	}
+	if got := r.outcome("orphan", "failed"); got != "unknown" {
+		t.Errorf("orphan was judged %q, want unknown, which moves no streak", got)
+	}
 	if got := r.owedLeases(); len(got) != 1 || got[0] != "later:failed" {
 		t.Errorf("owed = %v, want the later job, held back by nothing", got)
 	}
@@ -583,6 +604,9 @@ func TestTheHourRunsOutAfterAnAskWhateverTheBudget(t *testing.T) {
 	if got := r.marked(); got != 1 {
 		t.Errorf("%d marks, want the job judged unknown an hour after it was asked", got)
 	}
+	if got := r.outcome("asked", "failed"); got != "unknown" {
+		t.Errorf("asked was judged %q, want unknown, which moves no streak", got)
+	}
 }
 
 // A JOB NEVER ASKED ABOUT IS JUDGED UNKNOWN BEFORE IT LEAVES THE READ, and logged, so
@@ -607,6 +631,9 @@ func TestAJobNeverAskedIsUnknownBeforeItLeavesTheRead(t *testing.T) {
 		t.Errorf("%d marks and %d reads near the end of the read, want it judged unknown unread", got,
 			r.record.readCount())
 	}
+	if got := r.outcome("starved", "failed"); got != "unknown" {
+		t.Errorf("starved was judged %q, want unknown, which moves no streak", got)
+	}
 }
 
 // A WAIT GITHUB NEVER GAVE A QUEUE TIME FOR IS RECORDED AS UNKNOWN just before the job
@@ -629,6 +656,9 @@ func TestAWaitNeverKnownIsRecordedUnknown(t *testing.T) {
 	r.pass()
 	if got := r.marked(); got != 1 {
 		t.Errorf("%d marks just before it leaves the read, want the unknown wait recorded", got)
+	}
+	if got := r.outcome("unwaited", "waited-long"); got != "unknown" {
+		t.Errorf("unwaited was judged %q, want unknown, which moves no streak", got)
 	}
 }
 
@@ -772,6 +802,9 @@ func TestALateFirstAskStillGetsItsTime(t *testing.T) {
 	if got := r.marked(); got != 1 {
 		t.Errorf("%d marks past its deadline, want it judged unknown", got)
 	}
+	if got := r.outcome("late", "failed"); got != "unknown" {
+		t.Errorf("late was judged %q, want unknown, which moves no streak", got)
+	}
 }
 
 // A REPOSITORY NEVER WRITTEN IS WAITED FOR AN HOUR, not the job's whole time in the
@@ -793,6 +826,9 @@ func TestARepositoryNeverWrittenIsWaitedForAnHour(t *testing.T) {
 	r.pass()
 	if got := r.marked(); got != 1 {
 		t.Errorf("%d marks past the hour, want it judged unknown", got)
+	}
+	if got := r.outcome("nameless", "failed"); got != "unknown" {
+		t.Errorf("nameless was judged %q, want unknown, which moves no streak", got)
 	}
 }
 
@@ -821,6 +857,9 @@ func TestAnArchivedLeaseIsJudgedBeforeItsArchivingAgesOut(t *testing.T) {
 	if got := r.marked(); got != 1 {
 		t.Errorf("%d marks near the end of its archiving's window, want it judged unknown", got)
 	}
+	if got := r.outcome("archived", "disrupted"); got != "unknown" {
+		t.Errorf("archived was judged %q, want unknown, which moves no streak", got)
+	}
 }
 
 // A RUNNING JOB NEVER ASKED ABOUT IS JUDGED UNKNOWN BEFORE IT LEAVES ITS WINDOW, so an
@@ -846,6 +885,9 @@ func TestARunningJobNeverAskedIsUnknownBeforeItsWindowEnds(t *testing.T) {
 	r.pass()
 	if got := r.marked(); got != 1 {
 		t.Errorf("%d marks at the end of its window, want it judged unknown", got)
+	}
+	if got := r.outcome("forever", "running-long"); got != "unknown" {
+		t.Errorf("forever was judged %q, want unknown, which moves no streak", got)
 	}
 }
 
@@ -1052,6 +1094,9 @@ func TestAReadThatFailsWaitsThenIsJudgedUnknownAndBreaksNoStreak(t *testing.T) {
 	r.pass()
 	if got := r.marked(); got != 2 {
 		t.Fatalf("past the window, %d marks, want the unknown recorded", got)
+	}
+	if got := r.outcome("unread", "failed"); got != "unknown" {
+		t.Errorf("unread was judged %q, want unknown, which moves no streak", got)
 	}
 	if due := r.owed(); len(due) != 0 {
 		t.Errorf("an unknown job is owed: %+v", due)
