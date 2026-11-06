@@ -111,7 +111,7 @@ func gitHubTargetAccessNote(ctx context.Context, cfg *config.Config, gh config.G
 	}
 
 	inst, err := github.VerifyAppAt(ctx, nil, app.GitHubAPIBase, gh.AppID, key,
-		app.GitHubTargetOf(gh), gh.InstallationID, cfg.TargetNeedsRunEvidence(gh.Name))
+		app.GitHubTargetOf(gh), gh.InstallationID, app.ActionsAccessOf(cfg, gh.Name))
 
 	switch {
 	case ctx.Err() != nil:

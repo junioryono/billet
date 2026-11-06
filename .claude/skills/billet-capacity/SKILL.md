@@ -35,7 +35,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A heartbeat pass's budget starts after it holds the mutex.**
 - **Exactly one party renews a lease, and every defect here was a moment when that count was zero.**
 - **An inventory that shrinks is capacity that gets resold.**
-- **billet attributes a lost job; it never re-runs one.**
+- **billet attributes a lost job, and re-runs one only for a tier that asks and only on GitHub's proof of a lost runner.**
 - **A reserved fleet's claim is released by a proof.**
 
 ### Custody, quarantine, drains and sessions: [references/custody-and-drains.md](references/custody-and-drains.md)

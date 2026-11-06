@@ -74,7 +74,32 @@ Quarantine resolves itself in the ordinary case: the host destroys the compute a
 
 ## What `leases failures` is and is not
 
-It shows two facts side by side and no verdict between them: GitHub's own result for the job, and what billet's infrastructure was doing at the time (the host stopped answering, the guest went missing from an inventory, the machine was reclaimed by a spot interruption, the job was destroyed under a custody bound). billet cannot tell a broken host from a broken build, and it **does not re-run anything**, because a re-run is a side effect on your repository and a deploy must not happen twice because a machine went away. Every runner in this ecosystem fails-and-stops on a lost runner; what billet owes the person whose build went red is the one thing only billet knows. A restart of billet itself is deliberately not recorded as a disruption, because adopted jobs routinely finish green.
+It shows two facts side by side and no verdict between them: GitHub's own result for the job, and what billet's infrastructure was doing at the time (the host stopped answering, the guest went missing from an inventory, the machine was reclaimed by a spot interruption, the job was destroyed under a custody bound). billet cannot tell a broken host from a broken build from this alone, and it **re-runs nothing here by default**, because a re-run is a side effect on your repository and a deploy must not happen twice because a machine went away. Every runner in this ecosystem fails-and-stops on a lost runner; what billet owes the person whose build went red is the one thing only billet knows. A restart of billet itself is deliberately not recorded as a disruption, because adopted jobs routinely finish green.
+
+## Re-running a job billet ended
+
+A tier can ask for more: `retry: {disrupted: 1}` lets billet ask GitHub to re-run a job it ended, up to that many times for one workflow run. The App needs `actions: write`, which `billet github-app create --actions-write` asks for; on an App that already exists, add the permission on the App's settings page and accept it on the installation, and `billet check` says when it holds what the tiers need. [ADR-029](../reference/decisions/adr-029-rerunning-disrupted-jobs.md) holds the decision.
+
+A job is re-run only when all of these are true:
+
+- The ledger recorded a disruption from the closed list while the job could still have been running: `reclaimed` or `guest-absent`. Not `node-forgotten`, because a host cut off by a partition goes on running the job. Not `held-past-limit`, because `node.max_custody` is a bound an operator chose and a job that hangs would meet it again. Not an operator's `billet force-destroy`, because a person chose that.
+- The job ended after its tier started asking: a job already red when `retry.disrupted` was set is not re-run because the config changed.
+- GitHub's own record of the job shows its runner was lost: the job concluded `failure`, a step never finished, and no step concluded `failure`. A job that failed on its own never leaves that record, and neither does a runner stopped gracefully, which GitHub records exactly as a job's own failure, so such a job stays red.
+
+The `RE-RUN` column of `billet leases failures`, and the `failure` line of `billet jobs show`, say what was decided:
+
+| Decision | What it means |
+|---|---|
+| `requested` | GitHub accepted a request that covers this job |
+| `unconfirmed` | a request that covers this job may have landed, and GitHub could not be read to say: a read failed after a day, or no target this control plane serves can read the run after a day, or the run went unread, refused or throttled for two; it is counted as one that did |
+| `unproven` | GitHub's record does not show a lost runner, so the job may have failed on its own |
+| `mixed` | several jobs were proved beside a failed job billet must not run again (one that failed on its own, or one past the window), and neither of GitHub's two requests can run them without it |
+| `limit` | the run already had every re-run the tiers of the jobs it would run again allow |
+| `superseded` | the run's latest attempt is a later one than the job's: a person re-ran it, or a request of billet's own made before the job's result arrived |
+| `expired` | nothing could be decided within a day of the job's result, or a request was not sent within a day of being decided, or a tier it covers stopped asking for re-runs and asked again before it was sent |
+| `failed` | GitHub did not accept the request in five sends, read the run after each; the log says why |
+
+A dash is nothing decided: a tier that did not ask, or a run that has not finished. A run is decided only once every job of it has finished, because GitHub refuses a re-run of one still going, and a failed request is retried with a backoff and never holds up scheduling. `billet_job_reruns{tier,decision}` counts the last day's decisions.
 
 ## `billet check`
 

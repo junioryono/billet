@@ -170,6 +170,7 @@ The per-sample series a node reports with each job records the wall time of its 
 | `intercept` | the deprecated spelling of `cache.actions.enabled`; refused beside `cache.actions` |
 | `network` | what the tier asks of its guests' network; see [`tiers[].network`](#tiersnetwork). Without it the tier is open, as a tier always was |
 | `max_concurrent`, `reserved` | a ceiling and a floor; a macOS tier's ceiling defaults to what its hosts permit between them |
+| `retry` | `disrupted`, 0 to 5, default 0: how many times billet asks GitHub to re-run a workflow run whose job on this tier it proved its own infrastructure ended. The App must hold `actions: write`. See [Re-running a job billet ended](../operating/status-and-leases.md#re-running-a-job-billet-ended) |
 | `warm_pool` | refused when non-zero; no backend implements it |
 
 ### `tiers[].network`
@@ -260,6 +261,6 @@ deployments:
 | `apps[].api_url` | no | the REST base, for GitHub Enterprise Server; absent, the real GitHub |
 | `deployments[].id` | yes | the deployment's identity, as `billet broker client-key` printed it |
 | `deployments[].clients` | yes | the fingerprints of the keys that prove this deployment, one per host. A key proves one deployment |
-| `deployments[].installations[]` | no | the only tokens this deployment may ask for: `app_id`, `installation_id`, `target` (`owner`, or `owner/name` for one repository), and `actions_read`, which lets its tokens read GitHub's job records: without it every job keeps an unknown queue time, and a tier publishing caches from a default branch is refused. `billet broker client-key` prints it set |
+| `deployments[].installations[]` | no | the only tokens this deployment may ask for: `app_id`, `installation_id`, `target` (`owner`, or `owner/name` for one repository), and `actions_read`, which lets its tokens read GitHub's job records: without it every job keeps an unknown queue time, and a tier publishing caches from a default branch is refused. `actions_write` grants write, which includes read, for a deployment whose tier sets `retry.disrupted`, and the installation must hold it too. `billet broker client-key` prints the one each target needs |
 
 An owner registered as a whole organization belongs to one deployment, under any App, because its token reaches every repository; two deployments may share an owner by repository, whose tokens are scoped to the repository, and a repository belongs to one deployment.

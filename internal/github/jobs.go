@@ -134,6 +134,8 @@ type jobRecord struct {
 	RunAttempt *int64          `json:"run_attempt"`
 	RunnerName json.RawMessage `json:"runner_name"`
 	CreatedAt  *string         `json:"created_at"`
+	Status     *string         `json:"status"`
+	Conclusion *string         `json:"conclusion"`
 	HeadSHA    *string         `json:"head_sha"`
 	HeadBranch *string         `json:"head_branch"`
 	Steps      *[]struct {
@@ -166,7 +168,7 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 	}
 
 	var matches []WorkflowJob
-	err := c.listRunJobs(ctx, owner, repository, runID, MaxRunJobs, func(record jobRecord, name string) error {
+	err := c.listRunJobs(ctx, owner, repository, runID, "all", MaxRunJobs, func(record jobRecord, name string) error {
 		if name != runnerName {
 			return nil
 		}
@@ -210,7 +212,7 @@ func (c *runnerGroupPolicyClient) RunJobs(
 
 	jobs := map[string]RunJob{}
 	shared := map[string]bool{}
-	err := c.listRunJobs(ctx, owner, repository, runID, MaxQueueTimeRunJobs, func(record jobRecord,
+	err := c.listRunJobs(ctx, owner, repository, runID, "all", MaxQueueTimeRunJobs, func(record jobRecord,
 		name string,
 	) error {
 		if name == "" || shared[name] {
@@ -246,14 +248,15 @@ func (c *runnerGroupPolicyClient) RunJobs(
 	return jobs, nil
 }
 
-// listRunJobs hands visit every job of a run, across every attempt, with the
-// name of the runner it ran on (empty for none).
+// listRunJobs hands visit every job of a run the filter names, `all` for every
+// attempt or `latest` for the newest, with the name of the runner it ran on (empty
+// for none).
 //
 // THE WHOLE LIST OR AN ERROR: a list longer than maxJobs, one whose count
 // changes while it is read, or one that repeats a job is could-not-tell rather
 // than a prefix. maxJobs is at most MaxRunJobs.
 func (c *runnerGroupPolicyClient) listRunJobs(ctx context.Context, owner, repository string,
-	runID int64, maxJobs int, visit func(record jobRecord, runnerName string) error,
+	runID int64, filter string, maxJobs int, visit func(record jobRecord, runnerName string) error,
 ) error {
 	endpoint, err := repositoryEndpoint(c.base, owner, repository)
 	if err != nil {
@@ -272,7 +275,7 @@ func (c *runnerGroupPolicyClient) listRunJobs(ctx context.Context, owner, reposi
 			return fmt.Errorf("github: run %d's %d jobs did not arrive in %d pages",
 				runID, total, maxPages)
 		}
-		query := url.Values{"filter": {"all"}, "per_page": {strconv.Itoa(runJobsPerPage)},
+		query := url.Values{"filter": {filter}, "per_page": {strconv.Itoa(runJobsPerPage)},
 			"page": {strconv.Itoa(page)}}
 		var body struct {
 			TotalCount *int         `json:"total_count"`

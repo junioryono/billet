@@ -429,6 +429,21 @@ func (c *Config) TargetNeedsRunEvidence(name string) bool {
 	return false
 }
 
+// TargetNeedsActionsWrite reports whether a tier of the named target re-runs a
+// job billet disrupted, which is what asks that target's GitHub App for
+// `actions: write`. PER TARGET for TargetNeedsRunEvidence's reason, and it is a
+// wider grant than that one, so a target with no such tier refuses it.
+func (c *Config) TargetNeedsActionsWrite(name string) bool {
+	for i := range c.Tiers {
+		target, ok := c.TierTarget(&c.Tiers[i])
+		if ok && target.Name == name && c.Tiers[i].DisruptedReruns() > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
 // NeedsGuestCacheServices reports whether a tier enables a cache that is
 // served by the node for a guest the node controls: the Actions cache, the Git
 // proxy, the Bazel and Go caches and the npm registry cache.

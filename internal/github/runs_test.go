@@ -116,7 +116,7 @@ func TestRunEvidenceAddsActionsReadAndNothingElse(t *testing.T) {
 	t.Parallel()
 
 	for _, scope := range []Scope{ScopeOrganization, ScopeRepository} {
-		without, with := Permissions(scope, false), Permissions(scope, true)
+		without, with := Permissions(scope, ActionsNone), Permissions(scope, ActionsRead)
 		if _, ok := without["actions"]; ok {
 			t.Errorf("%s: actions requested without run evidence", scope)
 		}
@@ -125,14 +125,14 @@ func TestRunEvidenceAddsActionsReadAndNothingElse(t *testing.T) {
 		}
 
 		granted := &Installation{Permissions: with}
-		if problems := granted.PermissionMismatches(scope, true); len(problems) != 0 {
+		if problems := granted.PermissionMismatches(scope, ActionsRead); len(problems) != 0 {
 			t.Errorf("%s: the requested set was refused: %v", scope, problems)
 		}
-		if problems := granted.PermissionMismatches(scope, false); len(problems) != 0 {
+		if problems := granted.PermissionMismatches(scope, ActionsNone); len(problems) != 0 {
 			t.Errorf("%s: actions: read held where no tier needs it = %v, want it accepted", scope, problems)
 		}
 		plain := &Installation{Permissions: without}
-		if problems := plain.PermissionMismatches(scope, true); len(problems) != 1 ||
+		if problems := plain.PermissionMismatches(scope, ActionsRead); len(problems) != 1 ||
 			!strings.Contains(problems[0], "actions: want read, not granted") {
 			t.Errorf("%s: missing actions: read = %v", scope, problems)
 		}

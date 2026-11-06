@@ -128,6 +128,9 @@ type BrokerInstallation struct {
 	// every job keeps an unknown queue time, and `tiers[].cache.publish: default-branch`
 	// cannot work at all.
 	ActionsRead bool `yaml:"actions_read,omitempty"`
+	// ActionsWrite adds `actions: write`, which includes read: what a deployment
+	// whose tier sets `retry.disrupted` needs to re-run a job billet disrupted.
+	ActionsWrite bool `yaml:"actions_write,omitempty"`
 }
 
 // LoadBroker reads and validates the broker's file, refusing a key it does not know

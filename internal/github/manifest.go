@@ -45,11 +45,11 @@ const ManifestTTL = time.Hour
 // Read ONLY through permissionsFor, so no code path can request both sets: a
 // test parses this package and holds that to be so.
 //
-// Absent from both: `actions: read`. It exposes workflow runs, logs and
-// artifacts, and only a deployment that publishes caches from a default branch
-// needs it, to read a run's own head branch and event from GitHub (see
-// runEvidencePermission). No `contents` either way, which is what makes "billet
-// cannot read your code" true rather than reassuring.
+// Absent from both: `actions`. Read exposes workflow runs, logs and artifacts,
+// and only a deployment that publishes caches from a default branch needs it, to
+// read a run's own head branch and event from GitHub; write is for a tier that
+// re-runs a job billet disrupted (see ActionsAccess). No `contents` either way,
+// which is what makes "billet cannot read your code" true rather than reassuring.
 //
 // THE REPOSITORY SET IS WIDER, AND THAT IS A STATED TRADE. Registering a
 // repository's runners needs the repository permission `administration: write`
@@ -71,40 +71,67 @@ var (
 	}
 )
 
-// runEvidencePermission is what a deployment publishing caches from a default
-// branch adds: `actions: read`, to read a workflow run's head branch, head
-// repository and event, the evidence a cache authority is decided from.
-// Requested only when asked for, so every other deployment's set is unchanged.
-var runEvidencePermission = map[string]string{"actions": "read"}
+// actionsPermission is the name of the one permission ActionsAccess decides.
+const actionsPermission = "actions"
+
+// actionsReadLevel is the level billet requests by default, and so the one an
+// App that needs no `actions` at all may hold anyway.
+const actionsReadLevel = "read"
+
+// ActionsAccess is how much of the `actions` permission a target asks for. Each
+// level is requested only when asked for, so every other deployment's set is
+// unchanged. The zero value is the narrowest.
+type ActionsAccess int
+
+const (
+	// ActionsNone adds nothing.
+	ActionsNone ActionsAccess = iota
+	// ActionsRead is what a deployment publishing caches from a default branch
+	// adds, to read a workflow run's head branch, head repository and event, the
+	// evidence a cache authority is decided from.
+	ActionsRead
+	// ActionsWrite is what a tier with retry.disrupted adds, to re-run a job
+	// billet ended. It includes read. GitHub offers no narrower grant: the same
+	// level also covers dispatching a workflow and deleting logs, artifacts and
+	// caches, none of which billet does (ADR-029).
+	ActionsWrite
+)
+
+// level is the permission's value, empty for none.
+func (a ActionsAccess) level() string {
+	switch a {
+	case ActionsRead:
+		return actionsReadLevel
+	case ActionsWrite:
+		return "write"
+	default:
+		return ""
+	}
+}
 
 // permissionsFor is the ONE reader of the two sets.
-func permissionsFor(scope Scope, runEvidence bool) map[string]string {
+func permissionsFor(scope Scope, actions ActionsAccess) map[string]string {
 	base := organizationPermissions
 	if scope == ScopeRepository {
 		base = repositoryPermissions
 	}
-	if !runEvidence {
+	if actions.level() == "" {
 		return base
 	}
 
-	out := make(map[string]string, len(base)+len(runEvidencePermission))
+	out := make(map[string]string, len(base)+1)
 	for k, v := range base {
 		out[k] = v
 	}
-	for k, v := range runEvidencePermission {
-		out[k] = v
-	}
+	out[actionsPermission] = actions.level()
 
 	return out
 }
 
 // Permissions returns a copy of the permission set billet requests for a
-// target of the given scope.
-//
-// runEvidence adds `actions: read`, which a deployment that publishes caches
-// from a default branch needs.
-func Permissions(scope Scope, runEvidence bool) map[string]string {
-	set := permissionsFor(scope, runEvidence)
+// target of the given scope and `actions` access.
+func Permissions(scope Scope, actions ActionsAccess) map[string]string {
+	set := permissionsFor(scope, actions)
 
 	out := make(map[string]string, len(set))
 	for k, v := range set {
@@ -142,7 +169,7 @@ type HookAttributes struct {
 // NewManifest builds billet's manifest for a target of the given scope.
 // redirectURL and setupURL point at the loopback server the CLI runs for the
 // duration of onboarding.
-func NewManifest(name, redirectURL, setupURL string, scope Scope, runEvidence bool) Manifest {
+func NewManifest(name, redirectURL, setupURL string, scope Scope, actions ActionsAccess) Manifest {
 	return Manifest{
 		Name:        name,
 		URL:         "https://github.com/junioryono/billet",
@@ -164,7 +191,7 @@ func NewManifest(name, redirectURL, setupURL string, scope Scope, runEvidence bo
 			URL:    webhookPlaceholderURL,
 			Active: false,
 		},
-		Permissions: Permissions(scope, runEvidence),
+		Permissions: Permissions(scope, actions),
 		// Deliberately NOT setting SetupOnUpdate. It would redirect a future
 		// repository-access change back to setup_url — a loopback port that
 		// stopped existing the moment onboarding finished, so the operator would
