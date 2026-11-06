@@ -88,7 +88,8 @@ const rightsizeCovers = "Covers the jobs GitHub started on a runner of this depl
 	"that a job stayed small; an OOM kill is the host's. CPU pressure is over the lease's whole life. A " +
 	"candidate tier is one that differs from the current tier only in its name, its vCPUs and memory, and how " +
 	"many of it are kept warm, run at once or reserved: every other setting is the same, its disk, shared " +
-	"memory and BuildKit cache mount limit are no smaller, and a trusted tier must allow the workflow. GitHub's " +
+	"memory and BuildKit cache mount limit are no smaller, the architecture can be told from its settings or " +
+	"its image, and a trusted tier must allow the workflow. GitHub's " +
 	"runner group settings are not read, and may still refuse a repository."
 
 // rightsizeThresholds words the thresholds for a person.
@@ -524,7 +525,7 @@ func recommend(job *rightsizeJob, current *config.Tier, tiers []config.Tier) {
 		job.Reason = strings.Join(why, " and ")
 		job.Recommended = largerTier(job, current, tiers, overMemory || nearMemory, cpuBound)
 		if job.Recommended == nil {
-			job.Reason += "; no larger tier is configured"
+			job.Reason += noTier(current, "; no larger tier is configured")
 		}
 	case busy <= rightsizeBusyIdle && (guestSmall || hostSmall):
 		job.Recommendation = rightsizeSmaller
@@ -542,7 +543,7 @@ func recommend(job *rightsizeJob, current *config.Tier, tiers []config.Tier) {
 		job.Reason = fmt.Sprintf("idle (CPU busy at p90 %.0f%%, %s)", 100*busy, from)
 		job.Recommended = smallerTier(job, current, tiers, *job.DemandP90, need)
 		if job.Recommended == nil {
-			job.Reason += "; no smaller tier is configured that would hold it"
+			job.Reason += noTier(current, "; no smaller tier is configured that would hold it")
 		}
 	case busy <= rightsizeBusyIdle:
 		job.Recommendation = rightsizeKeep
@@ -586,11 +587,23 @@ func cpuBoundWhy(job *rightsizeJob) string {
 	return fmt.Sprintf(" (CPU pressure at p90 %.0f%%)", 100**job.PressureP90)
 }
 
-// sameFamily says a tier is of current's family (config.Tier.SameFamily) and, when
+// noTier says why no tier was named: none fits, or the current tier's architecture
+// cannot be told, so no other tier is known to run what it runs.
+func noTier(current *config.Tier, none string) string {
+	if current.Platform().Arch == "" {
+		return "; the architecture of its tier cannot be told, so no other tier is known to run it"
+	}
+
+	return none
+}
+
+// sameFamily says a tier is of current's family (config.Tier.SameFamily), on an
+// architecture that can be told (the family shares it, since a platform is read from
+// settings a family keeps, but an image naming none may run on either), and, when
 // trusted, allows the workflow, or its runner group would refuse the job a
 // recommendation moved there.
 func sameFamily(current, other *config.Tier, workflow string) bool {
-	if !current.SameFamily(*other) {
+	if !current.SameFamily(*other) || current.Platform().Arch == "" {
 		return false
 	}
 
@@ -791,6 +804,10 @@ type rightsizeJobJSON struct {
 	Confidence        string   `json:"confidence"`
 	RecommendedTier   string   `json:"recommended_tier"`
 	RecommendedRunsOn string   `json:"recommended_runs_on"`
+	// RecommendedVCPU and RecommendedMemory are the recommended tier's shape when the
+	// report was made, so a tier resized since is not moved to on this report's word.
+	RecommendedVCPU   *int64 `json:"recommended_vcpu"`
+	RecommendedMemory *int64 `json:"recommended_memory_bytes"`
 }
 
 // positive is v, or nil where zero says it was not recorded.
@@ -827,6 +844,8 @@ func renderRightsizeJSON(w io.Writer, r rightsizeReport) error {
 		}
 		if job.Recommended != nil {
 			row.RecommendedTier, row.RecommendedRunsOn = job.Recommended.Label, job.Recommended.ScaleSetName()
+			row.RecommendedVCPU = positive(int64(job.Recommended.VCPU))
+			row.RecommendedMemory = positive(int64(job.Recommended.Memory))
 		}
 		out.Jobs = append(out.Jobs, row)
 	}

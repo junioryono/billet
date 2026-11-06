@@ -352,6 +352,26 @@ func TestARecommendationStaysInTheTiersFamily(t *testing.T) {
 		t.Errorf("no larger tier: %s to %+v (%s)", got.Recommendation, got.Recommended, got.Reason)
 	}
 
+	// AN IMAGE NAMING NO ARCHITECTURE MAY RUN ON EITHER, so a tier of the same family is
+	// still no tier known to run the job, and the reason says which it was.
+	noArch := func(name string, vcpu int, memory config.ByteSize) config.Tier {
+		out := rightsizeTier(name, vcpu, memory)
+		out.Image = "ubuntu-2404@verified"
+		return out
+	}
+	for _, tc := range []struct {
+		runs []fixedJob
+		want string
+	}{{idle, rightsizeSmaller}, {busy, rightsizeLarger}} {
+		got := rightsizeOne(t, tc.runs, []config.Tier{noArch("t4", 4, 16*gb), noArch("small", 2, 8*gb),
+			noArch("large", 8, 32*gb)})
+		if got.Recommendation != tc.want || got.Recommended != nil ||
+			!strings.Contains(got.Reason, "the architecture of its tier cannot be told") {
+			t.Errorf("no architecture: %s to %+v (%s); want %s and no tier", got.Recommendation, got.Recommended,
+				got.Reason, tc.want)
+		}
+	}
+
 	// A smaller tier the job would overfill is no candidate: 40% of 16 GB is 6.4 GB,
 	// which needs 9.1 GB to be no more than 70% full, so t2's 8 GB is out; and its
 	// CPU, 30% of 4 vCPU, needs 2 vCPU to be no more than 70% busy, which a 1 vCPU

@@ -451,7 +451,7 @@ jobs:
 	entry := func(job string) rightsizeEntry {
 		return rightsizeEntry{Repository: "acme/api", Workflow: "acme/api/" + file, Job: job, CurrentRunsOn: onFour,
 			Recommendation: "smaller", Reason: "idle", Confidence: "high", RecommendedTier: "platform-2vcpu",
-			RecommendedRunsOn: onTwo}
+			RecommendedRunsOn: onTwo, RecommendedVCPU: 2, RecommendedMemory: int64(8 * config.GiB)}
 	}
 	forged := entry("forged")
 	forged.RecommendedRunsOn = onTwo + "\n    evil: true"
@@ -1083,7 +1083,8 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 		return out
 	}
 	entry := rightsizeEntry{Repository: "acme/api", Workflow: "acme/api/" + file, Job: "build", CurrentRunsOn: onFour,
-		Recommendation: "smaller", Reason: "idle", Confidence: "high", RecommendedRunsOn: onTwo}
+		Recommendation: "smaller", Reason: "idle", Confidence: "high", RecommendedRunsOn: onTwo, RecommendedVCPU: 2,
+		RecommendedMemory: int64(8 * config.GiB)}
 
 	for _, tc := range []struct {
 		name   string
@@ -1104,7 +1105,7 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 			says: "is not"},
 		{name: "another architecture", tiers: tiers(func(t *config.Tier) { t.Image = "ubuntu-2404-arm64@verified" }),
 			says: "is not"},
-		{name: "the same image naming no architecture is one family", tiers: func() []config.Tier {
+		{name: "the same image naming no architecture, which may run on either", tiers: func() []config.Tier {
 			out := tiers(func(t *config.Tier) { t.Image = "ubuntu-2404@verified" })
 			for i := range out {
 				if out[i].Label == "platform-4vcpu" {
@@ -1112,7 +1113,11 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 				}
 			}
 			return out
-		}(), writes: onTwo},
+		}(), says: "the architecture of either cannot be told"},
+		{name: "a recommended tier resized since the report", tiers: tiers(func(t *config.Tier) { t.VCPU = 1 }),
+			says: "make the report again"},
+		{name: "a report with no shape for the tier", entry: func(e *rightsizeEntry) { e.RecommendedVCPU = 0 },
+			says: "make the report again"},
 		{name: "a recommended tier whose image changed since the report", tiers: tiers(func(t *config.Tier) {
 			t.Image = "ubuntu-2404-x64@g2"
 		}), says: "is not"},
@@ -1345,7 +1350,7 @@ func TestARecommendationLeavesAJobWhoseStrategyCannotBeRead(t *testing.T) {
 	const file = ".github/workflows/ci.yml"
 	data := "x: &legs\n  matrix:\n    n: [1, 2]\njobs:\n  build:\n    strategy: *legs\n    runs-on: " + onFour + "\n"
 	entry := rightsizeEntry{Repository: "acme/api", Workflow: "acme/api/" + file, Job: "build", CurrentRunsOn: onFour,
-		Recommendation: "smaller", RecommendedRunsOn: onTwo}
+		Recommendation: "smaller", RecommendedRunsOn: onTwo, RecommendedVCPU: 2, RecommendedMemory: int64(8 * config.GiB)}
 	got := rewriteWorkflow(file, []byte(data), chooserOf(t, migrateTiers(), labelMaps{}, false),
 		&rightsizeEntries{byFile: map[string][]rightsizeEntry{file: {entry}}})
 	report := (&migrationPlan{findings: got.findings}).reportText()
@@ -1478,5 +1483,39 @@ func TestMigrateWorkflowsDoesNotWriteThroughAReplacedDirectory(t *testing.T) {
 	}
 	if err := plan.install(dir); err == nil || !strings.Contains(err.Error(), "changed since it was read") {
 		t.Errorf("installing into another directory = %v, want refused", err)
+	}
+}
+
+// THE HEAD IS THE OWNER GIT WILL PUSH TO, after every rewrite rule: a rule that names
+// another repository is followed, a rule to a path on this machine falls back to the
+// URL configured, and a destination naming no owner is refused.
+func TestThePushOwnerIsWhereGitPushes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		setup func(dir string)
+		want  string
+		fails bool
+	}{
+		{"the configured URL", func(string) {}, "acme", false},
+		{"a push URL", func(dir string) {
+			runIn(t, dir, "config", "remote.origin.pushurl", "git@github.com:carol/api.git")
+		}, "carol", false},
+		{"a rewrite naming another repository", func(dir string) {
+			runIn(t, dir, "config", "--unset-all", "url."+originOf(t, dir)+".pushInsteadOf")
+			runIn(t, dir, "config", "url.https://github.com/dave/.pushInsteadOf", "https://github.com/acme/")
+		}, "dave", false},
+		{"a rewrite to an alias naming no owner", func(dir string) {
+			runIn(t, dir, "config", "--unset-all", "url."+originOf(t, dir)+".pushInsteadOf")
+			runIn(t, dir, "config", "url.gh-alias:.pushInsteadOf", "https://github.com/acme/")
+		}, "", true},
+	} {
+		dir := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+		tc.setup(dir)
+		got, err := pushOwner(t.Context(), dir)
+		if (err != nil) != tc.fails || got != tc.want {
+			t.Errorf("%s: %q, %v; want %q (fails %t)", tc.name, got, err, tc.want, tc.fails)
+		}
 	}
 }

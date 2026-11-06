@@ -160,28 +160,44 @@ func originRepository(ctx context.Context, path string) (string, error) {
 }
 
 // pushOwner is the owner of the repository origin pushes to, which the pull request's
-// head names. ORIGIN'S CONFIGURED PUSH URL, falling back to its URL, and not the one
-// git resolves: a fork pushes somewhere its fetch URL does not say, and a rewrite rule
-// is how a host is reached, not which repository it is. More than one push URL is a
-// push to several, which one head cannot name.
+// head names: THE URL GIT WILL PUSH TO, after every rewrite rule, since a rule can name
+// another repository as well as another way to reach one. A push to a path on this
+// machine names no owner, and only then is the configured URL the answer (its push
+// URL, else its URL). More than one destination is a push to several, which one head
+// cannot name, and a destination naming no owner/name is refused.
 func pushOwner(ctx context.Context, path string) (string, error) {
-	urls, err := runGit(ctx, path, "config", "--get-all", "remote.origin.pushurl")
-	if err != nil || strings.TrimSpace(urls) == "" {
-		urls, err = runGit(ctx, path, "config", "--get-all", "remote.origin.url")
-	}
-	lines := strings.Fields(urls)
-	if err != nil || len(lines) != 1 {
+	pushes, err := runGit(ctx, path, "remote", "get-url", "--push", "--all", "origin")
+	destinations := strings.Fields(pushes)
+	if err != nil || len(destinations) != 1 {
 		return "", errors.New("billet migrate workflows: --open-pr pushes to origin, and origin has no one URL to push " +
 			"to; nothing was changed")
 	}
-	repository, ok := repositoryOfRemote(lines[0])
+
+	remote := destinations[0]
+	if localPath(remote) {
+		configured, err := runGit(ctx, path, "config", "--get-all", "remote.origin.pushurl")
+		if err != nil || strings.TrimSpace(configured) == "" {
+			configured, err = runGit(ctx, path, "config", "--get-all", "remote.origin.url")
+		}
+		if lines := strings.Fields(configured); err == nil && len(lines) == 1 {
+			remote = lines[0]
+		}
+	}
+	repository, ok := repositoryOfRemote(remote)
 	if !ok {
-		return "", errors.New("billet migrate workflows: --open-pr pushes to origin, and its push URL names no " +
+		return "", errors.New("billet migrate workflows: --open-pr pushes to origin, and where it pushes names no " +
 			"owner/name; nothing was changed")
 	}
 	owner, _, _ := config.SplitRepository(repository)
 
 	return owner, nil
+}
+
+// localPath says a remote is a path on this machine rather than a URL: one git reaches
+// with no host.
+func localPath(remote string) bool {
+	return strings.HasPrefix(remote, "/") || strings.HasPrefix(remote, "file://") || strings.HasPrefix(remote, "./") ||
+		strings.HasPrefix(remote, "../")
 }
 
 // repositoryOfRemote reads owner/name from a remote in any form git takes: a URL, or
@@ -411,6 +427,8 @@ type rightsizeEntry struct {
 	Confidence        string `json:"confidence"`
 	RecommendedTier   string `json:"recommended_tier"`
 	RecommendedRunsOn string `json:"recommended_runs_on"`
+	RecommendedVCPU   int64  `json:"recommended_vcpu"`
+	RecommendedMemory int64  `json:"recommended_memory_bytes"`
 	Repository        string `json:"repository"`
 	MemorySource      string `json:"memory_source"`
 }
@@ -515,10 +533,18 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 				strconv.Quote(entry.CurrentRunsOn)))
 
 			continue
+		// A TIER RESIZED SINCE THE REPORT IS NOT THE TIER IT RECOMMENDED: a larger one
+		// shrunk since could take away the room the move was to give.
+		case int64(recommended.VCPU) != entry.RecommendedVCPU || int64(recommended.Memory) != entry.RecommendedMemory:
+			say(0, fmt.Sprintf("tier %s is %d vCPU and %s now, and the report recommended it at %d vCPU and %s; "+
+				"make the report again", strconv.Quote(recommended.Label), recommended.VCPU,
+				cli.HumanBytes(int64(recommended.Memory)), entry.RecommendedVCPU, cli.HumanBytes(entry.RecommendedMemory)))
+
+			continue
 		case !compatibleMove(current, recommended, chooser.repository, file):
 			say(0, fmt.Sprintf("tier %s is not %s with another size here: some other setting of it differs, it has "+
-				"less disk or shared memory, or it does not allow this workflow", strconv.Quote(recommended.Label),
-				strconv.Quote(current.Label)))
+				"less disk or shared memory, the architecture of either cannot be told, or it does not allow this "+
+				"workflow", strconv.Quote(recommended.Label), strconv.Quote(current.Label)))
 
 			continue
 		case len(matches) == 0:
@@ -566,9 +592,12 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 
 // compatibleMove says moving a job from current to recommended changes its size and
 // nothing else, judged by the tiers as they are now: the rule `billet jobs rightsize`
-// recommends by (config.Tier.SameFamily), and a tier that allows the workflow.
+// recommends by (config.Tier.SameFamily), an architecture that can be told, since an
+// image naming none may run on either (a family shares it: a platform is read only
+// from settings SameFamily keeps), and a tier that allows the workflow.
 func compatibleMove(current, recommended *config.Tier, repository, workflowFile string) bool {
-	return current.SameFamily(*recommended) && allowsWorkflow(recommended, repository, workflowFile)
+	return current.SameFamily(*recommended) && current.Platform().Arch != "" &&
+		allowsWorkflow(recommended, repository, workflowFile)
 }
 
 // migrationFile is one file the plan would change.
