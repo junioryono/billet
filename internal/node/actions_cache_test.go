@@ -279,6 +279,67 @@ func TestADownloadWhoseMountCouldNotBeUndoneIsStillCleanedUp(t *testing.T) {
 	}
 }
 
+// A DOWNLOAD WHOSE DISCARD FAILED IS A RECORD A RESTART STILL LOADS. Its retry must
+// survive the node: had the failed cleanup recorded the clone as unmounted, the
+// record actionsArchive.valid refuses for a download, the restarted node would
+// refuse its whole saved state and clean nothing up.
+func TestADownloadWhoseDiscardFailedIsCleanedUpAfterARestart(t *testing.T) {
+	t.Parallel()
+
+	service, storage, session, volumes := testActionsService(t)
+	create := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsCreatePath,
+		`{"key":"linux-npm-abc","version":"v1"}`)
+	response, handled, err := service.actionsResponse(create, session)
+	if err != nil || !handled {
+		t.Fatalf("CreateCacheEntry handled=%t error=%v", handled, err)
+	}
+	uploadURL, ok := responseJSON(t, response)["signed_upload_url"].(string)
+	if !ok || uploadURL == "" {
+		t.Fatal("CreateCacheEntry gave no upload URL")
+	}
+	upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "archive-body")
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	if response, handled, err = service.actionsResponse(upload, session); err != nil || !handled ||
+		response.StatusCode != http.StatusCreated {
+		t.Fatalf("blob upload handled=%t status=%v error=%v", handled, response, err)
+	}
+	response.Body.Close()
+	finalize := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"linux-npm-abc","version":"v1","size_bytes":"12"}`)
+	if response, handled, err = service.actionsResponse(finalize, session); err != nil || !handled ||
+		responseJSON(t, response)["ok"] != true {
+		t.Fatalf("FinalizeCacheEntryUpload handled=%t error=%v", handled, err)
+	}
+
+	// The mount reports failure, its undo works, and the discard after it fails.
+	volumes.readOnlyMountedButFailed = true
+	storage.discardFailures = 1
+	lookup := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsDownloadPath,
+		`{"key":"linux-npm-abc","version":"v1"}`)
+	if response, _, err = service.actionsResponse(lookup, session); err == nil &&
+		responseJSON(t, response)["signed_download_url"] != nil {
+		t.Fatal("a download whose mount failed was handed out")
+	}
+	volumes.readOnlyMountedButFailed = false
+
+	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", service.rootState,
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("the restarted node refused the saved state the failed discard left: %v", err)
+	}
+	restarted.actionIO = volumes
+	discardedBefore := storage.discarded
+	if err := restarted.Close(t.Context(), session.instance); err != nil {
+		t.Fatalf("Close after the restart: %v", err)
+	}
+	if err := restarted.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed after the restart: %v", err)
+	}
+	if storage.discarded == discardedBefore {
+		t.Fatal("the restarted node never discarded the clone the failed discard left")
+	}
+}
+
 func TestActionsCacheRoundTripPublishesAndServesRanges(t *testing.T) {
 	t.Parallel()
 

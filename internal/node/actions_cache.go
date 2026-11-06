@@ -809,9 +809,15 @@ func (s *CacheService) discardActionsArchive(
 		if err := s.actionIO.Unmount(ctx, s.actionsMountPath(session, archive)); err != nil {
 			return err
 		}
-		archive.Unmounted = true
-		if err := s.persistSession(session); err != nil {
-			return err
+		// ONLY AN UPLOAD RECORDS IT. A download marked unmounted is a record
+		// actionsArchive.valid refuses, so a restart after a discard that failed here
+		// would refuse the whole session and never clean it up. A download's retry
+		// unmounts again instead, which asks the kernel, as the session's cleanup does.
+		if archive.Mode == actionsModeUpload {
+			archive.Unmounted = true
+			if err := s.persistSession(session); err != nil {
+				return err
+			}
 		}
 	}
 	if err := s.store.Discard(ctx, archive.Volume); err != nil {
