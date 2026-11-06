@@ -7,18 +7,7 @@
     "barrier_id": "CommandResult.barrier_id",
     "instances": [
       "CommandResult.instances[0]"
-    ],
-    "log": {
-      "held": false,
-      "unreadable": 1997236290,
-      "lines": [
-        {
-          "line": 1407528106,
-          "at_ms": 999473901,
-          "text": "CommandResult.log.lines[0].text"
-        }
-      ]
-    }
+    ]
   },
   "CommandResult.draining": {
     "id": "CommandResult.id",
@@ -28,59 +17,7 @@
     "barrier_id": "CommandResult.barrier_id",
     "instances": [
       "CommandResult.instances[0]"
-    ],
-    "log": {
-      "held": false,
-      "unreadable": 1997236290,
-      "lines": [
-        {
-          "line": 1407528106,
-          "at_ms": 999473901,
-          "text": "CommandResult.log.lines[0].text"
-        }
-      ]
-    }
-  },
-  "CommandResult.log.cut": {
-    "id": "CommandResult.id",
-    "ok": false,
-    "error": "CommandResult.error",
-    "barrier_id": "CommandResult.barrier_id",
-    "instances": [
-      "CommandResult.instances[0]"
-    ],
-    "log": {
-      "held": false,
-      "cut": true,
-      "unreadable": 1997236290,
-      "lines": [
-        {
-          "line": 1407528106,
-          "at_ms": 999473901,
-          "text": "CommandResult.log.lines[0].text"
-        }
-      ]
-    }
-  },
-  "CommandResult.log.held": {
-    "id": "CommandResult.id",
-    "ok": false,
-    "error": "CommandResult.error",
-    "barrier_id": "CommandResult.barrier_id",
-    "instances": [
-      "CommandResult.instances[0]"
-    ],
-    "log": {
-      "held": true,
-      "unreadable": 1997236290,
-      "lines": [
-        {
-          "line": 1407528106,
-          "at_ms": 999473901,
-          "text": "CommandResult.log.lines[0].text"
-        }
-      ]
-    }
+    ]
   },
   "CommandResult.ok": {
     "id": "CommandResult.id",
@@ -89,17 +26,6 @@
     "barrier_id": "CommandResult.barrier_id",
     "instances": [
       "CommandResult.instances[0]"
-    ],
-    "log": {
-      "held": false,
-      "unreadable": 1997236290,
-      "lines": [
-        {
-          "line": 1407528106,
-          "at_ms": 999473901,
-          "text": "CommandResult.log.lines[0].text"
-        }
-      ]
-    }
+    ]
   }
 }

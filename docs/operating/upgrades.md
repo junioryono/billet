@@ -481,7 +481,7 @@ A maintenance window bounds when a rollout may **begin**. It never stops one —
 | A PostgreSQL controller, single or active-passive | the same timer on every controller host; see [PostgreSQL and active-passive controllers](../deploying/postgres-and-active-passive.md) for what its transaction skips |
 | Every node, Linux or Mac | the coordinator's dispatch, through the node's own updater |
 | Guest images on a firecracker node | the transaction, and `billet-images-refresh.timer` daily |
-| Guest images on a tart node | the transaction and the `sh.billet.images` agent, pulling only what is absent |
+| Guest images on a tart node | the transaction and the `sh.billet.images` agent, pulling only what is absent and verifying a `@verified` tag that moved |
 | A host installed by `install.sh` with no units | nothing; the units are what an updater stops and starts, and the script installs none |
 | An EC2 AMI or a CodeBuild image | nothing; `billet ami build` remains an operator's step |
 | The published Actions | the ref you write: `@v0` moves with each release |

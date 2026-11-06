@@ -3,6 +3,7 @@ package images
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -553,6 +555,29 @@ func TartTierImages(cfg *config.Config) ([]string, error) {
 		return nil, nil
 	}
 
+	tiers, err := tartLocalTiers(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	images := make([]string, 0, len(tiers))
+	seen := map[string]bool{}
+
+	for _, t := range tiers {
+		image := t.ImageFor(config.ProviderTart)
+		if image == "" || seen[image] {
+			continue
+		}
+
+		images = append(images, image)
+		seen[image] = true
+	}
+
+	return images, nil
+}
+
+// tartLocalTiers are the tiers this node would launch on tart.
+func tartLocalTiers(cfg *config.Config) ([]*config.Tier, error) {
 	// IDENTITY FIRST, exactly as firecrackerTierImages resolves it. A TLS node
 	// is ENCOURAGED to omit node.name — the certificate carries it, and
 	// nodeBundle fills it in — so comparing tier pins against an unresolved
@@ -563,28 +588,21 @@ func TartTierImages(cfg *config.Config) ([]string, error) {
 		return nil, fmt.Errorf("select tart tier images: resolve node identity: %w", err)
 	}
 
-	images := make([]string, 0, len(cfg.Tiers))
-	seen := map[string]bool{}
+	var tiers []*config.Tier
 
 	for i := range cfg.Tiers {
-		if cfg.Tiers[i].Node != "" && cfg.Tiers[i].Node != cfg.Node.Name {
-			continue
-		}
+		t := &cfg.Tiers[i]
 
-		if cfg.Tiers[i].Site != "" && cfg.Tiers[i].Site != cfg.Node.Site {
-			continue
+		switch {
+		case t.Node != "" && t.Node != cfg.Node.Name:
+		case t.Site != "" && t.Site != cfg.Node.Site:
+		case !t.AcceptsProvider(config.ProviderTart):
+		default:
+			tiers = append(tiers, t)
 		}
-
-		image := cfg.Tiers[i].ImageFor(config.ProviderTart)
-		if !cfg.Tiers[i].AcceptsProvider(config.ProviderTart) || image == "" || seen[image] {
-			continue
-		}
-
-		images = append(images, image)
-		seen[image] = true
 	}
 
-	return images, nil
+	return tiers, nil
 }
 
 // pullTartImages fetches the images this node's tart tiers name.
@@ -618,6 +636,18 @@ func PullTartImages(ctx context.Context, env cli.Env, cfg *config.Config, only s
 		return errors.New("billet images pull: no image given and no tart tier on this node " +
 			"names one")
 	}
+
+	// A VERIFIED IMAGE IS NEVER PULLED INTO THE SHARED STORE, where tart could replace a
+	// digest another deployment pins (ADR-021). Its verification pulls it in a store of
+	// its own.
+	images = slices.DeleteFunc(images, func(image string) bool {
+		_, verified := config.TartVerifiedImage(image)
+		if verified {
+			fmt.Fprintf(env.Stdout, "image    %-56s not pulled here; `billet images verify` fetches it\n", image)
+		}
+
+		return verified
+	})
 
 	for _, image := range images {
 		// ALREADY PRESENT IS NOT AN ERROR AND NOT A RE-FETCH. These are tens of
@@ -685,6 +715,14 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	diskFlag := fs.String("disk", "",
 		"grow the probe's root disk to this size before boot (default: the largest disk a "+
 			"firecracker tier asks for, else "+verifyDiskFallback.String()+")")
+	noYield := fs.Bool("no-yield", false,
+		"on a Mac, keep a macOS probe's slot when a job asks for it; refused while the node runs")
+	digest := fs.String("digest", "",
+		"on a Mac, pull this digest rather than what the tag names now, which also takes back "+
+			"one that was unpromoted")
+	untrusted := fs.Bool("untrusted", false,
+		"on a Mac, boot the probe with the network of untrusted work, for an image a tier on the "+
+			"control plane boots for it and this file does not name")
 
 	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
@@ -693,6 +731,30 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 
 	if rest == "" {
 		return errors.New("usage: billet images <pull|refresh|compatible|verify|due|list|reap|promote|unpromote>")
+	}
+
+	// A TART IMAGE NAMES NO GENERATION: its reference is what a tier names, and the
+	// verification makes the record. An unreadable file is the load's to report below.
+	if cfg, err := config.Load(*cfgPath); err == nil && cfg.Node != nil && cfg.Node.Provider == config.ProviderTart {
+		var ignored []string
+
+		fs.Visit(func(f *flag.Flag) {
+			if slices.Contains([]string{"wait", "record", "allow-unpaired", "disk"}, f.Name) {
+				ignored = append(ignored, "--"+f.Name)
+			}
+		})
+
+		if len(ignored) > 0 {
+			return fmt.Errorf("billet images verify: %s are for a firecracker node's generations, and "+
+				"a verification on a tart node always records", strings.Join(ignored, ", "))
+		}
+
+		return cmdImagesVerifyTart(ctx, env, cfg, rest, *digest, *noYield, *untrusted)
+	}
+
+	if *noYield || *digest != "" || *untrusted {
+		return errors.New("billet images verify: --no-yield, --digest and --untrusted are for a " +
+			"tart node's images")
 	}
 
 	// THE GENERATION IS REQUIRED, not defaulted, for the same reason the provider
@@ -1580,6 +1642,15 @@ func cmdImagesPromote(ctx context.Context, env cli.Env, args []string, verified 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
+	}
+
+	if cfg.Node != nil && cfg.Node.Provider == config.ProviderTart {
+		if verified {
+			return errors.New(name + ": on a tart node, `billet images verify` makes the record a " +
+				"launch resolves, since only a boot can")
+		}
+
+		return cmdImagesUnpromoteTart(ctx, env, cfg, rest)
 	}
 
 	if cfg.Node == nil || cfg.Node.Ceph == nil {
