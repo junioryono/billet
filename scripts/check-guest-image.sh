@@ -27,11 +27,36 @@ set -euo pipefail
 IMAGE="${1:-}"
 MANIFEST="${2:-}"
 
+# THE IMAGE'S MACHINE IS THE MACHINE CHECKING IT (ADR-022): this gate runs the image's
+# binaries in a chroot, as the build ran GitHub's scripts, so what it expects is
+# chosen from this host, here and together. TOOLCACHE_ARCH is what GitHub's toolcache
+# names the machine, JAVA_ARCH what Temurin's packages do, GOROOT_SUFFIX what
+# Configure-Toolset.ps1 ends a GOROOT_<major>_<minor> variable with, and ELF_MACHINE
+# the e_machine of its binaries. check_image_machine holds the image to them.
+GUEST_MACHINE=$(uname -m)
+case "$GUEST_MACHINE" in
+x86_64)
+	TOOLSET_NAME=toolset-2404.json PLAN_NAME=plan.json TOOLCACHE_ARCH=x64
+	JAVA_ARCH=amd64 GOROOT_SUFFIX=X64 ELF_MACHINE=62
+	;;
+aarch64)
+	TOOLSET_NAME=toolset-2404-arm64.json PLAN_NAME=plan-arm64.json TOOLCACHE_ARCH=arm64
+	JAVA_ARCH=arm64 GOROOT_SUFFIX=AARCH64 ELF_MACHINE=183
+	;;
+*)
+	GUEST_MACHINE="" TOOLSET_NAME="" PLAN_NAME="" TOOLCACHE_ARCH="" JAVA_ARCH="" GOROOT_SUFFIX=""
+	ELF_MACHINE=""
+	;;
+esac
+
 # GITHUB'S DECLARATION IS WHAT THIS GATE CHECKS AGAINST, and it is the same file
 # the build installs from. A gate holding its own copy of the expected contents
 # is a second list to keep in step with the first, and the failure when they
 # drift is a gate that passes an image missing exactly what it stopped checking.
-TOOLSET_FILE="${TOOLSET_FILE:-$(cd "$(dirname "$0")/.." && pwd)/internal/runnerimages/toolset-2404.json}"
+TOOLSET_FILE="${TOOLSET_FILE:-$(cd "$(dirname "$0")/.." && pwd)/internal/runnerimages/$TOOLSET_NAME}"
+
+# THE TEMPLATE'S PLAN FOR THIS MACHINE, which says what the image leaves out.
+PLAN_FILE="${PLAN_FILE:-$(cd "$(dirname "$0")" && pwd)/runner-images/$PLAN_NAME}"
 
 # THE TOOLS BILLET BAKES, IN ONE PLACE. This list was written out twice -- once
 # for the structural loop and once for the coverage loop -- so adding a seventh
@@ -52,6 +77,13 @@ TOOLSET_FILE="${TOOLSET_FILE:-$(cd "$(dirname "$0")/.." && pwd)/internal/runneri
 # (#584), and check-guest-component.sh holds what a completed image carries of it.
 TOOLCACHE_TOOLS=(node go Python PyPy Ruby)
 
+# GITHUB'S ARM64 IMAGE HAS NO PyPy: its template has no such step and its toolset
+# declares no version of it, which the coverage check below refuses to read as
+# something to check.
+if [ "$GUEST_MACHINE" = aarch64 ]; then
+	TOOLCACHE_TOOLS=(node go Python Ruby)
+fi
+
 # THE SAME ALIAS MAP THE BUILD INSTALLS FROM.
 #
 # A mapped package must still be VERIFIED, not excused. If the build installed
@@ -68,6 +100,12 @@ fi
 
 if [ ! -r "$IMAGE" ]; then
 	echo "cannot read $IMAGE" >&2
+	exit 2
+fi
+
+if [ -z "$GUEST_MACHINE" ]; then
+	echo "this host is $(uname -m), and billet builds guests for x86_64 and aarch64 only;" >&2
+	echo "this gate runs the image's own binaries, so it runs on the image's machine" >&2
 	exit 2
 fi
 
@@ -365,6 +403,56 @@ check_filesystem_ready() {
 	else
 		pass "filesystem clean and checked after its last mount, so a node can grow it"
 	fi
+}
+
+# ELF_BINARIES are the image's binaries that have to be this machine's, one from each
+# place the build gets them: Ubuntu's base, billet's own build and the runner's
+# tarball. An image built with one of them from the other machine boots, and then
+# fails when the agent execs it, inside a guest nobody has a console for.
+ELF_BINARIES=(/usr/bin/env /opt/billet/bin/billet /home/runner/runner/bin/Runner.Listener)
+
+# check_image_machine passes or fails the gate on the image mounted at $1 being of
+# this machine: the manifest, when one is named, says so, and each of ELF_BINARIES is:
+# a 64-bit little-endian ELF, which both machines' are, whose e_machine at offset 18 is
+# this machine's. Two bytes alone would pass a file that is no binary at all.
+check_image_machine() {
+	local path resolved said status header
+
+	if [ -n "$MANIFEST" ]; then
+		status=0
+		said=$(jq -r '.arch' "$MANIFEST") || status=$?
+		if [ "$status" -ne 0 ]; then
+			fail "could not read the architecture the manifest declares (status $status)"
+		elif [ "$said" != "$GUEST_MACHINE" ]; then
+			fail "the manifest says this image is $said, and it was built and checked on $GUEST_MACHINE;
+        a node chooses the manifest named for its machine and refuses another's"
+		fi
+	fi
+
+	for path in "${ELF_BINARIES[@]}"; do
+		status=0
+		resolved=$(image_resolve "$1" "$path") || status=$?
+		if [ "$status" -ne 0 ] || [ ! -f "$1$resolved" ]; then
+			fail "$path is not a file in the image, so nothing says it is $GUEST_MACHINE's"
+			continue
+		fi
+		status=0
+		header=$(od -An -tx1 -N6 "$1$resolved") && said=$(od -An -tu2 -j18 -N2 "$1$resolved") || status=$?
+		if [ "$status" -ne 0 ]; then
+			fail "could not read $path to tell which machine it runs on (status $status)"
+			continue
+		fi
+		header=${header//[[:space:]]/}
+		said=${said//[[:space:]]/}
+		if [ "$header" != 7f454c460201 ]; then
+			fail "$path is not a 64-bit little-endian ELF (it begins ${header:-with nothing}), so nothing says it is $GUEST_MACHINE's"
+		elif [ "$said" != "$ELF_MACHINE" ]; then
+			fail "$path has e_machine ${said:-nothing}, and this image is $GUEST_MACHINE's ($ELF_MACHINE);
+        a job on it would fail when the agent execs that binary"
+		else
+			pass "$path is $GUEST_MACHINE's"
+		fi
+	done
 }
 
 # THE COMPONENTS BILLET MAY NOT SHIP (#584): the Android SDK, the CodeQL bundle,
@@ -742,7 +830,7 @@ check_manifest_components() {
 	[ -n "$MANIFEST" ] && [ -r "$MANIFEST" ] || return 0
 
 	local declared want status=0
-	want=$("$GATE_DIR/check-guest-component.sh" names | sort | tr '\n' ' ') || status=$?
+	want=$("$GATE_DIR/check-guest-component.sh" offered "$PLAN_FILE" | sort | tr '\n' ' ') || status=$?
 	declared=$(jq -r '[(.components // [])[] | .name] | sort | .[]' "$MANIFEST" | tr '\n' ' ') || status=$?
 	if [ "$status" -ne 0 ]; then
 		fail "could not read the components the manifest declares (status $status)"
@@ -856,11 +944,14 @@ check_hosted_tools() {
 		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
 	grep -qx 'AZURE_EXTENSION_DIR=/opt/az/azcliextensions' "$env" 2>/dev/null ||
 		missing+=("AZURE_EXTENSION_DIR in /etc/billet-image-env")
-	grep -q '^GOROOT_[0-9]*_[0-9]*_X64=/opt/hostedtoolcache/go/' "$env" 2>/dev/null ||
-		missing+=("GOROOT_<major>_<minor>_X64 in /etc/billet-image-env")
+	grep -q "^GOROOT_[0-9]*_[0-9]*_$GOROOT_SUFFIX=/opt/hostedtoolcache/go/" "$env" 2>/dev/null ||
+		missing+=("GOROOT_<major>_<minor>_$GOROOT_SUFFIX in /etc/billet-image-env")
 
 	# A TOOLCACHE ENTRY COUNTS ONLY WITH ITS .complete MARKER, which is what
 	# @actions/tool-cache looks for; a payload without one is invisible to it.
+	#
+	# x64 ON EVERY MACHINE: the bundle is JavaScript, and GitHub's install-awf.sh
+	# names that one directory for it whatever it runs on.
 	local tc="$1/opt/hostedtoolcache" found=0 entry
 	for entry in "$tc"/agentic-workflow-firewall-js/*/x64/awf-bundle.js; do
 		[ -f "$entry" ] && [ -s "$entry" ] && [ -f "${entry%/x64/awf-bundle.js}/x64.complete" ] && found=1
@@ -1212,6 +1303,7 @@ for tool in zstd unzip zip tar wget rsync gcc make; do
 done
 
 check_filesystem_ready "$IMAGE"
+check_image_machine "$MNT"
 check_github_cli "$MNT"
 check_components_left_out "$MNT"
 check_completer "$MNT"
@@ -1308,25 +1400,11 @@ fi
 
 # --- the toolcache ---------------------------------------------------------
 
-# EVERY ONE OF THESE FAILS SILENTLY, WHICH IS WHY THEY ARE ASSERTED.
-#
-# A toolcache entry that is subtly wrong does not break a job. `setup-node` simply
-# does not find it, downloads a couple of hundred megabytes, and succeeds -- so the
-# only symptom is that jobs are as slow as they were before the toolcache existed,
-# and nothing anywhere says why. Four separate mistakes produce exactly that:
-#
-#   - the marker file missing, or written INSIDE the arch directory rather than
-#     beside it, which is where tool-cache stats for it
-#   - a version directory that is not a full semver, which the range resolver skips
-#     entirely rather than matching loosely
-#   - `x86_64` instead of `x64`
-#   - `python` instead of `Python`, which the actions spell inconsistently
-TOOLCACHE="$MNT/opt/hostedtoolcache"
+# check_toolcache_entries walks what is under each tool: a full semver, the machine's
+# directory, and the marker beside it. A function so it can be run without a loop mount.
+check_toolcache_entries() {
+	local toolcache_entries tool versiondir version
 
-if [ ! -d "$TOOLCACHE" ]; then
-	fail "no toolcache at /opt/hostedtoolcache; every job would download a runtime the
-        image was supposed to contain, and nothing would report it"
-else
 	toolcache_entries=0
 
 	# EVERY ONE BILLET BAKES. PyPy and Ruby were installed by the shared installer
@@ -1354,15 +1432,15 @@ else
 				continue
 			fi
 
-			if [ ! -d "$versiondir/x64" ]; then
-				fail "$tool/$version has no x64 directory"
+			if [ ! -d "$versiondir/$TOOLCACHE_ARCH" ]; then
+				fail "$tool/$version has no $TOOLCACHE_ARCH directory"
 				continue
 			fi
 
 			# THE MARKER IS A SIBLING, and its absence makes the entry invisible however
 			# complete it is.
-			if [ ! -f "$versiondir/x64.complete" ]; then
-				fail "$tool/$version has no x64.complete marker beside its arch directory,
+			if [ ! -f "$versiondir/$TOOLCACHE_ARCH.complete" ]; then
+				fail "$tool/$version has no $TOOLCACHE_ARCH.complete marker beside its arch directory,
         so tool-cache treats it as a half-finished download and ignores it"
 				continue
 			fi
@@ -1375,6 +1453,28 @@ else
 	if [ "$toolcache_entries" -eq 0 ]; then
 		fail "the toolcache directory exists and holds nothing usable"
 	fi
+}
+
+# EVERY ONE OF THESE FAILS SILENTLY, WHICH IS WHY THEY ARE ASSERTED.
+#
+# A toolcache entry that is subtly wrong does not break a job. `setup-node` simply
+# does not find it, downloads a couple of hundred megabytes, and succeeds -- so the
+# only symptom is that jobs are as slow as they were before the toolcache existed,
+# and nothing anywhere says why. Four separate mistakes produce exactly that:
+#
+#   - the marker file missing, or written INSIDE the arch directory rather than
+#     beside it, which is where tool-cache stats for it
+#   - a version directory that is not a full semver, which the range resolver skips
+#     entirely rather than matching loosely
+#   - `x86_64` instead of `x64`
+#   - `python` instead of `Python`, which the actions spell inconsistently
+TOOLCACHE="$MNT/opt/hostedtoolcache"
+
+if [ ! -d "$TOOLCACHE" ]; then
+	fail "no toolcache at /opt/hostedtoolcache; every job would download a runtime the
+        image was supposed to contain, and nothing would report it"
+else
+	check_toolcache_entries
 
 # check_toolcache_coverage asserts every line the declaration names has an entry.
 #
@@ -1459,7 +1559,7 @@ check_toolcache_coverage() {
 			found=""
 
 			for versiondir in "$TOOLCACHE/$tool"/*; do
-				[ -d "$versiondir/x64" ] || continue
+				[ -d "$versiondir/$TOOLCACHE_ARCH" ] || continue
 
 				candidate=$(basename "$versiondir")
 
@@ -1518,10 +1618,10 @@ check_toolcache_coverage() {
 	# name therefore ships a green image whose every node job dies, so the same check
 	# happens here where it is cheap.
 	for versiondir in "$TOOLCACHE/node"/*; do
-		[ -d "$versiondir/x64" ] || continue
+		[ -d "$versiondir/$TOOLCACHE_ARCH" ] || continue
 
 		version=$(basename "$versiondir")
-		reported=$(chroot "$MNT" "/opt/hostedtoolcache/node/$version/x64/bin/node" --version 2>/dev/null || true)
+		reported=$(chroot "$MNT" "/opt/hostedtoolcache/node/$version/$TOOLCACHE_ARCH/bin/node" --version 2>/dev/null || true)
 
 		if [ "$reported" = "v$version" ]; then
 			pass "node $version reports itself as $reported"
@@ -1548,10 +1648,10 @@ check_toolcache_coverage() {
 	# directory named "1.26.0", because the directory must be a full semver for
 	# tool-cache to see it at all while go's own name for that release is not.
 	for versiondir in "$TOOLCACHE/go"/*; do
-		[ -d "$versiondir/x64" ] || continue
+		[ -d "$versiondir/$TOOLCACHE_ARCH" ] || continue
 
 		version=$(basename "$versiondir")
-		reported=$(chroot "$MNT" "/opt/hostedtoolcache/go/$version/x64/bin/go" \
+		reported=$(chroot "$MNT" "/opt/hostedtoolcache/go/$version/$TOOLCACHE_ARCH/bin/go" \
 			env GOVERSION 2>/dev/null || true)
 
 		if [ "$reported" = "go$version" ] || [ "$reported" = "go${version%.0}" ]; then
@@ -1568,11 +1668,11 @@ check_toolcache_coverage() {
 	# skipped recreating them has an interpreter nobody can invoke by the name they
 	# type.
 	for versiondir in "$TOOLCACHE/Python"/*; do
-		[ -d "$versiondir/x64" ] || continue
+		[ -d "$versiondir/$TOOLCACHE_ARCH" ] || continue
 
 		version=$(basename "$versiondir")
 
-		if [ ! -e "$versiondir/x64/bin/python" ] || [ ! -e "$versiondir/x64/python" ]; then
+		if [ ! -e "$versiondir/$TOOLCACHE_ARCH/bin/python" ] || [ ! -e "$versiondir/$TOOLCACHE_ARCH/python" ]; then
 			fail "python $version is missing bin/python or the root python symlink, which
         its setup.sh creates and this build has to recreate"
 			continue
@@ -1582,9 +1682,9 @@ check_toolcache_coverage() {
 		# setup-python's `cache: pip` execs a bare `pip`; workflows run `python -m pip`.
 		# ensurepip -- skipped once, which shipped an interpreter with neither -- is what
 		# makes both exist, so prove both by running them under the mounted image.
-		if [ -x "$versiondir/x64/bin/pip" ] &&
-			chroot "$MNT" "/opt/hostedtoolcache/Python/$version/x64/bin/pip" --version >/dev/null 2>&1 &&
-			chroot "$MNT" "/opt/hostedtoolcache/Python/$version/x64/bin/python" -m pip --version >/dev/null 2>&1; then
+		if [ -x "$versiondir/$TOOLCACHE_ARCH/bin/pip" ] &&
+			chroot "$MNT" "/opt/hostedtoolcache/Python/$version/$TOOLCACHE_ARCH/bin/pip" --version >/dev/null 2>&1 &&
+			chroot "$MNT" "/opt/hostedtoolcache/Python/$version/$TOOLCACHE_ARCH/bin/python" -m pip --version >/dev/null 2>&1; then
 			pass "python $version has a working pip executable and module"
 		else
 			fail "python $version has no working pip; setup-python's cache: pip and
@@ -1617,15 +1717,15 @@ check_toolcache_coverage() {
 		flag="${tool_rest#* }"
 
 		for versiondir in "$TOOLCACHE/$tool"/*; do
-			[ -d "$versiondir/x64" ] || continue
+			[ -d "$versiondir/$TOOLCACHE_ARCH" ] || continue
 
 			version=$(basename "$versiondir")
 
-			if chroot "$MNT" "/opt/hostedtoolcache/$tool/$version/x64/$binary" \
+			if chroot "$MNT" "/opt/hostedtoolcache/$tool/$version/$TOOLCACHE_ARCH/$binary" \
 				"$flag" >/dev/null 2>&1; then
 				pass "$tool $version runs from the toolcache"
 			else
-				fail "$tool $version has an x64 directory and a completion marker and its
+				fail "$tool $version has a $TOOLCACHE_ARCH directory and a completion marker and its
         $binary does not run. An entry that is structurally complete but broken is
         one the action finds, uses, and fails the job with."
 			fi
@@ -1811,7 +1911,7 @@ else
         report success"
 	else
 		for v in $java_versions; do
-			home="/usr/lib/jvm/temurin-$v-jdk-amd64"
+			home="/usr/lib/jvm/temurin-$v-jdk-$JAVA_ARCH"
 
 			if [ ! -d "$MNT$home" ]; then
 				fail "the toolset declares java $v and $home does not exist. Every workflow
@@ -1858,6 +1958,9 @@ else
 			# would be a second copy of java_toolcache_version to drift against the
 			# build. What must be true is that some entry links to THIS jdk and is
 			# complete, which is checkable without knowing its name.
+			#
+			# x64 AND JAVA_HOME_<v>_X64 ON EVERY MACHINE: GitHub's install-java-tools.sh
+			# writes those names on arm64 too, and only the directory is the machine's.
 			entry=""
 			for candidate in "$TOOLCACHE/Java_Temurin-Hotspot_jdk"/*; do
 				[ -L "$candidate/x64" ] || continue
@@ -1899,7 +2002,7 @@ else
 		java_default=$(toolset_query '.java.default' "java's default version")
 
 		if [ -n "$java_default" ] && [ "$java_default" != "null" ] &&
-			! grep -qxF "JAVA_HOME=/usr/lib/jvm/temurin-$java_default-jdk-amd64" \
+			! grep -qxF "JAVA_HOME=/usr/lib/jvm/temurin-$java_default-jdk-$JAVA_ARCH" \
 				"$MNT/etc/billet-image-env"; then
 			fail "JAVA_HOME does not name the declared default JDK ($java_default). A bare
         \`java\` or a build tool reading JAVA_HOME gets a different version from a

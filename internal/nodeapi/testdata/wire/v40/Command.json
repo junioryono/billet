@@ -99,7 +99,12 @@
       "go_test_results": true,
       "npm": true
     },
-    "arch": "Command.tier.arch"
+    "arch": "Command.tier.arch",
+    "egress": {
+      "allow": [
+        "Command.tier.egress.allow[0]"
+      ]
+    }
   },
   "barrier_id": "Command.barrier_id",
   "request_id": 341765293,

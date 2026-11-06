@@ -41,6 +41,7 @@ type jobSeed struct {
 	job       *alloc.HistoryJob
 	usage     *alloc.JobUsage
 	series    *alloc.UsageSeries
+	egress    *alloc.JobEgress
 	// tests is the job's kept test results, as the node encodes them.
 	tests []byte
 }
@@ -87,6 +88,11 @@ func seedJob(t *testing.T, stateDir string, seed jobSeed) string {
 	if seed.job != nil {
 		if err := a.RecordJobIdentity(t.Context(), lease.ID, *seed.job); err != nil {
 			t.Fatalf("RecordJobIdentity: %v", err)
+		}
+	}
+	if seed.egress != nil {
+		if err := a.RecordLeaseEgress(t.Context(), lease.ID, lease.Epoch, *seed.egress); err != nil {
+			t.Fatalf("RecordLeaseEgress: %v", err)
 		}
 	}
 	if seed.tests != nil {
@@ -192,7 +198,7 @@ func TestEveryUsageGroupRendersItsOwnMeasurement(t *testing.T) {
 				usage.EnergySource = ""
 			}
 			var out bytes.Buffer
-			renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+			renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage, nil)
 
 			for other, label := range labels {
 				line := lineStarting(t, out.String(), label)
@@ -228,7 +234,7 @@ func TestAProcessMeasuredJobRendersWhatItsHostKept(t *testing.T) {
 		MemoryPeakBytes: 25_855_595_336, EnergyActiveMicrojoules: 7_400_903_879, EnergySource: alloc.EnergyProcess,
 	}}
 	var out bytes.Buffer
-	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage, nil)
 
 	if line := lineStarting(t, out.String(), "memory"); !strings.Contains(line, "peak 24.1 GiB, oom kills not measured") {
 		t.Errorf("the memory line reads %q", line)
@@ -247,7 +253,7 @@ func TestAMeterMeasuredJobRendersTheWalls(t *testing.T) {
 		EnergyActiveMicrojoules: 9_000_000_000, EnergyIdleMicrojoules: 666_000_000, EnergySource: alloc.EnergyMeter,
 	}}
 	var out bytes.Buffer
-	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage, nil)
 
 	if line := lineStarting(t, out.String(), "energy"); !strings.Contains(line,
 		"9.0 kJ active, 666.0 J idle (the whole host at the wall, from its power meter)") {
@@ -405,7 +411,7 @@ func TestTheKnownAnswerFixturesAreJobsShowsOwn(t *testing.T) {
 	for _, name := range slices.Sorted(maps.Keys(shapes)) {
 		var out bytes.Buffer
 		if err := renderJobJSON(&out, record, shapes[name].usage, nil, "the usage report came with no series", nil,
-			jobTests{}, shapes[name].window); err != nil {
+			jobEgress{}, jobTests{}, shapes[name].window); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		path := filepath.Join(knownAnswerFixtures, name+".json")
@@ -447,7 +453,7 @@ func countedJob(t *testing.T, counters *alloc.JobCounters) string {
 		Unmeasured: []string{alloc.UsageEnergy}, Counters: counters,
 	}}
 	var out bytes.Buffer
-	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage, nil)
 
 	return out.String()
 }

@@ -335,13 +335,21 @@ func TestTheGateAsksForTheComponentsTheCompleterAndTheManifest(t *testing.T) {
 func gateRun(t *testing.T, call, root, manifest string, functions ...string) (string, string) {
 	t.Helper()
 
+	return gateRunWith(t, "PLAN_FILE=runner-images/plan.json\n", call, root, manifest, functions...)
+}
+
+// gateRunWith is gateRun with PRELUDE, what the machine table would have set, before
+// the functions.
+func gateRunWith(t *testing.T, prelude, call, root, manifest string, functions ...string) (string, string) {
+	t.Helper()
+
 	here, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	script := "#!/usr/bin/env bash\nset -euo pipefail\nFAILED=0\nGATE_DIR=" + here + "\nMANIFEST=" + manifest + "\n" +
 		"pass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n" +
-		gateArray(t, "COMPLETER_FILES") + "\n" + gateArray(t, "COMPLETER_EXECUTED") + "\n"
+		gateArray(t, "COMPLETER_FILES") + "\n" + gateArray(t, "COMPLETER_EXECUTED") + "\n" + prelude
 	for _, name := range functions {
 		script += checkImageFunction(t, name) + "\n"
 	}

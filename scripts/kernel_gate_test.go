@@ -270,9 +270,124 @@ func TestTheVendoredKernelCheckerMatchesItsPin(t *testing.T) {
 func TestTheCommittedKernelConfigSatisfiesEveryRequiredBuiltIn(t *testing.T) {
 	t.Parallel()
 
-	out, err := runKernelGate(t, goodKernelConfig(t), passingChecker(t))
+	for _, config := range []string{goodKernelConfig(t), goodAarch64KernelConfig(t)} {
+		out, err := runKernelGate(t, config, passingChecker(t))
+		if err != nil {
+			t.Fatalf("the committed kernel config %s fails billet's own rules (%v):\n%s", config, err, out)
+		}
+	}
+}
+
+// AND EACH COMMITTED CONFIG IS ITS OWN MACHINE'S. The gate chooses its second list from
+// the config, so an x86 config in the arm64 kernel's place would be held to the shorter
+// list and pass.
+func TestEachCommittedKernelConfigNamesItsMachine(t *testing.T) {
+	t.Parallel()
+
+	for name, want := range map[string]string{
+		"guest-kernel.config":         "CONFIG_X86_64=y\n",
+		"guest-kernel-aarch64.config": "CONFIG_ARM64=y\n",
+	} {
+		if !strings.Contains(readFile(t, name), want) {
+			t.Errorf("%s does not carry %s", name, want)
+		}
+	}
+}
+
+// THE SECOND LIST IS THE CONFIG'S MACHINE'S, whatever host runs the gate. Each direction
+// matters: an arm64 kernel without its device tree or PSCI passes a gate reading only the
+// common list and hangs in a microVM, and an x86 kernel held to arm64's list could never
+// be published. A config naming neither is refused, since the alternative is the shorter
+// list.
+func TestTheKernelGateHoldsAConfigToItsMachinesList(t *testing.T) {
+	t.Parallel()
+
+	lists := t.TempDir()
+	common := filepath.Join(lists, "common.txt")
+	arm := filepath.Join(lists, "arm.txt")
+
+	if err := forkSafeWriteFile(common, []byte("# the common list\nCOMMON\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := forkSafeWriteFile(arm, []byte("# the arm64 list\nARMONLY\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	blank := filepath.Join(lists, "blank.txt")
+	if err := forkSafeWriteFile(blank, []byte("# a list of nothing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, tc := range map[string]struct {
+		config string
+		common string
+		arm    string
+		says   string
+	}{
+		// ONE LIST FULL DOES NOT ANSWER FOR THE OTHER.
+		"arm64's list empty":       {config: "CONFIG_ARM64=y\nCONFIG_COMMON=y\n", arm: blank, says: "blank.txt lists no options"},
+		"the common list empty":    {config: "CONFIG_ARM64=y\nCONFIG_ARMONLY=y\n", common: blank, arm: arm, says: "blank.txt lists no options"},
+		"the common empty on x86":  {config: "CONFIG_X86_64=y\n", common: blank, arm: arm, says: "blank.txt lists no options"},
+		"arm64 with both":          {config: "CONFIG_ARM64=y\nCONFIG_COMMON=y\nCONFIG_ARMONLY=y\n", arm: arm},
+		"arm64 without its own":    {config: "CONFIG_ARM64=y\nCONFIG_COMMON=y\n", arm: arm, says: "CONFIG_ARMONLY"},
+		"arm64 without the common": {config: "CONFIG_ARM64=y\nCONFIG_ARMONLY=y\n", arm: arm, says: "CONFIG_COMMON"},
+		"arm64's list unreadable":  {config: "CONFIG_ARM64=y\nCONFIG_COMMON=y\n", arm: filepath.Join(lists, "gone.txt"), says: "cannot read"},
+		"x86 without arm64's":      {config: "CONFIG_X86_64=y\nCONFIG_COMMON=y\n", arm: arm},
+		"x86's list is one":        {config: "CONFIG_X86_64=y\n", arm: arm, says: "CONFIG_COMMON"},
+		"a machine it cannot name": {config: "CONFIG_COMMON=y\nCONFIG_ARMONLY=y\n", arm: arm, says: "names neither"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			list := common
+			if tc.common != "" {
+				list = tc.common
+			}
+
+			env := append(passingChecker(t), "REQUIRED_BUILTINS="+list, "REQUIRED_BUILTINS_AARCH64="+tc.arm)
+
+			out, err := runKernelGate(t, writeKernelConfig(t, tc.config), env)
+			if tc.says == "" {
+				if err != nil {
+					t.Fatalf("the gate refused it (%v):\n%s", err, out)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(out, tc.says) {
+				t.Fatalf("answered %v, want a refusal saying %q:\n%s", err, tc.says, out)
+			}
+		})
+	}
+}
+
+// A MACHINE QUESTION IT COULD NOT ASK IS NOT A MACHINE IT HAS NO LIST FOR. The grep that
+// asks is three-valued, and read as "not arm64" a failure would hold an arm64 kernel to
+// the common list alone.
+func TestAConfigItCouldNotAskTheMachineOfIsRefused(t *testing.T) {
+	t.Parallel()
+
+	shims := t.TempDir()
+
+	tool, err := exec.LookPath("grep")
 	if err != nil {
-		t.Fatalf("the committed kernel config fails billet's own rules (%v):\n%s", err, out)
+		t.Skip("no grep on PATH to shim")
+	}
+
+	shim := "#!/bin/sh\nfor a in \"$@\"; do\n" +
+		"  case $a in CONFIG_ARM64=y) echo 'grep: cannot read' >&2; exit 2 ;; esac\n" +
+		"done\nexec " + tool + " \"$@\"\n"
+
+	if err := forkSafeWriteFile(filepath.Join(shims, "grep"), []byte(shim), 0o700); err != nil {
+		t.Fatalf("write the grep shim: %v", err)
+	}
+
+	out, err := runKernelGate(t, goodAarch64KernelConfig(t), append(passingChecker(t),
+		"PATH="+shims+string(os.PathListSeparator)+os.Getenv("PATH")))
+	if err == nil || !strings.Contains(out, "could not read") {
+		t.Fatalf("answered %v, want a refusal saying the read failed:\n%s", err, out)
 	}
 }
 
@@ -289,13 +404,15 @@ func TestTheCommittedKernelConfigPassesTheVendoredChecker(t *testing.T) {
 		t.Skip("moby's check-config.sh needs /proc, GNU stat and GNU sed")
 	}
 
-	out, err := runKernelGate(t, goodKernelConfig(t), nil)
-	if err != nil {
-		t.Fatalf("the committed kernel config does not pass moby's checker (%v):\n%s", err, out)
-	}
+	for _, config := range []string{goodKernelConfig(t), goodAarch64KernelConfig(t)} {
+		out, err := runKernelGate(t, config, nil)
+		if err != nil {
+			t.Fatalf("the committed kernel config %s does not pass moby's checker (%v):\n%s", config, err, out)
+		}
 
-	if !strings.Contains(out, "KERNEL CONFIG OK") {
-		t.Errorf("the gate passed without saying so:\n%s", out)
+		if !strings.Contains(out, "KERNEL CONFIG OK") {
+			t.Errorf("the gate passed %s without saying so:\n%s", config, out)
+		}
 	}
 }
 
@@ -362,7 +479,8 @@ func TestTheKernelBuildAndTheWorkflowBothRunTheGate(t *testing.T) {
 	// is the whole reason it is a file; a build that kept its own copy would drift
 	// silently, which is the two-pins problem this arrangement removes.
 	for _, want := range []string{
-		`done <"$REQUIRED_BUILTINS"`,
+		`for list in "$REQUIRED_BUILTINS" ${MACHINE_BUILTINS:+"$MACHINE_BUILTINS"}; do`,
+		`done <"$list"`,
 		`./scripts/config --enable "$opt"`,
 	} {
 		if !strings.Contains(build, want) {
@@ -637,6 +755,17 @@ func goodKernelConfig(t *testing.T) string {
 	t.Helper()
 
 	path, err := filepath.Abs("guest-kernel.config")
+	if err != nil {
+		t.Fatalf("absolute config path: %v", err)
+	}
+
+	return path
+}
+
+func goodAarch64KernelConfig(t *testing.T) string {
+	t.Helper()
+
+	path, err := filepath.Abs("guest-kernel-aarch64.config")
 	if err != nil {
 		t.Fatalf("absolute config path: %v", err)
 	}

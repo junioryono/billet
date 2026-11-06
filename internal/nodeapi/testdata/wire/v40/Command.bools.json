@@ -97,7 +97,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -221,7 +226,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -345,7 +355,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -469,7 +484,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -593,7 +613,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -717,7 +742,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -841,7 +871,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -965,7 +1000,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1089,7 +1129,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1213,7 +1258,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1338,7 +1388,12 @@
         },
         "go_test_results": true
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1463,7 +1518,12 @@
         },
         "npm": true
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1587,7 +1647,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
@@ -1712,7 +1777,12 @@
           "max_size": 156615474
         }
       },
-      "arch": "Command.tier.arch"
+      "arch": "Command.tier.arch",
+      "egress": {
+        "allow": [
+          "Command.tier.egress.allow[0]"
+        ]
+      }
     },
     "barrier_id": "Command.barrier_id",
     "request_id": 341765293,
