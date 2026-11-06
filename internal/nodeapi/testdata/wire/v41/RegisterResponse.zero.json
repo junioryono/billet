@@ -4,5 +4,6 @@
   "poll_seconds": 0,
   "images_accept": [
     ""
-  ]
+  ],
+  "macos_vm_limit": 0
 }

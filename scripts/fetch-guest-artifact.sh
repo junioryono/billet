@@ -12,7 +12,8 @@
 #
 # Usage: fetch-guest-artifact.sh <directory>
 # Needs GH_TOKEN (actions: read), GITHUB_REPOSITORY, GITHUB_RUN_ID, RUNNER_TEMP and
-# GUEST_ARTIFACT_ID, the id the build job's upload reported.
+# GUEST_ARTIFACT_ID, the id the build job's upload reported. GUEST_ARTIFACT_NAME is the
+# artifact's name, guest-image unless a leg of another machine uploaded it.
 set -euo pipefail
 
 out=${1:?usage: fetch-guest-artifact.sh <directory>}
@@ -21,6 +22,7 @@ out=${1:?usage: fetch-guest-artifact.sh <directory>}
 : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 : "${GUEST_ARTIFACT_ID:?GUEST_ARTIFACT_ID is required: the id the upload in the build job reported}"
+name=${GUEST_ARTIFACT_NAME:-guest-image}
 
 fail() {
 	echo "fetch-guest-artifact: $*" >&2
@@ -34,14 +36,15 @@ fail() {
 # run checked: run 39813415826 held a failed attempt's 45MB one beside the
 # successful attempt's 18GB one (2026-10-22).
 [[ $GUEST_ARTIFACT_ID =~ ^[1-9][0-9]*$ ]] || fail "the build job's artifact id '$GUEST_ARTIFACT_ID' is not a number"
-listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=guest-image&per_page=100") ||
+[[ $name =~ ^guest-image(-[a-z0-9_]+)?$ ]] || fail "'$name' is not the name of a guest image artifact"
+listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$name&per_page=100") ||
 	fail "could not list this run's artifacts"
-if ! meta=$(jq -er --argjson id "$GUEST_ARTIFACT_ID" '
-	[.artifacts[] | select(.id == $id and .name == "guest-image" and (.expired | not))]
-	| if length != 1 then error("no live guest-image artifact \($id)") else .[0] end
+if ! meta=$(jq -er --argjson id "$GUEST_ARTIFACT_ID" --arg name "$name" '
+	[.artifacts[] | select(.id == $id and .name == $name and (.expired | not))]
+	| if length != 1 then error("no live \($name) artifact \($id)") else .[0] end
 	| "\(.id) \(.size_in_bytes) \(.digest // "")"
 ' <<<"$listing"); then
-	fail "this run has no live guest-image artifact $GUEST_ARTIFACT_ID, the one its build job uploaded"
+	fail "this run has no live $name artifact $GUEST_ARTIFACT_ID, the one its build job uploaded"
 fi
 read -r id size digest <<<"$meta"
 [[ $id =~ ^[1-9][0-9]*$ ]] || fail "the artifact's id '$id' is not a number"
@@ -51,7 +54,7 @@ want=${digest#sha256:}
 	fail "GitHub published no sha256 for the artifact ('$digest'), so a download cannot be proved whole"
 
 # ROOM FOR THE ZIP AND WHAT IT HOLDS, both at once, before either is written.
-zip="$RUNNER_TEMP/guest-image.zip"
+zip="$RUNNER_TEMP/$name.zip"
 mkdir -p "$out"
 free=$(df --output=avail -B1 "$RUNNER_TEMP" | tail -n 1 | tr -dc '0-9')
 needed=$((2 * size + 4 * 1024 * 1024 * 1024))

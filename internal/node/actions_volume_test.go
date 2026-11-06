@@ -1,11 +1,13 @@
 package node
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A NEW VOLUME IS FORMATTED WITHOUT A DISCARD PASS. It is a thin rbd image Create
@@ -36,6 +38,92 @@ func TestANewCacheVolumeIsFormattedWithoutADiscardPass(t *testing.T) {
 	want := []string{"-F", "-m", "0", "-E", "nodiscard", "/dev/rbd7"}
 	if !slices.Equal(args, want) {
 		t.Fatalf("mkfs.ext4 ran with %q, want exactly %q", args, want)
+	}
+}
+
+// A MOUNT WHOSE COMMAND FAILED IS UNDONE IF THE KERNEL HOLDS IT. A mount killed by
+// its context can have finished mounting: on 2026-11-06 one left a Go cache
+// volume mounted that the node believed was not, and its discard could not unmap
+// the device for hours. The kernel is asked, and only what it holds is unmounted;
+// a look that fails says the mount may remain rather than calling it gone.
+//
+// NOT PARALLEL: the fake mount, mountpoint and umount reach the manager through PATH.
+func TestAFailedMountIsUndoneWhenTheKernelHoldsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mounted     bool
+		look        string
+		wantUnmount bool
+		wantKept    bool
+		wantErr     string
+	}{
+		{name: "killed after the kernel mounted", mounted: true, look: "ok",
+			wantUnmount: true, wantErr: "signal: killed"},
+		{name: "failed without mounting", mounted: false, look: "ok",
+			wantErr: "mount Actions cache volume"},
+		{name: "could not tell", mounted: true, look: "fail",
+			wantKept: true, wantErr: "may still be mounted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin, state := t.TempDir(), t.TempDir()
+			mountedFlag := filepath.Join(state, "mounted")
+			umounted := filepath.Join(state, "umounted")
+			if tc.mounted {
+				if err := os.WriteFile(mountedFlag, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mountpoint := "#!/bin/sh\n"
+			if tc.look == "fail" {
+				mountpoint += "exit 1\n"
+			} else {
+				mountpoint += "[ -e '" + mountedFlag + "' ] && exit 0\nexit 32\n"
+			}
+			started := filepath.Join(state, "started")
+			for name, body := range map[string]string{
+				// Blocks until the caller's context is cancelled, which is what
+				// killed the node's mount: exec.CommandContext kills it then, and
+				// the undo has to work with that context already done.
+				"mount":      "#!/bin/sh\n: > '" + started + "'\nexec sleep 60\n",
+				"mountpoint": mountpoint,
+				"umount":     "#!/bin/sh\nrm -f '" + mountedFlag + "'\n: > '" + umounted + "'\n",
+			} {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			go func() {
+				for ctx.Err() == nil {
+					if _, err := os.Stat(started); err == nil {
+						cancel()
+
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}()
+
+			target := filepath.Join(t.TempDir(), "go")
+			err := hostActionsVolumeManager{}.MountWritable(ctx, "/dev/rbd102", target)
+			if ctx.Err() == nil {
+				t.Fatal("the mount returned before its context was cancelled; the test proves nothing")
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("MountWritable = %v, want an error containing %q", err, tc.wantErr)
+			}
+			_, unmountErr := os.Stat(umounted)
+			if ran := unmountErr == nil; ran != tc.wantUnmount {
+				t.Fatalf("umount ran = %t, want %t", ran, tc.wantUnmount)
+			}
+			_, statErr := os.Stat(target)
+			if kept := statErr == nil; kept != tc.wantKept {
+				t.Fatalf("mount point kept = %t (%v), want %t", kept, statErr, tc.wantKept)
+			}
+		})
 	}
 }
 

@@ -11,16 +11,3 @@ CommandResult.barrier_id string
 CommandResult.instances tag omitempty
 CommandResult.instances slice
 CommandResult.instances[] string
-CommandResult.log tag omitempty
-CommandResult.log pointer
-CommandResult.log.held bool
-CommandResult.log.cut tag omitempty
-CommandResult.log.cut bool
-CommandResult.log.unreadable tag omitempty
-CommandResult.log.unreadable int
-CommandResult.log.lines tag omitempty
-CommandResult.log.lines slice
-CommandResult.log.lines[].line int64
-CommandResult.log.lines[].at_ms tag omitempty
-CommandResult.log.lines[].at_ms int64
-CommandResult.log.lines[].text string

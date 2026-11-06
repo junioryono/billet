@@ -443,10 +443,10 @@ func TestALogChunkCrossesTheWire(t *testing.T) {
 		indexed bool
 	}{
 		// LITERAL VERSIONS, for the reason above.
-		{"the last wire without it", 40, nil, http.StatusBadRequest, nodeapi.CodeRefused, false},
-		{"the wire with it", 41, nil, http.StatusNoContent, "", true},
-		{"a refusal", 41, fmt.Errorf("%w: no", nodeplane.ErrRefused), http.StatusBadRequest, nodeapi.CodeRefused, true},
-		{"a failure", 41, errors.New("busy"), http.StatusServiceUnavailable, "", true},
+		{"the last wire without it", 41, nil, http.StatusBadRequest, nodeapi.CodeRefused, false},
+		{"the wire with it", 42, nil, http.StatusNoContent, "", true},
+		{"a refusal", 42, fmt.Errorf("%w: no", nodeplane.ErrRefused), http.StatusBadRequest, nodeapi.CodeRefused, true},
+		{"a failure", 42, errors.New("busy"), http.StatusServiceUnavailable, "", true},
 	} {
 		index := &fakeIndexer{err: tc.err}
 		log := slog.New(slog.DiscardHandler)
@@ -501,7 +501,7 @@ func TestAnIndexIsNamedAtItsWireAndAnUnknownNodeIsNoAnswer(t *testing.T) {
 	for _, tc := range []struct {
 		version int
 		want    string
-	}{{40, ""}, {41, "index-a"}} {
+	}{{41, ""}, {42, "index-a"}} {
 		body, err := json.Marshal(nodeapi.RegisterRequest{MinVersion: tc.version, Version: tc.version, Incarnation: "i",
 			Node: "n1", Provider: config.ProviderDocker, GuestOS: []config.GuestOS{config.GuestLinux},
 			Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory})

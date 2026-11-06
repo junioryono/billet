@@ -96,10 +96,5 @@
     "lease": "",
     "ranges": [],
     "max_bytes": 0
-  },
-  "attach": {
-    "lease": "",
-    "stream": "",
-    "token": ""
   }
 }
