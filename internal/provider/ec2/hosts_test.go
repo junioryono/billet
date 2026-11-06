@@ -452,6 +452,31 @@ func TestALaunchRefusalNamesOnlyKnownCodes(t *testing.T) {
 	}
 }
 
+// A POOL LAUNCH ANSWERED WITH A REDIRECT IS REFUSED AS ONE, sent once and not followed:
+// its body cannot be rewound, so net/http hands the 307 back without asking the
+// redirect policy, and it must not read as an unrecognised refusal.
+func TestAPoolLaunchAnsweredWithARedirectIsARedirect(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		f := newFakeEC2(t)
+		f.redirectTo = "https://elsewhere.example/token-9QX"
+		f.respond = func(action string, _ url.Values) (int, string) {
+			if action == "RunInstances" {
+				return status, ``
+			}
+
+			return http.StatusOK, defaultReply(action)
+		}
+		_, err := newTestProvider(t, f, nil).Hosts().Launch(t.Context(), hostLaunch())
+		if !errors.Is(err, errRedirected) || strings.Contains(err.Error(), "token-9QX") {
+			t.Errorf("a %d answered %v, want a refused redirect that quotes nothing", status, err)
+		}
+		if n := f.countOf("RunInstances"); n != 1 {
+			t.Errorf("a %d: RunInstances was sent %d times, want once", status, n)
+		}
+	}
+}
+
 // WHAT ANSWERED IS NOT QUOTED ON ANY CALL: an unparsable Location fails before any
 // redirect policy runs and net/http renders it, and an XML error repeats the answer.
 func TestNoCallQuotesWhatAnswered(t *testing.T) {

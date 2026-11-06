@@ -357,6 +357,14 @@ func (c *client) attempt(ctx context.Context, body string, rewindable bool) ([]b
 
 	defer func() { _ = resp.Body.Close() }()
 
+	// A REDIRECT HANDED BACK UNFOLLOWED IS STILL A REDIRECT. net/http follows a 307 or
+	// 308 only for a body it can rewind, and returns one it cannot (a pool launch's)
+	// without asking CheckRedirect, so it would otherwise read as an unrecognised
+	// refusal.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, fmt.Errorf("%w (a %d, not followed)", errRedirected, resp.StatusCode)
+	}
+
 	// BOUNDED. A DescribeInstances page is large but not unbounded, and an
 	// unbounded read is an allocation sized by whatever answered.
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))

@@ -143,6 +143,54 @@ func TestWhyNoRoomNamesTheLimitThatBinds(t *testing.T) {
 		}
 	})
 
+	t.Run("no host and the share spent", func(t *testing.T) {
+		pinned := targetTier("repo-8", "repo", 8, 16*config.GiB)
+		pinned.Node = "gone"
+		a := newBareAllocator(t, Limits{
+			MaxVCPU: 64, MaxMemory: 256 * config.GiB,
+			Shares: map[string]config.TargetShare{"repo": {VCPU: 16}},
+		}, []config.Tier{pinned, targetTier("repo-16", "repo", 16, 32*config.GiB)})
+		mustRegister(t, a, NodeRegistration{
+			Name: "here", Provider: config.ProviderFirecracker, VCPU: 64, Memory: 256 * config.GiB,
+		})
+
+		reserve(t, a, "repo-16")
+
+		if got := whyNoRoom(t, a, "repo-8"); !got.NoHost || !got.ShareBound || got.CeilingBound || got.HostOnly() {
+			t.Errorf("no host under a spent share reports %+v, want both named and no host shortage", got)
+		}
+	})
+
+	t.Run("hosts full and the ceiling's memory spent", func(t *testing.T) {
+		a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 16 * config.GiB},
+			[]config.Tier{tier("work", 2, 16*config.GiB)})
+		mustRegister(t, a, NodeRegistration{
+			Name: "host", Provider: config.ProviderFirecracker, VCPU: 2, Memory: 128 * config.GiB,
+		})
+
+		reserve(t, a, "work")
+
+		got := whyNoRoom(t, a, "work")
+		if !slices.Equal(got.HostsFull, []string{"host"}) || !got.CeilingBound || got.HostOnly() {
+			t.Errorf("a full host under a ceiling whose memory is spent reports %+v, want both named", got)
+		}
+	})
+
+	t.Run("no host and the ceiling held by another tier's floor", func(t *testing.T) {
+		pinned := tier("pinned", 4, 8*config.GiB)
+		pinned.Node = "gone"
+		floored := tier("floored", 8, 8*config.GiB)
+		floored.Reserved = 1
+		a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 128 * config.GiB}, []config.Tier{pinned, floored})
+		mustRegister(t, a, NodeRegistration{
+			Name: "here", Provider: config.ProviderFirecracker, VCPU: 64, Memory: 128 * config.GiB,
+		})
+
+		if got := whyNoRoom(t, a, "pinned"); !got.NoHost || !got.CeilingBound || got.HostOnly() {
+			t.Errorf("no host under a ceiling another tier's floor holds reports %+v, want both named", got)
+		}
+	})
+
 	t.Run("no host", func(t *testing.T) {
 		pinned := tier("pinned", 4, 8*config.GiB)
 		pinned.Node = "gone"
