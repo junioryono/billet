@@ -48,19 +48,8 @@ var ErrUnreachable = errors.New("nodeclient: the control plane's answer did not 
 // listener that wants a client certificate) is the same answer every time, so asking
 // again would wait for good on something only a person can change.
 func lost(err error) error {
-	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
-		return err
-	}
-	if _, ok := errors.AsType[x509.UnknownAuthorityError](err); ok {
-		return err
-	}
-	if _, ok := errors.AsType[x509.HostnameError](err); ok {
-		return err
-	}
-	if _, ok := errors.AsType[x509.CertificateInvalidError](err); ok {
-		return err
-	}
-	if _, ok := errors.AsType[tls.RecordHeaderError](err); ok {
+	if is[*tls.CertificateVerificationError](err) || is[x509.UnknownAuthorityError](err) ||
+		is[x509.HostnameError](err) || is[x509.CertificateInvalidError](err) || is[tls.RecordHeaderError](err) {
 		return err
 	}
 	// crypto/tls reports an alert its peer sent as a net.OpError of this Op.
@@ -69,6 +58,13 @@ func lost(err error) error {
 	}
 
 	return fmt.Errorf("%w: %w", ErrUnreachable, err)
+}
+
+// is reports whether err's chain holds a T.
+func is[T error](err error) bool {
+	_, ok := errors.AsType[T](err)
+
+	return ok
 }
 
 // FetchCA reads a control plane's authority and checks it against a fingerprint
