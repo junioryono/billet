@@ -991,6 +991,7 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 
 	// A POOL ORDER'S TOKEN IS ASKED OF ITS SOURCE FIRST (ADR-030), which may admit the
 	// host on its own word, refuse it, or leave it to the request below.
+	poolOrder := ""
 	if h.poolJoins != nil && strings.TrimSpace(req.JoinToken) != "" {
 		order, live, err := h.poolJoins.PoolJoinOrder(r.Context(), req.JoinToken)
 		if err != nil {
@@ -1003,6 +1004,7 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 		if order != "" && h.poolEnroll(w, r, &req, fingerprint, order, live) {
 			return
 		}
+		poolOrder = order
 	}
 
 	// THE REQUEST AND THE TOKEN IN ONE CALL, because they have to commit
@@ -1012,7 +1014,9 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 	enrollment, err := h.enrollments.RequestEnrollmentWithToken(
 		r.Context(), req.Node, fingerprint, req.CSRPEM, req.JoinToken)
 	if err != nil {
-		if isPoolRefusal(err) {
+		// A POOL HOST'S REQUEST IS ANSWERED AS ONE on this path too, a conflict
+		// included: pending, quoting nothing, so the host keeps asking.
+		if isPoolRefusal(err) || (poolOrder != "" && errors.Is(err, alloc.ErrEnrollmentConflict)) {
 			h.poolRefusal(w, req.Node, fingerprint, err)
 
 			return

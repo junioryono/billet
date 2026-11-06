@@ -18,6 +18,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/poolconsole"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -46,11 +47,11 @@ func TestAPoolHostSaysItsFingerprintOnTheConsole(t *testing.T) { //nolint:parall
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "boot output\n" + nodeapi.PoolConsoleLine("pa", realFP) + "\n" + nodeapi.PoolConsoleLine("pa", realFP) + "\n"
+	want := "boot output\n" + poolconsole.Line("pa", realFP) + "\n" + poolconsole.Line("pa", realFP) + "\n"
 	if string(raw) != want {
 		t.Fatalf("the console holds %q, want %q", raw, want)
 	}
-	if got := nodeapi.PoolConsoleFingerprints(string(raw), "pa"); len(got) != 1 || got[0] != realFP {
+	if got := poolconsole.Fingerprints(string(raw), "pa"); len(got) != 1 || got[0] != realFP {
 		t.Fatalf("the plane would read %v", got)
 	}
 
@@ -86,10 +87,18 @@ type joinRecorder struct {
 	consoles []string
 }
 
+// answer writes a JSON body; a write that fails reaches the host as a failed ask, which
+// the test sees.
+func answer(w http.ResponseWriter, v any) {
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+}
+
 func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/v1/ca":
-		_ = json.NewEncoder(w).Encode(nodeapi.CAResponse{CAPEM: string(j.ca.CertPEM()), Fingerprint: j.ca.Fingerprint(),
+		answer(w, nodeapi.CAResponse{CAPEM: string(j.ca.CertPEM()), Fingerprint: j.ca.Fingerprint(),
 			Deployment: "0123456789abcdef0123456789abcdef"})
 	case "/v1/enroll":
 		var req nodeapi.EnrollRequest
@@ -99,6 +108,13 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		raw, _ := os.ReadFile(j.console) //nolint:errcheck // an unread console is an empty one, which the test reads
+		// THE CONSOLE IS EMPTIED AFTER EACH ASK, as the newest 64 KiB a source reads
+		// moves on, so the next ask must find a line written for it.
+		if err := os.WriteFile(j.console, nil, 0o600); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+
+			return
+		}
 		j.mu.Lock()
 		j.requests = append(j.requests, req)
 		j.consoles = append(j.consoles, string(raw))
@@ -111,7 +127,7 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if n < 2 || req.IdentityDocument == "" {
-			_ = json.NewEncoder(w).Encode(nodeapi.EnrollResponse{State: "pending", Fingerprint: fp})
+			answer(w, nodeapi.EnrollResponse{State: "pending", Fingerprint: fp})
 
 			return
 		}
@@ -121,7 +137,7 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
-		_ = json.NewEncoder(w).Encode(nodeapi.EnrollResponse{State: "approved", Fingerprint: fp,
+		answer(w, nodeapi.EnrollResponse{State: "approved", Fingerprint: fp,
 			CertPEM: string(bundle.CertPEM), CAPEM: string(j.ca.CertPEM())})
 	default:
 		w.WriteHeader(http.StatusNotFound)
@@ -188,7 +204,7 @@ func TestAPoolHostsEnrollmentSaysItsKeyAndSendsItsIdentity(t *testing.T) { //nol
 		t.Fatal(err)
 	}
 	for i, c := range rec.consoles {
-		if got := nodeapi.PoolConsoleFingerprints(c, "pa"); len(got) != 1 || got[0] != fp {
+		if got := poolconsole.Fingerprints(c, "pa"); len(got) != 1 || got[0] != fp {
 			t.Fatalf("ask %d: the console named %v, want the key %s", i+1, got, fp)
 		}
 	}

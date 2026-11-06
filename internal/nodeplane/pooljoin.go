@@ -28,6 +28,9 @@ type PoolJoins interface {
 	AdmitPoolEnrollment(ctx context.Context, adm alloc.PoolAdmission) (alloc.Enrollment, error)
 	// HoldPoolJoin holds an order's join for a person.
 	HoldPoolJoin(ctx context.Context, order, reason string) error
+	// RecordHeldPoolRequest records a held order's request pending, spending nothing,
+	// so a person has the host's key to approve.
+	RecordHeldPoolRequest(ctx context.Context, order, fingerprint, csrPEM string) (alloc.Enrollment, error)
 }
 
 // WithPoolJoins lets a pool host join without a person when its source vouches for it.
@@ -104,10 +107,10 @@ func (h *handler) poolEnroll(
 	case o.JoinHold != "":
 		h.log.Info("a pool host asked to join from an order held for a person", "node", req.Node, "order", order,
 			"fingerprint", fingerprint, "held", o.JoinHold)
-		poolPending(w, fingerprint)
+		h.recordHeld(w, r, req, fingerprint, order)
 
 		return true
-	case !live && !(mine && existing.PoolOrder == order):
+	case !live && (!mine || existing.PoolOrder != order):
 		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated, badJoinToken)
 
 		return true
@@ -131,8 +134,11 @@ func (h *handler) poolEnroll(
 			"node", req.Node, "order", order, "fingerprint", fingerprint, "why", t.Reason)
 		if err := h.poolJoins.HoldPoolJoin(ctx, order, t.Reason); err != nil {
 			h.log.Error("could not hold a pool order's join", "order", order, "error", err)
+			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, "billet could not record this request; try again")
+
+			return true
 		}
-		poolPending(w, fingerprint)
+		h.recordHeld(w, r, req, fingerprint, order)
 
 		return true
 	case hostsource.VerdictVouches:
@@ -145,6 +151,23 @@ func (h *handler) poolEnroll(
 		"node", req.Node, "order", order, "fingerprint", fingerprint, "why", t.Reason)
 
 	return false
+}
+
+// recordHeld records a held order's request for a person and answers it pending: the
+// host keeps asking, and its key is there to approve whether or not its token is still
+// live. Another key already holding the name is answered pending too, recording
+// nothing.
+func (h *handler) recordHeld(w http.ResponseWriter, r *http.Request, req *nodeapi.EnrollRequest, fingerprint, order string) {
+	e, err := h.poolJoins.RecordHeldPoolRequest(r.Context(), order, fingerprint, req.CSRPEM)
+
+	switch {
+	case err == nil && e.State == alloc.EnrollDenied:
+		writeJSON(w, http.StatusOK, nodeapi.EnrollResponse{State: e.State, Fingerprint: e.Fingerprint})
+	case err == nil, errors.Is(err, alloc.ErrEnrollmentConflict), errors.Is(err, alloc.ErrPoolJoinNotHeld):
+		poolPending(w, fingerprint)
+	default:
+		h.poolRefusal(w, req.Node, fingerprint, err)
+	}
 }
 
 // The answers an unauthenticated caller reads, in billet's words only.

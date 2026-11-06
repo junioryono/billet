@@ -42,7 +42,12 @@ type Joins struct {
 	asking map[string]bool
 }
 
-type judgedKey struct{ order, fingerprint, address string }
+// judgedKey is one claim on one order as the order stood: a hold or its release moves
+// the order, so a verdict given before either is never reused after it.
+type judgedKey struct {
+	order, fingerprint, address string
+	moved                       time.Time
+}
 
 type judged struct {
 	at        time.Time
@@ -68,9 +73,20 @@ func NewJoins(ledger JoinLedger, sources map[string]hostsource.Source, now func(
 //
 // AN ORDER'S SOURCE IS ASKED AT MOST ONCE PER DefaultJudgeEvery, AND ONE ASK AT A TIME,
 // whatever key a caller presents: a claim asked within it gets its own verdict back,
-// and any other claim on the order is could-not-tell until the interval passes.
+// unless the order has moved since (a hold, or its release), and any other claim on the
+// order is could-not-tell until the interval passes.
 func (j *Joins) JudgePoolJoin(ctx context.Context, claim hostsource.Claim) hostsource.Testimony {
-	key := judgedKey{claim.Order, claim.Fingerprint, claim.Address}
+	unknown := func(reason string) hostsource.Testimony {
+		return hostsource.Testimony{Verdict: hostsource.VerdictUnknown, Reason: reason}
+	}
+	o, err := j.ledger.ReadPoolOrder(ctx, claim.Order)
+	switch {
+	case errors.Is(err, alloc.ErrPoolOrderClosed):
+		return unknown("no such pool order")
+	case err != nil:
+		return unknown("the order could not be read")
+	}
+	key := judgedKey{order: claim.Order, fingerprint: claim.Fingerprint, address: claim.Address, moved: o.Updated}
 	now := j.now()
 
 	j.mu.Lock()
@@ -99,7 +115,7 @@ func (j *Joins) JudgePoolJoin(ctx context.Context, claim hostsource.Claim) hosts
 	j.mu.Unlock()
 
 	askCtx, cancel := context.WithTimeout(ctx, JudgeTimeout)
-	t := j.judge(askCtx, claim)
+	t := j.judge(askCtx, o, claim)
 	cancel()
 
 	j.mu.Lock()
@@ -110,17 +126,11 @@ func (j *Joins) JudgePoolJoin(ctx context.Context, claim hostsource.Claim) hosts
 	return t
 }
 
-func (j *Joins) judge(ctx context.Context, claim hostsource.Claim) hostsource.Testimony {
+func (j *Joins) judge(ctx context.Context, o alloc.PoolOrder, claim hostsource.Claim) hostsource.Testimony {
 	unknown := func(reason string) hostsource.Testimony {
 		return hostsource.Testimony{Verdict: hostsource.VerdictUnknown, Reason: reason}
 	}
-	o, err := j.ledger.ReadPoolOrder(ctx, claim.Order)
-	switch {
-	case errors.Is(err, alloc.ErrPoolOrderClosed):
-		return unknown("no such pool order")
-	case err != nil:
-		return unknown("the order could not be read")
-	case o.HostID == "":
+	if o.HostID == "" {
 		return unknown("the order's host is not recorded yet")
 	}
 	src := j.sources[o.Source]

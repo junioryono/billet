@@ -134,8 +134,8 @@ func TestADocumentVerifiesOnlyUnderItsRegionsCertificate(t *testing.T) {
 
 	// PAST THE BOUND, A SIGNED DOCUMENT THAT WOULD OTHERWISE BE READ IS REFUSED BY THE
 	// BOUND: valid JSON naming the instance, padded past MaxDocument.
-	big := document(t, map[string]string{"imageId": strings.Repeat("a", MaxDocument)})
-	if _, err := v.Verify("us-west-2", big, west.sign(t, big)); !errors.Is(err, ErrUnverified) ||
+	oversized := document(t, map[string]string{"imageId": strings.Repeat("a", MaxDocument)})
+	if _, err := v.Verify("us-west-2", oversized, west.sign(t, oversized)); !errors.Is(err, ErrUnverified) ||
 		!strings.Contains(err.Error(), "a document of") {
 		t.Errorf("a document past the bound: %v, want refused by its size", err)
 	}

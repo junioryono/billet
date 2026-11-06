@@ -97,6 +97,49 @@ func (a *Allocator) PoolJoinOrder(ctx context.Context, token string) (string, bo
 	return row.PoolOrder, row.Live == 1, nil
 }
 
+// RecordHeldPoolRequest records a request from a host whose order's join is held, under
+// its order and pending, WITHOUT SPENDING ANY TOKEN, so a person deciding about the
+// hold has the key the host presents to compare and approve (ADR-030). A held order
+// admits nothing on its own, so the record grants nothing; without it, a host whose
+// token lapsed while the order was held would have no request a person could approve.
+// The name is still claimed by the first key to ask: another key's request is answered
+// ErrEnrollmentConflict and recorded nowhere, and a denied key is replaced.
+func (a *Allocator) RecordHeldPoolRequest(ctx context.Context, order, fingerprint, csrPEM string) (Enrollment, error) {
+	name := PoolNodeName(order)
+
+	var out Enrollment
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+
+		row, err := openPoolOrderTx(ctx, q, order)
+		if err == nil {
+			return fmt.Errorf("%w: pool order %s is not held", ErrPoolJoinNotHeld, order)
+		}
+		if !errors.Is(err, ErrPoolJoinHeld) || row.JoinHold == "" {
+			return err
+		}
+
+		existing, err := readEnrollment(ctx, q, name)
+		switch {
+		case err == nil && existing.Fingerprint == fingerprint && existing.State == EnrollDenied:
+			out = existing
+
+			return nil
+		case err == nil && existing.State != EnrollDenied && existing.Fingerprint != fingerprint:
+			return fmt.Errorf("%w: %s is held by %s", ErrEnrollmentConflict, name, existing.Fingerprint)
+		case err != nil && !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+
+		out, err = a.requestEnrollmentTx(ctx, tx, name, fingerprint, csrPEM, order)
+
+		return err
+	})
+
+	return out, err
+}
+
 // ErrPoolJoinNotHeld is a release of a hold the order does not have.
 var ErrPoolJoinNotHeld = errors.New("alloc: this pool order's join is not held")
 
@@ -438,7 +481,7 @@ func (a *Allocator) linkPoolNodeTx(
 	}
 
 	row, err := openPoolOrderTx(ctx, q, order)
-	if err != nil && !(heldMay && errors.Is(err, ErrPoolJoinHeld)) {
+	if err != nil && (!heldMay || !errors.Is(err, ErrPoolJoinHeld)) {
 		return err
 	}
 

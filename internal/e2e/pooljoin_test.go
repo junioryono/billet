@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -15,17 +16,17 @@ import (
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
-	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/pool"
+	"github.com/junioryono/billet/internal/poolconsole"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // consoleSource is a source whose hosts' consoles are a buffer a test writes, read the
-// way the AWS source reads them, through nodeapi.PoolConsoleFingerprints, and judged as
+// way the AWS source reads them, through poolconsole.Fingerprints, and judged as
 // it judges them: no key is could-not-tell, this key alone vouches, other keys alone
 // contradict, and this key among others is could-not-tell. Only Witness is ever asked
 // of it here; the AWS source's own tests cover its document and address.
@@ -46,7 +47,7 @@ func (s *consoleSource) Witness(_ context.Context, c hostsource.Claim) hostsourc
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.asked = append(s.asked, c.HostID)
-	keys := nodeapi.PoolConsoleFingerprints(s.console[c.HostID], c.Order)
+	keys := poolconsole.Fingerprints(s.console[c.HostID], c.Order)
 	switch {
 	case len(keys) == 0:
 		return hostsource.Testimony{Reason: "nothing on the console yet"}
@@ -66,15 +67,9 @@ func (s *consoleSource) asks() int {
 	return len(s.asked)
 }
 
-// advance moves the judge's clock past its interval.
-func (w *poolJoinWire) advance(d time.Duration) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.now = w.now.Add(d)
-}
-
 // poolJoinWire is the enrollment listener as the control plane assembles it for a pool:
-// the real allocator and ledger, and the real judge over a console source.
+// the real allocator and ledger, and the real judge over a console source, both on one
+// clock the test moves.
 type poolJoinWire struct {
 	ca    *wirecert.CA
 	base  string
@@ -82,6 +77,20 @@ type poolJoinWire struct {
 	src   *consoleSource
 	mu    sync.Mutex
 	now   time.Time
+}
+
+// advance moves the clock the judge and the ledger read.
+func (w *poolJoinWire) advance(d time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.now = w.now.Add(d)
+}
+
+func (w *poolJoinWire) clock() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.now
 }
 
 type joinsOf struct {
@@ -98,10 +107,11 @@ func newPoolJoinWire(t *testing.T) *poolJoinWire {
 		t.Fatalf("state.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	w := &poolJoinWire{now: time.Now().UTC(), src: &consoleSource{console: map[string]string{}}}
 	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{{
 		Label: "fc", Provider: config.ProviderFirecracker, GuestOS: config.GuestLinux, VCPU: 2, Memory: 4 * config.GiB,
 		Image: "ubuntu@1",
-	}})
+	}}, alloc.WithClock(w.clock))
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
@@ -110,14 +120,8 @@ func newPoolJoinWire(t *testing.T) *poolJoinWire {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := &poolJoinWire{ca: ca, alloc: a, now: time.Now(), src: &consoleSource{console: map[string]string{}}}
-	clock := func() time.Time {
-		w.mu.Lock()
-		defer w.mu.Unlock()
-
-		return w.now
-	}
-	joins := joinsOf{Allocator: a, Joins: pool.NewJoins(a, map[string]hostsource.Source{"metal": w.src}, clock)}
+	w.ca, w.alloc = ca, a
+	joins := joinsOf{Allocator: a, Joins: pool.NewJoins(a, map[string]hostsource.Source{"metal": w.src}, w.clock)}
 	log := slog.New(slog.DiscardHandler)
 
 	// THE WIRE AS THE CONTROL PLANE ASSEMBLES IT, so a pool's joins that never reach the
@@ -197,11 +201,12 @@ func TestAPoolHostJoinsOnceItsSourceVouches(t *testing.T) {
 	if _, err := w.ask(t, name, token, csr); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("before the console names the key: %v, want not approved", err)
 	}
-	if e, ok, _ := w.alloc.LookupEnrollment(t.Context(), name); !ok || e.State != alloc.EnrollPending || e.PoolOrder != "pa" {
-		t.Fatalf("the first ask left %+v, %v", e, ok)
+	if e, ok, err := w.alloc.LookupEnrollment(t.Context(), name); err != nil || !ok || e.State != alloc.EnrollPending ||
+		e.PoolOrder != "pa" {
+		t.Fatalf("the first ask left %+v, %v, %v", e, ok, err)
 	}
 
-	w.src.write("host-pa", nodeapi.PoolConsoleLine("pa", fp))
+	w.src.write("host-pa", poolconsole.Line("pa", fp))
 	w.advance(pool.DefaultJudgeEvery)
 	cert, err := w.ask(t, name, token, csr)
 	if err != nil {
@@ -216,21 +221,27 @@ func TestAPoolHostJoinsOnceItsSourceVouches(t *testing.T) {
 		t.Fatalf("the order after the join: %+v, %v", o, err)
 	}
 	again, err := w.ask(t, name, token, csr)
-	if err != nil || string(again) != string(cert) {
-		t.Fatalf("a retry: %v, the same certificate %v", err, string(again) == string(cert))
+	if err != nil || !bytes.Equal(again, cert) {
+		t.Fatalf("a retry: %v, the same certificate %v", err, bytes.Equal(again, cert))
 	}
 }
 
-// A HOST WHOSE CONSOLE NAMES ANOTHER KEY IS TOLD TO WAIT AND ITS ORDER IS HELD, with
-// nothing recorded and the token unspent; the host the console names is told to wait
-// too, its source unasked, until a person acts. Once a person releases the hold, that
-// host's next ask is judged again and joins.
+// A HOST WHOSE CONSOLE NAMES ANOTHER KEY IS TOLD TO WAIT AND ITS ORDER IS HELD: the
+// request is recorded for a person without spending the token, and the host the console
+// names is told to wait too, its source unasked, while the name is taken. A person who
+// denies the other key and releases the hold lets that host's next ask be judged again,
+// and it joins.
 func TestAPoolHostTheConsoleContradictsWaitsForAPerson(t *testing.T) {
 	t.Parallel()
 	w := newPoolJoinWire(t)
+	ctx := t.Context()
 	token := w.order(t, "pb")
 	name := alloc.PoolNodeName("pb")
 	imposter, _, err := wirecert.NewNodeCSR(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imposterFP, err := wirecert.FingerprintOfCSR(imposter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,19 +253,19 @@ func TestAPoolHostTheConsoleContradictsWaitsForAPerson(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.src.write("host-pb", nodeapi.PoolConsoleLine("pb", hostFP))
+	w.src.write("host-pb", poolconsole.Line("pb", hostFP))
 	if _, err := w.ask(t, name, token, imposter); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("a contradicted ask: %v, want told to wait", err)
 	}
-	_, ok, err := w.alloc.LookupEnrollment(t.Context(), name)
-	if err != nil || ok {
-		t.Fatalf("a contradicted ask was recorded (%v, %v)", ok, err)
+	e, ok, err := w.alloc.LookupEnrollment(ctx, name)
+	if err != nil || !ok || e.Fingerprint != imposterFP || e.State != alloc.EnrollPending || e.PoolOrder != "pb" {
+		t.Fatalf("the contradicted ask was recorded as %+v (%v, %v), want pending for a person", e, ok, err)
 	}
-	o, err := w.alloc.ReadPoolOrder(t.Context(), "pb")
+	o, err := w.alloc.ReadPoolOrder(ctx, "pb")
 	if err != nil || o.JoinHold == "" || o.NodeName != "" {
 		t.Fatalf("the order after a contradiction: %+v, %v", o, err)
 	}
-	tokens, err := w.alloc.JoinTokens(t.Context())
+	tokens, err := w.alloc.JoinTokens(ctx)
 	if err != nil || len(tokens) != 1 || tokens[0].Uses != 1 {
 		t.Fatalf("the token after a contradiction: %+v, %v", tokens, err)
 	}
@@ -268,12 +279,71 @@ func TestAPoolHostTheConsoleContradictsWaitsForAPerson(t *testing.T) {
 		t.Fatal("a held order's source was asked")
 	}
 
-	if err := w.alloc.ReleasePoolJoin(t.Context(), "pb"); err != nil {
+	if err := w.alloc.DecideEnrollment(ctx, name, imposterFP, alloc.EnrollDenied, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.alloc.ReleasePoolJoin(ctx, "pb"); err != nil {
 		t.Fatal(err)
 	}
 	w.advance(pool.DefaultJudgeEvery)
 	cert, err := w.ask(t, name, token, host)
 	if err != nil || len(cert) == 0 {
-		t.Fatalf("the console's own key once the hold was released: %v", err)
+		t.Fatalf("the console's own key once the other was denied and the hold released: %v", err)
+	}
+}
+
+// A HOST WHOSE ORDER IS HELD UNTIL ITS TOKEN LAPSES STILL JOINS ON A PERSON'S WORD: its
+// request was recorded while held, a person approves it, and the host's next ask, with
+// its lapsed token, collects the certificate.
+func TestAHeldHostWhoseTokenLapsedJoinsOnAPersonsWord(t *testing.T) {
+	t.Parallel()
+	w := newPoolJoinWire(t)
+	ctx := t.Context()
+	token := w.order(t, "pc")
+	name := alloc.PoolNodeName("pc")
+	host, _, err := wirecert.NewNodeCSR(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostFP, err := wirecert.FingerprintOfCSR(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := wirecert.NewNodeCSR(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherFP, err := wirecert.FingerprintOfCSR(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// THE CONSOLE NAMES A KEY THE HOST NO LONGER HOLDS, so its own ask is contradicted.
+	w.src.write("host-pc", poolconsole.Line("pc", otherFP))
+	if _, err := w.ask(t, name, token, host); !errors.Is(err, nodeclient.ErrNotApproved) {
+		t.Fatalf("a contradicted ask: %v", err)
+	}
+	w.advance(3 * time.Hour)
+	if _, err := w.ask(t, name, token, host); !errors.Is(err, nodeclient.ErrNotApproved) {
+		t.Fatalf("an ask once the token lapsed: %v, want told to wait", err)
+	}
+	// AS `billet nodes approve` DOES: sign the recorded request, record its serial, decide.
+	bundle, err := w.ca.SignNodeCSR(name, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.alloc.DecideEnrollment(ctx, name, hostFP, alloc.EnrollApproved, string(bundle.CertPEM),
+		wirecert.Serial(leaf)); err != nil {
+		t.Fatalf("a person's approval of the held request: %v", err)
+	}
+	cert, err := w.ask(t, name, token, host)
+	if err != nil || !bytes.Equal(cert, bundle.CertPEM) {
+		t.Fatalf("the host's ask with its lapsed token after the approval: %v", err)
+	}
+	if o, err := w.alloc.ReadPoolOrder(ctx, "pc"); err != nil || o.NodeName != name || o.JoinHold != "" {
+		t.Fatalf("the order after the approval: %+v, %v", o, err)
 	}
 }

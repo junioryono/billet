@@ -90,7 +90,7 @@ func TestAPoolTokenEnrollsOnlyItsOrdersNode(t *testing.T) {
 	if left := usesLeft(t, a, "pa"); len(left) != 1 || left[0] != 0 {
 		t.Fatalf("the recorded request did not spend the token: %v", left)
 	}
-	if got, _, _ := a.LookupEnrollment(ctx, PoolNodeName("pa")); got.PoolOrder != "pa" {
+	if got, _, err := a.LookupEnrollment(ctx, PoolNodeName("pa")); err != nil || got.PoolOrder != "pa" {
 		t.Fatalf("the request read back as %+v", got)
 	}
 }
@@ -172,7 +172,7 @@ func TestAPoolAdmissionLinksTheOrderAndRetiresItsTokens(t *testing.T) {
 	if err != nil || again.CertPEM != "cert-0a" {
 		t.Fatalf("a retry with the same key answered %+v, %v; want the first certificate", again, err)
 	}
-	if certs, _ := a.LiveCertsFor(ctx, PoolNodeName("pa")); len(certs) != 1 {
+	if certs, err := a.LiveCertsFor(ctx, PoolNodeName("pa")); err != nil || len(certs) != 1 {
 		t.Fatalf("a retry recorded another certificate: %+v", certs)
 	}
 	if _, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:other", tok, "0c")); !errors.Is(err, ErrPoolOrderClosed) {
@@ -308,7 +308,7 @@ func TestApprovingARequestFromAClosedOrderIsRefusedWhole(t *testing.T) {
 	if err := a.DecideEnrollment(ctx, PoolNodeName("pa"), "SHA256:k", EnrollApproved, "cert", "0a"); !errors.Is(err, ErrPoolOrderClosed) {
 		t.Fatalf("approving a request from a closed order answered %v", err)
 	}
-	if e, _, _ := a.LookupEnrollment(ctx, PoolNodeName("pa")); e.State != EnrollPending {
+	if e, _, err := a.LookupEnrollment(ctx, PoolNodeName("pa")); err != nil || e.State != EnrollPending {
 		t.Fatalf("the refused approval left the request %s", e.State)
 	}
 }
@@ -469,5 +469,61 @@ func TestATokensOrderIsReadWithWhetherItIsLive(t *testing.T) {
 		return a.linkPoolNodeTx(ctx, state.WriteQueries(tx), "pa", PoolNodeName("pa"), "SHA256:k", "", false)
 	}); err == nil {
 		t.Fatal("an order was linked without its certificate's serial")
+	}
+}
+
+// A HELD ORDER'S REQUEST IS RECORDED FOR A PERSON WITHOUT SPENDING A TOKEN, even once
+// every token lapsed, so a person can approve the key the host presents: the name is
+// still the first key's, a denied key hears its denial, and only a held order records
+// this way. The approval then links the order as any approval does.
+func TestAHeldOrdersRequestIsRecordedForAPerson(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	placedOrder(t, a, "pa")
+	if _, err := a.RecordHeldPoolRequest(ctx, "pa", "SHA256:k", "csr"); !errors.Is(err, ErrPoolJoinNotHeld) {
+		t.Fatalf("recording for an order that is not held answered %v", err)
+	}
+	if err := a.HoldPoolJoin(ctx, "pa", "the console names another key"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Hour)
+	e, err := a.RecordHeldPoolRequest(ctx, "pa", "SHA256:k", "csr")
+	if err != nil || e.State != EnrollPending || e.PoolOrder != "pa" || e.Name != PoolNodeName("pa") {
+		t.Fatalf("recording a held order's request: %+v, %v", e, err)
+	}
+	if left := usesLeft(t, a, "pa"); !slices.Equal(left, []int{1}) {
+		t.Fatalf("recording spent a token: %v", left)
+	}
+	if again, err := a.RecordHeldPoolRequest(ctx, "pa", "SHA256:k", "csr"); err != nil || again.State != EnrollPending {
+		t.Fatalf("the same key again: %+v, %v", again, err)
+	}
+	if _, err := a.RecordHeldPoolRequest(ctx, "pa", "SHA256:other", "csr"); !errors.Is(err, ErrEnrollmentConflict) {
+		t.Fatalf("another key: %v", err)
+	}
+	if err := a.DecideEnrollment(ctx, PoolNodeName("pa"), "SHA256:k", EnrollApproved, "cert", "0a"); err != nil {
+		t.Fatalf("a person's approval of the held request: %v", err)
+	}
+	if o := readOrder(t, a, "pa"); o.NodeName != PoolNodeName("pa") || o.JoinHold != "" {
+		t.Fatalf("the order after the approval: %+v", o)
+	}
+
+	placedOrder(t, a, "pb")
+	if err := a.HoldPoolJoin(ctx, "pb", "held"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.RecordHeldPoolRequest(ctx, "pb", "SHA256:denied", "csr"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.DecideEnrollment(ctx, PoolNodeName("pb"), "SHA256:denied", EnrollDenied, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if e, err := a.RecordHeldPoolRequest(ctx, "pb", "SHA256:denied", "csr"); err != nil || e.State != EnrollDenied {
+		t.Fatalf("a denied key again: %+v, %v", e, err)
+	}
+	if e, err := a.RecordHeldPoolRequest(ctx, "pb", "SHA256:next", "csr"); err != nil || e.State != EnrollPending ||
+		e.Fingerprint != "SHA256:next" {
+		t.Fatalf("another key once the first was denied: %+v, %v", e, err)
 	}
 }

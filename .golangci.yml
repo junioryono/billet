@@ -399,6 +399,16 @@ linters:
           allow:
             - $gostd
 
+        # THE POOL HOST'S CONSOLE LINE IS A LEAF. A host writes it and a host source
+        # reads it, and neither may import the other's layer, so the one spelling
+        # imports nothing either does: the standard library only.
+        poolconsole:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/poolconsole/**"
+          allow:
+            - $gostd
+
         # THE ENDING RECORD IS A LEAF. The node writes it and every command that
         # stops or starts a node judges it, so whatever it imported the node and
         # those commands would import. The standard library and the two file

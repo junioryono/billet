@@ -18,8 +18,8 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
-	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/poolconsole"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -648,7 +648,7 @@ func announceOnConsole(order, fingerprint string) error {
 		return err
 	}
 
-	_, werr := fmt.Fprintf(f, "%s\n", nodeapi.PoolConsoleLine(order, fingerprint))
+	_, werr := fmt.Fprintf(f, "%s\n", poolconsole.Line(order, fingerprint))
 
 	return errors.Join(werr, f.Close())
 }

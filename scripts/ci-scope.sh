@@ -97,7 +97,7 @@ is_replay_input() {
 		internal/awsidentity/* | internal/egress/* | internal/hostauthority/* | internal/hostsource/* | internal/imageaccept/* | internal/jobtrace/* | internal/lifeops/* | \
 		internal/importcheck/* | internal/lease/* | internal/macoslimit/* | internal/metrics/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeending/* | internal/nodeplane/* | \
-		internal/pool/* | internal/power/* | internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
+		internal/pool/* | internal/poolconsole/* | internal/power/* | internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
 		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \
 		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
 		internal/tokenbroker/* | internal/usage/* | internal/version/* | internal/wallmeter/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;

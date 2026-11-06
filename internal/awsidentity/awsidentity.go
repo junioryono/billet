@@ -115,7 +115,7 @@ func (v *Verifier) Regions() int { return len(v.keys) }
 // Verify checks a document and its base64 signature under region's certificate and
 // answers what it says. The document must name that region.
 func (v *Verifier) Verify(region string, document []byte, signature string) (Document, error) {
-	if len(document) == 0 || len(document) > MaxDocument || len(signature) == 0 || len(signature) > MaxSignature {
+	if len(document) == 0 || len(document) > MaxDocument || signature == "" || len(signature) > MaxSignature {
 		return Document{}, fmt.Errorf("%w: a document of %d bytes and a signature of %d", ErrUnverified,
 			len(document), len(signature))
 	}

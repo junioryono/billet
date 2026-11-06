@@ -42,6 +42,25 @@ type poolRig struct {
 	admitted   []alloc.PoolAdmission
 	held       []string
 	requestErr error
+	// recordedHeld is each request recorded for a held order, and heldErr its answer.
+	recordedHeld []string
+	heldErr      error
+	heldState    string
+}
+
+func (p *poolRig) RecordHeldPoolRequest(_ context.Context, order, fingerprint, _ string) (alloc.Enrollment, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recordedHeld = append(p.recordedHeld, order+" "+fingerprint)
+	if p.heldErr != nil {
+		return alloc.Enrollment{}, p.heldErr
+	}
+	state := p.heldState
+	if state == "" {
+		state = alloc.EnrollPending
+	}
+
+	return alloc.Enrollment{Name: alloc.PoolNodeName(order), Fingerprint: fingerprint, State: state}, nil
 }
 
 func newPoolRig(verdict hostsource.Verdict) *poolRig {
@@ -218,9 +237,9 @@ func TestAPoolHostItsSourceVouchesForIsAdmitted(t *testing.T) {
 	}
 }
 
-// A CONTRADICTION HOLDS THE ORDER, SPENDS NOTHING AND IS ANSWERED PENDING: the host
-// keeps asking while a person looks, and the answer carries none of what the source
-// said.
+// A CONTRADICTION HOLDS THE ORDER, SPENDS NOTHING AND IS ANSWERED PENDING: the request
+// is recorded for a person without its token, the host keeps asking while a person
+// looks, and the answer carries none of what the source said.
 func TestAContradictionHoldsTheOrderAndAnswersPending(t *testing.T) {
 	t.Parallel()
 	rig := newPoolRig(hostsource.VerdictContradicts)
@@ -237,7 +256,45 @@ func TestAContradictionHoldsTheOrderAndAnswersPending(t *testing.T) {
 		t.Fatalf("held %v", rig.held)
 	}
 	if len(rig.requested) != 0 || len(rig.admitted) != 0 {
-		t.Fatalf("a contradicted join recorded %v and admitted %v", rig.requested, rig.admitted)
+		t.Fatalf("a contradicted join spent its token recording %v, or admitted %v", rig.requested, rig.admitted)
+	}
+	if len(rig.recordedHeld) != 1 || rig.recordedHeld[0] != "pa "+fp {
+		t.Fatalf("recorded for a person: %v", rig.recordedHeld)
+	}
+}
+
+// A HELD ORDER'S REQUEST IS RECORDED FOR A PERSON AND ANSWERED PENDING, its source
+// unasked: another key holding the name is pending too, a denied key hears its denial,
+// and a ledger that cannot record it says so.
+func TestAHeldOrdersRequestIsRecordedForAPerson(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		err    error
+		state  string
+		status int
+		want   string
+	}{
+		"recorded":         {nil, "", http.StatusOK, alloc.EnrollPending},
+		"another key":      {fmt.Errorf("%w: the secret key", alloc.ErrEnrollmentConflict), "", http.StatusOK, alloc.EnrollPending},
+		"a denied key":     {nil, alloc.EnrollDenied, http.StatusOK, alloc.EnrollDenied},
+		"a ledger failing": {errors.New("the secret reason"), "", http.StatusServiceUnavailable, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rig := newPoolRig(hostsource.VerdictVouches)
+			rig.order.JoinHold, rig.heldErr, rig.heldState = "a person looks", c.err, c.state
+			rig.spent["tok-pa"] = true
+			srv, _ := servePool(t, rig, true)
+			req, _ := poolRequest(t, alloc.PoolNodeName("pa"))
+			status, res, body := askToJoin(t, srv, req)
+			if status != c.status || res.State != c.want || strings.Contains(body, "secret") {
+				t.Fatalf("answered %d %+v %s, want %d %q", status, res, body, c.status, c.want)
+			}
+			if len(rig.recordedHeld) != 1 || len(rig.claims) != 0 || len(rig.requested) != 0 {
+				t.Fatalf("recorded %v held, asked the source %d times, spent a token %v",
+					rig.recordedHeld, len(rig.claims), rig.requested)
+			}
+		})
 	}
 }
 
@@ -253,8 +310,6 @@ func TestTheLedgerIsAskedBeforeTheSource(t *testing.T) {
 		state  string
 		says   string
 	}{
-		"a held order": {set: func(p *poolRig, _ *nodeapi.EnrollRequest) { p.order.JoinHold = "a person looks" },
-			status: http.StatusOK, state: alloc.EnrollPending},
 		"a joined order": {set: func(p *poolRig, _ *nodeapi.EnrollRequest) { p.order.NodeName = "pool-pa" },
 			status: http.StatusConflict, says: "admits no node"},
 		"a released order": {set: func(p *poolRig, _ *nodeapi.EnrollRequest) { p.order.State = alloc.PoolReleased },
@@ -361,6 +416,7 @@ func TestAPoolJoinsRefusalsAreAnsweredByWhatTheHostDoes(t *testing.T) {
 		"held":           {fmt.Errorf("%w: the secret reason", alloc.ErrPoolJoinHeld), want{http.StatusOK, alloc.EnrollPending, ""}},
 		"closed":         {fmt.Errorf("%w: the secret reason", alloc.ErrPoolOrderClosed), want{http.StatusConflict, "", "admits no node"}},
 		"a spent token":  {alloc.ErrBadJoinToken, want{http.StatusUnauthorized, "", "join token"}},
+		"a conflict":     {fmt.Errorf("%w: the secret key", alloc.ErrEnrollmentConflict), want{http.StatusOK, alloc.EnrollPending, ""}},
 	}
 	for name, c := range cases {
 		t.Run("recording "+name, func(t *testing.T) {
@@ -376,10 +432,6 @@ func TestAPoolJoinsRefusalsAreAnsweredByWhatTheHostDoes(t *testing.T) {
 			}
 		})
 	}
-	cases["a conflict"] = struct {
-		err  error
-		want want
-	}{fmt.Errorf("%w: the secret reason", alloc.ErrEnrollmentConflict), want{http.StatusOK, alloc.EnrollPending, ""}}
 	cases["anything else"] = struct {
 		err  error
 		want want

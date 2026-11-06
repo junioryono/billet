@@ -152,7 +152,7 @@ func TestAnOrdersSourceIsAskedOneAtATime(t *testing.T) {
 	j := NewJoins(orderLedger{"pa": {ID: "pa", Source: "aws", HostID: "i-1"}}, map[string]hostsource.Source{"aws": src}, nil)
 	done := make(chan hostsource.Testimony)
 	go func() {
-		done <- j.JudgePoolJoin(context.Background(), hostsource.Claim{Order: "pa", Fingerprint: "SHA256:k"})
+		done <- j.JudgePoolJoin(t.Context(), hostsource.Claim{Order: "pa", Fingerprint: "SHA256:k"})
 	}()
 	<-src.entered
 	if got := j.JudgePoolJoin(t.Context(), hostsource.Claim{Order: "pa", Fingerprint: "SHA256:k"}); got.Verdict != hostsource.VerdictUnknown {
@@ -164,5 +164,26 @@ func TestAnOrdersSourceIsAskedOneAtATime(t *testing.T) {
 	}
 	if n := src.asked(); n != 1 {
 		t.Fatalf("asked %d times, want once", n)
+	}
+}
+
+// A VERDICT IS NOT REUSED ONCE THE ORDER HAS MOVED: a contradiction given before a
+// person released a hold would otherwise hold the order again at once, without asking
+// anything.
+func TestAVerdictIsNotReusedOnceTheOrderMoved(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	src := &witnessSource{fakeSource: &fakeSource{}, answer: hostsource.Testimony{Verdict: hostsource.VerdictContradicts}}
+	ledger := orderLedger{"pa": {ID: "pa", Source: "aws", HostID: "i-1", Updated: now}}
+	j := NewJoins(ledger, map[string]hostsource.Source{"aws": src}, func() time.Time { return now })
+	claim := hostsource.Claim{Order: "pa", Fingerprint: "SHA256:k"}
+	if got := j.JudgePoolJoin(t.Context(), claim); got.Verdict != hostsource.VerdictContradicts {
+		t.Fatalf("first: %+v", got)
+	}
+	o := ledger["pa"]
+	o.Updated = now.Add(time.Second)
+	ledger["pa"] = o
+	if got := j.JudgePoolJoin(t.Context(), claim); got.Verdict == hostsource.VerdictContradicts {
+		t.Fatalf("the verdict from before the order moved was reused: %+v", got)
 	}
 }

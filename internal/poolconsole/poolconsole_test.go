@@ -1,4 +1,4 @@
-package nodeapi
+package poolconsole
 
 import (
 	"slices"
@@ -17,20 +17,20 @@ func TestAPoolConsoleLineIsReadBackForItsOrderOnly(t *testing.T) {
 	t.Parallel()
 	a, b, c := fp("aB+/c9"), fp("second"), fp("other")
 	console := "\x1b[32m[  OK  ]\x1b[0m Started cloud-final.\r\n" +
-		PoolConsoleLine("p1", a) + "\r\n" +
-		"[  12.0] " + PoolConsoleLine("p12", c) + "\n" +
-		PoolConsoleLine("p1", a) + "\r\n" +
-		PoolConsoleLine("p1", b)
-	if got := PoolConsoleFingerprints(console, "p1"); !slices.Equal(got, []string{a, b}) {
+		Line("p1", a) + "\r\n" +
+		"[  12.0] " + Line("p12", c) + "\n" +
+		Line("p1", a) + "\r\n" +
+		Line("p1", b)
+	if got := Fingerprints(console, "p1"); !slices.Equal(got, []string{a, b}) {
 		t.Fatalf("p1 read %v", got)
 	}
-	if got := PoolConsoleFingerprints(console, "p12"); !slices.Equal(got, []string{c}) {
+	if got := Fingerprints(console, "p12"); !slices.Equal(got, []string{c}) {
 		t.Fatalf("p12 read %v", got)
 	}
-	if got := PoolConsoleFingerprints(console, "p"); len(got) != 0 {
+	if got := Fingerprints(console, "p"); len(got) != 0 {
 		t.Fatalf("an order that is only a prefix read %v", got)
 	}
-	if got := PoolConsoleFingerprints("nothing here", "p1"); got != nil {
+	if got := Fingerprints("nothing here", "p1"); got != nil {
 		t.Fatalf("an empty console read %v", got)
 	}
 }
@@ -40,19 +40,19 @@ func TestAPoolConsoleLineIsReadBackForItsOrderOnly(t *testing.T) {
 // either would otherwise read as a different key and hold a host for nothing.
 func TestAPoolConsoleLineCutShortIsNoKey(t *testing.T) {
 	t.Parallel()
-	whole := PoolConsoleLine("p1", fp("k"))
+	whole := Line("p1", fp("k"))
 	for name, console := range map[string]string{
 		"cut at the end":          whole[:len(whole)-5],
 		"cut and then a new line": whole[:len(whole)-5] + "\n[ 3.1] next\n",
 		"run into by another write": whole[:len(whole)-10] + "[  3.2] usb 1-1: new device" +
 			whole[len(whole)-10:] + "\n",
-		"a short fingerprint": PoolConsoleLine("p1", "SHA256:abc") + "\n",
+		"a short fingerprint": Line("p1", "SHA256:abc") + "\n",
 	} {
-		if got := PoolConsoleFingerprints(console, "p1"); len(got) != 0 {
+		if got := Fingerprints(console, "p1"); len(got) != 0 {
 			t.Errorf("%s: read %v, want nothing", name, got)
 		}
 	}
-	if got := PoolConsoleFingerprints(whole, "p1"); !slices.Equal(got, []string{fp("k")}) {
+	if got := Fingerprints(whole, "p1"); !slices.Equal(got, []string{fp("k")}) {
 		t.Fatalf("the whole line at the console's end read %v", got)
 	}
 }

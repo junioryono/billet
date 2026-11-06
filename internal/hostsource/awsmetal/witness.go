@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/hostsource"
-	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/poolconsole"
 	"github.com/junioryono/billet/internal/provider/ec2"
 )
 
@@ -93,7 +93,7 @@ func (s *Source) Witness(ctx context.Context, claim hostsource.Claim) hostsource
 	if err != nil {
 		return unknown("EC2 could not read the console of %s (%s)", claim.HostID, s.failure(err))
 	}
-	keys := nodeapi.PoolConsoleFingerprints(console, claim.Order)
+	keys := poolconsole.Fingerprints(console, claim.Order)
 	switch {
 	case len(keys) == 0:
 		return unknown("the console of %s does not name a key for order %s yet", claim.HostID, claim.Order)
