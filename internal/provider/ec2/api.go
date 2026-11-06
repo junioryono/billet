@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -251,7 +253,9 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 				return nil
 			}
 
-			err = fmt.Errorf("ec2: parse the api response: %w", err)
+			// NOT QUOTED: an XML syntax error repeats part of the answer, and an
+			// answer can carry the request back.
+			err = errUnparsable
 		}
 
 		lastErr = err
@@ -332,7 +336,7 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 			return nil, err
 		}
 
-		return nil, fmt.Errorf("ec2: call the api: %w", err)
+		return nil, fmt.Errorf("ec2: call the api: %w", transportFailure(err))
 	}
 
 	defer func() { _ = resp.Body.Close() }()
@@ -341,7 +345,7 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 	// unbounded read is an allocation sized by whatever answered.
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, fmt.Errorf("ec2: read the api response: %w", err)
+		return nil, fmt.Errorf("ec2: read the api response: %w", transportFailure(err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -349,6 +353,41 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 	}
 
 	return payload, nil
+}
+
+// errUnparsable is an answer that would not parse. Its text is not kept.
+var errUnparsable = errors.New("ec2: parse the api response: the answer would not parse, and is not quoted")
+
+// errAnswerWithheld is a failure made of what answered (a Location that would not
+// parse, a body or trailer that would not read), whose text is not kept.
+var errAnswerWithheld = errors.New("the answer could not be read, and is not quoted")
+
+// transportFailure keeps what the network said and drops what the answer said. A
+// dial, a reset or a DNS failure names only the configured endpoint; an error built
+// from the answer (net/http quotes an unparsable Location before any redirect policy
+// runs, and a malformed trailer line) can carry the request, and its session token,
+// back. A cancelled or expired context stays itself.
+//
+// A NETWORK ERROR IS KEPT ONLY WHEN ITS CAUSE IS THE SYSTEM'S: a syscall that failed
+// (refused, reset, unreachable) or a timeout. net.OpError also wraps a TLS failure
+// through an HTTPS proxy, whose x509 error renders names a certificate chose.
+func transportFailure(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	}
+	// A DNS FAILURE NAMES ONLY THE CONFIGURED HOST, and arrives inside an OpError that
+	// is neither a syscall nor a timeout, so it is asked for first.
+	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
+		return dnsErr
+	}
+	if opErr, ok := errors.AsType[*net.OpError](err); ok {
+		if sysErr, sys := errors.AsType[*os.SyscallError](opErr.Err); (sys && sysErr.Err != nil) || opErr.Timeout() {
+			return opErr
+		}
+	}
+
+	return errAnswerWithheld
 }
 
 // errorResponse is the shape the query API uses for a refusal.
@@ -381,8 +420,10 @@ func parseAPIError(payload []byte, status int) error {
 
 // instanceItem is one instance as the API describes it.
 type instanceItem struct {
-	InstanceID string `xml:"instanceId"`
-	State      struct {
+	InstanceID   string `xml:"instanceId"`
+	InstanceType string `xml:"instanceType"`
+	PrivateIP    string `xml:"privateIpAddress"`
+	State        struct {
 		Name string `xml:"name"`
 	} `xml:"instanceState"`
 	// StateReason says WHO stopped it, which "stopped" alone does not.
