@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
@@ -67,5 +68,42 @@ func TestAVerifiedTartTierIsPlacedOnlyOnAHostThatReadsIt(t *testing.T) {
 
 	if leases[0].TargetNode != "b-new-tart" {
 		t.Fatalf("verified lease placed on %q, want b-new-tart", leases[0].TargetNode)
+	}
+}
+
+// A TIER SPANNING BACKENDS IS JUDGED BY THE HOST'S, not by whether it accepts Tart at all:
+// its Tart image names `@verified` and its Firecracker image does not, so an older
+// Firecracker host still serves it and only the older Tart host is passed over.
+func TestAVerifiedTartImageExcludesOnlyTheOlderTartHostOfAMixedTier(t *testing.T) {
+	t.Parallel()
+
+	mixed := config.Tier{
+		Label: "mixed", Providers: []config.ProviderKind{config.ProviderTart, config.ProviderFirecracker},
+		GuestOS: config.GuestLinux, VCPU: 2, Memory: 4 * config.GiB,
+		Launch: map[config.ProviderKind]config.TierLaunch{
+			config.ProviderTart:        {Image: "ghcr.io/cirruslabs/ubuntu:latest@verified"},
+			config.ProviderFirecracker: {Image: "ubuntu-2404-x64@20261106"},
+		},
+	}
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB}, []config.Tier{mixed})
+
+	host := func(name string, kind config.ProviderKind, wire int) nodeRow {
+		return nodeRow{name: name, provider: kind, vcpu: 64, memory: 128 * config.GiB, wire: wire}
+	}
+
+	rows := []nodeRow{
+		host("a-old-firecracker", config.ProviderFirecracker, TartVerifiedWireVersion-1),
+		host("a-old-tart", config.ProviderTart, TartVerifiedWireVersion-1),
+		host("b-new-tart", config.ProviderTart, TartVerifiedWireVersion),
+	}
+
+	var got []string
+	for _, n := range a.eligibleFrom(rows, mixed, 0) {
+		got = append(got, n.name)
+	}
+
+	if want := []string{"a-old-firecracker", "b-new-tart"}; !slices.Equal(got, want) {
+		t.Fatalf("a mixed tier is eligible on %v, want %v", got, want)
 	}
 }
