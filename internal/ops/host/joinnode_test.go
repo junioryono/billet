@@ -588,3 +588,19 @@ func TestAPoolHostsJoinPrintsNoKeyLine(t *testing.T) {
 		t.Fatalf("the console would read %v from:\n%s", got, console)
 	}
 }
+
+// A POOL'S NAME IS ITS ORDER'S: a join under a pool- name without the order is refused
+// before anything is asked or changed.
+func TestAJoinUnderAPoolNameNeedsItsOrder(t *testing.T) {
+	onPlatform(t, "darwin", 501)
+	f := &joinFakes{generated: joinedNodeConfig}
+	stageJoin(t, f)
+	args := slices.Clone(joinArgs)
+	args[slices.Index(args, "mac-1")] = "pool-p01"
+	if err := Join(t.Context(), processEnv(), args); err == nil || !strings.Contains(err.Error(), "reserved for the hosts a pool orders") {
+		t.Fatalf("a pool name without its order answered %v", err)
+	}
+	if len(f.trace) != 0 {
+		t.Fatalf("the join went on: %v", f.trace)
+	}
+}

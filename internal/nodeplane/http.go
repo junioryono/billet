@@ -1037,6 +1037,13 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if errors.Is(err, alloc.ErrPoolNameReserved) {
+			writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
+				"a node name beginning pool- is reserved for the hosts a pool orders; choose another --node-name")
+
+			return
+		}
+
 		if errors.Is(err, alloc.ErrBadJoinToken) {
 			h.log.Warn("an enrollment was attempted without a usable join token",
 				"node", req.Node, "fingerprint", fingerprint)

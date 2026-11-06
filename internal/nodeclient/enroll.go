@@ -344,6 +344,12 @@ func EnrollWithIdentity(
 
 	res, err := client.Do(req)
 	if err != nil {
+		if !errors.Is(lost(err), ErrUnreachable) {
+			return nil, nil, fmt.Errorf("nodeclient: the control plane did not prove it holds a key the authority "+
+				"you named signed (a control plane in the middle of a CA rotation presents the previous authority's "+
+				"certificate; finish it with `billet ca retire` and enroll again): %w", err)
+		}
+
 		return nil, nil, fmt.Errorf("nodeclient: ask to enroll: %w", lost(err))
 	}
 

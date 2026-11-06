@@ -23,6 +23,11 @@ import (
 // only feedback that makes guessing worth doing.
 var ErrBadJoinToken = errors.New("alloc: that join token is not usable")
 
+// ErrPoolNameReserved means a request under a name the pool gives its hosts came with a
+// token no pool order minted. It wraps ErrBadJoinToken, so nothing is recorded or spent,
+// and says why, because the token itself may be good for any other name.
+var ErrPoolNameReserved = errors.New("alloc: a node name beginning pool- is a pool host's, and only its order's token enrolls it")
+
 // JoinToken is a short-lived credential that lets a machine ASK to enroll.
 //
 // It admits nothing on its own: a request still waits for an operator to compare

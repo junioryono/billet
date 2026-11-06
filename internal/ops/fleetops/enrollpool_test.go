@@ -333,6 +333,8 @@ func TestAnAnswerEndsAPoolHostsJoin(t *testing.T) { //nolint:paralleltest // sha
 		set                func(*joinRecorder)
 		otherCA            bool
 		caAsks, enrollAsks int
+		// says is what the answer must name, if anything.
+		says string
 	}{
 		"a refusal":         {set: func(j *joinRecorder) { j.enrollStatus = http.StatusConflict }, caAsks: 1, enrollAsks: 1},
 		"a bad token":       {set: func(j *joinRecorder) { j.enrollStatus = http.StatusUnauthorized }, caAsks: 1, enrollAsks: 1},
@@ -344,14 +346,14 @@ func TestAnAnswerEndsAPoolHostsJoin(t *testing.T) { //nolint:paralleltest // sha
 				t.Fatal(err)
 			}
 			j.servedBy = other
-		}, caAsks: 1},
+		}, caAsks: 1, says: "billet ca retire"},
 		"a root appended to the authority": {set: func(j *joinRecorder) {
 			other, err := wirecert.LoadOrCreateCA(filepath.Join(t.TempDir(), "ca"), "fedcba9876543210fedcba9876543210")
 			if err != nil {
 				t.Fatal(err)
 			}
 			j.servedBy, j.appendServer = other, true
-		}, caAsks: 1},
+		}, caAsks: 1, says: "billet ca retire"},
 	} {
 		rec, srv, cfg, ca, _ := servePoolJoin(t, c.set)
 		fp := ca.Fingerprint()
@@ -363,7 +365,8 @@ func TestAnAnswerEndsAPoolHostsJoin(t *testing.T) { //nolint:paralleltest // sha
 		rec.mu.Lock()
 		caAsks, enrollAsks := rec.caAsks, len(rec.requests)
 		rec.mu.Unlock()
-		if err == nil || errors.Is(err, nodeclient.ErrUnreachable) || caAsks != c.caAsks || enrollAsks != c.enrollAsks {
+		if err == nil || errors.Is(err, nodeclient.ErrUnreachable) || caAsks != c.caAsks || enrollAsks != c.enrollAsks ||
+			!strings.Contains(err.Error(), c.says) {
 			t.Fatalf("%s: answered %v after %d authorities and %d enrollments, want an answer after %d and %d",
 				name, err, caAsks, enrollAsks, c.caAsks, c.enrollAsks)
 		}

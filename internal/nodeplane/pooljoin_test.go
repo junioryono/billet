@@ -584,3 +584,19 @@ func mustCert(t *testing.T, certPEM []byte) *x509.Certificate {
 
 	return cert
 }
+
+// A POOL'S NAME UNDER AN OPERATOR'S TOKEN IS REFUSED FOR WHAT IT IS: the token may be
+// good for any other name, so the answer names the reservation, not the token.
+func TestAPoolNameUnderAnOperatorsTokenSaysItIsReserved(t *testing.T) {
+	t.Parallel()
+	rig := newPoolRig(hostsource.VerdictUnknown)
+	rig.requestErr = fmt.Errorf("%w: %w", alloc.ErrBadJoinToken, alloc.ErrPoolNameReserved)
+	srv, _ := servePool(t, rig, true)
+	req, _ := poolRequest(t, alloc.PoolNodeName("pa"))
+	req.JoinToken = "operators-token"
+	status, _, body := askToJoin(t, srv, req)
+	if status != http.StatusUnauthorized || !strings.Contains(body, "reserved for the hosts a pool orders") ||
+		len(rig.claims) != 0 {
+		t.Fatalf("answered %d %s after %d claims", status, body, len(rig.claims))
+	}
+}

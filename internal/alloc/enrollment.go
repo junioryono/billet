@@ -228,7 +228,7 @@ func (a *Allocator) spendEnrollmentTokenTx(ctx context.Context, tx *sql.Tx, name
 
 	switch {
 	case (errors.Is(err, sql.ErrNoRows) || (err == nil && order == "")) && IsPoolNodeName(name):
-		return "", ErrBadJoinToken
+		return "", fmt.Errorf("%w: %w", ErrBadJoinToken, ErrPoolNameReserved)
 	case errors.Is(err, sql.ErrNoRows) || (err == nil && order == ""):
 		return "", a.spendJoinTokenTx(ctx, tx, token)
 	case err != nil:

@@ -441,7 +441,8 @@ func TestAnOperatorsTokenCannotClaimAPoolName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pa"), "SHA256:k", "csr", tok); !errors.Is(err, ErrBadJoinToken) {
+	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pa"), "SHA256:k", "csr", tok); !errors.Is(err, ErrBadJoinToken) ||
+		!errors.Is(err, ErrPoolNameReserved) {
 		t.Fatalf("an operator's token under a pool name answered %v", err)
 	}
 	if _, err := a.RequestEnrollmentWithToken(ctx, "epyc-1", "SHA256:k", "csr", tok); err != nil {

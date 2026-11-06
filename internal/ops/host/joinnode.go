@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
@@ -305,6 +306,12 @@ func parseJoin(env cli.Env, args []string) (joinRequest, error) {
 
 // refuseJoin is every refusal the flags and the platform decide.
 func refuseJoin(req joinRequest) error {
+	// A POOL'S NAME IS ITS ORDER'S: the control plane refuses any other token under it.
+	if req.poolOrder == "" && alloc.IsPoolNodeName(req.nodeName) {
+		return fmt.Errorf("billet join: %s begins pool-, which is reserved for the hosts a pool orders; choose "+
+			"another --node-name", req.nodeName)
+	}
+
 	switch cli.HostOS {
 	case "darwin":
 		if joinGeteuid() == 0 {
