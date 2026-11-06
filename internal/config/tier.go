@@ -184,6 +184,9 @@ type Tier struct {
 	// Cache configures every cache the tier's jobs get: whose writes publish,
 	// which caches are on, and how large each may grow. See TierCache.
 	Cache *TierCache `yaml:"cache,omitempty"`
+	// Logs keeps this tier's jobs' step logs on the node that ran them and indexes them
+	// so `billet logs search` finds them. Absent means none is kept. See logs.go.
+	Logs *TierLogs `yaml:"logs,omitempty"`
 	// Network is what the tier asks of its guests' network; see TierEgress.
 	Network *TierNetwork `yaml:"network,omitempty"`
 
@@ -430,6 +433,8 @@ const (
 // is a rule with a second entry point that does not.
 func (t Tier) ProviderErrors(where string) []error {
 	var errs []error
+
+	errs = append(errs, t.validateLogs(where)...)
 
 	// BOTH SPELLINGS IS AN ERROR, not a merge. Guessing which one an operator
 	// meant is not a kindness when the answer decides where untrusted code runs.

@@ -90,6 +90,12 @@ func NewNodeCacheService(
 	service.SetAuthorityReader(control)
 	if guestMonitoring(cfg) {
 		service.MonitorGuests()
+
+		// A NODE THAT CANNOT KEEP LOGS STILL RUNS JOBS: the store decides nothing, and an index
+		// holds nothing a job needs.
+		if err := startJobLogs(cfg, service); err != nil {
+			slog.Warn("this node will keep no job logs", "error", err)
+		}
 	}
 
 	return service, nil

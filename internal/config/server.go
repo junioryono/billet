@@ -281,6 +281,8 @@ type ServerConfig struct {
 	// least 1MiB; absent, 14 days and 128MiB. See retention.go.
 	TestResultsRetention string   `yaml:"test_results_retention,omitempty"`
 	TestResultsMaxBytes  ByteSize `yaml:"test_results_max_bytes,omitempty"`
+	// Logs bounds this control plane's index of what jobs wrote. See logs.go.
+	Logs *ServerLogsConfig `yaml:"logs,omitempty"`
 	// Metrics serves the control plane's Prometheus metrics. Absent, nothing is
 	// served: there is no default address.
 	Metrics *MetricsConfig `yaml:"metrics,omitempty"`
@@ -731,6 +733,9 @@ func (c *Config) validateServer() []error {
 		errs = append(errs, err)
 	}
 	if _, err := c.Server.TestResultsBound(); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := c.Server.Logs.Limits(); err != nil {
 		errs = append(errs, err)
 	}
 	return errs

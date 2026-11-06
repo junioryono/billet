@@ -146,6 +146,10 @@ type CacheSetting struct {
 // It is what travels to a node, so a node needs no copy of the rules.
 type CacheSpec struct {
 	Publish CachePublish `json:"publish"`
+	// KeepLogs says the node keeps this tier's jobs' step logs (tiers[].logs.keep). It
+	// travels here because this is what a node is told of what it serves a tier's guests,
+	// and an older node ignoring it keeps none, which is doing less.
+	KeepLogs bool `json:"keep_logs,omitempty"`
 	// Owner and Repository are the canonical scope of a default-branch
 	// namespace: the tier's cache_scope, or its repository target. Empty
 	// under trusted-only, whose keys are scoped by the deployment and site
@@ -283,6 +287,7 @@ func (t Tier) EffectiveCache() CacheSpec {
 	if spec.Publish == CachePublishDefaultBranch && t.CacheScope != nil {
 		spec.Owner, spec.Repository = t.CacheScope.Owner, t.CacheScope.Repository
 	}
+	spec.KeepLogs = t.Logs != nil && t.Logs.Keep
 
 	return spec
 }
