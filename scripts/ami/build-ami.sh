@@ -299,6 +299,10 @@ for name in $names; do
 done
 
 at=layer
+# WHAT THE GUEST'S CACHES NEED THAT GITHUB'S IMAGE DOES NOT CARRY: dnsmasq-base, for the
+# container resolver, as the firecracker guest's build adds it after its template (ADR-024).
+apt-get -o DPkg::Lock::Timeout=600 update
+DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends dnsmasq-base
 bash "$layer"
 
 # NOTHING OF THE BUILD STAYS IN THE IMAGE: its unit, its inputs, its record, and

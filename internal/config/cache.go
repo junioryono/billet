@@ -288,12 +288,25 @@ func (t Tier) EffectiveCache() CacheSpec {
 }
 
 // servesGuestCaches reports whether the node controls this tier's guest the way
-// the Git, Bazel, Go and Actions caches need: a Linux Firecracker guest and no
-// other backend.
+// the Git, Bazel, Go and Actions caches need: a Linux Firecracker or EC2 guest and
+// no other backend.
 func (t Tier) servesGuestCaches() bool {
 	providers := t.AcceptableProviders()
 
-	return len(providers) == 1 && providers[0] == ProviderFirecracker && t.GuestOS == GuestLinux
+	return len(providers) == 1 && serveGuestCaches(providers[0]) && t.GuestOS == GuestLinux
+}
+
+// WithoutGuestCaches is this spec with what the node serves to a guest it controls
+// turned off, for a node too old to give it to the guest it launches: doing less.
+func (s CacheSpec) WithoutGuestCaches() CacheSpec {
+	s.Actions.Enabled = false
+	s.Git.Enabled = false
+	s.Bazel.Enabled = false
+	s.Go.Enabled = false
+	s.GoTestResults = false
+	s.Npm = false
+
+	return s
 }
 
 // defaultPublish is the tier's publication rule, its own or the default by
@@ -416,10 +429,10 @@ func (c *Config) TargetNeedsRunEvidence(name string) bool {
 	return false
 }
 
-// needsGuestCacheServices reports whether a tier enables a cache that is
+// NeedsGuestCacheServices reports whether a tier enables a cache that is
 // served by the node for a guest the node controls: the Actions cache, the Git
 // proxy, the Bazel and Go caches and the npm registry cache.
-func (s CacheSpec) needsGuestCacheServices() bool {
+func (s CacheSpec) NeedsGuestCacheServices() bool {
 	return s.Actions.Enabled || s.Git.Enabled || s.Bazel.Enabled || s.Go.Enabled || s.Npm
 }
 

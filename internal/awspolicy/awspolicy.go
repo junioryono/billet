@@ -796,6 +796,10 @@ func cacheStatements(partition, suffix, region, owner string, c Cache) ([]Statem
 	prefix := strings.TrimSuffix(c.Prefix, "/")
 	bucketARN := fmt.Sprintf("arn:%s:s3:::%s", partition, c.Bucket)
 	objectARN := bucketARN + "/" + prefix + "/*"
+	var objectDeleteARNs []string
+	for _, subtree := range ebss3.S3ObjectDeleteSubtrees() {
+		objectDeleteARNs = append(objectDeleteARNs, bucketARN+"/"+prefix+"/owners/*/"+subtree+"/*")
+	}
 
 	ownerResource := ownerTagCondition("aws:ResourceTag/"+ec2.OwnerTagKey, owner)
 	ownerRequest := ownerTagCondition("aws:RequestTag/"+ec2.OwnerTagKey, owner)
@@ -875,6 +879,17 @@ func cacheStatements(partition, suffix, region, owner string, c Cache) ([]Statem
 			Condition: map[string]any{
 				"StringLike": map[string]any{"s3:prefix": []string{prefix + "/*"}},
 			},
+		},
+		// THE ARCHIVES AND ENTRIES ONLY, NEVER THE STATE OBJECTS: eviction goes by how
+		// recently a job used something, which no lifecycle rule can see, and the
+		// credential that does it cannot unpublish a sticky disk.
+		{
+			Sid: "BilletCacheObjectsEvict", Effect: "Allow",
+			Action: ebss3.S3ObjectDeleteIAMActions(), Resource: objectDeleteARNs,
+		},
+		{
+			Sid: "BilletCacheUploads", Effect: "Allow",
+			Action: ebss3.S3ListMultipartIAMActions(), Resource: []string{bucketARN},
 		},
 	}
 

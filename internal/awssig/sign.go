@@ -75,6 +75,38 @@ func Sign(
 	region, service string,
 	now time.Time,
 ) error {
+	return sign(req, SHA256Hex(body), creds, region, service, now)
+}
+
+// UnsignedPayload is what x-amz-content-sha256 says for a body S3 is not asked to
+// check against the signature.
+const UnsignedPayload = "UNSIGNED-PAYLOAD"
+
+// SignStream signs a request whose body is read as it is sent, so its digest
+// cannot be known first: a body too large to hold, carried over TLS, which is what
+// S3 allows UNSIGNED-PAYLOAD for. The caller sets req.ContentLength first, because
+// the signature covers it.
+func SignStream(
+	req *http.Request,
+	creds Credentials,
+	region, service string,
+	now time.Time,
+) error {
+	if req.URL == nil || req.URL.Scheme != "https" {
+		return errors.New("aws: an unsigned payload is only sent over https")
+	}
+	req.Header.Set("X-Amz-Content-Sha256", UnsignedPayload)
+
+	return sign(req, UnsignedPayload, creds, region, service, now)
+}
+
+func sign(
+	req *http.Request,
+	payloadHash string,
+	creds Credentials,
+	region, service string,
+	now time.Time,
+) error {
 	if creds.AccessKeyID == "" || creds.SecretAccessKey == "" {
 		return ErrNoCredentials
 	}
@@ -97,7 +129,6 @@ func Sign(
 	if host == "" {
 		host = req.URL.Host
 	}
-	payloadHash := SHA256Hex(body)
 	canonicalHeaders, signedHeaders := canonicalizeHeaders(req.Header, host, req.ContentLength)
 	query, err := CanonicalQuery(req.URL)
 	if err != nil {
