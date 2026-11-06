@@ -265,12 +265,12 @@ func TestAPoolHostsEnrollmentSaysItsKeyAndSendsItsIdentity(t *testing.T) { //nol
 
 // AN ANSWER THAT DID NOT ARRIVE IS NO VERDICT: a pool host whose boot runs its join once
 // asks again for an authority it could not read (no answer, an answer cut off, a 503),
-// and again with the same key for an approval it lost the same two ways, and is handed
-// the certificate.
+// and again with the same key for an approval it lost (no answer, an answer cut off, a
+// server error in its place), and is handed the certificate.
 func TestAPoolHostAsksAgainForAnAnswerItLost(t *testing.T) { //nolint:paralleltest // shared vars
 	rec, srv, cfg, ca, _ := servePoolJoin(t, func(j *joinRecorder) {
 		j.caFaults = []string{faultAbort, faultBody, "503"}
-		j.approvalFaults = []string{faultAbort, faultBody}
+		j.approvalFaults = []string{faultAbort, faultBody, "500", "502", "504"}
 	})
 	var out bytes.Buffer
 	if err := EnrollNode(bounded(t), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa"); err != nil {
@@ -279,7 +279,7 @@ func TestAPoolHostAsksAgainForAnAnswerItLost(t *testing.T) { //nolint:parallelte
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if len(rec.caFaults) != 0 || len(rec.approvalFaults) != 0 || rec.caAsks != 4 || len(rec.requests) != 4 {
+	if len(rec.caFaults) != 0 || len(rec.approvalFaults) != 0 || rec.caAsks != 4 || len(rec.requests) != 7 {
 		t.Fatalf("faults left %v %v, the authority asked for %d times, enrollment %d", rec.caFaults, rec.approvalFaults,
 			rec.caAsks, len(rec.requests))
 	}

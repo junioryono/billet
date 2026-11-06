@@ -713,6 +713,34 @@ func TestAnUncertainOrderItsSourceNowListsIsPlaced(t *testing.T) {
 	}
 }
 
+// AN ORDER WHOSE SHAPE ITS SOURCE NO LONGER DECLARES CANNOT BE SENT AGAIN, so a lost
+// answer the source lists no host for is uncertain rather than ordering for good, and
+// is still read back where it was placed and placed when its host is listed.
+func TestAnOrderWhoseShapeIsNoLongerDeclaredIsUncertain(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 1, Max: 2})
+	r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, errors.New("timeout") }
+	step(t, r)
+	r.first.mu.Lock()
+	r.first.shapes, r.first.answer = nil, nil
+	r.first.mu.Unlock()
+	step(t, r)
+	got := r.ledger.snapshot()
+	if got["o-1"].State != alloc.PoolUncertain || !strings.Contains(got["o-1"].Reason, "cannot be sent again") ||
+		len(r.first.requests()) != 1 {
+		t.Fatalf("orders = %+v, sent %d times", got, len(r.first.requests()))
+	}
+	r.first.mu.Lock()
+	r.first.find = func(order string) (hostsource.Host, bool, error) {
+		return hostsource.Host{ID: "found-" + order}, true, nil
+	}
+	r.first.mu.Unlock()
+	step(t, r)
+	if got := r.ledger.snapshot(); got["o-1"].State != alloc.PoolPlaced || got["o-1"].HostID != "found-o-1" {
+		t.Fatalf("listed where it was placed: %+v", got)
+	}
+}
+
 // AN ORDER IS READ BACK ONLY WHERE IT WAS PLACED: a source whose scope changed since
 // is neither asked for it nor sent it again; the order is uncertain, for a person to
 // look where it was placed, and nothing more is ordered on its architecture meanwhile.

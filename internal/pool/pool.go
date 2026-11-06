@@ -417,7 +417,11 @@ func (p *Pool) resume(ctx context.Context, o alloc.PoolOrder) error {
 	}
 	terms, err := src.Terms(o.Shape)
 	if err != nil {
-		return fmt.Errorf("pool: the terms of order %s: %w", o.ID, err)
+		// A SHAPE ITS SOURCE NO LONGER DECLARES CANNOT BE SENT AGAIN, so the order is
+		// uncertain, still read back where it was placed, rather than ordering for good
+		// and holding its architecture with it.
+		return p.ledger.PoolOrderUncertain(ctx, o.ID, fmt.Sprintf(
+			"%s lists no host for this order, and its shape %s cannot be sent again: %v", o.Source, o.Shape, err))
 	}
 	if terms.IdempotentFor > 0 && p.now().Sub(o.FirstAttempt) < terms.IdempotentFor {
 		return p.send(ctx, o, false)

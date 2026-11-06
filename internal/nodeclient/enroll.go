@@ -48,21 +48,23 @@ var ErrUnreachable = errors.New("nodeclient: the control plane's answer did not 
 // listener that wants a client certificate) is the same answer every time, so asking
 // again would wait for good on something only a person can change.
 func lost(err error) error {
-	var (
-		verify   *tls.CertificateVerificationError
-		unknown  x509.UnknownAuthorityError
-		hostname x509.HostnameError
-		invalid  x509.CertificateInvalidError
-		record   tls.RecordHeaderError
-		op       *net.OpError
-	)
-
-	switch {
-	case errors.As(err, &verify), errors.As(err, &unknown), errors.As(err, &hostname), errors.As(err, &invalid),
-		errors.As(err, &record):
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
 		return err
-	case errors.As(err, &op) && op.Op == "remote error":
-		// crypto/tls reports an alert its peer sent as a net.OpError of this Op.
+	}
+	if _, ok := errors.AsType[x509.UnknownAuthorityError](err); ok {
+		return err
+	}
+	if _, ok := errors.AsType[x509.HostnameError](err); ok {
+		return err
+	}
+	if _, ok := errors.AsType[x509.CertificateInvalidError](err); ok {
+		return err
+	}
+	if _, ok := errors.AsType[tls.RecordHeaderError](err); ok {
+		return err
+	}
+	// crypto/tls reports an alert its peer sent as a net.OpError of this Op.
+	if op, ok := errors.AsType[*net.OpError](err); ok && op.Op == "remote error" {
 		return err
 	}
 
@@ -347,6 +349,12 @@ func EnrollWithIdentity(
 
 	if res.StatusCode == http.StatusServiceUnavailable {
 		return nil, nil, fmt.Errorf("%w (%s)", ErrEnrollUnavailable, res.Status)
+	}
+
+	// A SERVER ERROR IS NO REFUSAL: a proxy's 502 or 504, or the plane's own 500, may
+	// stand where an admission it committed should have been.
+	if res.StatusCode >= http.StatusInternalServerError {
+		return nil, nil, fmt.Errorf("%w: the control plane answered %s", ErrUnreachable, res.Status)
 	}
 
 	if res.StatusCode != http.StatusOK {
