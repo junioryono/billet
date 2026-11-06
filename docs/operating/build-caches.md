@@ -35,7 +35,7 @@ A cache's reads come from the newest published generation of its key; its writes
 
 `default-branch` needs a **static repository**: a repository target, or `cache_scope.owner` and `cache_scope.repository`. A pooled runner's caches are attached before GitHub chooses its job, so the namespace cannot come from the job. The proof comes from GitHub's own record of the run (`GET /repos/{owner}/{repo}/actions/runs/{run_id}` and the repository's default branch, read fresh at every completion), which needs the App's **`actions: read`** permission. `billet github-app create` requests it by default (`--actions-read=false` leaves it out), and `billet check` fails a target whose tiers publish from a default branch while its App lacks it. Without it, every such completion is could-not-tell and nothing publishes.
 
-Publication happens off the node's command path, after the compute is gone, journaled so a crash never snapshots twice and never publishes a stale clone, within 30 minutes of the completion or not at all. The kill switch is asked again before the pointer moves.
+A sticky disk on a trusted pool under `trusted-only` is published by its commit, in the job's own post step, which waits for the answer and writes it to the job's log: `billet published this sticky-disk update as generation …`, or a warning naming why not, `superseded` when another job published the key after this disk was cloned and `cas` kept theirs. A deferred publication (a `default-branch` write, once its completion decides it) happens off the node's command path, after the compute is gone, journaled so a crash never snapshots twice and never publishes a stale clone, within 30 minutes of the completion or not at all. The kill switch is asked again before the pointer moves.
 
 ## The caches
 

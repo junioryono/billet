@@ -1336,3 +1336,77 @@ run "a_builder_without_an_override_still_attaches" {
     error_message = "a builder with no override is the ordinary shape and must apply"
   }
 }
+
+# THE NODE ROLE'S BOUNDARY IS THE ONE NAMED, OR NONE: an operator whose automation adds
+# a grant to the role sets one so the grant can never exceed it, and an unset boundary
+# must render no boundary rather than an empty string IAM would refuse.
+run "node_role_carries_the_boundary_it_is_given" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id                        = "vpc-0f0f0f0f0f0f0f0f0"
+    name                          = "billet-test"
+    node_permissions_boundary_arn = "arn:aws:iam::123456789012:policy/billet-test-boundary"
+  }
+
+  assert {
+    condition     = aws_iam_role.node.permissions_boundary == "arn:aws:iam::123456789012:policy/billet-test-boundary"
+    error_message = "the node role does not carry the boundary it was given"
+  }
+}
+
+run "node_role_carries_no_boundary_by_default" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id = "vpc-0f0f0f0f0f0f0f0f0"
+    name   = "billet-test"
+  }
+
+  assert {
+    condition     = aws_iam_role.node.permissions_boundary == null
+    error_message = "the node role carries a boundary nobody named"
+  }
+}
+
+run "a_boundary_that_is_no_policy_arn_is_refused" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id                        = "vpc-0f0f0f0f0f0f0f0f0"
+    name                          = "billet-test"
+    node_permissions_boundary_arn = "billet-test-boundary"
+  }
+
+  expect_failures = [var.node_permissions_boundary_arn]
+}
+
+# A ROLE IS NO BOUNDARY: IAM takes only a managed policy, and an ARN that names a role
+# would plan and then fail at apply.
+run "a_boundary_that_names_a_role_is_refused" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id                        = "vpc-0f0f0f0f0f0f0f0f0"
+    name                          = "billet-test"
+    node_permissions_boundary_arn = "arn:aws:iam::123456789012:role/billet-test-boundary"
+  }
+
+  expect_failures = [var.node_permissions_boundary_arn]
+}

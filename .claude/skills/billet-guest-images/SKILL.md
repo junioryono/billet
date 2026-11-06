@@ -7,7 +7,7 @@ description: "Load when touching the vendored runner-images template or its nspa
 
 ## What this area is
 
-A Firecracker job boots a golden image: an Ubuntu 24.04 rootfs with Docker, the Actions runner and a small agent that reads its registration from the metadata service. It lives in Ceph as an RBD image with immutable snapshots called generations, and every job gets a copy-on-write clone. billet builds it once, centrally (`.github/workflows/guest-image.yml`, weekly), signs the manifest with Sigstore, publishes a dated `guest-YYYYMMDD-HHMMSS` prerelease and advances a signed pointer on the `release-channel` branch; a deployment pulls it with `billet images pull`. The EC2 backend boots an AMI `billet ami build` makes by running the same template on an EC2 builder (ADR-022). `scripts/runner-images` vendors GitHub's `actions/runner-images` tree at one commit and the guest build runs it; `internal/runnerimages` vendors GitHub's `toolset-2404.json` and `toolset-2404-arm64.json`; `internal/imagesource` fetches and verifies; `internal/runnerrelease` knows which `actions/runner` is installed and how close to refusal it is. `docs/reference/decisions/adr-005-runner-image-parity.md` records what parity costs.
+A Firecracker job boots a golden image: an Ubuntu 24.04 rootfs with Docker, the Actions runner and a small agent that reads its registration from the metadata service. It lives in Ceph as an RBD image with immutable snapshots called generations, and every job gets a copy-on-write clone. billet builds it once, centrally (`.github/workflows/guest-image.yml`, weekly), signs the manifest with Sigstore, publishes a dated `guest-YYYYMMDD-HHMMSS` prerelease and advances a signed pointer on the `guest-channel` branch; a deployment pulls it with `billet images pull`. The EC2 backend boots an AMI `billet ami build` makes by running the same template on an EC2 builder (ADR-022). `scripts/runner-images` vendors GitHub's `actions/runner-images` tree at one commit and the guest build runs it; `internal/runnerimages` vendors GitHub's `toolset-2404.json` and `toolset-2404-arm64.json`; `internal/imagesource` fetches and verifies; `internal/runnerrelease` knows which `actions/runner` is installed and how close to refusal it is. `docs/reference/decisions/adr-005-runner-image-parity.md` records what parity costs.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -20,7 +20,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The nspawn driver proves what it stops, three ways, before the workspace is touched.**
 - **The published image leaves out what billet may not redistribute, and carries what completes it (#584).**
 - **The build runs on a fleet tier, not a hosted runner.**
-- **The build job checks out the release the stable channel names, never `main`.**
+- **The build legs check out the release the stable channel names, never `main`.**
 - **The guest carries billet itself, for the build caches (#226).**
 
 ### The kernel and the gates: [references/kernel-and-gates.md](references/kernel-and-gates.md)
@@ -40,6 +40,9 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The manifest is the only thing that needs signing, and it is verified before it is parsed.**
 - **Manifest schema 2 splits the rootfs into ordered parts, and the reader shipped before the writer.**
 - **A reader reads the manifest named for its machine, and the channel's list of architectures is final (ADR-022).**
+- **One workflow run builds both machines, and x86_64 gates the release (ADR-022).**
+- **A failed arm64 build carries its last good image forward, and only on proof (ADR-022).**
+- **The channel lists what the release carries, read from what the release carries.**
 - **A verification acts as the probe's holder only while its lock's name still leads to the file it locked.**
 - **A tier says `@verified` or an exact generation, never a bare name.**
 - **A generation records its machine, an image holds one, and nothing resolves to another's (ADR-022).**

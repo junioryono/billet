@@ -644,10 +644,15 @@ func (s *CacheService) releaseCASVolume(
 	}
 	defer hv.io.Unlock()
 
+	// UNMOUNTED WHATEVER THE RECORD SAYS. Mounted false is what the node believes,
+	// not what the kernel holds: a mount whose command was killed can have finished
+	// mounting, and the discard after it then cannot unmap a device still mounted
+	// here, so it retried every half minute for hours (2026-11-06). Unmount asks the
+	// kernel, and leaves alone what is not mounted.
+	if err := s.actionIO.Unmount(ctx, s.casMountPath(session, hv.Kind)); err != nil {
+		return false, fmt.Errorf("unmount the %s cache: %w", hv.Kind, err)
+	}
 	if hv.Mounted {
-		if err := s.actionIO.Unmount(ctx, s.casMountPath(session, hv.Kind)); err != nil {
-			return false, fmt.Errorf("unmount the %s cache: %w", hv.Kind, err)
-		}
 		hv.Mounted = false
 		if err := s.persistSession(session); err != nil {
 			return false, err

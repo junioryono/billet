@@ -262,6 +262,29 @@ linters:
               desc: "A provider must not import the node runtime that drives it."
             - pkg: "github.com/junioryono/billet/cmd"
               desc: "Providers must not import cmd/."
+            - pkg: "github.com/junioryono/billet/internal/hostsource"
+              desc: "A host source may use a provider's client; a provider never reaches up to a host source."
+
+        # A host source rents the machine a node runs on (ADR-030). It answers the
+        # pool and nothing above it, and it writes no ledger: the pool reads what a
+        # release needs and hands the source a proof.
+        hostsource:
+          list-mode: lax
+          files:
+            - "${config-path}/internal/hostsource/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/server"
+              desc: "A host source is a lower layer than the scheduler."
+            - pkg: "github.com/junioryono/billet/internal/node"
+              desc: "A host source must not import the node runtime it hosts, nor (by prefix) either half of the node wire."
+            - pkg: "github.com/junioryono/billet/internal/state"
+              desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
+            - pkg: "github.com/junioryono/billet/internal/alloc"
+              desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
+            - pkg: "github.com/junioryono/billet/internal/rollout"
+              desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
+            - pkg: "github.com/junioryono/billet/cmd"
+              desc: "Host sources must not import cmd/."
 
         # The storage layer is a leaf too.
         store:
@@ -395,6 +418,16 @@ linters:
           list-mode: strict
           files:
             - "${config-path}/internal/imageaccept/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/durablefile$
+            - github.com/junioryono/billet/internal/regularfile$
+
+        # The node's record of its macOS limit: a leaf for the same reason (ADR-021).
+        macoslimit:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/macoslimit/**"
           allow:
             - $gostd
             - github.com/junioryono/billet/internal/durablefile$
@@ -771,6 +804,8 @@ linters:
               desc: "The ledger is a lower layer than compute; a provider call inside a transaction holds the single writer slot across a remote API."
             - pkg: "github.com/junioryono/billet/internal/egress"
               desc: "The ledger is a lower layer than a guest's network policy, which runs nft and opens sockets; a call inside a transaction holds the writer slot for it."
+            - pkg: "github.com/junioryono/billet/internal/hostsource"
+              desc: "A host source calls a provider's API (ADR-030): the release proof is built inside the transaction, and the source is called after it commits."
             - pkg: "github.com/junioryono/billet/internal/store"
               desc: "The ledger is a lower layer than site storage; an rbd call inside a transaction holds the single writer slot."
             - pkg: "github.com/junioryono/billet/internal/tokenbroker"

@@ -58,6 +58,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A guest reaches its build caches through a relay that waits out a node restart (#374).**
 - **What each build cache did is observed like the image store.**
 - **The sticky-disk action adds the guest's system bundle to what Node trusts by default, and on a contract 4 AMI it works on an EC2 guest.**
+- **A trusted-only sticky disk is published by its own commit, which says in the job's log what became of the write, and a cas loss by name.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

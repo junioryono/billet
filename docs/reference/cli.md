@@ -172,6 +172,7 @@ Manage the systemd units (Linux) or launch agents (macOS). `status` reports what
 | `--timeout` | down, uninstall | give up waiting after this long (default: wait for as long as the jobs take) |
 | `--force` | down, uninstall | stop services running a different billet build |
 | `--without-compute-proof` | down | stop once the ledger is quiet, without asking each host what it is running |
+| `--node` | down | stop this host's node alone: it drains its own jobs and exits, the control plane keeps running and admission stays as it is, and `up` starts it again ([macOS slots](../deploying/mac-tart.md#macos-slots)) |
 
 ### `billet local prepare`
 
@@ -259,8 +260,10 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 | Command | Meaning |
 |---|---|
-| `billet images refresh [--keep 3] [--dry-run]` | take up a newer published image: on a firecracker node, pull, boot-verify and promote only when the channel's image was built after the newest generation imported, then reap to `--keep` verified generations per contract; on a tart node, pull every configured image that is absent; nothing under `release.automatic: false`. What `billet-images-refresh.timer` runs daily |
+| `billet images refresh [--keep 3] [--dry-run]` | take up a newer published image: on a firecracker node, pull, boot-verify and promote only when the channel's image was built after the newest generation imported, then reap to `--keep` verified generations per contract; on a tart node, pull every image a tier names plainly that is absent, and verify each `@verified` tag that now names a new digest, whether a tier in this file names it or a job launched it or an operator verified it in the last thirty days; nothing is pulled or verified under `release.automatic: false`, and a tart node's recorded runners are asked about GitHub's window whatever it says. What `billet-images-refresh.timer` runs daily |
 | `billet images pull [<ref>] [--from <dir>] [--source <url>] [--verify] [--result-file <path>] [--allow-stale] [--kernel-dir <dir>] [--staging-dir <dir>] [--keep-staging] [--signing-identity <pattern>] [--signing-issuer <issuer>] [--skip-signature-verification] [--completion-wait <duration>]` | fetch a published guest image, verify its signature and every asset, install the components it leaves out that `images.accept` accepts (in a completion microVM, before anything is published), install the paired kernel durably, import it as a generation; on a tart node, pull the tiers' images into tart's store |
+| `billet images verify <image>[@verified] [--digest sha256:…] [--no-yield] [--untrusted]` | on a tart node: make a base VM of the image and boot a clone of it, record it once the guest's runner answered with its version, and Docker with Buildx and Compose (Linux) or `xcodebuild` (macOS) answered, and the clone is proved gone ([Run jobs on a Mac](../deploying/mac-tart.md#boot-only-what-billet-verified)). `--digest` pulls that digest rather than what the tag names now, for a registry that needs credentials or to take back one that was unpromoted. `--no-yield` keeps a macOS probe's slot when a job asks for it, and is refused unless this Mac's node is proved stopped. `--untrusted` boots the probe with the network of untrusted work, for an image a tier on the control plane boots for it and this file does not name |
+| `billet images unpromote <image>@<base>` | on a tart node: remove a record and its base, withdraw its digest and remove every other record of that digest, so a tag that still names it does not bring it back. `billet check` lists the bases |
 | `billet images verify <image>@<gen> [--wait 3m] [--record] [--allow-unpaired] [--disk SIZE]` | boot one microVM on a root disk grown as a launch grows it (the largest firecracker tier's `disk`, else 80GiB, or `--disk`) and make the guest prove it works; `--record` (default) marks it so `@verified` resolves to it |
 | `billet images compatible [--wait 3m] [--result-file]` | prove every configured image speaks this binary's guest contract. Exit 2: images need a compatible generation |
 | `billet images due [--max-age 144h]` | is the newest generation old enough to rebuild. Exit 2: nothing to do |
@@ -366,13 +369,17 @@ Remove what the record under `/run/billet-uplink/` says a `billet uplink shape` 
 
 ## Acceptance
 
-`billet acceptance` stands an isolated deployment up beside this one against a real account, runs a real job, and destroys exactly what it made. Nothing runs it on a schedule; it is run by hand, never on a pull request.
+`billet acceptance` stands an isolated deployment up beside this one against a real account, runs a real job, and destroys exactly what it made. It is never run on a pull request: by hand, or by the `aws-acceptance` workflow, which runs the matrix below weekly and on dispatch from the `acceptance` environment.
 
 | Command | Meaning |
 |---|---|
 | `billet acceptance up --config <derive-from> --workspace <dir> [--account] [--label-prefix accept] [--region]` | derive the isolated deployment from `--config` (read, never written) into a workspace this run owns entirely; `--account` is the AWS account the credential must be in, and `--region` the one `sts:GetCallerIdentity` is asked in (default the config's); a `--workspace` too long for the node's unix socket (103 bytes on macOS, 107 on Linux) is refused here, before anything exists |
 | `billet acceptance run --workspace <dir> [--jobs 1] [--wait 30m] [--no-teardown]` | run real jobs and wait for that many to reach a terminal outcome; a workspace left sealed, as `--no-teardown` leaves one, is refused before anything starts, naming `billet resume` |
 | `billet acceptance evidence --workspace <dir> [--out]` | write the run's evidence (default under the workspace) |
+| `billet acceptance matrix cells [--json]` | print the acceptance matrix (#554): every backend, architecture, cache and case, each with the workflow job that runs it and the observation it must end with, or why it is not run or not supported |
+| `billet acceptance matrix tiers --workspace <dir>` | print one `<backend> <arch> <label>` line for each combination the workspace has exactly one single-provider tier for, which is the tier a dispatcher sends that combination's workflows to |
+| `billet acceptance matrix jobs --archs <x64,arm64>` | print how many jobs one run of the matrix's workflows on those architectures waits for, which is the number its `billet acceptance run` is told to wait for |
+| `billet acceptance matrix judge --workspace <dir> [--evidence] [--out] [--archs] [--runs] [--repository]` | judge each cell from the run's evidence, reading only the jobs of the GitHub runs `--runs` names (a file of run ids, one per line) in `--repository`, so another run on the same labels never stands in for one this run did not get: a pass needs GitHub's result and the node's observation of every job of the cell to be what the cell wants; writes the verdicts (default `<workspace>/matrix.json`) with each cell's wait, run time and an instance-cost estimate, prints them, and exits 1 on any failed cell, or on any cell that should have run on an architecture named in `--archs` and did not; evidence of another deployment is refused |
 | `billet acceptance down --workspace <dir> [--wait 20m] [--keep-workspace]` | destroy exactly what the run made |
 | `billet acceptance sweep --workspace <dir>` | ask whether anything billable is left, destroying nothing |
 
