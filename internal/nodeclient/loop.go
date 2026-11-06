@@ -19,6 +19,14 @@ import (
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
+// logReadsAtOnce bounds the log reads a node serves beside its loop.
+const logReadsAtOnce = 4
+
+// LogReader is a Compute that keeps its jobs' logs.
+type LogReader interface {
+	ReadJobLog(ctx context.Context, spec nodeapi.LogReadSpec) (nodeapi.LogReadResult, error)
+}
+
 // Compute is the part of internal/node.Runner the loop drives.
 //
 // An interface so the loop can be tested without a container runtime, and so the
@@ -1328,6 +1336,9 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	// re-registration never runs beside a launch begun under the last one. The
 	// wait comes before the cancel: the other order would cancel what it waits for.
 	launches := newLaunchSet(opts.LaunchConcurrency)
+	reads := newLaunchSet(logReadsAtOnce)
+	defer reads.wait()
+
 	defer func() {
 		launches.wait()
 		stopSaying()
@@ -1456,6 +1467,23 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		run := func() error {
 			return reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd,
 				executePolled(ctx, launchCtx, &executing, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
+		}
+
+		// A LOG READ RUNS BESIDE THE LOOP ALWAYS: it touches no compute and takes no
+		// lease, and a search should not wait out a destroy or an upgrade. NOR THE LOOP
+		// FOR A READ: with every slot taken it is answered busy at once, since a destroy
+		// behind it matters more, and a reader can ask again.
+		if cmd.Kind == nodeapi.CommandReadLog {
+			if !reads.tryStart(run) {
+				err := reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd, nodeapi.CommandResult{
+					ID: cmd.ID, Error: "this node is reading as many logs as it may; ask again",
+				})
+				if err != nil {
+					return err
+				}
+			}
+
+			continue
 		}
 
 		// A LAUNCH RUNS BESIDE THE LOOP when the provider allows it, and the poll
@@ -1805,6 +1833,28 @@ func execute(
 		}
 
 		res.OK = true
+
+		return res
+
+	case nodeapi.CommandReadLog:
+		// A NODE THAT KEEPS NO LOGS ANSWERS THAT IT HOLDS NOTHING: an error would read as
+		// could-not-tell, and asking again would change nothing.
+		res.OK = true
+		res.Log = &nodeapi.LogReadResult{}
+
+		reader, ok := compute.(LogReader)
+		if !ok || cmd.LogRead == nil {
+			return res
+		}
+
+		log, err := reader.ReadJobLog(ctx, *cmd.LogRead)
+		if err != nil {
+			res.OK, res.Log, res.Error = false, nil, err.Error()
+
+			return res
+		}
+
+		res.Log = &log
 
 		return res
 

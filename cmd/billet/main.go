@@ -22,6 +22,7 @@ import (
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	opsimages "github.com/junioryono/billet/internal/ops/images"
+	"github.com/junioryono/billet/internal/ops/logs"
 
 	"github.com/junioryono/billet/internal/ops/cache"
 
@@ -63,6 +64,8 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: fleetops.Jobs},
 		{Name: "tests", Summary: "rank the tests jobs reported: the slowest, the most often failing and the flaky",
 			Run: fleetops.Tests},
+		{Name: "logs", Summary: "search what jobs wrote to their logs, across every job",
+			Run: logs.Run},
 		{Name: "usage", Summary: "export what each finished lease was charged, for a billing system",
 			Run: fleetops.Usage},
 		{Name: "alerts", Summary: "show what the alert rules have done, mute or unmute one, or send a destination a test notice",
