@@ -95,7 +95,7 @@ is_replay_input() {
 		internal/endpoint/* | internal/fakeactions/* | internal/flightrecorder/* | internal/github/* | internal/guestassets/* | \
 		internal/guestreport/* | \
 		internal/egress/* | internal/hostauthority/* | internal/hostsource/* | internal/imageaccept/* | internal/jobtrace/* | internal/lifeops/* | \
-		internal/importcheck/* | internal/lease/* | internal/metrics/* | \
+		internal/importcheck/* | internal/lease/* | internal/macoslimit/* | internal/metrics/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeending/* | internal/nodeplane/* | \
 		internal/pool/* | internal/power/* | internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
 		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \

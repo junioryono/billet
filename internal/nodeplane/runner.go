@@ -99,6 +99,15 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 			ErrNoNode, lease.ID, n.name, wire, nodeapi.VersionWindowsGuests)
 	}
 
+	// NOR A TART IMAGE NAMING `@verified`, which an older node hands to `tart fqn` as a
+	// name and fails every launch of (ADR-021).
+	tartVerified := tartTierNamesVerified(tier, selectedProvider)
+	if tartVerified && wire < nodeapi.VersionTartVerified {
+		return fmt.Errorf("%w: tier %s boots a verified Tart image, which node %s cannot read: it "+
+			"speaks wire %d and that needs %d, so upgrade the node",
+			ErrNoNode, tier.Label, n.name, wire, nodeapi.VersionTartVerified)
+	}
+
 	if tier.NeedsCacheAwareNode() && wire < nodeapi.VersionCacheAuthority {
 		return fmt.Errorf("%w: tier %s configures its caches, which node %s cannot honour: it "+
 			"speaks wire %d and a cache block needs %d, so upgrade the node",
@@ -151,6 +160,10 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 
 	if lease.GuestOS == config.GuestWindows {
 		pend.minWire = max(pend.minWire, nodeapi.VersionWindowsGuests)
+	}
+
+	if tartVerified {
+		pend.minWire = max(pend.minWire, nodeapi.VersionTartVerified)
 	}
 
 	res, err := r.plane.dispatch(ctx, n, pend)
@@ -931,4 +944,10 @@ func WireCacheAuthority(a dispatch.CacheAuthority) *nodeapi.CacheAuthority {
 		DefaultRef: a.DefaultRef, Proven: a.Proven, WriteOwnRef: a.WriteOwnRef,
 		PublishDefault: a.PublishDefault,
 	}
+}
+
+// tartTierNamesVerified reports whether a launch on this backend boots a Tart image
+// named `@verified`. On any other backend the same spelling means something else.
+func tartTierNamesVerified(tier config.Tier, selected config.ProviderKind) bool {
+	return selected == config.ProviderTart && tier.NamesTartVerified()
 }
