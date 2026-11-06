@@ -40,8 +40,10 @@ type rerunGitHub struct {
 	// reset when it is refilled, an hour from the wall clock when zero.
 	remaining, limit int64
 	reset            time.Time
-	// onAsk runs inside a request, for a run whose state a request changes.
-	onAsk func(*rerunGitHub)
+	// onAsk runs inside a request, for a run whose state a request changes, and onRead
+	// inside a read, for time a read takes.
+	onAsk  func(*rerunGitHub)
+	onRead func()
 }
 
 func (g *rerunGitHub) LatestAttempt(_ context.Context, owner, repository string, runID int64) (RunAttempt, error) {
@@ -50,6 +52,9 @@ func (g *rerunGitHub) LatestAttempt(_ context.Context, owner, repository string,
 
 	g.reads++
 	g.readRuns = append(g.readRuns, runID)
+	if g.onRead != nil {
+		g.onRead()
+	}
 	if owner != "acme" || repository != "api" {
 		return RunAttempt{}, fmt.Errorf("read %s/%s", owner, repository)
 	}
@@ -1492,8 +1497,8 @@ func TestARunThatCannotBeReadHoldsARequestOnlyUntilTheWindow(t *testing.T) {
 }
 
 // AN INSTALLATION THAT REFUSES EVERY READ HOLDS A REQUEST IN DOUBT ONLY UNTIL TWICE THE
-// WINDOW: a refusal may pass, so a day is not enough, and two are. An installation
-// paused at that moment is not read, and its request is settled without a read.
+// WINDOW: a refusal may pass, so a day is not enough, and two are. The refused read
+// past two days settles it, and still pauses the installation.
 func TestARefusedInstallationHoldsARequestOnlyUntilTwiceTheWindow(t *testing.T) {
 	t.Parallel()
 
@@ -1511,15 +1516,17 @@ func TestARefusedInstallationHoldsARequestOnlyUntilTwiceTheWindow(t *testing.T) 
 	}
 
 	r.after(rerunWindow)
-	r.sweep.paused[installationOf(r.targets[rerunTier])] = r.now.Add(time.Hour)
 	reads := r.reads()
 	r.pass()
 
 	if got := r.decision("lost"); got != alloc.RerunUnconfirmed {
 		t.Errorf("past twice the window = %q", got)
 	}
-	if got := r.reads(); got != reads {
-		t.Errorf("read GitHub %d times to settle it", got-reads)
+	if got := r.reads(); got != reads+1 {
+		t.Errorf("read GitHub %d times, want the refused read that settles it", got-reads)
+	}
+	if paused := r.sweep.paused[installationOf(r.targets[rerunTier])]; !paused.After(r.now) {
+		t.Errorf("the installation is paused until %v, at %v", paused, r.now)
 	}
 	if r.github.asked() != 0 {
 		t.Error("sent")
@@ -1545,7 +1552,8 @@ func TestAnOverdueRequestThePassCannotReadIsSettledWithoutARead(t *testing.T) {
 			r.github.remaining, r.github.limit, r.github.reset = 100, 5000, r.now.Add(time.Hour)
 		}},
 		{"its run waits between failed reads", func(r *rerunStack) {
-			r.sweep.retries[rerunRun{repository: "acme/api", run: 31}] = queueTimeRetry{after: r.now.Add(time.Hour)}
+			r.sweep.retries[rerunRun{repository: "acme/api", run: 31}] = queueTimeRetry{wait: rerunRetryMost,
+				after: r.now.Add(rerunRetryMost)}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1631,6 +1639,11 @@ func TestAnOverdueRequestOutOfTheShareIsReadInItsTurn(t *testing.T) {
 	}
 	if got := r.reads(); got != len(leases) {
 		t.Errorf("%d reads, want one a run", got)
+	}
+	for i := range leases {
+		if used, err := r.a.RunReruns(t.Context(), "acme/api", int64(31+i)); err != nil || used != 0 {
+			t.Errorf("run %d counted %d (%v)", 31+i, used, err)
+		}
 	}
 	if r.github.asked() != 0 {
 		t.Error("sent")
@@ -1741,10 +1754,11 @@ func TestTheWindowIsCheckedAfterTheRead(t *testing.T) {
 	}
 	r.lists(1)
 
-	// THE PASS BEGAN TWO HOURS AGO ON THE WALL CLOCK, an hour short of the window by
-	// its own reckoning.
+	// THE READ TAKES TWO HOURS, and the request is an hour short of the window when it
+	// begins.
 	r.after(rerunWindow - time.Hour)
-	r.sweep.began = time.Now().Add(-2 * time.Hour)
+	r.sweep.began = time.Now()
+	r.github.onRead = func() { r.sweep.began = r.sweep.began.Add(-2 * time.Hour) }
 	w := rerunWork{run: rerunRun{repository: "acme/api", run: 31}, target: "default", installation: "i",
 		client: r.github}
 	if err := r.s.decideRerun(t.Context(), &w, r.limits, r.sweep, r.now); err != nil {
@@ -1771,7 +1785,9 @@ func TestAFreshJobIsCheckedAgainstTheWindowAfterTheRead(t *testing.T) {
 	r.job("young", 31, 10*time.Minute)
 	r.lists(1, listed("lost", 77, true), listed("young", 88, true))
 
-	r.sweep.began = time.Now().Add(-2 * time.Hour)
+	// THE READ TAKES TWO HOURS.
+	r.sweep.began = time.Now()
+	r.github.onRead = func() { r.sweep.began = r.sweep.began.Add(-2 * time.Hour) }
 	w := rerunWork{run: rerunRun{repository: "acme/api", run: 31}, target: "default", installation: "i",
 		client: r.github}
 	if err := r.s.decideRerun(t.Context(), &w, r.limits, r.sweep, r.now); err != nil {
@@ -1795,8 +1811,9 @@ func TestALateJobTakesTheStoredAnswer(t *testing.T) {
 	t.Parallel()
 
 	r := newRerunStack(t)
+	r.job("first", 31, 20*time.Minute)
 	request := alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1, Kind: alloc.RerunFailedJobs}
-	if err := r.a.BeginRerun(t.Context(), request, nil); err != nil {
+	if err := r.a.BeginRerun(t.Context(), request, []string{"first"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.a.SettleRerun(t.Context(), request, alloc.RerunLimit, "lowered"); err != nil {
@@ -1810,6 +1827,24 @@ func TestALateJobTakesTheStoredAnswer(t *testing.T) {
 
 	if got := r.decision("late"); got != alloc.RerunLimit {
 		t.Errorf("decision = %q", got)
+	}
+	if got := r.decision("first"); got != alloc.RerunLimit {
+		t.Errorf("the job the request covered = %q", got)
+	}
+}
+
+// EVERY PASS STARTS ITS OWN CLOCK: the deadline after a read is measured from when this
+// pass began, never from an earlier one, which would carry a long-running control plane
+// past every window.
+func TestEveryPassStartsItsOwnClock(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.sweep.began = time.Now().Add(-48 * time.Hour)
+	r.pass()
+
+	if since := time.Since(r.sweep.began); since > time.Minute {
+		t.Errorf("the pass measures from %v ago", since)
 	}
 }
 
