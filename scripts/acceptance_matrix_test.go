@@ -886,7 +886,7 @@ func TestTheMatrixRunOutlivesItsSupervisorsOutput(t *testing.T) {
 // only the supervisor, which sends it on once through the gate.
 func TestAGroupSignalReachesTheRunOnce(t *testing.T) {
 	t.Parallel()
-	f := newMatrixFakes(t, "python3")
+	f := newMatrixFakes(t, "python3", "ps")
 	f.command(t, "billet", fakeBillet)
 	f.fixture(t, "run-waits", "")
 	dir := hostRunDir(t, f)
@@ -931,8 +931,11 @@ func TestAGroupSignalReachesTheRunOnce(t *testing.T) {
 	}
 	// AND IT WAS IN NO GROUP THE SIGNAL WENT TO, which is what keeps it to one: two
 	// TERMs to one process can merge, and so cannot be counted at the receiver.
-	if b, err := os.ReadFile(filepath.Join(f.dir, "pgid")); err != nil ||
-		strings.TrimSpace(string(b)) == strconv.Itoa(run.Process.Pid) || strings.TrimSpace(string(b)) == "" {
-		t.Fatalf("the run's process group is %q (%v), the supervisor's %d: the group's signal reached it", b, err, run.Process.Pid)
+	b, err := os.ReadFile(filepath.Join(f.dir, "pgid"))
+	switch pgid := strings.TrimSpace(string(b)); {
+	case err != nil || pgid == "":
+		t.Fatalf("the fake run could not say its process group (%q, %v)", b, err)
+	case pgid == strconv.Itoa(run.Process.Pid):
+		t.Fatalf("the run is in its supervisor's process group %s: the group's signal reached it", pgid)
 	}
 }

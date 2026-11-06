@@ -95,6 +95,20 @@ jobs:
           # LONGER THAN THE RUN: the host's run may wait 150 minutes, and polling SSM
           # after the session ended would leave the host running.
           role-duration-seconds: 18000
+      - name: No earlier run was left for a person
+        run: |
+          set -euo pipefail
+          # A RUN LEFT TO FINISH ITS TEARDOWN HOLDS THE HOST: a second run beside it
+          # would share its node and could stop the host under it. A person who has
+          # finished it deletes /billet-acceptance/held.
+          if held=$(aws ssm get-parameter --name /billet-acceptance/held --query Parameter.Value --output text 2>&1); then
+            echo "run $held was left for a person to finish its teardown on $HOST; delete /billet-acceptance/held once it is" >&2
+            exit 1
+          fi
+          case "$held" in
+          *ParameterNotFound*) ;;
+          *) echo "could not tell whether an earlier run holds the host: $held" >&2; exit 1 ;;
+          esac
       - name: Send this run's binary and scripts
         run: |
           set -euo pipefail
@@ -311,6 +325,10 @@ jobs:
             echo "left for a person to finish the teardown in $RUN_DIR on $HOST, which is left running:" >&2
             echo "  the policy billet-matrix-$RUN on $HOST_ROLE, /srv/billet-accept/app.pem on the host," >&2
             echo "  and the parameter /billet-acceptance/runs/$RUN/app-key" >&2
+            # AND THE HOST IS HELD, so no later run starts beside this one.
+            if ! aws ssm put-parameter --name /billet-acceptance/held --type String --value "$RUN" --overwrite >/dev/null; then
+              echo "could not mark the host held; a later run could start beside this one" >&2
+            fi
             exit "$status"
           fi
           gone "the run's node policy" NoSuchEntity \
