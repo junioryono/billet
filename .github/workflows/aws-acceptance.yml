@@ -1,0 +1,213 @@
+name: aws-acceptance
+# billet's acceptance matrix on AWS (#554): a deployment built from this commit, stood up
+# beside the acceptance host's node, runs every cell the matrix declares on per-job EC2,
+# and `billet acceptance matrix judge` judges each from the ledger. Any failed cell, or any
+# cell that should have run on an architecture this run covered and did not, fails the run.
+#
+# What it needs lives in the `acceptance` environment, which only main and the release
+# branches may use, and nothing here names the account:
+#   secrets ACCEPTANCE_ROLE_ARN    the role this job assumes through GitHub's OIDC provider
+#           ACCEPTANCE_ACCOUNT     the account that role is in, asserted by `acceptance up`
+#           ACCEPTANCE_APP_KEY     the acceptance App's private key: the App the deployment runs
+#                                  with, holding exactly what billet requests
+#           ACCEPTANCE_DISPATCH_KEY the dispatch App's private key: a second App, installed on
+#                                  ACCEPTANCE_REPO alone with contents: read and actions: write,
+#                                  because `billet check` refuses a runner App that holds a
+#                                  permission billet never requested (2026-09-04)
+#   vars    ACCEPTANCE_DISPATCH_APP_ID the dispatch App's id
+#           ACCEPTANCE_REPO        the repository the acceptance App serves, holding the matrix's
+#                                  workflows; the runner group the base config's tiers use must
+#                                  admit it, or every job waits unrouted (2026-09-04)
+#           ACCEPTANCE_REGION      the region of everything below
+#           ACCEPTANCE_HOST        the acceptance host's instance id
+#           ACCEPTANCE_HOST_ROLE   the host's role name, which each run's node policy is put on
+#           ACCEPTANCE_KMS_KEY_ARN the site store's key
+#           ACCEPTANCE_BUCKET      the bucket a run's binary and evidence travel through
+# The host is prepared once (docs/reference/records/aws-acceptance.md says how): a base
+# config at /srv/billet-accept/base.yaml whose App key path is /srv/billet-accept/app.pem,
+# which each run writes and removes.
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: the architectures to cover, comma-separated
+        required: false
+        default: x64
+  schedule:
+    - cron: "17 9 * * 1"
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: aws-acceptance
+  cancel-in-progress: false
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04
+    environment: acceptance
+    timeout-minutes: 300
+    env:
+      ARCHS: ${{ inputs.archs || 'x64' }}
+      RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+      AWS_REGION: ${{ vars.ACCEPTANCE_REGION }}
+      HOST: ${{ vars.ACCEPTANCE_HOST }}
+      REPO: ${{ vars.ACCEPTANCE_REPO }}
+      BUCKET: ${{ vars.ACCEPTANCE_BUCKET }}
+      HOST_ROLE: ${{ vars.ACCEPTANCE_HOST_ROLE }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build billet for the host
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/billet ./cmd/billet
+      - id: repo
+        name: Name the repository the App serves
+        run: |
+          set -eu
+          case "$REPO" in
+          */*) ;;
+          *) echo "ACCEPTANCE_REPO is \"$REPO\", not owner/name" >&2; exit 1 ;;
+          esac
+          echo "owner=${REPO%%/*}" >>"$GITHUB_OUTPUT"
+          echo "name=${REPO#*/}" >>"$GITHUB_OUTPUT"
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: The repository runs the workflows this commit reviewed
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: scripts/acceptance/matrix-workflows-match.sh "$REPO"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ACCEPTANCE_ROLE_ARN }}
+          aws-region: ${{ vars.ACCEPTANCE_REGION }}
+          role-session-name: billet-acceptance-${{ github.run_id }}
+      - name: Send this run's binary and scripts
+        run: |
+          set -eu
+          for f in dist/billet scripts/acceptance/matrix-host.sh; do
+            aws s3 cp --only-show-errors "$f" "s3://$BUCKET/runs/$RUN/$(basename "$f")"
+          done
+      - name: Hand the host the App's key through Parameter Store
+        env:
+          KEY: ${{ secrets.ACCEPTANCE_APP_KEY }}
+        run: |
+          set -eu
+          umask 077
+          key=$(mktemp)
+          printf '%s\n' "$KEY" >"$key"
+          aws ssm put-parameter --name "/billet-acceptance/runs/$RUN/app-key" --type SecureString \
+            --value "file://$key" --no-overwrite >/dev/null
+          rm -f "$key"
+      - name: Start the acceptance host
+        run: |
+          set -eu
+          aws ec2 start-instances --instance-ids "$HOST" >/dev/null
+          aws ec2 wait instance-running --instance-ids "$HOST"
+          for _ in $(seq 60); do
+            ping=$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$HOST" \
+              --query 'InstanceInformationList[0].PingStatus' --output text)
+            if [ "$ping" = Online ]; then exit 0; fi
+            sleep 10
+          done
+          echo "the host's SSM agent never came online" >&2
+          exit 1
+      - name: Stand the deployment up
+        env:
+          ACCOUNT: ${{ secrets.ACCEPTANCE_ACCOUNT }}
+          KMS_KEY_ARN: ${{ vars.ACCEPTANCE_KMS_KEY_ARN }}
+        run: |
+          set -eu
+          account=$ACCOUNT
+          role_arn="arn:aws:iam::$account:role/$HOST_ROLE"
+          d=/srv/billet-accept/runs/$RUN
+          scripts/acceptance/ssm-run.sh "$HOST" 900 "set -eu
+          mkdir -p $d
+          aws s3 cp --only-show-errors s3://$BUCKET/runs/$RUN/billet $d/billet
+          aws s3 cp --only-show-errors s3://$BUCKET/runs/$RUN/matrix-host.sh $d/matrix-host.sh
+          chmod 0755 $d/billet
+          (umask 077; aws ssm get-parameter --name /billet-acceptance/runs/$RUN/app-key --with-decryption \
+            --query Parameter.Value --output text >/srv/billet-accept/app.pem)
+          chown -R ubuntu: $d /srv/billet-accept/app.pem
+          runuser -u ubuntu -- bash $d/matrix-host.sh prepare $d /srv/billet-accept/base.yaml $account $role_arn $KMS_KEY_ARN
+          for f in tiers deployment iam.json; do aws s3 cp --only-show-errors $d/\$f s3://$BUCKET/runs/$RUN/\$f; done"
+          mkdir -p out
+          for f in tiers deployment iam.json; do
+            aws s3 cp --only-show-errors "s3://$BUCKET/runs/$RUN/$f" "out/$f"
+          done
+      - name: Grant the node its policy, scoped to this run's deployment
+        run: |
+          set -eu
+          aws iam put-role-policy --role-name "$HOST_ROLE" \
+            --policy-name "billet-matrix-$RUN" --policy-document file://out/iam.json
+          # IAM is eventually consistent: a grant can take seconds to reach EC2's checks.
+          sleep 20
+      - name: Run the matrix
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -eu
+          d=/srv/billet-accept/runs/$RUN
+          jobs=$(dist/billet acceptance matrix jobs --archs "$ARCHS")
+          labels=()
+          for arch in ${ARCHS//,/ }; do
+            label=$(awk -v a="$arch" '$1 == "ec2" && $2 == a { print $3 }' out/tiers)
+            if [ -z "$label" ]; then
+              echo "the deployment has no ec2 $arch tier for the matrix" >&2
+              exit 1
+            fi
+            labels+=("$label")
+          done
+          scripts/acceptance/ssm-run.sh "$HOST" 10800 "runuser -u ubuntu -- bash $d/matrix-host.sh run $d $jobs $ARCHS
+          status=\$?
+          aws s3 cp --only-show-errors --recursive $d/out s3://$BUCKET/runs/$RUN/out
+          exit \$status" >out/host.log 2>&1 &
+          host=$!
+          # DISPATCHED AT ONCE, though the deployment's scale sets exist only once its
+          # server has started: a job queued on a label before its scale set existed was
+          # assigned when the control plane came up (2026-09-04, aws-acceptance.md).
+          dispatched=0
+          scripts/acceptance/matrix-dispatch.sh "$REPO" "$RUN" "${labels[@]}" || dispatched=$?
+          ran=0
+          wait "$host" || ran=$?
+          cat out/host.log
+          if [ "$dispatched" -ne 0 ]; then echo "the dispatch failed with $dispatched" >&2; fi
+          if [ "$ran" -ne 0 ]; then echo "the host's run or judge failed with $ran" >&2; exit "$ran"; fi
+          exit "$dispatched"
+      - name: Bring the verdicts back
+        if: always()
+        run: |
+          mkdir -p out
+          aws s3 cp --only-show-errors --recursive "s3://$BUCKET/runs/$RUN/out" out/ || true
+          if [ -f out/matrix.txt ]; then
+            { echo '## Acceptance matrix'; echo; echo '```'; cat out/matrix.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: acceptance-matrix-${{ github.run_id }}
+          path: |
+            out/matrix.json
+            out/matrix.txt
+            out/evidence.json
+            out/host.log
+          if-no-files-found: ignore
+      - name: Take everything down
+        if: always()
+        run: |
+          d=/srv/billet-accept/runs/$RUN
+          status=0
+          scripts/acceptance/ssm-run.sh "$HOST" 2400 "runuser -u ubuntu -- bash $d/matrix-host.sh down $d
+          down=\$?
+          rm -f /srv/billet-accept/app.pem
+          exit \$down" || status=$?
+          aws iam delete-role-policy --role-name "$HOST_ROLE" \
+            --policy-name "billet-matrix-$RUN" 2>/dev/null || true
+          aws ssm delete-parameter --name "/billet-acceptance/runs/$RUN/app-key" 2>/dev/null || true
+          aws ec2 stop-instances --instance-ids "$HOST" >/dev/null || status=1
+          exit "$status"

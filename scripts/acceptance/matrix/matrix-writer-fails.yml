@@ -1,0 +1,76 @@
+name: matrix-writer-fails
+# billet's acceptance matrix (#554), a sticky-disk writer that fails after writing. A
+# seed publishes a generation; a writer clones it, writes, and fails; a reader then finds
+# the seed's generation and nothing the failed writer wrote. The reader is the matrix's
+# cell; cmd/billet/acceptancematrix.go judges it by name.
+#
+# This file is copied from billet's scripts/acceptance/matrix into the repository the
+# acceptance App serves, and the run refuses a copy that differs.
+run-name: matrix-writer-fails ${{ inputs.runs_on }} ${{ inputs.tag }}
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: the acceptance tier's label
+        required: true
+      tag:
+        description: what makes this run's keys its own
+        required: true
+permissions:
+  contents: read
+jobs:
+  seed:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    steps:
+      - uses: junioryono/billet/actions/stickydisk@main
+        with:
+          key: ${{ github.repository }}-matrix-fails-${{ inputs.tag }}
+          path: /mnt/matrix
+          size-gb: "5"
+      - env:
+          TAG: ${{ inputs.tag }}
+        run: echo "seed-$TAG" | sudo tee /mnt/matrix/marker
+  failer:
+    needs: seed
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    steps:
+      - name: Let the seed's publication land
+        run: sleep 120
+      - uses: junioryono/billet/actions/stickydisk@main
+        with:
+          key: ${{ github.repository }}-matrix-fails-${{ inputs.tag }}
+          path: /mnt/matrix
+          size-gb: "5"
+      - name: Write, then fail
+        run: |
+          echo failed | sudo tee /mnt/matrix/failed-writer
+          sync
+          exit 1
+  reader:
+    needs: failer
+    if: ${{ always() && needs.failer.result == 'failure' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    steps:
+      - name: Wait out any publication the failed writer could have made
+        run: sleep 120
+      - id: disk
+        uses: junioryono/billet/actions/stickydisk@main
+        with:
+          key: ${{ github.repository }}-matrix-fails-${{ inputs.tag }}
+          path: /mnt/matrix
+          size-gb: "5"
+      - name: The seed's generation, and nothing of the failed writer's
+        env:
+          HIT: ${{ steps.disk.outputs.cache-hit }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          test "$HIT" = true
+          test "$(cat /mnt/matrix/marker)" = "seed-$TAG"
+          if [ -e /mnt/matrix/failed-writer ]; then
+            echo "MATRIX a failed writer's file reached the generation" >&2
+            exit 1
+          fi
