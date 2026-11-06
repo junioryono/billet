@@ -607,19 +607,7 @@ func noTier(current *config.Tier, none string) string {
 // trusted, allows the workflow, or its runner group would refuse the job a
 // recommendation moved there.
 func sameFamily(current, other *config.Tier, workflow string) bool {
-	if !current.SameFamily(*other) || current.Platform().Arch == "" {
-		return false
-	}
-
-	if other.Trust.Effective() != config.WorkloadTrusted {
-		return true
-	}
-
-	return slices.ContainsFunc(other.Workflows, func(allowed string) bool {
-		path, _, _ := strings.Cut(allowed, "@")
-
-		return path == workflow
-	})
+	return current.SameFamily(*other) && current.Platform().Arch != "" && other.AllowsWorkflow(workflow)
 }
 
 // smallestOf is the smallest of the family that fits, by vCPU, then memory, then
@@ -796,7 +784,7 @@ type rightsizeJobJSON struct {
 	CPUBusyP90  *float64 `json:"cpu_busy_p90"`
 	CPUCoresP90 *float64 `json:"cpu_cores_p90"`
 	// GuestMemoryP95 is what the job's own VM reported, which it could have changed,
-	// and MemorySource which side a smaller recommendation's memory rests on: "host",
+	// and MemorySource which side a memory-based recommendation rests on: "host",
 	// "guest", or empty for one that rests on neither.
 	GuestMemoryP95    *float64 `json:"guest_reported_memory_p95_fraction"`
 	MemorySource      string   `json:"memory_source"`

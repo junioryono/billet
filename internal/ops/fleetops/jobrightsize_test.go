@@ -432,6 +432,13 @@ func TestARecommendationStaysInTheTiersFamily(t *testing.T) {
 	if got.Recommended == nil || got.Recommended.Label != "small" {
 		t.Errorf("a trusted tier allowing the workflow at another ref was not recommended: %+v", got.Recommended)
 	}
+	// THE ONE RULE migrate workflows checks a move by (config.Tier.AllowsWorkflow): the
+	// repository as GitHub names it, in any case.
+	got = rightsizeOne(t, idle, []config.Tier{trusted("t4", 4, 16*gb, allowed),
+		trusted("small", 2, 8*gb, "ACME/Api/.github/workflows/ci.yml@refs/heads/main")})
+	if got.Recommended == nil || got.Recommended.Label != "small" {
+		t.Errorf("a trusted tier listing the repository in another case was not recommended: %+v", got.Recommended)
+	}
 }
 
 // THE THRESHOLDS ARE STATED IN THE OUTPUT, EVERY NAME IS QUOTED, A FIGURE THE VM GAVE

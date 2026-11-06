@@ -159,27 +159,34 @@ func originRepository(ctx context.Context, path string) (string, error) {
 	return repository, nil
 }
 
-// pushOwner is the owner of the repository origin pushes to, which the pull request's
-// head names: THE URL GIT WILL PUSH TO, after every rewrite rule, since a rule can name
-// another repository as well as another way to reach one. A push to a path on this
-// machine names no owner, and only then is the configured URL the answer (its push
+// pushTarget is where origin pushes: the repository, owner/name, whose owner the pull
+// request's head names, and the destination git resolved. Two readings are the same
+// push only when both are the same, since a push to a path on this machine takes its
+// repository from the configured URL.
+//
+// THE REPOSITORY IS THE URL GIT WILL PUSH TO, after every rewrite rule, since a rule
+// can name another repository as well as another way to reach one. A push to a path
+// on this machine names none, and only then is the configured URL the answer (its push
 // URL, else its URL). More than one destination is a push to several, which one head
 // cannot name, and a destination naming no owner/name is refused.
-func pushOwner(ctx context.Context, path string) (string, error) {
-	owner, _, err := pushTarget(ctx, path)
-
-	return owner, err
+type pushTarget struct {
+	repository, destination string
 }
 
-// pushTarget is pushOwner's owner and the destination git resolved. Two readings are
-// the same push only when both are the same: one owner holds many repositories, and a
-// push to a path on this machine takes its owner from the configured URL.
-func pushTarget(ctx context.Context, path string) (string, string, error) {
+// owner is the head's owner.
+func (p pushTarget) owner() string {
+	owner, _, _ := config.SplitRepository(p.repository)
+
+	return owner
+}
+
+// readPushTarget reads where origin pushes now.
+func readPushTarget(ctx context.Context, path string) (pushTarget, error) {
 	pushes, err := runGit(ctx, path, "remote", "get-url", "--push", "--all", "origin")
 	destinations := gitLines(pushes)
 	if err != nil || len(destinations) != 1 {
-		return "", "", errors.New("billet migrate workflows: --open-pr pushes to origin, and origin has no one URL to " +
-			"push to; nothing was changed")
+		return pushTarget{}, errors.New("billet migrate workflows: --open-pr pushes to origin, and origin has no one " +
+			"URL to push to; nothing was changed")
 	}
 
 	remote := destinations[0]
@@ -194,12 +201,11 @@ func pushTarget(ctx context.Context, path string) (string, string, error) {
 	}
 	repository, ok := repositoryOfRemote(remote)
 	if !ok {
-		return "", "", errors.New("billet migrate workflows: --open-pr pushes to origin, and where it pushes names no " +
-			"owner/name; nothing was changed")
+		return pushTarget{}, errors.New("billet migrate workflows: --open-pr pushes to origin, and where it pushes " +
+			"names no owner/name; nothing was changed")
 	}
-	owner, _, _ := config.SplitRepository(repository)
 
-	return owner, destinations[0], nil
+	return pushTarget{repository: repository, destination: destinations[0]}, nil
 }
 
 // gitLines is git's output one value to a line, each kept whole: a path can hold a
@@ -394,7 +400,7 @@ func (c *tierChooser) smallestFor(hosted hostedLabel, workflowFile string) (*con
 			tooSmall++
 
 			continue
-		case !allowsWorkflow(t, c.repository, workflowFile):
+		case !t.AllowsWorkflow(c.repository + "/" + workflowFile):
 			disallowed++
 
 			continue
@@ -426,26 +432,6 @@ func (c *tierChooser) smallestFor(hosted hostedLabel, workflowFile string) (*con
 	default:
 		return nil, fmt.Sprintf("no tier of guest OS %s runs on %s", hosted.OS, hosted.Arch)
 	}
-}
-
-// allowsWorkflow says a tier will take a job of this workflow. An untrusted tier takes
-// any. A trusted one lists the workflows its runner group admits, and a job moved
-// there without being listed would queue forever; the ref in the list is GitHub's to
-// judge, so only the file is compared.
-func allowsWorkflow(t *config.Tier, repository, workflowFile string) bool {
-	if t.Trust.Effective() != config.WorkloadTrusted {
-		return true
-	}
-
-	// THE REPOSITORY IS COMPARED WITHOUT CASE, AS GITHUB NAMES IT, AND THE FILE WITH:
-	// ci.yml and CI.yml are two files a repository can hold.
-	return slices.ContainsFunc(t.Workflows, func(allowed string) bool {
-		path, _, _ := strings.Cut(allowed, "@")
-		owner, rest, _ := strings.Cut(path, "/")
-		name, file, _ := strings.Cut(rest, "/")
-
-		return strings.EqualFold(owner+"/"+name, repository) && file == workflowFile
-	})
 }
 
 // rightsizeEntry is one job of `billet jobs rightsize --json`, as far as this command
@@ -596,10 +582,9 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 			say(0, resizedSince(recommended, entry.RecommendedVCPU, entry.RecommendedMemory))
 
 			continue
-		case !compatibleMove(current, recommended, chooser.repository, file):
-			say(0, fmt.Sprintf("tier %s is not %s with another size here: some other setting of it differs, it has "+
-				"less disk or shared memory, the architecture of either cannot be told, or it does not allow this "+
-				"workflow", strconv.Quote(recommended.Label), strconv.Quote(current.Label)))
+		case moveRefusal(current, recommended, chooser.repository, file) != "":
+			say(0, fmt.Sprintf("tier %s is not %s with another size here: %s", strconv.Quote(recommended.Label),
+				strconv.Quote(current.Label), moveRefusal(current, recommended, chooser.repository, file)))
 
 			continue
 		case len(matches) == 0:
@@ -645,14 +630,23 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 	}
 }
 
-// compatibleMove says moving a job from current to recommended changes its size and
-// nothing else, judged by the tiers as they are now: the rule `billet jobs rightsize`
-// recommends by (config.Tier.SameFamily), an architecture that can be told, since an
-// image naming none may run on either (a family shares it: a platform is read only
-// from settings SameFamily keeps), and a tier that allows the workflow.
-func compatibleMove(current, recommended *config.Tier, repository, workflowFile string) bool {
-	return current.SameFamily(*recommended) && current.Platform().Arch != "" &&
-		allowsWorkflow(recommended, repository, workflowFile)
+// moveRefusal says why moving a job from current to recommended would change more
+// than its size, judged by the tiers as they are now, and is empty when it would not:
+// the rule `billet jobs rightsize` recommends by (config.Tier.FamilyDifference), an
+// architecture that can be told, since an image naming none may run on either (a
+// family shares it: a platform is read only from settings the family keeps), and a
+// tier that allows the workflow.
+func moveRefusal(current, recommended *config.Tier, repository, workflowFile string) string {
+	switch {
+	case current.FamilyDifference(*recommended) != "":
+		return current.FamilyDifference(*recommended)
+	case current.Platform().Arch == "":
+		return "the architecture of either cannot be told, and an image naming none may run on either"
+	case !recommended.AllowsWorkflow(repository + "/" + workflowFile):
+		return "it does not allow this workflow"
+	}
+
+	return ""
 }
 
 // migrationFile is one file the plan would change.
@@ -823,6 +817,14 @@ func (p *migrationPlan) install(path string) error {
 				"again", strconv.Quote(f.name))
 		}
 	}
+	// WHAT WAS WRITTEN BEFORE A FAILURE IS SAID: the files are written one by one, and
+	// those already written stay so.
+	written, changing := 0, 0
+	for i := range p.files {
+		if !bytes.Equal(p.files[i].before, p.files[i].after) {
+			changing++
+		}
+	}
 	for i := range p.files {
 		f := &p.files[i]
 		if bytes.Equal(f.before, f.after) {
@@ -835,8 +837,10 @@ func (p *migrationPlan) install(path string) error {
 
 				return err
 			}); err != nil {
-			return fmt.Errorf("billet migrate workflows: write %s: %w", strconv.Quote(f.name), err)
+			return fmt.Errorf("billet migrate workflows: write %s, having written %d of the %d files to change: %w",
+				strconv.Quote(f.name), written, changing, err)
 		}
+		written++
 	}
 
 	return nil
@@ -945,9 +949,16 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 		return fmt.Errorf("billet migrate workflows: HEAD is %s, which is no branch; nothing was changed",
 			strconv.Quote(strings.TrimSpace(headRef)))
 	}
-	pushedTo, destination, err := pushTarget(ctx, path)
+	pushedTo, err := readPushTarget(ctx, path)
 	if err != nil {
 		return err
+	}
+	// A HEAD NAMES ITS REPOSITORY BY OWNER ALONE, so a push to another repository of
+	// the one the pull request is for, under the same owner, is one gh cannot find.
+	if !strings.EqualFold(pushedTo.repository, repository) &&
+		strings.EqualFold(pushedTo.owner(), (pushTarget{repository: repository}).owner()) {
+		return fmt.Errorf("billet migrate workflows: origin pushes to %s, and a pull request into %s names its head "+
+			"by owner alone; nothing was changed", pushedTo.repository, repository)
 	}
 	// EACH FILE NAMED LITERALLY, by git's own --literal-pathspecs: a pathspec is a
 	// pattern, so a workflow named `[ab].yml` would otherwise answer for a tracked
@@ -977,18 +988,19 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 		return fmt.Errorf("billet migrate workflows: stopped on branch %s after %s: %w", branch, done, err)
 	}
 	// WHERE ORIGIN PUSHES IS READ AGAIN ON THE NEW BRANCH: configuration included
-	// only on some branches (includeIf "onbranch:") can name another destination there,
-	// and another repository of the same owner is another destination. The URLs are
-	// not said: one can carry a token.
-	if again, there, err := pushTarget(ctx, path); err != nil || again != pushedTo || there != destination {
-		switch {
-		case err != nil:
-		case again != pushedTo:
-			err = fmt.Errorf("origin pushes to %s on this branch and to %s on %s", again, pushedTo, base)
-		default:
-			err = fmt.Errorf("origin pushes to another repository of %s on this branch than on %s", again, base)
-		}
+	// only on some branches (includeIf "onbranch:") can name another repository or
+	// another destination there. Repositories are named, URLs never: one can carry a
+	// token.
+	again, err := readPushTarget(ctx, path)
+	switch {
+	case err != nil:
 		return stopped(err, "creating it")
+	case again.repository != pushedTo.repository:
+		return stopped(fmt.Errorf("origin pushes to %s on this branch and to %s on %s", again.repository,
+			pushedTo.repository, base), "creating it")
+	case again.destination != pushedTo.destination:
+		return stopped(fmt.Errorf("origin pushes %s through another URL on this branch than on %s", again.repository,
+			base), "creating it")
 	}
 	if err := plan.install(path); err != nil {
 		return stopped(err, "creating it")
@@ -1023,7 +1035,7 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 		"```\n" + strings.ReplaceAll(report, "```", "'''") + "```\n"
 	// THE BODY ON STDIN, since a report can be longer than one argument may be.
 	output, err := runToolWith(ctx, path, strings.NewReader(body), "gh", "pr", "create", "--repo="+repository,
-		"--base="+base, "--head="+pushedTo+":"+branch, "--title="+title, "--body-file=-")
+		"--base="+base, "--head="+pushedTo.owner()+":"+branch, "--title="+title, "--body-file=-")
 	if err != nil {
 		return stopped(err, "pushing")
 	}

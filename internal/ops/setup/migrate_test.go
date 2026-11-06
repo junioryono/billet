@@ -957,7 +957,7 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	}
 	runIn(t, onBranch, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", include)
 	_, _, err := migrateRun(t, "--config", cfg, "--path", onBranch, "--repo", "acme/api", "--open-pr")
-	if err == nil || !strings.Contains(err.Error(), "origin pushes to bob on this branch and to acme on main") {
+	if err == nil || !strings.Contains(err.Error(), "origin pushes to bob/api on this branch and to acme/api on main") {
 		t.Errorf("a push URL only on the new branch = %v", err)
 	}
 	if got := readFile(t, filepath.Join(onBranch, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
@@ -973,8 +973,8 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	}
 	runIn(t, sameOwner, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", other)
 	_, _, err = migrateRun(t, "--config", cfg, "--path", sameOwner, "--repo", "acme/api", "--open-pr")
-	if err == nil || !strings.Contains(err.Error(), "origin pushes to another repository of acme on this branch than on main") ||
-		strings.Contains(err.Error(), "other.git") {
+	if err == nil || !strings.Contains(err.Error(), "origin pushes to acme/other on this branch and to acme/api on main") ||
+		strings.Contains(err.Error(), "https://") {
 		t.Errorf("another repository of the same owner only on the new branch = %v", err)
 	}
 	if got := readFile(t, filepath.Join(sameOwner, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
@@ -992,8 +992,42 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	}
 	runIn(t, sameDestination, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", toBob)
 	_, _, err = migrateRun(t, "--config", cfg, "--path", sameDestination, "--repo", "acme/api", "--open-pr")
-	if err == nil || !strings.Contains(err.Error(), "origin pushes to bob on this branch and to acme on main") {
+	if err == nil || !strings.Contains(err.Error(), "origin pushes to bob/api on this branch and to acme/api on main") {
 		t.Errorf("another owner from the same destination only on the new branch = %v", err)
+	}
+	if got := readFile(t, filepath.Join(sameDestination, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
+		t.Errorf("another owner from the same destination still changed ci.yml to %q", got)
+	}
+
+	// THE SAME REPOSITORY THROUGH ANOTHER URL on the new branch is still another push,
+	// and the URL, which can carry a token, is not said.
+	otherURL := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	viaSSH := filepath.Join(t.TempDir(), "ssh.gitconfig")
+	if err := os.WriteFile(viaSSH, []byte("[remote \"origin\"]\n\tpushurl = git@github.com:acme/api.git\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, otherURL, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", viaSSH)
+	_, _, err = migrateRun(t, "--config", cfg, "--path", otherURL, "--repo", "acme/api", "--open-pr")
+	if err == nil || !strings.Contains(err.Error(), "origin pushes acme/api through another URL on this branch than on main") ||
+		strings.Contains(err.Error(), "git@github.com") {
+		t.Errorf("the same repository through another URL only on the new branch = %v", err)
+	}
+	if got := readFile(t, filepath.Join(otherURL, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
+		t.Errorf("the same repository through another URL still changed ci.yml to %q", got)
+	}
+
+	// ANOTHER REPOSITORY OF THE SAME OWNER is one a pull request's head cannot name,
+	// since it names its repository by owner alone.
+	sibling := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	runIn(t, sibling, "config", "remote.origin.pushurl", "https://github.com/acme/web.git")
+	runIn(t, sibling, "config", "url."+originOf(t, sibling)+".insteadOf", "https://github.com/acme/web.git")
+	_, _, err = migrateRun(t, "--config", cfg, "--path", sibling, "--repo", "acme/api", "--open-pr")
+	if err == nil || !strings.Contains(err.Error(),
+		"origin pushes to acme/web, and a pull request into acme/api names its head by owner alone; nothing was changed") {
+		t.Errorf("a push to another repository of the same owner = %v", err)
+	}
+	if got := head(sibling); got != "main" {
+		t.Errorf("a push to another repository of the same owner left the checkout on %q", got)
 	}
 
 	// A FILE NAME IS NO PATTERN: an ignored `[ab].yml` is not answered for by a tracked
@@ -1268,9 +1302,11 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 		{name: "the same tier by its ASCII name", tiers: tiers(func(t *config.Tier) { t.RunsOn = "kube-2vcpu" }),
 			entry: func(e *rightsizeEntry) { e.RecommendedRunsOn = "KUBE-2vcpu" }, writes: "kube-2vcpu"},
 		{name: "another guest OS on the same architecture", tiers: tiers(func(t *config.Tier) { t.GuestOS = config.GuestWindows }),
-			says: "is not"},
-		{name: "another architecture", tiers: tiers(func(t *config.Tier) { t.Image = "ubuntu-2404-arm64@verified" }),
-			says: "is not"},
+			says: "a setting other than its name, size and capacity differs"},
+		{name: "another architecture by its image", tiers: tiers(func(t *config.Tier) { t.Image = "ubuntu-2404-arm64@verified" }),
+			says: "a setting other than its name, size and capacity differs"},
+		{name: "another architecture by its setting, the image the same", tiers: tiers(func(t *config.Tier) { t.Arch = config.ArchARM64 }),
+			says: "a setting other than its name, size and capacity differs"},
 		{name: "the same image naming no architecture, which may run on either", tiers: func() []config.Tier {
 			out := tiers(func(t *config.Tier) { t.Image = "ubuntu-2404@verified" })
 			for i := range out {
@@ -1279,7 +1315,7 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 				}
 			}
 			return out
-		}(), says: "the architecture of either cannot be told"},
+		}(), says: "the architecture of either cannot be told, and an image naming none may run on either"},
 		{name: "a recommended tier given fewer vCPUs since the report", tiers: tiers(func(t *config.Tier) { t.VCPU = 1 }),
 			says: `tier "platform-2vcpu" is 1 vCPU and 8.0 GiB now, and the report judged it at 2 vCPU and 8.0 GiB`},
 		{name: "a recommended tier given less memory since the report",
@@ -1310,7 +1346,7 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 			says: `the report does not record the shape it judged tier "platform-4vcpu" at`},
 		{name: "a recommended tier whose image changed since the report", tiers: tiers(func(t *config.Tier) {
 			t.Image = "ubuntu-2404-x64@g2"
-		}), says: "is not"},
+		}), says: "a setting other than its name, size and capacity differs"},
 		{name: "a recommended tier with less disk since the report", tiers: func() []config.Tier {
 			out := migrateTiers()
 			for i := range out {
@@ -1322,7 +1358,7 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 				}
 			}
 			return out
-		}(), says: "less disk"},
+		}(), says: "it has less disk, shared memory or BuildKit cache mount room"},
 		{name: "a trusted tier listing the workflow under another case", tiers: func() []config.Tier {
 			out := migrateTiers()
 			for i := range out {
@@ -1334,7 +1370,7 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 				}
 			}
 			return out
-		}(), says: "is not"},
+		}(), says: "it does not allow this workflow"},
 		{name: "a trusted tier listing it, the repository in another case", tiers: func() []config.Tier {
 			out := migrateTiers()
 			for i := range out {
@@ -1703,7 +1739,8 @@ func TestThePushOwnerIsWhereGitPushes(t *testing.T) {
 	} {
 		dir := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
 		tc.setup(dir)
-		got, err := pushOwner(t.Context(), dir)
+		target, err := readPushTarget(t.Context(), dir)
+		got := target.owner()
 		if (err != nil) != tc.fails || got != tc.want {
 			t.Errorf("%s: %q, %v; want %q (fails %t)", tc.name, got, err, tc.want, tc.fails)
 		}
@@ -1727,13 +1764,13 @@ func TestAPushToAPathWithASpaceFallsBackToTheConfiguredURL(t *testing.T) {
 	dir := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
 	runIn(t, dir, "config", "--unset-all", "url."+originOf(t, dir)+".pushInsteadOf")
 	runIn(t, dir, "config", "url./srv/Git Mirrors/.pushInsteadOf", "https://github.com/acme/")
-	if got, err := pushOwner(t.Context(), dir); err != nil || got != "acme" {
-		t.Errorf("a push to a path with a space: %q, %v; want acme", got, err)
+	if got, err := readPushTarget(t.Context(), dir); err != nil || got.repository != "acme/api" {
+		t.Errorf("a push to a path with a space: %+v, %v; want acme/api", got, err)
 	}
 	runIn(t, dir, "config", "--unset-all", "url./srv/Git Mirrors/.pushInsteadOf")
 	runIn(t, dir, "config", "url.Git Mirrors/.pushInsteadOf", "https://github.com/acme/")
-	if got, err := pushOwner(t.Context(), dir); err != nil || got != "acme" {
-		t.Errorf("a push to a relative path: %q, %v; want acme", got, err)
+	if got, err := readPushTarget(t.Context(), dir); err != nil || got.repository != "acme/api" {
+		t.Errorf("a push to a relative path: %+v, %v; want acme/api", got, err)
 	}
 
 	for remote, want := range map[string]bool{
