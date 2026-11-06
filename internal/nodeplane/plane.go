@@ -131,6 +131,9 @@ type Plane struct {
 	// imagesAccept is the deployment's images.accept, which a registration's
 	// answer carries to the node from VersionImageAcceptance.
 	imagesAccept []string
+	// macOSLimit is the macOS guests the deployment places on a named node, which a
+	// registration's answer carries; nil answers none, as a plane in a test does.
+	macOSLimit func(node string) int
 
 	// lateResults holds the tombstones of nodes whose record is gone — withdrawn
 	// or expired — so a result that was already on the wire when the node left
@@ -739,6 +742,13 @@ func WithImageAcceptance(accepted []config.ImageComponent) Option {
 	}
 }
 
+// WithMacOSLimits gives the plane the limit it places each node's macOS guests against,
+// which every registration's answer carries, so a verification beside the node counts
+// its probe against the same number (ADR-021).
+func WithMacOSLimits(limit func(node string) int) Option {
+	return func(p *Plane) { p.macOSLimit = limit }
+}
+
 // tierFor reports a tier from the catalogue.
 func (p *Plane) tierFor(label string) (config.Tier, bool) {
 	t, ok := p.tiers[label]
@@ -1308,7 +1318,7 @@ func (p *Plane) register(
 			"node; the newer process keeps its commands",
 			"node", req.Node, "arrived_at_epoch", epoch, "current", n.ledgerEpoch)
 
-		return p.wireResponse(negotiated), nil
+		return p.wireResponse(negotiated, req.Node), nil
 	}
 	if n.incarnation != "" && n.incarnation != req.Incarnation {
 		// SAID OUT LOUD, because the two causes need different fixes and look
@@ -1406,7 +1416,7 @@ func (p *Plane) register(
 		p.adoptOwnershipLocked(req.Node, req.Incarnation, req.Instances, true, nil)
 	}
 
-	return p.wireResponse(negotiated), nil
+	return p.wireResponse(negotiated, req.Node), nil
 }
 
 // wireResponse answers a registration with the version it settled on.
@@ -1416,7 +1426,7 @@ func (p *Plane) register(
 // preference there would tell a node it had agreed to a version it does not
 // implement — for the one registration that is least able to complain, since
 // nothing further in that path runs.
-func (p *Plane) wireResponse(negotiated int) nodeapi.RegisterResponse {
+func (p *Plane) wireResponse(negotiated int, node string) nodeapi.RegisterResponse {
 	res := nodeapi.RegisterResponse{
 		Version:         negotiated,
 		MinVersion:      nodeapi.MinVersion,
@@ -1433,6 +1443,11 @@ func (p *Plane) wireResponse(negotiated int) nodeapi.RegisterResponse {
 		p.log.Warn("this node's wire does not carry the deployment's images.accept, so it completes "+
 			"guest images with its own list alone until it is upgraded", "protocol", negotiated,
 			"images_accept", p.imagesAccept)
+	}
+
+	if p.macOSLimit != nil && negotiated >= nodeapi.VersionTartVerified {
+		limit := p.macOSLimit(node)
+		res.MacOSVMLimit = &limit
 	}
 
 	return res

@@ -163,7 +163,7 @@ The per-sample series a node reports with each job records the wall time of its 
 | `minute_weight` | what one minute of this tier counts as in [`billet usage export`](usage-export.md), in minutes of a 2 vCPU Linux runner; a decimal above 0 and at most 1000, with at most three places, refused beside `sizes`. Absent, the vCPU charged over two. It reports and decides nothing |
 | `disk` | usable root capacity on Firecracker and EC2; ignored by Docker |
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
-| `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference; never one beginning with `-`, which a backend's command line would read as an option |
+| `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference or local VM name, either of which may end `@verified` to boot only a copy of what `billet images verify` booted on that node ([ADR-021](decisions/adr-021-tart-images-verified-not-published.md), never beside a digest, and `billet check` refuses it while a registered host predates wire 41); never one beginning with `-`, which a backend's command line would read as an option |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
 | `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |

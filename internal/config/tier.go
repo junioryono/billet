@@ -654,7 +654,22 @@ func (t Tier) ImageOptionErrors(where string) []error {
 		}
 	}
 
-	return errs
+	return append(errs, t.tartImageErrors(where)...)
+}
+
+// tartImageErrors refuses a `@verified` the image Tart would boot cannot mean: on another
+// backend the spelling is a generation, whose image is never read here. Load and
+// alloc.New both apply it, the second for a catalogue built in code.
+func (t Tier) tartImageErrors(where string) []error {
+	if _, named := t.Launch[ProviderTart]; !named && !t.AcceptsProvider(ProviderTart) {
+		return nil
+	}
+
+	if err := checkTartVerifiedImage(t.ImageFor(ProviderTart)); err != nil {
+		return []error{fmt.Errorf("%s: tart's image %w", where, err)}
+	}
+
+	return nil
 }
 
 // imageNotAnOption refuses an image a backend's command line would read as an
@@ -854,6 +869,7 @@ func (c *Config) validateTiers() []error {
 				"and no larger than 100GiB", where))
 		}
 		errs = append(errs, t.LaunchErrors(where)...)
+		errs = append(errs, t.tartImageErrors(where)...)
 		if t.WarmPool < 0 {
 			errs = append(errs, fmt.Errorf("%s: warm_pool must not be negative", where))
 		} else if t.WarmPool > 0 {

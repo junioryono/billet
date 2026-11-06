@@ -400,6 +400,16 @@ linters:
             - github.com/junioryono/billet/internal/durablefile$
             - github.com/junioryono/billet/internal/regularfile$
 
+        # The node's record of its macOS limit: a leaf for the same reason (ADR-021).
+        macoslimit:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/macoslimit/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/durablefile$
+            - github.com/junioryono/billet/internal/regularfile$
+
         # THE WORDS A COMMAND DECLARES ITS HOST PATHS IN (#174), which every
         # command family and the host family's `local unit-paths` share: a leaf,
         # so a declaration can be imported by any family without importing

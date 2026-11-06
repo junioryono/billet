@@ -137,4 +137,4 @@ The `ec2` backend boots an AMI `billet ami build` makes by running the same temp
 
 ## On a Mac
 
-A tart node pulls what its tiers name with `billet images pull`, into tart's own per-user store; a launch refuses an image that is not present rather than fetching tens of gigabytes inside a job. Guest images billet builds for a Mac are still open ([Run jobs on a Mac](../deploying/mac-tart.md)).
+A tart node pulls what its tiers name plainly with `billet images pull`, into tart's own per-user store, and a tier naming `<image>@verified` boots a copy of what `billet images verify` booted; a launch refuses an image that is not present rather than fetching tens of gigabytes inside a job. Guest images billet builds for a Mac are still open ([Run jobs on a Mac](../deploying/mac-tart.md)).
