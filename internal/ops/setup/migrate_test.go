@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
@@ -555,7 +556,8 @@ func TestARemoteIsReadForItsRepository(t *testing.T) {
 	}
 	// A path on this machine names no owner, a colon in it included.
 	for _, remote := range []string{"", "/srv/git/api.git", "https://github.com/acme", "https://github.com/a/b/c", "github.com",
-		"../mirrors:alice/api.git", "/srv/mirrors:alice/api.git", "file:///srv/alice/api.git"} {
+		"../mirrors:alice/api.git", "/srv/mirrors:alice/api.git", "file:///srv/alice/api.git",
+		"file://localhost/srv/alice/api.git"} {
 		if got, ok := repositoryOfRemote(remote); ok {
 			t.Errorf("%q = %q; want no answer", remote, got)
 		}
@@ -831,6 +833,12 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 	if mainBefore == "" {
 		t.Fatal("origin has no main to compare with")
 	}
+	// NOTHING BUT THE BRANCH IS PUSHED, whatever push.followTags says, and a push the
+	// operator's push.recurseSubmodules=only would make a success that sent nothing
+	// still sends the branch.
+	runIn(t, dir, "tag", "-a", "-m", "unreleased", "v1.0.0")
+	runIn(t, dir, "config", "push.followTags", "true")
+	runIn(t, dir, "config", "push.recurseSubmodules", "only")
 
 	// The repository named in another case than origin's: the pull request goes to it
 	// as named, from the branch on the fork origin pushes to.
@@ -844,6 +852,9 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 
 	if mainAfter := runIn(t, bare, "rev-parse", "refs/heads/main"); mainAfter != mainBefore {
 		t.Errorf("origin's main moved from %q to %q", mainBefore, mainAfter)
+	}
+	if tags := runIn(t, bare, "tag", "--list"); tags != "" {
+		t.Errorf("origin was sent the operator's tags: %q", tags)
 	}
 
 	branch := strings.TrimSpace(runIn(t, dir, "rev-parse", "--abbrev-ref", "HEAD"))
@@ -901,6 +912,54 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 		t.Errorf("a refusal left the checkout on %q", got)
 	}
 
+	// A DRAFT GIT WAS TOLD NOT TO SHOW is still uncommitted, and the plan reads it.
+	hidden := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	runIn(t, hidden, "config", "status.showUntrackedFiles", "no")
+	if err := os.WriteFile(filepath.Join(hidden, ".github", "workflows", "draft.yml"), []byte(migrateWorkflow), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := migrateRun(t, "--config", cfg, "--path", hidden, "--repo", "acme/api", "--open-pr"); err == nil ||
+		!strings.Contains(err.Error(), "needs a clean checkout") {
+		t.Errorf("an untracked draft git does not show = %v", err)
+	}
+
+	// A WORKFLOW GIT IGNORES would be written and then refused by git add.
+	ignored := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	if err := os.WriteFile(filepath.Join(ignored, ".gitignore"), []byte(".github/workflows/local.yml\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, ignored, "add", ".gitignore")
+	runIn(t, ignored, "commit", "-q", "-m", "ignore")
+	if err := os.WriteFile(filepath.Join(ignored, ".github", "workflows", "local.yml"), []byte(migrateWorkflow), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := migrateRun(t, "--config", cfg, "--path", ignored, "--repo", "acme/api", "--open-pr"); err == nil ||
+		!strings.Contains(err.Error(), "git does not track every one of them; nothing was changed") {
+		t.Errorf("an ignored workflow = %v", err)
+	}
+	if got := head(ignored); got != "main" {
+		t.Errorf("a refusal over an ignored workflow left the checkout on %q", got)
+	}
+	if got := readFile(t, filepath.Join(ignored, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
+		t.Errorf("a refusal over an ignored workflow still changed ci.yml to %q", got)
+	}
+
+	// CONFIGURATION ONLY ON THE NEW BRANCH that pushes somewhere else is seen there,
+	// before anything is written.
+	onBranch := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	include := filepath.Join(t.TempDir(), "fork.gitconfig")
+	if err := os.WriteFile(include, []byte("[remote \"origin\"]\n\tpushurl = https://github.com/bob/api.git\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, onBranch, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", include)
+	_, _, err := migrateRun(t, "--config", cfg, "--path", onBranch, "--repo", "acme/api", "--open-pr")
+	if err == nil || !strings.Contains(err.Error(), "origin pushes to bob on this branch and to acme on main") {
+		t.Errorf("a push URL only on the new branch = %v", err)
+	}
+	if got := readFile(t, filepath.Join(onBranch, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
+		t.Errorf("a push URL only on the new branch still changed ci.yml to %q", got)
+	}
+
 	// An origin pushing to two places has no one fork a head can name.
 	twice := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
 	runIn(t, twice, "config", "--add", "remote.origin.pushurl", "https://github.com/alice/api.git")
@@ -934,7 +993,7 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	unpushed := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
 	runIn(t, unpushed, "config", "remote.origin.pushurl", "https://github.com/bob/api.git")
 	runIn(t, unpushed, "config", "url."+filepath.Join(t.TempDir(), "gone")+".insteadOf", "https://github.com/bob/api.git")
-	_, _, err := migrateRun(t, "--config", cfg, "--path", unpushed, "--repo", "acme/api", "--open-pr")
+	_, _, err = migrateRun(t, "--config", cfg, "--path", unpushed, "--repo", "acme/api", "--open-pr")
 	if err == nil || !strings.Contains(err.Error(), "stopped on branch billet/migrate-workflows-") ||
 		!strings.Contains(err.Error(), "after committing") {
 		t.Errorf("a push that fails = %v", err)
@@ -964,6 +1023,34 @@ func TestMigrateWorkflowsOpenPRNeedsGH(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(dir, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
 		t.Errorf("no gh still changed the file to %q", got)
+	}
+}
+
+// A PUSH THAT SUCCEEDS HAVING SENT NOTHING IS NO PUSH, as git's own settings can make
+// one: the pull request is not opened for a branch the remote does not have.
+func TestMigrateWorkflowsOpenPRWantsTheBranchSent(t *testing.T) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := stubGH(t, "exit 0")
+	dir := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	cfg := migrateConfigFile(t)
+
+	stub := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = push ]; then printf 'To elsewhere\\nDone\\n'; exit 0; fi\nexec '" + gitPath + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(stub, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stub+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, _, err = migrateRun(t, "--config", cfg, "--path", dir, "--repo", "acme/api", "--open-pr")
+	if err == nil || !strings.Contains(err.Error(), "does not say it updated refs/heads/billet/migrate-workflows-") ||
+		!strings.Contains(err.Error(), "after committing") {
+		t.Errorf("a push that sent nothing = %v", err)
+	}
+	if _, err := os.Stat(record); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("gh was run for a branch never sent: %v", err)
 	}
 }
 
@@ -1597,5 +1684,30 @@ func TestAPushToAPathWithASpaceFallsBackToTheConfiguredURL(t *testing.T) {
 	if got := gitLines("/srv/Git Mirrors/api.git\r\n\nhttps://github.com/acme/api.git"); len(got) != 2 ||
 		got[0] != "/srv/Git Mirrors/api.git" {
 		t.Errorf("gitLines: %q", got)
+	}
+}
+
+// A PUSH IS PROVED BY WHAT GIT SAYS IT SENT: the refspec on a line of its own with a
+// flag that sent it, not a rejection, another ref or the summary.
+func TestAPushIsProvedByWhatGitSaysItSent(t *testing.T) {
+	t.Parallel()
+
+	const spec = "refs/heads/b:refs/heads/b"
+	for porcelain, want := range map[string]bool{
+		"To /srv/api.git\n*\t" + spec + "\t[new branch]\nDone\n":            true,
+		"To /srv/api.git\n \t" + spec + "\tabc..def\nDone\n":                true,
+		"To /srv/api.git\n+\t" + spec + "\tabc...def (forced update)\n":     true,
+		"=\t" + spec + "\t[up to date]\n":                                   true,
+		"To /srv/api.git\n!\t" + spec + "\t[rejected] (non-fast-forward)\n": false,
+		"*\trefs/heads/main:refs/heads/main\t[new branch]\n":                false,
+		"*\trefs/heads/b:refs/heads/main\t[new branch]\n":                   false,
+		"*\trefs/heads/b:refs/heads/bb\t[new branch]\n":                     false,
+		"!*\t" + spec + "\t[new branch]\n":                                  false,
+		"To /srv/api.git\nDone\n":                                           false,
+		"":                                                                  false,
+	} {
+		if got := pushedRef(porcelain, spec); got != want {
+			t.Errorf("pushedRef(%q) = %t, want %t", porcelain, got, want)
+		}
 	}
 }

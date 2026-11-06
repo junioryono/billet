@@ -221,12 +221,15 @@ func localPath(remote string) bool {
 // repositoryOfRemote reads owner/name from a remote in any form git takes: a URL, or
 // the scp form git@host:owner/name.
 func repositoryOfRemote(remote string) (string, bool) {
+	// A PATH ON THIS MACHINE NAMES NO OWNER, a file:// URL with a host and a path with a
+	// colon in it (`../mirrors:alice/api.git`) among them.
+	if localPath(remote) {
+		return "", false
+	}
 	path := ""
 	if u, err := url.Parse(remote); err == nil && u.Scheme != "" && u.Host != "" {
 		path = u.Path
-	} else if !localPath(remote) && !strings.Contains(remote, "://") {
-		// AN SCP-STYLE ADDRESS ONLY: a path on this machine names no owner, even with a
-		// colon in it (`../mirrors:alice/api.git`).
+	} else if !strings.Contains(remote, "://") {
 		_, path, _ = strings.Cut(remote, ":")
 	}
 
@@ -854,7 +857,9 @@ func workflowDirs(path string) ([]os.FileInfo, error) {
 // uncommitted would go on the branch beside the migration or be lost to it, and a
 // detached HEAD has no branch for a pull request to merge into.
 func refuseUnlessClean(ctx context.Context, path string) error {
-	status, err := runGit(ctx, path, "status", "--porcelain")
+	// EVERY UNTRACKED FILE, whatever status.showUntrackedFiles says: the plan reads the
+	// workflows directory itself, and would commit a draft git was told not to show.
+	status, err := runGit(ctx, path, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return err
 	}
@@ -925,6 +930,18 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 	if err != nil {
 		return err
 	}
+	var changed []string
+	for i := range plan.files {
+		if !bytes.Equal(plan.files[i].before, plan.files[i].after) {
+			changed = append(changed, filepath.FromSlash(plan.files[i].name))
+		}
+	}
+	// ONLY FILES GIT TRACKS: an ignored workflow would be written and then refused by
+	// git add, with the branch already made.
+	if _, err := runGit(ctx, path, append([]string{"ls-files", "--error-unmatch", "--"}, changed...)...); err != nil {
+		return fmt.Errorf("billet migrate workflows: --open-pr commits the workflows it changes, and git does not "+
+			"track every one of them; nothing was changed: %w", err)
+	}
 
 	branch := "billet/migrate-workflows-" + time.Now().UTC().Format("20060102-150405")
 	if _, err := runGit(ctx, path, "checkout", "-q", "-b", branch); err != nil {
@@ -934,17 +951,19 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 	stopped := func(err error, done string) error {
 		return fmt.Errorf("billet migrate workflows: stopped on branch %s after %s: %w", branch, done, err)
 	}
+	// WHERE ORIGIN PUSHES IS READ AGAIN ON THE NEW BRANCH: configuration included
+	// only on some branches (includeIf "onbranch:") can name another destination there.
+	if again, err := pushOwner(ctx, path); err != nil || again != pushedTo {
+		if err == nil {
+			err = fmt.Errorf("origin pushes to %s on this branch and to %s on %s", again, pushedTo, base)
+		}
+		return stopped(err, "creating it")
+	}
 	if err := plan.install(path); err != nil {
 		return stopped(err, "creating it")
 	}
 
-	args := []string{"add", "--"}
-	for i := range plan.files {
-		if !bytes.Equal(plan.files[i].before, plan.files[i].after) {
-			args = append(args, filepath.FromSlash(plan.files[i].name))
-		}
-	}
-	if _, err := runGit(ctx, path, args...); err != nil {
+	if _, err := runGit(ctx, path, append([]string{"add", "--"}, changed...)...); err != nil {
 		return stopped(err, "writing the files")
 	}
 
@@ -954,10 +973,19 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 	}
 	// THE DESTINATION IS SPELLED OUT: a bare branch name lets an upstream the new
 	// branch tracks (branch.autoSetupMerge, push.default=upstream) or a remote's push
-	// refspec send the commit to another branch, main among them.
+	// refspec send the commit to another branch, main among them. Nothing else goes
+	// with it (push.followTags would publish the operator's tags), and the push is
+	// proved by what git says it updated, since push.recurseSubmodules=only succeeds
+	// having updated nothing.
 	ref := "refs/heads/" + branch
-	if _, err := runGit(ctx, path, "push", "-q", "-u", "origin", ref+":"+ref); err != nil {
+	refspec := ref + ":" + ref
+	pushed, err := runGit(ctx, path, "push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", "-u",
+		"origin", refspec)
+	if err != nil {
 		return stopped(err, "committing")
+	}
+	if !pushedRef(pushed, refspec) {
+		return stopped(fmt.Errorf("git push succeeded and does not say it updated %s", ref), "committing")
 	}
 
 	body := "Written by `billet migrate workflows`. It moved each `runs-on` it could and lists what it left alone.\n\n" +
@@ -973,6 +1001,23 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 	}
 
 	return nil
+}
+
+// pushedRef says git push --porcelain reported refspec as sent: a line of its flag
+// (fast-forward, forced or new; an up-to-date one is there already), a tab, and the
+// refspec. A rejected one has no such line.
+func pushedRef(porcelain, refspec string) bool {
+	for _, line := range gitLines(porcelain) {
+		mark, rest, ok := strings.Cut(line, "\t")
+		if !ok || len(mark) != 1 || !strings.ContainsAny(mark, " +*=") {
+			continue
+		}
+		if got, _, _ := strings.Cut(rest, "\t"); got == refspec {
+			return true
+		}
+	}
+
+	return false
 }
 
 var _ flag.Value = labelMaps{}
