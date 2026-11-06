@@ -1,0 +1,100 @@
+{
+  "id": "",
+  "kind": "",
+  "lease": {
+    "ID": "",
+    "Tier": "",
+    "Node": "",
+    "TargetNode": "",
+    "MacOSSlot": false,
+    "GuestOS": "",
+    "Provider": "",
+    "Providers": [
+      ""
+    ],
+    "Phase": "",
+    "VCPU": 0,
+    "Memory": 0,
+    "RequestedVCPU": 0,
+    "RequestedMemory": 0,
+    "InstanceType": "",
+    "Site": "",
+    "PriceUSDPerHour": 0,
+    "ImageCache": "",
+    "CacheGeneration": "",
+    "ActionsCache": "",
+    "PreferenceRank": 0,
+    "HeldSince": "",
+    "HolderIncarnation": "",
+    "ForceRelease": false,
+    "FailureReason": "",
+    "Disruption": "",
+    "DisruptedAt": "",
+    "Epoch": 0,
+    "RunID": 0,
+    "RequestID": 0
+  },
+  "job": {
+    "request_id": 0,
+    "run_id": 0,
+    "event": "",
+    "owner": "",
+    "repository": "",
+    "workflow_ref": ""
+  },
+  "tier": {
+    "label": "",
+    "image": "",
+    "trust": "",
+    "command": [
+      ""
+    ],
+    "workflows": [
+      ""
+    ],
+    "buildkit_cache_mount_limit": 0,
+    "cache_scope": {
+      "Owner": "",
+      "Repository": "",
+      "WorkflowRef": ""
+    },
+    "cache": {
+      "publish": "",
+      "docker": {
+        "enabled": false
+      },
+      "sticky_disks": {
+        "enabled": false
+      },
+      "actions": {
+        "enabled": false
+      },
+      "git": {
+        "enabled": false
+      },
+      "bazel": {
+        "enabled": false
+      },
+      "go": {
+        "enabled": false
+      }
+    }
+  },
+  "cache_authority": {
+    "lease_id": "",
+    "job_id": "",
+    "run_id": 0,
+    "owner": "",
+    "repository": "",
+    "event": "",
+    "proven": false,
+    "write_own_ref": false,
+    "publish_default": false
+  },
+  "upgrade": {
+    "version": "",
+    "manifest_sha256": "",
+    "rollout_id": "",
+    "generation": 0
+  }
+}

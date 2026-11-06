@@ -66,6 +66,7 @@ type jobPage struct {
 	Steps               pageSteps
 	Charts              pageCharts
 	Destinations        pageDestinations
+	Egress              []pageField
 	Guest               guestView
 }
 
@@ -139,6 +140,8 @@ type pageDestinations struct {
 	// answered late, or that the report did not time them.
 	Timed bool
 	Slow  string
+	// Named says the rows carry the names the job's resolver saw.
+	Named bool
 	// Complete answers whether the totals are complete.
 	Complete string
 	Tap      string
@@ -147,14 +150,14 @@ type pageDestinations struct {
 
 // pageDestination is one destination's row.
 type pageDestination struct {
-	Addr, Sent, Received, Connections, Unanswered, SlowestReply string
+	Addr, Sent, Received, Connections, Unanswered, SlowestReply, Names string
 }
 
 // buildJobPage is the page for a job: its record, its usage report and the
 // steps readJobSteps learned. The series is the one the steps were placed on;
 // when no step was asked about, it is read here for the charts.
 func buildJobPage(ctx context.Context, a *alloc.Allocator, rec alloc.JobRecord, measured *alloc.RecordedUsage,
-	steps jobSteps, guest *jobGuest,
+	steps jobSteps, guest *jobGuest, network jobEgress,
 ) jobPage {
 	tl, unaligned := steps.timeline, steps.unaligned
 	if steps.none != "" {
@@ -162,6 +165,8 @@ func buildJobPage(ctx context.Context, a *alloc.Allocator, rec alloc.JobRecord, 
 	}
 	page := jobPageOf(rec, measured, steps, tl, unaligned)
 	page.Guest = guestSection(guest, rec, measured, steps, page.Charts)
+	page.Destinations = destinationsSection(rec, measured, network.names())
+	page.Egress = egressFields(network, rec)
 
 	return page
 }
@@ -211,7 +216,7 @@ func jobPageOf(rec alloc.JobRecord, measured *alloc.RecordedUsage, steps jobStep
 	}
 	page.Charts = buildCharts(tl, unaligned, rec, measured, listed)
 	page.Steps = stepsSection(steps, tl, unaligned, measured, page.Charts)
-	page.Destinations = destinationsSection(rec, measured)
+	page.Destinations = destinationsSection(rec, measured, nil)
 	page.Guest = guestViewOf(nil, measured, steps)
 
 	return page
@@ -248,6 +253,7 @@ func identityFields(rec alloc.JobRecord) []pageField {
 		{Label: "finished", Value: orNotRecorded(rec.FinishedAt)},
 		{Label: "github times", Value: githubTimes(rec, orNotRecorded)},
 		{Label: "waited", Value: waitedLine(rec)},
+		{Label: "runtime", Value: runtimeLine(rec)},
 		{Label: "detail", Value: orKept(rec)},
 		{Label: "tier", Value: orNotRecorded(rec.Tier)},
 		{Label: "node", Value: orNotRecorded(rec.Node)},
@@ -455,7 +461,7 @@ func windowCells(u usage.WindowUsage, m *alloc.RecordedUsage) []pageField {
 
 // destinationsSection is where the job's traffic went, worded as
 // renderDestinations words it.
-func destinationsSection(rec alloc.JobRecord, m *alloc.RecordedUsage) pageDestinations {
+func destinationsSection(rec alloc.JobRecord, m *alloc.RecordedUsage, names map[string][]string) pageDestinations {
 	switch {
 	case m == nil:
 		return pageDestinations{Why: "No usage report was recorded."}
@@ -481,11 +487,13 @@ func destinationsSection(rec alloc.JobRecord, m *alloc.RecordedUsage) pageDestin
 		Timed:      d.RepliesTimed,
 		Slow:       slowText(d),
 		Complete:   "yes",
+		Named:      names != nil,
 	}
 	for _, dest := range shown {
 		out.Rows = append(out.Rows, pageDestination{Addr: dest.Addr, Sent: cli.HumanBytes(dest.SentBytes),
 			Received: cli.HumanBytes(dest.ReceivedBytes), Connections: groupDigits(dest.Connections),
-			Unanswered: groupDigits(dest.Unanswered), SlowestReply: slowestReply(dest)})
+			Unanswered: groupDigits(dest.Unanswered), SlowestReply: slowestReply(dest),
+			Names: destinationNames(names, dest.Addr)})
 	}
 	if rest := sorted[len(shown):]; len(rest) > 0 {
 		out.More = fmt.Sprintf("and %d more: %s", len(rest), sumOf(rest...).said(d.UnansweredCounted))

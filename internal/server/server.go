@@ -56,6 +56,10 @@ type Server struct {
 	// detailRetention is how long a job's series, destinations and guest report
 	// are kept; zero is config.DefaultJobDetailRetention.
 	detailRetention time.Duration
+	// testRetention and testBound are how long a job's test results are kept and how
+	// many bytes of them in all; zero is config's default for each.
+	testRetention time.Duration
+	testBound     int64
 	// owner identifies this process to GitHub's message queue, so a session left
 	// by a crashed run can be told apart from a live one.
 	owner string
@@ -73,6 +77,10 @@ type Server struct {
 	reapEvery time.Duration
 	// hurry, when closed, ends every listener's drain wait early.
 	hurry <-chan struct{}
+	// foregroundLaunches is set by WithForegroundLaunches.
+	foregroundLaunches bool
+	// listenerTimings is set by WithListenerTimings.
+	listenerTimings *ListenerTimings
 	// restartHandoff makes an unsealed stop a handoff; see WithRestartHandoff.
 	restartHandoff bool
 
@@ -261,12 +269,32 @@ func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.detailRetention = d }
 }
 
+// WithTestResultsRetention is server.test_results_retention and
+// server.test_results_max_bytes reaching the loop that deletes test results past them.
+func WithTestResultsRetention(d time.Duration, maxBytes int64) ControlPlaneOption {
+	return func(s *Server) { s.testRetention, s.testBound = d, maxBytes }
+}
+
 // WithHurry gives every listener the channel that ends its drain wait early.
 //
 // This is the operator's second signal reaching the code that honours it. See
 // WithHurrySignal for what a listener does with it.
 func WithHurry(c <-chan struct{}) ControlPlaneOption {
 	return func(s *Server) { s.hurry = c }
+}
+
+// WithForegroundLaunches makes every listener wait for each launch, which only a
+// harness wants: a deployment's listener must go on hearing GitHub through a slow launch
+// (listener_flight.go), but a replay delivers one event at a time to quiescence so that
+// goroutine order cannot decide what a run did, and a listener parked on its poll with
+// a launch still out is not quiet.
+func WithForegroundLaunches() ControlPlaneOption {
+	return func(s *Server) { s.foregroundLaunches = true }
+}
+
+// WithListenerTimings has every listener report how long its loop's steps take.
+func WithListenerTimings(t *ListenerTimings) ControlPlaneOption {
+	return func(s *Server) { s.listenerTimings = t }
 }
 
 // WithStopHandoff makes every listener hand over to the next control plane, rather
@@ -315,11 +343,20 @@ func OptionsFromConfig(cfg *config.Config) ([]ControlPlaneOption, error) {
 	if err != nil {
 		return nil, err
 	}
+	testRetention, err := cfg.Server.TestResultsRetentionDuration()
+	if err != nil {
+		return nil, err
+	}
+	testBound, err := cfg.Server.TestResultsBound()
+	if err != nil {
+		return nil, err
+	}
 
 	return []ControlPlaneOption{
 		WithDrainTimeout(drain),
 		WithAdmissionOrder(cfg.Server.Order()),
 		WithJobDetailRetention(retention),
+		WithTestResultsRetention(testRetention, int64(testBound)),
 	}, nil
 }
 
@@ -464,6 +501,8 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.
 	group.Background("job detail retention", s.retireJobDetail)
+	group.Background("test results retention", s.retireTestResults)
+	group.Background("usage numbering", s.numberUsage)
 
 	// Cancelled together. One listener failing takes the others down rather than
 	// leaving a control plane that is advertising for some tiers and silent for
@@ -633,11 +672,15 @@ func (s *Server) reconcile(ctx context.Context) (map[string]*ScaleSet, map[strin
 //
 // A PACE, NOT A LIMIT. What is being waited for is GitHub expiring a session an
 // abandoned control plane left behind, and asking more often does not make that
-// happen sooner.
+// happen sooner; but asking less often opens it later, by up to the whole pace
+// after GitHub let it go, and after a promotion every tier waits here. Ten
+// seconds is at most ten seconds of that, for about nine more requests a tier
+// across the 60 to 92 seconds measured (2026-09-04), and a session opened is
+// one request whatever the pace.
 //
 // A VAR SO A TEST CAN DRIVE THE RETRY WITHOUT WAITING, which is the same seam
 // every other pace in this repository uses.
-var sessionRetryFor = 30 * time.Second
+var sessionRetryFor = 10 * time.Second
 
 // ErrSessionHeld means a message session for this scale set is already
 // outstanding, held by a control plane that did not close it.
@@ -685,6 +728,9 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 			return s.openSession(ctx, t, set, prov)
 		}),
 		WithPoolLaunchBatch(poolLaunchBatchFor(t)))
+	if !s.foregroundLaunches {
+		opts = append(opts, WithBackgroundLaunches())
+	}
 	if target, ok := s.targetFor(t); ok {
 		opts = append(opts, WithGitHubTarget(target.Config.Path()))
 	}
@@ -717,6 +763,8 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 // measurement rather than a promise, which is why this is a loop and not a
 // sleep, and why nothing here assumes the redelivery.
 func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet, prov Provisioner) (Session, error) {
+	began := time.Now()
+
 	for attempt := 1; ; attempt++ {
 		// BEFORE EVERY ATTEMPT, because a listener's recovery waits here too, and
 		// a process that is no longer the controller opens nothing.
@@ -726,6 +774,12 @@ func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet,
 
 		session, err := prov.Session(ctx, set.ID, s.owner)
 		if err == nil {
+			// SAID WHEN IT OPENS, and how long GitHub held it: after a promotion
+			// this is the one part of the failover billet does not own, and the
+			// rehearsal measures it from this line.
+			s.log.Info("opened this tier's message session", "tier", t.Label, "runs_on", t.ScaleSetName(),
+				"attempts", attempt, "waited", time.Since(began).Round(time.Millisecond))
+
 			return session, nil
 		}
 
@@ -772,6 +826,10 @@ func (s *Server) listenerOpts(prov Provisioner) []Option {
 	// listeners, so a control plane that handed some of them a queue and not
 	// others would be fair about part of its fleet.
 	opts = append(opts, WithAdmissionQueue(s.order))
+
+	if s.listenerTimings != nil {
+		opts = append(opts, WithTimings(s.listenerTimings))
+	}
 
 	if s.runner != nil {
 		opts = append(opts, WithRunner(s.runner))

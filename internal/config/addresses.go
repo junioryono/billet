@@ -11,9 +11,10 @@ import (
 
 // LoopbackAddr reports whether an address accepts only from this machine.
 //
-// SHARED WITH THE SERVER'S OWN DECISION: the wire is served without TLS on exactly
-// the addresses this returns true for, so config validation and the listener must
-// not answer differently. A wildcard is NOT loopback.
+// SHARED WITH THE SERVER'S OWN DECISION: the wire is served without TLS only on the
+// addresses this returns true for, and on those unless a router fronts it (see
+// ServerConfig.WireServesTLS), so config validation and the listener must not answer
+// differently. A wildcard is NOT loopback.
 func LoopbackAddr(addr string) bool {
 	return isLoopbackHostPort(addr)
 }

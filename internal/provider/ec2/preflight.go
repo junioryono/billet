@@ -55,6 +55,9 @@ type ImageInfo struct {
 	// Arch is the architecture the image boots on, or empty for one AWS names in
 	// a way billet launches no Linux image for (config.ArchFromEC2).
 	Arch config.Arch
+	// Windows says DescribeImages reports the image as a Windows AMI, whose contract
+	// is WindowsAMIContract and whose tier sets guest_os: windows.
+	Windows bool
 }
 
 // DescribeSubnet reports the subnet's VPC, availability zone and state. A subnet
@@ -206,7 +209,10 @@ func DescribeImageStates(
 			continue
 		}
 
-		info := ImageInfo{ImageID: id, State: resp.Images[0].State, Found: true}
+		info := ImageInfo{
+			ImageID: id, State: resp.Images[0].State, Found: true,
+			Windows: resp.Images[0].Platform == imagePlatformWindows,
+		}
 		if arch, ok := config.ArchFromEC2(resp.Images[0].Architecture); ok {
 			info.Arch = arch
 		}

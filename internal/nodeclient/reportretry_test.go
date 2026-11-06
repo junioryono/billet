@@ -29,7 +29,7 @@ func unheardClient(t *testing.T, sent *[]time.Time) *Client {
 		t.Fatalf("new client: %v", err)
 	}
 
-	c.http = &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+	c.targets[0].http = &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
 		*sent = append(*sent, time.Now())
 
 		return nil, errors.New("the plane did not answer")

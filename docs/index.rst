@@ -36,6 +36,7 @@
    deploying/hybrid-owned-hardware
    deploying/postgres-and-active-passive
    deploying/reaching-hosts
+   deploying/many-deployments
    deploying/converging-from-ci
 
 .. toctree::
@@ -50,6 +51,7 @@
    operating/guest-images
    operating/build-caches
    operating/actions-cache
+   operating/egress
    operating/compatibility
    operating/upgrades
    operating/backup-restore-recover
@@ -64,6 +66,7 @@
 
    reference/cli
    reference/configuration
+   reference/usage-export
    reference/status
    reference/reference-hardware
    reference/action-versioning

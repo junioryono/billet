@@ -1,0 +1,966 @@
+[
+  {
+    "id": "inline:1fab1fab88aa",
+    "kind": "powershell",
+    "inline": [
+      "New-Item -Path C:\\image -ItemType Directory -Force",
+      "New-Item -Path C:\\temp -ItemType Directory -Force"
+    ]
+  },
+  {
+    "id": "file:C:\\image\\",
+    "kind": "file",
+    "sources": [
+      "images/windows/assets",
+      "images/windows/scripts",
+      "images/windows/toolsets"
+    ],
+    "destination": "C:\\image\\"
+  },
+  {
+    "id": "file:C:\\image\\scripts\\docs-gen\\",
+    "kind": "file",
+    "sources": [
+      "helpers/software-report-base"
+    ],
+    "destination": "C:\\image\\scripts\\docs-gen\\"
+  },
+  {
+    "id": "inline:3b55dc2aba48",
+    "kind": "powershell",
+    "inline": [
+      "Move-Item 'C:\\image\\assets\\post-gen' 'C:\\post-generation'",
+      "Remove-Item -Recurse 'C:\\image\\assets'",
+      "Move-Item 'C:\\image\\scripts\\docs-gen' 'C:\\image\\SoftwareReport'",
+      "Move-Item 'C:\\image\\scripts\\helpers' 'C:\\Program Files\\WindowsPowerShell\\Modules\\\\ImageHelpers'",
+      "New-Item -Type Directory -Path 'C:\\Program Files\\WindowsPowerShell\\Modules\\\\TestsHelpers\\'",
+      "Move-Item 'C:\\image\\scripts\\tests\\Helpers.psm1' 'C:\\Program Files\\WindowsPowerShell\\Modules\\\\TestsHelpers\\TestsHelpers.psm1'",
+      "Move-Item 'C:\\image\\scripts\\tests' 'C:\\image\\tests'",
+      "Remove-Item -Recurse 'C:\\image\\scripts'",
+      "Move-Item 'C:\\image\\toolsets\\toolset-2025.json' 'C:\\image\\toolset.json'",
+      "Remove-Item -Recurse 'C:\\image\\toolsets'"
+    ]
+  },
+  {
+    "id": "shell:d1956e4c44c4",
+    "kind": "windows-shell",
+    "inline": [
+      "net user installer @install_password@ /add /passwordchg:no /passwordreq:yes /active:yes /Y",
+      "net localgroup Administrators installer /add",
+      "winrm set winrm/config/service/auth @{Basic=\"true\"}",
+      "winrm get winrm/config/service/auth"
+    ]
+  },
+  {
+    "id": "inline:66fcb42eef59",
+    "kind": "powershell",
+    "inline": [
+      "if (-not ((net localgroup Administrators) -contains 'installer')) { exit 1 }"
+    ]
+  },
+  {
+    "id": "inline:1cd1951e7394",
+    "kind": "powershell",
+    "inline": [
+      "bcdedit.exe /set TESTSIGNING ON"
+    ],
+    "elevated": true
+  },
+  {
+    "id": "Configure-WindowsDefender.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-WindowsDefender.ps1"
+  },
+  {
+    "id": "Configure-PowerShell.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-PowerShell.ps1"
+  },
+  {
+    "id": "Install-PowerShellModules.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-PowerShellModules.ps1"
+  },
+  {
+    "id": "Install-WSL2.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-WSL2.ps1"
+  },
+  {
+    "id": "Install-WindowsFeatures.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-WindowsFeatures.ps1"
+  },
+  {
+    "id": "Install-Chocolatey.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Chocolatey.ps1"
+  },
+  {
+    "id": "Configure-BaseImage.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-BaseImage.ps1"
+  },
+  {
+    "id": "Configure-ImageDataFile.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-ImageDataFile.ps1"
+  },
+  {
+    "id": "Configure-SystemEnvironment.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-SystemEnvironment.ps1"
+  },
+  {
+    "id": "Configure-DotnetSecureChannel.ps1",
+    "kind": "powershell",
+    "env": {
+      "AGENT_TOOLSDIRECTORY": "C:\\hostedtoolcache\\windows",
+      "IMAGEDATA_FILE": "C:\\imagedata.json",
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_OS": "win25",
+      "IMAGE_VERSION": "@image_version@",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-DotnetSecureChannel.ps1"
+  },
+  {
+    "id": "restart",
+    "kind": "windows-restart"
+  },
+  {
+    "id": "inline:b2ac39306f12",
+    "kind": "powershell",
+    "inline": [
+      "Set-Service -Name wlansvc -StartupType Manual",
+      "if ($(Get-Service -Name wlansvc).Status -eq 'Running') { Stop-Service -Name wlansvc}"
+    ]
+  },
+  {
+    "id": "Install-Docker.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Docker.ps1"
+  },
+  {
+    "id": "Install-DockerWinCred.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-DockerWinCred.ps1"
+  },
+  {
+    "id": "Install-DockerCompose.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-DockerCompose.ps1"
+  },
+  {
+    "id": "Install-PowershellCore.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-PowershellCore.ps1"
+  },
+  {
+    "id": "Install-WebPlatformInstaller.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-WebPlatformInstaller.ps1"
+  },
+  {
+    "id": "restart#2",
+    "kind": "windows-restart"
+  },
+  {
+    "id": "Install-VisualStudio.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-VisualStudio.ps1",
+    "elevated": true,
+    "valid_exit_codes": [
+      0,
+      3010
+    ]
+  },
+  {
+    "id": "Install-KubernetesTools.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-KubernetesTools.ps1",
+    "elevated": true,
+    "valid_exit_codes": [
+      0,
+      3010
+    ]
+  },
+  {
+    "id": "restart#3",
+    "kind": "windows-restart"
+  },
+  {
+    "id": "Install-Wix.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Wix.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "Install-VSExtensions.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-VSExtensions.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "Install-AzureCli.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-AzureCli.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "Install-AzureDevOpsCli.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-AzureDevOpsCli.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "Install-ChocolateyPackages.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-ChocolateyPackages.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "Install-JavaTools.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-JavaTools.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "Install-Kotlin.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Kotlin.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "Install-OpenSSL.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-OpenSSL.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "Install-ServiceFabricSDK.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-ServiceFabricSDK.ps1"
+  },
+  {
+    "id": "restart#4",
+    "kind": "windows-restart"
+  },
+  {
+    "id": "Install-ActionsCache.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-ActionsCache.ps1"
+  },
+  {
+    "id": "Install-Ruby.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Ruby.ps1"
+  },
+  {
+    "id": "Install-PyPy.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-PyPy.ps1"
+  },
+  {
+    "id": "Install-Toolset.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Toolset.ps1"
+  },
+  {
+    "id": "Configure-Toolset.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-Toolset.ps1"
+  },
+  {
+    "id": "Install-NodeJS.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-NodeJS.ps1"
+  },
+  {
+    "id": "Install-AndroidSDK.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-AndroidSDK.ps1"
+  },
+  {
+    "id": "Install-PowershellAzModules.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-PowershellAzModules.ps1"
+  },
+  {
+    "id": "Install-Pipx.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Pipx.ps1"
+  },
+  {
+    "id": "Install-Git.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Git.ps1"
+  },
+  {
+    "id": "Install-GitHub-CLI.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-GitHub-CLI.ps1"
+  },
+  {
+    "id": "Install-PHP.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-PHP.ps1"
+  },
+  {
+    "id": "Install-Rust.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Rust.ps1"
+  },
+  {
+    "id": "Install-Sbt.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Sbt.ps1"
+  },
+  {
+    "id": "Install-Chrome.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Chrome.ps1"
+  },
+  {
+    "id": "Install-EdgeDriver.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-EdgeDriver.ps1"
+  },
+  {
+    "id": "Install-Firefox.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Firefox.ps1"
+  },
+  {
+    "id": "Install-Selenium.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Selenium.ps1"
+  },
+  {
+    "id": "Install-IEWebDriver.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-IEWebDriver.ps1"
+  },
+  {
+    "id": "Install-Apache.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Apache.ps1"
+  },
+  {
+    "id": "Install-Nginx.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Nginx.ps1"
+  },
+  {
+    "id": "Install-Msys2.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Msys2.ps1"
+  },
+  {
+    "id": "Install-WinAppDriver.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-WinAppDriver.ps1"
+  },
+  {
+    "id": "Install-R.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-R.ps1"
+  },
+  {
+    "id": "Install-AWSTools.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-AWSTools.ps1"
+  },
+  {
+    "id": "Install-DACFx.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-DACFx.ps1"
+  },
+  {
+    "id": "Install-MysqlCli.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-MysqlCli.ps1"
+  },
+  {
+    "id": "Install-SQLPowerShellTools.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-SQLPowerShellTools.ps1"
+  },
+  {
+    "id": "Install-SQLOLEDBDriver.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-SQLOLEDBDriver.ps1"
+  },
+  {
+    "id": "Install-DotnetSDK.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-DotnetSDK.ps1"
+  },
+  {
+    "id": "Install-Mingw64.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Mingw64.ps1"
+  },
+  {
+    "id": "Install-Haskell.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Haskell.ps1"
+  },
+  {
+    "id": "Install-Stack.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Stack.ps1"
+  },
+  {
+    "id": "Install-Miniconda.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Miniconda.ps1"
+  },
+  {
+    "id": "Install-AzureCosmosDbEmulator.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-AzureCosmosDbEmulator.ps1"
+  },
+  {
+    "id": "Install-Zstd.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Zstd.ps1"
+  },
+  {
+    "id": "Install-Vcpkg.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Vcpkg.ps1"
+  },
+  {
+    "id": "Install-Bazel.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-Bazel.ps1"
+  },
+  {
+    "id": "Install-RootCA.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-RootCA.ps1"
+  },
+  {
+    "id": "Install-MongoDB.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-MongoDB.ps1"
+  },
+  {
+    "id": "Install-CodeQLBundle.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-CodeQLBundle.ps1"
+  },
+  {
+    "id": "Configure-Diagnostics.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-Diagnostics.ps1"
+  },
+  {
+    "id": "Install-PostgreSQL.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-PostgreSQL.ps1",
+    "elevated": true
+  },
+  {
+    "id": "Install-WindowsUpdates.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-WindowsUpdates.ps1",
+    "elevated": true
+  },
+  {
+    "id": "Configure-DynamicPort.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-DynamicPort.ps1",
+    "elevated": true
+  },
+  {
+    "id": "Configure-GDIProcessHandleQuota.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-GDIProcessHandleQuota.ps1",
+    "elevated": true
+  },
+  {
+    "id": "Configure-Shell.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-Shell.ps1",
+    "elevated": true
+  },
+  {
+    "id": "Configure-DeveloperMode.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Configure-DeveloperMode.ps1",
+    "elevated": true
+  },
+  {
+    "id": "Invoke-Cleanup.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Invoke-Cleanup.ps1",
+    "elevated": true
+  },
+  {
+    "id": "Install-LLVM.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-LLVM.ps1",
+    "elevated": true
+  },
+  {
+    "id": "restart#5",
+    "kind": "windows-restart"
+  },
+  {
+    "id": "Install-WindowsUpdatesAfterReboot.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Install-WindowsUpdatesAfterReboot.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "Invoke-Cleanup.ps1#2",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/build/Invoke-Cleanup.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "RunAll-Tests.ps1",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "TEMP_DIR": "C:\\temp"
+    },
+    "script": "images/windows/scripts/tests/RunAll-Tests.ps1",
+    "pause_before": "2m0s"
+  },
+  {
+    "id": "inline:2ccb342f8070",
+    "kind": "powershell",
+    "inline": [
+      "if (-not (Test-Path C:\\image\\tests\\testResults.xml)) { throw 'C:\\image\\tests\\testResults.xml not found' }"
+    ]
+  },
+  {
+    "id": "inline:95232ed70324",
+    "kind": "powershell",
+    "env": {
+      "IMAGE_FOLDER": "C:\\image",
+      "IMAGE_VERSION": "@image_version@"
+    },
+    "inline": [
+      "pwsh -File 'C:\\image\\SoftwareReport\\Generate-SoftwareReport.ps1'"
+    ]
+  },
+  {
+    "id": "inline:5e07af433741",
+    "kind": "powershell",
+    "inline": [
+      "if (-not (Test-Path C:\\software-report.md)) { throw 'C:\\software-report.md not found' }",
+      "if (-not (Test-Path C:\\software-report.json)) { throw 'C:\\software-report.json not found' }"
+    ]
+  },
+  {
+    "id": "download:C:\\software-report.md",
+    "kind": "file",
+    "sources": [
+      "C:\\software-report.md"
+    ],
+    "destination": "@root@/../Windows2025-Readme.md",
+    "download": true
+  },
+  {
+    "id": "download:C:\\software-report.json",
+    "kind": "file",
+    "sources": [
+      "C:\\software-report.json"
+    ],
+    "destination": "@root@/../software-report.json",
+    "download": true
+  },
+  {
+    "id": "Install-NativeImages.ps1",
+    "kind": "powershell",
+    "env": {
+      "INSTALL_USER": "installer"
+    },
+    "script": "images/windows/scripts/build/Install-NativeImages.ps1"
+  },
+  {
+    "id": "Configure-System.ps1",
+    "kind": "powershell",
+    "env": {
+      "INSTALL_USER": "installer"
+    },
+    "script": "images/windows/scripts/build/Configure-System.ps1"
+  },
+  {
+    "id": "Configure-User.ps1",
+    "kind": "powershell",
+    "env": {
+      "INSTALL_USER": "installer"
+    },
+    "script": "images/windows/scripts/build/Configure-User.ps1"
+  },
+  {
+    "id": "Post-Build-Validation.ps1",
+    "kind": "powershell",
+    "env": {
+      "INSTALL_USER": "installer"
+    },
+    "script": "images/windows/scripts/build/Post-Build-Validation.ps1"
+  },
+  {
+    "id": "restart#6",
+    "kind": "windows-restart"
+  },
+  {
+    "id": "inline:d7a486e6e744",
+    "kind": "powershell",
+    "inline": [
+      "if( Test-Path $env:SystemRoot\\System32\\Sysprep\\unattend.xml ){ rm $env:SystemRoot\\System32\\Sysprep\\unattend.xml -Force}",
+      "& $env:SystemRoot\\System32\\Sysprep\\Sysprep.exe /oobe /generalize /mode:vm /quiet /quit",
+      "while($true) { $imageState = Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Setup\\State | Select ImageState; if($imageState.ImageState -ne 'IMAGE_STATE_GENERALIZE_RESEAL_TO_OOBE') { Write-Output $imageState.ImageState; Start-Sleep -s 10 } else { break } }"
+    ]
+  }
+]

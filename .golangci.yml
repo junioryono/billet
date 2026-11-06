@@ -330,6 +330,18 @@ linters:
             - $gostd
             - github.com/junioryono/billet/internal/config$
 
+        # THE WORKLOAD FORMAT IS A FORMAT, NOT A LAYER (#526). `billet jobs export`
+        # writes it from the ledger and the replay harness reads it, so whatever it
+        # imported both sides would; it may use the standard library and
+        # internal/config, and nothing else.
+        jobtrace:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/jobtrace/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+
         # THE DISPATCH VOCABULARY IMPORTS NO LEDGER AND NO ROLE. The scheduler and
         # the node runtime both name a Runner, a Job and a CacheAuthority through
         # it, so whatever it imported the node would import too. Measured at zero
@@ -400,6 +412,23 @@ linters:
             - $gostd
             - github.com/junioryono/billet/internal/regularfile$
 
+        # THE HOST'S FIREWALL AND RESOLVER FOR A GUEST, below the provider that
+        # attaches it and the node that reads it, and #510's workspaces beside them.
+        # Its tests enter network namespaces, which production code here never does.
+        egress:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/egress/**"
+            - "!$test"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+            - github.com/junioryono/billet/internal/durablefile$
+            - github.com/junioryono/billet/internal/regularfile$
+            - golang.org/x/net/dns/dnsmessage$
+            - github.com/ti-mo/conntrack$
+            - github.com/ti-mo/netfilter$
+
         # THE IDLE POWER POLICY IS A LEAF. It writes a host's cpufreq ceiling as
         # root, so what it imports is what can reach that write: the standard
         # library and the two file primitives its record goes through.
@@ -431,6 +460,35 @@ linters:
           deny:
             - pkg: "github.com/junioryono/billet/internal/app$"
               desc: "internal/app is the assembly; only cmd/billet, its command families under internal/ops and billet's harnesses invoke it (ADR-015)."
+
+        # THE PROCESS HOLDING THE APP KEYS HOLDS NOTHING ELSE (#557), and that is worth
+        # nothing if the package serving them reaches the ledger or the scheduler, or if
+        # they reach it. Only the assembly, the one command that makes a client key and
+        # the suite that runs it through the assembly name it.
+        tokenbroker:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/tokenbroker/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+            - github.com/junioryono/billet/internal/durablefile$
+            - github.com/junioryono/billet/internal/github$
+            - github.com/junioryono/billet/internal/regularfile$
+            - github.com/junioryono/billet/internal/wirecert$
+            - github.com/junioryono/billet/internal/tokenbroker$
+        tokenbrokerconsumers:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!${config-path}/internal/tokenbroker/**"
+            - "!${config-path}/internal/app/**"
+            - "!${config-path}/internal/ops/setup/**"
+            - "!${config-path}/internal/e2e/**"
+            - "!$test"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/tokenbroker$"
+              desc: "internal/tokenbroker is reached through internal/app, or through the one command that makes a client key."
 
         # A COMMAND FAMILY IS THE BINARY'S, and only the binary dispatches to it
         # (#356 Phase 4). A runtime package importing one would be a layer below
@@ -709,8 +767,12 @@ linters:
               desc: "A package that opens a write transaction must not run subprocesses: DB.Tx holds SQLite's single writer slot for as long as the command takes."
             - pkg: "github.com/junioryono/billet/internal/provider"
               desc: "The ledger is a lower layer than compute; a provider call inside a transaction holds the single writer slot across a remote API."
+            - pkg: "github.com/junioryono/billet/internal/egress"
+              desc: "The ledger is a lower layer than a guest's network policy, which runs nft and opens sockets; a call inside a transaction holds the writer slot for it."
             - pkg: "github.com/junioryono/billet/internal/store"
               desc: "The ledger is a lower layer than site storage; an rbd call inside a transaction holds the single writer slot."
+            - pkg: "github.com/junioryono/billet/internal/tokenbroker"
+              desc: "The ledger is a lower layer than the token broker; a token asked for inside a transaction holds the writer slot across a network round trip."
             - pkg: "github.com/junioryono/billet/internal/github"
               desc: "The ledger is a lower layer than the GitHub client; a token mint inside a transaction holds the single writer slot across a network round trip."
             - pkg: "github.com/junioryono/billet/internal/scaleset"

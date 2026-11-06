@@ -9,3 +9,11 @@ The guest image is built by running GitHub's own runner-images template (#250): 
 - `base.pin` is the Ubuntu 24.04 cloud root filesystem each guest build starts from, a line per machine: the release directory, the file, and its sha256 from that release's `SHA256SUMS`. The pinned `SHA256SUMS` was verified against Canonical's cloud-image signing key (`D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81`, "UEC Image Automatic Signing Key") on 2026-09-27; a bump verifies the new one the same way before recording its sum.
 
 `scripts/run-runner-images.sh` executes the plan against a booted target through a driver (run as root, copy in, copy out, reboot). The guest build's driver is `runner-images-nspawn.sh`, a systemd-nspawn machine booted from the image being built; the EC2 AMI build's is `scripts/ami/ami-target.sh`, the builder itself, which `scripts/ami/build-ami.sh` runs as a systemd unit that resumes after the template's reboot (ADR-022).
+
+## Windows
+
+The Windows AMI runs a declared part of GitHub's `windows-2025` template ([ADR-026](../../docs/reference/decisions/adr-026-windows-on-ec2.md)), held the same way and driven by `scripts/windows/build-ami.ps1` rather than by the runner above.
+
+- `upstream/images/windows/` is GitHub's tree at the same commit, its files in `BLOBS` and `TREES` with the rest. The toolset it reads is `internal/runnerimages/toolset-2025.json`, not vendored twice.
+- `plan-windows-2025.json` is the template's provisioner list, derived by the same reader (`go test ./scripts -run TheWindowsPlanIsTheTemplates -update-plan`).
+- `differences-windows.tsv` is every difference, one line each as `action<TAB>id<TAB>reason`: a `skip`, or a `prepare:<name>` that runs `scripts/windows/prepare-<name>.ps1` before the step. There is one target, so it has no targets column. An entry naming a step the plan does not have stops the build, and a pin bump reviews every entry against the new plan.

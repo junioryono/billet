@@ -25,7 +25,7 @@ The advertisements of different tiers therefore sum to more than the fleet can r
 
 ### Capacity is bought when a runner starts
 
-A lease is taken at three points and nowhere else: per offer in `handle` (the legacy acquisition path), per pool launch in `reconcilePool` (`backPoolSlot`, one lease at a time, launched before the next is bought), and per assignment this process holds no promise for (`backAssignment`). Each purchase is the allocator's ordinary atomic `Escrow`, so the deployment ceiling, each node's budget, per-node fit, `max_concurrent`, explicit `reserved` floors, macOS licence slots and the admission seal all still decide it, unchanged. Escrow bought for work that did not use it is released after that message is handled.
+A lease is taken at three points and nowhere else: per offer in `handle` (the legacy acquisition path), per pool launch in `reconcilePool` (`backPoolSlot`, one lease at a time, up to the launches that may start at once), and per assignment this process holds no promise for (`backAssignment`). Each purchase is the allocator's ordinary atomic `Escrow`, so the deployment ceiling, each node's budget, per-node fit, `max_concurrent`, explicit `reserved` floors, macOS licence slots and the admission seal all still decide it, unchanged. Escrow bought for work that did not use it is released after that message is handled.
 
 Nothing is reserved for an idle tier. An explicit `reserved` floor is the one exception, because an operator asked for it.
 

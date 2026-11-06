@@ -4,11 +4,13 @@ tier       billet-2vcpu on epyc-1 (docker, 2 vCPU, 8.0 GiB)
 job        "build (ubuntu, go 1.26)" (github job "51000000007", run 4242, request 77)
 repository "acme/api"
 workflow   "acme/api/.github/workflows/ci.yml@refs/heads/main"
+commit     not recorded on branch not recorded
 event      "push"
 result     github "succeeded"; billet done
 times      queued 2026-10-09T11:59:57.000000000Z, assigned 2026-10-09T11:59:57.000000000Z, started 2026-10-09T12:00:00.000000000Z, finished 2026-10-09T12:02:51.000000000Z
 github     queued -, assigned to the scale set -, to a runner -
 waited     unknown (at github unknown, for room unknown, to start 3s)
+runtime    ran 2m51s; predicted 10m0s, the default, with nothing learned, and it ran 7m9s shorter
 phases     bought      2026-10-09T11:59:57.000000000Z
            assigned    2026-10-09T11:59:57.000000000Z  +0s
            launched    2026-10-09T11:59:58.000000000Z  +1s
@@ -47,6 +49,8 @@ complete   yes
 tap        sent 3.4 MiB, received 394.2 MiB; tap minus attributed: sent +16.6 KiB, received +213.9 KiB
            (a comparison of two counters read a moment apart, not a measurement of what was missed)
 
+egress     no report recorded (one arrives as the job's compute goes, from a firecracker node with node.monitoring.flows on or a tier with network.egress)
+
 series     169 samples on the host's clock from 2026-10-09T12:00:00.000Z to 2026-10-09T12:02:47.500Z; 1 interval not seen, 1s in all, which no window counts
            2026-10-09T12:00:59.000Z to 2026-10-09T12:01:00.000Z (1s): failed_read, a counter the sampler had read before could not be read
 
@@ -73,6 +77,8 @@ final      no record of accepting it
 restart    none while the job ran
 received   no arrival recorded (the node stamps only the batches it accepts)
 encoded    0 B, codec 1
+
+tests      no test cases recorded (the agent found none, the node or its VM's image is older than this, or they were deleted past server.test_results_retention)
 == billet jobs show --html, the guest section ==
 <section id="guest">
 <h2>What the job's own VM reported</h2>

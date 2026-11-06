@@ -22,6 +22,10 @@ type (
 	JobDestination   = lease.JobDestination
 	TapTotals        = lease.TapTotals
 	GuestReport      = lease.GuestReport
+	JobEgress        = lease.JobEgress
+	EgressRefusal    = lease.EgressRefusal
+	EgressNames      = lease.EgressNames
+	EgressDenial     = lease.EgressDenial
 )
 
 const (
@@ -74,7 +78,13 @@ const (
 	MaxJobDestinations      = lease.MaxJobDestinations
 	SlowReplyMillis         = lease.SlowReplyMillis
 	GuestReportCodec        = lease.GuestReportCodec
+	MaxEgressRefusedNames   = lease.MaxEgressRefusedNames
+	MaxEgressDenied         = lease.MaxEgressDenied
+	MaxEgressNamedAddrs     = lease.MaxEgressNamedAddrs
+	MaxEgressNamesPerAddr   = lease.MaxEgressNamesPerAddr
 	MaxGuestReportBytes     = lease.MaxGuestReportBytes
+	TestResultsCodec        = lease.TestResultsCodec
+	MaxTestResultsBytes     = lease.MaxTestResultsBytes
 )
 
 // ErrLeaseNotFound means the lease does not exist, or is already terminal.

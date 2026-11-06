@@ -120,7 +120,7 @@ func TestTheJSONRecordAndItsWindowListTheGaps(t *testing.T) {
 	w := window{from: tl.First.Add(5500 * time.Millisecond), to: tl.First.Add(9 * time.Second)}
 
 	var out bytes.Buffer
-	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, tl, "", nil,
+	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, tl, "", nil, jobEgress{}, jobTests{},
 		windowJSONOf(tl, "", w)); err != nil {
 		t.Fatalf("renderJobJSON: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestTheJSONRecordAndItsWindowListTheGaps(t *testing.T) {
 	seen := run15()
 	seen.Points[6].Gap = usage.GapNone
 	out.Reset()
-	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, seen, "", nil,
+	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, seen, "", nil, jobEgress{}, jobTests{},
 		windowJSONOf(seen, "", w)); err != nil {
 		t.Fatalf("renderJobJSON: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestTheJSONRecordAndItsWindowListTheGaps(t *testing.T) {
 	// AND ONE THAT CANNOT TELL SAYS NULL, AND WHY.
 	out.Reset()
 	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, nil, "the usage report came with "+
-		"no series", nil, windowJSONOf(nil, "the usage report came with no series", w)); err != nil {
+		"no series", nil, jobEgress{}, jobTests{}, windowJSONOf(nil, "the usage report came with no series", w)); err != nil {
 		t.Fatalf("renderJobJSON: %v", err)
 	}
 	whole = decodeRecord(t, out.Bytes())

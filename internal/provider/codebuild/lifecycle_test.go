@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -26,6 +27,20 @@ func TestALaunchAskingForGuestBuildCachesIsRefused(t *testing.T) {
 	if _, err := p.Launch(t.Context(), spec); err == nil ||
 		!strings.Contains(err.Error(), "guest build caches") {
 		t.Fatalf("Launch = %v, want a refusal naming the guest build caches", err)
+	}
+}
+
+// NOR A NETWORK POLICY, WHICH ONLY A FIRECRACKER GUEST'S TAP CAN CARRY: the build would
+// run open.
+func TestALaunchAskingForANetworkPolicyIsRefused(t *testing.T) {
+	f := newFakeAWS(t)
+	p := newTestProvider(t, f, nil)
+
+	spec := launchSpec(provider.InstanceName("abc123"))
+	spec.Egress = egress.Observe()
+
+	if _, err := p.Launch(t.Context(), spec); err == nil || !strings.Contains(err.Error(), "network policy") {
+		t.Fatalf("Launch = %v, want a refusal naming the network policy", err)
 	}
 }
 

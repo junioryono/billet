@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 )
@@ -90,10 +91,25 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 			ErrNoNode, tier.Label, tier.Arch, n.name, archs)
 	}
 
+	// NOR A WINDOWS LEASE, whose boot script an older node would write for Linux, on an
+	// AMI that does not run it (ADR-026).
+	if lease.GuestOS == config.GuestWindows && wire < nodeapi.VersionWindowsGuests {
+		return fmt.Errorf("%w: lease %s boots Windows, which node %s would not start: it speaks "+
+			"wire %d and a Windows guest needs %d, so upgrade the node",
+			ErrNoNode, lease.ID, n.name, wire, nodeapi.VersionWindowsGuests)
+	}
+
 	if tier.NeedsCacheAwareNode() && wire < nodeapi.VersionCacheAuthority {
 		return fmt.Errorf("%w: tier %s configures its caches, which node %s cannot honour: it "+
 			"speaks wire %d and a cache block needs %d, so upgrade the node",
 			ErrNoNode, tier.Label, n.name, wire, nodeapi.VersionCacheAuthority)
+	}
+
+	// NOR IS AN ALLOWLIST: an older node would ignore it and run the job open.
+	if tier.NeedsEgressAwareNode() && wire < nodeapi.VersionEgress {
+		return fmt.Errorf("%w: tier %s has an egress allowlist, which node %s cannot honour: it "+
+			"speaks wire %d and an allowlist needs %d, so upgrade the node",
+			ErrNoNode, tier.Label, n.name, wire, nodeapi.VersionEgress)
 	}
 
 	id, err := commandID()
@@ -127,6 +143,14 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 	if tier.Arch != "" {
 		pend.minWire = max(pend.minWire, nodeapi.VersionArchitectures)
 		pend.arch = tier.Arch
+	}
+
+	if tier.NeedsEgressAwareNode() {
+		pend.minWire = max(pend.minWire, nodeapi.VersionEgress)
+	}
+
+	if lease.GuestOS == config.GuestWindows {
+		pend.minWire = max(pend.minWire, nodeapi.VersionWindowsGuests)
 	}
 
 	res, err := r.plane.dispatch(ctx, n, pend)

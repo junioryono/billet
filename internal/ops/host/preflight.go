@@ -15,6 +15,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/ops/cache"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/ec2"
@@ -201,6 +202,16 @@ func ec2Preflight(
 				"and paste the id\n", img.ImageID, reason)
 		case img.State != "available":
 			fmt.Fprintf(env.Stdout, "image    %s is %s, not yet available\n", img.ImageID, img.State)
+		// A WINDOWS IMAGE ANSWERS TO ITS OWN CONTRACT: every gap below names something
+		// about a Linux image's Docker store, toolcache or components.
+		case img.Windows && img.Contract < ec2.WindowsAMIContract:
+			fmt.Fprintf(env.Stdout, "image    %s is a Windows AMI carrying no contract this billet "+
+				"accepts, so nothing billet booted says what it carries; `billet ami verify %s` "+
+				"boots it and stamps it if it meets contract %d, or rebuild with `billet ami build "+
+				"--os windows`\n", img.ImageID, img.ImageID, ec2.WindowsAMIContract)
+		case img.Windows:
+			fmt.Fprintf(env.Stdout, "image    %s available (Windows AMI contract %d)\n",
+				img.ImageID, img.Contract)
 		case img.Contract == 0:
 			// NO STAMP IS NOT AN OLD BUILD. A current build run with --verify=false,
 			// or one whose verification failed, is unstamped as well, so what it
@@ -275,6 +286,10 @@ func ec2Preflight(
 
 	// AND WHAT EACH IMAGE BOOTS ON, against the tiers that name it (ADR-022).
 	if err := ec2TierArchMismatch(cfg, images); err != nil {
+		return err
+	}
+
+	if err := ec2TierGuestOSMismatch(cfg, images); err != nil {
 		return err
 	}
 
@@ -669,6 +684,33 @@ func checkFirecrackerHost(ctx context.Context, env cli.Env, cfg *config.Config, 
 	// launch fail has been misled by this line.
 	fmt.Fprintf(env.Stdout, "         (read only — launching also needs root, to chroot, to create the root "+
 		"disk's device node inside the jail, and to attach a tap to the bridge)\n")
+
+	return checkEgress(ctx, env, cfg)
+}
+
+// checkEgress says whether this host can enforce a tier's allowlist and record the
+// names its guests resolve. A host that cannot only fails the check when a tier here
+// asks for a list: names are best effort, and a node with neither runs as it did.
+func checkEgress(ctx context.Context, env cli.Env, cfg *config.Config) error {
+	return judgeEgress(env, cfg, egress.Check(ctx))
+}
+
+// judgeEgress is checkEgress given what the host answered.
+func judgeEgress(env cli.Env, cfg *config.Config, err error) error {
+	if err == nil {
+		fmt.Fprintf(env.Stdout, "egress   a tier's allowlist can be enforced and guests' names recorded\n")
+
+		return nil
+	}
+
+	fmt.Fprintf(env.Stdout, "egress   a tier's allowlist cannot be enforced here, and guests' names are not "+
+		"recorded: %v\n", err)
+
+	for i := range cfg.Tiers {
+		if cfg.Tiers[i].NeedsEgressAwareNode() {
+			return fmt.Errorf("tier %q has an allowlist and this host cannot apply one: %w", cfg.Tiers[i].Label, err)
+		}
+	}
 
 	return nil
 }

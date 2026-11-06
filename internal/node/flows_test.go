@@ -1,10 +1,14 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -201,6 +205,48 @@ func TestStartFlowsFollowsTheGuestsOwnLease(t *testing.T) {
 				t.Errorf("followed from %v, want the launch time %v", rec.launched["billet-1"], launched)
 			}
 		})
+	}
+}
+
+// THE NODE'S LOG SAYS WHY A JOB'S TOTALS ARE A LOWER BOUND (#678), since nothing
+// else names the rule that marked it, including a total too large for the
+// ledger, which the tracker never knew of; a complete job names no reason.
+func TestTheLogSaysWhyAJobsTrafficIsIncomplete(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		result     flows.Result
+		incomplete bool
+		why        string
+	}{
+		"complete": {why: "incomplete_why=[]"},
+		"marked by the tracker": {
+			result:     flows.Result{Incomplete: true, IncompleteWhy: []string{flows.WhyEventsGap, flows.WhyDropped}},
+			incomplete: true, why: `incomplete_why="[events_gap unclaimed_dropped]"`,
+		},
+		"a total too large for the ledger": {
+			result:     flows.Result{Other: flows.Destination{Sent: math.MaxUint64}},
+			incomplete: true, why: "incomplete_why=[total_too_large]",
+		},
+		"both": {
+			result: flows.Result{Incomplete: true, IncompleteWhy: []string{flows.WhyEventsGap},
+				Other: flows.Destination{Sent: math.MaxUint64}},
+			incomplete: true, why: `incomplete_why="[events_gap total_too_large]"`,
+		},
+	} {
+		var log bytes.Buffer
+		rec := newRecordingFlows()
+		rec.result = tc.result
+		r := &Runner{log: slog.New(slog.NewTextHandler(&log, nil)), flows: rec, leaseDir: "/leases"}
+
+		got := r.finalFlows(t.Context(), "billet-1", time.Now(), usage.Summary{}, false)
+		if got == nil || got.Incomplete != tc.incomplete {
+			t.Errorf("%s: reported %+v, want incomplete %v", name, got, tc.incomplete)
+		}
+		line := log.String()
+		if !strings.Contains(line, tc.why) || !strings.Contains(line, "incomplete="+strconv.FormatBool(tc.incomplete)) {
+			t.Errorf("%s: the log line said\n%s\nwant %s and incomplete=%v", name, line, tc.why, tc.incomplete)
+		}
 	}
 }
 

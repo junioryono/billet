@@ -30,6 +30,8 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The kernel is linked into each jail and stays root-owned.**
 - **Two defects survived every unit test and died on the first real launch**
 - **A restore loads paused, links its snapshot read-only, and is configured only by the jailer.**
+- **A guest's network policy goes on its tap's name before the tap exists, and comes off only on proof it is gone.**
+- **A frame to a link-local MAC never reaches the bridge's prerouting hook, so no rule there sees it.**
 
 ### Tart: [references/tart.md](references/tart.md)
 
@@ -44,6 +46,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The runner gets GitHub's locale.**
 - **A moving image tag resolves to its pulled digest**
 - **SIGKILL re-adopts; SIGTERM drains.**
+- **Every first exec waits for the guest agent, and a begun delete finishes.**
 
 ### Simulated: [references/simulated.md](references/simulated.md)
 

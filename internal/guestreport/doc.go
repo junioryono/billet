@@ -16,6 +16,10 @@
 // job and, when it destroys the compute, merges them (Merge) into one Report, halves
 // its resolution until it fits (Downsample) and hands the encoding on.
 //
+// A job's test cases travel in the agent's last batch (Batch.Cases) and never join
+// the Report: TestResultsOf gathers them into a TestResults of their own, which the
+// ledger keeps longer than a report and `billet tests stats` ranks.
+//
 // Codec 1 is the value as JSON, compressed with DEFLATE. Decoding is strict, and
 // every refusal is an *Error wrapping one of this package's sentinels; no refusal
 // quotes a byte the guest wrote, because an operator reads them.

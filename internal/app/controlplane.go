@@ -95,6 +95,10 @@ type ControlPlane struct {
 	serverOpts []server.ControlPlaneOption
 	steering   Steering
 
+	// listenerTimings joins this plane's listeners to its metrics endpoint, either of
+	// which may start first.
+	listenerTimings *server.ListenerTimings
+
 	// self is the address OpenControlPlane made this plane at, for the reason a
 	// Controller records its own: the proofs were earned against what is there,
 	// and a plane overwritten with another's value is not it.
@@ -211,6 +215,8 @@ func OpenControlPlane(
 	}
 
 	cp := &ControlPlane{
+		listenerTimings: &server.ListenerTimings{},
+
 		cfg:        cfg,
 		host:       host,
 		db:         db,
@@ -511,6 +517,10 @@ type ScheduleOptions struct {
 	// that runs the node runtime in process against the allocator; the wire is
 	// still served. Nil in a deployment.
 	NodeRunner dispatch.Runner
+	// ForegroundLaunches makes every listener wait for each launch, for the replay
+	// harness, whose determinism needs a parked listener to mean a quiet one. False in
+	// a deployment.
+	ForegroundLaunches bool
 }
 
 // Schedule assembles everything that schedules: the liveness and barrier loops,
@@ -547,7 +557,12 @@ func (c *Controller) Schedule(
 	serverOpts := append([]server.ControlPlaneOption{}, cp.serverOpts...)
 	serverOpts = append(serverOpts, server.WithHurry(opts.Hurry), server.WithLeadershipLost(cp.db.LeadershipLost),
 		server.WithCompletionLedger(cp.db), server.WithTargets(cp.targets...),
-		server.WithStopHandoff(), server.WithHeartbeatOverrun(c.heartbeatOverrun))
+		server.WithStopHandoff(), server.WithHeartbeatOverrun(c.heartbeatOverrun),
+		server.WithListenerTimings(cp.listenerTimings))
+
+	if opts.ForegroundLaunches {
+		serverOpts = append(serverOpts, server.WithForegroundLaunches())
+	}
 
 	if opts.DryRun {
 		serverOpts = append(serverOpts, server.AdvertiseNothing())
@@ -878,3 +893,6 @@ func nodeRunner(plane, steered dispatch.Runner) dispatch.Runner {
 
 	return plane
 }
+
+// ListenerTimings is where this controller's listeners report how long their loops take.
+func (c *Controller) ListenerTimings() *server.ListenerTimings { return c.cp.listenerTimings }
