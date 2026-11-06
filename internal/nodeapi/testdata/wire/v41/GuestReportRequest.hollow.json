@@ -1,0 +1,17 @@
+{
+  "epoch": 0,
+  "report": {
+    "agent_version": "",
+    "schema": 0,
+    "codec": 0,
+    "data": "",
+    "accepted": 0,
+    "refused": 0,
+    "dropped_bytes": 0,
+    "hello": false,
+    "final_seen": false,
+    "node_restarted": false,
+    "first_received": "0001-01-01T00:00:00Z",
+    "last_received": "0001-01-01T00:00:00Z"
+  }
+}

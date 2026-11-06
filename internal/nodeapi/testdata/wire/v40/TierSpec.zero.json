@@ -34,5 +34,10 @@
     "go": {
       "enabled": false
     }
+  },
+  "egress": {
+    "allow": [
+      ""
+    ]
   }
 }

@@ -42,6 +42,8 @@ jobs:
           - { package: ./internal/guestagent, fuzz: FuzzPIDStat }
           - { package: ./internal/guestagent, fuzz: FuzzJUnitParse }
           - { package: ./internal/usage, fuzz: FuzzDecodeSeriesGaps }
+          - { package: ./internal/egress, fuzz: FuzzReadQuestion }
+          - { package: ./internal/egress, fuzz: FuzzReadAnswer }
     steps:
       - uses: actions/checkout@v6
 

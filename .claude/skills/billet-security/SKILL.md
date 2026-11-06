@@ -18,6 +18,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The server is unprivileged; the node is a root custodian.**
 - **Trust belongs to a pool, not to the assignment that scaled it up.**
 - **Untrusted work needs a real boundary and a network of its own, and each backend answers differently.**
+- **A guest's network policy is keyed by its interface and its own resolver socket, never by anything it wrote.**
 - **A registration proves who you are; only a command proves what you may do.**
 - **Destruction is scoped by deployment identity.**
 - **Never signal a pid you have not proved is still yours.**

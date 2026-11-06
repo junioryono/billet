@@ -36,6 +36,8 @@
 #      `ghcr.io/actions/actions-runner:latest`. The image name is passed
 #      straight to `docker run`, so `ubuntu-2404-x64@g1` below is a golden-image
 #      reference for Firecracker and is not pullable.
+#   6. Delete the `network:` block. Only a Firecracker guest's tap can carry an
+#      allowlist, and on Docker the job would run open, so it is refused.
 #
 # Edits 1 through 3 together get you a config that validates and a server that
 # starts, and every job then fails to launch — which is why the third is here.
@@ -202,7 +204,7 @@ server:
   # This control plane's index of what jobs wrote, where a tier sets logs.keep: a file
   # of its own a day under identity_dir, not in the ledger, about three times the text
   # it covers. The text stays on the node that ran the job. At least 1h and 64MiB;
-  # absent, 336h and 32GiB. See ADR-028.
+  # absent, 336h and 32GiB. See ADR-029.
   #
   # logs:
   #   retention: 336h
@@ -1105,7 +1107,7 @@ node:
 
   # What this node keeps of its jobs' step logs, where a tier sets logs.keep: compressed
   # under state_dir, the oldest jobs evicted whole. At least 1h, 64MiB and 1MiB; absent, 336h,
-  # 64GiB and 64MiB. Only a node with monitoring.guest receives any. See ADR-028.
+  # 64GiB and 64MiB. Only a node with monitoring.guest receives any. See ADR-029.
   #
   # logs:
   #   retention: 336h
@@ -1284,6 +1286,30 @@ tiers:
       bazel: { enabled: false }
       go: { enabled: false }
       npm: { enabled: false }
+
+  # A TIER THAT MAY TALK ONLY TO WHAT IT NAMES, enforced on the host and never in
+  # the guest (ADR-028, docs/operating/egress.md). The node answers these guests'
+  # DNS itself and refuses a name off the list without forwarding it, connects
+  # them only to what a listed name answered and the prefixes below, and refuses
+  # DNS to any other resolver and every IPv6 packet. Every list includes GitHub's
+  # runner endpoints and the node's own services, so `allow: []` is the tightest.
+  #
+  # `example.com` is that name alone, `*.example.com` every name below it and not
+  # the name itself. Firecracker tiers only: on any other backend the job would
+  # run open, so the file is refused. A node that cannot apply the list refuses
+  # the launch.
+  - label: billet-2vcpu-ubuntu-2404-locked
+    provider: firecracker
+    vcpu: 2
+    memory: 8GiB
+    disk: 40GiB
+    image: ubuntu-2404-x64@g1
+    network:
+      egress:
+        allow:
+          - registry.npmjs.org
+          - "*.pythonhosted.org"
+          - 203.0.113.0/24
 
 # Apple Silicon, once a Mac mini joins the fleet. Such a host CAN serve both
 # macOS guests and native Linux arm64 guests, but whether it does is your

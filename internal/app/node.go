@@ -395,6 +395,10 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		return err
 	}
 	runnerOpts = append(runnerOpts, monitorOpts...)
+
+	egressOpts, stopEgress := nodeEgressOptions(ctx, cfg, p)
+	defer stopEgress()
+	runnerOpts = append(runnerOpts, egressOpts...)
 	if powerCtl != nil {
 		runnerOpts = append(runnerOpts, node.WithPower(powerCtl))
 	}

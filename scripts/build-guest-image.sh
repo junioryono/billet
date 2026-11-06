@@ -54,8 +54,38 @@ PINNED_RUNNER_FILE="$SCRIPT_DIR/../internal/runnerrelease/pinned.txt"
 # package lists in two languages is the shape of the bug runnerrelease exists to
 # prevent: a package added for one backend silently missing from the other, found
 # on the day a workflow needs it.
-TOOLSET_FILE="$SCRIPT_DIR/../internal/runnerimages/toolset-2404.json"
 TOOLSET_PIN="$SCRIPT_DIR/../internal/runnerimages/pinned.txt"
+
+# THE GUEST'S MACHINE IS THE HOST'S (ADR-022): GitHub's scripts run in the base
+# filesystem booted on this machine, so the base, the template's plan and toolset,
+# the runner, billet's own build and the image's name are all chosen from it, here
+# and together. An image of one machine with a runner or a userspace of the other
+# boots and then fails when the agent execs the runner, inside a guest nobody has
+# a console for. A machine billet builds no guest for is refused in need_tools.
+MACHINE=$(uname -m)
+case "$MACHINE" in
+x86_64)
+	SCOPE=guest-x64 PLAN_NAME=plan.json TOOLSET_NAME=toolset-2404.json TOOLSET_PIN_KEY=x64
+	RUNNER_PLATFORM=linux-x64 GUEST_GOARCH=amd64 TOOLCACHE_ARCH=x64 BASE_ARCH=amd64
+	IMAGE_NAME_DEFAULT=ubuntu-2404-x64
+	APT_URIS="https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/"
+	;;
+aarch64)
+	SCOPE=guest-arm64 PLAN_NAME=plan-arm64.json TOOLSET_NAME=toolset-2404-arm64.json TOOLSET_PIN_KEY=arm64
+	RUNNER_PLATFORM=linux-arm64 GUEST_GOARCH=arm64 TOOLCACHE_ARCH=arm64 BASE_ARCH=arm64
+	IMAGE_NAME_DEFAULT=ubuntu-2404-arm64
+	# ONE SITE, AS GITHUB'S configure-apt.sh SAYS OF 24.04 arm64: Ubuntu serves arm64
+	# from ports.ubuntu.com alone. Measured 2026-11-04: archive.ubuntu.com answers 404
+	# for binary-arm64, and mirrors.edge.kernel.org for ubuntu-ports.
+	APT_URIS="https://ports.ubuntu.com/ubuntu-ports/"
+	;;
+*)
+	SCOPE="" PLAN_NAME="" TOOLSET_NAME="" TOOLSET_PIN_KEY="" RUNNER_PLATFORM="" GUEST_GOARCH=""
+	TOOLCACHE_ARCH="" BASE_ARCH="" IMAGE_NAME_DEFAULT="" APT_URIS=""
+	;;
+esac
+TOOLSET_FILE="$SCRIPT_DIR/../internal/runnerimages/$TOOLSET_NAME"
+PLAN_FILE="$SCRIPT_DIR/runner-images/$PLAN_NAME"
 
 # TOOLCACHE_DIR IS NOT A CHOICE.
 #
@@ -115,7 +145,7 @@ SIZE_MB="${SIZE_MB:-81920}"
 # happened to work, which is the rule the billet-config skill states about byte sizes.
 MIN_FREE_MB="${MIN_FREE_MB:-512}"
 IMAGE_POOL="${IMAGE_POOL:-billet-images}"
-IMAGE_NAME="${IMAGE_NAME:-ubuntu-2404-x64}"
+IMAGE_NAME="${IMAGE_NAME:-$IMAGE_NAME_DEFAULT}"
 CEPH_USER="${CEPH_USER:-billet}"
 WORK_DEFAULT=/var/tmp/billet-guest
 WORK="${WORK:-$WORK_DEFAULT}"
@@ -135,11 +165,20 @@ PUBLISH="${PUBLISH:-yes}"
 # that version. Held apart, a bump updates one of them: either the build fails its
 # own integrity check, or -- worse -- the checksum is updated alone and the download
 # is verified against a number belonging to a different release.
-RUNNER_SHA256="${RUNNER_SHA256:-$(awk "NR==1{print \$2}" "$PINNED_RUNNER_FILE")}"
+#
+# ONE LINE PER PLATFORM: the first names the version and the linux-x64 tarball's
+# sum, and each after it `<platform> <sha256>` for the same version, so this
+# machine's tarball is verified against its own number.
+if [ "$RUNNER_PLATFORM" = linux-x64 ]; then
+	RUNNER_SHA256="${RUNNER_SHA256:-$(awk "NR==1{print \$2}" "$PINNED_RUNNER_FILE")}"
+else
+	RUNNER_SHA256="${RUNNER_SHA256:-$(awk -v p="$RUNNER_PLATFORM" 'NR>1 && $1==p{print $2; exit}' "$PINNED_RUNNER_FILE")}"
+fi
 
-if [ -z "$RUNNER_SHA256" ]; then
-	echo "no checksum for runner $RUNNER_VERSION in $PINNED_RUNNER_FILE; the format is" >&2
-	echo "one line: '<version> <sha256 of the linux-x64 tarball>'" >&2
+if [ -n "$RUNNER_PLATFORM" ] && [ -z "$RUNNER_SHA256" ]; then
+	echo "no checksum for runner $RUNNER_VERSION's $RUNNER_PLATFORM tarball in $PINNED_RUNNER_FILE;" >&2
+	echo "its first line is '<version> <sha256 of the linux-x64 tarball>' and each after it" >&2
+	echo "'<platform> <sha256>'" >&2
 	exit 1
 fi
 
@@ -317,7 +356,7 @@ NOTICES
 install_guest_billet() {
 	local rootfs=$1
 	local candidate go="" newest=""
-	for candidate in "$rootfs$TOOLCACHE_DIR"/go/*/x64/bin/go; do
+	for candidate in "$rootfs$TOOLCACHE_DIR"/go/*/"$TOOLCACHE_ARCH"/bin/go; do
 		[ -x "$candidate" ] || continue
 		local version=${candidate#"$rootfs$TOOLCACHE_DIR"/go/}
 		version=${version%%/*}
@@ -332,7 +371,7 @@ install_guest_billet() {
 		exit 1
 	fi
 	install -d -m 0755 "$rootfs/opt/billet/bin"
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=readonly \
+	CGO_ENABLED=0 GOOS=linux GOARCH="$GUEST_GOARCH" GOFLAGS=-mod=readonly \
 		GOPATH="$WORK/go" GOCACHE="$WORK/go-build" \
 		"$go" -C "$SCRIPT_DIR/.." build -trimpath -o "$rootfs/opt/billet/bin/billet" ./cmd/billet
 	chmod 0755 "$rootfs/opt/billet/bin/billet"
@@ -407,8 +446,11 @@ install_cache_sudoers() {
 
 # THE COMPONENTS THE PUBLISHED IMAGE LEAVES OUT (#584), whose licenses forbid
 # billet redistributing them; differences.tsv skips their installers. The one
-# list is check-guest-component.sh's, which a test holds to config.ImageComponents.
-COMPONENTS=$("$SCRIPT_DIR/check-guest-component.sh" names | tr '\n' ' ')
+# list is check-guest-component.sh's, which a test holds to config.ImageComponents,
+# narrowed to what this machine's template installs: GitHub's arm64 template
+# installs Firefox alone of the five (ADR-022), so that is all the arm64 guest
+# leaves out. Set in main, once need_tools has said whether jq is there to ask with.
+COMPONENTS=""
 
 # install_completer puts the image's completer at /opt/billet/complete: what a
 # deployment that accepts a component runs, chrooted into the image, to install
@@ -591,8 +633,13 @@ verify_toolset() {
 		exit 1
 	}
 
+	# THE FIRST LINE IS x64's, `<commit> <sha256>`; each after it `<arch> <sha256>`.
 	local want got
-	want=$(awk 'NR==1{print $2}' "$TOOLSET_PIN")
+	if [ "$TOOLSET_PIN_KEY" = x64 ]; then
+		want=$(awk 'NR==1{print $2}' "$TOOLSET_PIN")
+	else
+		want=$(awk -v k="$TOOLSET_PIN_KEY" 'NR>1 && $1==k{print $2; exit}' "$TOOLSET_PIN")
+	fi
 	got=$(sha256sum "$TOOLSET_FILE" | cut -d' ' -f1)
 
 	if [ "$want" != "$got" ]; then
@@ -829,11 +876,18 @@ recover_runner_images() {
 # scripts/runner-images/base.pin, into the mounted image and makes it a billet
 # guest's base: the filesystem GitHub's template starts from on Azure, without
 # Azure.
+#
+# ONE LINE PER MACHINE, the file naming its architecture, each sum from the same
+# signature-checked SHA256SUMS.
 install_cloud_base() {
-	local rootfs="$1" release file sum
-	read -r release file sum <"$SCRIPT_DIR/runner-images/base.pin"
+	local rootfs="$1" release="" file="" sum="" line
+	line=$(awk -v a="$BASE_ARCH" '$2 ~ ("-" a "-root\\.tar\\.xz$") {print; exit}' \
+		"$SCRIPT_DIR/runner-images/base.pin")
+	if [ -n "$line" ]; then
+		read -r release file sum <<<"$line"
+	fi
 	if [ -z "$sum" ]; then
-		echo "scripts/runner-images/base.pin names no release, file and sha256" >&2
+		echo "scripts/runner-images/base.pin names no release, file and sha256 for $BASE_ARCH" >&2
 		exit 1
 	fi
 
@@ -860,8 +914,7 @@ install_cloud_base() {
 	# and cloud-init would wait at every boot for a datasource that is not there.
 	touch "$rootfs/etc/cloud/cloud-init.disabled"
 
-	write_apt_sources "$rootfs" \
-		"https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/"
+	write_apt_sources "$rootfs" "$APT_URIS"
 	rm -f "$rootfs/etc/apt/sources.list"
 	install -m 0644 /dev/stdin "$rootfs/etc/apt/apt.conf.d/90billet-fetch" <<'APTCONF'
 Acquire::Retries "3";
@@ -898,7 +951,7 @@ run_runner_images_build() {
 
 	BILLET_RI_ROOTFS="$rootfs" \
 		BILLET_RI_TARGET="$driver" \
-		BILLET_RI_SCOPE=guest-x64 \
+		BILLET_RI_SCOPE="$SCOPE" \
 		BILLET_RI_IMAGE_VERSION="$(date -u +%Y%m%d).billet" \
 		BILLET_RI_OUT="$WORK/runner-images" \
 		"$SCRIPT_DIR/run-runner-images.sh"
@@ -994,20 +1047,9 @@ need_tools() {
 		exit 1
 	fi
 
-	# THE GUEST'S ARCHITECTURE IS THE HOST'S, AND THE RUNNER IS PINNED TO x64.
-	# The base filesystem and the machine that runs GitHub's scripts are the host's
-	# architecture, so on an arm64 machine this would build an arm64 userspace and
-	# drop an x86-64 runner into it.
-	# That combination boots perfectly and fails at the moment the agent execs the
-	# runner, with an executable-format error inside a guest nobody has a console for
-	# -- the exact shape of failure this whole image is built to make impossible.
-	local arch
-	arch=$(uname -m)
-
-	if [ "$arch" != "x86_64" ]; then
-		echo "this builds an x86-64 guest (the pinned runner is linux-x64) and this host is" >&2
-		echo "$arch; build it on an x86-64 machine, or teach this script to select the" >&2
-		echo "runner and base filesystem architecture together" >&2
+	# THE GUEST'S MACHINE IS THE HOST'S, and billet builds guests for two.
+	if [ -z "$SCOPE" ]; then
+		echo "this host is $MACHINE, and billet builds guests for x86_64 and aarch64 only" >&2
 		exit 1
 	fi
 }
@@ -1016,6 +1058,8 @@ need_tools() {
 main() {
 	need_root
 	need_tools
+
+	COMPONENTS=$("$SCRIPT_DIR/check-guest-component.sh" offered "$PLAN_FILE" | tr '\n' ' ')
 
 	# BEFORE ANYTHING IS BUILT, because this file decides what goes in.
 	verify_toolset
@@ -1153,7 +1197,7 @@ main() {
 		echo 'runner ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/runner
 	"
 
-	local tarball="actions-runner-linux-x64-$RUNNER_VERSION.tar.gz"
+	local tarball="actions-runner-$RUNNER_PLATFORM-$RUNNER_VERSION.tar.gz"
 
 	# RETRIED, FOR THE REASON THE KERNEL FETCH IS. A sibling download of comparable
 	# size died six minutes into a CI run with `curl: (92) HTTP/2 stream 1 was not
@@ -2798,6 +2842,64 @@ unmap_image() {
 	fi
 }
 
+# refuse_another_machine ends the build unless every generation of IMAGE_NAME is known
+# to be this machine's, as an import through `billet images pull` requires (ADR-022):
+# one image holds one machine, so a site's x64 and arm64 nodes cannot share one by
+# naming it, and an older billet, which resolves by contract alone, never meets a
+# generation of another. A generation with no record may be of either, and is refused
+# rather than guessed at: `billet images pull` learns it from the generation itself.
+#
+# ANYTHING IT COULD NOT READ IS REFUSED TOO, because this is what stands between a
+# build on the wrong machine and a fleet's image.
+refuse_another_machine() {
+	local rbd=(rbd --id "$CEPH_USER") snaps gen said status errors
+	if ! snaps=$("${rbd[@]}" -p "$IMAGE_POOL" snap ls "$IMAGE_NAME" --format json); then
+		echo "could not list the generations of $IMAGE_POOL/$IMAGE_NAME to hold them to $MACHINE" >&2
+		exit 1
+	fi
+	# EVERY NAME ceph.ParseGeneration TAKES FOR ONE, trimmed as it trims, whose time parser
+	# also accepts a fraction of a second, and any it would refuse for a date it cannot
+	# read: a generation this skipped is one this could write another machine beside.
+	if ! snaps=$(jq -er '[.[].name | gsub("^\\s+|\\s+$"; "") | select(test("^g[0-9]{14}([.,][0-9]+)?$"))] | join(" ")' <<<"$snaps"); then
+		echo "could not read the generations of $IMAGE_POOL/$IMAGE_NAME" >&2
+		exit 1
+	fi
+	errors=$(mktemp)
+	# EACH KEY ASKED FOR BY ITS WHOLE NAME, as ceph.GenerationArch asks, AND NO LISTING READ
+	# AT ALL. rbd escapes no key: a reference image holds one with a raw newline, from a
+	# hand-run publish in August (measured 2026-11-04), so `image-meta list --format json`
+	# is refused by jq whole, and in the plain table what follows that newline is a row of
+	# whatever it says, which could read as this key's.
+	for gen in $snaps; do
+		status=0
+		said=$("${rbd[@]}" -p "$IMAGE_POOL" image-meta get "$IMAGE_NAME" "billet.arch.$gen" 2>"$errors") || status=$?
+		if [ "$status" -ne 0 ]; then
+			# grep's THREE ANSWERS: anything but "it says so" is could-not-tell.
+			if ! grep -qF "(2) No such file or directory" "$errors"; then
+				echo "could not read what $IMAGE_POOL/$IMAGE_NAME records of $gen:" >&2
+				cat "$errors" >&2
+				rm -f "$errors"
+				exit 1
+			fi
+			said=""
+		fi
+		if [ -z "$said" ]; then
+			echo "$IMAGE_NAME@$gen records no machine, so a generation of $MACHINE cannot join it;" >&2
+			echo "run \`billet images pull\` on a node, which learns it from the generation, or" >&2
+			echo "set IMAGE_NAME to an image of its own" >&2
+			rm -f "$errors"
+			exit 1
+		fi
+		if [ "$said" != "$MACHINE" ]; then
+			echo "$IMAGE_NAME@$gen is $said's and this build is $MACHINE's; one image holds one" >&2
+			echo "machine, so set IMAGE_NAME to an image of its own" >&2
+			rm -f "$errors"
+			exit 1
+		fi
+	done
+	rm -f "$errors"
+}
+
 # publish writes the image into the pool as a NEW generation.
 #
 # A NEW SNAPSHOT EVERY TIME, never a moved one. A generation is what running jobs hold
@@ -2819,6 +2921,8 @@ publish() {
 	if ! "${rbd[@]}" -p "$IMAGE_POOL" info "$IMAGE_NAME" >/dev/null 2>&1; then
 		"${rbd[@]}" -p "$IMAGE_POOL" create "$IMAGE_NAME" --size "${want}M" --object-size 4M
 	else
+		refuse_another_machine
+
 		# GROWN IF IT HAS TO BE, because an image that already exists was sized for
 		# whatever the last generation needed. Writing a larger filesystem into it
 		# fails partway through with `No space left on device` — a corrupt image with
@@ -2865,9 +2969,11 @@ publish() {
 	# record is read as one that left nothing out, which this one did not, and a
 	# deployment that accepts a component refuses to verify one that lacks it. A
 	# crash between the two leaves a record for a generation never made, which
-	# nothing reads.
+	# nothing reads. ITS MACHINE THE SAME WAY, as ceph.SetArch records it: `uname -m`'s
+	# spelling, under the name this build holds the publish lock over.
 	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.components.$gen" \
 		"$(components_record)"
+	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.arch.$gen" "$MACHINE"
 
 	"${rbd[@]}" -p "$IMAGE_POOL" snap create "$IMAGE_NAME@$gen"
 

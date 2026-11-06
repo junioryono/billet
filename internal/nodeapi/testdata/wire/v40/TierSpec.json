@@ -20,7 +20,6 @@
   },
   "cache": {
     "publish": "TierSpec.cache.publish",
-    "keep_logs": true,
     "owner": "TierSpec.cache.owner",
     "repository": "TierSpec.cache.repository",
     "docker": {
@@ -50,5 +49,10 @@
     "go_test_results": true,
     "npm": true
   },
-  "arch": "TierSpec.arch"
+  "arch": "TierSpec.arch",
+  "egress": {
+    "allow": [
+      "TierSpec.egress.allow[0]"
+    ]
+  }
 }

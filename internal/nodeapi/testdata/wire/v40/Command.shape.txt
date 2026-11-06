@@ -80,8 +80,6 @@ Command.tier.cache_scope.WorkflowRef string
 Command.tier.cache tag omitempty
 Command.tier.cache pointer
 Command.tier.cache.publish string
-Command.tier.cache.keep_logs tag omitempty
-Command.tier.cache.keep_logs bool
 Command.tier.cache.owner tag omitempty
 Command.tier.cache.owner string
 Command.tier.cache.repository tag omitempty
@@ -110,6 +108,10 @@ Command.tier.cache.npm tag omitempty
 Command.tier.cache.npm bool
 Command.tier.arch tag omitempty
 Command.tier.arch string
+Command.tier.egress tag omitempty
+Command.tier.egress pointer
+Command.tier.egress.allow slice
+Command.tier.egress.allow[] string
 Command.barrier_id tag omitempty
 Command.barrier_id string
 Command.request_id tag omitempty
@@ -139,10 +141,3 @@ Command.upgrade.version string
 Command.upgrade.manifest_sha256 string
 Command.upgrade.rollout_id string
 Command.upgrade.generation int64
-Command.log_read tag omitempty
-Command.log_read pointer
-Command.log_read.lease string
-Command.log_read.ranges slice
-Command.log_read.ranges[].first int64
-Command.log_read.ranges[].last int64
-Command.log_read.max_bytes int

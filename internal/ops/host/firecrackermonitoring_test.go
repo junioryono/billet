@@ -126,3 +126,47 @@ func TestCheckRefusesAFirecrackerHostMonitoringCannotMeasure(t *testing.T) {
 		})
 	}
 }
+
+// A HOST THAT CANNOT APPLY A LIST FAILS THE CHECK ONLY WHERE A TIER HAS ONE: names are best
+// effort, and a node with neither runs as it did. Either way the line says which it is.
+func TestTheCheckSaysWhetherAListCanBeApplied(t *testing.T) {
+	t.Parallel()
+
+	refused := errors.New("the guard has no rule")
+	open := config.Tier{Label: "open"}
+	listed := config.Tier{Label: "locked", Network: &config.TierNetwork{Egress: &config.TierEgress{}}}
+
+	for name, tc := range map[string]struct {
+		tiers    []config.Tier
+		answer   error
+		wantErr  bool
+		wantLine string
+	}{
+		"a host that can":             {tiers: []config.Tier{listed}, wantLine: "can be enforced"},
+		"a host that cannot, no list": {tiers: []config.Tier{open}, answer: refused, wantLine: "cannot be enforced"},
+		"a host that cannot, with a list": {
+			tiers: []config.Tier{open, listed}, answer: refused, wantErr: true, wantLine: "cannot be enforced",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var out bytes.Buffer
+
+			env := cli.Env{Stdout: &out, Stderr: &out, Getenv: func(string) string { return "" }}
+
+			err := judgeEgress(env, &config.Config{Tiers: tc.tiers}, tc.answer)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("judgeEgress = %v, want an error: %v", err, tc.wantErr)
+			}
+
+			if tc.wantErr && !errors.Is(err, refused) {
+				t.Fatalf("the refusal does not carry the host's reason: %v", err)
+			}
+
+			if !strings.Contains(out.String(), tc.wantLine) {
+				t.Fatalf("the check said %q, want %q", out.String(), tc.wantLine)
+			}
+		})
+	}
+}
