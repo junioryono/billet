@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
@@ -112,7 +113,7 @@ func TestThePoolCommandSaysWhichJoinsAreHeld(t *testing.T) {
 			t.Fatalf("placed: %v", err)
 		}
 	}
-	if err := a.HoldPoolJoin(ctx, "p-held", "the console names\nanother key"); err != nil {
+	if err := a.HoldPoolJoin(ctx, "p-held", "the console names\nanother key", heldAt(t, a, "p-held")); err != nil {
 		t.Fatalf("hold: %v", err)
 	}
 	closeDB()
@@ -129,4 +130,14 @@ func TestThePoolCommandSaysWhichJoinsAreHeld(t *testing.T) {
 	if strings.Contains(out.String(), "held p-fine") {
 		t.Errorf("an order held for no one is listed as held:\n%s", out)
 	}
+}
+
+func heldAt(t *testing.T, a *alloc.Allocator, order string) time.Time {
+	t.Helper()
+	o, err := a.ReadPoolOrder(t.Context(), order)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return o.Updated
 }

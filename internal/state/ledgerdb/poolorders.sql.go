@@ -37,19 +37,27 @@ func (q *Queries) HoldLapsedPoolJoins(ctx context.Context, arg HoldLapsedPoolJoi
 
 const holdPoolOrderJoin = `-- name: HoldPoolOrderJoin :execrows
 UPDATE pool_orders SET join_hold = $1, updated_at = $2
- WHERE order_id = $3 AND join_hold = '' AND state = 'placed' AND node_name = ''
+ WHERE order_id = $3 AND join_hold = '' AND state = 'placed' AND node_name = '' AND updated_at = $4
 `
 
 type HoldPoolOrderJoinParams struct {
 	JoinHold  string
 	UpdatedAt string
 	OrderID   string
+	Seen      string
 }
 
-// Hold an order's join for a person, with the first reason kept, and only while a node
-// may still join from it.
+// Hold an order's join for a person, with the first reason kept, only while a node may
+// still join from it, and only as the order stood when it was judged (@seen, its
+// updated_at then): a verdict reached before a person released a hold does not hold it
+// again after.
 func (q *Queries) HoldPoolOrderJoin(ctx context.Context, arg HoldPoolOrderJoinParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, holdPoolOrderJoin, arg.JoinHold, arg.UpdatedAt, arg.OrderID)
+	result, err := q.db.ExecContext(ctx, holdPoolOrderJoin,
+		arg.JoinHold,
+		arg.UpdatedAt,
+		arg.OrderID,
+		arg.Seen,
+	)
 	if err != nil {
 		return 0, err
 	}

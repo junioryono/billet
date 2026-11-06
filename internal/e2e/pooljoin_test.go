@@ -347,3 +347,69 @@ func TestAHeldHostWhoseTokenLapsedJoinsOnAPersonsWord(t *testing.T) {
 		t.Fatalf("the order after the approval: %+v, %v", o, err)
 	}
 }
+
+// A HOST WHOSE TOKEN LAPSES BEFORE ITS ORDER IS PLACED IS NEVER TURNED AWAY: it is
+// told to ask again while the order is being ordered, and again once it is placed with
+// the token lapsed, recording nothing; the pool then holds the order nothing can join
+// from, the host's next ask is recorded for a person, and their approval admits it.
+func TestAHostWhoseTokenLapsedBeforePlacementWaitsForAPerson(t *testing.T) {
+	t.Parallel()
+	w := newPoolJoinWire(t)
+	ctx := t.Context()
+	if err := w.alloc.RecordPoolOrder(ctx, alloc.PoolOrder{ID: "pd", Source: "metal", Scope: "metal:here", Shape: "m",
+		Arch: config.ArchX64}); err != nil {
+		t.Fatal(err)
+	}
+	token, err := w.alloc.NewPoolJoinToken(ctx, "pd", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := alloc.PoolNodeName("pd")
+	host, _, err := wirecert.NewNodeCSR(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostFP, err := wirecert.FingerprintOfCSR(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waits := func(when string) {
+		t.Helper()
+		if _, err := w.ask(t, name, token, host); !errors.Is(err, nodeclient.ErrEnrollUnavailable) &&
+			!errors.Is(err, nodeclient.ErrNotApproved) {
+			t.Fatalf("%s: %v, want told to wait", when, err)
+		}
+	}
+	waits("while the order is being ordered")
+	w.advance(2 * time.Hour)
+	if err := w.alloc.PoolOrderPlaced(ctx, "pd", "host-pd"); err != nil {
+		t.Fatal(err)
+	}
+	waits("placed, with its token lapsed")
+	if _, ok, err := w.alloc.LookupEnrollment(ctx, name); err != nil || ok {
+		t.Fatalf("a lapsed token recorded a request (%v, %v)", ok, err)
+	}
+	if held, err := w.alloc.HoldLapsedPoolJoins(ctx); err != nil || held != 1 {
+		t.Fatalf("the pool held %d, %v", held, err)
+	}
+	waits("once the order is held")
+	e, ok, err := w.alloc.LookupEnrollment(ctx, name)
+	if err != nil || !ok || e.Fingerprint != hostFP || e.State != alloc.EnrollPending || e.PoolOrder != "pd" {
+		t.Fatalf("the held order's request: %+v, %v, %v", e, ok, err)
+	}
+	bundle, err := w.ca.SignNodeCSR(name, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.alloc.DecideEnrollment(ctx, name, hostFP, alloc.EnrollApproved, string(bundle.CertPEM),
+		wirecert.Serial(leaf)); err != nil {
+		t.Fatal(err)
+	}
+	if cert, err := w.ask(t, name, token, host); err != nil || !bytes.Equal(cert, bundle.CertPEM) {
+		t.Fatalf("after the approval: %v", err)
+	}
+}

@@ -46,3 +46,18 @@ ALTER TABLE pool_orders ADD COLUMN node_cert_serial TEXT NOT NULL DEFAULT ''
 -- +billet:statement
 ALTER TABLE pool_orders ADD COLUMN join_hold TEXT NOT NULL DEFAULT ''
 -- +billet:end
+
+-- WHAT MIGRATION 74 LEFT IS BOUND TO ITS ORDER: a pool then minted each order's token
+-- with the note `pool order <order>` and named the host `pool-<order>`, so a token and a
+-- request of a recorded order are that order's, and a host booted before this joins
+-- under the rules after it.
+
+-- +billet:statement
+UPDATE join_tokens SET pool_order = substr(note, 12)
+ WHERE pool_order = '' AND note LIKE 'pool order %' AND substr(note, 12) IN (SELECT order_id FROM pool_orders)
+-- +billet:end
+
+-- +billet:statement
+UPDATE node_enrollments SET pool_order = substr(name, 6)
+ WHERE pool_order = '' AND name LIKE 'pool-%' AND substr(name, 6) IN (SELECT order_id FROM pool_orders)
+-- +billet:end

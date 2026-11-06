@@ -192,8 +192,12 @@ func (a *Allocator) ReadPoolOrder(ctx context.Context, id string) (PoolOrder, er
 	return out, err
 }
 
-// HoldPoolJoin holds an order's join for a person, keeping the first reason given.
-func (a *Allocator) HoldPoolJoin(ctx context.Context, order, reason string) error {
+// HoldPoolJoin holds an order's join for a person, keeping the first reason given, as
+// the order stood when it was judged: seen is its Updated then, and an order that has
+// moved since (a hold released, a node joined) is not held on that verdict, answering
+// ErrPoolOrderMoved, so a person's release is never undone by a verdict reached before
+// it. An order held already, or closed, has nothing to hold.
+func (a *Allocator) HoldPoolJoin(ctx context.Context, order, reason string, seen time.Time) error {
 	if reason == "" {
 		return fmt.Errorf("alloc: pool order %s: a hold needs the reason a person reads", order)
 	}
@@ -202,7 +206,7 @@ func (a *Allocator) HoldPoolJoin(ctx context.Context, order, reason string) erro
 		q := state.WriteQueries(tx)
 
 		n, err := q.HoldPoolOrderJoin(ctx, ledgerdb.HoldPoolOrderJoinParams{
-			OrderID: order, JoinHold: reason, UpdatedAt: ts(a.now()),
+			OrderID: order, JoinHold: reason, UpdatedAt: ts(a.now()), Seen: ts(seen),
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: hold pool order %s: %w", order, err)
@@ -212,12 +216,15 @@ func (a *Allocator) HoldPoolJoin(ctx context.Context, order, reason string) erro
 			return nil
 		}
 
-		// HELD ALREADY, OR CLOSED (a node joined, or it is no longer placed), so there is
-		// nothing to hold: only no such order is a failure.
-		if _, err := q.ReadPoolOrder(ctx, order); errors.Is(err, sql.ErrNoRows) {
+		row, err := q.ReadPoolOrder(ctx, order)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("%w: no pool order %s", ErrPoolOrderClosed, order)
-		} else if err != nil {
+		case err != nil:
 			return fmt.Errorf("alloc: hold pool order %s: %w", order, err)
+		case row.JoinHold == "" && row.State == PoolPlaced && row.NodeName == "":
+			return fmt.Errorf("%w: pool order %s changed after it was judged", ErrPoolOrderMoved, order)
 		}
 
 		return nil
@@ -311,7 +318,8 @@ func (a *Allocator) AdmitPoolEnrollment(ctx context.Context, adm PoolAdmission) 
 			return err
 		}
 
-		if _, err := openPoolOrderTx(ctx, q, adm.Order); err != nil {
+		open, err := openPoolOrderTx(ctx, q, adm.Order)
+		if err != nil {
 			return err
 		}
 
@@ -337,7 +345,7 @@ func (a *Allocator) AdmitPoolEnrollment(ctx context.Context, adm PoolAdmission) 
 			conflict = existing.Fingerprint
 
 			if _, err := q.HoldPoolOrderJoin(ctx, ledgerdb.HoldPoolOrderJoinParams{
-				OrderID: adm.Order, UpdatedAt: now,
+				OrderID: adm.Order, UpdatedAt: now, Seen: open.UpdatedAt,
 				JoinHold: fmt.Sprintf("the source vouched for key %s, and %s already holds the name %s",
 					adm.Fingerprint, conflict, name),
 			}); err != nil {

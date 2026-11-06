@@ -46,6 +46,7 @@ type poolRig struct {
 	recordedHeld []string
 	heldErr      error
 	heldState    string
+	holdErr      error
 }
 
 func (p *poolRig) RecordHeldPoolRequest(_ context.Context, order, fingerprint, _ string) (alloc.Enrollment, error) {
@@ -67,7 +68,7 @@ func newPoolRig(verdict hostsource.Verdict) *poolRig {
 	return &poolRig{
 		orders:  map[string]string{"tok-pa": "pa"},
 		spent:   map[string]bool{},
-		order:   alloc.PoolOrder{ID: "pa", State: alloc.PoolPlaced, HostID: "i-1"},
+		order:   alloc.PoolOrder{ID: "pa", State: alloc.PoolPlaced, HostID: "i-1", Updated: time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)},
 		verdict: hostsource.Testimony{Verdict: verdict, Reason: "the console names i-1's key, 10.0.0.7"},
 	}
 }
@@ -113,9 +114,15 @@ func (p *poolRig) AdmitPoolEnrollment(_ context.Context, adm alloc.PoolAdmission
 		CertPEM: adm.CertPEM, State: alloc.EnrollApproved}, nil
 }
 
-func (p *poolRig) HoldPoolJoin(_ context.Context, order, reason string) error {
+func (p *poolRig) HoldPoolJoin(_ context.Context, order, reason string, seen time.Time) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.holdErr != nil {
+		return p.holdErr
+	}
+	if !seen.Equal(p.order.Updated) {
+		return fmt.Errorf("held as of %v, read %v", seen, p.order.Updated)
+	}
 	p.held = append(p.held, order+": "+reason)
 
 	return nil
@@ -319,7 +326,7 @@ func TestTheLedgerIsAskedBeforeTheSource(t *testing.T) {
 		"an order being ordered": {set: func(p *poolRig, _ *nodeapi.EnrollRequest) { p.order.State = alloc.PoolOrdering },
 			status: http.StatusServiceUnavailable, says: "not yet recorded as placed"},
 		"a spent token and no request": {set: func(p *poolRig, _ *nodeapi.EnrollRequest) { p.spent["tok-pa"] = true },
-			status: http.StatusUnauthorized, says: "join token"},
+			status: http.StatusServiceUnavailable, says: "join waits"},
 		"another name": {set: func(_ *poolRig, r *nodeapi.EnrollRequest) { r.Node = "epyc-1" },
 			status: http.StatusUnauthorized, says: "join token"},
 		"an order that cannot be read": {set: func(p *poolRig, _ *nodeapi.EnrollRequest) { p.orderErr = errors.New("locked") },
@@ -348,7 +355,8 @@ func TestTheLedgerIsAskedBeforeTheSource(t *testing.T) {
 }
 
 // THE REQUEST ALREADY RECORDED MAY ASK AGAIN WITH ITS SPENT TOKEN, and is judged; any
-// other key with that spent token is refused unasked.
+// other key with that spent token is told to ask again, unasked and unrecorded, until
+// the pool holds the order and its request is recorded for a person.
 func TestASpentTokenAsksOnlyForTheRequestItRecorded(t *testing.T) {
 	t.Parallel()
 	rig := newPoolRig(hostsource.VerdictVouches)
@@ -360,8 +368,8 @@ func TestASpentTokenAsksOnlyForTheRequestItRecorded(t *testing.T) {
 		t.Fatalf("the recorded request with its spent token answered %d %+v", status, res)
 	}
 	other, _ := poolRequest(t, alloc.PoolNodeName("pa"))
-	if status, _, _ := askToJoin(t, srv, other); status != http.StatusUnauthorized {
-		t.Fatalf("another key with the spent token answered %d", status)
+	if status, _, _ := askToJoin(t, srv, other); status != http.StatusServiceUnavailable {
+		t.Fatalf("another key with the spent token answered %d, want to ask again", status)
 	}
 	if len(rig.claims) != 1 {
 		t.Fatalf("the source was asked %d times, want once", len(rig.claims))
@@ -370,7 +378,7 @@ func TestASpentTokenAsksOnlyForTheRequestItRecorded(t *testing.T) {
 	// THE SAME KEY RECORDED UNDER NO ORDER is not the order's request, so the spent
 	// token asks nothing for it either.
 	rig.known.PoolOrder = ""
-	if status, _, _ := askToJoin(t, srv, req); status != http.StatusUnauthorized {
+	if status, _, _ := askToJoin(t, srv, req); status != http.StatusServiceUnavailable {
 		t.Fatalf("a spent token for a request recorded under no order answered %d", status)
 	}
 	if len(rig.claims) != 1 {
@@ -459,6 +467,59 @@ func TestAPoolJoinsRefusalsAreAnsweredByWhatTheHostDoes(t *testing.T) {
 				t.Fatalf("answered %d %+v %s, want %+v and no certificate", status, res, body, c.want)
 			}
 		})
+	}
+}
+
+// ANSWERS THAT ARE NOT VERDICTS ARE ASKED AGAIN, RECORDING AND SPENDING NOTHING: a
+// source not asked because its order was asked moments ago, a verdict on an order that
+// moved before it could be acted on, and a held request whose order a node joined from
+// meanwhile.
+func TestWhatIsNotAVerdictIsAskedAgain(t *testing.T) {
+	t.Parallel()
+	for name, set := range map[string]func(*poolRig){
+		"deferred": func(p *poolRig) { p.verdict.Verdict = hostsource.VerdictDeferred },
+		"an order that moved": func(p *poolRig) {
+			p.verdict.Verdict, p.holdErr = hostsource.VerdictContradicts, alloc.ErrPoolOrderMoved
+		},
+		"a node joined meanwhile": func(p *poolRig) {
+			p.order.JoinHold, p.heldErr = "held", fmt.Errorf("%w: joined", alloc.ErrPoolOrderClosed)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rig := newPoolRig(hostsource.VerdictVouches)
+			set(rig)
+			srv, _ := servePool(t, rig, true)
+			req, _ := poolRequest(t, alloc.PoolNodeName("pa"))
+			status, _, body := askToJoin(t, srv, req)
+			if status != http.StatusServiceUnavailable || !strings.Contains(body, "ask again") {
+				t.Fatalf("answered %d %s, want to ask again", status, body)
+			}
+			if len(rig.requested) != 0 || len(rig.admitted) != 0 || len(rig.held) != 0 {
+				t.Fatalf("recorded %v, admitted %d, held %v", rig.requested, len(rig.admitted), rig.held)
+			}
+		})
+	}
+}
+
+// A KEY THAT JOINED FROM ITS ORDER WHILE ITS REQUEST WAS ON ITS WAY is answered on the
+// ordinary path, which hands over what it was given, rather than refused as a closed
+// order.
+func TestAKeyThatJustJoinedIsAnsweredNotRefused(t *testing.T) {
+	t.Parallel()
+	rig := newPoolRig(hostsource.VerdictVouches)
+	srv, _ := servePool(t, rig, true)
+	req, fp := poolRequest(t, alloc.PoolNodeName("pa"))
+	rig.order.NodeName, rig.order.NodeFingerprint = alloc.PoolNodeName("pa"), fp
+	if status, _, _ := askToJoin(t, srv, req); status != http.StatusOK {
+		t.Fatalf("the key that joined answered %d", status)
+	}
+	if len(rig.requested) != 1 || len(rig.claims) != 0 {
+		t.Fatalf("took the ordinary path %d times and asked the source %d", len(rig.requested), len(rig.claims))
+	}
+	other, _ := poolRequest(t, alloc.PoolNodeName("pa"))
+	if status, _, _ := askToJoin(t, srv, other); status != http.StatusConflict {
+		t.Fatalf("another key after the order closed answered %d", status)
 	}
 }
 

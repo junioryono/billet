@@ -237,10 +237,10 @@ func TestAHeldOrderWaitsForAPerson(t *testing.T) {
 	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pa"), "SHA256:k", "csr", tok); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.HoldPoolJoin(ctx, "pa", "the console named another key"); err != nil {
+	if err := a.HoldPoolJoin(ctx, "pa", "the console named another key", readOrder(t, a, "pa").Updated); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.HoldPoolJoin(ctx, "pa", "a second reason"); err != nil {
+	if err := a.HoldPoolJoin(ctx, "pa", "a second reason", readOrder(t, a, "pa").Updated); err != nil {
 		t.Fatalf("a second hold: %v", err)
 	}
 	if o := readOrder(t, a, "pa"); o.JoinHold != "the console named another key" {
@@ -360,16 +360,16 @@ func TestAHoldIsOnlyOnAnOpenOrder(t *testing.T) {
 	if _, err := a.AdmitPoolEnrollment(ctx, admission("joined", "SHA256:j", tok, "0j")); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.HoldPoolJoin(ctx, "joined", "too late"); err != nil {
+	if err := a.HoldPoolJoin(ctx, "joined", "too late", readOrder(t, a, "joined").Updated); err != nil {
 		t.Fatalf("holding a joined order: %v", err)
 	}
 	if o := readOrder(t, a, "joined"); o.JoinHold != "" {
 		t.Fatalf("a joined order was held: %+v", o)
 	}
-	if err := a.HoldPoolJoin(ctx, "missing", "why"); !errors.Is(err, ErrPoolOrderClosed) {
+	if err := a.HoldPoolJoin(ctx, "missing", "why", time.Time{}); !errors.Is(err, ErrPoolOrderClosed) {
 		t.Fatalf("holding no order answered %v", err)
 	}
-	if err := a.HoldPoolJoin(ctx, "joined", ""); err == nil {
+	if err := a.HoldPoolJoin(ctx, "joined", "", readOrder(t, a, "joined").Updated); err == nil {
 		t.Fatal("a hold with no reason was accepted")
 	}
 }
@@ -386,7 +386,7 @@ func TestAHeldJoinIsReleasedOnAPersonsWord(t *testing.T) {
 	if err := a.ReleasePoolJoin(ctx, "pa"); !errors.Is(err, ErrPoolJoinNotHeld) {
 		t.Fatalf("releasing an order with no hold answered %v", err)
 	}
-	if err := a.HoldPoolJoin(ctx, "pa", "a key nobody can account for"); err != nil {
+	if err := a.HoldPoolJoin(ctx, "pa", "a key nobody can account for", readOrder(t, a, "pa").Updated); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", tok, "0a")); !errors.Is(err, ErrPoolJoinHeld) {
@@ -409,7 +409,7 @@ func TestAHeldJoinIsReleasedOnAPersonsWord(t *testing.T) {
 	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pb"), "SHA256:b", "csr", tokB); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.HoldPoolJoin(ctx, "pb", "held"); err != nil {
+	if err := a.HoldPoolJoin(ctx, "pb", "held", readOrder(t, a, "pb").Updated); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.DecideEnrollment(ctx, PoolNodeName("pb"), "SHA256:b", EnrollApproved, "cert", "0b"); err != nil {
@@ -485,7 +485,7 @@ func TestAHeldOrdersRequestIsRecordedForAPerson(t *testing.T) {
 	if _, err := a.RecordHeldPoolRequest(ctx, "pa", "SHA256:k", "csr"); !errors.Is(err, ErrPoolJoinNotHeld) {
 		t.Fatalf("recording for an order that is not held answered %v", err)
 	}
-	if err := a.HoldPoolJoin(ctx, "pa", "the console names another key"); err != nil {
+	if err := a.HoldPoolJoin(ctx, "pa", "the console names another key", readOrder(t, a, "pa").Updated); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(2 * time.Hour)
@@ -510,7 +510,7 @@ func TestAHeldOrdersRequestIsRecordedForAPerson(t *testing.T) {
 	}
 
 	placedOrder(t, a, "pb")
-	if err := a.HoldPoolJoin(ctx, "pb", "held"); err != nil {
+	if err := a.HoldPoolJoin(ctx, "pb", "held", readOrder(t, a, "pb").Updated); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.RecordHeldPoolRequest(ctx, "pb", "SHA256:denied", "csr"); err != nil {
@@ -525,5 +525,30 @@ func TestAHeldOrdersRequestIsRecordedForAPerson(t *testing.T) {
 	if e, err := a.RecordHeldPoolRequest(ctx, "pb", "SHA256:next", "csr"); err != nil || e.State != EnrollPending ||
 		e.Fingerprint != "SHA256:next" {
 		t.Fatalf("another key once the first was denied: %+v, %v", e, err)
+	}
+}
+
+// A VERDICT REACHED BEFORE THE ORDER MOVED HOLDS NOTHING: a person released a hold
+// between a request's judgment and its hold, and the release stands.
+func TestAHoldOnAStaleVerdictHoldsNothing(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	placedOrder(t, a, "pa")
+	judged := readOrder(t, a, "pa").Updated
+	now = now.Add(time.Second)
+	if err := a.HoldPoolJoin(ctx, "pa", "first", judged); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if err := a.ReleasePoolJoin(ctx, "pa"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.HoldPoolJoin(ctx, "pa", "a verdict from before the release", judged); !errors.Is(err, ErrPoolOrderMoved) {
+		t.Fatalf("holding on a stale verdict answered %v", err)
+	}
+	if o := readOrder(t, a, "pa"); o.JoinHold != "" {
+		t.Fatalf("a stale verdict held the order: %+v", o)
 	}
 }

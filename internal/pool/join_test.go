@@ -95,7 +95,7 @@ func TestTheJudgeAsksTheOrdersSourceAboutItsHost(t *testing.T) {
 // AN ORDER'S SOURCE IS ASKED AT MOST ONCE PER INTERVAL, WHATEVER KEY OR ADDRESS A CALLER
 // PRESENTS: a host asks every five seconds, the console read is throttled, and a caller
 // chooses its key. The claim asked gets its verdict back inside the interval; any other
-// claim on the order is could-not-tell without asking, until the interval passes. Each
+// claim on the order is deferred without asking, until the interval passes. Each
 // ask carries a deadline inside the listener's write timeout.
 func TestAnOrdersSourceIsAskedOncePerInterval(t *testing.T) {
 	t.Parallel()
@@ -112,8 +112,8 @@ func TestAnOrdersSourceIsAskedOncePerInterval(t *testing.T) {
 	otherKey, otherAddress := claim, claim
 	otherKey.Fingerprint, otherAddress.Address = "SHA256:other", "10.0.0.8"
 	for _, c := range []hostsource.Claim{otherKey, otherAddress} {
-		if got := j.JudgePoolJoin(t.Context(), c); got.Verdict != hostsource.VerdictUnknown {
-			t.Fatalf("another claim on the order inside the interval: %+v, want could-not-tell", got)
+		if got := j.JudgePoolJoin(t.Context(), c); got.Verdict != hostsource.VerdictDeferred {
+			t.Fatalf("another claim on the order inside the interval: %+v, want deferred", got)
 		}
 	}
 	if got := j.JudgePoolJoin(t.Context(), hostsource.Claim{Order: "pb", Fingerprint: "SHA256:k"}); got.Verdict != hostsource.VerdictVouches {
@@ -144,7 +144,7 @@ func TestAnOrdersSourceIsAskedOncePerInterval(t *testing.T) {
 }
 
 // ONE ASK OF AN ORDER AT A TIME: a second request while the source is still being asked
-// is could-not-tell at once, rather than a second ask of the source.
+// is deferred at once, rather than a second ask of the source.
 func TestAnOrdersSourceIsAskedOneAtATime(t *testing.T) {
 	t.Parallel()
 	src := &witnessSource{fakeSource: &fakeSource{}, answer: hostsource.Testimony{Verdict: hostsource.VerdictVouches},
@@ -155,7 +155,7 @@ func TestAnOrdersSourceIsAskedOneAtATime(t *testing.T) {
 		done <- j.JudgePoolJoin(t.Context(), hostsource.Claim{Order: "pa", Fingerprint: "SHA256:k"})
 	}()
 	<-src.entered
-	if got := j.JudgePoolJoin(t.Context(), hostsource.Claim{Order: "pa", Fingerprint: "SHA256:k"}); got.Verdict != hostsource.VerdictUnknown {
+	if got := j.JudgePoolJoin(t.Context(), hostsource.Claim{Order: "pa", Fingerprint: "SHA256:k"}); got.Verdict != hostsource.VerdictDeferred {
 		t.Fatalf("a request while the order is being asked: %+v", got)
 	}
 	close(src.held)

@@ -26,8 +26,9 @@ type PoolJoins interface {
 	// AdmitPoolEnrollment records the admission, the certificate and the link from the
 	// order to its node in one transaction.
 	AdmitPoolEnrollment(ctx context.Context, adm alloc.PoolAdmission) (alloc.Enrollment, error)
-	// HoldPoolJoin holds an order's join for a person.
-	HoldPoolJoin(ctx context.Context, order, reason string) error
+	// HoldPoolJoin holds an order's join for a person, as the order stood when it was
+	// read (seen, its Updated then): alloc.ErrPoolOrderMoved when it has moved since.
+	HoldPoolJoin(ctx context.Context, order, reason string, seen time.Time) error
 	// RecordHeldPoolRequest records a held order's request pending, spending nothing,
 	// so a person has the host's key to approve.
 	RecordHeldPoolRequest(ctx context.Context, order, fingerprint, csrPEM string) (alloc.Enrollment, error)
@@ -100,6 +101,11 @@ func (h *handler) poolEnroll(
 		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolOrderNotPlaced)
 
 		return true
+	case o.NodeName == req.Node && o.NodeFingerprint == fingerprint:
+		// THIS KEY JOINED FROM THE ORDER while the request was on its way (a person's
+		// approval, a concurrent admission): the ordinary path hands over what it was
+		// given.
+		return false
 	case o.State != alloc.PoolPlaced || o.NodeName != "":
 		writeErr(w, http.StatusConflict, nodeapi.CodeRefused, poolOrderClosed)
 
@@ -111,7 +117,11 @@ func (h *handler) poolEnroll(
 
 		return true
 	case !live && (!mine || existing.PoolOrder != order):
-		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated, badJoinToken)
+		// A TOKEN OF THE ORDER THAT CAN NO LONGER BE SPENT, from a host with nothing
+		// recorded: it is asked again, never refused, because the order is open and the
+		// pool holds an order nothing can join from, after which this host's request is
+		// recorded for a person. Nothing is asked of the source or spent meanwhile.
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
 
 		return true
 	}
@@ -132,7 +142,13 @@ func (h *handler) poolEnroll(
 	case hostsource.VerdictContradicts:
 		h.log.Warn("a pool host's source contradicted its enrollment; the order is held for a person",
 			"node", req.Node, "order", order, "fingerprint", fingerprint, "why", t.Reason)
-		if err := h.poolJoins.HoldPoolJoin(ctx, order, t.Reason); err != nil {
+		if err := h.poolJoins.HoldPoolJoin(ctx, order, t.Reason, o.Updated); errors.Is(err, alloc.ErrPoolOrderMoved) {
+			// THE ORDER MOVED SINCE IT WAS JUDGED (a person released a hold), so this
+			// verdict is not acted on; the host asks again and is judged afresh.
+			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
+
+			return true
+		} else if err != nil {
 			h.log.Error("could not hold a pool order's join", "order", order, "error", err)
 			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, "billet could not record this request; try again")
 
@@ -143,6 +159,12 @@ func (h *handler) poolEnroll(
 		return true
 	case hostsource.VerdictVouches:
 		h.admitPoolHost(w, r, req, fingerprint, order, t.Reason)
+
+		return true
+	case hostsource.VerdictDeferred:
+		// NOT ASKED, SO NOTHING RECORDED OR SPENT: another ask of this order is under way
+		// or just answered, and this host asks again.
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
 
 		return true
 	}
@@ -165,6 +187,10 @@ func (h *handler) recordHeld(w http.ResponseWriter, r *http.Request, req *nodeap
 		writeJSON(w, http.StatusOK, nodeapi.EnrollResponse{State: e.State, Fingerprint: e.Fingerprint})
 	case err == nil, errors.Is(err, alloc.ErrEnrollmentConflict), errors.Is(err, alloc.ErrPoolJoinNotHeld):
 		poolPending(w, fingerprint)
+	case errors.Is(err, alloc.ErrPoolOrderClosed):
+		// A NODE JOINED FROM THE ORDER while this was on its way, perhaps this very key
+		// by a person's approval: the next ask finds out which.
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
 	default:
 		h.poolRefusal(w, req.Node, fingerprint, err)
 	}
@@ -176,6 +202,7 @@ const (
 		"--join-token"
 	poolOrderClosed    = "this pool order admits no node"
 	poolOrderNotPlaced = "this pool host's order is not yet recorded as placed; ask again in a moment"
+	poolJoinWaits      = "this pool host's join waits; ask again in a moment"
 )
 
 // poolPending answers a pool host that waits for a person.

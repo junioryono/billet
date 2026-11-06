@@ -15,6 +15,10 @@ const (
 	// VerdictContradicts is a positive answer for something else: another key, another
 	// instance, another address, or a host that is ending.
 	VerdictContradicts
+	// VerdictDeferred is no answer at all: the source was not asked, because it was
+	// asked about the order moments ago. Unlike could-not-tell, it records nothing and
+	// spends nothing; the host asks again.
+	VerdictDeferred
 )
 
 func (v Verdict) String() string {
@@ -23,6 +27,8 @@ func (v Verdict) String() string {
 		return "vouches"
 	case VerdictContradicts:
 		return "contradicts"
+	case VerdictDeferred:
+		return "deferred"
 	}
 
 	return "unknown"

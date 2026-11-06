@@ -109,7 +109,9 @@ func (j *Joins) JudgePoolJoin(ctx context.Context, claim hostsource.Claim) hosts
 	if _, recently := j.asked[claim.Order]; recently {
 		j.mu.Unlock()
 
-		return hostsource.Testimony{Verdict: hostsource.VerdictUnknown,
+		// DEFERRED, NOT COULD-NOT-TELL: the source was not asked, so nothing may be
+		// recorded or spent on this request, which another ask may be about to answer.
+		return hostsource.Testimony{Verdict: hostsource.VerdictDeferred,
 			Reason: "the order's source was asked about it moments ago; it is asked again shortly"}
 	}
 	j.asked[claim.Order] = now

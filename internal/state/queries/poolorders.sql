@@ -44,10 +44,12 @@ UPDATE pool_orders
  WHERE order_id = @order_id AND state = 'placed' AND node_name = '' AND join_hold = @join_hold;
 
 -- name: HoldPoolOrderJoin :execrows
--- Hold an order's join for a person, with the first reason kept, and only while a node
--- may still join from it.
+-- Hold an order's join for a person, with the first reason kept, only while a node may
+-- still join from it, and only as the order stood when it was judged (@seen, its
+-- updated_at then): a verdict reached before a person released a hold does not hold it
+-- again after.
 UPDATE pool_orders SET join_hold = @join_hold, updated_at = @updated_at
- WHERE order_id = @order_id AND join_hold = '' AND state = 'placed' AND node_name = '';
+ WHERE order_id = @order_id AND join_hold = '' AND state = 'placed' AND node_name = '' AND updated_at = @seen;
 
 -- name: ReleasePoolOrderJoin :execrows
 -- A person releases an order's held join, so its host's next request is judged again.
