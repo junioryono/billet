@@ -113,7 +113,7 @@ func TestAlertsRefuse(t *testing.T) {
 		{"a destination with two", "    url_env: BILLET_ALERT_ONCALL\n", "    url_env: BILLET_ALERT_ONCALL\n    url_file: /x\n", "both set"},
 		{"an illegal variable", "url_env: BILLET_ALERT_ONCALL", "url_env: 9-lives", "not a legal environment variable name"},
 		{"the address itself as the variable", "url_env: BILLET_ALERT_ONCALL", "url_env: https://hooks.slack.example/services/T/B/x", "looks like an address"},
-		{"a relative file", "url_file: /etc/billet/alert-hook-url", "url_file: alert-hook-url", "must be absolute"},
+		{"a relative file", "url_file: /etc/billet/alert-hook-url", "url_file: alert-hook-url", "must be an absolute path"},
 		{"a destination named twice", "name: hook", "name: oncall", `name "oncall" is used twice`},
 		{"a destination name that is no word", "name: oncall", "name: on call", "is not a letter or digit"},
 		{"a rule named twice", "name: slow", "name: deploys", `name "deploys" is used twice`},
@@ -157,7 +157,17 @@ func TestAnAddressInTheConfigIsNotQuotedBack(t *testing.T) {
 	for from, to := range map[string]string{
 		"url_env: BILLET_ALERT_ONCALL":         "url_env: https://hooks.slack.example/services/T/B/" + secret,
 		"url_file: /etc/billet/alert-hook-url": "url_file: https://hooks.slack.example/services/T/B/" + secret,
+		// WITHOUT ITS SCHEME, which no `://` check sees.
+		"url_file: /etc/billet/alert-hook-url\n": "url_file: hooks.slack.example/services/T/B/" + secret + "\n",
+		// PASTED WHERE A NAME OR A REFERENCE GOES.
+		"name: oncall":   "name: \"https://hooks.slack.example/services/T/B/" + secret + "\"",
+		"name: slow":     "name: \"https://hooks.slack.example/services/T/B/" + secret + "\"",
+		"notify: [hook]": "notify: [\"https://hooks.slack.example/services/T/B/" + secret + "\"]",
 	} {
+		if !strings.Contains(goodAlerts, from) {
+			t.Fatalf("the good block has no %q, so this edit tests nothing", from)
+		}
+
 		_, err := Load(writeConfig(t, alertsYAML(strings.Replace(goodAlerts, from, to, 1))))
 		if err == nil {
 			t.Errorf("%q loaded", to)

@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -173,12 +176,13 @@ func TestADestinationThatHangsIsBoundedAndHoldsUpNothingElse(t *testing.T) {
 			t.Errorf("a hung try = %v, want it to say so", err)
 		}
 		assertNoSecret(t, "the error", err.Error(), address)
-	case <-time.After(30 * time.Second):
-		t.Fatal("a destination that hangs held its request past every bound")
+	case <-time.After(5 * time.Second):
+		t.Fatal("a destination that hangs held its request past its bound")
 	}
 
-	if took := time.Since(begun); took < hung.timeout {
-		t.Errorf("the try ended after %s, before its bound of %s", took, hung.timeout)
+	// ITS OWN BOUND ENDED IT, not the transport's longer ones behind it.
+	if took := time.Since(begun); took < hung.timeout || took > 3*time.Second {
+		t.Errorf("the try ended after %s, want its bound of %s", took, hung.timeout)
 	}
 }
 
@@ -212,7 +216,7 @@ func TestAStopEndsATry(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "cancelled") {
 			t.Errorf("a stopped try = %v", err)
 		}
-	case <-time.After(30 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("a stop did not end the try")
 	}
 }
@@ -222,28 +226,106 @@ func TestAStopEndsATry(t *testing.T) {
 func TestATransportFailureCarriesNoAddress(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	address := URL(srv.URL + secretPath)
-	srv.Close()
+	// A CONNECTION THAT CLOSES WITHOUT AN ANSWER, held open for the test so no other
+	// test's server can take its port.
+	hangUp, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hangUp.Close() })
+	go func() {
+		for {
+			conn, err := hangUp.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
 
-	err := NewSender("gone", address).Send(t.Context(), []byte(`{}`))
-	if err == nil {
-		t.Fatal("a refused connection read as delivered")
-	}
-	assertNoSecret(t, "the error", err.Error(), address)
-	if strings.Contains(err.Error(), "127.0.0.1") {
-		t.Errorf("the error names the host: %v", err)
-	}
-	if errors.Is(err, ErrPermanent) {
-		t.Errorf("a refused connection is worth trying again: %v", err)
-	}
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(plain.Close)
+	untrusted := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(untrusted.Close)
 
-	tlsAddress := URL("https://" + strings.TrimPrefix(srv.URL, "http://") + secretPath)
-	if err := NewSender("gone", tlsAddress).Send(t.Context(), []byte(`{}`)); err == nil {
-		t.Error("a refused https connection read as delivered")
-	} else {
-		assertNoSecret(t, "the error", err.Error(), tlsAddress)
+	for name, address := range map[string]URL{
+		"a connection closed unanswered": URL("http://" + hangUp.Addr().String() + secretPath),
+		"https to a plain server":        URL("https://" + strings.TrimPrefix(plain.URL, "http://") + secretPath),
+		"a certificate nobody trusts":    URL(untrusted.URL + secretPath),
+		"a name that does not resolve":   URL("https://hooks.invalid" + secretPath),
+	} {
+		err := NewSender("gone", address).Send(t.Context(), []byte(`{}`))
+		if err == nil {
+			t.Errorf("%s read as delivered", name)
+
+			continue
+		}
+		assertNoSecret(t, name, err.Error(), address)
+		for _, host := range []string{"127.0.0.1", "hooks.invalid"} {
+			if strings.Contains(err.Error(), host) {
+				t.Errorf("%s: the error names the host: %v", name, err)
+			}
+		}
+		if errors.Is(err, ErrPermanent) {
+			t.Errorf("%s is worth trying again: %v", name, err)
+		}
 	}
+}
+
+// AN IDLE CONNECTION IS NEVER KEPT, so nothing a destination writes after its answer
+// is read: the transport reports such bytes through the standard logger, quoting
+// them, and a destination could write the address back. Not parallel: it watches the
+// standard logger.
+func TestWhatADestinationWritesAfterItsAnswerReachesNoLog(t *testing.T) {
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	address := URL("http://" + listener.Addr().String() + secretPath)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				buf := make([]byte, 4096)
+				if _, err := conn.Read(buf); err != nil {
+					return
+				}
+				if _, err := io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); err != nil {
+					return
+				}
+				time.Sleep(200 * time.Millisecond)
+				// UNASKED, on what a kept connection would be idle: the address, back.
+				if _, err := io.WriteString(conn, "HTTP/1.1 200 OK\r\n\r\n"+secretPath); err != nil {
+					return
+				}
+				time.Sleep(500 * time.Millisecond)
+			}()
+		}
+	}()
+
+	var logged bytes.Buffer
+	saved := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(saved) })
+
+	sender := NewSender("oncall", address)
+	if err := sender.Send(t.Context(), []byte(`{}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	time.Sleep(time.Second)
+
+	assertNoSecret(t, "the standard logger", logged.String(), address)
 }
 
 // A DESTINATION WHOSE ADDRESS COULD NOT BE HAD SAYS SO ON EVERY NOTICE, and is never
@@ -284,12 +366,16 @@ func TestNeitherAURLNorASenderRendersTheAddress(t *testing.T) {
 		}
 
 		return map[string]string{
-			"%v":        fmt.Sprintf("%v", v),
-			"%+v":       fmt.Sprintf("%+v", v),
-			"%#v":       fmt.Sprintf("%#v", v),
-			"%s":        fmt.Sprintf("%s", v),
-			"%q":        fmt.Sprintf("%q", v),
-			"%x":        fmt.Sprintf("%x", v),
+			"%v":  fmt.Sprintf("%v", v),
+			"%+v": fmt.Sprintf("%+v", v),
+			"%#v": fmt.Sprintf("%#v", v),
+			"%s":  fmt.Sprintf("%s", v),
+			"%q":  fmt.Sprintf("%q", v),
+			"%x":  fmt.Sprintf("%x", v),
+			// A VERB NO OTHER METHOD ANSWERS, which only Format covers: without it fmt
+			// prints the value raw beside the complaint.
+			"%d":        fmt.Sprintf("%d", v),
+			"%t":        fmt.Sprintf("%t", v),
 			"json":      string(marshalled),
 			"slog json": logged.String(),
 			"slog text": text.String(),
@@ -298,9 +384,15 @@ func TestNeitherAURLNorASenderRendersTheAddress(t *testing.T) {
 
 	hexed := fmt.Sprintf("%x", string(address))
 
+	type byValue struct {
+		Sender Sender
+	}
+
 	for name, v := range map[string]any{
-		"a URL": address, "a sender": sender, "a struct holding both": holder{Address: address, Sender: sender},
-		"a pointer to one": &holder{Address: address, Sender: sender},
+		"a URL": address, "a sender": sender, "a sender's value": *sender,
+		"a struct holding both":           holder{Address: address, Sender: sender},
+		"a pointer to one":                &holder{Address: address, Sender: sender},
+		"a struct holding a sender value": byValue{Sender: *sender},
 	} {
 		for path, text := range render(v) {
 			assertNoSecret(t, name+" through "+path, text, address)
@@ -312,6 +404,16 @@ func TestNeitherAURLNorASenderRendersTheAddress(t *testing.T) {
 
 	if got := sender.Name(); got != "oncall" {
 		t.Errorf("Name = %q", got)
+	}
+
+	// EACH METHOD ON ITS OWN, since fmt answers most verbs from one of the others.
+	senderValue := *sender
+	for name, text := range map[string]string{
+		"URL.GoString": address.GoString(), "URL.LogValue": address.LogValue().String(),
+		"Sender.GoString": sender.GoString(), "Sender.LogValue": sender.LogValue().String(),
+		"Sender value's String": senderValue.String(),
+	} {
+		assertNoSecret(t, name, text, address)
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/junioryono/billet/internal/alerts"
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/server"
 )
@@ -101,28 +100,32 @@ func installationError(err, throttled, refused error) error {
 	}
 }
 
-var _ server.JobSteps = (*Client)(nil)
+var _ server.RunJobSteps = (*Client)(nil)
 
-// RunnerJobSteps reads the steps of the job that ran on runnerName, for an alert rule
-// that names a step, through the target's App client.
-func (c *Client) RunnerJobSteps(ctx context.Context, owner, repository string, runID int64, runnerName string,
-) ([]alerts.Step, error) {
-	records, ok := c.policy.(billetgithub.JobRecords)
+// RunJobSteps reads every job of a run with its steps, by runner name, for an alert
+// rule that names a step, through the target's App client, in one read of the run.
+func (c *Client) RunJobSteps(ctx context.Context, owner, repository string, runID int64,
+) (map[string]server.RunnerSteps, error) {
+	records, ok := c.policy.(billetgithub.RunJobRecords)
 	if c.policy == nil || !ok {
 		return nil, billetgithub.ErrRunEvidenceUnavailable
 	}
 
-	job, err := records.RunnerJob(ctx, owner, repository, runID, runnerName)
+	jobs, err := records.RunnerJobs(ctx, owner, repository, runID)
 	if err != nil {
 		return nil, fmt.Errorf("scaleset: %w", err)
 	}
 
-	steps := make([]alerts.Step, 0, len(job.Steps))
-	for _, step := range job.Steps {
-		steps = append(steps, alerts.Step{Name: step.Name, Conclusion: step.Conclusion})
+	out := make(map[string]server.RunnerSteps, len(jobs))
+	for runner, job := range jobs {
+		record := server.RunnerSteps{Completed: job.Status == billetgithub.RunStatusCompleted}
+		for _, step := range job.Steps {
+			record.Steps = append(record.Steps, server.JobStep{Name: step.Name, Conclusion: step.Conclusion})
+		}
+		out[runner] = record
 	}
 
-	return steps, nil
+	return out, nil
 }
 
 var _ server.RunReruns = (*Client)(nil)

@@ -106,9 +106,17 @@ func TestAFailedJobIsToldToAWebhookOnceAndNotAgainInsideTheCooldown(t *testing.T
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// A DELIVERY PASS OR TWO, so a notice wrongly owed would have gone.
-	time.Sleep(300 * time.Millisecond)
-
+	// NOTHING IS OWED FOR IT: the notice would have been written in the transaction
+	// that moved the streak, which the wait above saw.
+	report, err := s.alloc.AlertReport(t.Context(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range report.Notices {
+		if n.Destination != "hook" || n.State != "delivered" || n.Notices != 1 {
+			t.Errorf("the outbox holds %+v, want the one delivered notice", report.Notices)
+		}
+	}
 	if got := receiver.received(); len(got) != 1 {
 		t.Errorf("the webhook was told %d times, want once: %v", len(got), got)
 	}

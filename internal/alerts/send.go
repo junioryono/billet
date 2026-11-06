@@ -31,7 +31,8 @@ var ErrPermanent = errors.New("alerts: the destination will not accept this")
 //
 // IT HOLDS A CREDENTIAL IN AN UNEXPORTED FIELD, so it redacts itself: fmt, encoding/json
 // and slog reach an unexported field by reflection without calling its methods, so
-// the URL's own redaction does not cover a struct holding one.
+// the URL's own redaction does not cover a struct holding one. On value receivers, so
+// a Sender reached as a value, or through a field, is covered too.
 type Sender struct {
 	name    string
 	url     URL
@@ -53,9 +54,14 @@ func NewSender(name string, address URL) *Sender {
 			DialContext:           (&net.Dialer{Timeout: sendDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
 			TLSHandshakeTimeout:   sendTLSTimeout,
 			ResponseHeaderTimeout: sendHeaderTimeout,
-			IdleConnTimeout:       90 * time.Second,
-			MaxIdleConns:          2,
-			ForceAttemptHTTP2:     true,
+			// NO CONNECTION IS KEPT. An idle HTTP/1.1 connection that a destination
+			// writes to unasked is reported by the transport through the standard
+			// logger, quoting what it wrote, and a destination can write the address
+			// back; a closed connection is never read again. A notice is rare enough
+			// that a fresh connection each costs nothing. HTTP/1.1 only, for the same
+			// reason: one connection, one request.
+			DisableKeepAlives: true,
+			ForceAttemptHTTP2: false,
 		},
 	}}
 }
@@ -69,22 +75,22 @@ func UnusableSender(name, reason string) *Sender {
 }
 
 // Name is the destination's name in the config.
-func (s *Sender) Name() string { return s.name }
+func (s Sender) Name() string { return s.name }
 
 // String names the destination and shows nothing of its address.
-func (s *Sender) String() string { return "alerts.Sender{" + s.name + "}" }
+func (s Sender) String() string { return "alerts.Sender{" + s.name + "}" }
 
 // GoString covers %#v, which does not consult String.
-func (s *Sender) GoString() string { return s.String() }
+func (s Sender) GoString() string { return s.String() }
 
 // Format makes every verb safe, %+v above all, which walks an unexported field.
-func (s *Sender) Format(f fmt.State, _ rune) {
+func (s Sender) Format(f fmt.State, _ rune) {
 	//nolint:errcheck // fmt.State has no error channel; a failed write to it is the caller's output problem.
 	io.WriteString(f, s.String())
 }
 
 // MarshalJSON renders the destination's name and nothing else.
-func (s *Sender) MarshalJSON() ([]byte, error) {
+func (s Sender) MarshalJSON() ([]byte, error) {
 	out, err := json.Marshal(s.String())
 	if err != nil {
 		return nil, fmt.Errorf("alerts: marshal a sender: %w", err)
@@ -94,7 +100,7 @@ func (s *Sender) MarshalJSON() ([]byte, error) {
 }
 
 // LogValue is what slog asks for before falling back to reflection.
-func (s *Sender) LogValue() slog.Value { return slog.StringValue(s.String()) }
+func (s Sender) LogValue() slog.Value { return slog.StringValue(s.String()) }
 
 // Send delivers one rendered notice. nil is an answer of 2xx. An error wrapping
 // ErrPermanent is not worth another try; any other is.
@@ -103,7 +109,7 @@ func (s *Sender) LogValue() slog.Value { return slog.StringValue(s.String()) }
 // client returned. A *url.Error names the URL, and a Slack URL's path is the secret,
 // so scrubbing a query is not enough; and a response body is the destination's to
 // write, so only its status is kept.
-func (s *Sender) Send(ctx context.Context, body []byte) error {
+func (s Sender) Send(ctx context.Context, body []byte) error {
 	if s.reason != "" {
 		return fmt.Errorf("%w: %s", ErrPermanent, s.reason)
 	}

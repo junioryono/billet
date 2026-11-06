@@ -25,11 +25,15 @@ func newAlertAllocator(t *testing.T) (*Allocator, *alertClock) {
 }
 
 // judge is one judgement of a new job of one key under one rule.
+// jobKey is a streak's key as the evaluation writes one: a JSON array of the condition
+// and the job, quotes and all, which PostgreSQL's text must hold as SQLite's does.
+const jobKey = `["failed","acme/api",".github/workflows/deploy.yml","deploy \"eu\" (prod)"]`
+
 func judge(t *testing.T, a *Allocator, lease string, outcome AlertOutcome, inARow int64, cooldown time.Duration) AlertDecision {
 	t.Helper()
 
 	decision, err := a.RecordAlertJudgement(t.Context(), &AlertJudgement{Rule: "r", LeaseID: lease, Condition: "failed",
-		Key: "job", Outcome: outcome, InARow: inARow, Cooldown: cooldown,
+		Key: jobKey, Outcome: outcome, InARow: inARow, Cooldown: cooldown,
 		Notices: []AlertNotice{{Destination: "oncall", Payload: []byte(`{"lease":"` + lease + `"}`)}}})
 	if err != nil {
 		t.Fatalf("judge %s: %v", lease, err)
@@ -131,8 +135,8 @@ func TestAJobIsJudgedOnce(t *testing.T) {
 
 	// ANOTHER CONDITION, OR ANOTHER RULE, IS ANOTHER JUDGEMENT.
 	for _, j := range []AlertJudgement{
-		{Rule: "r", LeaseID: "one", Condition: "disrupted", Key: "job", Outcome: AlertMiss, InARow: 1},
-		{Rule: "other", LeaseID: "one", Condition: "failed", Key: "job", Outcome: AlertMiss, InARow: 1},
+		{Rule: "r", LeaseID: "one", Condition: "disrupted", Key: jobKey, Outcome: AlertMiss, InARow: 1},
+		{Rule: "other", LeaseID: "one", Condition: "failed", Key: jobKey, Outcome: AlertMiss, InARow: 1},
 	} {
 		if d, err := a.RecordAlertJudgement(t.Context(), &j); err != nil || !d.Recorded {
 			t.Errorf("%+v = %+v, %v", j, d, err)
@@ -289,7 +293,7 @@ func TestARulesFirstSightingStands(t *testing.T) {
 		t.Fatal(err)
 	}
 	if d, err := a.RecordAlertJudgement(t.Context(), &AlertJudgement{Rule: "muted-first", LeaseID: "1", Condition: "failed",
-		Key: "job", Outcome: AlertHit, InARow: 1}); err != nil || d.Fired || !d.Muted {
+		Key: jobKey, Outcome: AlertHit, InARow: 1}); err != nil || d.Fired || !d.Muted {
 		t.Errorf("after the first sighting = %+v, %v", d, err)
 	}
 }
@@ -300,7 +304,7 @@ func TestANoticeIsOwedUntilItSettles(t *testing.T) {
 
 	a, clock := newAlertAllocator(t)
 
-	if _, err := a.RecordAlertJudgement(t.Context(), &AlertJudgement{Rule: "r", LeaseID: "one", Condition: "failed", Key: "job",
+	if _, err := a.RecordAlertJudgement(t.Context(), &AlertJudgement{Rule: "r", LeaseID: "one", Condition: "failed", Key: jobKey,
 		Outcome: AlertHit, InARow: 1, Notices: []AlertNotice{
 			{Destination: "oncall", Payload: []byte("a")}, {Destination: "pager", Payload: []byte("b")},
 		}}); err != nil {
@@ -389,7 +393,7 @@ func TestAJudgementLandsWholeOrNotAtAll(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := a.RecordAlertJudgement(t.Context(), &AlertJudgement{Rule: "r", LeaseID: "one", Condition: "failed", Key: "job",
+	if _, err := a.RecordAlertJudgement(t.Context(), &AlertJudgement{Rule: "r", LeaseID: "one", Condition: "failed", Key: jobKey,
 		Outcome: AlertHit, InARow: 1, Notices: []AlertNotice{{Destination: "oncall", Payload: []byte("a")}}}); err == nil {
 		t.Fatal("a notice that could not be owed was accepted")
 	}
@@ -467,27 +471,32 @@ func TestPruningKeepsWhatIsStillOwed(t *testing.T) {
 }
 
 // THE TWO READS ARE EACH THEIR OWN: the running by when they started, the ended by when
-// their result came, and neither lists a job that never started.
+// their result came and after a cursor, both oldest first and bounded, and neither
+// lists a job that never started, a lease that finished without a result, or an
+// ended job that started before the running window.
 func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 	t.Parallel()
 
 	a, clock := newAlertAllocator(t)
 	now := clock.now
 
-	insert := func(lease, started, result, resultAt string) {
+	insert := func(lease, started, result, resultAt, finished string) {
 		t.Helper()
 
-		var startedAt any
+		var startedAt, finishedAt any
 		if started != "" {
 			startedAt = started
+		}
+		if finished != "" {
+			finishedAt = finished
 		}
 
 		if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
 			_, err := tx.ExecContext(t.Context(), `INSERT INTO job_history
 				(lease_id, tier, queued_at, started_at, repo, workflow_ref, job_name, github_run_id, result, result_at,
-				 github_queued_at, disruption, rerun_decision, node)
+				 github_queued_at, disruption, rerun_decision, node, head_branch, finished_at)
 				VALUES ($1, 'billet-2vcpu', '', $2, 'acme/api', 'acme/api/.github/workflows/ci.yml@refs/heads/main', 'build', 31,
-				        $3, $4, '', 'reclaimed', 'unproven', 'epyc-1')`, lease, startedAt, result, resultAt)
+				        $3, $4, '', 'reclaimed', 'unproven', 'epyc-1', 'main', $5)`, lease, startedAt, result, resultAt, finishedAt)
 
 			return err
 		}); err != nil {
@@ -497,44 +506,152 @@ func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 
 	hour := func(n int) string { return ts(now.Add(time.Duration(n) * time.Hour)) }
 
-	insert("running", hour(-2), "", "")
-	insert("running-too-long", hour(-200), "", "")
-	insert("ended", hour(-3), "failed", hour(-1))
-	insert("ended-long-ago", hour(-30), "failed", hour(-20))
-	insert("never-started", "", "canceled", hour(-1))
-	insert("never-started-running", "", "", "")
+	insert("running-older", hour(-3), "", "", "")
+	insert("running", hour(-2), "", "", "")
+	insert("running-too-long", hour(-200), "", "", "")
+	insert("finished-without-a-result", hour(-2), "", "", hour(-1))
+	insert("ended-older", hour(-4), "failed", hour(-2), "")
+	insert("ended", hour(-3), "failed", hour(-1), "")
+	insert("ended-long-ago", hour(-30), "failed", hour(-20), "")
+	insert("ended-but-started-before-the-window", hour(-200), "failed", hour(-1), "")
+	insert("never-started", "", "canceled", hour(-1), "")
+	insert("never-started-running", "", "", "", "")
 
-	got, err := a.AlertJobs(t.Context(), now.Add(-7*24*time.Hour), now.Add(-6*time.Hour), 100)
+	runningSince, endedSince := now.Add(-7*24*time.Hour), now.Add(-6*time.Hour)
+
+	got, err := a.AlertJobs(t.Context(), runningSince, endedSince, AlertCursor{}, 100)
 	if err != nil {
 		t.Fatalf("AlertJobs: %v", err)
 	}
 
-	byLease := map[string]AlertJob{}
-	for _, j := range got {
-		byLease[j.LeaseID] = j
+	leases := func(jobs []AlertJob) []string {
+		out := make([]string, 0, len(jobs))
+		for _, j := range jobs {
+			out = append(out, j.LeaseID)
+		}
+
+		return out
 	}
-	if len(got) != 2 || byLease["running"].LeaseID == "" || byLease["ended"].LeaseID == "" {
-		t.Fatalf("jobs = %+v", got)
+	if r := leases(got.Running); len(r) != 2 || r[0] != "running-older" || r[1] != "running" {
+		t.Errorf("running = %v, want the two, oldest first", r)
+	}
+	if e := leases(got.Ended); len(e) != 2 || e[0] != "ended-older" || e[1] != "ended" {
+		t.Fatalf("ended = %v, want the two, oldest first", e)
 	}
 
-	ended := byLease["ended"]
+	ended := got.Ended[1]
 	if ended.Tier != "billet-2vcpu" || ended.Node != "epyc-1" || ended.Repository != "acme/api" || ended.JobName != "build" ||
 		ended.WorkflowRef == "" || ended.RunID != 31 || ended.Result != "failed" || ended.Disruption != "reclaimed" ||
-		ended.Rerun != "unproven" || !ended.StartedAt.Equal(now.Add(-3*time.Hour)) || !ended.ResultAt.Equal(now.Add(-time.Hour)) {
+		ended.Rerun != "unproven" || ended.HeadBranch != "main" || !ended.StartedAt.Equal(now.Add(-3*time.Hour)) ||
+		!ended.ResultAt.Equal(now.Add(-time.Hour)) || ended.Cursor.LeaseID != "ended" {
 		t.Errorf("the ended job = %+v", ended)
 	}
 	if !ended.QueuedAt.IsZero() {
 		t.Errorf("a queue time nobody recorded = %s", ended.QueuedAt)
 	}
-	if running := byLease["running"]; running.Result != "" || !running.ResultAt.IsZero() {
+	if running := got.Running[1]; running.Result != "" || !running.ResultAt.IsZero() || running.HeadBranch != "main" {
 		t.Errorf("the running job = %+v", running)
 	}
 
-	bounded, err := a.AlertJobs(t.Context(), now.Add(-7*24*time.Hour), now.Add(-6*time.Hour), 1)
+	// A LIMIT BINDS EACH READ, keeping the oldest, and the cursor goes on from there.
+	bounded, err := a.AlertJobs(t.Context(), runningSince, endedSince, AlertCursor{}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bounded) != 2 {
-		t.Errorf("a limit of 1 each = %d jobs", len(bounded))
+	if r, e := leases(bounded.Running), leases(bounded.Ended); len(r) != 1 || r[0] != "running-older" ||
+		len(e) != 1 || e[0] != "ended-older" {
+		t.Errorf("a limit of 1 = running %v, ended %v", r, e)
+	}
+
+	next, err := a.AlertJobs(t.Context(), runningSince, endedSince, bounded.Ended[0].Cursor, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := leases(next.Ended); len(e) != 1 || e[0] != "ended" {
+		t.Errorf("after the cursor = %v, want the next one", e)
+	}
+}
+
+// A NOTICE OWED TO A DESTINATION THE CONFIG NO LONGER NAMES IS GIVEN UP ON, with why;
+// one owed to a destination it names is left to that destination's loop.
+func TestNoticesOutsideTheConfiguredDestinationsAreGivenUpOn(t *testing.T) {
+	t.Parallel()
+
+	a, clock := newAlertAllocator(t)
+	if _, err := a.RecordAlertJudgement(t.Context(), &AlertJudgement{Rule: "r", LeaseID: "one", Condition: "failed",
+		Key: jobKey, Outcome: AlertHit, InARow: 1, Notices: []AlertNotice{
+			{Destination: "oncall", Payload: []byte("{}")}, {Destination: "removed", Payload: []byte("{}")},
+		}}); err != nil {
+		t.Fatal(err)
+	}
+
+	failed, err := a.FailAlertNoticesOutside(t.Context(), []string{"oncall"}, "its destination is gone")
+	if err != nil || failed != 1 {
+		t.Fatalf("FailAlertNoticesOutside = %d, %v, want the one notice", failed, err)
+	}
+	if due := owed(t, a, "oncall", clock); len(due) != 1 {
+		t.Errorf("the configured destination is owed %d", len(due))
+	}
+	if due := owed(t, a, "removed", clock); len(due) != 0 {
+		t.Errorf("the removed destination is still owed %d", len(due))
+	}
+
+	report, err := a.AlertReport(t.Context(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Failures) != 1 || report.Failures[0].Destination != "removed" ||
+		report.Failures[0].Failure != "its destination is gone" {
+		t.Errorf("failures = %+v", report.Failures)
+	}
+
+	if again, err := a.FailAlertNoticesOutside(t.Context(), []string{"oncall"}, "x"); err != nil || again != 0 {
+		t.Errorf("a second settlement = %d, %v", again, err)
+	}
+}
+
+// A COOLDOWN STILL RUNNING OUTLIVES THE STREAK'S RETENTION, however long it was asked
+// to be: pruning it would let the rule fire inside the quiet it promised.
+func TestPruningKeepsACooldownStillRunning(t *testing.T) {
+	t.Parallel()
+
+	a, clock := newAlertAllocator(t)
+	judge(t, a, "one", AlertHit, 1, 45*24*time.Hour)
+
+	clock.now = clock.now.Add(31 * 24 * time.Hour)
+	if err := a.PruneAlerts(t.Context(), clock.now.Add(-8*24*time.Hour), clock.now.Add(-30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if d := judge(t, a, "two", AlertHit, 1, time.Hour); d.Fired {
+		t.Errorf("a hit inside a 45-day cooldown fired after 31 days: %+v", d)
+	}
+
+	clock.now = clock.now.Add(15 * 24 * time.Hour)
+	if err := a.PruneAlerts(t.Context(), clock.now.Add(-8*24*time.Hour), clock.now.Add(-30*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if d := judge(t, a, "three", AlertHit, 1, time.Hour); !d.Fired {
+		t.Errorf("a hit after the cooldown ended did not fire: %+v", d)
+	}
+}
+
+// UNMUTING SAYS WHETHER THERE WAS A MUTE, not whether the rule was ever seen.
+func TestUnmutingSaysWhetherThereWasAMute(t *testing.T) {
+	t.Parallel()
+
+	a, clock := newAlertAllocator(t)
+	if _, err := a.EnsureAlertRules(t.Context(), []string{"r"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if lifted, err := a.UnmuteAlertRule(t.Context(), "r"); err != nil || lifted {
+		t.Errorf("unmuting a rule never muted = %v, %v", lifted, err)
+	}
+	if err := a.MuteAlertRule(t.Context(), "r", clock.now.Add(time.Hour), "someone"); err != nil {
+		t.Fatal(err)
+	}
+	if lifted, err := a.UnmuteAlertRule(t.Context(), "r"); err != nil || !lifted {
+		t.Errorf("unmuting a muted rule = %v, %v", lifted, err)
 	}
 }

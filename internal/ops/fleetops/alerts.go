@@ -21,6 +21,10 @@ import (
 // alertReportRows bounds each table `billet alerts list` prints.
 const alertReportRows = 20
 
+// maxAlertMute is the longest mute: one wanted for longer is a rule to take out of
+// the config, where the next reader of the config sees it.
+const maxAlertMute = 30 * 24 * time.Hour
+
 // Alerts is `billet alerts`: what the rules have done, and an operator's mute.
 func Alerts(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
@@ -121,7 +125,7 @@ func printAlertReport(env cli.Env, cfg *config.Config, report *alloc.AlertReport
 		fmt.Fprintf(env.Stdout, "\nJobs each rule is counting, most recent first:\n")
 
 		w = tabwriter.NewWriter(env.Stdout, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "RULE\tJOB\tIN A ROW\tLAST FIRED\tQUIET UNTIL")
+		fmt.Fprintln(w, "RULE\tCONDITION AND JOB\tIN A ROW\tLAST FIRED\tQUIET UNTIL")
 
 		for i := range report.Streaks {
 			s := &report.Streaks[i]
@@ -196,15 +200,15 @@ func alertMuteWords(state alloc.AlertRuleState, now time.Time) string {
 	return words
 }
 
-// alertJobWords renders a streak's key, which the ledger keeps joined. A job's name is
-// a workflow author's to choose, so it is quoted where it reaches an operator.
+// alertJobWords renders a streak's key, the condition it counts and the job. A job's
+// name is a workflow author's to choose, so it is quoted where it reaches an operator.
 func alertJobWords(key string) string {
-	parts := strings.Split(key, "\x00")
-	if len(parts) != 3 {
+	condition, repository, workflow, job, ok := alerts.KeyParts(key)
+	if !ok {
 		return strconv.Quote(key)
 	}
 
-	return strconv.Quote(parts[0] + " " + parts[1] + " " + parts[2])
+	return string(condition) + " " + strconv.Quote(repository+" "+workflow+" "+job)
 }
 
 // alertTime is an instant, or a dash for none.
@@ -234,8 +238,9 @@ func cmdAlertsMute(ctx context.Context, env cli.Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	if *duration <= 0 {
-		return errors.New("--for must be positive: a mute that never ends is a rule to take out of the config")
+	if *duration <= 0 || *duration > maxAlertMute {
+		return fmt.Errorf("--for must be positive and at most %s: a mute that never ends is a rule to take out "+
+			"of the config", maxAlertMute)
 	}
 
 	cfg, err := alertsConfig(*cfgPath)
@@ -341,7 +346,7 @@ func cmdAlertsTest(ctx context.Context, env cli.Env, args []string) error {
 		return fmt.Errorf("%s names no destination %q", *cfgPath, *name)
 	}
 
-	sender, err := app.AlertSender(destination)
+	sender, err := app.AlertSender(destination, env.Getenv)
 	if err != nil {
 		return fmt.Errorf("destination %s, read with this shell's environment and files: %w", *name, err)
 	}

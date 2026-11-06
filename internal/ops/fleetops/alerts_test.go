@@ -116,11 +116,15 @@ func TestAlertsRefuseAMuteThatWouldSilenceNothingOrNeverEnd(t *testing.T) {
 		!strings.Contains(err.Error(), `names no rule "rde"`) {
 		t.Errorf("a mute of an undeclared rule = %v", err)
 	}
-	if _, err := runAlerts(t, "unmute", "rde", "--config", cfg); err == nil {
-		t.Error("an unmute of an undeclared rule was accepted")
+	if _, err := runAlerts(t, "unmute", "rde", "--config", cfg); err == nil ||
+		!strings.Contains(err.Error(), `names no rule "rde"`) {
+		t.Errorf("an unmute of an undeclared rule = %v", err)
+	}
+	if out, err := runAlerts(t, "unmute", "red", "--config", cfg); err != nil || !strings.Contains(out, "was not muted") {
+		t.Errorf("an unmute of a rule never muted = %q, %v", out, err)
 	}
 	if _, err := runAlerts(t, "mute", "red", "--config", cfg); err == nil ||
-		!strings.Contains(err.Error(), "--for must be positive") {
+		!strings.Contains(err.Error(), "--for must be positive and at most") {
 		t.Errorf("a mute with no end = %v", err)
 	}
 }

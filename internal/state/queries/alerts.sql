@@ -2,30 +2,38 @@
 -- it owes a destination. Migration 74 holds why each table is shaped as it is.
 
 -- name: ListRunningJobsForAlerts :many
--- The jobs running now that started since a moment, newest first and bounded, with
+-- The jobs running now that started since a moment, oldest first and bounded, with
 -- what a rule is judged against. The run is the one that started, as
--- ListJobsAwaitingQueueTime reads it.
+-- ListJobsAwaitingQueueTime reads it. A lease that finished without a result is not
+-- running, whatever its result says. They are as many as the fleet's runners.
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, workflow_ref, job_name,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       result, result_at, COALESCE(started_at, '') AS started_at, github_queued_at, disruption, rerun_decision
+       result, result_at, COALESCE(started_at, '') AS started_at, github_queued_at, disruption, rerun_decision,
+       head_branch
   FROM job_history
- WHERE result = '' AND started_at IS NOT NULL AND started_at >= @since
- ORDER BY started_at DESC, lease_id DESC
+ WHERE result = '' AND started_at IS NOT NULL AND started_at >= @since AND COALESCE(finished_at, '') = ''
+ ORDER BY started_at, lease_id
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: ListEndedJobsForAlerts :many
--- The jobs that started and whose result arrived since a moment, newest first and
--- bounded. A job GitHub cancelled before it started is not here: an assignment nobody
--- ran is cancelled and reassigned by GitHub itself (assignment-protocol.md), and
--- that is nobody's failure.
+-- The jobs whose result arrived after a cursor and since a moment, oldest first and
+-- bounded, so a pass reads on from where the last one decided everything and a
+-- backlog is reached in order rather than hidden behind newer results. Only a job
+-- that started since started_since, the window a running job is watched for, so a
+-- job is judged in one window and a judgement outlives every window it is read in. A
+-- job GitHub cancelled before it started is not here: an assignment nobody ran is
+-- cancelled and reassigned by GitHub itself (assignment-protocol.md), and that is
+-- nobody's failure.
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, workflow_ref, job_name,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       result, result_at, COALESCE(started_at, '') AS started_at, github_queued_at, disruption, rerun_decision
+       result, result_at, COALESCE(started_at, '') AS started_at, github_queued_at, disruption, rerun_decision,
+       head_branch
   FROM job_history
- WHERE result != '' AND result_at >= @since AND started_at IS NOT NULL
- ORDER BY result_at DESC, lease_id DESC
+ WHERE result != '' AND result_at >= @since AND started_at IS NOT NULL AND started_at >= @started_since
+   AND (result_at > @after_result OR (result_at = @after_result AND lease_id > @after_lease))
+ ORDER BY result_at, lease_id
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: InsertAlertRule :exec
@@ -50,8 +58,8 @@ VALUES (@name, @first_seen_at, @muted_until, @muted_by)
 ON CONFLICT (name) DO UPDATE SET muted_until = excluded.muted_until, muted_by = excluded.muted_by;
 
 -- name: UnmuteAlertRule :execrows
--- Lift a rule's mute; the count says whether there was such a rule.
-UPDATE alert_rules SET muted_until = '', muted_by = '' WHERE name = @name;
+-- Lift a rule's mute; the count says whether there was one.
+UPDATE alert_rules SET muted_until = '', muted_by = '' WHERE name = @name AND muted_until != '';
 
 -- name: ListAlertMarks :many
 -- What has been judged since a moment, read once when the loop starts so a restart
@@ -136,5 +144,16 @@ DELETE FROM alert_marks WHERE decided_at < @before;
 DELETE FROM alert_outbox WHERE state != 'pending' AND settled_at < @before;
 
 -- name: PruneAlertStreaks :exec
--- Forget a job nobody has run in a long while; a streak of that age says nothing.
-DELETE FROM alert_streaks WHERE updated_at < @before;
+-- Forget a job nobody has run in a long while; a streak of that age says nothing. A
+-- cooldown still running is kept, however long it was asked to be.
+DELETE FROM alert_streaks WHERE updated_at < @before AND cooldown_until < @now;
+
+-- name: ListPendingAlertDestinations :many
+-- Every destination a notice is still owed to, so one the config no longer names can
+-- be told so rather than owe for ever.
+SELECT DISTINCT destination FROM alert_outbox WHERE state = 'pending' ORDER BY destination;
+
+-- name: FailPendingAlertNotices :execrows
+-- Give up on every notice still owed to one destination, with why.
+UPDATE alert_outbox SET state = 'failed', last_error = @last_error, settled_at = @settled_at
+ WHERE destination = @destination AND state = 'pending';

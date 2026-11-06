@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/junioryono/billet/internal/state"
@@ -24,23 +25,45 @@ type AlertJob struct {
 	Result      string
 	Disruption  string
 	Rerun       string
-	StartedAt   time.Time
-	ResultAt    time.Time
-	QueuedAt    time.Time
+	// HeadBranch is the run's branch as the queue-time sweep recorded it from GitHub,
+	// empty until it has.
+	HeadBranch string
+	StartedAt  time.Time
+	ResultAt   time.Time
+	QueuedAt   time.Time
+	// Cursor is where an ended job stands in the order AlertJobs reads them.
+	Cursor AlertCursor
+}
+
+// AlertCursor is a place in the order ended jobs are read in: after the job whose
+// result arrived at ResultAt, with LeaseID breaking a tie. The zero value is the
+// start.
+type AlertCursor struct {
+	ResultAt string
+	LeaseID  string
+}
+
+// AlertJobsRead is what one pass judges: the jobs running now and the ended ones,
+// each oldest first.
+type AlertJobsRead struct {
+	Running, Ended []AlertJob
 }
 
 // AlertJobs reads the jobs a pass judges: those running that started since
-// runningSince, and those whose result arrived since endedSince, each newest first
-// and at most limit. Two reads rather than one, each served by its partial index,
-// so neither scans a history that only grows.
-func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time.Time, limit int) ([]AlertJob, error) {
-	var out []AlertJob
+// runningSince, and those that started since then whose result arrived since
+// endedSince and after the cursor, each oldest first and at most limit. Two reads
+// rather than one, each served by its partial index, so neither scans a history
+// that only grows.
+func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time.Time, after AlertCursor, limit int,
+) (AlertJobsRead, error) {
+	var out AlertJobsRead
 
 	err := a.db.View(ctx, func(q querier) error {
 		reads := state.ReadQueries(q)
+		started := ts(runningSince.UTC())
 
 		running, err := reads.ListRunningJobsForAlerts(ctx, ledgerdb.ListRunningJobsForAlertsParams{
-			Since:   sql.NullString{String: ts(runningSince.UTC()), Valid: true},
+			Since:   sql.NullString{String: started, Valid: true},
 			MaxRows: int64(limit),
 		})
 		if err != nil {
@@ -48,26 +71,28 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 		}
 
 		ended, err := reads.ListEndedJobsForAlerts(ctx, ledgerdb.ListEndedJobsForAlertsParams{
-			Since: ts(endedSince.UTC()), MaxRows: int64(limit),
+			Since: ts(endedSince.UTC()), StartedSince: sql.NullString{String: started, Valid: true},
+			AfterResult: after.ResultAt, AfterLease: after.LeaseID, MaxRows: int64(limit),
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: list the ended jobs for alerts: %w", err)
 		}
 
-		out = make([]AlertJob, 0, len(running)+len(ended))
+		out = AlertJobsRead{Running: make([]AlertJob, 0, len(running)), Ended: make([]AlertJob, 0, len(ended))}
 		for i := range running {
 			r := &running[i]
-			out = append(out, AlertJob{LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node, Repository: r.Repo,
+			out.Running = append(out.Running, AlertJob{LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node, Repository: r.Repo,
 				WorkflowRef: r.WorkflowRef, JobName: r.JobName, RunID: r.RunID, Result: r.Result, Disruption: r.Disruption,
-				Rerun: r.RerunDecision, StartedAt: parseStamp(r.StartedAt), ResultAt: parseStamp(r.ResultAt),
-				QueuedAt: parseStamp(r.GithubQueuedAt)})
+				Rerun: r.RerunDecision, HeadBranch: r.HeadBranch, StartedAt: parseStamp(r.StartedAt),
+				ResultAt: parseStamp(r.ResultAt), QueuedAt: parseStamp(r.GithubQueuedAt)})
 		}
 		for i := range ended {
 			r := &ended[i]
-			out = append(out, AlertJob{LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node, Repository: r.Repo,
+			out.Ended = append(out.Ended, AlertJob{LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node, Repository: r.Repo,
 				WorkflowRef: r.WorkflowRef, JobName: r.JobName, RunID: r.RunID, Result: r.Result, Disruption: r.Disruption,
-				Rerun: r.RerunDecision, StartedAt: parseStamp(r.StartedAt), ResultAt: parseStamp(r.ResultAt),
-				QueuedAt: parseStamp(r.GithubQueuedAt)})
+				Rerun: r.RerunDecision, HeadBranch: r.HeadBranch, StartedAt: parseStamp(r.StartedAt),
+				ResultAt: parseStamp(r.ResultAt), QueuedAt: parseStamp(r.GithubQueuedAt),
+				Cursor: AlertCursor{ResultAt: r.ResultAt, LeaseID: r.LeaseID}})
 		}
 
 		return nil
@@ -376,7 +401,7 @@ func (a *Allocator) SettleAlertNotice(ctx context.Context, id string, delivered 
 }
 
 // PruneAlerts forgets judgements and settled notices older than before, and streaks
-// older than streaksBefore.
+// older than streaksBefore whose cooldown has ended.
 func (a *Allocator) PruneAlerts(ctx context.Context, before, streaksBefore time.Time) error {
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		q := state.WriteQueries(tx)
@@ -387,12 +412,50 @@ func (a *Allocator) PruneAlerts(ctx context.Context, before, streaksBefore time.
 		if err := q.PruneAlertNotices(ctx, ts(before.UTC())); err != nil {
 			return fmt.Errorf("alloc: prune the alert notices: %w", err)
 		}
-		if err := q.PruneAlertStreaks(ctx, ts(streaksBefore.UTC())); err != nil {
+		if err := q.PruneAlertStreaks(ctx, ledgerdb.PruneAlertStreaksParams{Before: ts(streaksBefore.UTC()),
+			Now: ts(a.now().UTC())}); err != nil {
 			return fmt.Errorf("alloc: prune the alert streaks: %w", err)
 		}
 
 		return nil
 	})
+}
+
+// FailAlertNoticesOutside gives up, with why, on every notice still owed to a
+// destination that is not one of configured: nothing will ever try it again, and a
+// notice owed for ever would hold billet_alert_notices' pending count up for ever.
+// It says how many it gave up on.
+func (a *Allocator) FailAlertNoticesOutside(ctx context.Context, configured []string, why string) (int64, error) {
+	var failed int64
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		failed = 0
+		q := state.WriteQueries(tx)
+
+		pending, err := q.ListPendingAlertDestinations(ctx)
+		if err != nil {
+			return fmt.Errorf("alloc: list the destinations notices are owed to: %w", err)
+		}
+
+		at := ts(a.now().UTC())
+		for _, destination := range pending {
+			if slices.Contains(configured, destination) {
+				continue
+			}
+
+			n, err := q.FailPendingAlertNotices(ctx, ledgerdb.FailPendingAlertNoticesParams{
+				Destination: destination, LastError: why, SettledAt: at,
+			})
+			if err != nil {
+				return fmt.Errorf("alloc: give up on what %s is owed: %w", destination, err)
+			}
+			failed += n
+		}
+
+		return nil
+	})
+
+	return failed, err
 }
 
 // AlertRuleState is one rule as `billet alerts list` shows it.

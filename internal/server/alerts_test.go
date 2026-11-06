@@ -21,24 +21,30 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
-// alertRecord answers GitHub's record of a run and a job from fields, counting reads.
+// alertRecord answers GitHub's record of a run and its jobs from fields, counting
+// reads and keeping what each asked for.
 type alertRecord struct {
 	*fakeProvisioner
 
-	mu        sync.Mutex
-	branch    string
-	steps     []alerts.Step
-	err       error
-	reads     int
-	remaining int64
-	limit     int64
+	mu     sync.Mutex
+	branch string
+	// steps is each runner's job in every run a test reads, completed unless
+	// unfinished says otherwise.
+	steps      map[string][]JobStep
+	unfinished bool
+	err        error
+	reads      int
+	asked      []string
+	remaining  int64
+	limit      int64
 }
 
-func (g *alertRecord) WorkflowRun(_ context.Context, _, _ string, runID int64) (WorkflowRun, error) {
+func (g *alertRecord) WorkflowRun(_ context.Context, owner, repository string, runID int64) (WorkflowRun, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	g.reads++
+	g.asked = append(g.asked, fmt.Sprintf("run %s/%s %d", owner, repository, runID))
 
 	return WorkflowRun{ID: runID, HeadBranch: g.branch}, g.err
 }
@@ -47,17 +53,31 @@ func (g *alertRecord) DefaultBranch(context.Context, string, string) (string, er
 	return "main", nil
 }
 
-func (g *alertRecord) RunnerJobSteps(_ context.Context, _, _ string, _ int64, _ string) ([]alerts.Step, error) {
+func (g *alertRecord) RunJobSteps(_ context.Context, owner, repository string, runID int64,
+) (map[string]RunnerSteps, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	g.reads++
+	g.asked = append(g.asked, fmt.Sprintf("jobs %s/%s %d", owner, repository, runID))
 
-	return g.steps, g.err
+	out := map[string]RunnerSteps{}
+	for runner, steps := range g.steps {
+		out[runner] = RunnerSteps{Completed: !g.unfinished, Steps: steps}
+	}
+
+	return out, g.err
 }
 
 func (g *alertRecord) RESTHeadroom() (int64, int64, time.Time, bool) {
 	return g.remaining, g.limit, time.Now().Add(time.Hour), g.limit > 0
+}
+
+func (g *alertRecord) readCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.reads
 }
 
 // alertStack is a real allocator over a real ledger, and the loop's own pass at a
@@ -104,12 +124,8 @@ func newAlertStack(t *testing.T, rules ...config.AlertRule) *alertStack {
 	got := &atomic.Int32{}
 	bodies := make(chan string, 64)
 	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		buf := new(strings.Builder)
-		if _, err := fmt.Fprint(buf, readAll(t, r)); err != nil {
-			t.Errorf("read a notice: %v", err)
-		}
 		got.Add(1)
-		bodies <- buf.String()
+		bodies <- readAll(t, r)
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(destination.Close)
@@ -130,7 +146,7 @@ func newAlertStack(t *testing.T, rules ...config.AlertRule) *alertStack {
 	r = &alertStack{t: t, s: New(a, nil, tiers, "owner", nil, WithAlerts(set)), a: a, db: db, record: record,
 		targets: map[string]Target{alertTier: {Config: config.GitHubTarget{Name: "default", Org: "acme", InstallationID: 7},
 			Provisioner: record}},
-		sweep: &alertSweep{judged: map[alloc.AlertMark]bool{}, branches: map[rerunRun]string{}}, now: now, got: got, bodies: bodies}
+		sweep: newAlertSweep(), now: now, got: got, bodies: bodies}
 
 	return r
 }
@@ -153,6 +169,8 @@ func readAll(t *testing.T, r *http.Request) string {
 type jobRow struct {
 	lease, result, disruption string
 	name, repo, queued        string
+	branch                    string
+	run                       int64
 	age                       time.Duration
 	ran                       time.Duration
 }
@@ -170,6 +188,9 @@ func (r *alertStack) seed(job jobRow) {
 	if job.age == 0 {
 		job.age = 10 * time.Minute
 	}
+	if job.run == 0 {
+		job.run = 31
+	}
 
 	started := r.now.Add(-job.age)
 	resultAt := ""
@@ -180,9 +201,10 @@ func (r *alertStack) seed(job jobRow) {
 	if err := r.db.Tx(r.t.Context(), func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(r.t.Context(), `INSERT INTO job_history
 			(lease_id, tier, queued_at, started_at, repo, workflow_ref, job_name, github_run_id, result, result_at,
-			 github_queued_at, disruption)
-			VALUES ($1, $2, '', $3, $4, 'acme/api/.github/workflows/deploy.yml@refs/heads/main', $5, 31, $6, $7, $8, $9)`,
-			job.lease, alertTier, stamp(started), job.repo, job.name, job.result, resultAt, job.queued, job.disruption)
+			 github_queued_at, disruption, head_branch)
+			VALUES ($1, $2, '', $3, $4, 'acme/api/.github/workflows/deploy.yml@refs/heads/main', $5, $6, $7, $8, $9, $10, $11)`,
+			job.lease, alertTier, stamp(started), job.repo, job.name, job.run, job.result, resultAt, job.queued,
+			job.disruption, job.branch)
 
 		return err
 	}); err != nil {
@@ -211,6 +233,30 @@ func (r *alertStack) owed() []alloc.DueAlertNotice {
 	return due
 }
 
+// owedLeases is the leases owed a notice, in the order they were owed.
+func (r *alertStack) owedLeases() []string {
+	r.t.Helper()
+
+	var out []string
+	for _, n := range r.owed() {
+		out = append(out, n.LeaseID+":"+n.Condition)
+	}
+
+	return out
+}
+
+// marked is how many judgements the ledger holds.
+func (r *alertStack) marked() int {
+	r.t.Helper()
+
+	marks, err := r.a.AlertMarks(r.t.Context(), r.now.Add(-30*24*time.Hour))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+
+	return len(marks)
+}
+
 // atRule is the rule the tests use unless they say otherwise.
 func atRule(mutate ...func(*config.AlertRule)) config.AlertRule {
 	rule := config.AlertRule{Name: "deploys", On: config.AlertConditions{Failed: true}, Notify: []string{"hook"}, Cooldown: "1h"}
@@ -221,15 +267,24 @@ func atRule(mutate ...func(*config.AlertRule)) config.AlertRule {
 	return rule
 }
 
+// started is a stack whose rules have been first seen, a minute ago.
+func started(t *testing.T, rules ...config.AlertRule) *alertStack {
+	t.Helper()
+
+	r := newAlertStack(t, rules...)
+	r.pass()
+	r.now = r.now.Add(time.Minute)
+
+	return r
+}
+
 // A RULE FIRES ONCE AND THEN RESPECTS ITS COOLDOWN, through the real loop and a real
 // destination, with the notice saying what happened. A later pass over the same job
 // sends nothing, and neither does a second failure inside the cooldown.
 func TestARuleFiresOnceThenRespectsItsCooldownThroughTheLoop(t *testing.T) {
 	t.Parallel()
 
-	r := newAlertStack(t, atRule())
-	r.pass()
-	r.now = r.now.Add(time.Minute)
+	r := started(t, atRule())
 
 	r.seed(jobRow{lease: "first", result: "failed", ran: 5 * time.Minute, age: time.Second})
 	r.now = r.now.Add(time.Minute)
@@ -278,15 +333,13 @@ func TestARuleFiresOnceThenRespectsItsCooldownThroughTheLoop(t *testing.T) {
 func TestARestartDoesNotJudgeAJobAgain(t *testing.T) {
 	t.Parallel()
 
-	r := newAlertStack(t, atRule(func(c *config.AlertRule) { c.Cooldown = "0s" }))
-	r.pass()
-	r.now = r.now.Add(time.Minute)
+	r := started(t, atRule(func(c *config.AlertRule) { c.Cooldown = "0s" }))
 	r.seed(jobRow{lease: "first", result: "failed", ran: time.Second, age: time.Second})
 	r.now = r.now.Add(time.Minute)
 	r.pass()
 	r.deliver()
 
-	r.sweep = &alertSweep{judged: map[alloc.AlertMark]bool{}, branches: map[rerunRun]string{}}
+	r.sweep = newAlertSweep()
 	r.pass()
 	r.deliver()
 
@@ -311,13 +364,102 @@ func TestANewRuleIgnoresHistory(t *testing.T) {
 	}
 }
 
+// EACH CONDITION OF A RULE COUNTS APART, as the docs promise: a failure that was not
+// disrupted is a miss on `disrupted`, and must not break the failures' streak.
+func TestEachConditionOfARuleCountsApart(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{Failed: true, Disrupted: true}
+		c.InARow = 2
+		c.Cooldown = "0s"
+	}))
+
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "one", result: "failed", ran: time.Second, age: 3 * time.Minute})
+	r.seed(jobRow{lease: "two", result: "failed", ran: time.Second, age: 2 * time.Minute})
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "two:failed" {
+		t.Errorf("owed = %v, want the second failure in a row", got)
+	}
+
+	// AND ONE JOB IS NOT TWO IN A ROW: a disrupted failure is one of each.
+	both := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{Failed: true, Disrupted: true}
+		c.InARow = 2
+	}))
+	both.seed(jobRow{lease: "once", result: "failed", disruption: "reclaimed", ran: time.Second, age: time.Second})
+	both.now = both.now.Add(5 * time.Minute)
+	both.pass()
+	if got := both.owedLeases(); len(got) != 0 {
+		t.Errorf("one job fired a rule asking for two: %v", got)
+	}
+}
+
+// A STREAK COUNTS ITS JOBS IN THE ORDER THEY RAN, however the passes fell: a success
+// between two failures breaks it even when both arrive between the same two passes.
+func TestAStreakCountsItsJobsInTheOrderTheyRan(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.InARow = 2
+		c.Cooldown = "0s"
+	}))
+
+	r.seed(jobRow{lease: "first", result: "failed", ran: time.Second, age: 50 * time.Second})
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+
+	// BETWEEN TWO PASSES: a success, then a failure.
+	r.seed(jobRow{lease: "fixed", result: "succeeded", ran: time.Second, age: 3 * time.Minute})
+	r.seed(jobRow{lease: "broke", result: "failed", ran: time.Second, age: 2 * time.Minute})
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 0 {
+		t.Errorf("owed = %v, want none: a success came between the failures", got)
+	}
+}
+
+// A JOB PUT OFF HOLDS THE LATER JOBS OF ITS STREAK: a failure whose branch GitHub has
+// not yet given waits, and so does the success after it, so the streak still counts
+// the failure before the success once the read comes back.
+func TestAJobPutOffHoldsTheLaterJobsOfItsStreak(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.Match.Branch = "main"
+		c.InARow = 2
+		c.Cooldown = "0s"
+	}))
+	r.now = r.now.Add(5 * time.Minute)
+
+	r.seed(jobRow{lease: "first", result: "failed", ran: time.Second, age: 4 * time.Minute, branch: "main"})
+	r.seed(jobRow{lease: "unread", result: "failed", ran: time.Second, age: 3 * time.Minute, run: 51})
+	r.seed(jobRow{lease: "fixed", result: "succeeded", ran: time.Second, age: 2 * time.Minute, branch: "main"})
+	r.record.err = errors.New("connection reset")
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+
+	if got := r.marked(); got != 1 {
+		t.Fatalf("%d marks, want only the first judged: the later two wait for the unread one", got)
+	}
+
+	r.record.err = nil
+	r.record.branch = "main"
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "unread:failed" {
+		t.Errorf("owed = %v, want the second failure in a row, counted before the success", got)
+	}
+}
+
 // A RUNNING JOB FIRES AS IT PASSES THE DURATION, while it runs, and once.
 func TestARunningJobFiresWhileItRuns(t *testing.T) {
 	t.Parallel()
 
-	r := newAlertStack(t, atRule(func(c *config.AlertRule) { c.On = config.AlertConditions{RunningLongerThan: "1h"} }))
-	r.pass()
-	r.now = r.now.Add(time.Minute)
+	r := started(t, atRule(func(c *config.AlertRule) { c.On = config.AlertConditions{RunningLongerThan: "1h"} }))
 	r.seed(jobRow{lease: "slow", age: 30 * time.Second})
 
 	r.pass()
@@ -337,9 +479,7 @@ func TestARunningJobFiresWhileItRuns(t *testing.T) {
 func TestAWaitIsJudgedOnceItIsKnown(t *testing.T) {
 	t.Parallel()
 
-	r := newAlertStack(t, atRule(func(c *config.AlertRule) { c.On = config.AlertConditions{WaitedLongerThan: "10m"} }))
-	r.pass()
-	r.now = r.now.Add(time.Minute)
+	r := started(t, atRule(func(c *config.AlertRule) { c.On = config.AlertConditions{WaitedLongerThan: "10m"} }))
 	r.seed(jobRow{lease: "waited", result: "succeeded", ran: time.Second, age: time.Second})
 
 	r.pass()
@@ -362,164 +502,219 @@ func TestAWaitIsJudgedOnceItIsKnown(t *testing.T) {
 	}
 }
 
-// A RULE THAT NAMES NEITHER ASKS GITHUB NOTHING, and a rule naming a branch reads each
-// run once and judges a job on another branch as not its job, which breaks no streak.
-func TestABranchIsReadOncePerRunAndNarrowsTheRule(t *testing.T) {
+// A RULE THAT NAMES NEITHER ASKS GITHUB NOTHING. A rule naming a branch takes it from
+// the ledger where the queue-time sweep recorded it, reads each run once where it did
+// not, and counts a job on another branch as not its job, which breaks no streak.
+func TestABranchNarrowsTheRuleFromTheLedgerOrOneReadARun(t *testing.T) {
 	t.Parallel()
 
-	plain := newAlertStack(t, atRule())
-	plain.pass()
-	plain.now = plain.now.Add(time.Minute)
+	plain := started(t, atRule())
 	plain.seed(jobRow{lease: "any", result: "failed", ran: time.Second, age: time.Second})
 	plain.pass()
-	if plain.record.reads != 0 {
-		t.Errorf("a rule naming neither read GitHub %d times", plain.record.reads)
+	if got := plain.record.readCount(); got != 0 {
+		t.Errorf("a rule naming neither read GitHub %d times", got)
 	}
 
-	r := newAlertStack(t, atRule(func(c *config.AlertRule) {
+	branchRule := atRule(func(c *config.AlertRule) {
 		c.Match.Branch = "main"
 		c.InARow = 2
 		c.Cooldown = "0s"
-	}))
-	r.pass()
-	r.now = r.now.Add(time.Minute)
+	})
+
+	ledger := started(t, branchRule)
+	ledger.now = ledger.now.Add(5 * time.Minute)
+	ledger.seed(jobRow{lease: "recorded", result: "failed", ran: time.Second, age: 2 * time.Minute, branch: "main"})
+	ledger.seed(jobRow{lease: "also", result: "failed", ran: time.Second, age: time.Minute, branch: "main"})
+	ledger.now = ledger.now.Add(5 * time.Minute)
+	ledger.pass()
+	if got := ledger.record.readCount(); got != 0 {
+		t.Errorf("a branch the ledger holds was read from GitHub %d times", got)
+	}
+	if got := ledger.owedLeases(); len(got) != 1 || got[0] != "also:failed" {
+		t.Errorf("owed = %v", got)
+	}
+
+	r := started(t, branchRule)
 	r.record.branch = "main"
-
-	r.seed(jobRow{lease: "one", result: "failed", ran: time.Second, age: time.Second})
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "one", result: "failed", ran: time.Second, age: 3 * time.Minute})
+	r.seed(jobRow{lease: "elsewhere", result: "failed", ran: time.Second, age: 2 * time.Minute, branch: "feature"})
+	r.seed(jobRow{lease: "two", result: "failed", ran: time.Second, age: time.Minute})
+	r.now = r.now.Add(5 * time.Minute)
 	r.pass()
-	if r.record.reads != 1 {
-		t.Fatalf("read %d times", r.record.reads)
-	}
 
-	// THE SAME RUN, SO NO NEW READ, on another job, which completes the streak.
-	r.seed(jobRow{lease: "two", result: "failed", ran: time.Second, age: time.Second, name: "deploy"})
-	r.pass()
-	if r.record.reads != 1 {
-		t.Errorf("read %d times for one run", r.record.reads)
+	if got := r.record.readCount(); got != 1 {
+		t.Errorf("read GitHub %d times for one run", got)
 	}
-	if due := r.owed(); len(due) != 1 || due[0].LeaseID != "two" {
-		t.Errorf("owed = %+v, want the second in a row", due)
+	if len(r.record.asked) != 1 || r.record.asked[0] != "run acme/api 31" {
+		t.Errorf("asked %v, want the job's own run", r.record.asked)
 	}
-
-	branch := newAlertStack(t, atRule(func(c *config.AlertRule) { c.Match.Branch = "main" }))
-	branch.pass()
-	branch.now = branch.now.Add(time.Minute)
-	branch.record.branch = "feature"
-	branch.seed(jobRow{lease: "elsewhere", result: "failed", ran: time.Second, age: time.Second})
-	branch.pass()
-	if due := branch.owed(); len(due) != 0 {
-		t.Errorf("a job on another branch is owed: %+v", due)
+	// THE JOB ON ANOTHER BRANCH BETWEEN THEM BROKE NOTHING.
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "two:failed" {
+		t.Errorf("owed = %v, want the second on main in a row", got)
 	}
 }
 
-// A STEP THE RULE NAMES HAS TO BE THE ONE THAT FAILED. Only a hit asks: a job that
-// succeeded has nothing to narrow.
-func TestAStepNarrowsAHitAndOnlyAHitAsks(t *testing.T) {
+// A STEP THE RULE NAMES HAS TO BE THE ONE THAT FAILED, read from one read of the run,
+// for the job's own runner. Only a hit asks, and a job GitHub has not concluded waits:
+// a step still running has no conclusion yet.
+func TestAStepNarrowsAHitAndOnlyAConcludedJobDecides(t *testing.T) {
 	t.Parallel()
 
-	r := newAlertStack(t, atRule(func(c *config.AlertRule) { c.Match.Step = "Deploy*" }))
-	r.pass()
-	r.now = r.now.Add(time.Minute)
+	r := started(t, atRule(func(c *config.AlertRule) { c.Match.Step = "Deploy*" }))
 
 	r.seed(jobRow{lease: "fine", result: "succeeded", ran: time.Second, age: time.Second})
 	r.pass()
-	if r.record.reads != 0 {
-		t.Errorf("a job that succeeded read its steps %d times", r.record.reads)
+	if got := r.record.readCount(); got != 0 {
+		t.Errorf("a job that succeeded read its steps %d times", got)
 	}
 
-	r.record.steps = []alerts.Step{{Name: "Build", Conclusion: "failure"}}
-	r.seed(jobRow{lease: "build", result: "failed", ran: time.Second, age: time.Second, name: "other"})
+	r.record.steps = map[string][]JobStep{
+		provider.InstanceName("build"):  {{Name: "Build", Conclusion: "failure"}},
+		provider.InstanceName("deploy"): {{Name: "Deploy to eu", Conclusion: ""}},
+		"billet-another-lease":          {{Name: "Deploy to eu", Conclusion: "failure"}},
+	}
+	r.record.unfinished = true
+	r.seed(jobRow{lease: "build", result: "failed", ran: time.Second, age: time.Second, name: "other", run: 41})
+	r.seed(jobRow{lease: "deploy", result: "failed", ran: time.Second, age: time.Second, name: "third", run: 42})
 	r.pass()
-	if due := r.owed(); len(due) != 0 {
-		t.Errorf("a failure in another step is owed: %+v", due)
+	if got := r.owedLeases(); len(got) != 0 || r.marked() != 1 {
+		t.Fatalf("owed %v, %d marks, want nothing decided while GitHub has not concluded the jobs", got, r.marked())
 	}
 
-	r.record.steps = []alerts.Step{{Name: "Deploy to eu", Conclusion: "failure"}}
-	r.seed(jobRow{lease: "deploy", result: "failed", ran: time.Second, age: time.Second, name: "third"})
+	// CONCLUDED: the job that failed in another step is a miss, and the one that
+	// failed in the step the rule names fires.
+	r.record.unfinished = false
+	r.record.steps[provider.InstanceName("deploy")] = []JobStep{{Name: "Deploy to eu", Conclusion: "failure"}}
+	r.now = r.now.Add(time.Minute)
 	r.pass()
-	if due := r.owed(); len(due) != 1 || due[0].LeaseID != "deploy" {
-		t.Errorf("owed = %+v", due)
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "deploy:failed" {
+		t.Errorf("owed = %v, want the failure in the step the rule names", got)
+	}
+	for _, want := range []string{"jobs acme/api 41", "jobs acme/api 42"} {
+		found := false
+		for _, asked := range r.record.asked {
+			found = found || asked == want
+		}
+		if !found {
+			t.Errorf("never asked %q; asked %v", want, r.record.asked)
+		}
 	}
 }
 
 // COULD NOT TELL WAITS, AND THEN SAYS SO. A read that fails is not a miss and not a
-// hit: the job is asked about again, and past the window is judged unknown, which
-// moves no streak and sends nothing, rather than a rule falling silent unnoticed.
-func TestAReadThatFailsWaitsThenIsJudgedUnknown(t *testing.T) {
+// hit: the job is asked about again, and an hour after GitHub was first asked it is
+// judged unknown, which moves no streak and sends nothing.
+func TestAReadThatFailsWaitsThenIsJudgedUnknownAndBreaksNoStreak(t *testing.T) {
 	t.Parallel()
 
-	r := newAlertStack(t, atRule(func(c *config.AlertRule) { c.Match.Branch = "main" }))
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.Match.Branch = "main"
+		c.InARow = 2
+		c.Cooldown = "0s"
+	}))
+
+	r.seed(jobRow{lease: "before", result: "failed", ran: time.Second, age: time.Second, branch: "main"})
+	r.now = r.now.Add(5 * time.Minute)
 	r.pass()
-	r.now = r.now.Add(time.Minute)
+
 	r.record.err = errors.New("HTTP 403: Resource not accessible by integration")
 	r.seed(jobRow{lease: "unread", result: "failed", ran: time.Second, age: time.Second})
-
+	r.now = r.now.Add(5 * time.Minute)
 	r.pass()
-	reads := r.record.reads
+	reads := r.record.readCount()
 	if reads == 0 {
 		t.Fatal("GitHub was not asked")
 	}
-	marks, err := r.a.AlertMarks(t.Context(), r.now.Add(-time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(marks) != 0 {
-		t.Fatalf("a read that failed recorded %+v", marks)
+	if got := r.marked(); got != 1 {
+		t.Fatalf("a read that failed was recorded: %d marks", got)
 	}
 
 	r.pass()
-	if r.record.reads <= reads {
-		t.Errorf("the job was not asked about again: %d reads", r.record.reads)
+	if got := r.record.readCount(); got <= reads {
+		t.Errorf("the job was not asked about again: %d reads", got)
 	}
 
 	r.now = r.now.Add(alertReadWindow + time.Minute)
 	r.pass()
-	marks, err = r.a.AlertMarks(t.Context(), r.now.Add(-2*time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(marks) != 1 {
-		t.Errorf("past the window, marks = %+v", marks)
+	if got := r.marked(); got != 2 {
+		t.Fatalf("past the window, %d marks, want the unknown recorded", got)
 	}
 	if due := r.owed(); len(due) != 0 {
 		t.Errorf("an unknown job is owed: %+v", due)
 	}
+
+	// UNKNOWN IS NOT A MISS: the next failure on main is the second in a row.
+	r.record.err = nil
+	r.seed(jobRow{lease: "after", result: "failed", ran: time.Second, age: time.Second, branch: "main"})
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "after:failed" {
+		t.Errorf("owed = %v, want the unknown to have broken nothing", got)
+	}
+}
+
+// A PASS WITH NO READ LEFT ASKED NOTHING, AND COSTS A JOB NO TIME: its window starts
+// with the first request actually made for it, however long it waited for one.
+func TestTheReadWindowStartsWithTheFirstRequest(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.Match.Branch = "main" }))
+	r.record.branch = "main"
+	r.record.remaining, r.record.limit = 100, 5000
+
+	r.seed(jobRow{lease: "waiting", result: "failed", ran: time.Second, age: time.Second})
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+
+	// WELL PAST THE WINDOW, STILL WITH NO READ LEFT: nothing is decided.
+	r.now = r.now.Add(3 * alertReadWindow)
+	r.pass()
+	if got := r.marked(); got != 0 || r.record.readCount() != 0 {
+		t.Fatalf("%d marks and %d reads with no read left, want neither", got, r.record.readCount())
+	}
+
+	// THE BUDGET COMES BACK: the job is read and judged, not written off.
+	r.record.remaining = 5000
+	r.pass()
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "waiting:failed" {
+		t.Errorf("owed = %v, want the job judged on its read", got)
+	}
 }
 
 // THE RESERVE IS LEFT, AND EACH INSTALLATION HAS ITS SHARE OF A PASS, because this
-// decides nothing about a runner.
+// decides nothing about a runner; one read of a run serves every job of it.
 func TestAlertReadsLeaveTheReserveAndTakeTheirShare(t *testing.T) {
 	t.Parallel()
 
-	r := newAlertStack(t, atRule(func(c *config.AlertRule) { c.Match.Step = "Deploy*" }))
-	r.pass()
-	r.now = r.now.Add(time.Minute)
+	stepRule := atRule(func(c *config.AlertRule) { c.Match.Step = "Deploy*" })
+
+	r := started(t, stepRule)
 	r.record.remaining, r.record.limit = 100, 5000
 	r.seed(jobRow{lease: "held", result: "failed", ran: time.Second, age: time.Second})
 	r.pass()
-	if r.record.reads != 0 {
-		t.Errorf("read %d times on an installation down to its reserve", r.record.reads)
+	if got := r.record.readCount(); got != 0 {
+		t.Errorf("read %d times on an installation down to its reserve", got)
 	}
 
-	r = newAlertStack(t, atRule(func(c *config.AlertRule) { c.Match.Step = "Deploy*" }))
-	r.pass()
-	r.now = r.now.Add(time.Minute)
+	r = started(t, stepRule)
 	for i := range alertRunsPerInstallation + 2 {
 		r.seed(jobRow{lease: fmt.Sprintf("job-%d", i), result: "failed", ran: time.Second, age: time.Second,
-			name: fmt.Sprintf("job-%d", i)})
+			name: fmt.Sprintf("job-%d", i), run: int64(100 + i)})
 	}
 	r.pass()
-	if r.record.reads != alertRunsPerInstallation {
-		t.Errorf("%d reads in one pass, want the share's %d", r.record.reads, alertRunsPerInstallation)
+	if got := r.record.readCount(); got != alertRunsPerInstallation {
+		t.Errorf("%d reads in one pass, want the share's %d", got, alertRunsPerInstallation)
 	}
-}
 
-// A STEP IS READ FOR THE JOB BY ITS RUNNER'S NAME, which is its lease's.
-func TestAStepsAreReadByTheRunnersName(t *testing.T) {
-	t.Parallel()
-
-	if got := provider.InstanceName("abc"); got != "billet-abc" {
-		t.Errorf("the runner of lease abc is %q", got)
+	same := started(t, stepRule)
+	for i := range alertRunsPerInstallation + 2 {
+		same.seed(jobRow{lease: fmt.Sprintf("job-%d", i), result: "failed", ran: time.Second, age: time.Second,
+			name: fmt.Sprintf("job-%d", i)})
+	}
+	same.pass()
+	if got := same.record.readCount(); got != 1 {
+		t.Errorf("%d reads for one run's jobs, want one", got)
 	}
 }
 
@@ -541,9 +736,6 @@ func TestADeliveryIsBoundedAndSpaced(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// THE LEDGER'S CLOCK IS REAL, so the notice is due from now.
-	r.now = time.Now().Add(time.Second)
-
 	wait := alertRetryFirst
 	for try := int32(1); try <= alertMaxAttempts; try++ {
 		r.s.deliverAlertsOnce(t.Context(), "hook", dest, r.now)
@@ -559,7 +751,8 @@ func TestADeliveryIsBoundedAndSpaced(t *testing.T) {
 			}
 		}
 
-		r.now = r.now.Add(wait)
+		// A SECOND PAST THE WAIT, which is counted from when the try ended.
+		r.now = r.now.Add(wait + time.Second)
 		wait *= 2
 	}
 
@@ -580,7 +773,36 @@ func TestADeliveryIsBoundedAndSpaced(t *testing.T) {
 	}
 }
 
-// AN ANSWER TRYING AGAIN CANNOT HELP ENDS AT ONCE.
+// A TRY'S WAIT IS COUNTED FROM WHEN IT ENDED, not from when the look at the queue
+// began: a slow look does not make the next try come early.
+func TestARetryWaitsFromWhenItsTryEnded(t *testing.T) {
+	t.Parallel()
+
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(slow.Close)
+
+	r := newAlertStack(t, atRule())
+	dest := alerts.NewSender("hook", alerts.URL(slow.URL))
+	if _, err := r.a.RecordAlertJudgement(t.Context(), &alloc.AlertJudgement{Rule: "deploys", LeaseID: "job", Condition: "failed",
+		Key: "k", Outcome: alloc.AlertHit, InARow: 1, Notices: []alloc.AlertNotice{{Destination: "hook", Payload: []byte("{}")}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.s.deliverAlertsOnce(t.Context(), "hook", dest, r.now)
+
+	due, err := r.a.DueAlertNotices(t.Context(), "hook", r.now.Add(alertRetryFirst+100*time.Millisecond), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Errorf("due %d notices a wait after the look began, before a wait after the try ended", len(due))
+	}
+}
+
+// AN ANSWER TRYING AGAIN CANNOT HELP ENDS AT ONCE, and is reported.
 func TestAPermanentAnswerIsNotTriedAgain(t *testing.T) {
 	t.Parallel()
 
@@ -598,11 +820,20 @@ func TestAPermanentAnswerIsNotTriedAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for range 3 {
-		r.s.deliverAlertsOnce(t.Context(), "hook", dest, time.Now().Add(24*time.Hour))
+	// A DAY APART, so a retry it was wrongly given would have come round.
+	for day := 1; day <= 3; day++ {
+		r.s.deliverAlertsOnce(t.Context(), "hook", dest, r.now.Add(time.Duration(day)*24*time.Hour))
 	}
 	if got := tries.Load(); got != 1 {
 		t.Errorf("%d requests, want 1", got)
+	}
+
+	report, err := r.a.AlertReport(t.Context(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Failures) != 1 || !strings.Contains(report.Failures[0].Failure, "403") {
+		t.Errorf("failures = %+v, want the 403 given up on", report.Failures)
 	}
 }
 
@@ -639,12 +870,11 @@ func TestADestinationThatHangsHoldsUpOnlyItsOwnQueue(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		r.s.deliverAlertsOnce(ctx, "stuck", alerts.NewSender("stuck", alerts.URL(hung.URL)), time.Now().Add(time.Second))
+		r.s.deliverAlertsOnce(ctx, "stuck", alerts.NewSender("stuck", alerts.URL(hung.URL)), r.now)
 	}()
 
 	<-entered
 
-	r.now = time.Now().Add(time.Second)
 	r.deliver()
 	select {
 	case body := <-r.bodies:
@@ -655,15 +885,20 @@ func TestADestinationThatHangsHoldsUpOnlyItsOwnQueue(t *testing.T) {
 		t.Error("the other destination got nothing while one hung")
 	}
 
-	// AND A STOP ENDS THE HUNG REQUEST, with its try uncounted: it was not an answer.
+	// AND A STOP ENDS THE HUNG REQUEST AT ONCE, well inside the sender's own bound,
+	// with its try uncounted: it was not an answer.
+	stopped := time.Now()
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(30 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("a stop did not end a hung delivery")
 	}
+	if took := time.Since(stopped); took > 3*time.Second {
+		t.Errorf("a stop took %s to end a hung delivery", took)
+	}
 
-	due, err := r.a.DueAlertNotices(t.Context(), "stuck", time.Now().Add(time.Hour), 10)
+	due, err := r.a.DueAlertNotices(t.Context(), "stuck", r.now.Add(time.Hour), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,12 +907,74 @@ func TestADestinationThatHangsHoldsUpOnlyItsOwnQueue(t *testing.T) {
 	}
 }
 
-// ONLY RULES START THE LOOPS, and the option carries the rules.
-func TestAlertsStartOnlyWithRules(t *testing.T) {
+// WHAT IS OWED TO A DESTINATION THE CONFIG NO LONGER NAMES IS GIVEN UP ON, with why,
+// and what is owed to one it does name is left to its loop.
+func TestNoticesOwedToARemovedDestinationAreGivenUpOn(t *testing.T) {
 	t.Parallel()
 
-	s := New(nil, nil, nil, "owner", nil)
-	if s.alerts != nil {
-		t.Error("a control plane given no alerts holds some")
+	r := newAlertStack(t, atRule())
+	if _, err := r.a.RecordAlertJudgement(t.Context(), &alloc.AlertJudgement{Rule: "deploys", LeaseID: "job", Condition: "failed",
+		Key: "k", Outcome: alloc.AlertHit, InARow: 1, Notices: []alloc.AlertNotice{
+			{Destination: "removed", Payload: []byte("{}")}, {Destination: "hook", Payload: []byte("{}")},
+		}}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.s.settleRemovedDestinations(t.Context())
+
+	report, err := r.a.AlertReport(t.Context(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Failures) != 1 || report.Failures[0].Destination != "removed" ||
+		!strings.Contains(report.Failures[0].Failure, "no longer in server.alerts") {
+		t.Errorf("failures = %+v", report.Failures)
+	}
+	if due := r.owed(); len(due) != 1 {
+		t.Errorf("the configured destination is owed %d, want its one", len(due))
+	}
+}
+
+// THE PASS'S MEMORY OF WHAT IT JUDGED IS THE LEDGER'S, read again at each prune, so it
+// does not grow with the process's life: a judgement the ledger has let go is let go
+// here too.
+func TestTheJudgedSetIsReadAgainAtEachPrune(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.Cooldown = "0s" }))
+	r.seed(jobRow{lease: "one", result: "failed", ran: time.Second, age: time.Second})
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+	if len(r.sweep.judged) != 1 {
+		t.Fatalf("judged = %v", r.sweep.judged)
+	}
+
+	r.sweep.judged[alloc.AlertMark{Rule: "deploys", LeaseID: "long-gone", Condition: "failed"}] = true
+	r.now = r.now.Add(alertPruneEvery + time.Minute)
+	r.pass()
+
+	if _, kept := r.sweep.judged[alloc.AlertMark{Rule: "deploys", LeaseID: "long-gone", Condition: "failed"}]; kept {
+		t.Error("a judgement the ledger does not hold was kept")
+	}
+	if !r.sweep.judged[alloc.AlertMark{Rule: "deploys", LeaseID: "one", Condition: "failed"}] {
+		t.Error("a judgement the ledger holds was forgotten")
+	}
+}
+
+// THE OPTION CARRIES WHAT THERE IS: nothing for an empty set, and destinations with no
+// rule, which still deliver what they are owed.
+func TestAlertsCarryRulesOrDestinations(t *testing.T) {
+	t.Parallel()
+
+	if s := New(nil, nil, nil, "owner", nil, WithAlerts(&Alerts{})); s.alerts != nil {
+		t.Error("an empty set was kept")
+	}
+	if s := New(nil, nil, nil, "owner", nil, WithAlerts(nil)); s.alerts != nil {
+		t.Error("nil was kept")
+	}
+
+	only := &Alerts{Destinations: map[string]AlertDestination{"hook": {Sender: alerts.NewSender("hook", "https://x")}}}
+	if s := New(nil, nil, nil, "owner", nil, WithAlerts(only)); s.alerts != only {
+		t.Error("destinations with no rule were dropped, and what they are owed with them")
 	}
 }

@@ -527,11 +527,17 @@ func (s *Server) Run(ctx context.Context) error {
 	})
 
 	// AND A JOB IS TOLD ABOUT WHERE A RULE ASKS, under the same rule, with one loop
-	// per destination, so a destination that hangs delays only its own notices.
+	// per destination, so a destination that hangs delays only its own notices. A
+	// destination is delivered to while it is configured, rule or no rule, and what is
+	// owed to one no longer configured is given up on once, here, even with no
+	// server.alerts left at all.
+	group.Background("alert notices of removed destinations", s.settleRemovedDestinations)
 	if s.alerts != nil {
-		group.Background("alert evaluation", func(ctx context.Context) {
-			s.evaluateAlerts(ctx, targets)
-		})
+		if len(s.alerts.Rules) > 0 {
+			group.Background("alert evaluation", func(ctx context.Context) {
+				s.evaluateAlerts(ctx, targets)
+			})
+		}
 
 		for _, name := range slices.Sorted(maps.Keys(s.alerts.Destinations)) {
 			sender := s.alerts.Destinations[name].Sender

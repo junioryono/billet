@@ -56,12 +56,21 @@ type RunJob struct {
 	RunAttempt int64
 }
 
-// WorkflowJob is the part of GitHub's job record `billet jobs show` reads.
+// WorkflowJob is the part of GitHub's job record `billet jobs show` reads. Status
+// is the job's own, `completed` once GitHub has concluded it and its steps, and
+// empty where the record does not say.
 type WorkflowJob struct {
 	ID         int64
 	Name       string
 	RunAttempt int64
+	Status     string
 	Steps      []JobStep
+}
+
+// RunJobRecords reads every job of a run, with its steps, by the name of the runner
+// that ran it. A target's policy client implements it.
+type RunJobRecords interface {
+	RunnerJobs(ctx context.Context, owner, repository string, runID int64) (map[string]WorkflowJob, error)
 }
 
 // JobStep is one step of a job as GitHub records it. StartedAt and
@@ -192,6 +201,59 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 		return WorkflowJob{}, fmt.Errorf("github: run %d lists %d jobs on runner %q; refusing to guess",
 			runID, len(matches), runnerName)
 	}
+}
+
+// RunnerJobs reads every job of a run that has a runner, with its steps, keyed by
+// the runner's name, across every attempt of the run, in one read of the list.
+//
+// A NAME TWO JOBS SHARE IS LEFT OUT rather than given either's record, and the
+// caller reads a missing name as could-not-tell; so is a record that does not say
+// enough to read. The list is bounded as RunJobs' is, since it is read beside
+// scheduling from the same hourly budget.
+func (c *runnerGroupPolicyClient) RunnerJobs(
+	ctx context.Context, owner, repository string, runID int64,
+) (map[string]WorkflowJob, error) {
+	if !c.configured() {
+		return nil, errJobRecordsUnavailable
+	}
+	if runID <= 0 {
+		return nil, fmt.Errorf("github: a workflow run needs a positive id, not %d", runID)
+	}
+
+	jobs := map[string]WorkflowJob{}
+	shared := map[string]bool{}
+	err := c.listRunJobs(ctx, owner, repository, runID, "all", MaxQueueTimeRunJobs, func(record jobRecord,
+		name string,
+	) error {
+		if name == "" || shared[name] {
+			return nil
+		}
+		if _, seen := jobs[name]; seen {
+			delete(jobs, name)
+			shared[name] = true
+			return nil
+		}
+		job, readable := readableJob(record)
+		if !readable {
+			shared[name] = true
+			return nil
+		}
+		jobs[name] = job
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return jobs, nil
+}
+
+// readableJob is a job record read, false for one too incomplete to read, which
+// RunnerJobs leaves out as could-not-tell rather than fail the whole run for.
+func readableJob(record jobRecord) (WorkflowJob, bool) {
+	job, err := workflowJobOf(record)
+
+	return job, err == nil
 }
 
 // RunJobs reads when GitHub queued each job of a run that has a runner and the
@@ -363,6 +425,9 @@ func workflowJobOf(record jobRecord) (WorkflowJob, error) {
 	job := WorkflowJob{ID: *record.ID, Name: *record.Name}
 	if record.RunAttempt != nil {
 		job.RunAttempt = *record.RunAttempt
+	}
+	if record.Status != nil {
+		job.Status = *record.Status
 	}
 	for _, s := range *record.Steps {
 		if s.Number == nil || s.Name == nil {

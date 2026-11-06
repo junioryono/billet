@@ -46,12 +46,14 @@ func TestEachConditionJudgesAJob(t *testing.T) {
 		{"running under it", RanLong, Job{StartedAt: ruleNow.Add(-time.Minute)}, Later},
 		{"ended after it", RanLong, Job{StartedAt: started, Result: "succeeded", ResultAt: started.Add(90 * time.Minute)}, Hit},
 		{"ended under it", RanLong, Job{StartedAt: started, Result: "succeeded", ResultAt: started.Add(time.Minute)}, Miss},
+		{"ended exactly at it", RanLong, Job{StartedAt: started, Result: "succeeded", ResultAt: started.Add(time.Hour)}, Miss},
 		{"never started", RanLong, Job{}, Later},
 
 		{"waited past it", WaitedLong, Job{StartedAt: started, QueuedAt: queued(time.Hour)}, Hit},
 		{"waited under it", WaitedLong, Job{StartedAt: started, QueuedAt: queued(time.Minute)}, Miss},
 		{"exactly at it", WaitedLong, Job{StartedAt: started, QueuedAt: queued(10 * time.Minute)}, Miss},
 		{"no queue time recorded", WaitedLong, Job{StartedAt: started}, Later},
+		{"a queue time and no start", WaitedLong, Job{QueuedAt: queued(time.Hour)}, Later},
 
 		{"a condition this binary does not know", Condition("newer"), Job{Result: "failed"}, Later},
 	} {
@@ -206,7 +208,7 @@ func TestAJobsWorkflowAndKey(t *testing.T) {
 
 	same := job
 	same.Tier, same.LeaseID = "b", "2"
-	if job.Key() != same.Key() {
+	if job.Key(Failed) != same.Key(Failed) {
 		t.Error("another tier and lease changed the key")
 	}
 	for name, other := range map[string]Job{
@@ -214,9 +216,30 @@ func TestAJobsWorkflowAndKey(t *testing.T) {
 		"job":        {Repository: "acme/api", JobName: "test", WorkflowRef: job.WorkflowRef},
 		"workflow":   {Repository: "acme/api", JobName: "build", WorkflowRef: "acme/api/.github/workflows/x.yml@refs/heads/main"},
 	} {
-		if job.Key() == other.Key() {
+		if job.Key(Failed) == other.Key(Failed) {
 			t.Errorf("another %s kept the key", name)
 		}
+	}
+
+	// EACH CONDITION COUNTS APART, so one cannot break or feed another's streak.
+	if job.Key(Failed) == job.Key(Disrupted) {
+		t.Error("two conditions share a key")
+	}
+
+	// NO NAME A WORKFLOW CHOSE MAKES TWO JOBS ONE KEY, and no key holds a NUL, which
+	// PostgreSQL's text refuses.
+	tricky := Job{Repository: "acme/api", JobName: `a","b`, WorkflowRef: job.WorkflowRef}
+	split := Job{Repository: "acme/api", JobName: "a", WorkflowRef: job.WorkflowRef}
+	if tricky.Key(Failed) == split.Key(Failed) || strings.ContainsRune(tricky.Key(Failed), 0) {
+		t.Errorf("keys %q and %q", tricky.Key(Failed), split.Key(Failed))
+	}
+	condition, repository, workflow, name, ok := KeyParts(tricky.Key(Cancelled))
+	if !ok || condition != Cancelled || repository != "acme/api" || workflow != ".github/workflows/ci.yml" ||
+		name != `a","b` {
+		t.Errorf("KeyParts = %q %q %q %q %v", condition, repository, workflow, name, ok)
+	}
+	if _, _, _, _, ok := KeyParts("not a key"); ok {
+		t.Error("KeyParts read something that is not a key")
 	}
 
 	if got := (&Job{}).Workflow(); got != "" {

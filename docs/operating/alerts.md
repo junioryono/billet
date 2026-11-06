@@ -39,6 +39,8 @@ It must be `https`. Plain `http` is refused unless the host is a literal loopbac
 
 **A destination that cannot be read does not stop the control plane**, because scheduling matters more than a notice. It is logged as an error at the start, and every notice owed to it settles `failed` with the reason, which `billet alerts list` shows. To check one before a job goes red, run `billet alerts test --destination NAME`. It reads the address with your shell's environment and files, which may not be the service's.
 
+A destination is delivered to while the config names it, even with no rule left, so what it is already owed still arrives. Notices owed to a destination the config no longer names are given up on when the control plane starts, with that reason, rather than owed for ever.
+
 | `kind` | What is sent |
 |---|---|
 | `webhook` | a POST of the notice below |
@@ -70,6 +72,8 @@ An empty string is not recorded. `condition` is one of `failed`, `cancelled`, `d
 
 A job GitHub cancelled before it started is not one of these. GitHub cancels and reassigns an assignment nobody ran, and that is nobody's failure. And `waited_longer_than` is judged once a job has started: a job still waiting has no row to judge, so use `billet_tier_waiting_seconds` for that. A job whose queue time GitHub's record never gave is not judged either way.
 
+Each condition is judged, counted and cooled down apart: a failure that was not disrupted is a miss on `disrupted` and changes nothing about the failures' streak, and one job that both failed and was disrupted counts once on each. A rule's jobs are counted in the order their results arrived, so a success between two failures breaks the streak however the evaluation's passes fell.
+
 `match` narrows a rule, and an empty one matches every job. Each field is a pattern, with `*` for any run of characters and `?` for one, `/` included:
 
 | Field | What it is matched against |
@@ -81,29 +85,33 @@ A job GitHub cancelled before it started is not one of these. GitHub cancels and
 | `branch` | the run's own branch, read from GitHub |
 | `step` | a step that ended the way the condition is about, read from GitHub. It takes only `failed` and `cancelled`, and a job that went red in another step counts as a run that did not hit |
 
-**`branch` and `step` need the App to hold `actions: read`**, which `billet check` holds to. They are read within the budget the queue-time sweep leaves, a few a pass, and a job waits for an answer for an hour. If GitHub never gives one, the job is judged neither way and the log says so, because a rule that silently stopped firing is what this exists to prevent.
+**`branch` and `step` need the App to hold `actions: read`**, which `billet check` holds to. The branch is the one the queue-time sweep already recorded from GitHub when it has, and is read only for a run it has not. Steps are read once a run, for every job of it, and only from a job GitHub has concluded: a step still running has no conclusion yet. Reads take three a pass from each App installation and never its reserve, and a job waits for its turn. Once GitHub has been asked about a job, it waits an hour for an answer; if none comes, the job is judged neither way and the log says so, because a rule that silently stopped firing is what this exists to prevent. A job judged neither way breaks no streak.
+
+A job whose runner billet lost has no failed step: GitHub leaves the running step without a conclusion (measured 2026-11-04, [Re-running disrupted jobs](../reference/records/job-reruns.md)). So a rule naming a `step` with `failed` does not fire for it; use `disrupted` for that.
 
 ## Noise
 
-Everything below counts per rule, and per job of a workflow of a repository, whichever tier or attempt ran it.
+Everything below counts per rule and condition, and per job of a workflow of a repository, whichever tier or attempt ran it.
 
 - **`in_a_row`** is how many runs in a row must hit before the rule fires, 1 to 100, default 1.
 - **`cooldown`** is how long the rule then stays quiet about that job, default `1h`; `0s` is none. A hit during it still counts towards the streak.
-- **A mute** silences a rule without a restart, and holds across a failover: `billet alerts mute deploys --for 2h`, and `billet alerts unmute deploys`. It has to end, because a rule nobody wants should leave the config. A muted rule's jobs go on being counted, and a hit it swallowed is not sent later.
+- **A mute** silences a rule without a restart, and holds across a failover: `billet alerts mute deploys --for 2h`, and `billet alerts unmute deploys`. It has to end, within 30 days, because a rule nobody wants should leave the config. A muted rule's jobs go on being counted, and a hit it swallowed is not sent later.
 
 A rule is about jobs that started after this deployment first saw it, so adding one does not page anybody about the last day.
 
 ## What it costs and what it promises
 
-The evaluation and each destination run in the background of the control plane and can stop nothing. Every decision is written before anything is sent, so a destination that hangs holds no write and delays no job.
+The evaluation and each destination run in the background of the control plane and can stop nothing. Every decision is written before anything is sent, so a destination that hangs holds no write and delays no job. Each verdict is one ledger write: a job that ended costs one per rule and condition that judged it, a success included, since a success is what ends a streak.
+
+A job is judged once its result arrives, within six hours, and only if it started within the last seven days; a control plane down for longer than six hours does not judge what ended meanwhile. The evaluation reads on from the last job it decided, so a backlog is reached in order rather than hidden behind newer results.
 
 One request goes to a destination at a time, each bounded at ten seconds, so one that hangs delays only its own queue. A redirect is refused, not followed, because a notice is not for wherever a destination sends it.
 
-A notice gets five tries, thirty seconds apart and doubling. A 429, a 5xx or a failed connection is tried again; any other answer is not, since a Slack `invalid_token` will not change. A notice given up on is logged and shown by `billet alerts list`, and `billet_alert_notices{destination,state}` counts them, which is what to alert on for this itself.
+A notice gets five tries, thirty seconds apart from the end of the last and doubling. A 429, a 5xx or a failed connection is tried again; any other answer is not, since a Slack `invalid_token` will not change. A notice given up on is logged and shown by `billet alerts list`, and `billet_alert_notices{destination,state}` counts them, which is what to alert on for this itself.
 
 Delivery is at least once: a notice delivered whose delivery could not be recorded is sent again.
 
-No log line or stored error carries a destination's address or what it answered, only the status and the class of a failure.
+No log line or stored error carries a destination's address or what it answered, only the status and the class of a failure. Nor does a refusal of the config: a name or a reference that is not a name is not repeated, in case it is the address pasted in the wrong place. A connection to a destination is used for one request and closed, so nothing it writes afterwards is read.
 
 ## Commands
 

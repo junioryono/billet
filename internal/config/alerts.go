@@ -139,6 +139,17 @@ func (r *AlertRule) NeedsRunRecords() bool { return r.Match.Branch != "" || r.Ma
 // label, and a word in a message.
 var alertName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
+// quoteAlertName is a name as a refusal may show it. ONLY A NAME IS QUOTED: the likeliest
+// thing in a name's place is the address pasted there, a credential, and a refusal is
+// printed, logged and pasted into tickets.
+func quoteAlertName(name string) string {
+	if alertName.MatchString(name) {
+		return fmt.Sprintf("%q", name)
+	}
+
+	return "a value that is not a name (not repeated here, in case it is an address)"
+}
+
 // validateAlerts checks `server.alerts`.
 func (c *Config) validateAlerts() []error {
 	if c.Server == nil || c.Server.Alerts == nil {
@@ -156,8 +167,8 @@ func (c *Config) validateAlerts() []error {
 
 		errs = append(errs, d.errors(where)...)
 
-		if kinds[d.Name] {
-			errs = append(errs, fmt.Errorf("%s: name %q is used twice", where, d.Name))
+		if kinds[d.Name] && alertName.MatchString(d.Name) {
+			errs = append(errs, fmt.Errorf("%s: name %s is used twice", where, quoteAlertName(d.Name)))
 		}
 		kinds[d.Name] = true
 	}
@@ -169,8 +180,8 @@ func (c *Config) validateAlerts() []error {
 
 		errs = append(errs, r.errors(where, kinds)...)
 
-		if names[r.Name] {
-			errs = append(errs, fmt.Errorf("%s: name %q is used twice", where, r.Name))
+		if names[r.Name] && alertName.MatchString(r.Name) {
+			errs = append(errs, fmt.Errorf("%s: name %s is used twice", where, quoteAlertName(r.Name)))
 		}
 		names[r.Name] = true
 	}
@@ -182,8 +193,8 @@ func (d *AlertDestination) errors(where string) []error {
 	var errs []error
 
 	if !alertName.MatchString(d.Name) {
-		errs = append(errs, fmt.Errorf("%s: name %q is not a letter or digit followed by at most 63 of "+
-			"letters, digits, `.`, `_` and `-`", where, d.Name))
+		errs = append(errs, fmt.Errorf("%s: name is not a letter or digit followed by at most 63 of "+
+			"letters, digits, `.`, `_` and `-`; it is not repeated here, in case it is an address", where))
 	}
 
 	switch d.Kind {
@@ -207,8 +218,9 @@ func (d *AlertDestination) errors(where string) []error {
 		errs = append(errs, fmt.Errorf("%s: url_file looks like an address rather than the path of a file "+
 			"holding one; write the path, and keep the address out of the config", where))
 	case !filepath.IsAbs(d.URLFile):
-		errs = append(errs, fmt.Errorf("%s: url_file %q must be absolute: the service's working directory "+
-			"is not what an operator is looking at", where, d.URLFile))
+		// NOT QUOTED: an address written without its scheme passes the check above.
+		errs = append(errs, fmt.Errorf("%s: url_file must be an absolute path: the service's working directory "+
+			"is not what an operator is looking at", where))
 	}
 
 	return errs
@@ -235,8 +247,8 @@ func (r *AlertRule) errors(where string, destinations map[string]bool) []error {
 	var errs []error
 
 	if !alertName.MatchString(r.Name) {
-		errs = append(errs, fmt.Errorf("%s: name %q is not a letter or digit followed by at most 63 of "+
-			"letters, digits, `.`, `_` and `-`", where, r.Name))
+		errs = append(errs, fmt.Errorf("%s: name is not a letter or digit followed by at most 63 of "+
+			"letters, digits, `.`, `_` and `-`; it is not repeated here, in case it is an address", where))
 	}
 
 	running, err := r.On.RunningOver()
@@ -292,10 +304,10 @@ func (r *AlertRule) errors(where string, destinations map[string]bool) []error {
 	seen := make(map[string]bool, len(r.Notify))
 	for _, name := range r.Notify {
 		if !destinations[name] {
-			errs = append(errs, fmt.Errorf("%s: notify names %q, which is no destination", where, name))
+			errs = append(errs, fmt.Errorf("%s: notify names %s, which is no destination", where, quoteAlertName(name)))
 		}
 		if seen[name] {
-			errs = append(errs, fmt.Errorf("%s: notify names %q twice", where, name))
+			errs = append(errs, fmt.Errorf("%s: notify names %s twice", where, quoteAlertName(name)))
 		}
 		seen[name] = true
 	}

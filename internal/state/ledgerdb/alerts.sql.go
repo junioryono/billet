@@ -45,6 +45,26 @@ func (q *Queries) CountAlertNotices(ctx context.Context) ([]CountAlertNoticesRow
 	return items, nil
 }
 
+const failPendingAlertNotices = `-- name: FailPendingAlertNotices :execrows
+UPDATE alert_outbox SET state = 'failed', last_error = $1, settled_at = $2
+ WHERE destination = $3 AND state = 'pending'
+`
+
+type FailPendingAlertNoticesParams struct {
+	LastError   string
+	SettledAt   string
+	Destination string
+}
+
+// Give up on every notice still owed to one destination, with why.
+func (q *Queries) FailPendingAlertNotices(ctx context.Context, arg FailPendingAlertNoticesParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, failPendingAlertNotices, arg.LastError, arg.SettledAt, arg.Destination)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const insertAlertMark = `-- name: InsertAlertMark :execrows
 INSERT INTO alert_marks (rule_name, lease_id, alert_condition, outcome, decided_at)
 VALUES ($1, $2, $3, $4, $5)
@@ -293,16 +313,21 @@ const listEndedJobsForAlerts = `-- name: ListEndedJobsForAlerts :many
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, workflow_ref, job_name,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       result, result_at, COALESCE(started_at, '') AS started_at, github_queued_at, disruption, rerun_decision
+       result, result_at, COALESCE(started_at, '') AS started_at, github_queued_at, disruption, rerun_decision,
+       head_branch
   FROM job_history
- WHERE result != '' AND result_at >= $1 AND started_at IS NOT NULL
- ORDER BY result_at DESC, lease_id DESC
- LIMIT CAST($2 AS BIGINT)
+ WHERE result != '' AND result_at >= $1 AND started_at IS NOT NULL AND started_at >= $2
+   AND (result_at > $3 OR (result_at = $3 AND lease_id > $4))
+ ORDER BY result_at, lease_id
+ LIMIT CAST($5 AS BIGINT)
 `
 
 type ListEndedJobsForAlertsParams struct {
-	Since   string
-	MaxRows int64
+	Since        string
+	StartedSince sql.NullString
+	AfterResult  string
+	AfterLease   string
+	MaxRows      int64
 }
 
 type ListEndedJobsForAlertsRow struct {
@@ -319,14 +344,25 @@ type ListEndedJobsForAlertsRow struct {
 	GithubQueuedAt string
 	Disruption     string
 	RerunDecision  string
+	HeadBranch     string
 }
 
-// The jobs that started and whose result arrived since a moment, newest first and
-// bounded. A job GitHub cancelled before it started is not here: an assignment nobody
-// ran is cancelled and reassigned by GitHub itself (assignment-protocol.md), and
-// that is nobody's failure.
+// The jobs whose result arrived after a cursor and since a moment, oldest first and
+// bounded, so a pass reads on from where the last one decided everything and a
+// backlog is reached in order rather than hidden behind newer results. Only a job
+// that started since started_since, the window a running job is watched for, so a
+// job is judged in one window and a judgement outlives every window it is read in. A
+// job GitHub cancelled before it started is not here: an assignment nobody ran is
+// cancelled and reassigned by GitHub itself (assignment-protocol.md), and that is
+// nobody's failure.
 func (q *Queries) ListEndedJobsForAlerts(ctx context.Context, arg ListEndedJobsForAlertsParams) ([]ListEndedJobsForAlertsRow, error) {
-	rows, err := q.db.QueryContext(ctx, listEndedJobsForAlerts, arg.Since, arg.MaxRows)
+	rows, err := q.db.QueryContext(ctx, listEndedJobsForAlerts,
+		arg.Since,
+		arg.StartedSince,
+		arg.AfterResult,
+		arg.AfterLease,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -348,6 +384,7 @@ func (q *Queries) ListEndedJobsForAlerts(ctx context.Context, arg ListEndedJobsF
 			&i.GithubQueuedAt,
 			&i.Disruption,
 			&i.RerunDecision,
+			&i.HeadBranch,
 		); err != nil {
 			return nil, err
 		}
@@ -411,15 +448,45 @@ func (q *Queries) ListFailedAlertNotices(ctx context.Context, maxRows int64) ([]
 	return items, nil
 }
 
+const listPendingAlertDestinations = `-- name: ListPendingAlertDestinations :many
+SELECT DISTINCT destination FROM alert_outbox WHERE state = 'pending' ORDER BY destination
+`
+
+// Every destination a notice is still owed to, so one the config no longer names can
+// be told so rather than owe for ever.
+func (q *Queries) ListPendingAlertDestinations(ctx context.Context) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listPendingAlertDestinations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var destination string
+		if err := rows.Scan(&destination); err != nil {
+			return nil, err
+		}
+		items = append(items, destination)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunningJobsForAlerts = `-- name: ListRunningJobsForAlerts :many
 
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, workflow_ref, job_name,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
-       result, result_at, COALESCE(started_at, '') AS started_at, github_queued_at, disruption, rerun_decision
+       result, result_at, COALESCE(started_at, '') AS started_at, github_queued_at, disruption, rerun_decision,
+       head_branch
   FROM job_history
- WHERE result = '' AND started_at IS NOT NULL AND started_at >= $1
- ORDER BY started_at DESC, lease_id DESC
+ WHERE result = '' AND started_at IS NOT NULL AND started_at >= $1 AND COALESCE(finished_at, '') = ''
+ ORDER BY started_at, lease_id
  LIMIT CAST($2 AS BIGINT)
 `
 
@@ -442,13 +509,15 @@ type ListRunningJobsForAlertsRow struct {
 	GithubQueuedAt string
 	Disruption     string
 	RerunDecision  string
+	HeadBranch     string
 }
 
 // Alerts (#537): which jobs `server.alerts` looks at, what it has decided, and what
 // it owes a destination. Migration 74 holds why each table is shaped as it is.
-// The jobs running now that started since a moment, newest first and bounded, with
+// The jobs running now that started since a moment, oldest first and bounded, with
 // what a rule is judged against. The run is the one that started, as
-// ListJobsAwaitingQueueTime reads it.
+// ListJobsAwaitingQueueTime reads it. A lease that finished without a result is not
+// running, whatever its result says. They are as many as the fleet's runners.
 func (q *Queries) ListRunningJobsForAlerts(ctx context.Context, arg ListRunningJobsForAlertsParams) ([]ListRunningJobsForAlertsRow, error) {
 	rows, err := q.db.QueryContext(ctx, listRunningJobsForAlerts, arg.Since, arg.MaxRows)
 	if err != nil {
@@ -472,6 +541,7 @@ func (q *Queries) ListRunningJobsForAlerts(ctx context.Context, arg ListRunningJ
 			&i.GithubQueuedAt,
 			&i.Disruption,
 			&i.RerunDecision,
+			&i.HeadBranch,
 		); err != nil {
 			return nil, err
 		}
@@ -533,12 +603,18 @@ func (q *Queries) PruneAlertNotices(ctx context.Context, before string) error {
 }
 
 const pruneAlertStreaks = `-- name: PruneAlertStreaks :exec
-DELETE FROM alert_streaks WHERE updated_at < $1
+DELETE FROM alert_streaks WHERE updated_at < $1 AND cooldown_until < $2
 `
 
-// Forget a job nobody has run in a long while; a streak of that age says nothing.
-func (q *Queries) PruneAlertStreaks(ctx context.Context, before string) error {
-	_, err := q.db.ExecContext(ctx, pruneAlertStreaks, before)
+type PruneAlertStreaksParams struct {
+	Before string
+	Now    string
+}
+
+// Forget a job nobody has run in a long while; a streak of that age says nothing. A
+// cooldown still running is kept, however long it was asked to be.
+func (q *Queries) PruneAlertStreaks(ctx context.Context, arg PruneAlertStreaksParams) error {
+	_, err := q.db.ExecContext(ctx, pruneAlertStreaks, arg.Before, arg.Now)
 	return err
 }
 
@@ -619,10 +695,10 @@ func (q *Queries) SettleAlertNotice(ctx context.Context, arg SettleAlertNoticePa
 }
 
 const unmuteAlertRule = `-- name: UnmuteAlertRule :execrows
-UPDATE alert_rules SET muted_until = '', muted_by = '' WHERE name = $1
+UPDATE alert_rules SET muted_until = '', muted_by = '' WHERE name = $1 AND muted_until != ''
 `
 
-// Lift a rule's mute; the count says whether there was such a rule.
+// Lift a rule's mute; the count says whether there was one.
 func (q *Queries) UnmuteAlertRule(ctx context.Context, name string) (int64, error) {
 	result, err := q.db.ExecContext(ctx, unmuteAlertRule, name)
 	if err != nil {

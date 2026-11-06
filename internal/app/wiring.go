@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/junioryono/billet/internal/alerts"
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	billetgithub "github.com/junioryono/billet/internal/github"
@@ -132,7 +131,7 @@ var (
 	_ server.QueueTimes      = Provisioner{}
 	_ server.RESTHeadroom    = Provisioner{}
 	_ server.RunReruns       = Provisioner{}
-	_ server.JobSteps        = Provisioner{}
+	_ server.RunJobSteps     = Provisioner{}
 )
 
 // LatestAttempt reads the attempt a run is on, and its jobs once it is completed.
@@ -170,11 +169,11 @@ func (p Provisioner) WorkflowRun(ctx context.Context, owner, repository string, 
 	return p.Client.WorkflowRun(ctx, owner, repository, runID)
 }
 
-// RunnerJobSteps reads the steps of the job a runner ran, for an alert rule naming a
+// RunJobSteps reads every job of a run with its steps, for an alert rule naming a
 // step.
-func (p Provisioner) RunnerJobSteps(ctx context.Context, owner, repository string, runID int64, runnerName string,
-) ([]alerts.Step, error) {
-	return p.Client.RunnerJobSteps(ctx, owner, repository, runID, runnerName)
+func (p Provisioner) RunJobSteps(ctx context.Context, owner, repository string, runID int64,
+) (map[string]server.RunnerSteps, error) {
+	return p.Client.RunJobSteps(ctx, owner, repository, runID)
 }
 
 // DefaultBranch reads a repository's default branch, for a cache authority.

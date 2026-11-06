@@ -1,6 +1,7 @@
 package alerts
 
 import (
+	"encoding/json"
 	"path"
 	"strings"
 	"time"
@@ -47,10 +48,12 @@ type Job struct {
 	Result      string
 	Disruption  string
 	// Rerun is what billet decided about re-running the job.
-	Rerun     string
-	StartedAt time.Time
-	ResultAt  time.Time
-	QueuedAt  time.Time
+	Rerun string
+	// HeadBranch is the run's branch as the ledger holds it, empty where it does not.
+	HeadBranch string
+	StartedAt  time.Time
+	ResultAt   time.Time
+	QueuedAt   time.Time
 }
 
 // Workflow is the job's workflow file within its repository,
@@ -65,10 +68,31 @@ func (j *Job) Workflow() string {
 	return ref
 }
 
-// Key is what a rule's streak and cooldown are counted by: one job of one workflow
-// of one repository, whichever tier or attempt ran it.
-func (j *Job) Key() string {
-	return j.Repository + "\x00" + j.Workflow() + "\x00" + j.JobName
+// Key is what a rule's streak and cooldown on one condition are counted by: one job
+// of one workflow of one repository, whichever tier or attempt ran it, so each
+// condition of a rule is counted apart, as the docs promise.
+//
+// A JSON ARRAY, so no name a workflow author chose can make two jobs one key, and no
+// byte PostgreSQL's text refuses, a NUL, is ever written.
+func (j *Job) Key(condition Condition) string {
+	key, err := json.Marshal([]string{string(condition), j.Repository, j.Workflow(), j.JobName})
+	if err != nil {
+		// Marshalling strings cannot fail; a key that says so is never a real job's.
+		return "unencodable"
+	}
+
+	return string(key)
+}
+
+// KeyParts is a Key read back: its condition, repository, workflow and job, false
+// for one that is not a key.
+func KeyParts(key string) (Condition, string, string, string, bool) {
+	var parts []string
+	if err := json.Unmarshal([]byte(key), &parts); err != nil || len(parts) != 4 {
+		return "", "", "", "", false
+	}
+
+	return Condition(parts[0]), parts[1], parts[2], parts[3], true
 }
 
 // Verdict is what a condition says about a job.
@@ -255,11 +279,14 @@ func judgeDuration(j *Job, over time.Duration, now time.Time) Verdict {
 // glob is a pattern with `*` for any run of characters and `?` for one, `/` included,
 // since a job's or a step's name is free text. An empty pattern matches everything:
 // a rule names only what it narrows by. It backtracks only to the last `*`, so a
-// name a workflow wrote costs at most the pattern's length times its own.
-func glob(pattern, value string) bool {
-	if pattern == "" {
+// name a workflow wrote costs at most the pattern's length times its own. Character
+// by character, not byte by byte, so `?` matches one letter of any script.
+func glob(patternText, valueText string) bool {
+	if patternText == "" {
 		return true
 	}
+
+	pattern, value := []rune(patternText), []rune(valueText)
 
 	p, v, star, mark := 0, 0, -1, 0
 	for v < len(value) {

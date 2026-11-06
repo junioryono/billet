@@ -48,7 +48,7 @@ func TestAnAlertAddressIsReadFromWhereTheConfigSays(t *testing.T) {
 		{"plain http off loopback", config.AlertDestination{URLEnv: "BILLET_TEST_ALERT_CLEAR"}, "not usable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			address, err := AlertAddress(&tc.destination)
+			address, err := AlertAddress(&tc.destination, os.Getenv)
 
 			if tc.refused == "" {
 				if err != nil {
@@ -78,6 +78,8 @@ func TestAnAlertAddressIsReadFromWhereTheConfigSays(t *testing.T) {
 // with the reason, so the rules naming it record why nothing arrived.
 func TestAnUnreadableDestinationStopsNothingAndSaysWhy(t *testing.T) {
 	t.Setenv("BILLET_TEST_ALERT_GOOD", secretAddress)
+	// SET, AND UNUSABLE: in the clear off loopback, with the secret in its path.
+	t.Setenv("BILLET_TEST_ALERT_CLEAR_TOO", "http://hooks.example.com/services/s3cretS3cretS3cret")
 
 	var logged bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logged, nil))
@@ -86,6 +88,7 @@ func TestAnUnreadableDestinationStopsNothingAndSaysWhy(t *testing.T) {
 		Destinations: []config.AlertDestination{
 			{Name: "good", Kind: config.AlertSlack, URLEnv: "BILLET_TEST_ALERT_GOOD"},
 			{Name: "unset", Kind: config.AlertWebhook, URLEnv: "BILLET_TEST_ALERT_NEVER_SET"},
+			{Name: "clear", Kind: config.AlertWebhook, URLEnv: "BILLET_TEST_ALERT_CLEAR_TOO"},
 		},
 		Rules: []config.AlertRule{{Name: "r", On: config.AlertConditions{Failed: true}, Notify: []string{"good", "unset"}}},
 	}}}
@@ -94,7 +97,7 @@ func TestAnUnreadableDestinationStopsNothingAndSaysWhy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildAlerts: %v", err)
 	}
-	if len(set.Rules) != 1 || len(set.Destinations) != 2 {
+	if len(set.Rules) != 1 || len(set.Destinations) != 3 {
 		t.Fatalf("set = %d rules, %d destinations", len(set.Rules), len(set.Destinations))
 	}
 
@@ -102,8 +105,13 @@ func TestAnUnreadableDestinationStopsNothingAndSaysWhy(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "BILLET_TEST_ALERT_NEVER_SET") {
 		t.Errorf("the unreadable destination's send = %v, want why", err)
 	}
-	if !strings.Contains(logged.String(), "unset") || strings.Contains(logged.String(), "s3cret") {
+	if !strings.Contains(logged.String(), "unset") || !strings.Contains(logged.String(), "clear") ||
+		strings.Contains(logged.String(), "s3cret") || strings.Contains(logged.String(), "hooks.") {
 		t.Errorf("logged %q", logged.String())
+	}
+	err = set.Destinations["clear"].Sender.Send(t.Context(), []byte(`{}`))
+	if err == nil || strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("the unusable destination's send = %v, want a refusal without the address", err)
 	}
 	if set.Destinations["good"].Kind != config.AlertSlack {
 		t.Errorf("the readable destination = %+v", set.Destinations["good"])
