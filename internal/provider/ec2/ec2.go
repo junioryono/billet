@@ -1785,7 +1785,7 @@ const maxUserData = 16 * 1024
 func withoutMessage(err error) error {
 	apiErr, ok := errors.AsType[*apiError](err)
 	if !ok {
-		return err
+		return withheldFailure(err)
 	}
 
 	// AND THE CODE IS CHECKED RATHER THAN TRUSTED. "AWS's fixed enumeration" is an
@@ -1793,13 +1793,56 @@ func withoutMessage(err error) error {
 	// so a reply that puts the echoed request body in <Code> instead of <Message>
 	// would walk straight through a function whose whole job is to stop that. A
 	// real code is a short identifier; anything else is not one, whatever it is.
+	// AND ONLY A CODE BILLET KNOWS IS RENDERED. A short token fits an identifier's
+	// shape as well as a code does, so the shape alone let `<Code>token</Code>` through.
 	code := apiErr.Code
-	if !awsErrorCode.MatchString(code) {
+	if !awsErrorCode.MatchString(code) || !knownLaunchCodes[code] {
 		code = "(unrecognised error code)"
 	}
 
 	return &apiError{Code: code, Status: apiErr.Status,
 		Message: "(message withheld: this request carries a runner registration)"}
+}
+
+// errWithheld is a failure of a credential-bearing call that was not an API refusal:
+// a transport error or an answer that would not parse.
+var errWithheld = errors.New("the call failed and its error is withheld: this request carries a credential")
+
+// withheldFailure keeps only what is safe to say about a failure that is not an API
+// refusal. A transport error renders the URL it was answered with, a redirect's
+// Location included, and an XML syntax error quotes the answer, and either can carry
+// the request back; so the text goes and the classification stays: a cancelled or
+// expired context, and a refused redirect, are still themselves.
+func withheldFailure(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%w: %w", errWithheld, context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%w: %w", errWithheld, context.DeadlineExceeded)
+	case errors.Is(err, errRedirected):
+		return errRedirected
+	}
+
+	return errWithheld
+}
+
+// knownLaunchCodes are the EC2 codes a refused launch may name: the ones billet
+// branches on, and the ones that tell an operator what to fix. Any other code is
+// rendered as unrecognised, because a launch carries a credential and an unknown
+// "code" is text whoever answered chose.
+var knownLaunchCodes = map[string]bool{
+	"InsufficientInstanceCapacity": true, "UnfulfillableCapacity": true, "InsufficientHostCapacity": true,
+	"Unsupported": true, "VcpuLimitExceeded": true, "InstanceLimitExceeded": true,
+	"UnauthorizedOperation": true, "AuthFailure": true, "InvalidClientTokenId": true,
+	"SignatureDoesNotMatch": true, "OptInRequired": true, "PendingVerification": true, "Blocked": true,
+	"InvalidParameterValue": true, "InvalidParameterCombination": true, "InvalidParameter": true,
+	"MissingParameter": true, "InvalidAMIID.NotFound": true, "InvalidAMIID.Malformed": true,
+	"InvalidSubnetID.NotFound": true, "InvalidGroup.NotFound": true, "InvalidBlockDeviceMapping": true,
+	"InvalidInstanceID.NotFound": true, "IdempotentParameterMismatch": true,
+	"InsufficientFreeAddressesInSubnet": true, "RequestLimitExceeded": true, "Throttling": true,
+	"InternalError": true, "InternalFailure": true, "Unavailable": true, "ServiceUnavailable": true,
 }
 
 // awsErrorCode is the shape of an EC2 error code — a short identifier, never

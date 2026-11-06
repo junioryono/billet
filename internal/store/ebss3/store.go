@@ -602,8 +602,7 @@ func (s Store) PublishCAS(
 			return fmt.Errorf("%w: cache %q has a newer writer", storecontract.ErrConflict, key)
 		}
 		if state.Pointer != expected {
-			return fmt.Errorf("%w: cache %q is at generation %q, not %q",
-				storecontract.ErrConflict, key, state.Pointer, expected)
+			return &storecontract.PointerMovedError{Key: key, Current: state.Pointer, Expected: expected}
 		}
 		recorded, ok := state.Candidates[candidate.Generation]
 		if !ok || recorded.Handle != candidate.Handle || recorded.Filesystem != candidate.Filesystem {

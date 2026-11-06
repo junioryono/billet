@@ -37,6 +37,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`ec2:RunInstances` on `*` authorises every snapshot a block-device mapping names**
 - **The runner is root on its own instance, and the instance is the boundary.**
 - **The AMI carries the guest half of every cache, and its library is cut from the firecracker agent's own text at build time (ADR-024).**
+- **A pool host carries tags of its own, never a job instance's owner tag, and its order is its `ClientToken` (ADR-030).**
 
 ### Windows on ec2: [references/windows.md](references/windows.md)
 
