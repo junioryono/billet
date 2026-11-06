@@ -290,7 +290,7 @@ func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision st
 
 	defer closeDB()
 
-	certPEM := ""
+	certPEM, serial := "", ""
 
 	if decision == alloc.EnrollApproved {
 		deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
@@ -331,14 +331,14 @@ func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision st
 		// RECORDED BEFORE IT IS HANDED OVER. Revocation names a serial, so a
 		// credential billet never wrote down cannot be taken back — and this is
 		// the first of the three ways one comes into existence.
-		if err := recordIssuedCert(ctx, a, bundle, name, alloc.CertEnrolled); err != nil {
+		if serial, err = recordIssuedCert(ctx, a, bundle, name, alloc.CertEnrolled); err != nil {
 			return err
 		}
 
 		certPEM = string(bundle.CertPEM)
 	}
 
-	if err := a.DecideEnrollment(ctx, name, *fingerprint, decision, certPEM); err != nil {
+	if err := a.DecideEnrollment(ctx, name, *fingerprint, decision, certPEM, serial); err != nil {
 		return err
 	}
 
@@ -412,7 +412,8 @@ func backfillIssuedCerts(ctx context.Context, env cli.Env, a *alloc.Allocator) e
 	return nil
 }
 
-// recordIssuedCert writes a credential into the list revocation reads.
+// recordIssuedCert writes a credential into the list revocation reads, and answers
+// its serial.
 //
 // EVERY WAY A CERTIFICATE COMES INTO EXISTENCE GOES THROUGH HERE — approval,
 // `billet ca issue`, and renewal over the wire. Revocation is keyed on serial,
@@ -421,14 +422,16 @@ func backfillIssuedCerts(ctx context.Context, env cli.Env, a *alloc.Allocator) e
 // is a credential it cannot take back.
 func recordIssuedCert(
 	ctx context.Context, a *alloc.Allocator, bundle wirecert.Bundle, node, source string,
-) error {
+) (string, error) {
 	leaf, err := wirecert.LeafOf(bundle)
 	if err != nil {
-		return fmt.Errorf("read back the certificate just issued to %s: %w", node, err)
+		return "", fmt.Errorf("read back the certificate just issued to %s: %w", node, err)
 	}
 
-	return a.RecordIssuedCert(ctx, alloc.IssuedCert{
-		Serial:   wirecert.Serial(leaf),
+	serial := wirecert.Serial(leaf)
+
+	return serial, a.RecordIssuedCert(ctx, alloc.IssuedCert{
+		Serial:   serial,
 		Node:     node,
 		Source:   source,
 		NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),

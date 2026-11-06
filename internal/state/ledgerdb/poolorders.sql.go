@@ -9,6 +9,52 @@ import (
 	"context"
 )
 
+const holdLapsedPoolJoins = `-- name: HoldLapsedPoolJoins :execrows
+UPDATE pool_orders SET join_hold = $1, updated_at = $2
+ WHERE state = 'placed' AND node_name = '' AND join_hold = ''
+   AND NOT EXISTS (SELECT 1 FROM join_tokens t
+                    WHERE t.pool_order = pool_orders.order_id AND t.uses_remaining > 0 AND t.expires_at > $3)
+   AND NOT EXISTS (SELECT 1 FROM node_enrollments e
+                    WHERE e.pool_order = pool_orders.order_id AND e.state = 'pending')
+`
+
+type HoldLapsedPoolJoinsParams struct {
+	JoinHold  string
+	UpdatedAt string
+	Now       string
+}
+
+// Hold every placed order nothing joined from that has no live token left and no
+// request waiting for a person: its host can no longer join, and without a hold the
+// pool would count it on its way forever.
+func (q *Queries) HoldLapsedPoolJoins(ctx context.Context, arg HoldLapsedPoolJoinsParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, holdLapsedPoolJoins, arg.JoinHold, arg.UpdatedAt, arg.Now)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const holdPoolOrderJoin = `-- name: HoldPoolOrderJoin :execrows
+UPDATE pool_orders SET join_hold = $1, updated_at = $2
+ WHERE order_id = $3 AND join_hold = ''
+`
+
+type HoldPoolOrderJoinParams struct {
+	JoinHold  string
+	UpdatedAt string
+	OrderID   string
+}
+
+// Hold an order's join for a person, with the first reason kept.
+func (q *Queries) HoldPoolOrderJoin(ctx context.Context, arg HoldPoolOrderJoinParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, holdPoolOrderJoin, arg.JoinHold, arg.UpdatedAt, arg.OrderID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const insertPoolOrder = `-- name: InsertPoolOrder :exec
 
 INSERT INTO pool_orders (order_id, source, scope, shape, location, arch, state, first_attempt_at, updated_at)
@@ -42,8 +88,40 @@ func (q *Queries) InsertPoolOrder(ctx context.Context, arg InsertPoolOrderParams
 	return err
 }
 
+const linkPoolOrderNode = `-- name: LinkPoolOrderNode :execrows
+UPDATE pool_orders
+   SET node_name = $1, node_fingerprint = $2, node_cert_serial = $3,
+       updated_at = $4
+ WHERE order_id = $5 AND state = 'placed' AND node_name = ''
+`
+
+type LinkPoolOrderNodeParams struct {
+	NodeName        string
+	NodeFingerprint string
+	NodeCertSerial  string
+	UpdatedAt       string
+	OrderID         string
+}
+
+// The node that joined from a placed order, the key it was admitted with and the
+// certificate it was handed. Once: an order's node is never replaced.
+func (q *Queries) LinkPoolOrderNode(ctx context.Context, arg LinkPoolOrderNodeParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, linkPoolOrderNode,
+		arg.NodeName,
+		arg.NodeFingerprint,
+		arg.NodeCertSerial,
+		arg.UpdatedAt,
+		arg.OrderID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const listPoolOrders = `-- name: ListPoolOrders :many
-SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at
+SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
+       node_fingerprint, node_cert_serial, join_hold
 FROM pool_orders
 ORDER BY first_attempt_at, order_id
 `
@@ -70,6 +148,9 @@ func (q *Queries) ListPoolOrders(ctx context.Context) ([]PoolOrder, error) {
 			&i.Reason,
 			&i.FirstAttemptAt,
 			&i.UpdatedAt,
+			&i.NodeFingerprint,
+			&i.NodeCertSerial,
+			&i.JoinHold,
 		); err != nil {
 			return nil, err
 		}
@@ -158,4 +239,34 @@ func (q *Queries) MarkPoolOrderUncertain(ctx context.Context, arg MarkPoolOrderU
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const readPoolOrder = `-- name: ReadPoolOrder :one
+SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
+       node_fingerprint, node_cert_serial, join_hold
+FROM pool_orders
+WHERE order_id = $1
+`
+
+func (q *Queries) ReadPoolOrder(ctx context.Context, orderID string) (PoolOrder, error) {
+	row := q.db.QueryRowContext(ctx, readPoolOrder, orderID)
+	var i PoolOrder
+	err := row.Scan(
+		&i.OrderID,
+		&i.Source,
+		&i.Scope,
+		&i.Shape,
+		&i.Location,
+		&i.Arch,
+		&i.State,
+		&i.HostID,
+		&i.NodeName,
+		&i.Reason,
+		&i.FirstAttemptAt,
+		&i.UpdatedAt,
+		&i.NodeFingerprint,
+		&i.NodeCertSerial,
+		&i.JoinHold,
+	)
+	return i, err
 }

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -97,6 +98,9 @@ type HostRecord struct {
 	InstanceType string
 	PrivateIP    string
 	Order        string
+	// LaunchTime is EC2's launchTime, zero when it did not say or said something
+	// that is not a time.
+	LaunchTime time.Time
 }
 
 // Launch starts one pool host. Its errors keep EC2's code and drop EC2's message,
@@ -318,5 +322,15 @@ func hostRecord(item instanceItem) HostRecord {
 		InstanceType: item.InstanceType,
 		PrivateIP:    item.PrivateIP,
 		Order:        order,
+		LaunchTime:   launchTime(item.LaunchTime),
 	}
+}
+
+func launchTime(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}
+	}
+
+	return t.UTC()
 }

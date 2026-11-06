@@ -13,10 +13,12 @@
 // Growth for demand is one host at a time while any placed host has not joined, because
 // a host takes minutes to join. The floor is kept otherwise.
 //
-// SHRINKING IS NOT HERE. A host leaves only by drain, on proof it holds nothing
-// (ADR-030), and that proof needs the host linked to the node that joined from it,
-// which the join brings. Until it does, no host is known to have joined, and demand
-// grows the pool by one host past the floor at most.
+// A HOST JOINS FROM ITS ORDER (ADR-030): every send mints a token bound to the order,
+// the admission links the order to the node that joined from it, and an order whose
+// tokens all lapsed with nothing joined is held for a person, as is one whose join the
+// source contradicted. A held order still holds its host and is no longer on its way.
+//
+// SHRINKING IS NOT HERE. A host leaves only by drain, on proof it holds nothing.
 package pool
 
 import (
@@ -52,7 +54,8 @@ type Ledger interface {
 	PoolOrderPlaced(ctx context.Context, id, hostID string) error
 	PoolOrderUncertain(ctx context.Context, id, reason string) error
 	PoolOrderRefused(ctx context.Context, id, reason string) error
-	NewJoinToken(ctx context.Context, ttl time.Duration, uses int, note string) (string, error)
+	NewPoolJoinToken(ctx context.Context, order string, ttl time.Duration) (string, error)
+	HoldLapsedPoolJoins(ctx context.Context) (int, error)
 	CapacityReports(ctx context.Context) (map[string]alloc.TierCapacity, error)
 }
 
@@ -149,13 +152,21 @@ func (p *Pool) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// Step reads every order back, then orders what the floor and the demand call for.
+// Step reads every order back, holds for a person every placed order nothing can join
+// from any more, then orders what the floor and the demand call for.
 func (p *Pool) Step(ctx context.Context) error {
+	var errs []error
+	// A HOST WHOSE TOKENS ALL LAPSED CAN NEVER JOIN, and without a hold it would count
+	// on its way forever and stop growth for demand with nothing to say why.
+	if held, err := p.ledger.HoldLapsedPoolJoins(ctx); err != nil {
+		errs = append(errs, err)
+	} else if held > 0 {
+		p.log.Warn("pool orders whose hosts can no longer join are held for a person", "held", held)
+	}
 	orders, err := p.ledger.PoolOrders(ctx)
 	if err != nil {
-		return err
+		return errors.Join(append(errs, err)...)
 	}
-	var errs []error
 	for i := range orders {
 		if o := orders[i]; o.State == alloc.PoolOrdering {
 			if err := p.resume(ctx, o); err != nil {
@@ -193,8 +204,8 @@ func (p *Pool) Step(ctx context.Context) error {
 }
 
 // counts are an architecture's orders that hold or may hold a host (active), those
-// whose outcome is not known (unknown), and those placed and not yet known to have
-// joined (onItsWay).
+// whose outcome is not known (unknown), and those placed, not yet joined and not held
+// for a person (onItsWay).
 type counts struct{ active, unknown, onItsWay int }
 
 func count(orders []alloc.PoolOrder, arch config.Arch) counts {
@@ -210,7 +221,9 @@ func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 			c.unknown++
 		case alloc.PoolPlaced:
 			c.active++
-			if o.NodeName == "" {
+			// A HELD ORDER IS NOT ON ITS WAY: its host joins only once a person acts, and
+			// counting it would stop growth for demand until then.
+			if o.NodeName == "" && o.JoinHold == "" {
 				c.onItsWay++
 			}
 		}
@@ -334,7 +347,7 @@ func (p *Pool) send(ctx context.Context, o alloc.PoolOrder, first bool) error {
 
 		return err
 	}
-	token, err := p.ledger.NewJoinToken(ctx, p.cfg.TokenLife, 1, "pool order "+o.ID)
+	token, err := p.ledger.NewPoolJoinToken(ctx, o.ID, p.cfg.TokenLife)
 	if err != nil {
 		return notSent(fmt.Errorf("pool: mint the join token of order %s: %w", o.ID, err))
 	}

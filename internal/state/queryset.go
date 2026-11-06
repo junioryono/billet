@@ -140,6 +140,8 @@ type ReadOps interface {
 	ReadRetirement(ctx context.Context, deployment string) (ledgerdb.ControllerRetirement, error)
 	ReadEnrollment(ctx context.Context, name string) (ledgerdb.NodeEnrollment, error)
 	ReadEnrollmentFingerprint(ctx context.Context, name string) (string, error)
+	ReadJoinTokenOrder(ctx context.Context, tokenSha256 string) (string, error)
+	ReadPoolOrder(ctx context.Context, orderID string) (ledgerdb.PoolOrder, error)
 	ReadJobConclusion(ctx context.Context, leaseID string) (sql.NullString, error)
 	ReadJobFailureReason(ctx context.Context, leaseID string) (string, error)
 	ReadJobNode(ctx context.Context, leaseID string) (sql.NullString, error)
@@ -283,6 +285,13 @@ type WriteOps interface {
 	MarkPoolOrderUncertain(ctx context.Context, arg ledgerdb.MarkPoolOrderUncertainParams) (int64, error)
 	MarkPoolOrderRefused(ctx context.Context, arg ledgerdb.MarkPoolOrderRefusedParams) (int64, error)
 	MarkPoolOrderAbandoned(ctx context.Context, arg ledgerdb.MarkPoolOrderAbandonedParams) (int64, error)
+	LinkPoolOrderNode(ctx context.Context, arg ledgerdb.LinkPoolOrderNodeParams) (int64, error)
+	HoldPoolOrderJoin(ctx context.Context, arg ledgerdb.HoldPoolOrderJoinParams) (int64, error)
+	HoldLapsedPoolJoins(ctx context.Context, arg ledgerdb.HoldLapsedPoolJoinsParams) (int64, error)
+	SpendPoolJoinToken(ctx context.Context, arg ledgerdb.SpendPoolJoinTokenParams) (sql.Result, error)
+	RetirePoolJoinTokens(ctx context.Context, poolOrder string) error
+	InsertAdmittedEnrollment(ctx context.Context, arg ledgerdb.InsertAdmittedEnrollmentParams) error
+	AdmitPendingEnrollment(ctx context.Context, arg ledgerdb.AdmitPendingEnrollmentParams) (int64, error)
 	RefreshLeaseHolder(ctx context.Context, arg ledgerdb.RefreshLeaseHolderParams) error
 	RecordBarrierRun(ctx context.Context, arg ledgerdb.RecordBarrierRunParams) error
 	RecordHistoryCacheObservation(ctx context.Context, arg ledgerdb.RecordHistoryCacheObservationParams) error

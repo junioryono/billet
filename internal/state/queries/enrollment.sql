@@ -8,7 +8,7 @@
 
 -- name: ReadEnrollment :one
 -- One request, by the name it claims.
-SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source
+SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source, pool_order
   FROM node_enrollments WHERE name = @name;
 
 -- name: ReadEnrollmentFingerprint :one
@@ -20,9 +20,10 @@ SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, so
 SELECT fingerprint FROM node_enrollments WHERE name = @name;
 
 -- name: InsertEnrollment :exec
--- Record a request for a name nothing holds.
-INSERT INTO node_enrollments (name, fingerprint, csr_pem, state, requested_at)
-VALUES (@name, @fingerprint, @csr_pem, @state, @requested_at);
+-- Record a request for a name nothing holds, and the pool order it came in under, if
+-- any.
+INSERT INTO node_enrollments (name, fingerprint, csr_pem, state, requested_at, pool_order)
+VALUES (@name, @fingerprint, @csr_pem, @state, @requested_at, @pool_order);
 
 -- name: ReplaceDeniedEnrollment :exec
 -- Let a different key take a name a denial is holding.
@@ -35,7 +36,7 @@ VALUES (@name, @fingerprint, @csr_pem, @state, @requested_at);
 -- this, the machine that comes back is refused forever.
 UPDATE node_enrollments
    SET fingerprint = @fingerprint, csr_pem = @csr_pem, cert_pem = '', state = @state,
-       source = 'enrolled', requested_at = @requested_at, decided_at = ''
+       source = 'enrolled', requested_at = @requested_at, decided_at = '', pool_order = @pool_order
  WHERE name = @name;
 
 -- name: DecideEnrollment :exec
@@ -59,11 +60,12 @@ ON CONFLICT (name) DO UPDATE SET
   cert_pem    = excluded.cert_pem,
   state       = excluded.state,
   source      = excluded.source,
-  decided_at  = excluded.decided_at;
+  decided_at  = excluded.decided_at,
+  pool_order  = '';
 
 -- name: ListEnrollments :many
 -- Everything that has asked to join.
-SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source
+SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source, pool_order
   FROM node_enrollments ORDER BY requested_at;
 
 -- name: ListEnrollmentsInState :many
@@ -74,5 +76,20 @@ SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, so
 -- Go that chooses it. An unfiltered
 -- read of this table is the operator's whole pending list; a filtered one is a
 -- lookup, and folding them into one query hides which is running.
-SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source
+SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source, pool_order
   FROM node_enrollments WHERE state = @state ORDER BY requested_at;
+
+-- name: InsertAdmittedEnrollment :exec
+-- Record a pool host admitted on its source's word (ADR-030): approved as it is
+-- recorded, with the certificate it is handed and the order it joined from.
+INSERT INTO node_enrollments
+     (name, fingerprint, csr_pem, cert_pem, state, source, requested_at, decided_at, pool_order)
+VALUES (@name, @fingerprint, @csr_pem, @cert_pem, 'approved', 'pool', @requested_at, @decided_at, @pool_order);
+
+-- name: AdmitPendingEnrollment :execrows
+-- Approve a pool host's request that was recorded while its source could not yet say
+-- which key is its own, on the source's word: only that request, by its key and its
+-- order, and only while it is still pending.
+UPDATE node_enrollments
+   SET state = 'approved', cert_pem = @cert_pem, source = 'pool', decided_at = @decided_at
+ WHERE name = @name AND fingerprint = @fingerprint AND pool_order = @pool_order AND state = 'pending';

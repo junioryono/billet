@@ -38,6 +38,9 @@ type Enrollment struct {
 	Source      string
 	RequestedAt string
 	DecidedAt   string
+	// PoolOrder is the pool order this machine asked to join from, when its token was
+	// one a pool minted for an order (ADR-030).
+	PoolOrder string
 }
 
 // RequestEnrollment records a node asking to join, or returns what it was
@@ -52,7 +55,7 @@ func (a *Allocator) RequestEnrollment(ctx context.Context, name, fingerprint, cs
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		var err error
 
-		out, err = a.requestEnrollmentTx(ctx, tx, name, fingerprint, csrPEM)
+		out, err = a.requestEnrollmentTx(ctx, tx, name, fingerprint, csrPEM, "")
 
 		return err
 	})
@@ -107,13 +110,15 @@ func (a *Allocator) RequestEnrollmentWithToken(
 			return err
 		}
 
+		order := ""
+
 		if !known {
-			if err := a.spendJoinTokenTx(ctx, tx, token); err != nil {
+			if order, err = a.spendEnrollmentTokenTx(ctx, tx, name, token); err != nil {
 				return err
 			}
 		}
 
-		out, err = a.requestEnrollmentTx(ctx, tx, name, fingerprint, csrPEM)
+		out, err = a.requestEnrollmentTx(ctx, tx, name, fingerprint, csrPEM, order)
 
 		return err
 	})
@@ -199,9 +204,44 @@ func isKnownEnrollmentTx(ctx context.Context, q state.ReadOps, name, fingerprint
 	return existing.Fingerprint == fingerprint, nil
 }
 
+// spendEnrollmentTokenTx spends the token a new request carries and answers the
+// pool order it was minted for, empty for an operator's.
+//
+// A POOL'S TOKEN ENROLLS ONLY ITS ORDER'S NODE, and only while the order is open:
+// placed, its join held for no one, and no node joined from it yet (ADR-030). The
+// name comes from the order, never from the request, so a request naming anything
+// else is refused as an unusable token, and nothing is spent: the transaction rolls
+// back with the refusal.
+func (a *Allocator) spendEnrollmentTokenTx(ctx context.Context, tx *sql.Tx, name, token string) (string, error) {
+	q := state.WriteQueries(tx)
+
+	order, err := q.ReadJoinTokenOrder(ctx, hashJoinToken(token))
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows) || (err == nil && order == ""):
+		return "", a.spendJoinTokenTx(ctx, tx, token)
+	case err != nil:
+		return "", fmt.Errorf("alloc: read which order a join token is for: %w", err)
+	}
+
+	if name != PoolNodeName(order) {
+		return "", ErrBadJoinToken
+	}
+
+	if _, err := openPoolOrderTx(ctx, q, order); err != nil {
+		return "", err
+	}
+
+	if err := a.spendPoolJoinTokenTx(ctx, tx, order, token); err != nil {
+		return "", err
+	}
+
+	return order, nil
+}
+
 // requestEnrollmentTx is the body of a request, inside a caller's transaction.
 func (a *Allocator) requestEnrollmentTx(
-	ctx context.Context, tx *sql.Tx, name, fingerprint, csrPEM string,
+	ctx context.Context, tx *sql.Tx, name, fingerprint, csrPEM, poolOrder string,
 ) (Enrollment, error) {
 	q := state.WriteQueries(tx)
 
@@ -217,13 +257,14 @@ func (a *Allocator) requestEnrollmentTx(
 			CsrPem:      csrPEM,
 			State:       EnrollPending,
 			RequestedAt: now,
+			PoolOrder:   poolOrder,
 		}); err != nil {
 			return Enrollment{}, fmt.Errorf("alloc: record the enrollment of %s: %w", name, err)
 		}
 
 		return Enrollment{
 			Name: name, Fingerprint: fingerprint, CSRPEM: csrPEM,
-			State: EnrollPending, RequestedAt: now,
+			State: EnrollPending, RequestedAt: now, PoolOrder: poolOrder,
 		}, nil
 	case err != nil:
 		return Enrollment{}, err
@@ -247,6 +288,7 @@ func (a *Allocator) requestEnrollmentTx(
 			CsrPem:      csrPEM,
 			State:       EnrollPending,
 			RequestedAt: now,
+			PoolOrder:   poolOrder,
 			Name:        name,
 		}); err != nil {
 			return Enrollment{}, fmt.Errorf("alloc: record the enrollment of %s: %w", name, err)
@@ -254,7 +296,7 @@ func (a *Allocator) requestEnrollmentTx(
 
 		return Enrollment{
 			Name: name, Fingerprint: fingerprint, CSRPEM: csrPEM,
-			State: EnrollPending, RequestedAt: now,
+			State: EnrollPending, RequestedAt: now, PoolOrder: poolOrder,
 		}, nil
 	}
 
@@ -298,14 +340,20 @@ func (a *Allocator) LookupEnrollment(ctx context.Context, name string) (Enrollme
 	return out, found, err
 }
 
-// DecideEnrollment approves or denies a pending request.
+// DecideEnrollment approves or denies a pending request. certSerial is the serial
+// of certPEM, which an approval of a pool host's request records on its order.
 //
 // THE FINGERPRINT IS PART OF THE DECISION, not just a thing to look at. An
 // operator approves the machine whose fingerprint they read off its console, and
 // requiring it here is what makes that comparison load-bearing: approving by
 // name alone would approve whatever is currently holding the name.
+//
+// AN APPROVAL OF A POOL HOST'S REQUEST LINKS THE HOST TO ITS NODE in the same
+// transaction, as the automatic admission does, and only while its order is placed
+// with no node joined from it: a sealed or released order admits nothing. A held one
+// may be approved, because a person deciding is what the hold waits for.
 func (a *Allocator) DecideEnrollment(
-	ctx context.Context, name, fingerprint, decision, certPEM string,
+	ctx context.Context, name, fingerprint, decision, certPEM, certSerial string,
 ) error {
 	if decision != EnrollApproved && decision != EnrollDenied {
 		return fmt.Errorf("alloc: %q is not a decision", decision)
@@ -337,7 +385,11 @@ func (a *Allocator) DecideEnrollment(
 			return fmt.Errorf("alloc: record the decision on %s: %w", name, err)
 		}
 
-		return nil
+		if decision != EnrollApproved || existing.PoolOrder == "" {
+			return nil
+		}
+
+		return a.linkPoolNodeTx(ctx, q, existing.PoolOrder, name, existing.Fingerprint, certSerial, true)
 	})
 }
 
@@ -456,6 +508,7 @@ func enrollmentFrom(row *ledgerdb.NodeEnrollment) Enrollment {
 		Source:      row.Source,
 		RequestedAt: row.RequestedAt,
 		DecidedAt:   row.DecidedAt,
+		PoolOrder:   row.PoolOrder,
 	}
 }
 

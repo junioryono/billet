@@ -4,9 +4,10 @@
 -- every statement here takes a hash rather than a secret.
 
 -- name: InsertJoinToken :exec
--- Mint one join token.
-INSERT INTO join_tokens (token_sha256, note, uses_remaining, created_at, expires_at)
-VALUES (@token_sha256, @note, @uses_remaining, @created_at, @expires_at);
+-- Mint one join token. pool_order is the order a pool minted it for, and empty for
+-- one an operator minted (migration 75).
+INSERT INTO join_tokens (token_sha256, note, uses_remaining, created_at, expires_at, pool_order)
+VALUES (@token_sha256, @note, @uses_remaining, @created_at, @expires_at, @pool_order);
 
 -- name: SpendJoinToken :execresult
 -- Check a token and consume one use, in one statement.
@@ -38,3 +39,22 @@ SELECT token_sha256 FROM join_tokens;
 SELECT EXISTS(SELECT 1 FROM join_tokens
                WHERE token_sha256 = @token_sha256 AND uses_remaining > 0
                  AND expires_at > @now);
+
+-- name: ReadJoinTokenOrder :one
+-- The pool order a token was minted for, spent or not: a host polls with the token
+-- it booted with long after the admission spent it, and its poll is still the
+-- order's. Empty for an operator's token; sql.ErrNoRows for no such token.
+SELECT pool_order FROM join_tokens WHERE token_sha256 = @token_sha256;
+
+-- name: SpendPoolJoinToken :execresult
+-- Consume one use of a token, only while it is live AND minted for this order, in
+-- one statement, so a token of one order never admits another's host.
+UPDATE join_tokens SET uses_remaining = uses_remaining - 1
+ WHERE token_sha256 = @token_sha256 AND pool_order = @pool_order
+   AND uses_remaining > 0 AND expires_at > @now;
+
+-- name: RetirePoolJoinTokens :exec
+-- Spend every use left on an order's tokens, once a node has joined from it: each
+-- send minted one, and only the one that booted the host was ever needed.
+UPDATE join_tokens SET uses_remaining = 0
+ WHERE pool_order = @pool_order AND uses_remaining > 0;

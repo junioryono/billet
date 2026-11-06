@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/awsidentity"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
 	"github.com/junioryono/billet/internal/provider/ec2"
@@ -37,6 +38,7 @@ type hosts interface {
 	Find(ctx context.Context, order string) (ec2.HostRecord, bool, error)
 	Describe(ctx context.Context, id string) (ec2.HostRecord, error)
 	Terminate(ctx context.Context, id string) error
+	Console(ctx context.Context, id string) (string, error)
 	Scope() string
 }
 
@@ -58,16 +60,34 @@ type Source struct {
 	account func(context.Context) (string, error)
 	// code reads EC2's error code out of an error chain; ec2.Code outside a test.
 	code func(error) (string, bool)
+	// region is the provider's, whose certificate verifies an identity document, and
+	// identity verifies one (Witness).
+	region   string
+	identity *awsidentity.Verifier
 }
 
-// New builds a source over a provider's pool-host surface. location is the subnet's
-// availability zone, the one place this source orders in, and account answers which
-// AWS account the credentials are in.
-func New(h *ec2.Hosts, location string, shapes []Shape, account func(context.Context) (string, error)) (*Source, error) {
-	return newSource(h, location, shapes, account)
+// Config is what a source is built from beside its provider's pool-host surface.
+type Config struct {
+	// Region is the provider's region, and Location the subnet's availability zone,
+	// the one place this source orders in.
+	Region, Location string
+	Shapes           []Shape
+	// Account answers which AWS account the credentials are in.
+	Account func(context.Context) (string, error)
+	// Identity verifies a host's identity document; nil, and Witness never vouches.
+	Identity *awsidentity.Verifier
 }
 
-func newSource(h hosts, location string, shapes []Shape, account func(context.Context) (string, error)) (*Source, error) {
+// New builds a source over a provider's pool-host surface.
+func New(h *ec2.Hosts, cfg Config) (*Source, error) {
+	return newSource(h, cfg)
+}
+
+func newSource(h hosts, cfg Config) (*Source, error) {
+	location, shapes, account := cfg.Location, cfg.Shapes, cfg.Account
+	if cfg.Region == "" {
+		return nil, errors.New("awsmetal: a source needs its region, whose certificate verifies an identity document")
+	}
 	if account == nil {
 		return nil, errors.New("awsmetal: a source needs to know its account, because a shared subnet has several")
 	}
@@ -88,7 +108,8 @@ func newSource(h hosts, location string, shapes []Shape, account func(context.Co
 		return nil, errors.New("awsmetal: a source needs at least one shape")
 	}
 
-	return &Source{hosts: h, location: location, shapes: byType, code: ec2.Code, account: account}, nil
+	return &Source{hosts: h, location: location, shapes: byType, code: ec2.Code, account: account,
+		region: cfg.Region, identity: cfg.Identity}, nil
 }
 
 var _ hostsource.Source = (*Source)(nil)

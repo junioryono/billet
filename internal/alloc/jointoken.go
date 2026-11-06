@@ -36,10 +36,6 @@ type JoinToken struct {
 }
 
 // NewJoinToken mints one and returns the secret, which is shown exactly once.
-//
-// BASE32 WITHOUT PADDING, because this is read off one terminal and typed into
-// another: no case sensitivity to lose, no `+` or `/` to mangle in a shell, and
-// no `=` for somebody to trim.
 func (a *Allocator) NewJoinToken(ctx context.Context, ttl time.Duration, uses int, note string) (string, error) {
 	if ttl <= 0 {
 		return "", errors.New("alloc: a join token needs a positive lifetime")
@@ -49,29 +45,47 @@ func (a *Allocator) NewJoinToken(ctx context.Context, ttl time.Duration, uses in
 		return "", errors.New("alloc: a join token needs at least one use")
 	}
 
+	token, err := newJoinTokenSecret()
+	if err != nil {
+		return "", err
+	}
+
+	now := a.now().UTC()
+
+	err = a.db.Tx(ctx, func(tx *sql.Tx) error {
+		return insertJoinTokenTx(ctx, state.WriteQueries(tx), token, note, "", uses, now, ttl)
+	})
+
+	return token, err
+}
+
+// newJoinTokenSecret draws a token: BASE32 WITHOUT PADDING, because one is read off
+// one terminal and typed into another, so there is no case to lose, no `+` or `/` to
+// mangle in a shell, and no `=` to trim.
+func newJoinTokenSecret() (string, error) {
 	var raw [20]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", fmt.Errorf("alloc: generate a join token: %w", err)
 	}
 
-	token := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw[:]))
-	now := a.now().UTC()
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw[:])), nil
+}
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		if err := state.WriteQueries(tx).InsertJoinToken(ctx, ledgerdb.InsertJoinTokenParams{
-			TokenSha256:   hashJoinToken(token),
-			Note:          note,
-			UsesRemaining: int64(uses),
-			CreatedAt:     ts(now),
-			ExpiresAt:     ts(now.Add(ttl)),
-		}); err != nil {
-			return fmt.Errorf("alloc: record a join token: %w", err)
-		}
+func insertJoinTokenTx(
+	ctx context.Context, q state.WriteOps, token, note, poolOrder string, uses int, now time.Time, ttl time.Duration,
+) error {
+	if err := q.InsertJoinToken(ctx, ledgerdb.InsertJoinTokenParams{
+		TokenSha256:   hashJoinToken(token),
+		Note:          note,
+		UsesRemaining: int64(uses),
+		CreatedAt:     ts(now),
+		ExpiresAt:     ts(now.Add(ttl)),
+		PoolOrder:     poolOrder,
+	}); err != nil {
+		return fmt.Errorf("alloc: record a join token: %w", err)
+	}
 
-		return nil
-	})
-
-	return token, err
+	return nil
 }
 
 // SpendJoinToken checks a token and consumes one use.
