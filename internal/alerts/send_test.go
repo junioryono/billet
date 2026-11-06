@@ -1,6 +1,7 @@
 package alerts
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -379,6 +382,16 @@ func TestAConnectionReadsNothingBeforeItsRequest(t *testing.T) {
 		t.Fatal("the read did not follow the write")
 	}
 
+	// A READ DEADLINE ENDS A READ WAITING AT THE GATE.
+	timed, _ := net.Pipe()
+	deadlined := quietUntilWritten(timed)
+	if err := deadlined.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deadlined.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("a read past its deadline at the gate = %v", err)
+	}
+
 	waiting, _ := net.Pipe()
 	closing := quietUntilWritten(waiting)
 	ended := make(chan error, 1)
@@ -420,6 +433,107 @@ func TestAConnectionReadsNothingBeforeItsRequest(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 	if _, gatedDial := conn.(*gatedConn); !gatedDial {
 		t.Errorf("the sender dials a %T, not a gated connection", conn)
+	}
+}
+
+// A PROXY TUNNEL IS BILLET'S OWN: it writes the CONNECT, with the proxy's credentials
+// when the proxy's address carries them, takes only a plain yes, and refuses a proxy
+// that answers otherwise or writes past its answer into the destination's stream.
+func TestTheSenderOpensItsOwnProxyTunnel(t *testing.T) {
+	t.Parallel()
+
+	proxy := func(t *testing.T, answer string) (*url.URL, chan string) {
+		t.Helper()
+
+		listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+
+		asked := make(chan string, 1)
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+
+			request, err := http.ReadRequest(bufio.NewReader(conn))
+			if err != nil {
+				asked <- "unreadable: " + err.Error()
+
+				return
+			}
+			asked <- request.Method + " " + request.Host + " " + request.Header.Get("Proxy-Authorization")
+			if _, err := io.WriteString(conn, answer); err != nil {
+				return
+			}
+			// AN ECHO, for what comes through the tunnel.
+			buf := make([]byte, 64)
+			n, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+			if _, err := conn.Write(buf[:n]); err != nil {
+				return
+			}
+		}()
+
+		return &url.URL{Scheme: "http", Host: listener.Addr().String(), User: url.UserPassword("billet", "pw")}, asked
+	}
+
+	dialer := &net.Dialer{Timeout: time.Second}
+	via := func(u *url.URL) func(*http.Request) (*url.URL, error) {
+		return func(*http.Request) (*url.URL, error) { return u, nil }
+	}
+
+	address, asked := proxy(t, "HTTP/1.1 200 Connection established\r\n\r\n")
+	conn, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", via(address))
+	if err != nil {
+		t.Fatalf("a tunnel the proxy opened: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if got := <-asked; got != "CONNECT hooks.example:443 Basic YmlsbGV0OnB3" {
+		t.Errorf("the proxy was asked %q", got)
+	}
+	if _, err := conn.Write([]byte("through")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	if n, err := conn.Read(buf); err != nil || string(buf[:n]) != "through" {
+		t.Errorf("through the tunnel came %q, %v", buf[:n], err)
+	}
+
+	for name, answer := range map[string]string{
+		"a refusal":                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+		"a yes with more after it": "HTTP/1.1 200 OK\r\n\r\n" + secretPath,
+	} {
+		address, _ := proxy(t, answer)
+		if conn, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", via(address)); err == nil {
+			_ = conn.Close()
+			t.Errorf("%s opened a tunnel", name)
+		} else if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), secretPath) {
+			t.Errorf("%s: the error quotes the proxy: %v", name, err)
+		}
+	}
+
+	// NO PROXY NAMED: the destination is dialled directly.
+	direct, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = direct.Close() })
+	go func() {
+		if c, err := direct.Accept(); err == nil {
+			_ = c.Close()
+		}
+	}()
+	none := func(*http.Request) (*url.URL, error) { return nil, nil }
+	if conn, err := dialThroughProxy(t.Context(), dialer, "tcp", direct.Addr().String(), none); err != nil {
+		t.Errorf("no proxy: %v", err)
+	} else {
+		_ = conn.Close()
 	}
 }
 

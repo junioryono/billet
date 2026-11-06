@@ -6,8 +6,10 @@
 -- with what a rule is judged against. The run is the one that started, as
 -- ListJobsAwaitingQueueTime reads it. finished_at says the lease is archived though
 -- GitHub has said nothing: a lease a disruption archived is here, so the disruption
--- is told at once, and its finish says it is not running. They are as many as the
--- fleet's runners and the leases waiting for GitHub's word.
+-- is told at once, and its finish says it is not running. One archived longer ago than
+-- archived_since is left out: GitHub concludes a lost runner's job within minutes, and
+-- one it never concluded must not hold the read. They are as many as the fleet's
+-- runners and the leases waiting for GitHub's word.
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, workflow_ref, job_name,
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
@@ -15,6 +17,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, w
        head_branch, COALESCE(finished_at, '') AS finished_at
   FROM job_history
  WHERE result = '' AND started_at IS NOT NULL AND started_at >= @since
+   AND (COALESCE(finished_at, '') = '' OR finished_at >= @archived_since)
  ORDER BY started_at, lease_id
  LIMIT CAST(@max_rows AS BIGINT);
 

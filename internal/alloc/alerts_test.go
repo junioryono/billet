@@ -510,6 +510,7 @@ func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 	insert("running", hour(-2), "", "", "")
 	insert("running-too-long", hour(-200), "", "", "")
 	insert("finished-without-a-result", hour(-2), "", "", hour(-1))
+	insert("archived-too-long-ago", hour(-9), "", "", hour(-8))
 	insert("ended-older", hour(-4), "failed", hour(-2), "")
 	insert("ended", hour(-3), "failed", hour(-1), "")
 	insert("ended-long-ago", hour(-30), "failed", hour(-20), "")

@@ -82,6 +82,12 @@ const (
 	// alertJobsRead bounds each of a pass's two reads. The ended read goes on from
 	// where the last pass decided everything, so a backlog is reached in turn.
 	alertJobsRead = 5000
+	// alertEndedPages bounds how many pages of ended jobs one pass reads on through
+	// before it judges the running ones.
+	alertEndedPages = 10
+	// alertLeaveMargin is how long before a job leaves its read it is judged unknown,
+	// if GitHub's answer is still owed: a few passes, so it is never lost unrecorded.
+	alertLeaveMargin = 5 * time.Minute
 	// alertSettledAfter is how old a result must be before the cursor passes it: a
 	// result is stamped before its transaction commits, so one stamped earlier can
 	// land after a later one was read.
@@ -129,9 +135,8 @@ var (
 	// installation is down to its reserve: nothing was asked, and nothing is decided.
 	errAlertNoRead = errors.New("server: no read of GitHub was left this pass")
 	// errAlertUnreadable says no request could ever be made for a job: its tier has no
-	// target this control plane serves, its repository is not one, or the target's
-	// client cannot read what the rule needs. Waiting cannot help, so it is judged
-	// unknown at once.
+	// target this control plane serves, or the target's client cannot read what the
+	// rule needs. Waiting cannot help, so it is judged unknown at once.
 	errAlertUnreadable = errors.New("server: nothing this control plane serves can read the job's record")
 	// errAlertNotRead says GitHub was asked and did not answer what a rule needs.
 	errAlertNotRead = errors.New("server: GitHub's record of the job was not read")
@@ -205,7 +210,8 @@ func (s *Server) evaluateAlerts(ctx context.Context, targets map[string]Target) 
 // THE ENDED JOBS OLDEST FIRST, then the running ones: a streak is counted in the order
 // its jobs ran, so a success between two failures breaks it however the passes fell.
 // A running job waits for a pass that read every ended job to its end, so none it
-// has not seen can come before it.
+// has not seen can come before it; one whose result commits in the very moment a
+// running job of its streak is judged is counted after it.
 func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Target, sweep *alertSweep, now time.Time) {
 	if !s.startAlerts(ctx, sweep, now) {
 		return
@@ -216,40 +222,56 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 		rows = alertJobsRead
 	}
 
-	read, err := s.alloc.AlertJobs(ctx, now.Add(-alertRunningWindow), now.Add(-alertEndedWindow), sweep.ended, rows)
-	if err != nil {
-		s.log.Warn("could not list the jobs for alerts; trying again", "error", err)
-
-		return
-	}
-
 	pass := &alertPass{spent: map[string]int{}, budgets: installationBudgets(targets),
 		steps: map[rerunRun]map[string]RunnerSteps{}, failed: map[rerunRun]error{},
 		unbranched: map[rerunRun]error{}, deferred: map[string]bool{}}
 
-	// THE CURSOR PASSES ONLY WHAT IS DECIDED, and only a result old enough that no
-	// earlier one can still land: what this pass put off is read again on the next.
-	decided := true
-	for i := range read.Ended {
-		if ctx.Err() != nil {
+	// THE ENDED JOBS ARE READ ON TO THE END, page by page from the cursor, before a
+	// running job is judged: a job held at the cursor does not keep the running ones
+	// from being judged, however many results follow it. The cursor passes only what
+	// is decided, and only a result old enough that no earlier one can still land.
+	var running []alloc.AlertJob
+
+	page, decided, readAll := sweep.ended, true, false
+	for n := range alertEndedPages {
+		read, err := s.alloc.AlertJobs(ctx, now.Add(-alertRunningWindow), now.Add(-alertEndedWindow), page, rows)
+		if err != nil {
+			s.log.Warn("could not list the jobs for alerts; trying again", "error", err)
+
 			return
 		}
-
-		settled := s.judgeAll(ctx, &read.Ended[i], true, targets, sweep, pass, now)
-		if decided && settled && now.Sub(read.Ended[i].ResultAt) > alertSettledAfter {
-			sweep.ended = read.Ended[i].Cursor
-		} else {
-			decided = false
+		if n == 0 {
+			running = read.Running
 		}
-	}
 
-	if len(read.Ended) < rows {
-		for i := range read.Running {
+		for i := range read.Ended {
 			if ctx.Err() != nil {
 				return
 			}
 
-			s.judgeAll(ctx, &read.Running[i], false, targets, sweep, pass, now)
+			settled := s.judgeAll(ctx, &read.Ended[i], true, targets, sweep, pass, now)
+			if decided && settled && now.Sub(read.Ended[i].ResultAt) > alertSettledAfter {
+				sweep.ended = read.Ended[i].Cursor
+			} else {
+				decided = false
+			}
+		}
+
+		if len(read.Ended) < rows {
+			readAll = true
+
+			break
+		}
+		page = read.Ended[len(read.Ended)-1].Cursor
+	}
+
+	if readAll {
+		for i := range running {
+			if ctx.Err() != nil {
+				return
+			}
+
+			s.judgeAll(ctx, &running[i], false, targets, sweep, pass, now)
 		}
 	}
 
@@ -384,10 +406,10 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 	verdict := rule.Judge(condition, &job, now)
 	if verdict == alerts.Later {
 		switch {
-		// A WAIT GITHUB NEVER GAVE A QUEUE TIME FOR is recorded as unknown once an answer
-		// can no longer be expected, so a queue time that comes later cannot reorder the
-		// streak.
-		case condition == alerts.WaitedLong && ended && now.Sub(job.ResultAt) > alertReadWindow:
+		// A WAIT GITHUB NEVER GAVE A QUEUE TIME FOR is recorded as unknown just before the
+		// job leaves the read, as late as the queue-time sweep's answer can still help, so
+		// one that comes later cannot reorder the streak.
+		case condition == alerts.WaitedLong && ended && now.After(alertReadDeadline(&job, ended)):
 			return s.recordAlert(ctx, rule, condition, &job, alloc.AlertUnknown, job.HeadBranch, sweep, pass, now)
 		// NOT YET IS NOT OUT OF ORDER: only an ended job holds its streak back. A running
 		// job is still running, and one that is cannot hold another's disruption.
@@ -406,9 +428,9 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 		// exists to prevent. A pass that asked nothing costs it no time, until the job
 		// is about to leave the read; one nothing could ever ask for is unknown at once.
 		asked, wasAsked := sweep.firstAsked[mark]
-		leaving := ended && now.Sub(job.ResultAt) > alertEndedWindow-alertReadWindow
-
 		expired := wasAsked && now.Sub(asked) > alertReadWindow
+		leaving := now.After(alertReadDeadline(&job, ended))
+
 		if !errors.Is(err, errAlertUnreadable) && !expired && !leaving {
 			if ended {
 				pass.deferred[streak] = true
@@ -418,12 +440,22 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 		}
 
 		outcome = alloc.AlertUnknown
-		s.log.Warn("GitHub's record could not say what an alert rule needs; this job is not judged, and a rule "+
-			"naming a branch or a step needs its tier's App to hold `actions: read`",
-			"rule", rule.Name, "lease", job.LeaseID, "condition", condition, "why", err)
+		s.log.Warn("what an alert rule needs from GitHub could not be had in time; this job is not judged. A rule "+
+			"naming a branch or a step reads within the installation's share and needs its tier's App to hold "+
+			"`actions: read`", "rule", rule.Name, "lease", job.LeaseID, "condition", condition, "why", err)
 	}
 
 	return s.recordAlert(ctx, rule, condition, &job, outcome, branch, sweep, pass, now)
+}
+
+// alertReadDeadline is when a job is about to leave the read it is judged in: an ended
+// job's result window, a running job's start window, less a margin of passes.
+func alertReadDeadline(job *alerts.Job, ended bool) time.Time {
+	if ended {
+		return job.ResultAt.Add(alertEndedWindow - alertLeaveMargin)
+	}
+
+	return job.StartedAt.Add(alertRunningWindow - alertLeaveMargin)
 }
 
 // recordAlert records one verdict, rendering the notices a hit owes, and says whether
@@ -483,7 +515,7 @@ func (s *Server) narrowAlert(ctx context.Context, rule *alerts.Rule, condition a
 	}
 
 	// THE TARGET ONLY FOR A READ, and its absence is for good: a tier removed from the
-	// config, or a job with no repository, can never be read about.
+	// config can never be read about. A job with no repository yet can, later.
 	needsRead := (rule.NeedsBranch() && job.HeadBranch == "") || (verdict == alerts.Hit && rule.NeedsSteps())
 	target, known := targets[job.Tier]
 	owner, repository, ok := config.SplitRepository(job.Repository)
@@ -492,7 +524,8 @@ func (s *Server) narrowAlert(ctx context.Context, rule *alerts.Rule, condition a
 	case !known:
 		return "", "", fmt.Errorf("%w: tier %s has no target this control plane serves", errAlertUnreadable, job.Tier)
 	case !ok:
-		return "", "", fmt.Errorf("%w: the job names no repository", errAlertUnreadable)
+		// NOT YET: a job's repository is written after its start and its result.
+		return "", "", fmt.Errorf("%w: the job names no repository yet", errAlertNotRead)
 	}
 
 	// ASKED IS RECORDED BEFORE THE ASKING, so the window starts with the first request

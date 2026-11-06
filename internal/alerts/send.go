@@ -1,9 +1,11 @@
 package alerts
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"sync"
 	"time"
 )
@@ -55,13 +59,15 @@ func NewSender(name string, address URL) *Sender {
 		// receive it. The refusal's own error is discarded with the rest.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
 			// NOTHING IS READ FROM A CONNECTION BEFORE ITS REQUEST IS WRITTEN. The
 			// transport reports bytes it finds on a connection that owes it no answer
 			// through the standard logger, quoting them, and a destination that writes the
 			// moment it is reached would otherwise land there. An HTTPS connection is
-			// gated after billet's own handshake, so its first write is the request; one
-			// through a proxy is handshaken by the transport, after the gate's first write.
+			// opened by billet itself, through the environment's proxy when it names one,
+			// and gated after the destination's handshake, so the gate's first write is the
+			// request. The transport is given no proxy of its own: one it negotiated would
+			// open the gate with its CONNECT. Plain http goes only to loopback, never
+			// through a proxy.
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				conn, err := dialer.DialContext(ctx, network, addr)
 				if err != nil {
@@ -87,12 +93,13 @@ func NewSender(name string, address URL) *Sender {
 	}}
 }
 
-// dialTLS dials and handshakes a destination itself, verifying its certificate for
-// the name dialled, and gates the connection on its first write after the handshake.
+// dialTLS dials and handshakes a destination itself, through the environment's HTTP
+// proxy when it names one, verifying the certificate for the name dialled, and gates
+// the connection on its first write after the handshake.
 func dialTLS(ctx context.Context, dialer *net.Dialer, network, addr string) (net.Conn, error) {
-	raw, err := dialer.DialContext(ctx, network, addr)
+	raw, err := dialThroughProxy(ctx, dialer, network, addr, http.ProxyFromEnvironment)
 	if err != nil {
-		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+		return nil, err
 	}
 
 	host, _, err := net.SplitHostPort(addr)
@@ -115,28 +122,149 @@ func dialTLS(ctx context.Context, dialer *net.Dialer, network, addr string) (net
 	return quietUntilWritten(conn), nil
 }
 
-// gatedConn reads nothing until it has written once, or until it is closed.
+// errProxyRefused says the environment's proxy would not open a tunnel to the
+// destination. Its answer is not quoted: it is the proxy's to write.
+var errProxyRefused = errors.New("alerts: the proxy refused the tunnel")
+
+// dialThroughProxy is a connection to addr, through the HTTP proxy proxyFor names for
+// it when it names one (the environment's HTTPS_PROXY and NO_PROXY, as the standard
+// library reads them), by a CONNECT billet writes and reads itself.
+func dialThroughProxy(ctx context.Context, dialer *net.Dialer, network, addr string,
+	proxyFor func(*http.Request) (*url.URL, error),
+) (net.Conn, error) {
+	proxy, err := proxyFor(&http.Request{URL: &url.URL{Scheme: "https", Host: addr}})
+	if err != nil {
+		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+	}
+	if proxy == nil {
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+		}
+
+		return conn, nil
+	}
+	if proxy.Scheme != "http" {
+		return nil, fmt.Errorf("%w: only an http:// proxy is supported", errProxyRefused)
+	}
+
+	proxyAddr := proxy.Host
+	if proxy.Port() == "" {
+		proxyAddr = net.JoinHostPort(proxy.Hostname(), "80")
+	}
+
+	conn, err := dialer.DialContext(ctx, network, proxyAddr)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+	}
+
+	connect := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: addr}, Host: addr,
+		Header: http.Header{}}
+	if user := proxy.User; user != nil {
+		password, _ := user.Password()
+		connect.Header.Set("Proxy-Authorization",
+			"Basic "+base64.StdEncoding.EncodeToString([]byte(user.Username()+":"+password)))
+	}
+
+	// THE TUNNEL IS BOUNDED BY THE TRY, and the deadline is lifted once it is open, so
+	// the transport's own bounds govern the request.
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			_ = conn.Close()
+
+			return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+		}
+	}
+
+	reader := bufio.NewReader(conn)
+	if err := connect.Write(conn); err != nil {
+		_ = conn.Close()
+
+		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+	}
+
+	resp, err := http.ReadResponse(reader, connect)
+	if err != nil {
+		_ = conn.Close()
+
+		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+	}
+	_ = resp.Body.Close()
+
+	// A PROXY THAT SAID MORE THAN YES has written into what is the destination's
+	// stream; nothing it wrote is kept.
+	if resp.StatusCode != http.StatusOK || reader.Buffered() > 0 {
+		_ = conn.Close()
+
+		return nil, errProxyRefused
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+
+		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+	}
+
+	return conn, nil
+}
+
+// gatedConn reads nothing until it has written once, or until it is closed or its
+// read deadline passes.
 type gatedConn struct {
 	net.Conn
 
 	wrote, closed         chan struct{}
 	wroteOnce, closedOnce sync.Once
+
+	mu       sync.Mutex
+	deadline time.Time
 }
 
 func quietUntilWritten(conn net.Conn) net.Conn {
 	return &gatedConn{Conn: conn, wrote: make(chan struct{}), closed: make(chan struct{})}
 }
 
-// Read waits for the first write: a destination's bytes before the request are not
-// an answer to anything.
+// Read waits for the first write. What a destination wrote before the request is
+// held until then, and read as its answer; it never reaches the transport as bytes
+// owed to no request.
 func (c *gatedConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	deadline := c.deadline
+	c.mu.Unlock()
+
+	var expired <-chan time.Time
+	if !deadline.IsZero() {
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		expired = timer.C
+	}
+
 	select {
 	case <-c.wrote:
 	case <-c.closed:
 		return 0, net.ErrClosed
+	case <-expired:
+		return 0, os.ErrDeadlineExceeded
 	}
 
 	return c.Conn.Read(b) //nolint:wrapcheck // the connection's own error, for the transport.
+}
+
+// SetDeadline and SetReadDeadline are kept for a read waiting at the gate, as well
+// as passed on to the connection.
+func (c *gatedConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+
+	return c.Conn.SetDeadline(t) //nolint:wrapcheck // the connection's own error, for the transport.
+}
+
+func (c *gatedConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+
+	return c.Conn.SetReadDeadline(t) //nolint:wrapcheck // the connection's own error, for the transport.
 }
 
 func (c *gatedConn) Write(b []byte) (int, error) {

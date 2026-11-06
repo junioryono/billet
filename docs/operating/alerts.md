@@ -35,7 +35,7 @@ server:
 
 An address is a credential: a Slack incoming webhook authenticates by its URL, so whoever holds it can post to the channel. So the config holds where to find it and never the address, and billet refuses the address written in its place, without repeating it. It is read from the environment variable `url_env` names or the file `url_file` names, which must be readable only by its owner, when the control plane starts. So change one by restarting the control plane.
 
-It must be `https`. Plain `http` is refused unless the host is a literal loopback address.
+It must be `https`. Plain `http` is refused unless the host is a literal loopback address. A notice goes through the HTTP proxy `HTTPS_PROXY` names for the destination, unless `NO_PROXY` exempts it, as other tools read them; only an `http://` proxy is supported, and billet opens the tunnel itself.
 
 **A destination that cannot be read does not stop the control plane**, because scheduling matters more than a notice. It is logged as an error at the start, and every notice owed to it settles `failed` with the reason, which `billet alerts list` shows. To check one before a job goes red, run `billet alerts test --destination NAME`. It reads the address with your shell's environment and files, which may not be the service's.
 
@@ -72,7 +72,7 @@ An empty string is not recorded. `condition` is one of `failed`, `cancelled`, `d
 
 A job GitHub cancelled before it started is not one of these. GitHub cancels and reassigns an assignment nobody ran, and that is nobody's failure. And `waited_longer_than` is judged once a job has started: a job still waiting has no row to judge, so use `billet_tier_waiting_seconds` for that. A job whose queue time GitHub's record never gave is not judged either way.
 
-Each condition is judged, counted and cooled down apart: a failure that was not disrupted is a miss on `disrupted` and changes nothing about the failures' streak, and one job that both failed and was disrupted counts once on each. A rule's jobs are counted in the order their results arrived, so a success between two failures breaks the streak however the evaluation's passes fell, and a job still running is judged only once every ended job before it has been read. A job that ended and cannot be judged yet holds the later jobs of its streak until it is; a job still running holds nothing.
+Each condition is judged, counted and cooled down apart: a failure that was not disrupted is a miss on `disrupted` and changes nothing about the failures' streak, and one job that both failed and was disrupted counts once on each. A rule's jobs are counted in the order their results arrived, so a success between two failures breaks the streak however the evaluation's passes fell, and a job still running is judged only once every ended job before it has been read. A job that ended and cannot be judged yet holds the later jobs of its streak until it is; a job still running holds nothing. One limit is left: a job whose result is recorded in the very moment a running job of the same streak is judged is counted after it.
 
 `match` narrows a rule, and an empty one matches every job. Each field is a pattern, with `*` for any run of characters and `?` for one, `/` included:
 
@@ -87,7 +87,7 @@ Each condition is judged, counted and cooled down apart: a failure that was not 
 
 **`branch` and `step` need the App to hold `actions: read`**, which `billet check` holds to. The branch is the one the queue-time sweep already recorded from GitHub when it has, and is read only for a run it has not; a job the ledger shows on another branch is settled at once as not the rule's. Steps are read with one read of the run each pass, for every job of it, and only from a job GitHub has concluded: a step still running has no conclusion yet. A run of more than 200 jobs across its attempts is not read, so a rule naming a step judges its jobs neither way. Reads take three a pass from each App installation, each admitted only while what it can cost, one request for a branch and up to eight for a run's steps, leaves the installation's reserve whole; a job waits for its turn.
 
-Once GitHub has been asked about a job, it waits an hour for an answer; if none comes, the job is judged neither way and the log says so, because a rule that silently stopped firing is what this exists to prevent. A job never asked about, because no read was left for it, is judged neither way before it leaves the six-hour read, and one nothing could ever read about, its tier gone from the config or its repository unknown, is judged neither way at once. A job judged neither way breaks no streak.
+Once GitHub has been asked about a job, it waits an hour for an answer, or until just before it leaves the read if that comes first; if none comes, the job is judged neither way and the log says so, because a rule that silently stopped firing is what this exists to prevent. A job never asked about, because no read was left for it, is judged neither way just before it leaves its read, and one nothing could ever read about, its tier gone from the config, is judged neither way at once. A job whose repository is not recorded yet waits for it. A job judged neither way breaks no streak.
 
 A job whose runner billet lost has no failed step: GitHub leaves the running step without a conclusion (measured 2026-11-04, [Re-running disrupted jobs](../reference/records/job-reruns.md)). So a rule naming a `step` with `failed` does not fire for it; use `disrupted` for that.
 
@@ -105,7 +105,7 @@ A rule is about jobs that started after this deployment first saw it, so adding 
 
 The evaluation and each destination run in the background of the control plane and can stop nothing. Every decision is written before anything is sent, so a destination that hangs holds no write and delays no job. Each verdict is one ledger write: a job that ended costs one per rule and condition that judged it, a success included, since a success is what ends a streak.
 
-A job is judged once its result arrives, within six hours, and only if it started within the last seven days; a control plane down for longer than six hours does not judge what ended meanwhile. The evaluation reads on from the last job it decided, so a backlog is reached in order rather than hidden behind newer results.
+A job is judged once its result arrives, within six hours, and only if it started within the last seven days; a control plane down for longer than six hours does not judge what ended meanwhile. The evaluation reads on from the last job it decided, page by page, so a backlog is reached in order rather than hidden behind newer results, and a job waiting at the front holds no other rule's jobs back. A lease billet archived before GitHub said how its job ended is watched for six hours, so a disruption on it is told at once. A wait GitHub never gave a queue time for is judged neither way just before the job leaves the read.
 
 One request goes to a destination at a time, each bounded at ten seconds, so one that hangs delays only its own queue. A redirect is refused, not followed, because a notice is not for wherever a destination sends it.
 

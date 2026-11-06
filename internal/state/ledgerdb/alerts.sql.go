@@ -486,13 +486,15 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, w
        head_branch, COALESCE(finished_at, '') AS finished_at
   FROM job_history
  WHERE result = '' AND started_at IS NOT NULL AND started_at >= $1
+   AND (COALESCE(finished_at, '') = '' OR finished_at >= $2)
  ORDER BY started_at, lease_id
- LIMIT CAST($2 AS BIGINT)
+ LIMIT CAST($3 AS BIGINT)
 `
 
 type ListRunningJobsForAlertsParams struct {
-	Since   sql.NullString
-	MaxRows int64
+	Since         sql.NullString
+	ArchivedSince sql.NullString
+	MaxRows       int64
 }
 
 type ListRunningJobsForAlertsRow struct {
@@ -519,10 +521,12 @@ type ListRunningJobsForAlertsRow struct {
 // with what a rule is judged against. The run is the one that started, as
 // ListJobsAwaitingQueueTime reads it. finished_at says the lease is archived though
 // GitHub has said nothing: a lease a disruption archived is here, so the disruption
-// is told at once, and its finish says it is not running. They are as many as the
-// fleet's runners and the leases waiting for GitHub's word.
+// is told at once, and its finish says it is not running. One archived longer ago than
+// archived_since is left out: GitHub concludes a lost runner's job within minutes, and
+// one it never concluded must not hold the read. They are as many as the fleet's
+// runners and the leases waiting for GitHub's word.
 func (q *Queries) ListRunningJobsForAlerts(ctx context.Context, arg ListRunningJobsForAlertsParams) ([]ListRunningJobsForAlertsRow, error) {
-	rows, err := q.db.QueryContext(ctx, listRunningJobsForAlerts, arg.Since, arg.MaxRows)
+	rows, err := q.db.QueryContext(ctx, listRunningJobsForAlerts, arg.Since, arg.ArchivedSince, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}

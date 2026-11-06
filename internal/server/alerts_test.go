@@ -170,9 +170,12 @@ type jobRow struct {
 	lease, result, disruption string
 	name, repo, queued        string
 	branch, tier              string
-	run                       int64
-	age                       time.Duration
-	ran                       time.Duration
+	// noRepo leaves the repository unwritten, as it is between a job's result and
+	// its identity.
+	noRepo bool
+	run    int64
+	age    time.Duration
+	ran    time.Duration
 }
 
 // seed writes one job. Its start is age ago; a result arrives ran after that.
@@ -182,7 +185,7 @@ func (r *alertStack) seed(job jobRow) {
 	if job.name == "" {
 		job.name = "deploy"
 	}
-	if job.repo == "" {
+	if job.repo == "" && !job.noRepo {
 		job.repo = "acme/api"
 	}
 	if job.age == 0 {
@@ -606,8 +609,9 @@ func TestAJobNeverAskedIsUnknownBeforeItLeavesTheRead(t *testing.T) {
 	}
 }
 
-// A WAIT GITHUB NEVER GAVE A QUEUE TIME FOR IS RECORDED AS UNKNOWN once none can be
-// expected, so a queue time that arrives later cannot judge it, out of order.
+// A WAIT GITHUB NEVER GAVE A QUEUE TIME FOR IS RECORDED AS UNKNOWN just before the job
+// leaves the read, as late as the queue-time sweep's answer could still come, so one
+// that arrives later cannot judge it, out of order.
 func TestAWaitNeverKnownIsRecordedUnknown(t *testing.T) {
 	t.Parallel()
 
@@ -617,34 +621,148 @@ func TestAWaitNeverKnownIsRecordedUnknown(t *testing.T) {
 
 	r.now = r.now.Add(alertReadWindow + time.Minute)
 	r.pass()
+	if got := r.marked(); got != 0 {
+		t.Fatalf("%d marks an hour in, want it still waiting for the queue time", got)
+	}
+
+	r.now = r.now.Add(alertEndedWindow - alertLeaveMargin - alertReadWindow)
+	r.pass()
 	if got := r.marked(); got != 1 {
-		t.Errorf("%d marks, want the unknown wait recorded", got)
+		t.Errorf("%d marks just before it leaves the read, want the unknown wait recorded", got)
 	}
 }
 
 // A RUNNING JOB WAITS FOR A PASS THAT READ EVERY ENDED JOB: one not yet read could come
-// before it and break the streak it would add to.
+// before it and break the streak it would add to. A pass reads on, page by page, so a
+// job held at the cursor keeps no running job waiting; only more pages than a pass
+// reads do, until a pass reads to the end.
 func TestARunningJobWaitsForTheEndedJobsToBeRead(t *testing.T) {
 	t.Parallel()
 
-	r := started(t, atRule(func(c *config.AlertRule) { c.On = config.AlertConditions{RunningLongerThan: "1m"} }))
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{RunningLongerThan: "1m"}
+		c.Match.Job = "run*"
+	}))
 	r.sweep.rows = 1
-	r.now = r.now.Add(5 * time.Minute)
-	r.seed(jobRow{lease: "ended-a", result: "succeeded", ran: time.Second, age: 4 * time.Minute, name: "a"})
-	r.seed(jobRow{lease: "ended-b", result: "succeeded", ran: time.Second, age: 3 * time.Minute, name: "b"})
-	r.seed(jobRow{lease: "running", age: 2 * time.Minute})
+	r.now = r.now.Add(30 * time.Minute)
+	for i := range alertEndedPages + 2 {
+		r.seed(jobRow{lease: fmt.Sprintf("ended-%02d", i), result: "succeeded", ran: time.Second,
+			age: time.Duration(25-i) * time.Minute, name: fmt.Sprintf("other-%d", i)})
+	}
+	r.seed(jobRow{lease: "running", age: 2 * time.Minute, name: "run"})
 	r.now = r.now.Add(5 * time.Minute)
 
 	r.pass()
 	if got := r.owedLeases(); len(got) != 0 {
-		t.Fatalf("owed %v with an ended page still full", got)
+		t.Fatalf("owed %v with more ended pages than a pass reads", got)
 	}
 
-	for range 3 {
-		r.pass()
-	}
+	r.pass()
 	if got := r.owedLeases(); len(got) != 1 || got[0] != "running:running-long" {
 		t.Errorf("owed = %v, want the running job once the ended jobs were read", got)
+	}
+
+	// A JOB HELD AT THE CURSOR does not keep the running ones waiting.
+	held := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{RunningLongerThan: "1m", Failed: true}
+		c.Match.Branch = "main"
+	}))
+	held.record.err = errors.New("connection reset")
+	held.sweep.rows = 1
+	held.now = held.now.Add(30 * time.Minute)
+	held.seed(jobRow{lease: "unread", result: "failed", ran: time.Second, age: 10 * time.Minute, name: "x"})
+	for i := range 3 {
+		held.seed(jobRow{lease: fmt.Sprintf("after-%d", i), result: "succeeded", ran: time.Second,
+			age: time.Duration(9-i) * time.Minute, name: fmt.Sprintf("y-%d", i), branch: "main"})
+	}
+	held.seed(jobRow{lease: "running", age: 2 * time.Minute, name: "run", branch: "main"})
+	held.now = held.now.Add(5 * time.Minute)
+	held.pass()
+	if got := held.owedLeases(); len(got) != 1 || got[0] != "running:running-long" {
+		t.Errorf("owed = %v, want the running job judged past the job held at the cursor", got)
+	}
+}
+
+// A JOB WHOSE REPOSITORY IS NOT WRITTEN YET WAITS FOR IT: the identity lands after the
+// result, and a job with none yet is not one nothing could ever read about.
+func TestAJobWithNoRepositoryYetWaitsForIt(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.Match.Branch = "main" }))
+	r.record.branch = "main"
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "nameless", result: "failed", ran: time.Second, age: time.Second, noRepo: true})
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+	if got := r.marked(); got != 0 {
+		t.Fatalf("%d marks before the repository was written, want it waiting", got)
+	}
+
+	if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET repo = 'acme/api' WHERE lease_id = 'nameless'`)
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r.pass()
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "nameless:failed" {
+		t.Errorf("owed = %v, want the job judged once its repository was written", got)
+	}
+}
+
+// A JOB'S LAST HOUR IN THE READ DOES NOT CUT ITS HOUR SHORT: one first asked late gets
+// until the earlier of an hour after the ask and a few passes before it leaves.
+func TestALateFirstAskStillGetsItsTime(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.Match.Branch = "main" }))
+	r.record.err = errors.New("connection reset")
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "late", result: "failed", ran: time.Second, age: time.Second})
+
+	r.now = r.now.Add(5*time.Hour + time.Minute)
+	r.pass()
+	if got := r.marked(); got != 0 {
+		t.Fatalf("%d marks on the first ask, at five hours, want it still waiting", got)
+	}
+
+	r.now = r.now.Add(50 * time.Minute)
+	r.pass()
+	if got := r.marked(); got != 0 {
+		t.Fatalf("%d marks before its deadline, want it still waiting", got)
+	}
+
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+	if got := r.marked(); got != 1 {
+		t.Errorf("%d marks just before it leaves the read, want it judged unknown", got)
+	}
+}
+
+// A RUNNING JOB NEVER ASKED ABOUT IS JUDGED UNKNOWN BEFORE IT LEAVES ITS WINDOW, so an
+// installation never with a read to spare does not let it age out unseen.
+func TestARunningJobNeverAskedIsUnknownBeforeItsWindowEnds(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{RunningLongerThan: "1h"}
+		c.Match.Branch = "main"
+	}))
+	r.record.remaining, r.record.limit = 100, 5000
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "forever", age: time.Second})
+
+	r.now = r.now.Add(2 * time.Hour)
+	r.pass()
+	if got := r.marked(); got != 0 {
+		t.Fatalf("%d marks with days left, want it waiting for a read", got)
+	}
+
+	r.now = r.now.Add(alertRunningWindow - 2*time.Hour - time.Minute)
+	r.pass()
+	if got := r.marked(); got != 1 {
+		t.Errorf("%d marks at the end of its window, want it judged unknown", got)
 	}
 }
 
