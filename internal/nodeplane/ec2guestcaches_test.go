@@ -93,7 +93,7 @@ func TestTheEC2GuestCachesBoundaryIsWire41(t *testing.T) {
 	for _, c := range []struct {
 		wire int
 		sent bool
-	}{{40, false}, {41, true}} {
+	}{{41, false}, {42, true}} {
 		spec := launchOn(t, ec2CacheTier(), c.wire).Tier.Cache
 		if got := spec != nil && spec.Go.Enabled; got != c.sent {
 			t.Errorf("wire %d: guest caches sent = %t, want %t", c.wire, got, c.sent)

@@ -105,6 +105,31 @@ type stub struct {
 	cloneBlocks  string
 	cloneReached string
 	cloneRelease string
+	// envLog records each invocation's TART_HOME and TART_NO_AUTO_PRUNE beside its
+	// arguments, since which store a command acted on is the point of a private pull.
+	envLog string
+	// cloneOS is the operating system a clone of an image reports, linux when empty.
+	cloneOS string
+	// cloneStacked makes a clone of an image a stacked VM: an overlay and no disk.
+	cloneStacked string
+	// cloneSuspended makes a clone carry a saved suspension.
+	cloneSuspended string
+	// imageBytes is what a clone of an image holds as its disk, so a test can change
+	// an image's content.
+	imageBytes string
+	// pullManifest is the manifest a pull stores in its private cache.
+	pullManifest string
+	// pullStoresNothing makes a pull in a private store cache nothing.
+	pullStoresNothing string
+	// runHolds makes `tart run` leave a process holding what it inherited until `tart
+	// stop` ends it, the way a real VM's process holds a slot for its whole life.
+	runHolds string
+	// guestBin is on the PATH of what a guest runs, for its docker and xcodebuild.
+	guestBin string
+	// deleteHangs makes `tart delete` never return.
+	deleteHangs string
+	// pullFails makes `tart pull` fail, as a network that went away does.
+	pullFails string
 	// deleteBlocks holds a delete open the same way: announced (deleteReached),
 	// then released (deleteRelease). A real `tart delete` of a VM that has just
 	// stopped took long enough to be killed part-way (2026-10-25), and this is
@@ -161,12 +186,24 @@ func newStub(t *testing.T) *stub {
 		cloneBlocks:      filepath.Join(dir, "clone-blocks"),
 		cloneReached:     filepath.Join(dir, "clone-reached"),
 		cloneRelease:     filepath.Join(dir, "clone-release"),
-		deleteBlocks:     filepath.Join(dir, "delete-blocks"),
-		deleteReached:    filepath.Join(dir, "delete-reached"),
-		deleteRelease:    filepath.Join(dir, "delete-release"),
-		guestSaysRefusal: filepath.Join(dir, "guest-says-refusal"),
-		guestAsked:       filepath.Join(dir, "guest-asked"),
-		probeSays:        filepath.Join(dir, "probe-says"),
+
+		envLog:            filepath.Join(dir, "env.log"),
+		cloneOS:           filepath.Join(dir, "clone-os"),
+		cloneStacked:      filepath.Join(dir, "clone-stacked"),
+		cloneSuspended:    filepath.Join(dir, "clone-suspended"),
+		imageBytes:        filepath.Join(dir, "image-bytes"),
+		pullManifest:      filepath.Join(dir, "pull-manifest"),
+		pullStoresNothing: filepath.Join(dir, "pull-stores-nothing"),
+		runHolds:          filepath.Join(dir, "run-holds"),
+		guestBin:          filepath.Join(dir, "guest-bin"),
+		deleteHangs:       filepath.Join(dir, "delete-hangs"),
+		pullFails:         filepath.Join(dir, "pull-fails"),
+		deleteBlocks:      filepath.Join(dir, "delete-blocks"),
+		deleteReached:     filepath.Join(dir, "delete-reached"),
+		deleteRelease:     filepath.Join(dir, "delete-release"),
+		guestSaysRefusal:  filepath.Join(dir, "guest-says-refusal"),
+		guestAsked:        filepath.Join(dir, "guest-asked"),
+		probeSays:         filepath.Join(dir, "probe-says"),
 	}
 
 	if err := os.MkdirAll(filepath.Join(s.home, "vms"), 0o755); err != nil {
@@ -201,8 +238,10 @@ func newStub(t *testing.T) *stub {
 	}
 
 	script := `#!/bin/sh
-vms="` + s.home + `/vms"
+vms="${TART_HOME:-` + s.home + `}/vms"
+mkdir -p "$vms"
 printf '%s\n' "$*" >> "` + s.argvLog + `"
+printf '%s|%s|%s\n' "${TART_HOME:-}" "${TART_NO_AUTO_PRUNE:-}" "$*" >> "` + s.envLog + `"
 cmd="$1"; shift
 case "$cmd" in
 --version)
@@ -216,6 +255,20 @@ pull)
   if [ -s "` + s.pullEvicts + `" ]; then
     exit 0
   fi
+  if [ -e "` + s.pullFails + `" ]; then
+    echo "the network went away" >&2
+    exit 1
+  fi
+  # A pull by digest in a private store caches the manifest as tart lays it out.
+  case "$name" in
+  *@sha256:*)
+    if [ -n "${TART_HOME:-}" ] && [ ! -e "` + s.pullStoresNothing + `" ]; then
+      entry="$TART_HOME/cache/OCIs/registry/ns/${name##*@}"
+      mkdir -p "$entry"
+      cp "` + s.pullManifest + `" "$entry/manifest.json"
+    fi
+    ;;
+  esac
   printf '%s\n' "$name" >> "` + s.pulled + `"
   ;;
 fqn)
@@ -241,6 +294,23 @@ clone)
   src="$1"; dst="$2"
   mkdir -p "$vms/$dst"
   printf 'stopped\n' > "$vms/$dst/.state"
+  if [ -d "$vms/$src" ]; then
+    # A local clone copies the VM's files, and has its own MAC address.
+    cp "$vms/$src/config.json" "$vms/$src/disk.img" "$vms/$src/nvram.bin" "$vms/$dst/"
+  else
+    guest_os=linux
+    if [ -s "` + s.cloneOS + `" ]; then guest_os=$(cat "` + s.cloneOS + `"); fi
+    printf '{"os":"%s","macAddress":"02:00:00:00:00:01"}\n' "$guest_os" > "$vms/$dst/config.json"
+    printf 'nvram\n' > "$vms/$dst/nvram.bin"
+    if [ -e "` + s.cloneStacked + `" ]; then
+      : > "$vms/$dst/overlay.asif"
+    elif [ -s "` + s.imageBytes + `" ]; then
+      cp "` + s.imageBytes + `" "$vms/$dst/disk.img"
+    else
+      printf 'image\n' > "$vms/$dst/disk.img"
+    fi
+    if [ -e "` + s.cloneSuspended + `" ]; then : > "$vms/$dst/state.vzvmsave"; fi
+  fi
   # Another billet puts a VM under this lease's name while the clone runs —
   # after Launch read the inventory and before it renames into that name.
   if [ -s "` + s.cloneStealsName + `" ]; then
@@ -278,6 +348,13 @@ run)
     exit 1
   fi
   printf 'running\n' > "$vms/$name/.state"
+  if [ -e "` + s.runHolds + `" ]; then
+    # exec: the sleep is the process holding the inherited descriptors, and this
+    # shell's own copies go with it.
+    # Long enough that nothing here passes because it ran out; killHeld ends it.
+    ( exec sleep 300 ) >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$vms/$name/.held"
+  fi
   ;;
 stop)
   name="$1"
@@ -296,6 +373,7 @@ stop)
     :
   elif [ ! -f "` + s.stopNoop + `" ]; then
     printf 'stopped\n' > "$vms/$name/.state"
+    if [ -s "$vms/$name/.held" ]; then kill "$(cat "$vms/$name/.held")" 2>/dev/null; fi
   fi
   ;;
 delete)
@@ -304,6 +382,7 @@ delete)
     echo "the specified VM \"$name\" does not exist" >&2
     exit 1
   fi
+  if [ -e "` + s.deleteHangs + `" ]; then exec sleep 300; fi
   if [ -s "` + s.deleteBlocks + `" ]; then
     printf 'reached\n' > "` + s.deleteReached + `"
     n=0
@@ -390,6 +469,8 @@ exec)
   interactive=no
   if [ "$1" = "-i" ]; then interactive=yes; shift; fi
   name="$1"; shift
+  PATH="` + s.guestBin + `:$PATH"
+  export PATH
   if [ -s "` + s.execFails + `" ]; then
     n=$(cat "` + s.execFails + `")
     if [ "$n" -gt 0 ]; then

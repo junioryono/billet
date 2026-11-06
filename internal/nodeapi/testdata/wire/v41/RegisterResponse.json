@@ -7,5 +7,6 @@
   "poll_seconds": 1204678581,
   "images_accept": [
     "RegisterResponse.images_accept[0]"
-  ]
+  ],
+  "macos_vm_limit": 951190810
 }

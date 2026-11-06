@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 41
+	Version = 42
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -548,6 +548,19 @@ const (
 	// MinVersion does not move.
 	VersionEgress = 40
 
+	// VersionTartVerified is the version from which a node reads a Tart tier's
+	// `<image>@verified` and a registration's answer carries the node's macOS limit
+	// (RegisterResponse's macos_vm_limit), which a verification beside the node counts
+	// its probe against (ADR-021).
+	//
+	// IGNORED BY AN OLDER NODE, which decodes an answer leniently, and a node below it
+	// records that its control plane does not say. CHECKED WHERE A LAUNCH IS SENT: an
+	// older node hands `@verified` to `tart fqn` as a name, so placement passes over a
+	// Tart host below this for a tier naming it (alloc.TartVerifiedWireVersion, which a
+	// test holds equal), and such a tier is refused to one at dispatch and again at
+	// delivery.
+	VersionTartVerified = 41
+
 	// VersionEC2GuestCaches is the version from which an EC2 node carries the caches
 	// it serves to a guest into that guest's boot script (ADR-024).
 	//
@@ -556,7 +569,7 @@ const (
 	// merely has them by default. So the plane sends it the tier's cache block with
 	// them off, and its job runs as it did before them. Delivery holds a launch that
 	// names them to a node at this version or above.
-	VersionEC2GuestCaches = 41
+	VersionEC2GuestCaches = 42
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -841,6 +854,9 @@ type RegisterResponse struct {
 	// ImagesAccept is what the control plane's images.accept names, sorted, from
 	// VersionImageAcceptance. Absent at that version means it accepts none.
 	ImagesAccept []string `json:"images_accept,omitempty"`
+	// MacOSVMLimit is how many macOS guests the control plane places on this node, from
+	// VersionTartVerified. A pointer so zero, which runs none, is told from silence.
+	MacOSVMLimit *int `json:"macos_vm_limit,omitempty"`
 }
 
 // HeaderIncarnation carries the node process's identity on every request.
