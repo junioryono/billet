@@ -394,6 +394,14 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			return report, err
 		}
 
+		// NOR A VERIFIED TART IMAGE (ADR-021): an older Mac's own image commands read
+		// this file, and hand the reference to tart as a name.
+		if err := tartVerifiedBeforeEveryHost(cfg, hostWires); err != nil {
+			return report, err
+		}
+
+		reportUnverifiedTartTiers(env, cfg)
+
 		// AN AMI'S ARCHITECTURE IS READ WHERE THE AWS CREDENTIALS ARE. A control
 		// plane whose file names no EC2 node cannot resolve its tiers' AMIs, so it
 		// says who does rather than reading as if they were checked.
@@ -535,7 +543,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		}
 
 		if cfg.Node.Provider == config.ProviderTart {
-			if err := checkTartHost(ctx, env, cfg); err != nil {
+			if err := checkTartHost(ctx, env, cfg, skipNetworkProbes); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
 		}

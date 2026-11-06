@@ -143,17 +143,7 @@ func TestReleaseWorkflowVerifiesThePublishedReleaseAfterGoReleaser(t *testing.T)
 func TestGuestImageReleasesCannotTakeOverTheBinaryLatestChannel(t *testing.T) {
 	t.Parallel()
 
-	body, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image.yml"))
-	if err != nil {
-		t.Fatalf("read guest-image workflow: %v", err)
-	}
-	workflow := string(body)
-	buildJob := strings.Index(workflow, "\n  build:\n")
-	publishJob := strings.Index(workflow, "\n  publish:\n")
-	if buildJob < 0 || publishJob <= buildJob {
-		t.Fatal("separate guest build and publication jobs are missing or out of order")
-	}
-	buildBody := workflow[buildJob:publishJob]
+	workflow, buildBody, publishBody := guestImageWorkflows(t)
 	for _, required := range []string{
 		"contents: read",
 		"persist-credentials: false",
@@ -169,10 +159,9 @@ func TestGuestImageReleasesCannotTakeOverTheBinaryLatestChannel(t *testing.T) {
 			t.Fatalf("branch-controlled guest build retains publication capability %q", forbidden)
 		}
 	}
-	publishBody := workflow[publishJob:]
 	for _, required := range []string{
-		"needs: build",
-		"if: github.ref == 'refs/heads/main'",
+		"needs: [resolve, x64, arm64]",
+		"github.ref == 'refs/heads/main'",
 		"contents: write",
 		"id-token: write",
 		"run: scripts/fetch-guest-artifact.sh out",
@@ -180,8 +169,7 @@ func TestGuestImageReleasesCannotTakeOverTheBinaryLatestChannel(t *testing.T) {
 		"name: Sign the manifest",
 		"run: scripts/publish-guest-release.sh out",
 		"name: Advance the guest channel",
-		"expires_epoch=$((published_epoch + 10 * 24 * 60 * 60))",
-		`"release_immutable":true`,
+		"scripts/write-guest-channel.sh out",
 		"--bundle out/current.sigstore.json",
 		"out/current.json",
 		"git -C \"$channel_dir\" add current.json current.sigstore.json",
@@ -2403,6 +2391,31 @@ func TestAnInstallSurvivesBilletRefusingToTieItToAManifest(t *testing.T) {
 	}
 }
 
+// guestImageWorkflows is guest-image.yml, the reusable build its legs run, and the
+// caller's publish job.
+func guestImageWorkflows(t *testing.T) (string, string, string) {
+	t.Helper()
+
+	caller, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image.yml"))
+	if err != nil {
+		t.Fatalf("read guest-image workflow: %v", err)
+	}
+
+	build, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image-build.yml"))
+	if err != nil {
+		t.Fatalf("read guest-image build workflow: %v", err)
+	}
+
+	workflow := string(caller)
+
+	publishJob := strings.Index(workflow, "\n  publish:\n")
+	if publishJob < 0 {
+		t.Fatal("guest-image.yml has no publish job")
+	}
+
+	return workflow, string(build), workflow[publishJob:]
+}
+
 // The guest image is built from the tree of the release the stable channel names,
 // while the workflow that builds it stays on main so its signature keeps the
 // identity every deployed binary verifies. A build from main is for testing the
@@ -2410,21 +2423,15 @@ func TestAnInstallSurvivesBilletRefusingToTieItToAManifest(t *testing.T) {
 func TestTheGuestImageIsBuiltFromTheStableReleaseAndABuildFromMainCannotPublish(t *testing.T) {
 	t.Parallel()
 
-	body, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image.yml"))
-	if err != nil {
-		t.Fatalf("read guest-image workflow: %v", err)
-	}
-	workflow := string(body)
-	buildJob := strings.Index(workflow, "\n  build:\n")
-	publishJob := strings.Index(workflow, "\n  publish:\n")
-	if buildJob < 0 || publishJob <= buildJob {
-		t.Fatal("separate guest build and publication jobs are missing or out of order")
-	}
-	buildBody := workflow[buildJob:publishJob]
+	workflow, buildBody, publishBody := guestImageWorkflows(t)
 
-	resolve := strings.Index(buildBody, "name: Resolve the source release")
-	checkout := strings.Index(buildBody, "uses: actions/checkout@")
-	if resolve < 0 || checkout < 0 || checkout < resolve {
+	resolveJob := strings.Index(workflow, "\n  resolve:\n")
+	x64Job := strings.Index(workflow, "\n  x64:\n")
+	if resolveJob < 0 || x64Job <= resolveJob {
+		t.Fatal("the source release must be resolved in a job of its own, before either leg")
+	}
+	resolveBody := workflow[resolveJob:x64Job]
+	if strings.Contains(resolveBody, "uses: actions/checkout@") {
 		t.Fatal("the source release must be resolved before anything is checked out")
 	}
 	for _, required := range []string{
@@ -2432,21 +2439,26 @@ func TestTheGuestImageIsBuiltFromTheStableReleaseAndABuildFromMainCannotPublish(
 		`contents/stable.json?ref=release-channel`,
 		// A hand-named tag must be a real, locked release.
 		`.isImmutable and (.isPrerelease | not) and (.isDraft | not)`,
-		// The build checks out what was resolved, nothing else.
-		"ref: ${{ steps.source.outputs.sha }}",
-		// Provenance travels to the release notes and the publish job.
-		"SOURCE_TAG: ${{ steps.source.outputs.tag }}",
+		// Provenance travels to the legs and the publish job.
 		"source_is_release: ${{ steps.source.outputs.is_release }}",
+	} {
+		if !strings.Contains(resolveBody, required) {
+			t.Fatalf("the resolve job is missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		// The build checks out what was resolved, nothing else.
+		"ref: ${{ inputs.source_sha }}",
+		"SOURCE_TAG: ${{ inputs.source_tag }}",
 	} {
 		if !strings.Contains(buildBody, required) {
 			t.Fatalf("guest build is missing %q", required)
 		}
 	}
 
-	publishBody := workflow[publishJob:]
 	for _, required := range []string{
-		"needs.build.outputs.source_is_release == 'true'",
-		"SOURCE_SHA: ${{ needs.build.outputs.source_sha }}",
+		"needs.resolve.outputs.source_is_release == 'true'",
+		"SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}",
 	} {
 		if !strings.Contains(publishBody, required) {
 			t.Fatalf("guest publication is missing %q", required)
@@ -2474,19 +2486,9 @@ func TestTheGuestImageIsBuiltFromTheStableReleaseAndABuildFromMainCannotPublish(
 func TestTheGuestImageWorkflowsSeamWithTheReleaseTreeIsFrozen(t *testing.T) {
 	t.Parallel()
 
-	body, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image.yml"))
-	if err != nil {
-		t.Fatalf("read guest-image workflow: %v", err)
-	}
-	workflow := string(body)
-	buildJob := strings.Index(workflow, "\n  build:\n")
-	publishJob := strings.Index(workflow, "\n  publish:\n")
-	if buildJob < 0 || publishJob <= buildJob {
-		t.Fatal("separate guest build and publication jobs are missing or out of order")
-	}
-	// Everything from the checkout onward runs against the release's tree; the
-	// resolve step before it runs against nothing but the API.
-	buildBody := workflow[buildJob:publishJob]
+	_, buildBody, _ := guestImageWorkflows(t)
+	// Everything from the checkout onward runs against the release's tree; what comes
+	// before it runs against nothing but the machine.
 	checkout := strings.Index(buildBody, "uses: actions/checkout@")
 	if checkout < 0 {
 		t.Fatal("the guest build never checks out a tree")
@@ -2517,16 +2519,20 @@ func TestTheGuestImageWorkflowsSeamWithTheReleaseTreeIsFrozen(t *testing.T) {
 		"scripts/guest-kernel.config":          true,
 		"scripts/kernel/required-builtins.txt": true,
 		"scripts/kernel/linux.pin":             true,
-		"scripts/fetch-image-sources.py":       true,
-		"IMAGE_NAME":                           true,
-		"WORK":                                 true,
-		"PUBLISH":                              true,
-		"RUNNER_VERSION":                       true,
-		"OUT":                                  true,
-		"KERNEL":                               true,
-		"ROOTFS":                               true,
-		"SOURCE_TAG":                           true,
-		"SOURCE_SHA":                           true,
+		// READ ONLY BY hashFiles FOR THE KERNEL'S CACHE KEY, which reads nothing for a
+		// file a release from before the arm64 build does not have.
+		"scripts/guest-kernel-aarch64.config":          true,
+		"scripts/kernel/required-builtins-aarch64.txt": true,
+		"scripts/fetch-image-sources.py":               true,
+		"IMAGE_NAME":                                   true,
+		"WORK":                                         true,
+		"PUBLISH":                                      true,
+		"RUNNER_VERSION":                               true,
+		"OUT":                                          true,
+		"KERNEL":                                       true,
+		"ROOTFS":                                       true,
+		"SOURCE_TAG":                                   true,
+		"SOURCE_SHA":                                   true,
 	}
 	got := map[string]bool{}
 	for k := range scripts {

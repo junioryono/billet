@@ -32,6 +32,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -85,11 +87,22 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 		return fmt.Errorf("gocacheprog: announce capabilities: %w", err)
 	}
 
+	// ANSWERED SIDE BY SIDE, matched by ID as the go command matches them: it sends
+	// a build's requests without waiting, and one at a time made the sum of every
+	// request's wait the build's, which on a node that fetches an entry from S3 made
+	// a warm build slower than a cold one (114 s against 45 s, 2026-11-05).
+	answers := &replies{encoder: encoder}
+	slots := make(chan struct{}, inFlight)
+	defer answers.wg.Wait()
 	for {
 		var req request
 		if err := decoder.Decode(&req); err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				// WHAT IS STILL RUNNING HAS NOT ANSWERED YET, and an answer that could not
+				// be written is this run's failure.
+				answers.wg.Wait()
+
+				return answers.failed()
 			}
 
 			return fmt.Errorf("gocacheprog: read a request: %w", err)
@@ -105,26 +118,106 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 			}
 		}
 
-		resp := response{ID: req.ID}
 		switch req.Command {
-		case "get":
-			h.get(ctx, req, &resp)
-		case "put":
-			h.put(ctx, req, body, &resp)
+		case "get", "put":
+			// IN THE ORDER THEY CAME FOR ANY ONE ACTION, so a get after a put of the
+			// same action finds it; different actions do not wait on each other.
+			after, done := answers.queue(hex.EncodeToString(req.ActionID))
+			slots <- struct{}{}
+			answers.wg.Go(func() {
+				defer func() { <-slots }()
+				defer done()
+				if after != nil {
+					<-after
+				}
+				resp := response{ID: req.ID}
+				if req.Command == "get" {
+					h.get(ctx, req, &resp)
+				} else {
+					h.put(ctx, req, body, &resp)
+				}
+				// A failed write is kept by answers, which refuses every later one,
+				// and Run returns it at EOF or close.
+				_ = answers.send(resp) //nolint:errcheck // answers keeps the first failure and Run returns it
+			})
 		case "close":
-			return encoder.Encode(resp)
+			// EVERY ANSWER BEFORE CLOSE'S, because the go command treats a request
+			// still pending at close as the helper's failure.
+			answers.wg.Wait()
+
+			return answers.send(response{ID: req.ID})
 		default:
-			resp.Err = "unknown command " + strconv.Quote(req.Command)
+			if err := answers.send(response{ID: req.ID, Err: "unknown command " + strconv.Quote(req.Command)}); err != nil {
+				return err
+			}
 		}
-		if err := encoder.Encode(resp); err != nil {
-			return fmt.Errorf("gocacheprog: answer request %d: %w", req.ID, err)
+		if err := answers.failed(); err != nil {
+			return err
 		}
 	}
 }
 
+// inFlight is how many requests the helper works on at once: the node takes 16 of a
+// job's transfers at once and answers the next as busy, which is a miss.
+const inFlight = 8
+
+// replies writes answers one at a time, in whatever order they are ready.
+type replies struct {
+	mu      sync.Mutex
+	encoder *json.Encoder
+	err     error
+	wg      sync.WaitGroup
+	// last is each action's newest request still running, which the next of it waits for.
+	last map[string]chan struct{}
+}
+
+// queue is what a request for action waits for first, and what it calls when done.
+// Called on the reader's goroutine, so the order is the order requests arrived.
+func (r *replies) queue(action string) (<-chan struct{}, func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.last == nil {
+		r.last = make(map[string]chan struct{})
+	}
+	after := r.last[action]
+	mine := make(chan struct{})
+	r.last[action] = mine
+
+	return after, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		close(mine)
+		if r.last[action] == mine {
+			delete(r.last, action)
+		}
+	}
+}
+
+func (r *replies) send(resp response) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return r.err
+	}
+	if err := r.encoder.Encode(resp); err != nil {
+		r.err = fmt.Errorf("gocacheprog: answer request %d: %w", resp.ID, err)
+	}
+
+	return r.err
+}
+
+func (r *replies) failed() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.err
+}
+
 type helper struct {
-	cfg    Config
-	remote bool
+	cfg Config
+	// remote is whether the node is still asked, which any request may turn off.
+	remote atomic.Bool
+	logMu  sync.Mutex
 }
 
 func newHelper(cfg Config) (*helper, error) {
@@ -143,7 +236,10 @@ func newHelper(cfg Config) (*helper, error) {
 	endpoint := strings.TrimRight(cfg.Endpoint, "/")
 	cfg.Endpoint = endpoint
 
-	return &helper{cfg: cfg, remote: endpoint != "" && cfg.Token != ""}, nil
+	h := &helper{cfg: cfg}
+	h.remote.Store(endpoint != "" && cfg.Token != "")
+
+	return h, nil
 }
 
 // entry is what the helper records for one action: its output and size.
@@ -302,7 +398,7 @@ func (h *helper) markUsed(paths ...string) {
 
 // fetch asks the node for an action's entry and output, and keeps both.
 func (h *helper) fetch(ctx context.Context, action string) (entry, bool) {
-	if !h.remote {
+	if !h.remote.Load() {
 		return entry{}, false
 	}
 	raw, ok := h.call(ctx, http.MethodGet, "ac/"+action, nil)
@@ -365,7 +461,7 @@ func (h *helper) put(ctx context.Context, req request, body []byte, resp *respon
 
 	// SHARED ONLY WHEN THE BYTES ARE WHAT THE OUTPUT ID SAYS, which is how the
 	// go command computes one; the node refuses anything else anyway.
-	if h.remote && digest(body) == output {
+	if h.remote.Load() && digest(body) == output {
 		if _, ok := h.call(ctx, http.MethodPut, "cas/"+output, body); ok {
 			h.call(ctx, http.MethodPut, "ac/"+action, record.encode())
 		}
@@ -375,7 +471,7 @@ func (h *helper) put(ctx context.Context, req request, body []byte, resp *respon
 // call makes one node request. A refusal or a failure to reach the node turns
 // the helper local for the rest of the process; a miss does not.
 func (h *helper) call(ctx context.Context, method, path string, body []byte) ([]byte, bool) {
-	if !h.remote {
+	if !h.remote.Load() {
 		return nil, false
 	}
 	req, err := http.NewRequestWithContext(ctx, method, h.cfg.Endpoint+"/v1/cas/go/"+path,
@@ -412,11 +508,13 @@ func (h *helper) call(ctx context.Context, method, path string, body []byte) ([]
 	}
 }
 
+// disable turns the node off for the rest of the process, and says so once.
 func (h *helper) disable(reason string) {
-	if !h.remote {
+	if !h.remote.Swap(false) {
 		return
 	}
-	h.remote = false
+	h.logMu.Lock()
+	defer h.logMu.Unlock()
 	fmt.Fprintf(h.cfg.Log, "billet go cache: %s; continuing with a local cache only\n", reason)
 }
 

@@ -36,6 +36,8 @@ type downOptions struct {
 	// concurrent `up` bootstraps the node whose definition is about to be
 	// deleted.
 	locked bool
+	// nodeOnly stops this host's node alone and seals nothing.
+	nodeOnly bool
 
 	configPath string
 	reason     string
@@ -77,6 +79,9 @@ func cmdLocalDown(ctx context.Context, env cli.Env, args []string) error {
 	withoutProof := fs.Bool("without-compute-proof", false,
 		"stop once the LEDGER is quiet, without asking each host what it is actually "+
 			"running (faster, and it cannot see compute whose lease has already gone)")
+	nodeOnly := fs.Bool("node", false,
+		"stop this host's node alone, which drains its own jobs and exits, and leave the control "+
+			"plane and the deployment's admission as they are")
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -89,7 +94,7 @@ func cmdLocalDown(ctx context.Context, env cli.Env, args []string) error {
 
 	return runLocalDown(ctx, env, downOptions{
 		configPath: *cfgPath, reason: *reason, timeout: *timeout,
-		dryRun: *dryRun, force: *force, withoutProof: *withoutProof,
+		dryRun: *dryRun, force: *force, withoutProof: *withoutProof, nodeOnly: *nodeOnly,
 	})
 }
 
@@ -99,9 +104,16 @@ func runLocalDown(ctx context.Context, env cli.Env, o downOptions) error {
 		return err
 	}
 
+	// A MAC THAT ALSO RUNS THE CONTROL PLANE IS WHY THIS EXISTS: a plain `down` stops both
+	// roles and seals the deployment, and all an operator wanted was this node stopped so
+	// nothing is placed here while a macOS image is verified (ADR-021).
+	if o.nodeOnly && cfg.Node == nil {
+		return fmt.Errorf("%s declares no node, so --node has nothing to stop", o.configPath)
+	}
+
 	req := lifeops.UpRequest{
 		ConfigPath: o.configPath,
-		WantServer: cfg.Server != nil,
+		WantServer: cfg.Server != nil && !o.nodeOnly,
 		WantNode:   cfg.Node != nil,
 	}
 	req.KeyPaths = app.KeyFilePaths(cfg)
@@ -235,6 +247,15 @@ func refuseForeignBuilds(services []lifeops.RunningFacts, force bool) error {
 func sealForShutdown(ctx context.Context, env cli.Env, c converger, cfg *config.Config, req lifeops.UpRequest,
 	running []lifeops.RunningFacts, o downOptions,
 ) (int64, bool, error) {
+	if o.nodeOnly {
+		fmt.Fprintf(env.Stdout, "seal     SKIPPED by --node: the deployment keeps admitting work, and no\n")
+		fmt.Fprintf(env.Stdout, "         control plane places anything on a node that has stopped. Stopping\n")
+		fmt.Fprintf(env.Stdout, "         it below drains the jobs already on it; `billet local up` starts it\n")
+		fmt.Fprintf(env.Stdout, "         again.\n\n")
+
+		return 0, false, nil
+	}
+
 	if !req.WantServer {
 		fmt.Fprintf(env.Stdout, "seal     SKIPPED: this host runs a node and no control plane, so it has\n")
 		fmt.Fprintf(env.Stdout, "         no admission ledger to seal. Stopping the node below drains the\n")
@@ -365,10 +386,15 @@ func stopAndDisable(ctx context.Context, env cli.Env, c converger, cfg *config.C
 	// never in the same words for the two cases. `billet drain --wait` carries the
 	// same distinction and it matters more here: that command only waits, and this
 	// one is about to stop the services.
-	if proved {
+	switch {
+	case !req.WantServer:
+		fmt.Fprintf(env.Stdout, "\nnote     no ledger was read and no other host was asked: this says nothing\n")
+		fmt.Fprintf(env.Stdout, "         about the rest of the deployment. This node drains its own jobs as\n")
+		fmt.Fprintf(env.Stdout, "         it stops.\n\n")
+	case proved:
 		fmt.Fprintf(env.Stdout, "\nnote     the ledger records nothing outstanding, and every host billet\n")
 		fmt.Fprintf(env.Stdout, "         expects an answer from says it is running no compute.\n\n")
-	} else {
+	default:
 		fmt.Fprintf(env.Stdout, "\nnote     the ledger records nothing outstanding. NO HOST WAS ASKED what it\n")
 		fmt.Fprintf(env.Stdout, "         is actually running, and compute whose lease has already gone is not\n")
 		fmt.Fprintf(env.Stdout, "         visible to the ledger — so this does not establish that the machines\n")
@@ -831,7 +857,8 @@ func byWhom(a state.Admission) string {
 func printDownPlan(env cli.Env, c converger, req lifeops.UpRequest, o downOptions) {
 	fmt.Fprintf(env.Stdout, "plan     what `billet local down` would do on this host:\n")
 
-	if req.WantServer {
+	switch {
+	case req.WantServer:
 		fmt.Fprintf(env.Stdout, "         1. seal admission (local-down), so nothing new is taken\n")
 		fmt.Fprintf(env.Stdout, "         2. wait for work already running to finish")
 
@@ -848,7 +875,9 @@ func printDownPlan(env cli.Env, c converger, req lifeops.UpRequest, o downOption
 			fmt.Fprintf(env.Stdout, "         3. ask every host what it is actually running, and wait until\n")
 			fmt.Fprintf(env.Stdout, "            each says it is running nothing\n")
 		}
-	} else {
+	case o.nodeOnly:
+		fmt.Fprintf(env.Stdout, "         1. seal nothing (--node): the deployment keeps admitting work\n")
+	default:
 		fmt.Fprintf(env.Stdout, "         1. nothing to seal: this host runs no control plane, and nothing\n")
 		fmt.Fprintf(env.Stdout, "            here can ask it what it is running either\n")
 	}

@@ -426,7 +426,7 @@ func TestTheBuildWritesTheSourceManifestBeforeTheListsGo(t *testing.T) {
 		}
 	}
 
-	workflow, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image.yml"))
+	workflow, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image-build.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,20 +434,20 @@ func TestTheBuildWritesTheSourceManifestBeforeTheListsGo(t *testing.T) {
 		t.Helper()
 		_, after, found := strings.Cut(string(workflow), "\n      - name: "+name+"\n")
 		if !found {
-			t.Fatalf("guest-image.yml has no step %q", name)
+			t.Fatalf("guest-image-build.yml has no step %q", name)
 		}
 		body, _, _ := strings.Cut(after, "\n      - name: ")
 
 		return body
 	}
-	if !strings.Contains(step("Pack and describe"), "\n          cp \"$WORK/image-sources.tsv\" out/image-sources.tsv\n") {
-		t.Error("guest-image.yml's pack step does not put the source manifest in out/")
+	if !strings.Contains(step("Pack and describe"), "\n          cp \"$WORK/image-sources.tsv\" \"out/image-sources$SUFFIX.tsv\"\n") {
+		t.Error("guest-image-build.yml's pack step does not put the source manifest in out/")
 	}
-	if !strings.Contains(step("Upload the checked image"), "\n            out/image-sources.tsv\n") {
-		t.Error("guest-image.yml's upload does not carry out/image-sources.tsv to the publish job")
+	if !strings.Contains(step("Upload the checked image"), "\n            out/image-sources${{ inputs.suffix }}.tsv\n") {
+		t.Error("guest-image-build.yml's upload does not carry the source manifest to the publish job")
 	}
 	if !strings.Contains(step("Check the image is fit to publish"),
-		`sudo SOURCES_EXPORT="${{ github.workspace }}/out/image-sources.tsv" \`) {
-		t.Error("guest-image.yml's gate does not hold the exported source manifest to the image's")
+		`sudo SOURCES_EXPORT="$GITHUB_WORKSPACE/out/image-sources$SUFFIX.tsv" \`) {
+		t.Error("guest-image-build.yml's gate does not hold the exported source manifest to the image's")
 	}
 }

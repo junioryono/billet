@@ -804,7 +804,7 @@ func readFile(t *testing.T, name string) string {
 func readWorkflow(t *testing.T) string {
 	t.Helper()
 
-	return readFile(t, filepath.Join("..", ".github", "workflows", "guest-image.yml"))
+	return readFile(t, filepath.Join("..", ".github", "workflows", "guest-image-build.yml"))
 }
 
 // A PASSING CHECKER THAT SAYS A LOT IS STILL A PASS, and this is the trap the gate

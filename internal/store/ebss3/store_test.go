@@ -386,8 +386,10 @@ func TestACloudPointerRejectsAStaleGenerationAndWriter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireWriter two: %v", err)
 	}
-	if err := s.PublishCAS(t.Context(), one.Key, "", two, leaseTwo, fenceTwo); !errors.Is(err, storecontract.ErrConflict) {
-		t.Fatalf("stale expected generation error = %v", err)
+	err = s.PublishCAS(t.Context(), one.Key, "", two, leaseTwo, fenceTwo)
+	moved, ok := errors.AsType[*storecontract.PointerMovedError](err)
+	if !errors.Is(err, storecontract.ErrConflict) || !ok || moved.Current != one.Generation || moved.Expected != "" {
+		t.Fatalf("stale expected generation error = %v, want a PointerMovedError at %q, not %q", err, one.Generation, "")
 	}
 
 	now = now.Add(2 * time.Minute)
@@ -395,8 +397,14 @@ func TestACloudPointerRejectsAStaleGenerationAndWriter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireWriter three: %v", err)
 	}
-	if err := s.PublishCAS(t.Context(), one.Key, one.Generation, two, leaseTwo, fenceTwo); !errors.Is(err, storecontract.ErrConflict) {
+	err = s.PublishCAS(t.Context(), one.Key, one.Generation, two, leaseTwo, fenceTwo)
+	if !errors.Is(err, storecontract.ErrConflict) {
 		t.Fatalf("stale writer error = %v", err)
+	}
+	// A LOST WRITER IS NOT A MOVED POINTER, though both are conflicts: the pointer is
+	// where this writer expected it.
+	if moved, ok := errors.AsType[*storecontract.PointerMovedError](err); ok {
+		t.Fatalf("a stale writer's refusal reads as a moved pointer: %v", moved)
 	}
 	if fenceThree <= fenceTwo || leaseThree.ID == leaseTwo.ID {
 		t.Fatalf("new writer = %+v fence %d; old = %+v fence %d",

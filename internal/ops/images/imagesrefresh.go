@@ -92,6 +92,14 @@ func cmdImagesRefresh(ctx context.Context, env cli.Env, args []string) error {
 		return nil
 	}
 
+	// WHATEVER release.automatic SAYS: where a recorded runner sits in GitHub's window
+	// changes without the image changing, and asking updates nothing (ADR-021).
+	if cfg.Node.Provider == config.ProviderTart && !*dryRun {
+		if err := refreshTartVerified(ctx, env, cfg); err != nil {
+			return err
+		}
+	}
+
 	if !cfg.Release.AutomaticUpdates() {
 		fmt.Fprintf(env.Stdout, "release.automatic is false, so guest images are left to an operator; "+
 			"nothing to do.\n")
@@ -106,14 +114,17 @@ func cmdImagesRefresh(ctx context.Context, env cli.Env, args []string) error {
 		// in the store — tens of gigabytes on a schedule for an image that may not
 		// have changed is a decision a person makes. What it does is make sure
 		// every configured image is present.
+		//
+		// A `@verified` REFERENCE IS THE EXCEPTION: a tag that moved is verified, since
+		// a tier names the newest billet proved to boot, and it is never pulled here.
 		if *dryRun {
 			fmt.Fprintf(env.Stdout, "a tart node pulls only images that are absent; nothing is "+
 				"compared against a channel\n")
 
-			return nil
+			return verifyDueTartImages(ctx, env, cfg, true)
 		}
 
-		return PullTartImages(ctx, env, cfg, "")
+		return errors.Join(tartPullAbsent(ctx, env, cfg), verifyDueTartImages(ctx, env, cfg, false))
 
 	case config.ProviderFirecracker:
 		return refreshFirecrackerImages(ctx, env, cfg, *cfgPath, *keep, *dryRun)

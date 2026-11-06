@@ -141,7 +141,7 @@ The per-sample series a node reports with each job records the wall time of its 
 
 ### `node.ebs_s3` (for an EC2 site's cache)
 
-`region`, `availability_zone` (must match the subnet's), `bucket`, `prefix`, `kms_key_id`. It exists only to back `node.cache`: without that listener nothing reads it, so `billet check` refuses the pairing rather than letting every job run cold on the instance's root volume.
+`region`, `availability_zone` (must match the subnet's), `bucket`, `prefix`, `kms_key_id`. It exists only to back `node.cache`: without that listener nothing reads it, so `billet check` refuses the pairing rather than letting every job run cold on the instance's root volume. Sticky disks and the Docker image store are EBS volumes under `kms_key_id`, and the Actions, Go and Bazel caches are objects in the bucket under `prefix`, encrypted with S3's own key ([ADR-024](decisions/adr-024-caches-off-firecracker.md)).
 
 ## `tiers`
 
@@ -163,7 +163,7 @@ The per-sample series a node reports with each job records the wall time of its 
 | `minute_weight` | what one minute of this tier counts as in [`billet usage export`](usage-export.md), in minutes of a 2 vCPU Linux runner; a decimal above 0 and at most 1000, with at most three places, refused beside `sizes`. Absent, the vCPU charged over two. It reports and decides nothing |
 | `disk` | usable root capacity on Firecracker and EC2; ignored by Docker |
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
-| `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference; never one beginning with `-`, which a backend's command line would read as an option |
+| `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference or local VM name, either of which may end `@verified` to boot only a copy of what `billet images verify` booted on that node ([ADR-021](decisions/adr-021-tart-images-verified-not-published.md), never beside a digest, and `billet check` refuses it while a registered host predates wire 41); never one beginning with `-`, which a backend's command line would read as an option |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
 | `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
@@ -195,13 +195,13 @@ Everything here is optional; [Build caches](../operating/build-caches.md) explai
 | `docker.enabled`, `docker.max_size` | `true`, `100GiB` | the guest's Docker image store and its ceiling |
 | `sticky_disks.enabled`, `sticky_disks.max_size` | `true`, `100GiB` | `actions/stickydisk` volumes; a larger request is clamped |
 | `actions.enabled`, `actions.max_archive` | on where the scope already holds, `10GiB` | the transparent Actions cache; an untrusted tier needs `default-branch`, a trusted `trusted-only` one a `cache_scope.workflow_ref` in its `workflows` |
-| `git.enabled`, `git.max_size` | `true` on Linux Firecracker, `50GiB` | the Git mirror for `github.com` fetches; a repository above the ceiling is not mirrored |
-| `bazel.enabled`, `bazel.max_size` | `true` on Linux Firecracker where the tier can publish it (trusted under `trusted-only`, or `default-branch`), `50GiB` | Bazel's HTTP cache and the Remote Execution API for Bazel and Buck2 |
-| `go.enabled`, `go.max_size` | `true` on Linux Firecracker where the tier can publish it, as for Bazel, `20GiB` | the Go build cache through `GOCACHEPROG` |
+| `git.enabled`, `git.max_size` | `true` on Linux Firecracker or EC2, `50GiB` | the Git mirror for `github.com` fetches; a repository above the ceiling is not mirrored |
+| `bazel.enabled`, `bazel.max_size` | `true` on Linux Firecracker or EC2 where the tier can publish it (trusted under `trusted-only`, or `default-branch`), `50GiB` | Bazel's HTTP cache and the Remote Execution API for Bazel and Buck2 |
+| `go.enabled`, `go.max_size` | `true` on Linux Firecracker or EC2 where the tier can publish it, as for Bazel, `20GiB` | the Go build cache through `GOCACHEPROG` |
 | `go.test_results` | `false` | also cache `go test` results; off, the guest sets `GOFLAGS=-count=1` |
-| `npm.enabled` | `true` on a firecracker Linux tier, as every cache is; `false` turns it off for a tier whose jobs run a client the node's authority does not reach | the node serves `registry.npmjs.org` to the tier's guests from a store of its own, answering only anonymous reads and splicing everything else to the registry ([ADR-020](decisions/adr-020-npm-registry-interception.md)); Linux Firecracker only. It has no `max_size`: the store is the node's, shared by every tier on it |
+| `npm.enabled` | `true` on a firecracker or EC2 Linux tier, as every cache is; `false` turns it off for a tier whose jobs run a client the node's authority does not reach | the node serves `registry.npmjs.org` to the tier's guests from a store of its own, answering only anonymous reads and splicing everything else to the registry ([ADR-020](decisions/adr-020-npm-registry-interception.md)); Linux Firecracker only. It has no `max_size`: the store is the node's, shared by every tier on it |
 
-A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. A tier an older node would exceed is placed only on a node at protocol 23 or later: every `default-branch` tier (an older node would read the pool's wider pre-#226 keys), a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, and an Actions archive held below `10GiB`.
+A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. On EC2, where the Go and Bazel caches are objects rather than a volume, it bounds what one job adds. A tier an older node would exceed is placed only on a node at protocol 23 or later: every `default-branch` tier (an older node would read the pool's wider pre-#226 keys), a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, and an Actions archive held below `10GiB`.
 
 ## `nodes`
 

@@ -1341,6 +1341,8 @@ tiers:
 #    node: mac-mini-1      # required: 2 macOS guests per Mac, counted per host
 #    vcpu: 6
 #    memory: 24GiB
+#    # Add @verified to boot only a copy of what `billet images verify` booted:
+#    # ghcr.io/cirruslabs/macos-tahoe-xcode:26@verified, or macos-26@verified.
 #    image: macos-26
 #    # Defaults to the host's macOS limit, and may not exceed it. Two macOS
 #    # tiers on one node must still sum to that limit or less.
