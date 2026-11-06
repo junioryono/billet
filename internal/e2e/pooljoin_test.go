@@ -349,9 +349,9 @@ func TestAHeldHostWhoseTokenLapsedJoinsOnAPersonsWord(t *testing.T) {
 }
 
 // A HOST WHOSE TOKEN LAPSES BEFORE ITS ORDER IS PLACED IS NEVER TURNED AWAY: it is
-// told to ask again while the order is being ordered, and again once it is placed with
-// the token lapsed, recording nothing; the pool then holds the order nothing can join
-// from, the host's next ask is recorded for a person, and their approval admits it.
+// told to ask again while the order is being ordered; once it is placed with the token
+// lapsed, its ask holds the order nothing can join from and is recorded for a person,
+// with no pool loop involved, and their approval admits it.
 func TestAHostWhoseTokenLapsedBeforePlacementWaitsForAPerson(t *testing.T) {
 	t.Parallel()
 	w := newPoolJoinWire(t)
@@ -385,14 +385,12 @@ func TestAHostWhoseTokenLapsedBeforePlacementWaitsForAPerson(t *testing.T) {
 	if err := w.alloc.PoolOrderPlaced(ctx, "pd", "host-pd"); err != nil {
 		t.Fatal(err)
 	}
+	// THE ASK ITSELF HOLDS THE ORDER, nothing being able to join from it any more, so it
+	// waits on no pool loop: a control plane whose config names no pool runs none.
 	waits("placed, with its token lapsed")
-	if _, ok, err := w.alloc.LookupEnrollment(ctx, name); err != nil || ok {
-		t.Fatalf("a lapsed token recorded a request (%v, %v)", ok, err)
+	if o, err := w.alloc.ReadPoolOrder(ctx, "pd"); err != nil || o.JoinHold == "" {
+		t.Fatalf("the order after a lapsed token's ask: %+v, %v, want held", o, err)
 	}
-	if held, err := w.alloc.HoldLapsedPoolJoins(ctx); err != nil || held != 1 {
-		t.Fatalf("the pool held %d, %v", held, err)
-	}
-	waits("once the order is held")
 	e, ok, err := w.alloc.LookupEnrollment(ctx, name)
 	if err != nil || !ok || e.Fingerprint != hostFP || e.State != alloc.EnrollPending || e.PoolOrder != "pd" {
 		t.Fatalf("the held order's request: %+v, %v, %v", e, ok, err)

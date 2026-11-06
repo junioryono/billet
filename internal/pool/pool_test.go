@@ -387,6 +387,27 @@ func TestDemandOrdersOneHostWhileNoneIsOnItsWay(t *testing.T) {
 	}
 }
 
+// A TIER PINNED TO ONE NODE IS NO POOL'S DEMAND, short of hosts or not: no host the pool
+// orders is that node. The floor is still kept.
+func TestAPinnedTierIsNotDemand(t *testing.T) {
+	t.Parallel()
+	pinned := firecrackerTier("fc-pinned")
+	pinned.Node = "epyc-1"
+	r := newRig(t, Policy{Floor: 0, Max: 3}, pinned)
+	r.report("fc-pinned", true, 0, "")
+	step(t, r)
+	step(t, r)
+	if n := len(r.ledger.states()); n != 0 {
+		t.Fatalf("%d orders for a tier pinned to one node", n)
+	}
+	r = newRig(t, Policy{Floor: 1, Max: 3}, pinned)
+	r.report("fc-pinned", true, 0, "")
+	step(t, r)
+	if n := len(r.ledger.states()); n != 1 {
+		t.Fatalf("%d orders, want the floor's one", n)
+	}
+}
+
 // A TIER THAT NAMES FIRECRACKER AMONG SEVERAL PROVIDERS IS THE POOL'S DEMAND TOO.
 func TestATierOfSeveralProvidersIncludingFirecrackerIsDemand(t *testing.T) {
 	t.Parallel()

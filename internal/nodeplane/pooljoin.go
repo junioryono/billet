@@ -29,6 +29,9 @@ type PoolJoins interface {
 	// HoldPoolJoin holds an order's join for a person, as the order stood when it was
 	// read (seen, its Updated then): alloc.ErrPoolOrderMoved when it has moved since.
 	HoldPoolJoin(ctx context.Context, order, reason string, seen time.Time) error
+	// HoldLapsedPoolJoin holds the order when nothing can join from it any more, and
+	// answers whether it is held now.
+	HoldLapsedPoolJoin(ctx context.Context, order string) (bool, error)
 	// RecordHeldPoolRequest records a held order's request pending, spending nothing,
 	// so a person has the host's key to approve.
 	RecordHeldPoolRequest(ctx context.Context, order, fingerprint, csrPEM string) (alloc.Enrollment, error)
@@ -97,7 +100,9 @@ func (h *handler) poolEnroll(
 		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, "billet could not read this request; try again")
 
 		return true
-	case o.State == alloc.PoolOrdering:
+	case o.State == alloc.PoolOrdering, o.State == alloc.PoolUncertain:
+		// NOT YET PLACED, OR NOT KNOWN TO BE: an order whose answer was lost may yet
+		// prove to hold this very host, so the host asks again rather than giving up.
 		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolOrderNotPlaced)
 
 		return true
@@ -118,10 +123,20 @@ func (h *handler) poolEnroll(
 		return true
 	case !live && (!mine || existing.PoolOrder != order):
 		// A TOKEN OF THE ORDER THAT CAN NO LONGER BE SPENT, from a host with nothing
-		// recorded: it is asked again, never refused, because the order is open and the
-		// pool holds an order nothing can join from, after which this host's request is
-		// recorded for a person. Nothing is asked of the source or spent meanwhile.
-		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
+		// recorded: never refused. The order is held here when nothing can join from it
+		// any more (no live token, no request waiting), as the pool's step would, so it
+		// waits on no pool loop, and this host's request is then recorded for a person;
+		// otherwise it asks again. Nothing is asked of the source or spent.
+		held, err := h.poolJoins.HoldLapsedPoolJoin(ctx, order)
+		switch {
+		case err != nil:
+			h.log.Error("could not hold a pool order nothing can join from", "order", order, "error", err)
+			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
+		case held:
+			h.recordHeld(w, r, req, fingerprint, order)
+		default:
+			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
+		}
 
 		return true
 	}

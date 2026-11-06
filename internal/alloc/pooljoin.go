@@ -243,10 +243,7 @@ func (a *Allocator) HoldLapsedPoolJoins(ctx context.Context) (int, error) {
 		var err error
 
 		held, err = state.WriteQueries(tx).HoldLapsedPoolJoins(ctx, ledgerdb.HoldLapsedPoolJoinsParams{
-			JoinHold: "every join token of this order lapsed and no node joined from it; look at its host " +
-				"before abandoning or releasing it",
-			UpdatedAt: now,
-			Now:       now,
+			JoinHold: lapsedJoin, UpdatedAt: now, Now: now,
 		})
 
 		return err
@@ -256,6 +253,43 @@ func (a *Allocator) HoldLapsedPoolJoins(ctx context.Context) (int, error) {
 	}
 
 	return int(held), nil
+}
+
+// lapsedJoin is the hold an order nothing can join from any more carries.
+const lapsedJoin = "every join token of this order lapsed and no node joined from it; look at its host " +
+	"before abandoning or releasing it"
+
+// HoldLapsedPoolJoin is HoldLapsedPoolJoins for one order, and answers whether the
+// order is held now, by this or before. A host whose token lapsed asks about its own
+// order, so its request is recorded for a person without waiting on a pool loop, which a
+// control plane whose config names no pool any more does not run.
+func (a *Allocator) HoldLapsedPoolJoin(ctx context.Context, order string) (bool, error) {
+	now := ts(a.now().UTC())
+
+	var held bool
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+
+		if _, err := q.HoldLapsedPoolJoin(ctx, ledgerdb.HoldLapsedPoolJoinParams{
+			JoinHold: lapsedJoin, UpdatedAt: now, OrderID: order, Now: now,
+		}); err != nil {
+			return err
+		}
+
+		row, err := q.ReadPoolOrder(ctx, order)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: no pool order %s", ErrPoolOrderClosed, order)
+		}
+		held = err == nil && row.JoinHold != ""
+
+		return err
+	})
+	if err != nil {
+		return false, fmt.Errorf("alloc: hold pool order %s if nothing can join from it: %w", order, err)
+	}
+
+	return held, nil
 }
 
 // PoolAdmission is a pool host's enrollment its source vouched for, and the

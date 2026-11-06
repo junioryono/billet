@@ -47,6 +47,21 @@ type poolRig struct {
 	heldErr      error
 	heldState    string
 	holdErr      error
+	// lapsed is whether the order has nothing left to join from, which a lapsed token's
+	// ask holds; lapsedAsks counts those asks.
+	lapsed     bool
+	lapsedAsks int
+}
+
+func (p *poolRig) HoldLapsedPoolJoin(_ context.Context, order string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lapsedAsks++
+	if p.lapsed {
+		p.order.JoinHold = "every join token of this order lapsed"
+	}
+
+	return p.order.JoinHold != "", nil
 }
 
 func (p *poolRig) RecordHeldPoolRequest(_ context.Context, order, fingerprint, _ string) (alloc.Enrollment, error) {
@@ -325,6 +340,8 @@ func TestTheLedgerIsAskedBeforeTheSource(t *testing.T) {
 			status: http.StatusConflict, says: "admits no node"},
 		"an order being ordered": {set: func(p *poolRig, _ *nodeapi.EnrollRequest) { p.order.State = alloc.PoolOrdering },
 			status: http.StatusServiceUnavailable, says: "not yet recorded as placed"},
+		"an uncertain order": {set: func(p *poolRig, _ *nodeapi.EnrollRequest) { p.order.State = alloc.PoolUncertain },
+			status: http.StatusServiceUnavailable, says: "not yet recorded as placed"},
 		"a spent token and no request": {set: func(p *poolRig, _ *nodeapi.EnrollRequest) { p.spent["tok-pa"] = true },
 			status: http.StatusServiceUnavailable, says: "join waits"},
 		"another name": {set: func(_ *poolRig, r *nodeapi.EnrollRequest) { r.Node = "epyc-1" },
@@ -520,6 +537,31 @@ func TestAKeyThatJustJoinedIsAnsweredNotRefused(t *testing.T) {
 	other, _ := poolRequest(t, alloc.PoolNodeName("pa"))
 	if status, _, _ := askToJoin(t, srv, other); status != http.StatusConflict {
 		t.Fatalf("another key after the order closed answered %d", status)
+	}
+}
+
+// A LAPSED TOKEN OF AN ORDER NOTHING CAN JOIN FROM ANY MORE HOLDS THE ORDER THERE AND
+// THEN and records the host's request for a person, so it waits on no pool loop; one of
+// an order something can still join from asks again, recording nothing.
+func TestALapsedTokenHoldsItsOrderWhenNothingCanJoin(t *testing.T) {
+	t.Parallel()
+	for _, lapsed := range []bool{true, false} {
+		rig := newPoolRig(hostsource.VerdictVouches)
+		rig.spent["tok-pa"], rig.lapsed = true, lapsed
+		srv, _ := servePool(t, rig, true)
+		req, fp := poolRequest(t, alloc.PoolNodeName("pa"))
+		status, res, _ := askToJoin(t, srv, req)
+		if rig.lapsedAsks != 1 || len(rig.claims) != 0 || len(rig.requested) != 0 {
+			t.Fatalf("lapsed=%v: asked the lapse %d times, the source %d, spent %v", lapsed, rig.lapsedAsks,
+				len(rig.claims), rig.requested)
+		}
+		if lapsed && (status != http.StatusOK || res.State != alloc.EnrollPending ||
+			len(rig.recordedHeld) != 1 || rig.recordedHeld[0] != "pa "+fp) {
+			t.Fatalf("an order nothing can join from: %d %+v, recorded %v", status, res, rig.recordedHeld)
+		}
+		if !lapsed && (status != http.StatusServiceUnavailable || len(rig.recordedHeld) != 0) {
+			t.Fatalf("an order something can still join from: %d, recorded %v", status, rig.recordedHeld)
+		}
 	}
 }
 

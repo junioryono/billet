@@ -288,6 +288,7 @@ type WriteOps interface {
 	LinkPoolOrderNode(ctx context.Context, arg ledgerdb.LinkPoolOrderNodeParams) (int64, error)
 	HoldPoolOrderJoin(ctx context.Context, arg ledgerdb.HoldPoolOrderJoinParams) (int64, error)
 	HoldLapsedPoolJoins(ctx context.Context, arg ledgerdb.HoldLapsedPoolJoinsParams) (int64, error)
+	HoldLapsedPoolJoin(ctx context.Context, arg ledgerdb.HoldLapsedPoolJoinParams) (int64, error)
 	ReleasePoolOrderJoin(ctx context.Context, arg ledgerdb.ReleasePoolOrderJoinParams) (int64, error)
 	SpendPoolJoinToken(ctx context.Context, arg ledgerdb.SpendPoolJoinTokenParams) (sql.Result, error)
 	RetirePoolJoinTokens(ctx context.Context, poolOrder string) error

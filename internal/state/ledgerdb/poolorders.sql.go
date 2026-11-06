@@ -9,6 +9,37 @@ import (
 	"context"
 )
 
+const holdLapsedPoolJoin = `-- name: HoldLapsedPoolJoin :execrows
+UPDATE pool_orders SET join_hold = $1, updated_at = $2
+ WHERE order_id = $3 AND state = 'placed' AND node_name = '' AND join_hold = ''
+   AND NOT EXISTS (SELECT 1 FROM join_tokens t
+                    WHERE t.pool_order = pool_orders.order_id AND t.uses_remaining > 0 AND t.expires_at > $4)
+   AND NOT EXISTS (SELECT 1 FROM node_enrollments e
+                    WHERE e.pool_order = pool_orders.order_id AND e.state = 'pending')
+`
+
+type HoldLapsedPoolJoinParams struct {
+	JoinHold  string
+	UpdatedAt string
+	OrderID   string
+	Now       string
+}
+
+// HoldLapsedPoolJoins for one order, which a host whose token lapsed asks about: the
+// same proof that nothing can join from it, so a pool loop is not what it waits on.
+func (q *Queries) HoldLapsedPoolJoin(ctx context.Context, arg HoldLapsedPoolJoinParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, holdLapsedPoolJoin,
+		arg.JoinHold,
+		arg.UpdatedAt,
+		arg.OrderID,
+		arg.Now,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const holdLapsedPoolJoins = `-- name: HoldLapsedPoolJoins :execrows
 UPDATE pool_orders SET join_hold = $1, updated_at = $2
  WHERE state = 'placed' AND node_name = '' AND join_hold = ''

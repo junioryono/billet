@@ -552,3 +552,31 @@ func TestAHoldOnAStaleVerdictHoldsNothing(t *testing.T) {
 		t.Fatalf("a stale verdict held the order: %+v", o)
 	}
 }
+
+// ONE ORDER'S LAPSE IS HELD ON ITS OWN, by the same proof the pool's step uses: placed,
+// joined by no node, no live token and no request waiting. An order something can still
+// join from is not held, and one already held answers held.
+func TestOneOrdersLapseIsHeldOnItsOwn(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	placedOrder(t, a, "pa")
+	placedOrder(t, a, "pb")
+	if held, err := a.HoldLapsedPoolJoin(ctx, "pa"); err != nil || held {
+		t.Fatalf("an order with a live token: held %v, %v", held, err)
+	}
+	now = now.Add(2 * time.Hour)
+	if held, err := a.HoldLapsedPoolJoin(ctx, "pa"); err != nil || !held {
+		t.Fatalf("an order nothing can join from: held %v, %v", held, err)
+	}
+	if o := readOrder(t, a, "pb"); o.JoinHold != "" {
+		t.Fatalf("holding one order held another: %+v", o)
+	}
+	if held, err := a.HoldLapsedPoolJoin(ctx, "pa"); err != nil || !held {
+		t.Fatalf("an order already held: held %v, %v", held, err)
+	}
+	if _, err := a.HoldLapsedPoolJoin(ctx, "missing"); !errors.Is(err, ErrPoolOrderClosed) {
+		t.Fatalf("no such order: %v", err)
+	}
+}

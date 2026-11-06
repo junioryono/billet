@@ -245,7 +245,10 @@ func (p *Pool) demand(ctx context.Context) (map[config.Arch]bool, error) {
 	var unknown []string
 	for i := range p.cfg.Tiers {
 		t := &p.cfg.Tiers[i]
-		if !servesFirecracker(t) || t.Arch == "" {
+		// A TIER PINNED TO ONE NODE IS NO POOL'S DEMAND: no host the pool orders is that
+		// node, so growing for it would order hosts its work can never run on, up to the
+		// maximum, while it waits as before.
+		if !servesFirecracker(t) || t.Arch == "" || t.Node != "" {
 			continue
 		}
 		r, ok := reports[t.Label]

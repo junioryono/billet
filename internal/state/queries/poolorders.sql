@@ -56,6 +56,16 @@ UPDATE pool_orders SET join_hold = @join_hold, updated_at = @updated_at
 UPDATE pool_orders SET join_hold = '', updated_at = @updated_at
  WHERE order_id = @order_id AND join_hold != '' AND state = 'placed' AND node_name = '';
 
+-- name: HoldLapsedPoolJoin :execrows
+-- HoldLapsedPoolJoins for one order, which a host whose token lapsed asks about: the
+-- same proof that nothing can join from it, so a pool loop is not what it waits on.
+UPDATE pool_orders SET join_hold = @join_hold, updated_at = @updated_at
+ WHERE order_id = @order_id AND state = 'placed' AND node_name = '' AND join_hold = ''
+   AND NOT EXISTS (SELECT 1 FROM join_tokens t
+                    WHERE t.pool_order = pool_orders.order_id AND t.uses_remaining > 0 AND t.expires_at > @now)
+   AND NOT EXISTS (SELECT 1 FROM node_enrollments e
+                    WHERE e.pool_order = pool_orders.order_id AND e.state = 'pending');
+
 -- name: HoldLapsedPoolJoins :execrows
 -- Hold every placed order nothing joined from that has no live token left and no
 -- request waiting for a person: its host can no longer join, and without a hold the
