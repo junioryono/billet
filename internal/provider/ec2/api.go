@@ -216,7 +216,8 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 // could carry a refusal back from a second attempt whose first launched a host, and the
 // pool, which reads the order back, is what tries again. ITS BODY CANNOT BE REWOUND, so
 // the transport cannot resend it either: Go's HTTP/2 client replays a request whose
-// GetBody is set after some stream errors from the peer, inside one Do.
+// GetBody is set after some stream errors from the peer, inside one Do (go1.26.0's
+// h2_bundle.go, by its source, not probed against AWS).
 func (c *client) callOnce(ctx context.Context, params url.Values, out any) error {
 	return c.callUpTo(ctx, params, out, 1)
 }
