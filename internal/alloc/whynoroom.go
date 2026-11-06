@@ -141,11 +141,11 @@ func (a *Allocator) WhyNoRoom(ctx context.Context, tier string) (RoomRefusal, er
 		case len(fits) == 0:
 			out.NoHost = true
 
-			return nil
+			return a.potsWhateverTheHosts(ctx, tx, t, floors, &out)
 		case p.total(t) == 0:
 			out.HostsFull = fits
 
-			return nil
+			return a.potsWhateverTheHosts(ctx, tx, t, floors, &out)
 		}
 
 		// THE POTS, JUDGED ON THE HOSTS THAT HAVE ROOM, at the shapes those
@@ -212,22 +212,9 @@ func (a *Allocator) ShapeHosts(ctx context.Context) (map[string][]string, error)
 func (a *Allocator) whichPotRefuses(ctx context.Context, tx querier, t config.Tier, p *placer,
 	floors floorCharge, out *RoomRefusal,
 ) error {
-	used, err := a.usage(ctx, tx)
+	share, ceiling, err := a.potRoom(ctx, tx, t, floors)
 	if err != nil {
 		return err
-	}
-
-	ceiling := placementCost{
-		vcpu:   a.limits.MaxVCPU - used.VCPU - floors.vcpu,
-		memory: a.limits.MaxMemory - used.Memory - floors.memory,
-	}
-
-	share := placementCost{vcpu: unboundedVCPU, memory: unboundedMemory}
-	if _, ok := a.limits.Shares[config.ShareTarget(t)]; ok {
-		share, err = a.shareRoomFor(ctx, tx, t.Label, placementCost{}, floors)
-		if err != nil {
-			return err
-		}
 	}
 
 	within := func(room placementCost) int {
@@ -247,4 +234,49 @@ func (a *Allocator) whichPotRefuses(ctx context.Context, tx querier, t config.Ti
 	out.Budgets = shareAlone > 0 && ceilingAlone > 0 && within(both) == 0
 
 	return nil
+}
+
+// potsWhateverTheHosts sets which of the target's share and the deployment ceiling has
+// no room for the least a lease of t charges on any host, its own shape, for a tier no
+// live host can place or whose hosts are full. NAMED THERE TOO, because a pool reads a
+// refusal that names hosts and nothing else as a shortage more hosts would fill, and a
+// spent pot would leave every host it ordered idle (ADR-028).
+func (a *Allocator) potsWhateverTheHosts(ctx context.Context, tx querier, t config.Tier,
+	floors floorCharge, out *RoomRefusal,
+) error {
+	share, ceiling, err := a.potRoom(ctx, tx, t, floors)
+	if err != nil {
+		return err
+	}
+
+	fits := func(room placementCost) bool { return t.VCPU <= room.vcpu && t.Memory <= room.memory }
+	out.ShareBound = !fits(share)
+	out.CeilingBound = !fits(ceiling)
+
+	return nil
+}
+
+// potRoom is the room left in t's target's share (unbounded without one) and in the
+// deployment ceiling, other tiers' outstanding floors charged to both.
+func (a *Allocator) potRoom(ctx context.Context, tx querier, t config.Tier, floors floorCharge,
+) (placementCost, placementCost, error) {
+	used, err := a.usage(ctx, tx)
+	if err != nil {
+		return placementCost{}, placementCost{}, err
+	}
+
+	ceiling := placementCost{
+		vcpu:   a.limits.MaxVCPU - used.VCPU - floors.vcpu,
+		memory: a.limits.MaxMemory - used.Memory - floors.memory,
+	}
+
+	share := placementCost{vcpu: unboundedVCPU, memory: unboundedMemory}
+	if _, ok := a.limits.Shares[config.ShareTarget(t)]; ok {
+		share, err = a.shareRoomFor(ctx, tx, t.Label, placementCost{}, floors)
+		if err != nil {
+			return placementCost{}, placementCost{}, err
+		}
+	}
+
+	return share, ceiling, nil
 }

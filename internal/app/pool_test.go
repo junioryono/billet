@@ -98,11 +98,13 @@ func TestAPreludeThatFailsStopsTheBootBeforeTheJoin(t *testing.T) {
 // refused rather than run as something else.
 func TestABootHoldingANULIsRefused(t *testing.T) {
 	t.Parallel()
-	if _, err := PoolBoot(poolBootConfig(), "echo a\x00b\n", "SHA256:ab", "p01", "tok"); err == nil {
-		t.Fatal("a prelude holding a NUL was rendered")
+	if _, err := PoolBoot(poolBootConfig(), "echo a\x00b\n", "SHA256:ab", "p01", "tok"); err == nil ||
+		!strings.Contains(err.Error(), "boot_prelude holds a NUL") {
+		t.Fatalf("a prelude holding a NUL answered %v", err)
 	}
-	if _, err := PoolBoot(poolBootConfig(), "true\n", "SHA256:ab", "p01", "to\x00k"); err == nil {
-		t.Fatal("a token holding a NUL was rendered")
+	if _, err := PoolBoot(poolBootConfig(), "true\n", "SHA256:ab", "p01", "to\x00k"); err == nil ||
+		!strings.Contains(err.Error(), "join argument 7 holds a NUL") {
+		t.Fatalf("a token holding a NUL answered %v", err)
 	}
 }
 

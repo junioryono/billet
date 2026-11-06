@@ -214,7 +214,9 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 
 // callOnce issues one action exactly once. A pool launch is sent this way: a retry here
 // could carry a refusal back from a second attempt whose first launched a host, and the
-// pool, which reads the order back, is what tries again.
+// pool, which reads the order back, is what tries again. ITS BODY CANNOT BE REWOUND, so
+// the transport cannot resend it either: Go's HTTP/2 client replays a request whose
+// GetBody is set after some stream errors from the peer, inside one Do.
 func (c *client) callOnce(ctx context.Context, params url.Values, out any) error {
 	return c.callUpTo(ctx, params, out, 1)
 }
@@ -241,7 +243,7 @@ func (c *client) callUpTo(ctx context.Context, params url.Values, out any, attem
 		// REBUILT EVERY ATTEMPT. A signature covers a timestamp and the
 		// credentials, both of which can change between attempts, and the body
 		// reader is consumed by the one before.
-		payload, err := c.attempt(ctx, body)
+		payload, err := c.attempt(ctx, body, attempts > 1)
 		if err == nil {
 			if out == nil {
 				return nil
@@ -300,10 +302,13 @@ func (c *client) wait(ctx context.Context, d time.Duration) error {
 
 // attempt issues one request and returns its body, leaving the decode to the
 // caller so that a failed attempt cannot contaminate the next one's target.
-func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
+func (c *client) attempt(ctx context.Context, body string, rewindable bool) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, strings.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("ec2: build request: %w", err)
+	}
+	if !rewindable {
+		req.GetBody = nil
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")

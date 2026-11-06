@@ -625,8 +625,8 @@ func TestASourceThatCannotSayWhereItOrdersOrdersNothing(t *testing.T) {
 	r.first.scopeErr = errors.New("sts: throttled")
 	r.first.answer = nil
 	r.first.mu.Unlock()
-	if err := r.pool.Step(t.Context()); err == nil {
-		t.Fatal("a resume whose source could not say where it orders was not reported")
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "throttled") {
+		t.Fatalf("a resume whose source could not say where it orders answered %v", err)
 	}
 	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolOrdering ||
 		len(r.first.finds()) != 0 || len(r.first.requests()) != 1 {
@@ -655,7 +655,7 @@ func TestAnOrderWhoseSourceIsGoneIsUncertain(t *testing.T) {
 		}
 	}
 	got := r.ledger.snapshot()
-	if len(got) != 1 || got["o-1"].State != alloc.PoolUncertain || !strings.Contains(got["o-1"].Reason, "first") {
+	if len(got) != 1 || got["o-1"].State != alloc.PoolUncertain || !strings.Contains(got["o-1"].Reason, "first is no longer configured") {
 		t.Fatalf("orders = %+v, want o-1 uncertain naming its source", got)
 	}
 	if n := len(r.second.requests()); n != 0 {

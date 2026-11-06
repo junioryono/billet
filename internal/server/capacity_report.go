@@ -85,8 +85,12 @@ func (l *Listener) publishCapacity(ctx context.Context, sent *int, exchange stri
 	// reads as its demand (ADR-028). A tier with no host that can place it never waits
 	// in the admission queue, so Waiting reads zero for exactly the shortage a pool
 	// exists to fill; this is set from the allocator's reason whatever the queue made
-	// of the tier, and never for a seal, a cap, a share or the ceiling.
-	report.HostShortage = l.waitingFor > 0 && !l.refused.draining && l.refused.room != nil && l.refused.room.HostOnly()
+	// of the tier, and never for a seal, a cap, a share or the ceiling. ONLY ON A
+	// COUNT IN HAND: a count made unknown (a session recovered, a launch ended) or a
+	// tier draining publishes no shortage, though the refusal it last kept survives
+	// and this report is stamped now.
+	report.HostShortage = l.demandKnown && !l.draining && l.waitingFor > 0 && !l.refused.draining &&
+		l.refused.room != nil && l.refused.room.HostOnly()
 
 	// A COUNT WITHOUT A DATE IS NOT A WAIT. The two are written by different
 	// parties — the count by this tier's own reconciliation, the date by the

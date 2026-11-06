@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -132,12 +134,22 @@ func TestAPoolLaunchIsSentOnce(t *testing.T) {
 
 				return http.StatusOK, defaultReply(action)
 			}
-			h := newTestProvider(t, f, nil).Hosts()
+			p := newTestProvider(t, f, nil)
+			rewound := &rewindRecorder{next: p.api.http.Transport}
+			if rewound.next == nil {
+				rewound.next = http.DefaultTransport
+			}
+			p.api.http = &http.Client{Transport: rewound, CheckRedirect: p.api.http.CheckRedirect, Timeout: p.api.http.Timeout}
+			h := p.Hosts()
 			if _, err := h.Launch(t.Context(), hostLaunch()); err == nil {
 				t.Fatal("a failed launch succeeded")
 			}
 			if n := f.countOf("RunInstances"); n != 1 {
 				t.Fatalf("RunInstances was sent %d times, want once", n)
+			}
+			if n := len(rewound.of("RunInstances")); n != 1 || rewound.of("RunInstances")[0] {
+				t.Fatalf("RunInstances went to the transport as %v (rewindable?), want once and not rewindable",
+					rewound.of("RunInstances"))
 			}
 			if _, _, err := h.Find(t.Context(), "o-1"); err == nil {
 				t.Fatal("a failed read back succeeded")
@@ -145,8 +157,50 @@ func TestAPoolLaunchIsSentOnce(t *testing.T) {
 			if n := f.countOf("DescribeInstances"); n != maxAttempts {
 				t.Fatalf("DescribeInstances was sent %d times, want its %d retries kept", n, maxAttempts)
 			}
+			for _, r := range rewound.of("DescribeInstances") {
+				if !r {
+					t.Fatal("a retried read went out with a body that cannot be rewound")
+				}
+			}
 		})
 	}
+}
+
+// rewindRecorder records, per action, whether each request handed to the transport
+// could be rewound (GetBody set), which is what lets Go's HTTP/2 client resend it.
+type rewindRecorder struct {
+	next http.RoundTripper
+	mu   sync.Mutex
+	seen map[string][]bool
+}
+
+func (r *rewindRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	rewindable := req.GetBody != nil
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	_ = req.Body.Close()
+	form, err := url.ParseQuery(string(raw))
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	if r.seen == nil {
+		r.seen = map[string][]bool{}
+	}
+	r.seen[form.Get("Action")] = append(r.seen[form.Get("Action")], rewindable)
+	r.mu.Unlock()
+	req.Body = io.NopCloser(bytes.NewReader(raw))
+
+	return r.next.RoundTrip(req)
+}
+
+func (r *rewindRecorder) of(action string) []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]bool(nil), r.seen[action]...)
 }
 
 func TestAnOrderThatCannotBeATokenOrAFilterIsRefused(t *testing.T) {

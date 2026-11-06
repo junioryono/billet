@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -53,11 +52,10 @@ type Source struct {
 	hosts    hosts
 	location string
 	shapes   map[string]Shape
-	// account answers which AWS account the credentials are in; it is asked once,
-	// then kept.
-	account   func(context.Context) (string, error)
-	accountMu sync.Mutex
-	accountID string
+	// account answers which AWS account the credentials are in now. It is asked at
+	// every Scope, never kept: credentials that rotate into another account without a
+	// restart would otherwise read an order placed in the first as absent in the second.
+	account func(context.Context) (string, error)
 	// code reads EC2's error code out of an error chain; ec2.Code outside a test.
 	code func(error) (string, bool)
 }
@@ -103,20 +101,15 @@ func (s *Source) Name() string { return Name }
 // accounts, each blind to the others' instances: credentials that changed account
 // would read an order back as absent and launch it again.
 func (s *Source) Scope(ctx context.Context) (string, error) {
-	s.accountMu.Lock()
-	defer s.accountMu.Unlock()
-	if s.accountID == "" {
-		id, err := s.account(ctx)
-		if err != nil {
-			return "", fmt.Errorf("awsmetal: which account the credentials are in: %w", err)
-		}
-		if id == "" {
-			return "", errors.New("awsmetal: the credentials named no account")
-		}
-		s.accountID = id
+	id, err := s.account(ctx)
+	if err != nil {
+		return "", fmt.Errorf("awsmetal: which account the credentials are in: %w", err)
+	}
+	if id == "" {
+		return "", errors.New("awsmetal: the credentials named no account")
 	}
 
-	return "aws:" + s.accountID + ":" + strings.TrimPrefix(s.hosts.Scope(), "aws:") + ":" + s.location, nil
+	return "aws:" + id + ":" + strings.TrimPrefix(s.hosts.Scope(), "aws:") + ":" + s.location, nil
 }
 
 // Terms are on-demand EC2's: billed by the second, and a launch measured reaching its

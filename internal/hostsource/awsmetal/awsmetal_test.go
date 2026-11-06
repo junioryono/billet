@@ -251,7 +251,8 @@ func TestALaunchRefusedLocallyIsNotSent(t *testing.T) {
 // THE SCOPE IS WHERE AN ORDER WAS PLACED: the credentials' account, the provider's
 // region and subnet, and this source's zone, so a changed config or credentials in
 // another account sharing the subnet are never mistaken for the same place. The account
-// is asked once and kept; a failed or empty answer is could-not-tell, and is asked again.
+// is asked every time, so credentials that rotate into another account change the scope;
+// a failed or empty answer is could-not-tell.
 func TestTheScopeNamesAccountRegionSubnetAndZone(t *testing.T) {
 	t.Parallel()
 	asked := 0
@@ -268,23 +269,21 @@ func TestTheScopeNamesAccountRegionSubnetAndZone(t *testing.T) {
 	if _, err := s.Scope(t.Context()); err == nil || !strings.Contains(err.Error(), "throttled") {
 		t.Fatalf("a failed account read answered %v", err)
 	}
-	if _, err := s.Scope(t.Context()); err == nil {
-		t.Fatal("an empty account was accepted")
+	if _, err := s.Scope(t.Context()); err == nil || !strings.Contains(err.Error(), "no account") {
+		t.Fatalf("an empty account answered %v", err)
 	}
-	for range 2 {
-		got, err := s.Scope(t.Context())
-		if err != nil || got != "aws:111122223333:us-west-2:subnet-0abc:us-west-2a" {
-			t.Fatalf("scope = %q, %v", got, err)
-		}
+	if got, err := s.Scope(t.Context()); err != nil || got != "aws:111122223333:us-west-2:subnet-0abc:us-west-2a" {
+		t.Fatalf("scope = %q, %v", got, err)
 	}
-	if asked != 3 {
-		t.Fatalf("the account was asked %d times, want 3: once kept, never again", asked)
+	if got, err := s.Scope(t.Context()); err != nil || got != "aws:444455556666:us-west-2:subnet-0abc:us-west-2a" {
+		t.Fatalf("after the credentials moved account, scope = %q, %v", got, err)
 	}
 }
 
 func TestASourceWithoutAnAccountIsRefused(t *testing.T) {
 	t.Parallel()
-	if _, err := newSource(&fakeHosts{}, "us-west-2a", []Shape{{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"}}, nil); err == nil {
-		t.Fatal("a source that cannot name its account was built")
+	if _, err := newSource(&fakeHosts{}, "us-west-2a", []Shape{{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"}}, nil); err == nil ||
+		!strings.Contains(err.Error(), "account") {
+		t.Fatalf("a source that cannot name its account answered %v", err)
 	}
 }
