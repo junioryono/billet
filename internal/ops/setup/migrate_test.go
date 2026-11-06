@@ -841,6 +841,8 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 	runIn(t, dir, "config", "push.recurseSubmodules", "only")
 	// AN INHERITED GIT_LITERAL_PATHSPECS still finds the tracked workflow by its name.
 	t.Setenv("GIT_LITERAL_PATHSPECS", "1")
+	// A TAG NAMED LIKE THE BRANCH leaves the base the branch's name, not heads/main.
+	runIn(t, dir, "tag", "main")
 
 	// The repository named in another case than origin's: the pull request goes to it
 	// as named, from the branch on the fork origin pushes to.
@@ -1030,6 +1032,15 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	if _, _, err := migrateRun(t, "--config", cfg, "--path", detached, "--repo", "acme/api", "--open-pr"); err == nil ||
 		!strings.Contains(err.Error(), "HEAD is detached") {
 		t.Errorf("a detached HEAD = %v", err)
+	}
+
+	// A HEAD THAT IS SYMBOLIC AND NO BRANCH has nothing a pull request could merge into.
+	remoteHead := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	runIn(t, remoteHead, "update-ref", "refs/remotes/origin/main", "HEAD")
+	runIn(t, remoteHead, "symbolic-ref", "HEAD", "refs/remotes/origin/main")
+	if _, _, err := migrateRun(t, "--config", cfg, "--path", remoteHead, "--repo", "acme/api", "--open-pr"); err == nil ||
+		!strings.Contains(err.Error(), `HEAD is "refs/remotes/origin/main", which is no branch; nothing was changed`) {
+		t.Errorf("a HEAD on a remote-tracking ref = %v", err)
 	}
 
 	nothing := checkout(t, map[string]string{"ci.yml": "on: [push]\njobs:\n  a:\n    runs-on: billet-2vcpu\n"})

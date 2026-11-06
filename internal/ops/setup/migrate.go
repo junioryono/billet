@@ -934,11 +934,17 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 	if _, err := exec.LookPath("gh"); err != nil {
 		return errors.New("billet migrate workflows: --open-pr uses your own gh, and none is on PATH; nothing was changed")
 	}
-	base, err := runGit(ctx, path, "symbolic-ref", "--quiet", "--short", "HEAD")
+	// THE FULL REF, not --short: git shortens a branch a tag shares its name with to
+	// heads/<name>, which no pull request's base is.
+	headRef, err := runGit(ctx, path, "symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
 		return fmt.Errorf("billet migrate workflows: nothing was changed: %w", err)
 	}
-	base = strings.TrimSpace(base)
+	base, onBranch := strings.CutPrefix(strings.TrimSuffix(headRef, "\n"), "refs/heads/")
+	if !onBranch || base == "" {
+		return fmt.Errorf("billet migrate workflows: HEAD is %s, which is no branch; nothing was changed",
+			strconv.Quote(strings.TrimSpace(headRef)))
+	}
 	pushedTo, destination, err := pushTarget(ctx, path)
 	if err != nil {
 		return err
