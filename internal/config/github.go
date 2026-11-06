@@ -44,4 +44,7 @@ type GitHubConfig struct {
 	// target's burst from taking every host another target's jobs need.
 	MaxVCPU   int      `yaml:"max_vcpu,omitempty"`
 	MaxMemory ByteSize `yaml:"max_memory,omitempty"`
+	// Weight is this target's claim on contended room, against the other targets
+	// waiting for it (TargetWeights). Zero is no weight written.
+	Weight int `yaml:"weight,omitempty"`
 }

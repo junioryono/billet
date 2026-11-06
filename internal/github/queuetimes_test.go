@@ -42,19 +42,19 @@ func TestARunsQueueTimesAreEachRunnersJobsCreatedAt(t *testing.T) {
 		}
 	})
 
-	records, err := c.RunJobRecords(t.Context(), "acme", "api", 31)
+	jobs, err := c.RunJobs(t.Context(), "acme", "api", 31)
 	if err != nil {
-		t.Fatalf("RunJobRecords: %v", err)
+		t.Fatalf("RunJobs: %v", err)
 	}
-	if got, want := records["billet-a"].QueuedAt, time.Date(2026, 10, 18, 21, 37, 9, 0, time.UTC); !got.Equal(want) {
+	if got, want := jobs["billet-a"].QueuedAt, time.Date(2026, 10, 18, 21, 37, 9, 0, time.UTC); !got.Equal(want) {
 		t.Errorf("billet-a = %s, want %s", got, want)
 	}
-	if got, want := records["billet-b"].QueuedAt, time.Date(2026, 10, 18, 21, 37, 47, 0, time.UTC); !got.Equal(want) {
+	if got, want := jobs["billet-b"].QueuedAt, time.Date(2026, 10, 18, 21, 37, 47, 0, time.UTC); !got.Equal(want) {
 		t.Errorf("billet-b, on the second page, = %s, want %s", got, want)
 	}
 	for _, absent := range []string{"billet-twice", "", "billet-no-time", "billet-bad-time"} {
-		if got, ok := records[absent]; ok {
-			t.Errorf("%q has record %+v, want none", absent, got)
+		if got, ok := jobs[absent]; ok {
+			t.Errorf("%q has queue time %s, want none", absent, got.QueuedAt)
 		}
 	}
 	if requests.Load() != 3 {
@@ -68,7 +68,7 @@ func TestARunsQueueTimesAreEachRunnersJobsCreatedAt(t *testing.T) {
 		}
 		fmt.Fprint(w, `{"total_count":2,"jobs":[]}`)
 	})
-	if _, err := short.RunJobRecords(t.Context(), "acme", "api", 31); err == nil ||
+	if _, err := short.RunJobs(t.Context(), "acme", "api", 31); err == nil ||
 		!strings.Contains(err.Error(), "ended after 1 of the 2") {
 		t.Errorf("a list that ended short of its count = %v, want refused for ending early", err)
 	}
@@ -89,7 +89,7 @@ func TestAQueueTimeReadOfALargeRunCostsOnePage(t *testing.T) {
 	c, requests := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
 		fmt.Fprintf(w, `{"total_count":%d,"jobs":[%s]}`, MaxQueueTimeRunJobs+1, strings.Join(jobs, ","))
 	})
-	if _, err := c.RunJobRecords(t.Context(), "acme", "api", 31); err == nil ||
+	if _, err := c.RunJobs(t.Context(), "acme", "api", 31); err == nil ||
 		!strings.Contains(err.Error(), fmt.Sprintf("more than the %d", MaxQueueTimeRunJobs)) {
 		t.Errorf("a run of %d jobs = %v, want refused", MaxQueueTimeRunJobs+1, err)
 	}
@@ -98,10 +98,44 @@ func TestAQueueTimeReadOfALargeRunCostsOnePage(t *testing.T) {
 	}
 }
 
+// A JOB'S COMMIT IS READ FROM THE RECORD THAT GIVES ITS QUEUE TIME. The shape is the
+// measured one, 2026-11-03 on the test organization: head_sha and head_branch beside
+// created_at. A branch GitHub gives as null, and a record with neither, are empty,
+// which is could-not-tell; the queue time still stands.
+func TestARunsJobsNameTheirCommit(t *testing.T) {
+	t.Parallel()
+
+	c, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		fmt.Fprint(w, `{"total_count":3,"jobs":[
+			{"id":1,"runner_name":"billet-a","created_at":"2026-10-18T21:37:09Z",
+			 "head_sha":"20f462ad39fee8e29587ae6a2a317c68992469ae","head_branch":"main","run_attempt":2},
+			{"id":2,"runner_name":"billet-b","created_at":"2026-10-18T21:37:09Z",
+			 "head_sha":"abc","head_branch":null},
+			{"id":3,"runner_name":"billet-c","created_at":"2026-10-18T21:37:09Z"}]}`)
+	})
+
+	jobs, err := c.RunJobs(t.Context(), "acme", "api", 31)
+	if err != nil {
+		t.Fatalf("RunJobs: %v", err)
+	}
+	queued := time.Date(2026, 10, 18, 21, 37, 9, 0, time.UTC)
+	for name, want := range map[string]RunJob{
+		"billet-a": {QueuedAt: queued, HeadSHA: "20f462ad39fee8e29587ae6a2a317c68992469ae", HeadBranch: "main", RunAttempt: 2},
+		"billet-b": {QueuedAt: queued, HeadSHA: "abc"},
+		"billet-c": {QueuedAt: queued},
+	} {
+		got := jobs[name]
+		if !got.QueuedAt.Equal(want.QueuedAt) || got.HeadSHA != want.HeadSHA || got.HeadBranch != want.HeadBranch ||
+			got.RunAttempt != want.RunAttempt {
+			t.Errorf("%s = %+v, want %+v", name, got, want)
+		}
+	}
+}
+
 // EACH RUNNER'S ATTEMPT IS ITS JOB'S run_attempt, read from the same list as its
-// queue time, with neither fact's absence costing the other: a re-run lists every
-// attempt's jobs under one run id, on runners of their own, and a record that does
-// not say, or says zero, gives no attempt rather than a first one.
+// queue time: a re-run lists every attempt's jobs under one run id, on runners of
+// their own, and a record that does not say, or says zero, gives no attempt rather
+// than a first one.
 func TestARunsRecordsCarryEachRunnersAttempt(t *testing.T) {
 	t.Parallel()
 
@@ -123,32 +157,34 @@ func TestARunsRecordsCarryEachRunnersAttempt(t *testing.T) {
 		fmt.Fprintf(w, `{"total_count":%d,"jobs":[%s]}`, len(jobs), strings.Join(jobs, ","))
 	})
 
-	records, err := c.RunJobRecords(t.Context(), "acme", "api", 31)
+	records, err := c.RunJobs(t.Context(), "acme", "api", 31)
 	if err != nil {
-		t.Fatalf("RunJobRecords: %v", err)
+		t.Fatalf("RunJobs: %v", err)
 	}
 	queued := time.Date(2026, 10, 18, 21, 37, 9, 0, time.UTC)
-	for runner, want := range map[string]RunnerRecord{
+	for runner, want := range map[string]RunJob{
 		"billet-first":    {QueuedAt: queued, RunAttempt: 1},
 		"billet-rerun":    {QueuedAt: queued, RunAttempt: 2},
 		"billet-silent":   {QueuedAt: queued},
 		"billet-zero":     {QueuedAt: queued},
 		"billet-negative": {QueuedAt: queued},
-		"billet-no-time":  {RunAttempt: 3},
 	} {
 		got, ok := records[runner]
 		if !ok || !got.QueuedAt.Equal(want.QueuedAt) || got.RunAttempt != want.RunAttempt {
 			t.Errorf("%s = %+v (%t), want %+v", runner, got, ok, want)
 		}
 	}
-	if got, ok := records["billet-nothing"]; ok {
-		t.Errorf("a job whose record gives neither fact has record %+v, want none", got)
+	for _, runner := range []string{"billet-no-time", "billet-nothing"} {
+		if got, ok := records[runner]; ok {
+			t.Errorf("%s, whose created_at is null, has record %+v, want none", runner, got)
+		}
 	}
 }
 
 // A JOB A RE-RUN CARRIED FORWARD KEEPS THE ATTEMPT THAT RAN IT, in whichever order the
 // list names them, with that attempt's queue time and not the later created_at GitHub
-// gives the copy. A name the attempts cannot separate is still left out.
+// gives the copy. A name the attempts cannot separate, or one an entry of which has
+// no queue time, is still left out.
 func TestARunsRecordsKeepTheAttemptThatRanACarriedJob(t *testing.T) {
 	t.Parallel()
 
@@ -176,9 +212,9 @@ func TestARunsRecordsKeepTheAttemptThatRanACarriedJob(t *testing.T) {
 		fmt.Fprintf(w, `{"total_count":%d,"jobs":[%s]}`, len(jobs), strings.Join(jobs[from:to], ","))
 	})
 
-	records, err := c.RunJobRecords(t.Context(), "acme", "api", 31)
+	records, err := c.RunJobs(t.Context(), "acme", "api", 31)
 	if err != nil {
-		t.Fatalf("RunJobRecords: %v", err)
+		t.Fatalf("RunJobs: %v", err)
 	}
 
 	// The same entries in the reverse order settle every name the same way.
@@ -188,22 +224,21 @@ func TestARunsRecordsKeepTheAttemptThatRanACarriedJob(t *testing.T) {
 		from, to := (page-1)*runJobsPerPage, min(page*runJobsPerPage, len(reversed))
 		fmt.Fprintf(w, `{"total_count":%d,"jobs":[%s]}`, len(reversed), strings.Join(reversed[from:to], ","))
 	})
-	again, err := back.RunJobRecords(t.Context(), "acme", "api", 31)
+	again, err := back.RunJobs(t.Context(), "acme", "api", 31)
 	if err != nil {
-		t.Fatalf("RunJobRecords in reverse: %v", err)
+		t.Fatalf("RunJobs in reverse: %v", err)
 	}
-	if !maps.EqualFunc(records, again, func(x, y RunnerRecord) bool {
+	if !maps.EqualFunc(records, again, func(x, y RunJob) bool {
 		return x.QueuedAt.Equal(y.QueuedAt) && x.RunAttempt == y.RunAttempt
 	}) {
 		t.Errorf("the order of the list decided the answer: %v against %v", records, again)
 	}
 
 	queued := time.Date(2026, 10, 22, 17, 9, 6, 0, time.UTC)
-	for runner, want := range map[string]RunnerRecord{
-		"carried":              {QueuedAt: queued, RunAttempt: 2},
-		"carried-backwards":    {QueuedAt: queued, RunAttempt: 2},
-		"carried-twice":        {QueuedAt: queued, RunAttempt: 1},
-		"no-time-on-the-first": {RunAttempt: 2},
+	for runner, want := range map[string]RunJob{
+		"carried":           {QueuedAt: queued, RunAttempt: 2},
+		"carried-backwards": {QueuedAt: queued, RunAttempt: 2},
+		"carried-twice":     {QueuedAt: queued, RunAttempt: 1},
 	} {
 		got, ok := records[runner]
 		if !ok || !got.QueuedAt.Equal(want.QueuedAt) || got.RunAttempt != want.RunAttempt {
@@ -211,9 +246,10 @@ func TestARunsRecordsKeepTheAttemptThatRanACarriedJob(t *testing.T) {
 		}
 	}
 	for _, runner := range []string{"one-attempt-twice", "a-copy-says-nothing", "the-first-says-nothing", "shared-then-more",
-		"more-then-shared"} {
+		"more-then-shared", "no-time-on-the-first"} {
 		if got, ok := records[runner]; ok {
-			t.Errorf("%s = %+v; the attempts cannot separate these, so want none", runner, got)
+			t.Errorf("%s = %+v; the attempts cannot separate these, or an entry has no queue time, so want none", runner,
+				got)
 		}
 	}
 }

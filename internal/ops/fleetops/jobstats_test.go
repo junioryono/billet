@@ -148,7 +148,7 @@ func writeFixedJobs(t *testing.T, db *state.DB, jobs []fixedJob) {
 			}
 			conclusion := sql.NullString{String: j.conclusion, Valid: j.conclusion != ""}
 			if _, err := tx.ExecContext(t.Context(), `INSERT INTO job_history
-				(lease_id, tier, node, repo, workflow_ref, job_name, github_run_id, github_run_attempt,
+				(lease_id, tier, node, repo, workflow_ref, job_name, github_run_id, run_attempt,
 				 result, result_at, conclusion, disruption, queued_at, started_at, github_queued_at, vcpu,
 				 memory, price_micros_per_hour, instance_type)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

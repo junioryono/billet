@@ -328,7 +328,7 @@ func TestJobFactsReadsAWindowAndSaysWhenItIsPartial(t *testing.T) {
 			"after":   {base.Add(2 * time.Hour), 4},
 		} {
 			if _, err := tx.ExecContext(t.Context(), `INSERT INTO job_history
-				(lease_id, tier, repo, workflow_ref, job_name, run_id, github_run_id, github_run_attempt, result,
+				(lease_id, tier, repo, workflow_ref, job_name, run_id, github_run_id, run_attempt, result,
 				 result_at, disruption, queued_at, started_at, github_queued_at, vcpu, memory,
 				 price_micros_per_hour)
 				VALUES (?, 'small', 'acme/api', 'acme/api/.github/workflows/ci.yml@refs/heads/main', 'test', 5, 6,
@@ -449,7 +449,7 @@ func TestARunAttemptIsWrittenOnceOnTheJobItNames(t *testing.T) {
 			t.Fatalf("Job: %v", err)
 		}
 
-		return rec.GitHubRunAttempt
+		return rec.Job.RunAttempt
 	}
 	record := func(job HistoryJob) {
 		t.Helper()

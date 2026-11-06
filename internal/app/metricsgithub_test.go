@@ -105,8 +105,8 @@ func TestTheGitHubSourceServesEachInstallationsBudget(t *testing.T) {
 		if !ok {
 			t.Fatalf("target %s reads no queue times", target.Config.Name)
 		}
-		if _, err := reader.RunJobRecords(t.Context(), "acme", "api", 31); err != nil {
-			t.Fatalf("RunJobRecords through %s: %v", target.Config.Name, err)
+		if _, err := reader.RunJobs(t.Context(), "acme", "api", 31); err != nil {
+			t.Fatalf("RunJobs through %s: %v", target.Config.Name, err)
 		}
 	}
 

@@ -82,7 +82,7 @@ tiers:
 				return err
 			}
 			if _, err := tx.ExecContext(t.Context(), `INSERT INTO job_history
-				(lease_id, tier, repo, workflow_ref, job_name, github_run_id, github_run_attempt, result, result_at,
+				(lease_id, tier, repo, workflow_ref, job_name, github_run_id, run_attempt, result, result_at,
 				 queued_at, started_at, vcpu, memory)
 				VALUES (?, 'billet-8vcpu', 'acme/api', 'acme/api/.github/workflows/ci.yml@refs/heads/main', 'build',
 				        ?, 1, 'succeeded', ?, ?, ?, 8, 34359738368)`,

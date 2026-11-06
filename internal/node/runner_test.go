@@ -362,9 +362,12 @@ func TestAnInterruptionMessageIsAcknowledgedAfterTheFailureIsDurable(t *testing.
 		Receipt:    "secret-receipt",
 	}
 
+	// A FAILURE GUARD, NOT A CONDITION: handling the warning writes the lease's
+	// failure and its history and destroys the instance first, which took longer
+	// than a second under -race and coverage on a loaded CI runner (2026-10-26).
 	select {
 	case <-p.acked:
-	case <-time.After(time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("the handled warning was not acknowledged")
 	}
 	if reason, err := a.HistoryFailureReason(t.Context(), lease.ID); err != nil {

@@ -33,7 +33,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	}
 
 	for i := range runners {
-		if runners[i].Status == alloc.PoolRunnerRetiring {
+		if runners[i].Status == alloc.PoolRunnerRetiring && !l.launchInFlight(runners[i].LeaseID) &&
+			!l.cleanupOwns(runners[i].LaunchRequestID) {
 			l.retirePoolMember(ctx, runners[i])
 		}
 	}
@@ -49,10 +50,11 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	}
 
 	// READ ONCE, so every purchase in this loop and the record below judge the
-	// tier as it stood at one instant.
+	// tier as it stood at one instant, unless targets are weighted (below).
 	admission := l.admission(ctx)
 
 	launched := false
+	slotsTaken := false
 
 	for active < desired {
 		// BOUGHT ONE AT A TIME, LAUNCHED TOGETHER. Each purchase still asks the
@@ -63,11 +65,24 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		// (2026-10-03, with 66 runners wanted on one tier).
 		var batch []poolLaunch
 
+		// ONLY WHAT MAY START NOW, WHEN A LAUNCH RUNS BESIDE THIS LOOP. The rest waits
+		// for one to end, which wakes the loop (exchange), rather than sitting bought
+		// behind them with its capacity charged and its command's clock running.
+		room := max(l.poolLaunchBatch, 1)
+		if l.backgroundLaunches {
+			room = l.launchRoom()
+			if room == 0 {
+				slotsTaken = true
+
+				break
+			}
+		}
+
 		l.mu.Lock()
 		l.batchBuying, l.batchBought = true, false
 		l.mu.Unlock()
 
-		for active < desired && len(batch) < max(l.poolLaunchBatch, 1) {
+		for active < desired && len(batch) < room {
 			// WHOSE TURN IT IS, asked before the purchase and not after: under
 			// fair the room a finished job leaves belongs to the longest-waiting
 			// tier until its shape fits, and a tier that bought first would have
@@ -105,6 +120,13 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			}
 			batch = append(batch, poolLaunch{lease: lease, job: job})
 			active++
+
+			// A WEIGHTED ORDER IS JUDGED ON WHAT THE LAST PURCHASE HELD: a target
+			// behind by one lease's worth would otherwise buy its whole backlog on
+			// the rank it had when it was behind.
+			if admission.TargetRank != nil {
+				admission = l.admission(ctx)
+			}
 		}
 
 		l.endBatchBuying()
@@ -117,6 +139,10 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		}
 
 		launched = true
+
+		if l.backgroundLaunches {
+			break
+		}
 	}
 
 	// COUNTED AGAIN AFTER A LAUNCH, which can fail and release its lease
@@ -162,9 +188,13 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		admission = l.admission(ctx)
 	}
 
-	if active < desired && admission.CanGrow {
+	switch {
+	case active < desired && admission.CanGrow && slotsTaken:
+		l.order.waitsOnLaunches(l.tier, admission)
+	case active < desired && admission.CanGrow:
 		l.order.waits(l.tier, admission)
-	} else {
+		l.askForAHold(ctx, admission)
+	default:
 		l.order.served(l.tier)
 	}
 
@@ -194,7 +224,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		if surplus == 0 {
 			break
 		}
-		if runners[i].Status != alloc.PoolRunnerIdle {
+		if runners[i].Status != alloc.PoolRunnerIdle || l.launchInFlight(runners[i].LeaseID) ||
+			l.cleanupOwns(runners[i].LaunchRequestID) {
 			continue
 		}
 		if err := l.alloc.RetirePoolRunner(ctx, runners[i].LeaseID); err != nil {
@@ -255,6 +286,14 @@ func (l *Listener) endBatchBuying() {
 // Every launch is waited for even when one fails, because each has already
 // been assigned its lease and has to settle it, success or not.
 func (l *Listener) launchPool(ctx context.Context, batch []poolLaunch) error {
+	if l.backgroundLaunches {
+		for i := range batch {
+			l.startLaunch(ctx, batch[i].lease, batch[i].job)
+		}
+
+		return nil
+	}
+
 	if len(batch) == 1 {
 		return l.launch(ctx, batch[0].lease, batch[0].job)
 	}
@@ -368,6 +407,36 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	l.backedBy(requestID, refusal{}, lost)
 
 	return nil
+}
+
+// askForAHold tells the order which hosts this waiting tier could be held, under the
+// order that holds hosts. A tier the ceiling or its target's share refuses is waiting
+// for room a hold cannot keep. A read that failed holds nothing: what withholds room
+// from others is what a failed read must not keep doing, and nothing here may fail a
+// reconciliation.
+func (l *Listener) askForAHold(ctx context.Context, admission alloc.TierAdmission) {
+	if !l.order.holds() {
+		return
+	}
+
+	if admission.CeilingBound || admission.ShareBound {
+		l.order.mayHold(l.tier, nil)
+
+		return
+	}
+
+	candidates, behindAsLarge, err := l.alloc.HoldCandidates(ctx, l.tier, l.order.heldAgainst(l.tier), l.order.ownHold(l.tier))
+	if err != nil {
+		l.log.Warn("could not read which host to hold for this waiting tier", "tier", l.tier, "error", err)
+	}
+
+	if behindAsLarge {
+		l.order.behindAsLarge(l.tier)
+
+		return
+	}
+
+	l.order.mayHold(l.tier, candidates)
 }
 
 // admission is what the order needs to know about this tier: whether room could

@@ -141,7 +141,29 @@ type PostgresStateConfig struct {
 	// written into YAML ends up in a backup, a paste buffer, and eventually a
 	// support thread. It is the same rule the GitHub App private key follows.
 	DSNEnv string `yaml:"dsn_env"`
+
+	// MaxConnections is the most PostgreSQL connections one process of this
+	// deployment may hold: the writer, the controller claim's session, and the
+	// reader pool, which gets what those two leave, up to
+	// DefaultLedgerReaderConnections. Absent leaves the reader pool at that default.
+	// A value that leaves no reader is refused, zero included, because a control plane
+	// cannot run on fewer; see LedgerConnections for the count a deployment holds.
+	//
+	// THE CLAIM AND THE SESSION SETTINGS CANNOT GO THROUGH A TRANSACTION-MODE
+	// POOLER: the claim is a session advisory lock, the writer's lock_timeout and
+	// the readers' read-only default are session settings, and a pooler would
+	// hand each of them to whoever came next.
+	MaxConnections *int `yaml:"max_connections,omitempty"`
 }
+
+const (
+	// DefaultLedgerReaderConnections is the reader pool of a ledger with no budget.
+	DefaultLedgerReaderConnections = 4
+
+	// postgresFixedConnections is what a PostgreSQL ledger holds before any
+	// reader: the writer and the controller claim's session.
+	postgresFixedConnections = 2
+)
 
 // ServerConfig configures the control plane.
 type ServerConfig struct {
@@ -212,6 +234,14 @@ type ServerConfig struct {
 	// Identity says where the deployment's identity material lives. Absent means
 	// `file`, which is what every deployment before this key had.
 	Identity *IdentityConfig `yaml:"identity,omitempty"`
+
+	// TLSRouter says this control plane sits behind a TLS-passthrough router, which
+	// is what makes a loopback wire serve mutual TLS. See TLSRouterConfig.
+	TLSRouter *TLSRouterConfig `yaml:"tls_router,omitempty"`
+
+	// TokenBroker takes this deployment's installation tokens from a broker. With it,
+	// no target names a key and this host holds none.
+	TokenBroker *TokenBrokerConfig `yaml:"token_broker,omitempty"`
 	// MaxVCPU and MaxMemory bound what the allocator will ever hand out across every
 	// tier combined. Required and positive: capacity is escrowed before each listener
 	// advertises, so an absent ceiling lets concurrent listeners collectively
@@ -245,6 +275,12 @@ type ServerConfig struct {
 	// destinations and guest report; a job's usage summary is kept. A Go
 	// duration string, at least an hour; absent, 72 hours. See retention.go.
 	JobDetailRetention string `yaml:"job_detail_retention,omitempty"`
+	// TestResultsRetention is how long the ledger keeps a job's test suites and
+	// cases, and TestResultsMaxBytes how much of them it keeps in all, the oldest
+	// deleted first. A Go duration string, at least an hour, and a byte size, at
+	// least 1MiB; absent, 14 days and 128MiB. See retention.go.
+	TestResultsRetention string   `yaml:"test_results_retention,omitempty"`
+	TestResultsMaxBytes  ByteSize `yaml:"test_results_max_bytes,omitempty"`
 	// Metrics serves the control plane's Prometheus metrics. Absent, nothing is
 	// served: there is no default address.
 	Metrics *MetricsConfig `yaml:"metrics,omitempty"`
@@ -584,7 +620,36 @@ func (s *ServerConfig) validatePostgresState() []error {
 		errs = append(errs, fmt.Errorf("server.state.postgres.dsn_env: %w", err))
 	}
 
+	if pg.MaxConnections != nil && *pg.MaxConnections <= postgresFixedConnections {
+		errs = append(errs, fmt.Errorf(
+			"server.state.postgres.max_connections is %d, and a control plane needs at least %d: "+
+				"the writer, the controller claim's session and one reader",
+			*pg.MaxConnections, postgresFixedConnections+1))
+	}
+
 	return errs
+}
+
+// LedgerReaderConnections is the size of the ledger's reader pool: what the
+// operator's budget leaves after the writer and the claim, never more than the
+// default, which is all a control plane's reads were ever given.
+func (s *ServerConfig) LedgerReaderConnections() int {
+	if s.LedgerBackend() != StatePostgres || s.State == nil || s.State.Postgres == nil ||
+		s.State.Postgres.MaxConnections == nil {
+		return DefaultLedgerReaderConnections
+	}
+
+	return min(DefaultLedgerReaderConnections, *s.State.Postgres.MaxConnections-postgresFixedConnections)
+}
+
+// LedgerConnections is the most PostgreSQL connections one process of this
+// deployment holds, or zero on a ledger that is a local file.
+func (s *ServerConfig) LedgerConnections() int {
+	if s.LedgerBackend() != StatePostgres {
+		return 0
+	}
+
+	return postgresFixedConnections + s.LedgerReaderConnections()
 }
 
 // CheckDSNEnv is the one rule for what may name the PostgreSQL connection
@@ -628,11 +693,13 @@ func (c *Config) validateServer() []error {
 	// the block that one has just checked.
 	errs = append(errs, c.Server.validateControllers()...)
 	errs = append(errs, c.validateIdentity()...)
+	errs = append(errs, c.Server.validateTokenBroker()...)
 	if err := validateHostPort("server.listen", c.Server.Listen); err != nil {
 		errs = append(errs, err)
 	}
 
 	errs = append(errs, c.validateBootstrapListen()...)
+	errs = append(errs, c.validateTLSRouter()...)
 
 	if err := c.Server.Placement.Validate(); err != nil {
 		errs = append(errs, err)
@@ -658,6 +725,12 @@ func (c *Config) validateServer() []error {
 		errs = append(errs, err)
 	}
 	if _, err := c.Server.JobDetailRetentionDuration(); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := c.Server.TestResultsRetentionDuration(); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := c.Server.TestResultsBound(); err != nil {
 		errs = append(errs, err)
 	}
 	return errs
@@ -765,7 +838,7 @@ func (c *Config) validateBootstrapListen() []error {
 	// A LOOPBACK WIRE HAS NO CERTIFICATES AT ALL, so it has nothing to enroll a
 	// machine into — and nothing off this host could reach the operational wire
 	// anyway. The same rule refuses node.tls against a loopback server.
-	if LoopbackAddr(c.Server.Listen) {
+	if !c.Server.WireServesTLS() {
 		return []error{fmt.Errorf(
 			"server.bootstrap_listen is set, but server.listen is %q — a control plane that "+
 				"accepts only on loopback serves plain HTTP and issues no certificates, so there "+

@@ -58,26 +58,27 @@ func (c *Client) DefaultBranch(ctx context.Context, owner, repository string) (s
 
 var _ server.QueueTimes = (*Client)(nil)
 
-// RunJobRecords reads when GitHub queued each job of a run and which attempt of
-// the run it was, by runner name, through the target's App client. A throttle is
+// RunJobs reads when GitHub queued each job of a run and the commit it ran on, by
+// runner name, through the target's App client. A throttle is
 // server.ErrQueueTimesThrottled and a refused credential or permission
-// server.ErrQueueTimesRefused, which the sweep pauses the App installation for
-// rather than the one run.
-func (c *Client) RunJobRecords(
+// server.ErrQueueTimesRefused, which the sweep pauses the App installation for rather
+// than the one run.
+func (c *Client) RunJobs(
 	ctx context.Context, owner, repository string, runID int64,
-) (map[string]server.RunnerRecord, error) {
+) (map[string]server.RunJob, error) {
 	reader, ok := c.policy.(billetgithub.QueueTimes)
 	if c.policy == nil || !ok {
 		return nil, billetgithub.ErrRunEvidenceUnavailable
 	}
-	records, err := reader.RunJobRecords(ctx, owner, repository, runID)
+	records, err := reader.RunJobs(ctx, owner, repository, runID)
 	if err == nil {
-		out := make(map[string]server.RunnerRecord, len(records))
+		jobs := make(map[string]server.RunJob, len(records))
 		for name, record := range records {
-			out[name] = server.RunnerRecord(record)
+			jobs[name] = server.RunJob{QueuedAt: record.QueuedAt, HeadSHA: record.HeadSHA,
+				HeadBranch: record.HeadBranch, RunAttempt: record.RunAttempt}
 		}
 
-		return out, nil
+		return jobs, nil
 	}
 	refused, ok := errors.AsType[*billetgithub.APIError](err)
 	switch {

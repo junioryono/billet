@@ -22,20 +22,24 @@ import (
 func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet jobs show <lease> | billet jobs show --run <run id> | billet jobs wait | " +
-			"billet jobs stats | billet jobs rightsize")
+			"billet jobs runtimes | billet jobs export | billet jobs stats | billet jobs rightsize")
 	}
 	switch args[0] {
 	case "show":
 		return cmdJobsShow(ctx, env, args[1:])
 	case "wait":
 		return cmdJobsWait(ctx, env, args[1:])
+	case "runtimes":
+		return cmdJobsRuntimes(ctx, env, args[1:])
+	case "export":
+		return cmdJobsExport(ctx, env, args[1:])
 	case "stats":
 		return cmdJobsStats(ctx, env, args[1:])
 	case "rightsize":
 		return cmdJobsRightsize(ctx, env, args[1:])
 	}
 
-	return fmt.Errorf("unknown jobs command %q; try show, wait, stats or rightsize", args[0])
+	return fmt.Errorf("unknown jobs command %q; try show, wait, runtimes, export, stats or rightsize", args[0])
 }
 
 // cmdJobsShow prints one job's history and what the host measured it do, or
@@ -94,8 +98,9 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	// A RUN'S JOBS ARE SHOWN WITHOUT THEIR STEPS: reading them asks GitHub for
 	// each job in turn, with the App's installation the control plane also
 	// polls through, and a wide matrix would spend a share of its budget.
+	priors := jobPriors(ctx, a)
 	show := func(leaseID string) ([]byte, error) {
-		return showJobOnce(ctx, a, *cfgPath, leaseID, *asJSON, *asHTML, w, !runGiven)
+		return showJobOnce(ctx, a, priors, *cfgPath, leaseID, *asJSON, *asHTML, w, !runGiven)
 	}
 	if !runGiven {
 		out, err := show(fs.Arg(0))
@@ -171,11 +176,11 @@ func showRun(ctx context.Context, env cli.Env, a *alloc.Allocator, run int64, as
 // meanwhile, the report is built once more, now with the marker, which is never
 // unset. A report is therefore never missing detail it does not say was
 // retired.
-func showJobOnce(ctx context.Context, a *alloc.Allocator, cfgPath, leaseID string, asJSON, asHTML bool,
-	w *window, readSteps bool,
+func showJobOnce(ctx context.Context, a *alloc.Allocator, priors func(time.Time) (*alloc.RuntimePriors, error),
+	cfgPath, leaseID string, asJSON, asHTML bool, w *window, readSteps bool,
 ) ([]byte, error) {
 	show := func(out io.Writer) (string, error) {
-		return showJob(ctx, out, a, cfgPath, leaseID, asJSON, asHTML, w, readSteps)
+		return showJob(ctx, out, a, priors, cfgPath, leaseID, asJSON, asHTML, w, readSteps)
 	}
 	// A BUILD THAT FAILED is rebuilt too when the job is now retired: on
 	// PostgreSQL a usage summary and its destinations are two reads at read
@@ -213,12 +218,18 @@ var afterJobShown func(a *alloc.Allocator)
 // showJob writes one job's report to out in the form asked for, and says the
 // retirement marker it was built with. readSteps is whether the text report
 // and the page read the job's steps from GitHub.
-func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, leaseID string,
+func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator,
+	priors func(time.Time) (*alloc.RuntimePriors, error), cfgPath, leaseID string,
 	asJSON, asHTML bool, w *window, readSteps bool,
 ) (string, error) {
 	rec, err := a.Job(ctx, leaseID)
 	if err != nil {
 		return "", err
+	}
+	// A PREDICTION THAT CANNOT BE READ IS SAID, NOT FATAL: the record is the
+	// ledger's, and what the history would have predicted is a figure beside it.
+	if err := alloc.PredictJob(&rec, priors); err != nil {
+		rec.NotPredicted = err.Error()
 	}
 	var measured *alloc.RecordedUsage
 	switch u, err := a.LeaseUsage(ctx, leaseID); {
@@ -238,7 +249,8 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, le
 			wj = windowJSONOf(tl, unaligned, *w)
 		}
 
-		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest, wj)
+		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest,
+			readJobTests(ctx, a, leaseID), wj)
 	}
 	steps := jobSteps{measured: measured, runner: provider.InstanceName(rec.LeaseID),
 		none: "not read for a run's jobs, which would ask GitHub once for each; `billet jobs show " +
@@ -258,6 +270,7 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator, cfgPath, le
 	renderSeries(out, tl, unaligned, measured)
 	renderSteps(out, steps)
 	renderGuest(out, retiredGuest(guestViewOf(guest, measured, steps), guest, rec))
+	renderJobTests(out, readJobTests(ctx, a, leaseID))
 
 	return rec.DetailRetiredAt, nil
 }
@@ -277,9 +290,9 @@ type jobJSON struct {
 	// may differ from RunID, the run the lease was assigned; zero is not
 	// recorded.
 	GitHubRunID int64 `json:"github_run_id"`
-	// GitHubRunAttempt is which attempt of that run the job was, from GitHub's
-	// REST record; zero is not recorded, never a first attempt.
-	GitHubRunAttempt int64 `json:"github_run_attempt"`
+	// RunAttempt is which attempt of that run the job was, from GitHub's REST
+	// record; zero is not recorded, never a first attempt.
+	RunAttempt int64 `json:"run_attempt"`
 	// RequestID is GitHub's runner request id, zero for a pooled lease, whose
 	// negative id is billet's own scheduler identity and nothing GitHub shows.
 	RequestID   int64  `json:"request_id"`
@@ -326,8 +339,20 @@ type jobJSON struct {
 	// were deleted past the deployment's retention, empty while they are kept.
 	DetailRetiredAt string     `json:"detail_retired_at"`
 	Usage           *usageJSON `json:"usage"`
+	// Prediction is what a controller refreshing hourly would have predicted
+	// the job's runtime to be when it started, beside the runtime and the
+	// error once it finished; null for a job that never started.
+	Prediction *predictionJSON `json:"prediction"`
+	// PredictionUnavailable is why there is no prediction when the history
+	// could not be read, and absent otherwise.
+	PredictionUnavailable string `json:"prediction_unavailable,omitempty"`
 	// Guest is what the job's own VM reported, null when no row was recorded.
 	Guest *guestJSON `json:"guest"`
+	// Tests is the test suites and cases the job's own VM reported.
+	Tests testsJSON `json:"tests"`
+	// HeadSHA and HeadBranch are the commit and branch from GitHub's record of the job.
+	HeadSHA    string `json:"head_sha"`
+	HeadBranch string `json:"head_branch"`
 	// Window is present only when --window asked for one.
 	Window *windowJSON `json:"window,omitempty"`
 }
@@ -367,6 +392,7 @@ var usageGroups = []string{alloc.UsageCPU, alloc.UsageThreads, alloc.UsageMemory
 // never a report of zeros.
 func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl *usage.Timeline, unaligned string,
 	g *jobGuest,
+	tests jobTests,
 	win *windowJSON,
 ) error {
 	out := jobJSON{
@@ -375,11 +401,13 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 		RequestID: max(rec.RequestID, 0), JobName: rec.Job.Name, Repository: rec.Repo,
 		WorkflowRef: rec.Job.WorkflowRef, Event: rec.Job.Event, Result: rec.Result,
 		Conclusion: rec.Conclusion, QueuedAt: rec.QueuedAt, AssignedAt: rec.AssignedAt,
-		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Window: win,
+		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Tests: testsJSONOf(tests),
+		Window: win, HeadSHA: rec.Job.HeadSHA, HeadBranch: rec.Job.HeadBranch,
+		Prediction: predictionJSONOf(rec), PredictionUnavailable: rec.NotPredicted,
 		GitHubQueuedAt: rec.GitHubQueuedAt, GitHubScaleSetAssignedAt: rec.GitHubScaleSetAssignedAt,
 		GitHubRunnerAssignedAt: rec.GitHubRunnerAssignedAt, BoughtAt: rec.BoughtAt,
 		DetailRetiredAt: rec.DetailRetiredAt,
-		GitHubRunID:     rec.GitHubRunID, GitHubRunAttempt: rec.GitHubRunAttempt,
+		GitHubRunID:     rec.GitHubRunID, RunAttempt: rec.Job.RunAttempt,
 		LaunchedAt: rec.LaunchedAt, RegisteredAt: rec.RegisteredAt,
 		CustodyAt: rec.CustodyAt, TeardownAt: rec.TeardownAt, QuarantinedAt: rec.QuarantinedAt,
 		RunnerID: rec.RunnerID, LaunchIncarnation: rec.LaunchIncarnation,
@@ -441,19 +469,21 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		request = fmt.Sprintf(", request %d", rec.RequestID)
 	}
 	attempt := "attempt not recorded"
-	if rec.GitHubRunAttempt > 0 {
-		attempt = fmt.Sprintf("attempt %d", rec.GitHubRunAttempt)
+	if rec.Job.RunAttempt > 0 {
+		attempt = fmt.Sprintf("attempt %d", rec.Job.RunAttempt)
 	}
 	line("job", "%s (github job %s, run %s, %s%s)", quoted(rec.Job.Name),
 		quoted(rec.Job.JobID), runOf(rec), attempt, request)
 	line("repository", "%s", quoted(rec.Repo))
 	line("workflow", "%s", quoted(rec.Job.WorkflowRef))
+	line("commit", "%s on branch %s", quoted(rec.Job.HeadSHA), quoted(rec.Job.HeadBranch))
 	line("event", "%s", quoted(rec.Job.Event))
 	line("result", "github %s; billet %s", quoted(rec.Result), orUnknown(rec.Conclusion))
 	line("times", "queued %s, assigned %s, started %s, finished %s", orUnknown(rec.QueuedAt),
 		orUnknown(rec.AssignedAt), orUnknown(rec.StartedAt), orUnknown(rec.FinishedAt))
 	line("github", "%s", githubTimes(rec, orUnknown))
 	line("waited", "%s", waitedLine(rec))
+	line("runtime", "%s", runtimeLine(rec))
 	if rec.DetailRetiredAt != "" {
 		line("detail", "%s", detailRetired(rec))
 	}

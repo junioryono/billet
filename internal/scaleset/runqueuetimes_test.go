@@ -17,15 +17,12 @@ type queueTimesPolicy struct {
 	err error
 }
 
-func (q queueTimesPolicy) RunJobRecords(context.Context, string, string, int64,
-) (map[string]billetgithub.RunnerRecord, error) {
+func (q queueTimesPolicy) RunJobs(context.Context, string, string, int64) (map[string]billetgithub.RunJob, error) {
 	if q.err != nil {
 		return nil, q.err
 	}
 
-	return map[string]billetgithub.RunnerRecord{
-		"billet-a": {QueuedAt: time.Unix(1, 0), RunAttempt: 2},
-	}, nil
+	return map[string]billetgithub.RunJob{"billet-a": {QueuedAt: time.Unix(1, 0), HeadSHA: "abc", HeadBranch: "main", RunAttempt: 3}}, nil
 }
 
 // GITHUB'S THROTTLE AND ITS REFUSAL REACH THE SWEEP AS THE SERVER'S OWN
@@ -47,7 +44,7 @@ func TestAQueueTimeReadsRefusalIsTheServersSentinel(t *testing.T) {
 		{"transport", errors.New("connection reset"), nil},
 	} {
 		c := &Client{policy: queueTimesPolicy{err: tc.err}}
-		_, err := c.RunJobRecords(t.Context(), "acme", "api", 31)
+		_, err := c.RunJobs(t.Context(), "acme", "api", 31)
 		throttled, refused := errors.Is(err, server.ErrQueueTimesThrottled), errors.Is(err, server.ErrQueueTimesRefused)
 		switch {
 		case err == nil:
@@ -61,11 +58,12 @@ func TestAQueueTimeReadsRefusalIsTheServersSentinel(t *testing.T) {
 		}
 	}
 
-	records, err := (&Client{policy: queueTimesPolicy{}}).RunJobRecords(t.Context(), "acme", "api", 31)
-	if err != nil || records["billet-a"] != (server.RunnerRecord{QueuedAt: time.Unix(1, 0), RunAttempt: 2}) {
-		t.Errorf("a read GitHub answered = %v, %v; want billet-a's time and attempt carried over", records, err)
+	jobs, err := (&Client{policy: queueTimesPolicy{}}).RunJobs(t.Context(), "acme", "api", 31)
+	want := server.RunJob{QueuedAt: time.Unix(1, 0), HeadSHA: "abc", HeadBranch: "main", RunAttempt: 3}
+	if err != nil || len(jobs) != 1 || jobs["billet-a"] != want {
+		t.Errorf("a read GitHub answered = %v, %v, want billet-a's whole record", jobs, err)
 	}
-	if _, err := (&Client{}).RunJobRecords(t.Context(), "acme", "api", 31); !errors.Is(err,
+	if _, err := (&Client{}).RunJobs(t.Context(), "acme", "api", 31); !errors.Is(err,
 		billetgithub.ErrRunEvidenceUnavailable) {
 		t.Errorf("a client with no App = %v, want ErrRunEvidenceUnavailable", err)
 	}

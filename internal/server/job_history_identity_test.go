@@ -149,6 +149,7 @@ func TestACompletionFillsTheQueueTimeOnlyWhenItNamesItsRunner(t *testing.T) {
 		completed := started
 		completed.Result = "Succeeded"
 		completed.QueuedAt = time.Now().Add(-5 * time.Minute)
+		completed.FinishedAt = time.Now().Add(-time.Minute)
 		if !named {
 			completed.RunnerID, completed.RunnerName = 0, ""
 		}
@@ -165,6 +166,10 @@ func TestACompletionFillsTheQueueTimeOnlyWhenItNamesItsRunner(t *testing.T) {
 		if named && (got.GitHubQueuedAt == "" || len(waits) != 1) {
 			t.Errorf("a completion naming its runner left queue time %q and told %v; want it filled and one wait",
 				got.GitHubQueuedAt, waits)
+		}
+		// THE FINISH TOO: billing reads it, and another job's would bill this lease.
+		if named != (got.GitHubFinishedAt != "") {
+			t.Errorf("named %v, and the row's finish is %q", named, got.GitHubFinishedAt)
 		}
 		if !named && (got.GitHubQueuedAt != "" || len(waits) != 0) {
 			t.Errorf("a runnerless completion recorded queue time %q and told %v; want neither",

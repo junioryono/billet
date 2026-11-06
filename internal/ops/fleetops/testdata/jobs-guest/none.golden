@@ -4,11 +4,13 @@ tier       billet-2vcpu on epyc-1 (docker, 2 vCPU, 8.0 GiB)
 job        "build (ubuntu, go 1.26)" (github job "51000000007", run 4242, attempt not recorded, request 77)
 repository "acme/api"
 workflow   "acme/api/.github/workflows/ci.yml@refs/heads/main"
+commit     not recorded on branch not recorded
 event      "push"
 result     github "succeeded"; billet done
 times      queued 2026-10-09T11:59:57.000000000Z, assigned 2026-10-09T11:59:57.000000000Z, started 2026-10-09T12:00:00.000000000Z, finished 2026-10-09T12:02:51.000000000Z
 github     queued -, assigned to the scale set -, to a runner -
 waited     unknown (at github unknown, for room unknown, to start 3s)
+runtime    ran 2m51s; predicted 10m0s, the default, with nothing learned, and it ran 7m9s shorter
 phases     bought      2026-10-09T11:59:57.000000000Z
            assigned    2026-10-09T11:59:57.000000000Z  +0s
            launched    2026-10-09T11:59:58.000000000Z  +1s
@@ -65,6 +67,8 @@ step 5     "Post Run actions/checkout@v5" "success", started 2026-10-09T12:02:47
 step 6     "Complete job" "success", started 2026-10-09T12:02:48Z, took 0s (start and end in the same second), so no usage can be placed in it
 
 guest      no report recorded (the node had node.monitoring.guest off, or is older than wire 29; a job still running has none yet, since the node sends it as the compute is destroyed)
+
+tests      no test cases recorded (the agent found none, the node or its VM's image is older than this, or they were deleted past server.test_results_retention)
 == billet jobs show --html, the guest section ==
 <section id="guest">
 <h2>What the job's own VM reported</h2>

@@ -123,7 +123,7 @@ func (a *Allocator) jobFacts(ctx context.Context, from, until time.Time, limit i
 func jobFactOf(r *ledgerdb.ListJobFactsRow) JobFact {
 	fact := JobFact{
 		LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node, Repo: r.Repo, WorkflowRef: r.WorkflowRef,
-		JobName: r.JobName, RunID: r.RunID, RunAttempt: r.GithubRunAttempt, Result: r.Result,
+		JobName: r.JobName, RunID: r.RunID, RunAttempt: r.RunAttempt, Result: r.Result,
 		Conclusion: r.Conclusion, Disruption: r.Disruption, StartedAt: parseStamp(r.StartedAt),
 		ResultAt: parseStamp(r.ResultAt), GitHubQueuedAt: parseStamp(r.GithubQueuedAt),
 		VCPU: r.Vcpu, Memory: r.Memory, PriceMicrosPerHour: r.PriceMicrosPerHour, InstanceType: r.InstanceType,

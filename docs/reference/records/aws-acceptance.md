@@ -610,7 +610,39 @@ So an on-demand Linux build is a per-job boundary the way an `ec2` instance is: 
 
 - **The 100-build `sortOrder` error was not exercised.** AWS documents `ListBuildsForProject` as erroring when `sortOrder` is passed and the project has more than 100 builds; this project had three, and it accepted the parameter. billet never sends it, so the documented behaviour is a reason for an absence rather than something to verify.
 
+## Windows jobs (2026-11-05)
+
+Three Windows jobs ran end to end through a billet tier on 2026-11-05 ([ADR-026](../decisions/adr-026-windows-on-ec2.md), #532), on an AMI `billet ami build --os windows` built from `ami-018876cb673bc1709` (`Windows_Server-2025-English-Full-Base-2026.10.14`) in us-west-2.
+
+**The build.** Run from an orchestrator instance whose role held what `billet init iam --account-wide --builder --payload-bucket …` printed, and AWS's `AmazonSSMManagedInstanceCore` to reach the instance, so the build ran under billet's own IAM and not an administrator's. The builder, a `c7i.4xlarge` with its 150 GiB default root, reported `verdict=ok` 50 minutes after launch and stopped itself with `Client.InstanceInitiatedShutdown` a minute and a half later; the image took 34 minutes to become available and the verifier 8 min 30 s, after which billet stamped `ami-05233187db2ea237a` with Windows AMI contract 1. The verifier's report, read as `runner`, through a scheduled task set as the runner's is:
+
+```
+verdict=ok step=done runner=2.337.0 image_os=win25 tool_cache=C:\hostedtoolcache\windows
+pwsh=PowerShell 7.6.9 git=git version 2.56.0.windows.4 node=v22.23.4 python=Python 3.12.10
+go=go version go1.24.13 windows/amd64 ruby=ruby 3.3.13 bash=GNU bash, version 5.3.15(2)-release
+tc_python=3.10.11 3.11.9 3.12.10 3.13.17 3.14.10 tc_node=22.23.4 24.22.2 tc_go=1.24.13 1.25.14 1.26.10
+tc_ruby=3.2.11 3.3.13 3.4.12 4.0.9 tc_pypy=3.9.19 3.10.16
+page_file_mb=1408 priority=Normal root_used_gib=25.6 root_free_gib=123.9
+```
+
+Getting there took four real builds, each of which found what no test off Windows could: the AWS Tools on Amazon's AMI were not where the first prepare looked, SYSTEM has no `Documents` folder and so no profile for PowerHTML, the page file left in the image cost every job its assignment, and a job's first reads needed a provisioned rate on top. ADR-026 has each, measured.
+
+**The jobs.** `billet acceptance up` from a config holding one untrusted `ec2` tier on that AMI (`c7i.xlarge`, the egress-only group as its untrusted group), then three dispatches of the testbed's `windows` workflow at once. Each launched within four seconds of its dispatch and each succeeded, and the ledger agrees:
+
+| Run | GitHub | billet | Dispatch to job start | Launch to runner | Launch to job start | Job |
+|---|---|---|---|---|---|---|
+| 41974549536 | succeeded | done | 168 s | 148.6 s | 165.5 s | 21 s |
+| 41974552991 | succeeded | done | 168 s | 154.8 s | 171.0 s | 18 s |
+| 41974556650 | succeeded | done | 168 s | 153.3 s | 171.1 s | 26 s |
+
+Every step passed in all three: `actions/checkout`, a `pwsh` step reporting PowerShell 7.6.9, `ImageOS=win25` and membership of `BUILTIN\Administrators`, a Windows PowerShell step, a `cmd` step, a `bash` step under Git Bash (MINGW64), `actions/setup-node` 22 and `actions/setup-go` 1.26 found in `C:\hostedtoolcache\windows` (node 22.23.4, go 1.26.10), `actions/setup-python` 3.12 (3.12.10), a step holding each of the three to the toolcache, and a `git clone`. The evidence lists 3 jobs, 0 outstanding, and the node proved clear; `acceptance down` deleted the scale set, billet had already destroyed each instance when its job completed, and `acceptance sweep` found nothing carrying the run's deployment.
+
+**Before the provisioned rate**, on the debug image of the same build, two `queue` jobs had each been launched, booted for five minutes, had their assignment cancelled by GitHub unstarted, and been withdrawn and destroyed by billet, with the lease released and the sweep clean, which is the path a slow boot takes. A third, after the page file was gone, started 311 s after launch, 14 s inside the window.
+
+**What it does not prove.** Visual Studio, Docker and the rest of what ADR-026's parity table leaves out were not exercised, because the image does not carry them. A tier at scale, Spot, and a node below wire 39 meeting a Windows tier are covered by tests and not by this run. The jobs were three; a fleet's cold-start distribution is not.
+
 ## What this does not prove
 
+- Untrusted fork work, which is not in this record: [An untrusted fork pull request on EC2](untrusted-fork-ec2.md) ran a fork's pull request on an untrusted EC2 tier on 2026-10-25, with the tier's isolation checked from inside the job and from outside it.
 - The shape allowlist and resource ceilings are the enforceable cost policy. `billet check` reports a node's conservative compute-only peak, `billet status` aggregates registered EC2 nodes under the deployment ceiling, and AWS Budgets is the account-wide backstop rather than a stale copied price becoming a runtime admission gate.
 - EBS/S3 cache reuse is measured in [`site-acceptance.md`](site-acceptance.md) (2026-09-03): a Docker image-store generation published from one instance came up warm on another, after the two defects that run found were fixed. Failure recovery of that store — a settlement interrupted mid-snapshot, a lost pointer write — remains unmeasured on real AWS.

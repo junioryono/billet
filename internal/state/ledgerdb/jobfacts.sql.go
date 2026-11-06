@@ -15,7 +15,7 @@ SELECT h.lease_id, h.tier, COALESCE(h.node, '') AS node, COALESCE(h.repo, '') AS
        h.workflow_ref, h.job_name,
        CAST(CASE WHEN h.github_run_id > 0 THEN h.github_run_id ELSE COALESCE(h.run_id, 0) END
             AS BIGINT) AS run_id,
-       h.github_run_attempt, h.result, COALESCE(h.conclusion, '') AS conclusion, h.disruption,
+       h.run_attempt, h.result, COALESCE(h.conclusion, '') AS conclusion, h.disruption,
        COALESCE(h.started_at, '') AS started_at, h.result_at, h.github_queued_at,
        h.vcpu, h.memory, h.price_micros_per_hour, h.instance_type,
        CAST(CASE WHEN u.lease_id IS NULL THEN 0 ELSE 1 END AS BIGINT) AS has_usage,
@@ -53,7 +53,7 @@ type ListJobFactsRow struct {
 	WorkflowRef        string
 	JobName            string
 	RunID              int64
-	GithubRunAttempt   int64
+	RunAttempt         int64
 	Result             string
 	Conclusion         string
 	Disruption         string
@@ -111,7 +111,7 @@ func (q *Queries) ListJobFacts(ctx context.Context, arg ListJobFactsParams) ([]L
 			&i.WorkflowRef,
 			&i.JobName,
 			&i.RunID,
-			&i.GithubRunAttempt,
+			&i.RunAttempt,
 			&i.Result,
 			&i.Conclusion,
 			&i.Disruption,

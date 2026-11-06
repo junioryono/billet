@@ -20,7 +20,7 @@ On the tiers, the 16 vCPU pool ran 258 jobs against 523 the week before, at 88.3
 
 ## Flakes need the run attempt, and GitHub's record of a re-run
 
-No scale-set message carries a run's attempt, so migration 71 adds `github_run_attempt` and the queue-time sweep records it from the same REST read of a run that gives it the queue time. The reference ledger predates migration 71, so its week shows `flaky not recorded (attempt recorded for 0 of 258 jobs)` and so on per group, never a rate of zero.
+No scale-set message carries a run's attempt, so the queue-time sweep records it in migration 71's `run_attempt` from the same REST read of a run that gives it the queue time, keeping the lowest attempt a runner's name is listed under. The reference ledger predates migration 71, so its week shows `flaky not recorded (attempt recorded for 0 of 258 jobs)` and so on per group, never a rate of zero.
 
 To check the judgment on real re-runs, the copy was written with the attempts GitHub's REST record gave for six of billet's own runs from 2026-10-21 to 25 that had been re-run (nineteen more could not be read, answering HTTP 502 that day). `billet jobs stats --since 14d --by job --repo junioryono/billet` then judged 10 job runs, all failed and then passed, which is what the six were chosen for: `ci.yml` `test` 4 of 4, `ci.yml` `Verify All Checks Passed` 4 of 4, and `guest-image.yml` `Build and check` 2 of 2.
 
