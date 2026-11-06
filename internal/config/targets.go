@@ -190,6 +190,82 @@ func (c *Config) TargetShares() map[string]TargetShare {
 	return out
 }
 
+// MaxTargetWeight is the largest weight a target may be given: a thousand to
+// one is already one target taking everything its waiting neighbours would not
+// notice, so a larger number is more likely a typo than an intent.
+const MaxTargetWeight = 1000
+
+// TargetWeights is every target's weight by target name, with a target that
+// writes none weighing 1, and empty when no target writes one.
+//
+// EMPTY MEANS THE ORDER IS OLDEST FIRST, exactly as it was before weights
+// existed: a deployment that never mentions a weight changes in no way.
+func (c *Config) TargetWeights() map[string]int {
+	targets := map[string]int{}
+	weighted := false
+
+	if c.GitHub != nil {
+		targets[DefaultTargetName] = c.GitHub.Weight
+		weighted = c.GitHub.Weight != 0
+	}
+
+	for i := range c.Targets {
+		targets[c.Targets[i].Name] = c.Targets[i].Weight
+		weighted = weighted || c.Targets[i].Weight != 0
+	}
+
+	if !weighted {
+		return map[string]int{}
+	}
+
+	for name, weight := range targets {
+		if weight == 0 {
+			targets[name] = 1
+		}
+	}
+
+	return targets
+}
+
+// TargetWeightErrors reports a weight billet could not honour. Exported because
+// alloc.New re-applies it on a catalogue that never went through Parse.
+func TargetWeightErrors(weights map[string]int) []error {
+	var errs []error
+
+	names := make([]string, 0, len(weights))
+	for name := range weights {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
+	for _, name := range names {
+		if w := weights[name]; w < 1 || w > MaxTargetWeight {
+			errs = append(errs, fmt.Errorf("target %q: weight %d must be from 1 to %d", name, w, MaxTargetWeight))
+		}
+	}
+
+	return errs
+}
+
+// validateTargetWeights checks every weight, and refuses one under fill.
+//
+// A WEIGHT UNDER FILL WOULD DECIDE NOTHING: fill admits whatever fits and ranks
+// no waiters, so an operator who wrote one would believe a division the control
+// plane never makes.
+func (c *Config) validateTargetWeights() []error {
+	weights := c.TargetWeights()
+	errs := TargetWeightErrors(weights)
+
+	if len(weights) > 0 && c.Server.Order() == AdmissionFill {
+		errs = append(errs, fmt.Errorf("a target writes a weight and server.admission_order is %q, which "+
+			"admits whatever fits and ranks no waiters, so the weight would decide nothing; remove it, or "+
+			"use %q", AdmissionFill, AdmissionFair))
+	}
+
+	return errs
+}
+
 // ShareTarget is the target a tier's share is keyed by: its own, or the
 // default target's when it names none, which is what applyDefaults writes.
 func ShareTarget(t Tier) string {

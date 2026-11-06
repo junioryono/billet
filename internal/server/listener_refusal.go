@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,13 +23,18 @@ type refusal struct {
 	// draining is a listener that buys nothing while it drains.
 	draining bool
 	// waiter is the tier the admission order holds the line for, and since is
-	// when it began waiting.
+	// when it began waiting; ahead says why it stands ahead, where a rank put it
+	// there.
 	waiter string
 	since  time.Time
+	ahead  string
 	// room is the allocator's own reason, read after it granted nothing, and
 	// protecting the waiters ahead a purchase out of turn had to leave room for.
 	room       *alloc.RoomRefusal
 	protecting []string
+	// heldHosts are the hosts held for other tiers the purchase could not use, each
+	// with its owner.
+	heldHosts map[string]string
 	// unread is why the allocator's reason could not be read, said rather than
 	// taken for no reason at all.
 	unread error
@@ -40,7 +47,7 @@ type refusal struct {
 // not.
 func (r refusal) explained() bool {
 	return r.draining || r.waiter != "" ||
-		(r.room != nil && r.unread == nil && (r.room.Binds() || len(r.protecting) > 0))
+		(r.room != nil && r.unread == nil && (r.room.Binds() || len(r.protecting) > 0 || len(r.heldHosts) > 0))
 }
 
 // attrs is the refusal as log attributes.
@@ -96,13 +103,16 @@ func (l *Listener) backedBy(request int64, r refusal, lost uint64) {
 
 // byOrder reports whether the admission order, not the allocator, refused.
 func (r refusal) byOrder() bool {
-	return r.waiter != "" || (r.room != nil && !r.room.Binds() && len(r.protecting) > 0)
+	return r.waiter != "" || (r.room != nil && !r.room.Binds() && (len(r.protecting) > 0 || len(r.heldHosts) > 0))
 }
 
 func (r refusal) String() string {
 	switch {
 	case r.draining:
 		return "this listener is draining and buys nothing"
+	case r.waiter != "" && r.ahead != "":
+		return fmt.Sprintf("the admission order holds freed room for %s, waiting since %s: %s",
+			r.waiter, r.since.UTC().Format(time.RFC3339), r.ahead)
 	case r.waiter != "":
 		return fmt.Sprintf("the admission order holds freed room for %s, waiting since %s",
 			r.waiter, r.since.UTC().Format(time.RFC3339))
@@ -111,6 +121,13 @@ func (r refusal) String() string {
 	case r.room != nil && !r.room.Binds() && len(r.protecting) > 0:
 		return "buying ahead of its turn would leave " + strings.Join(r.protecting, ", ") +
 			" without room for one lease"
+	case r.room != nil && !r.room.Binds() && len(r.heldHosts) > 0:
+		held := make([]string, 0, len(r.heldHosts))
+		for _, host := range slices.Sorted(maps.Keys(r.heldHosts)) {
+			held = append(held, host+" for "+r.heldHosts[host])
+		}
+
+		return "the only room is on hosts held for tiers whose shape fits on none: " + strings.Join(held, ", ")
 	case r.room != nil:
 		return "the allocator has no room: " + r.room.String()
 	default:
@@ -128,7 +145,7 @@ func (l *Listener) orderRefusal(where alloc.TierAdmission) refusal {
 		return refusal{waiter: "a waiter that has since been served or moved"}
 	}
 
-	return refusal{waiter: waiter, since: since}
+	return refusal{waiter: waiter, since: since, ahead: l.order.whyAhead(waiter, where)}
 }
 
 // roomRefusal asks the allocator why a purchase it was asked for granted
@@ -143,7 +160,25 @@ func (l *Listener) roomRefusal(ctx context.Context, protect []string) refusal {
 		return refusal{unread: err}
 	}
 
-	return refusal{room: &room, protecting: protect}
+	return refusal{room: &room, protecting: protect, heldHosts: l.heldAgainst(ctx)}
+}
+
+// heldAgainst is the hosts this tier avoids that it could use, each with its owner.
+func (l *Listener) heldAgainst(ctx context.Context) map[string]string {
+	if !l.order.holds() {
+		return nil
+	}
+
+	where := l.admission(ctx)
+	out := map[string]string{}
+
+	for host, owner := range l.order.heldAgainst(l.tier) {
+		if slices.Contains(where.Nodes, host) {
+			out[host] = owner
+		}
+	}
+
+	return out
 }
 
 // refuse records why a purchase bought nothing, for the decline that follows

@@ -248,6 +248,7 @@ func identityFields(rec alloc.JobRecord) []pageField {
 		{Label: "finished", Value: orNotRecorded(rec.FinishedAt)},
 		{Label: "github times", Value: githubTimes(rec, orNotRecorded)},
 		{Label: "waited", Value: waitedLine(rec)},
+		{Label: "runtime", Value: runtimeLine(rec)},
 		{Label: "detail", Value: orKept(rec)},
 		{Label: "tier", Value: orNotRecorded(rec.Tier)},
 		{Label: "node", Value: orNotRecorded(rec.Node)},

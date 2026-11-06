@@ -330,6 +330,18 @@ linters:
             - $gostd
             - github.com/junioryono/billet/internal/config$
 
+        # THE WORKLOAD FORMAT IS A FORMAT, NOT A LAYER (#526). `billet jobs export`
+        # writes it from the ledger and the replay harness reads it, so whatever it
+        # imported both sides would; it may use the standard library and
+        # internal/config, and nothing else.
+        jobtrace:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/jobtrace/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+
         # THE DISPATCH VOCABULARY IMPORTS NO LEDGER AND NO ROLE. The scheduler and
         # the node runtime both name a Runner, a Job and a CacheAuthority through
         # it, so whatever it imported the node would import too. Measured at zero
