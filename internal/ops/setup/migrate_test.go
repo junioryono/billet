@@ -1563,6 +1563,21 @@ func TestAPushToAPathWithASpaceFallsBackToTheConfiguredURL(t *testing.T) {
 	if got, err := pushOwner(t.Context(), dir); err != nil || got != "acme" {
 		t.Errorf("a push to a path with a space: %q, %v; want acme", got, err)
 	}
+	runIn(t, dir, "config", "--unset-all", "url./srv/Git Mirrors/.pushInsteadOf")
+	runIn(t, dir, "config", "url.Git Mirrors/.pushInsteadOf", "https://github.com/acme/")
+	if got, err := pushOwner(t.Context(), dir); err != nil || got != "acme" {
+		t.Errorf("a push to a relative path: %q, %v; want acme", got, err)
+	}
+
+	for remote, want := range map[string]bool{
+		"/srv/api.git": true, "Git Mirrors/api.git": true, "api": true, "./a:b/api.git": true, "Mirrors/odd://api.git": true,
+		"file:///srv/api.git": true, "https://github.com/acme/api.git": false, "ssh://git@github.com/acme/api.git": false,
+		"git@github.com:acme/api.git": false, "gh-alias:api.git": false,
+	} {
+		if got := localPath(remote); got != want {
+			t.Errorf("localPath(%q) = %t, want %t", remote, got, want)
+		}
+	}
 	if got := gitLines("/srv/Git Mirrors/api.git\r\n\nhttps://github.com/acme/api.git"); len(got) != 2 ||
 		got[0] != "/srv/Git Mirrors/api.git" {
 		t.Errorf("gitLines: %q", got)

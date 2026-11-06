@@ -206,11 +206,16 @@ func gitLines(output string) []string {
 	return out
 }
 
-// localPath says a remote is a path on this machine rather than a URL: one git reaches
-// with no host.
+// localPath says a remote is a path on this machine rather than a URL, by git's own
+// rule: a URL names a scheme (file:// alone is local), an scp-style address has a colon
+// before any slash, and everything else, `Git Mirrors/api.git` among it, is a path.
 func localPath(remote string) bool {
-	return strings.HasPrefix(remote, "/") || strings.HasPrefix(remote, "file://") || strings.HasPrefix(remote, "./") ||
-		strings.HasPrefix(remote, "../")
+	if scheme, _, ok := strings.Cut(remote, "://"); ok && !strings.Contains(scheme, "/") {
+		return scheme == "file"
+	}
+	colon, slash := strings.Index(remote, ":"), strings.Index(remote, "/")
+
+	return colon < 0 || (slash >= 0 && slash < colon)
 }
 
 // repositoryOfRemote reads owner/name from a remote in any form git takes: a URL, or
