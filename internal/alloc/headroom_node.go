@@ -40,6 +40,10 @@ const EgressWireVersion = 40
 // mirrored from nodeapi.VersionWindowsGuests for the same reason (ADR-026).
 const WindowsGuestsWireVersion = 39
 
+// TartVerifiedWireVersion is the oldest wire a Tart host reads `<image>@verified` on,
+// mirrored from nodeapi.VersionTartVerified for the same reason (ADR-021).
+const TartVerifiedWireVersion = 41
+
 // guestWireFloor is the oldest wire a host can start the tier's guest on at all,
 // which no report asks what the tier would have without.
 func guestWireFloor(t config.Tier) int {
@@ -193,6 +197,13 @@ func (a *Allocator) eligibleFrom(rows []nodeRow, t config.Tier, minWire int) []n
 		// a report asking what a tier would have without the cache rule still may
 		// not count a host that would run the job open if it were sent.
 		if n.wire < EgressWireVersion && t.NeedsEgressAwareNode() {
+			continue
+		}
+
+		// NOR A TART HOST THAT WOULD HAND `@verified` TO `tart fqn` AS A NAME, and
+		// always, as the allowlist is. A host of another backend is not asked: there
+		// the spelling names a Firecracker generation.
+		if n.provider == config.ProviderTart && n.wire < TartVerifiedWireVersion && t.NamesTartVerified() {
 			continue
 		}
 

@@ -555,8 +555,10 @@ const (
 	//
 	// IGNORED BY AN OLDER NODE, which decodes an answer leniently, and a node below it
 	// records that its control plane does not say. CHECKED WHERE A LAUNCH IS SENT: an
-	// older node hands `@verified` to `tart fqn` as a name, so a Tart tier naming it is
-	// refused to a node below this at dispatch and again at delivery.
+	// older node hands `@verified` to `tart fqn` as a name, so placement passes over a
+	// Tart host below this for a tier naming it (alloc.TartVerifiedWireVersion, which a
+	// test holds equal), and such a tier is refused to one at dispatch and again at
+	// delivery.
 	VersionTartVerified = 41
 )
 

@@ -949,11 +949,5 @@ func WireCacheAuthority(a dispatch.CacheAuthority) *nodeapi.CacheAuthority {
 // tartTierNamesVerified reports whether a launch on this backend boots a Tart image
 // named `@verified`. On any other backend the same spelling means something else.
 func tartTierNamesVerified(tier config.Tier, selected config.ProviderKind) bool {
-	if selected != config.ProviderTart {
-		return false
-	}
-
-	_, verified := config.TartVerifiedImage(tier.ImageFor(config.ProviderTart))
-
-	return verified
+	return selected == config.ProviderTart && tier.NamesTartVerified()
 }

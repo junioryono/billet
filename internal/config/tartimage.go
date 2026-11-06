@@ -71,15 +71,19 @@ func checkTartVerifiedImage(image string) error {
 	return nil
 }
 
+// NamesTartVerified reports whether the image this tier boots on Tart is `<image>@verified`.
+// It says nothing of another backend, where the same spelling means something else.
+func (t Tier) NamesTartVerified() bool {
+	_, verified := TartVerifiedImage(t.ImageFor(ProviderTart))
+
+	return verified
+}
+
 // CatalogueNamesTartVerified reports whether any tier a Tart node could launch names
 // `@verified`, which a node from before ADR-021 hands to `tart fqn` as a name.
 func CatalogueNamesTartVerified(tiers []Tier) bool {
 	for i := range tiers {
-		if !tiers[i].AcceptsProvider(ProviderTart) {
-			continue
-		}
-
-		if _, verified := TartVerifiedImage(tiers[i].ImageFor(ProviderTart)); verified {
+		if tiers[i].AcceptsProvider(ProviderTart) && tiers[i].NamesTartVerified() {
 			return true
 		}
 	}
