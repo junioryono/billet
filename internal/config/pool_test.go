@@ -159,3 +159,20 @@ func TestAPoolNeedsAnEnrollmentListenerItsHostsCanDial(t *testing.T) {
 		t.Fatalf("the address given: %v", err)
 	}
 }
+
+// AN ENROLLMENT ADDRESS INHERITED FROM THE ROUTER IS HELD TO THE SAME RULE: a rented host
+// dials it, and loopback there is the host itself.
+func TestAPoolRefusesAnInheritedEnrollmentAddressItsHostsCannotDial(t *testing.T) {
+	t.Parallel()
+	for _, addr := range []string{"localhost:443", "billet.localhost:443", "127.0.0.1:443", "billet.example:443"} {
+		s := &ServerConfig{BootstrapListen: "127.0.0.1:7718", TLSRouter: &TLSRouterConfig{EnrollAddr: addr},
+			Pool: &PoolConfig{}}
+		want := ""
+		if addr == "billet.example:443" {
+			want = addr
+		}
+		if got := s.PoolEnrollAddr(); got != want {
+			t.Errorf("router enroll_addr %s: the pool's hosts dial %q, want %q", addr, got, want)
+		}
+	}
+}

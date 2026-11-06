@@ -132,16 +132,20 @@ func (p *PoolConfig) ShapeArch(source, shape string) (Arch, bool) {
 
 // PoolEnrollAddr is the enrollment listener an ordered host dials: server.pool's
 // bootstrap_addr when it is given, else the TLS router's enroll_addr, else
-// server.bootstrap_listen when it names a host one can dial. Empty when there is none,
-// which validation refuses.
+// server.bootstrap_listen. Empty when the one chosen names no host another machine
+// can dial (none, a wildcard, loopback), which validation refuses: WHATEVER IT CAME
+// FROM, a rented host would dial it as itself.
 func (s *ServerConfig) PoolEnrollAddr() string {
-	if s.Pool != nil && strings.TrimSpace(s.Pool.BootstrapAddr) != "" {
-		return strings.TrimSpace(s.Pool.BootstrapAddr)
+	var addr string
+	switch {
+	case s.Pool != nil && strings.TrimSpace(s.Pool.BootstrapAddr) != "":
+		addr = s.Pool.BootstrapAddr
+	case s.TLSRouter != nil && strings.TrimSpace(s.TLSRouter.EnrollAddr) != "":
+		addr = s.TLSRouter.EnrollAddr
+	default:
+		addr = s.BootstrapListen
 	}
-	if s.TLSRouter != nil && strings.TrimSpace(s.TLSRouter.EnrollAddr) != "" {
-		return strings.TrimSpace(s.TLSRouter.EnrollAddr)
-	}
-	addr := strings.TrimSpace(s.BootstrapListen)
+	addr = strings.TrimSpace(addr)
 	if host, _, err := net.SplitHostPort(addr); err == nil && dialableFromElsewhere(host) {
 		return addr
 	}
@@ -187,8 +191,9 @@ func (s *ServerConfig) validatePool() []error {
 		errs = append(errs, errors.New("server.pool needs server.bootstrap_listen: without it this control "+
 			"plane enrolls nothing over the network, so no host the pool orders could ever join"))
 	case s.PoolEnrollAddr() == "":
-		errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr is required: server.bootstrap_listen %q "+
-			"names no host an ordered host can dial (a wildcard or loopback)", s.BootstrapListen))
+		errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr is required: the enrollment address an "+
+			"ordered host would dial (server.tls_router.enroll_addr, else server.bootstrap_listen %q) names no host "+
+			"it can dial (a wildcard or loopback)", s.BootstrapListen))
 	}
 	if p.BootPrelude == "" || !filepath.IsAbs(p.BootPrelude) {
 		errs = append(errs, fmt.Errorf("server.pool.boot_prelude %q must be an absolute path to the script a "+

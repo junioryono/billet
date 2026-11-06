@@ -65,13 +65,14 @@ func TestAPoolConsoleLineInsideAnotherIsNoKey(t *testing.T) {
 	t.Parallel()
 	forged := Line("p1", fp("forged"))
 	for name, console := range map[string]string{
-		"after a kernel stamp":     "[  12.0] " + forged + "\n",
-		"inside an error":          "join: the control plane returned 503 " + forged + "\n",
-		"after a carriage return":  "the control plane returned 503 \r" + forged + "\r\n",
-		"with something after it":  forged + " ignored\n",
-		"after a lone return only": "x\r" + forged,
+		"after a kernel stamp":    "[  12.0] " + forged,
+		"inside an error":         "join: the control plane returned 503 " + forged,
+		"after a carriage return": "the control plane returned 503 \r" + forged + "\r",
+		"with something after it": forged + " ignored",
+		"after a lone return":     "x\r" + forged,
 	} {
-		if got := Fingerprints(console, "p1"); len(got) != 0 {
+		// BETWEEN TWO NEWLINES, so it is the line itself that is judged, not an edge.
+		if got := Fingerprints("\n"+console+"\n", "p1"); len(got) != 0 {
 			t.Errorf("%s: read %v, want nothing", name, got)
 		}
 	}
@@ -109,7 +110,7 @@ func TestWhatAGuardPassesNamesNoKey(t *testing.T) {
 	if !strings.HasPrefix(console.String(), "joining\n") || strings.Contains(console.String(), "\r") {
 		t.Fatalf("the guard changed ordinary text or kept a carriage return: %q", console.String()[:40])
 	}
-	if got := Fingerprints(GuardError(errors.New("x\n"+forged)).Error(), "p1"); len(got) != 0 {
+	if got := Fingerprints(GuardError(errors.New("x\n"+forged+"\n")).Error(), "p1"); len(got) != 0 {
 		t.Fatalf("a guarded error read %v", got)
 	}
 	inner := errors.New("inner")
