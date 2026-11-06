@@ -1030,6 +1030,13 @@ type EnrollRequest struct {
 	// can reach the port, who could then fill the pending list or take a name
 	// before the machine that should have it.
 	JoinToken string `json:"join_token"`
+	// IdentityDocument and IdentitySignature are what the host's platform signed about
+	// it (an EC2 instance identity document and its base64 signature), which a pool
+	// host sends so its order's source can vouch for it (ADR-030). Sent only by a pool
+	// host, whose control plane runs the pool and so decodes them; an older plane's
+	// strict decoder refuses a request carrying them (VersionPoolJoin).
+	IdentityDocument  string `json:"identity_document,omitempty"`
+	IdentitySignature string `json:"identity_signature,omitempty"`
 }
 
 // EnrollResponse is the decision, or that there is not one yet.

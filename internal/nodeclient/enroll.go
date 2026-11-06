@@ -240,6 +240,22 @@ func pinnedAuthority(caPEM []byte, fingerprint string) ([]byte, error) {
 func Enroll(
 	ctx context.Context, base, name, joinToken string, caPEM, csrPEM []byte,
 ) ([]byte, []byte, error) {
+	return EnrollWithIdentity(ctx, base, name, joinToken, caPEM, csrPEM, Identity{})
+}
+
+// Identity is what a pool host's platform signed about it, sent with its enrollment
+// so its order's source can vouch for it (ADR-030). The zero value sends nothing.
+type Identity struct {
+	Document  []byte
+	Signature string
+}
+
+// EnrollWithIdentity is Enroll carrying a pool host's identity. It is sent only when
+// non-empty, because a control plane older than the fields refuses a request naming
+// them, and an ordinary node has none to send.
+func EnrollWithIdentity(
+	ctx context.Context, base, name, joinToken string, caPEM, csrPEM []byte, identity Identity,
+) ([]byte, []byte, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, nil, errors.New("nodeclient: the authority could not be parsed for verification")
@@ -262,6 +278,7 @@ func Enroll(
 
 	payload, err := json.Marshal(nodeapi.EnrollRequest{
 		Node: name, CSRPEM: string(csrPEM), JoinToken: joinToken,
+		IdentityDocument: string(identity.Document), IdentitySignature: identity.Signature,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("nodeclient: encode the enrollment request: %w", err)

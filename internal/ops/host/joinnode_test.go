@@ -105,8 +105,12 @@ func stageJoin(t *testing.T, f *joinFakes) string {
 
 		return nil
 	}
-	joinEnroll = func(_ context.Context, _ cli.Env, cfg *config.Config, base, fp, token string) error {
-		f.record("enroll " + cfg.Node.Name + " " + base + " " + fp + " " + token)
+	joinEnroll = func(_ context.Context, _ cli.Env, cfg *config.Config, base, fp, token, order string) error {
+		call := "enroll " + cfg.Node.Name + " " + base + " " + fp + " " + token
+		if order != "" {
+			call += " pool-order=" + order
+		}
+		f.record(call)
 
 		return nil
 	}
@@ -486,5 +490,21 @@ func TestJoinPassesInitsFlagsThrough(t *testing.T) {
 	got := joinInitArgs(req, testJoinDeployment)
 	if !slices.Equal(got[len(got)-2:], []string{"--macos-image", "ghcr.io/x/y:1"}) {
 		t.Errorf("init would be given %v, want the flags after -- at the end", got)
+	}
+}
+
+// A POOL HOST'S JOIN CARRIES ITS ORDER TO ENROLLMENT, which says the fingerprint on the
+// console and sends what the platform signed; an ordinary join carries none.
+func TestAPoolHostsJoinCarriesItsOrderToEnrollment(t *testing.T) {
+	onPlatform(t, "darwin", 501)
+
+	f := &joinFakes{generated: joinedNodeConfig}
+	stageJoin(t, f)
+
+	if err := Join(t.Context(), processEnv(), append(slices.Clone(joinArgs), "--pool-order", "p01")); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if !slices.Contains(f.trace, "enroll mac-1 https://cp.example:7717 SHA256:abc tok-1 pool-order=p01") {
+		t.Fatalf("join did %v, want enrollment for order p01", f.trace)
 	}
 }

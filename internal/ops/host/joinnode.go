@@ -68,11 +68,11 @@ type joinAuthority struct {
 
 // joinRequest is what `billet join` was asked for.
 type joinRequest struct {
-	server, fingerprint, token, nodeName, bootstrapAddr string
-	provider, org, repository, runnerGroup, image       string
-	workflows, guestOS                                  []string
-	cfgPath                                             string
-	force, skipPrerequisites, hardenSSH, dryRun         bool
+	server, fingerprint, token, nodeName, bootstrapAddr, poolOrder string
+	provider, org, repository, runnerGroup, image                  string
+	workflows, guestOS                                             []string
+	cfgPath                                                        string
+	force, skipPrerequisites, hardenSSH, dryRun                    bool
 	// initArgs are the flags after `--`, handed to `billet init` as they are:
 	// a backend's own (firecracker's kernel and Ceph identity) are init's.
 	initArgs []string
@@ -179,7 +179,7 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 		fmt.Fprintf(env.Stdout, "join     already enrolled: %s is node %s's in deployment %s\n",
 			cfg.Node.TLS.CertPath, req.nodeName, authority.deployment)
 	default:
-		if err := joinEnroll(ctx, env, cfg, base, req.fingerprint, req.token); err != nil {
+		if err := joinEnroll(ctx, env, cfg, base, req.fingerprint, req.token, req.poolOrder); err != nil {
 			return err
 		}
 	}
@@ -209,6 +209,9 @@ func parseJoin(env cli.Env, args []string) (joinRequest, error) {
 		"`billet ca show` or `billet ca token` (required)")
 	flags.StringVar(&req.token, "token", "", "a join token from `billet ca token` (required)")
 	flags.StringVar(&req.nodeName, "node-name", "", "this machine's node name (required)")
+	flags.StringVar(&req.poolOrder, "pool-order", "", "the pool order this host was booted for, which a pool's "+
+		"boot passes: the host says its fingerprint on the console and sends what its platform signed, so the "+
+		"order's source may vouch for it (ADR-030)")
 	flags.StringVar(&req.bootstrapAddr, "bootstrap-addr", "", "the control plane's enrollment address, when it "+
 		"serves one apart from the node wire (`billet ca token` prints it)")
 	flags.StringVar(&req.provider, "provider", defaultJoinProvider(), "this machine's backend")

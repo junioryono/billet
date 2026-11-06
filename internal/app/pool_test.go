@@ -121,7 +121,7 @@ func TestAPoolHostsBootRunsThePreludeThenJoins(t *testing.T) {
 	}
 	args, stderr := runBoot(t, boot)
 	want := []string{"join", "--server", "10.77.0.10:7717", "--ca-fingerprint", "SHA256:ab",
-		"--token", joinToken, "--node-name", "pool-p01", "--provider", "firecracker",
+		"--token", joinToken, "--node-name", "pool-p01", "--pool-order", "p01", "--provider", "firecracker",
 		"--bootstrap-addr", "10.77.0.10:7718", "--org", "acme"}
 	if strings.Join(args, "|") != strings.Join(want, "|") {
 		t.Fatalf("join ran as %q, want %q", args, want)

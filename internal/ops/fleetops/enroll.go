@@ -13,9 +13,11 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
+	"github.com/junioryono/billet/internal/hostsource"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -487,9 +489,21 @@ func BootstrapBase(cfg *config.Config, flag string) string {
 // ends displaying the same number, over a channel an attacker on the network
 // does not control. That comparison is the trust decision; everything else here
 // is transport.
-func EnrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFingerprint, joinToken string) error {
+//
+// A POOL HOST (poolOrder names the order it was booted for, ADR-030) ALSO SAYS ITS
+// FINGERPRINT ON THE SYSTEM CONSOLE before every attempt, where a source that reads the
+// console of the exact host it placed can say which key is that host's, and sends the
+// identity its platform signed, when it has one; its name is its order's.
+func EnrollNode(
+	ctx context.Context, env cli.Env, cfg *config.Config, base, caFingerprint, joinToken, poolOrder string,
+) error {
 	if cfg.Node.TLS == nil {
 		return errors.New("enrolling writes a certificate, so node.tls must say where to put it")
+	}
+
+	if poolOrder != "" && cfg.Node.Name != alloc.PoolNodeName(poolOrder) {
+		return fmt.Errorf("a host joining from pool order %s is node %s, and this config names %q",
+			poolOrder, alloc.PoolNodeName(poolOrder), cfg.Node.Name)
 	}
 
 	caPEM, deployment, err := nodeclient.FetchCA(ctx, base, caFingerprint)
@@ -523,11 +537,33 @@ func EnrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFi
 
 	fmt.Fprintf(env.Stdout, "Asking to join deployment %s as %q.\n\n", deployment, name)
 	fmt.Fprintf(env.Stdout, "  this node's fingerprint  %s\n\n", fingerprint)
-	fmt.Fprintf(env.Stdout, "On the control plane, check it matches and approve:\n\n")
+
+	var identity nodeclient.Identity
+
+	if poolOrder != "" {
+		identity = poolIdentity(ctx, env)
+		fmt.Fprintf(env.Stdout, "A pool host: its order's source may vouch for it. Otherwise, on the control plane,\n")
+		fmt.Fprintf(env.Stdout, "check the fingerprint matches and approve:\n\n")
+	} else {
+		fmt.Fprintf(env.Stdout, "On the control plane, check it matches and approve:\n\n")
+	}
+
 	fmt.Fprintf(env.Stdout, "  billet nodes approve %s --fingerprint %s\n\n", name, fingerprint)
 
+	warned := false
+
 	for {
-		certPEM, signedBy, err := nodeclient.Enroll(ctx, base, name, joinToken, caPEM, csrPEM)
+		if poolOrder != "" {
+			// BEFORE EVERY ATTEMPT, because the source reads the newest 64 KiB of the
+			// console and a long boot can push one line out of it.
+			if err := announceOnConsole(poolOrder, fingerprint); err != nil && !warned {
+				warned = true
+				fmt.Fprintf(env.Stderr, "this pool host could not write its fingerprint to %s, so its source "+
+					"cannot vouch for it and a person approves it: %v\n", consolePath, err)
+			}
+		}
+
+		certPEM, signedBy, err := nodeclient.EnrollWithIdentity(ctx, base, name, joinToken, caPEM, csrPEM, identity)
 
 		switch {
 		case err == nil:
@@ -575,6 +611,41 @@ func EnrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFi
 		case <-wait.C:
 		}
 	}
+}
+
+// consolePath is the system console a pool host says its fingerprint on, and
+// instanceIdentity reads what its platform signed about it; a test replaces both.
+var (
+	consolePath      = "/dev/console"
+	instanceIdentity = func(ctx context.Context) ([]byte, string, error) { return awscreds.InstanceIdentity(ctx, "") }
+)
+
+// announceOnConsole writes the pool host's line to the system console, opened for
+// writing only and never created: a console that is not there is a failure to say so,
+// not a file to make.
+func announceOnConsole(order, fingerprint string) error {
+	f, err := os.OpenFile(consolePath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return err
+	}
+
+	_, werr := fmt.Fprintf(f, "%s\n", hostsource.ConsoleLine(order, fingerprint))
+
+	return errors.Join(werr, f.Close())
+}
+
+// poolIdentity is the identity document the host's platform signed, or none: a host
+// that is not on EC2, or whose metadata service is closed, has none, and its join waits
+// for a person instead.
+func poolIdentity(ctx context.Context, env cli.Env) nodeclient.Identity {
+	doc, sig, err := instanceIdentity(ctx)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "No identity document to send (%v); the source cannot vouch without one.\n\n", err)
+
+		return nodeclient.Identity{}
+	}
+
+	return nodeclient.Identity{Document: doc, Signature: sig}
 }
 
 // pendingIdentity is the key and request this node is enrolling with, generated
