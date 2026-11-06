@@ -25,6 +25,7 @@ func TestTheEnrollmentAddressPrefersTheFlagThenTheConfig(t *testing.T) {
 		name             string
 		flag, cfgAddr    string
 		serverAddr, want string
+		serverAddrs      []string
 	}{
 		{
 			name: "the flag wins over both",
@@ -41,6 +42,16 @@ func TestTheEnrollmentAddressPrefersTheFlagThenTheConfig(t *testing.T) {
 			serverAddr: "wire.example:7717", want: "https://wire.example:7717",
 		},
 		{
+			name:        "with every controller named, the first is the fallback",
+			serverAddrs: []string{"wire-a.example:7717", "wire-b.example:7717"},
+			want:        "https://wire-a.example:7717",
+		},
+		{
+			name:    "and the config key still wins over them",
+			cfgAddr: "cfg.example:7718", serverAddrs: []string{"wire-a.example:7717", "wire-b.example:7717"},
+			want: "https://cfg.example:7718",
+		},
+		{
 			name: "whitespace is not an address",
 			flag: "   ", cfgAddr: "\t", serverAddr: "wire.example:7717",
 			want: "https://wire.example:7717",
@@ -51,6 +62,7 @@ func TestTheEnrollmentAddressPrefersTheFlagThenTheConfig(t *testing.T) {
 
 			cfg := &config.Config{Node: &config.NodeConfig{
 				ServerAddr:    c.serverAddr,
+				ServerAddrs:   c.serverAddrs,
 				BootstrapAddr: c.cfgAddr,
 			}}
 
@@ -88,5 +100,26 @@ func TestTheEnrollmentFlagIsPrintedOnlyWhenThereIsOne(t *testing.T) {
 				t.Errorf("enrollAddrFlag(%q) = %q, want %q", c.listen, got, c.want)
 			}
 		})
+	}
+}
+
+// BEHIND A ROUTER A JOINING MACHINE IS TOLD THE ROUTER'S NAMES. The listen address is loopback
+// there: printed, it has a machine dial itself.
+func TestAJoinCommandBehindARouterNamesTheRouter(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{Server: &config.ServerConfig{
+		Listen: "127.0.0.1:17001", BootstrapListen: "127.0.0.1:17002",
+		TLSRouter: &config.TLSRouterConfig{
+			NodeAddr: "a.nodes.billet.example:443", EnrollAddr: "a.enroll.billet.example:443",
+		},
+	}}
+
+	if got := nodeWireAddr(cfg); got != "a.nodes.billet.example:443" {
+		t.Errorf("nodeWireAddr = %q, want the router's address", got)
+	}
+
+	if got := enrollAddrFlag(cfg); got != " --bootstrap-addr a.enroll.billet.example:443" {
+		t.Errorf("enrollAddrFlag = %q, want the router's enrollment address", got)
 	}
 }

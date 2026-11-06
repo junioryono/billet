@@ -94,13 +94,20 @@ is_replay_input() {
 		internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
 		internal/endpoint/* | internal/fakeactions/* | internal/flightrecorder/* | internal/github/* | internal/guestassets/* | \
 		internal/guestreport/* | \
-		internal/hostauthority/* | internal/imageaccept/* | internal/lifeops/* | \
+		internal/hostauthority/* | internal/imageaccept/* | internal/jobtrace/* | internal/lifeops/* | \
 		internal/importcheck/* | internal/lease/* | internal/metrics/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeending/* | internal/nodeplane/* | \
 		internal/power/* | internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
 		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \
 		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
-		internal/usage/* | internal/version/* | internal/wallmeter/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;
+		internal/tokenbroker/* | internal/usage/* | internal/version/* | internal/wallmeter/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;
+	# internal/lifeops embeds the units and plists, so the harness builds deploy.
+	deploy/*) return 0 ;;
+	# And the EC2 provider builds the top of scripts/, for the AMI's build it
+	# embeds. Not its tests or the packages below it, which the harness never
+	# builds, and not what it embeds, which the simulated backend never runs.
+	scripts/*_test.go | scripts/*/*) return 1 ;;
+	scripts/*.go) return 0 ;;
 	*) return 1 ;;
 	esac
 }

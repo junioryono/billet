@@ -149,6 +149,14 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	// A DEPLOYMENT ON A BROKER HOLDS NO KEY, and creating an App here spends its one
+	// key on a host told not to have it. Refused before anything else is, for that
+	// reason.
+	if config.PeekTokenBroker(plan.body) {
+		return fmt.Errorf("%s has server.token_broker, so this host holds no App key. Create the App where the "+
+			"broker's keys are, and register its installation there", *cfgPath)
+	}
+
 	// THE RESOLVED PATH, so a symlinked --config defaults its key beside the file
 	// that actually holds the config rather than beside the link.
 	if *keyPath == "" {
@@ -238,7 +246,7 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 		// THE WIDER GRANT IS SAID OUT LOUD, as the repository one is above.
 		fmt.Fprintf(env.Stdout, "Actions write is the ONLY permission GitHub offers for re-running a job. It also\n"+
 			"covers dispatching workflows and deleting logs, artifacts and caches. billet uses\n"+
-			"it for the two re-run requests and nothing else (ADR-023).\n")
+			"it for the two re-run requests and nothing else (ADR-028).\n")
 	}
 
 	fmt.Fprintf(env.Stdout, "GitHub allows one hour to finish; if it lapses, just run this again.\n\n")

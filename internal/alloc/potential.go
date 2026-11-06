@@ -81,6 +81,21 @@ type TierAdmission struct {
 	// never reach it until its own target's work ends, so it must not hold that
 	// target's tiers back: that is the starvation a share exists to prevent.
 	ShareBound bool
+	// TargetRank is every catalogue target's dominant share of the deployment
+	// ceiling over its weight, from one ledger snapshot, and nil when no target
+	// has a weight. The admission order puts the lowest first among waiters of
+	// different targets, so what a target holds per unit of weight evens out while
+	// they all wait, and a target with nobody waiting claims nothing. Shared
+	// between the tiers of one view, and never written after it is read.
+	TargetRank map[string]float64
+	// BelowFloor reports that this tier holds fewer leases than its `reserved`
+	// floor, counted as the floor is, so a lease on a draining host meets it. Room
+	// is already held for it from every other tier, so under ranks it goes first:
+	// it takes nothing a waiter could buy. Read only when TargetRank is.
+	BelowFloor bool
+	// VCPU and Memory are the tier's shape. Zero says the admission could not be read.
+	VCPU   int
+	Memory config.ByteSize
 }
 
 // AdmissionView reads every tier's TierAdmission in one ledger snapshot, so one
@@ -101,10 +116,22 @@ func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission
 			return err
 		}
 
+		ranks, floors, err := a.rankReads(ctx, tx)
+		if err != nil {
+			return err
+		}
+
 		for _, label := range a.sortedLabels() {
-			if out[label], err = a.admissionIn(ctx, tx, a.tiers[label], nodes, held); err != nil {
+			t := a.tiers[label]
+
+			entry, err := a.admissionIn(ctx, tx, t, nodes, held)
+			if err != nil {
 				return err
 			}
+
+			entry.TargetRank = ranks
+			entry.BelowFloor = ranks != nil && t.Reserved > floors[label]
+			out[label] = entry
 		}
 
 		return nil
@@ -130,7 +157,14 @@ func (a *Allocator) AdmissionFor(ctx context.Context, tier string) (TierAdmissio
 			return err
 		}
 
+		ranks, floors, err := a.rankReads(ctx, tx)
+		if err != nil {
+			return err
+		}
+
 		out, err = a.admissionIn(ctx, tx, t, nodes, held)
+		out.TargetRank = ranks
+		out.BelowFloor = ranks != nil && t.Reserved > floors[t.Label]
 
 		return err
 	})
@@ -157,6 +191,23 @@ func (a *Allocator) admissionReads(ctx context.Context, tx querier) ([]nodeRow, 
 	}
 
 	return nodes, held, nil
+}
+
+// rankReads is what the order needs only when some target has a weight: the
+// targets' ranks, and what each tier holds as its floor counts it. Both are nil
+// otherwise, and a deployment with no weight pays for neither.
+func (a *Allocator) rankReads(ctx context.Context, tx querier) (map[string]float64, map[string]int, error) {
+	ranks, err := a.targetRanks(ctx, tx)
+	if err != nil || ranks == nil {
+		return nil, nil, err
+	}
+
+	floors, err := a.countFloorLeasesPerTier(ctx, tx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return ranks, floors, nil
 }
 
 // admissionIn is one tier's TierAdmission inside the caller's snapshot.
@@ -206,6 +257,8 @@ func (a *Allocator) admissionIn(ctx context.Context, tx querier, t config.Tier, 
 	_, hasShare := a.limits.Shares[config.ShareTarget(t)]
 
 	return TierAdmission{
+		VCPU:    t.VCPU,
+		Memory:  t.Memory,
 		CanGrow: grow, Nodes: p.nodes, CeilingBound: bound.ceiling,
 		Target: config.ShareTarget(t), TargetShared: hasShare, ShareBound: bound.share,
 	}, nil
@@ -262,7 +315,7 @@ func (a *Allocator) potentialIn(ctx context.Context, tx querier, label string,
 ) (potential, error) {
 	free := &fleet{
 		vcpu: make(map[string]int), memory: make(map[string]config.ByteSize),
-		macOS: make(map[string]int),
+		macOS: make(map[string]int), rows: nodes,
 	}
 	for _, n := range nodes {
 		free.vcpu[n.name], free.memory[n.name] = n.vcpu, n.memory
@@ -302,10 +355,7 @@ func (a *Allocator) potentialIn(ctx context.Context, tx querier, label string,
 		}
 	}
 
-	p, err := free.forTier(ctx, tx, a, t)
-	if err != nil {
-		return potential{}, err
-	}
+	p := free.forTier(a, t)
 
 	// THE HOSTS THAT COULD EVER HOLD ONE, measured while the placer still carries
 	// no deployment ceiling: a host is this tier's only if an empty fleet could

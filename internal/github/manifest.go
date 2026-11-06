@@ -93,7 +93,7 @@ const (
 	// ActionsWrite is what a tier with retry.disrupted adds, to re-run a job
 	// billet ended. It includes read. GitHub offers no narrower grant: the same
 	// level also covers dispatching a workflow and deleting logs, artifacts and
-	// caches, none of which billet does (ADR-023).
+	// caches, none of which billet does (ADR-028).
 	ActionsWrite
 )
 

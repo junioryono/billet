@@ -22,8 +22,11 @@ package replay
 
 import (
 	"log/slog"
+	"maps"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
 )
 
 // Options vary a replay beyond its fleet and trace.
@@ -39,6 +42,20 @@ type Options struct {
 	// for it, nothing is offered or acquired, and an assignment billet cannot
 	// back waits at GitHub for the next runner the tier starts (#140).
 	DirectAssignment bool
+	// Until is the replay's horizon: no event after it is delivered, and a job
+	// that arrived by it and had not started is reported as still queued, with
+	// its wait kept out of every percentile. Zero replays every event.
+	Until time.Time
+	// AfterRun is handed the replayed deployment's allocator after the last
+	// event and before its ledger closes, so a test can read the ledger as an
+	// operator would (billet jobs export).
+	AfterRun func(*alloc.Allocator)
+	// BackgroundLaunches replays with launches running beside the listener's loop, as
+	// a deployment does. A replay otherwise waits for each one: it delivers one event
+	// at a time to quiescence, and a listener parked on its poll with a launch out is
+	// not quiet, so with this on two runs are not comparable, and only what a run did
+	// not lose can be asserted.
+	BackgroundLaunches bool
 }
 
 func (o Options) settleWithin() time.Duration {
@@ -81,6 +98,7 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 
 	actions := newPlane(t, clock, fleet, trace)
 	actions.direct = opts.DirectAssignment
+	actions.backgroundLaunches = opts.BackgroundLaunches
 	st := buildStack(t, log, fleet, tiers, clock, actions)
 	stop := st.run(t)
 
@@ -122,15 +140,42 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		actions.schedule(event{at: a.At, kind: eventArrival, seq: a.Seq})
 	}
 
+	// AN EMPTY EVENT LIST IS NOT THE END WITH LAUNCHES BESIDE THE LOOP. A job's start is
+	// scheduled when its runner registers, which is during its launch, so with the last
+	// launch still out there is nothing left to deliver and the job is not done. Waited
+	// for and bounded: a job that is really lost runs this out, and the report names it.
+	var awaitingLaunches time.Time
+
 	for {
 		ev, ok := actions.next()
-		if !ok {
-			break
-		}
+		if !ok || (!opts.Until.IsZero() && ev.at.After(opts.Until)) {
+			// PAST THE HORIZON NOTHING MORE IS DELIVERED, launches out or not.
+			if ok || !opts.BackgroundLaunches || actions.everyJobCompleted() {
+				break
+			}
 
-		clock.Step(ev.at)
-		actions.deliver(ev)
-		settle(describe(ev))
+			if awaitingLaunches.IsZero() {
+				awaitingLaunches = time.Now()
+			}
+			if time.Since(awaitingLaunches) > opts.settleWithin() {
+				break
+			}
+
+			pause := time.NewTimer(5 * time.Millisecond)
+
+			select {
+			case <-t.Context().Done():
+				pause.Stop()
+				t.Fatalf("replay: stopped waiting for launches: %v", t.Context().Err())
+			case <-pause.C:
+			}
+		} else {
+			awaitingLaunches = time.Time{}
+
+			clock.Step(ev.at)
+			actions.deliver(ev)
+			settle(describe(ev))
+		}
 
 		// EVERY TIER POLLS WHEN ANY WORK WAITS, in the fleet's order, so which
 		// waiting tier buys returning capacity is deterministic per trace.
@@ -163,14 +208,24 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 	stop()
 	st.stopNodes()
 
-	report, err := readReport(t.Context(), st.db, fleet, trace, opts.DirectAssignment)
+	if opts.AfterRun != nil {
+		opts.AfterRun(st.alloc)
+	}
+
+	startsSent, completionsSent := actions.deliveredJobs()
+
+	report, err := readReport(t.Context(), st.db, fleet, trace, opts.DirectAssignment, opts.BackgroundLaunches,
+		opts.Until, actions.waitingJobs(), startsSent)
 	if err != nil {
 		t.Fatalf("replay: read the ledger back: %v", err)
 	}
 
 	actions.mu.Lock()
 	report.DeclinedThenRun = actions.declinedThenRun
+	report.Declined = maps.Clone(actions.declined)
 	actions.mu.Unlock()
+
+	report.noteLostCompletions(completionsSent)
 
 	st.closeDB()
 

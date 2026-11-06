@@ -80,33 +80,35 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 ) *stack {
 	t.Helper()
 
-	client, err := scaleset.New(scaleset.Config{
-		Target:         billetgithub.OrganizationTarget(DefaultOwner),
-		GitHubURL:      actions.URL,
-		ClientID:       "12345",
-		InstallationID: 67890,
-		PrivateKey:     actions.PrivateKeyPEM(),
-		AppID:          12345,
-		APIURL:         actions.URL + "/api/v3",
-	}, nil)
-	if err != nil {
-		t.Fatalf("scaleset.New: %v", err)
-	}
-
 	// AUTOMATIC UPDATES OFF: an absent release block turns them on, and the
 	// starter would ask the public release channel from inside a replay.
 	automatic := false
 
 	cfg := &config.Config{
 		Server: &config.ServerConfig{
-			IdentityDir: t.TempDir(),
-			Listen:      "127.0.0.1:0",
-			MaxVCPU:     fleet.MaxVCPU,
-			MaxMemory:   fleet.MaxMemory,
-			Placement:   fleet.Placement,
+			IdentityDir:    t.TempDir(),
+			Listen:         "127.0.0.1:0",
+			MaxVCPU:        fleet.MaxVCPU,
+			MaxMemory:      fleet.MaxMemory,
+			Placement:      fleet.Placement,
+			AdmissionOrder: fleet.AdmissionOrder,
 		},
 		Release: &config.ReleaseConfig{Automatic: &automatic},
 		Tiers:   tiers,
+	}
+
+	// A FLEET THAT DECLARES ITS TARGETS WRITES THEM AS A CONFIG DOES, so their
+	// weights reach the allocator through the one function the CLI's do.
+	for i, target := range fleet.Targets {
+		block := config.GitHubConfig{Org: ownerOf(target.Name), Weight: target.Weight}
+		if i == 0 {
+			cfg.GitHub = &block
+
+			continue
+		}
+
+		block.Name = target.Name
+		cfg.Targets = append(cfg.Targets, block)
 	}
 
 	// THE OPERATOR'S SECOND SIGNAL, wired as `billet node` and `billet server`
@@ -115,12 +117,32 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 	// hanging in cleanup instead of in the assertion that named the failure.
 	hurry := make(chan struct{})
 
-	// The one target, assembled the way the CLI assembles one, so the scale-set
-	// record carries the owner's path and every tier resolves through it.
-	targets := []app.Target{{
-		Config: config.GitHubTarget{Name: config.DefaultTargetName, Org: DefaultOwner},
-		Client: client,
-	}}
+	// Each target, assembled the way the CLI assembles one, so the scale-set
+	// record carries the owner's path and every tier resolves through it. A fleet
+	// that declares none has the one target.
+	declared := []config.GitHubTarget{{Name: config.DefaultTargetName, Org: DefaultOwner}}
+	if len(fleet.Targets) > 0 {
+		declared = cfg.GitHubTargets()
+	}
+
+	targets := make([]app.Target, 0, len(declared))
+
+	for _, target := range declared {
+		client, err := scaleset.New(scaleset.Config{
+			Target:         billetgithub.OrganizationTarget(target.Org),
+			GitHubURL:      actions.URL,
+			ClientID:       "12345",
+			InstallationID: 67890,
+			PrivateKey:     actions.PrivateKeyPEM(),
+			AppID:          12345,
+			APIURL:         actions.URL + "/api/v3",
+		}, nil)
+		if err != nil {
+			t.Fatalf("scaleset.New: %v", err)
+		}
+
+		targets = append(targets, app.Target{Config: target, Client: client})
+	}
 
 	cp, err := app.OpenControlPlane(t.Context(), cfg, harnessHost(), targets, app.ControlPlaneOptions{
 		Steering: &app.Steering{
@@ -246,7 +268,8 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 		t.Fatalf("PublishAuthority: %v", err)
 	}
 
-	scheduler, err := ctl.Schedule(wire, published, app.ScheduleOptions{Hurry: hurry})
+	scheduler, err := ctl.Schedule(wire, published, app.ScheduleOptions{Hurry: hurry,
+		ForegroundLaunches: !actions.backgroundLaunches})
 	if err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}

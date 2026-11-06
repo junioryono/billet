@@ -29,10 +29,18 @@ type queueTimeReader struct {
 	runs  []int64
 	times map[int64]map[string]time.Time
 	err   error
+	// noCommit makes every record it answers name no commit.
+	noCommit bool
 }
 
-func (r *queueTimeReader) RunQueueTimes(_ context.Context, owner, repository string, runID int64,
-) (map[string]time.Time, error) {
+// readerHeadSHA and readerHeadBranch are the commit every run the reader lists names.
+const (
+	readerHeadSHA    = "20f462ad39fee8e29587ae6a2a317c68992469ae"
+	readerHeadBranch = "feature/x"
+)
+
+func (r *queueTimeReader) RunJobs(_ context.Context, owner, repository string, runID int64,
+) (map[string]RunJob, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -43,7 +51,19 @@ func (r *queueTimeReader) RunQueueTimes(_ context.Context, owner, repository str
 	if r.err != nil {
 		return nil, r.err
 	}
-	return r.times[runID], nil
+	jobs := make(map[string]RunJob, len(r.times[runID]))
+	for name, queued := range r.times[runID] {
+		jobs[name] = RunJob{QueuedAt: queued, HeadSHA: r.headSHA(), HeadBranch: readerHeadBranch, RunAttempt: 2}
+	}
+	return jobs, nil
+}
+
+// headSHA is the commit its records name; noCommit makes them name none.
+func (r *queueTimeReader) headSHA() string {
+	if r.noCommit {
+		return ""
+	}
+	return readerHeadSHA
 }
 
 func (r *queueTimeReader) asked() []int64 {
@@ -539,10 +559,10 @@ type budgetedReader struct {
 	stated                  bool
 }
 
-func (r *budgetedReader) RunQueueTimes(ctx context.Context, owner, repository string, runID int64,
-) (map[string]time.Time, error) {
+func (r *budgetedReader) RunJobs(ctx context.Context, owner, repository string, runID int64,
+) (map[string]RunJob, error) {
 	r.remaining -= r.spend
-	return r.queueTimeReader.RunQueueTimes(ctx, owner, repository, runID)
+	return r.queueTimeReader.RunJobs(ctx, owner, repository, runID)
 }
 
 func (r *budgetedReader) RESTHeadroom() (int64, int64, time.Time, bool) {
@@ -656,5 +676,73 @@ func TestAnInstallationDownToItsReserveIsNotRead(t *testing.T) {
 	if got := len(reader.asked()) - before; got != queueTimeRunsPerInstallation {
 		t.Errorf("an installation that has stated no budget read %d runs, want %d", got,
 			queueTimeRunsPerInstallation)
+	}
+}
+
+// A JOB'S COMMIT COMES WITH ITS QUEUE TIME, FROM THE ONE READ OF ITS RUN, so a sweep
+// costs GitHub no request more. A job whose queue time a message already gave is still
+// listed until it has its commit; one with both never is. A record that names no
+// commit is could-not-tell: the job keeps none, the run backs off, and what the record
+// did give is kept.
+func TestAJobsCommitComesFromItsRunsRecordWithItsQueueTime(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	runner := p.launchedFor11(t)
+	start := job11
+	start.RunnerID, start.RunnerName = 77, runner.RunnerName
+	start.Owner, start.Repository = "acme", "api"
+	// A QUEUE TIME THE MESSAGE GAVE, so only the commit is missing.
+	given := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	start.QueuedAt = given
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{start},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("start job 11: %v", err)
+	}
+
+	queued := given.Add(time.Minute)
+	reader := &queueTimeReader{fakeProvisioner: &fakeProvisioner{}, noCommit: true,
+		times: map[int64]map[string]time.Time{job11.RunID: {runner.RunnerName: queued}}}
+	s := New(p.a, reader, []config.Tier{tier(p.l.tier)}, "test", nil)
+	targets := map[string]Target{p.l.tier: {Config: config.GitHubTarget{Name: "acme"}, Provisioner: reader}}
+	sweep := newQueueTimeSweep()
+	run := queueTimeRun{target: "acme", repository: "acme/api", run: job11.RunID}
+
+	now := time.Now()
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now)
+	got, err := p.a.Job(t.Context(), runner.LeaseID)
+	if err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if got.Job.HeadSHA != "" || got.Job.HeadBranch != readerHeadBranch {
+		t.Errorf("a record naming no commit left %q on %q, want none on the branch it gave", got.Job.HeadSHA,
+			got.Job.HeadBranch)
+	}
+	if got.GitHubQueuedAt != stamp(given) {
+		t.Errorf("the queue time is %q, want the message's %s, written once", got.GitHubQueuedAt, stamp(given))
+	}
+	if _, backedOff := sweep.retries[run]; !backedOff {
+		t.Fatal("a record naming no commit left the run to be read on every pass")
+	}
+
+	reader.mu.Lock()
+	reader.noCommit = false
+	reader.mu.Unlock()
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(2*time.Minute))
+	if got, err = p.a.Job(t.Context(), runner.LeaseID); err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if got.Job.HeadSHA != readerHeadSHA || got.Job.HeadBranch != readerHeadBranch || got.Job.RunAttempt != 2 {
+		t.Errorf("after the backoff the commit is %q on %q, attempt %d; want %q on %q, attempt 2", got.Job.HeadSHA,
+			got.Job.HeadBranch, got.Job.RunAttempt, readerHeadSHA, readerHeadBranch)
+	}
+	if _, backedOff := sweep.retries[run]; backedOff {
+		t.Error("a job with its commit and its queue time is still scheduled for a retry")
+	}
+
+	asked := len(reader.asked())
+	s.fillQueueTimesOnce(t.Context(), targets, sweep, now.Add(3*time.Minute))
+	if got := len(reader.asked()); got != asked {
+		t.Errorf("a job with both was read again: %d reads, want %d", got, asked)
 	}
 }

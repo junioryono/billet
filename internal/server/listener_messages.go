@@ -43,6 +43,13 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	}
 	l.mu.Unlock()
 
+	// A START OR COMPLETION WAITS FOR THE LAUNCH THAT CREATED ITS SUBJECT, because
+	// everything below assumes that launch has settled: its pool row exists, or its
+	// lease has gone. Only for the launch it names; the others keep running.
+	if err := l.awaitFlightsNamedBy(ctx, msg); err != nil {
+		return err
+	}
+
 	// STARTS PRECEDE COMPLETIONS EVEN WHEN GITHUB BATCHES THEM TOGETHER. The
 	// start is the authoritative runner-to-job binding; resolving the completion
 	// first would either settle the request that caused launch or mistake a busy
@@ -72,6 +79,17 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	}
 
 	resolved, err := l.resolveMessage(ctx, msg)
+	// AND ONE THE RESOLVER FOUND BEHIND A COMPLETION THAT NAMED NO RUNNER, which is
+	// resolved again: what it decided read a launch that had not settled.
+	if err == nil {
+		waited, waitErr := l.awaitFlightsResolved(ctx, &resolved)
+		if waitErr != nil {
+			return waitErr
+		}
+		if waited {
+			resolved, err = l.resolveMessage(ctx, msg)
+		}
+	}
 	// Persist the hold before any later error can send Run into its drain.
 	if len(resolved.held) > 0 {
 		l.mu.Lock()
@@ -162,6 +180,9 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			return err
 		}
 		if disposition != state.PendingCompletionActionable {
+			continue
+		}
+		if l.backgroundLaunches && l.parkCompletion(ctx, job) {
 			continue
 		}
 		l.complete(ctx, job)
@@ -287,7 +308,9 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 			continue
 		}
 
-		if err := l.launch(ctx, lease, job); err != nil {
+		if l.backgroundLaunches {
+			l.startLaunch(ctx, lease, job)
+		} else if err := l.launch(ctx, lease, job); err != nil {
 			return err
 		}
 		if assignmentDeficit > 0 {

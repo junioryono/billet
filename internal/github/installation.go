@@ -240,7 +240,7 @@ func Undecided(err error) bool {
 		return false
 	}
 
-	if errors.Is(err, ErrAppUnverifiable) || errors.Is(err, errNoAnswer) {
+	if errors.Is(err, ErrAppUnverifiable) || errors.Is(err, errNoAnswer) || errors.Is(err, ErrTokenUnavailable) {
 		return true
 	}
 
@@ -291,12 +291,13 @@ func verifyAppAt(
 				return nil, fmt.Errorf("github: the App (id %d) is not installed on repository %q — "+
 					"open the App's settings page and install it on the repository's owner with "+
 					"access to that repository (or check that the target names the right "+
-					"repository; GitHub answers 404 for both)", appID, target)
+					"repository; GitHub answers 404 for both): %w", appID, target, ErrNotInstalled)
 			}
 
 			return nil, fmt.Errorf("github: the App (id %d) is not installed on %q — open the "+
 				"App's settings page and install it on the organization (or check that "+
-				"github.org names the right organization; GitHub answers 404 for both)", appID, target)
+				"github.org names the right organization; GitHub answers 404 for both): %w", appID, target,
+				ErrNotInstalled)
 		}
 
 		if api, ok := errors.AsType[*APIError](err); ok {

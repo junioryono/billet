@@ -112,6 +112,7 @@ type ReadOps interface {
 	ListJoinTokenHashes(ctx context.Context) ([]string, error)
 	ListJoinTokens(ctx context.Context) ([]ledgerdb.ListJoinTokensRow, error)
 	ListLeaseIDsOnNode(ctx context.Context, arg ledgerdb.ListLeaseIDsOnNodeParams) ([]string, error)
+	ListLiveNodeNames(ctx context.Context) ([]string, error)
 	ListNodeInventories(ctx context.Context) ([]ledgerdb.ListNodeInventoriesRow, error)
 	ListNodeRegistrations(ctx context.Context) ([]ledgerdb.ListNodeRegistrationsRow, error)
 	ListNodeWireVersions(ctx context.Context) ([]ledgerdb.ListNodeWireVersionsRow, error)
@@ -158,14 +159,26 @@ type ReadOps interface {
 	ReadJob(ctx context.Context, leaseID string) (ledgerdb.ReadJobRow, error)
 	ReadJobWait(ctx context.Context, leaseID string) (ledgerdb.ReadJobWaitRow, error)
 	ListJobWaits(ctx context.Context, arg ledgerdb.ListJobWaitsParams) ([]ledgerdb.ListJobWaitsRow, error)
+	ListJobRuntimes(ctx context.Context, arg ledgerdb.ListJobRuntimesParams) ([]ledgerdb.ListJobRuntimesRow, error)
+	ListJobsForExport(ctx context.Context,
+		arg ledgerdb.ListJobsForExportParams) ([]ledgerdb.ListJobsForExportRow, error)
+	ListOpenLeasesForHold(ctx context.Context, maxRows int64) ([]ledgerdb.ListOpenLeasesForHoldRow, error)
 	ListRetirableJobDetail(ctx context.Context, arg ledgerdb.ListRetirableJobDetailParams) ([]string, error)
 	ListJobsAwaitingQueueTime(ctx context.Context,
 		arg ledgerdb.ListJobsAwaitingQueueTimeParams) ([]ledgerdb.ListJobsAwaitingQueueTimeRow, error)
 	ListJobsOfRun(ctx context.Context, arg ledgerdb.ListJobsOfRunParams) ([]string, error)
+	ListUsageSince(ctx context.Context, arg ledgerdb.ListUsageSinceParams) ([]ledgerdb.ListUsageSinceRow, error)
+	ReadUsageRecord(ctx context.Context, usageSeq int64) (ledgerdb.ReadUsageRecordRow, error)
+	ListUnnumberedUsage(ctx context.Context, maxRows int64) ([]string, error)
+	ReadAnyUnnumberedUsage(ctx context.Context) (bool, error)
 	ReadJobUsage(ctx context.Context, leaseID string) (ledgerdb.JobUsage, error)
 	ReadJobSeries(ctx context.Context, leaseID string) (ledgerdb.ReadJobSeriesRow, error)
 	ReadJobDestinations(ctx context.Context, leaseID string) ([]ledgerdb.ReadJobDestinationsRow, error)
 	ReadJobGuestReport(ctx context.Context, leaseID string) (ledgerdb.JobGuestReport, error)
+	ReadJobTestResults(ctx context.Context, leaseID string) (ledgerdb.JobTestResult, error)
+	ListJobTestResults(ctx context.Context, arg ledgerdb.ListJobTestResultsParams) ([]ledgerdb.ListJobTestResultsRow, error)
+	ListJobTestResultsPastRetention(ctx context.Context, arg ledgerdb.ListJobTestResultsPastRetentionParams) ([]string, error)
+	ListJobTestResultsPastBound(ctx context.Context, arg ledgerdb.ListJobTestResultsPastBoundParams) ([]string, error)
 	ReadJobResult(ctx context.Context, leaseID string) (string, error)
 	ReadJobStarted(ctx context.Context, leaseID string) (bool, error)
 	ReadLease(ctx context.Context, id string) (ledgerdb.ReadLeaseRow, error)
@@ -195,6 +208,7 @@ type ReadOps interface {
 	ReadRolloutNodeProgress(ctx context.Context, arg ledgerdb.ReadRolloutNodeProgressParams) (ledgerdb.ReadRolloutNodeProgressRow, error)
 	TotalUsage(ctx context.Context) (ledgerdb.TotalUsageRow, error)
 	UsageByNode(ctx context.Context) ([]ledgerdb.UsageByNodeRow, error)
+	UsageByNodeAndTier(ctx context.Context) ([]ledgerdb.UsageByNodeAndTierRow, error)
 	UsageByTier(ctx context.Context) ([]ledgerdb.UsageByTierRow, error)
 	UsageOnNode(ctx context.Context, node string) (ledgerdb.UsageOnNodeRow, error)
 }
@@ -219,6 +233,9 @@ type WriteOps interface {
 	BindLease(ctx context.Context, arg ledgerdb.BindLeaseParams) error
 	BindPoolRunnerJob(ctx context.Context, arg ledgerdb.BindPoolRunnerJobParams) error
 	BumpDispatchGeneration(ctx context.Context, name string) (int64, error)
+	NextUsageSeq(ctx context.Context) (int64, error)
+	TakeUsageSeqs(ctx context.Context, n int64) (int64, error)
+	NumberUsage(ctx context.Context, arg ledgerdb.NumberUsageParams) (int64, error)
 	BumpTierReleases(ctx context.Context, tier string) error
 	ClaimController(ctx context.Context, arg ledgerdb.ClaimControllerParams) (int64, error)
 	ClaimPoolRunnerForRetirement(ctx context.Context, arg ledgerdb.ClaimPoolRunnerForRetirementParams) (sql.Result, error)
@@ -244,6 +261,7 @@ type WriteOps interface {
 	FinishRollout(ctx context.Context, arg ledgerdb.FinishRolloutParams) error
 	ForgetEveryNode(ctx context.Context) error
 	HeartbeatLease(ctx context.Context, arg ledgerdb.HeartbeatLeaseParams) error
+	HeartbeatLeases(ctx context.Context, arg ledgerdb.HeartbeatLeasesParams) ([]ledgerdb.HeartbeatLeasesRow, error)
 	HoldLease(ctx context.Context, arg ledgerdb.HoldLeaseParams) error
 	InsertEnrollment(ctx context.Context, arg ledgerdb.InsertEnrollmentParams) error
 	InsertForceDestroy(ctx context.Context, arg ledgerdb.InsertForceDestroyParams) error
@@ -290,6 +308,8 @@ type WriteOps interface {
 	RecordJobSeries(ctx context.Context, arg ledgerdb.RecordJobSeriesParams) error
 	RecordJobDestinations(ctx context.Context, arg ledgerdb.RecordJobDestinationsParams) error
 	RecordJobGuestReport(ctx context.Context, arg ledgerdb.RecordJobGuestReportParams) (int64, error)
+	RecordJobTestResults(ctx context.Context, arg ledgerdb.RecordJobTestResultsParams) (int64, error)
+	DeleteJobTestResults(ctx context.Context, packed string) (int64, error)
 	MarkJobDetailRetired(ctx context.Context, arg ledgerdb.MarkJobDetailRetiredParams) (int64, error)
 	DeleteRetiredJobSeries(ctx context.Context, stamp string) (int64, error)
 	DeleteRetiredJobDestinations(ctx context.Context, stamp string) (int64, error)

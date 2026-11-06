@@ -39,6 +39,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **The end-to-end suite assembles billet the way `cmd/billet` does.**
 - **The replay harness drives a workload through the real scheduler at compressed time, and steers exactly two things.**
+- **A replay can be of a deployment's own history, and is judged by its tail (#526).**
 - **Generated shell is executed, never pattern-matched.**
 - **Real and live tests skip without their resource and never spend money by accident.**
 - **PostgreSQL is tested against a real server or not at all.**

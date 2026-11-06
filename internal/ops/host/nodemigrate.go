@@ -23,14 +23,24 @@ import (
 // nothing. It observes the unit (a unit still stopping refuses whatever the
 // endpoints say), establishes the running node's EFFECTIVE endpoint from its
 // registration record read inside a bracket of unit observations, requires
-// the rendering (on stdin) to be what is installed, and, when the effective
-// endpoint differs from the installed one, requires a KillMode under which a
+// the rendering (on stdin) to be what is installed, and, when the process dials
+// other controllers than the installed ones, requires a KillMode under which a
 // stop proves something, stops the node under the migration's own deadline
 // with only its own systemctl subprocess ever signalled, proves the stop by
 // observation (inactive, dead, success), starts the node, and waits for the
-// node's own record under the new invocation naming the installed endpoint
-// as effective. The answer is evidence the role carries to the controller's
-// confirmation and to the receipt.
+// node's own record under the new invocation naming the installed controllers.
+// The answer is evidence the role carries to the controller's confirmation and
+// to the receipt.
+//
+// A NODE MAY NAME SEVERAL CONTROLLERS (node.server_addrs), and a process's list
+// is fixed when it starts. So what is compared is the list the process dials,
+// from its record, never only the controller it is on: being on a controller a
+// new configuration still names does not prove the process knows the rest of
+// that configuration's list. The comparison is of the controllers in any order,
+// because an order matters only when a process starts. `from`, `to` and
+// `endpoint` keep naming one endpoint (the controller the node is on, or else
+// the first named), and the answers about a node naming several also carry the
+// lists; everything about a node with one controller stays what it always was.
 //
 // `--dry-run` is THE DECISION, run before the transaction and the render: it
 // reports whether a migration is planned (the effective endpoint, or the
@@ -62,17 +72,19 @@ type migrateStopped struct {
 
 // migrateReport is the dry run's answer.
 type migrateReport struct {
-	Schema      int         `json:"schema"`
-	Outcome     string      `json:"outcome"`
-	Planned     bool        `json:"planned"`
-	FirstStart  bool        `json:"first_start"`
-	NodeRemoved bool        `json:"node_removed"`
-	From        *string     `json:"from"`
-	To          *string     `json:"to"`
-	Effective   *string     `json:"effective"`
-	Record      string      `json:"record"`
-	Config      string      `json:"config"`
-	Unit        migrateUnit `json:"unit"`
+	Schema        int         `json:"schema"`
+	Outcome       string      `json:"outcome"`
+	Planned       bool        `json:"planned"`
+	FirstStart    bool        `json:"first_start"`
+	NodeRemoved   bool        `json:"node_removed"`
+	From          *string     `json:"from"`
+	To            *string     `json:"to"`
+	FromEndpoints []string    `json:"from_endpoints,omitempty"`
+	ToEndpoints   []string    `json:"to_endpoints,omitempty"`
+	Effective     *string     `json:"effective"`
+	Record        string      `json:"record"`
+	Config        string      `json:"config"`
+	Unit          migrateUnit `json:"unit"`
 }
 
 // migrateUnchanged is the action's answer when nothing is to be migrated.
@@ -82,6 +94,7 @@ type migrateUnchanged struct {
 	Node        *string     `json:"node"`
 	Deployment  *string     `json:"deployment"`
 	Endpoint    *string     `json:"endpoint"`
+	Endpoints   []string    `json:"endpoints,omitempty"`
 	Effective   *string     `json:"effective"`
 	Record      string      `json:"record"`
 	NodeRemoved bool        `json:"node_removed"`
@@ -97,6 +110,8 @@ type migrateEvidence struct {
 	Deployment      string         `json:"deployment"`
 	From            string         `json:"from"`
 	To              string         `json:"to"`
+	FromEndpoints   []string       `json:"from_endpoints,omitempty"`
+	ToEndpoints     []string       `json:"to_endpoints,omitempty"`
 	ConfigPath      string         `json:"config_path"`
 	InstalledSHA256 string         `json:"installed_sha256"`
 	InvocationID    string         `json:"invocation_id"`
@@ -195,19 +210,19 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 
 	// (5) THE ENDPOINTS AND THE IDENTITY, from whichever configuration has a
 	// node section.
-	installedEP, installedHasNode, err := nodeEndpointOf(installed.cfg)
+	installedSet, installedHasNode, err := nodeEndpointsOf(installed.cfg)
 	if err != nil {
 		return nil, endpointRefuse(endpointReasonConfig, "the installed configuration's node endpoint: "+err.Error(), "",
 			stateNothing)
 	}
 
 	var (
-		renderedEP      endpoint.Endpoint
+		renderedSet     controllerSet
 		renderedHasNode bool
 	)
 
 	if rendering != nil {
-		renderedEP, renderedHasNode, err = nodeEndpointOf(rendering.cfg)
+		renderedSet, renderedHasNode, err = nodeEndpointsOf(rendering.cfg)
 		if err != nil {
 			return nil, endpointRefuse(endpointReasonDesired, "the rendering's node endpoint: "+err.Error(), "",
 				stateNothing)
@@ -250,8 +265,8 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 
 	insp := endpointInspector()
 
-	in := migrateInputs{installed: installed, rendering: rendering, installedEP: installedEP,
-		installedHasNode: installedHasNode, renderedEP: renderedEP, renderedHasNode: renderedHasNode, identity: identity}
+	in := migrateInputs{installed: installed, rendering: rendering, installedSet: installedSet,
+		installedHasNode: installedHasNode, renderedSet: renderedSet, renderedHasNode: renderedHasNode, identity: identity}
 
 	// (6) TO (10) THE JUDGEMENT, retried from the unit's first observation
 	// when the closing observation finds the process moved under it (three
@@ -281,7 +296,7 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 		return j.answer, nil
 	}
 
-	br, effective := j.br, j.effective
+	br, effective, dials := j.br, j.effective, j.dials
 
 	// (11) THE POLICY AND THE UNIT, ON A FRESH OBSERVATION IMMEDIATELY BEFORE
 	// THE STOP: the judgement's observation is from before the record wait,
@@ -349,7 +364,7 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 	}
 
 	// (16) THE RECORD WAIT under the new invocation, naming the installed
-	// endpoint as effective.
+	// controllers.
 	newBr, elapsed, problem := waitForRecord(ctx, insp, identity, m.wait)
 	if problem != "" {
 		return nil, endpointUnknown(endpointReasonUnproved, "after the start: "+problem, "", stateStartedNoRecord)
@@ -382,10 +397,10 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 			newBr.obs.MainPID, newBr.obs.InvocationID), "", stateStarted)
 	}
 
-	newEP, err := endpoint.ParseCanonical(newBr.record.Endpoint)
-	if err != nil || !newEP.Equal(installedEP) {
+	newEP, newDials, err := recordControllers(newBr.record)
+	if err != nil || !newDials.sameControllers(installedSet) {
 		return nil, endpointUnknown(endpointReasonUnproved, fmt.Sprintf("the started node dials %s, not the installed "+
-			"endpoint %s", newBr.record.Endpoint, installedEP.String()), "", stateStartedNoRecord)
+			"endpoint %s", dialling(newBr.record), installedSet.text()), "", stateStartedNoRecord)
 	}
 
 	// (17) THE CLOSING CHECK: the configuration still the one judged, the
@@ -413,12 +428,44 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 		return nil, endpointUnknown(endpointReasonProcess, why, "", stateStarted)
 	}
 
+	fromAll, toAll := severalPair(dials, installedSet)
+
 	return migrateEvidence{
 		Schema: endpointSchema, Outcome: outcomeMigrated, Node: newBr.record.Node, Deployment: newBr.record.Deployment,
-		From: effective.String(), To: installedEP.String(), ConfigPath: installed.path,
+		From: effective.String(), To: newEP.String(), FromEndpoints: fromAll, ToEndpoints: toAll, ConfigPath: installed.path,
 		InstalledSHA256: installed.sha256, InvocationID: newBr.record.InvocationID,
 		Incarnation: newBr.record.Incarnation, RegisteredAt: newBr.record.RegisteredAt, Stopped: stopped,
 	}, nil
+}
+
+// recordControllers is what a usable record says: the controller the process is
+// on, and the controllers it dials, which name it.
+func recordControllers(rec registrationReport) (endpoint.Endpoint, controllerSet, error) {
+	e, err := endpoint.ParseCanonical(rec.Endpoint)
+	if err != nil {
+		return endpoint.Endpoint{}, nil, err
+	}
+
+	dials, err := rec.controllers()
+	if err != nil {
+		return endpoint.Endpoint{}, nil, err
+	}
+
+	if !dials.contains(e) {
+		return endpoint.Endpoint{}, nil, fmt.Errorf("the record's list does not name %s, the controller it is on", rec.Endpoint)
+	}
+
+	return e, dials, nil
+}
+
+// dialling is what a record's process dials, for a message: the one endpoint, or
+// the list.
+func dialling(rec registrationReport) string {
+	if len(rec.Endpoints) == 0 {
+		return rec.Endpoint
+	}
+
+	return strings.Join(rec.Endpoints, ", ")
 }
 
 // migrateJudgementAttempts bounds the judgement's retries when the process
@@ -426,11 +473,11 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 const migrateJudgementAttempts = 3
 
 // migrateInputs is what the judgement reads: the two configurations, their
-// endpoints and the identity the record must name.
+// controllers and the identity the record must name.
 type migrateInputs struct {
 	installed                         *installedConfigObservation
 	rendering                         *configObservationLite
-	installedEP, renderedEP           endpoint.Endpoint
+	installedSet, renderedSet         controllerSet
 	installedHasNode, renderedHasNode bool
 	identity                          registrationIdentity
 }
@@ -442,7 +489,9 @@ type judgedMigration struct {
 	obs       unitObservation
 	br        bracketedRecord
 	effective *endpoint.Endpoint
-	unit      migrateUnit
+	// dials is what the running process dials, from its record.
+	dials controllerSet
+	unit  migrateUnit
 }
 
 // judgeMigration is steps (6) to (10): the unit's first observation, the
@@ -452,8 +501,8 @@ type judgedMigration struct {
 // the process moved, which the caller retries.
 func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector, in migrateInputs) (judgedMigration, *endpointRefusal, bool) {
 	installed, rendering := in.installed, in.rendering
-	installedEP, installedHasNode := in.installedEP, in.installedHasNode
-	renderedEP, renderedHasNode := in.renderedEP, in.renderedHasNode
+	installedSet, installedHasNode := in.installedSet, in.installedHasNode
+	renderedSet, renderedHasNode := in.renderedSet, in.renderedHasNode
 	identity := in.identity
 
 	// (6) THE UNIT'S FIRST OBSERVATION.
@@ -494,6 +543,7 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 
 	var (
 		effective  *endpoint.Endpoint
+		dials      controllerSet
 		recordKind = recordNone
 	)
 
@@ -512,12 +562,12 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 		return judgedMigration{}, endpointUnknown(endpointReasonRecord, "the running node's record cannot be judged: "+br.why, "",
 			stateNothing), false
 	case br.class == recordUsable:
-		e, err := endpoint.ParseCanonical(br.record.Endpoint)
+		e, set, err := recordControllers(br.record)
 		if err != nil {
 			return judgedMigration{}, endpointUnknown(endpointReasonRecord, "the record's endpoint: "+err.Error(), "", stateNothing), false
 		}
 
-		effective, recordKind = &e, recordCurrent
+		effective, dials, recordKind = &e, set, recordCurrent
 	case elapsed:
 		// A RUNNING NODE WITHOUT A USABLE RECORD: positively a release before
 		// the guard, or could-not-tell.
@@ -577,29 +627,36 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 			Config: configWord(installed.present), Effective: canonicalPtr(effective),
 		}
 
+		from := installedSet
 		if effective != nil {
+			from = dials
 			report.From = canonicalPtr(effective)
 		} else if installedHasNode {
-			report.From = canonicalOrNull(installedEP, true)
+			report.From = canonicalOrNull(installedSet[0], true)
 		}
 
 		if rendering != nil {
-			report.To = canonicalOrNull(renderedEP, renderedHasNode)
+			if renderedHasNode {
+				report.To = canonicalOrNull(renderedSet[0], true)
+			}
+
 			report.NodeRemoved = !renderedHasNode
 			report.FirstStart = !installedHasNode && renderedHasNode && !br.running
 
 			if renderedHasNode {
-				if effective != nil && !effective.Equal(renderedEP) {
+				if effective != nil && !dials.sameControllers(renderedSet) {
 					report.Planned = true
 				}
 
-				if installedHasNode && !installedEP.Equal(renderedEP) {
+				if installedHasNode && !installedSet.sameControllers(renderedSet) {
 					report.Planned = true
 				}
 			}
-		} else if effective != nil && installedHasNode && !effective.Equal(installedEP) {
+		} else if effective != nil && installedHasNode && !dials.sameControllers(installedSet) {
 			report.Planned = true
 		}
+
+		report.FromEndpoints, report.ToEndpoints = severalPair(from, renderedSet)
 
 		if problem := closeInstalledConfig(installed); problem != "" {
 			return judgedMigration{}, endpointUnknown(endpointReasonConfig, problem, "", stateNothing), false
@@ -618,7 +675,7 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 			"; the render precedes this command", "", stateNothing), false
 	}
 
-	if renderedHasNode != installedHasNode || (renderedHasNode && !renderedEP.Equal(installedEP)) {
+	if renderedHasNode != installedHasNode || (renderedHasNode && !renderedSet.sameOrder(installedSet)) {
 		return judgedMigration{}, endpointRefuse(endpointReasonDesired, "the rendering was not installed: the installed configuration's "+
 			"node endpoint is not the rendering's", "the render precedes this command", stateNothing), false
 	}
@@ -637,7 +694,15 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 			Effective: canonicalPtr(effective), NodeRemoved: rendering != nil && !renderedHasNode}
 
 		if installedHasNode {
-			out.Endpoint = canonicalOrNull(installedEP, true)
+			// THE CONTROLLER IT IS ON, WHERE IT NAMES SEVERAL, and the list beside
+			// it: with one controller that is the one it names.
+			out.Endpoint = canonicalOrNull(installedSet[0], true)
+			if effective != nil && installedSet.contains(*effective) {
+				out.Endpoint = canonicalPtr(effective)
+			}
+
+			out.Endpoints = installedSet.severalTexts()
+
 			// THE IDENTITY IS SEPARATE from the record's judgement: the name is
 			// the configuration's effective one whenever a node section exists,
 			// and the deployment a string only where a certificate or an
@@ -659,7 +724,7 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 		return judgedMigration{answer: out}, nil, false
 	}
 
-	if !br.running || !renderedHasNode || (effective != nil && effective.Equal(installedEP)) {
+	if !br.running || !renderedHasNode || (effective != nil && dials.sameControllers(installedSet)) {
 		return unchanged()
 	}
 
@@ -671,7 +736,7 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 		return unchanged()
 	}
 
-	return judgedMigration{obs: obs, br: br, effective: effective, unit: unit}, nil, false
+	return judgedMigration{obs: obs, br: br, effective: effective, dials: dials, unit: unit}, nil, false
 }
 
 // closeUnitObservation is the closing check of a reported or unchanged

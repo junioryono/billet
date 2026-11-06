@@ -168,7 +168,7 @@ func TestTheCausesAreTheClosedList(t *testing.T) {
 		}
 	}
 	if len(RerunCauses) != 2 {
-		t.Errorf("there are %d causes; a new one is a decision for ADR-023", len(RerunCauses))
+		t.Errorf("there are %d causes; a new one is a decision for ADR-028", len(RerunCauses))
 	}
 }
 

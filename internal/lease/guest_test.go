@@ -98,3 +98,50 @@ func TestAGuestReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 		t.Fatalf("a report whose one batch arrived once was refused: %v", err)
 	}
 }
+
+// TEST RESULTS ARE OPAQUE TO THE CONTROL PLANE, SO WHAT IT HOLDS THEM TO IS THEIR
+// CODEC AND THEIR BOUND, and either both are named or neither is.
+func TestAGuestReportsTestsAreHeldToTheirCodecAndBound(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		codec int
+		tests []byte
+		says  string
+	}{
+		"neither":            {0, nil, ""},
+		"both":               {TestResultsCodec, []byte{1}, ""},
+		"at the bound":       {TestResultsCodec, make([]byte, MaxTestResultsBytes), ""},
+		"past the bound":     {TestResultsCodec, make([]byte, MaxTestResultsBytes+1), "over the"},
+		"a codec of nothing": {TestResultsCodec, nil, "carries none"},
+		"bytes of no codec":  {0, []byte{1}, "codec 0"},
+		"an unknown codec":   {2, []byte{1}, "codec 2"},
+	} {
+		err := GuestReport{Codec: GuestReportCodec, TestsCodec: tc.codec, Tests: tc.tests}.Validate()
+		switch {
+		case tc.says == "" && err != nil:
+			t.Errorf("%s: refused: %v", name, err)
+		case tc.says != "" && (err == nil || !strings.Contains(err.Error(), tc.says)):
+			t.Errorf("%s: %v, want a refusal saying %q", name, err, tc.says)
+		}
+	}
+}
+
+// BELOW THE WIRE THAT CARRIES THEM A REPORT IS THE REST OF ITSELF, and the caller's is
+// not changed.
+func TestAReportWithoutTestsIsTheRestOfIt(t *testing.T) {
+	t.Parallel()
+
+	report := GuestReport{Codec: GuestReportCodec, Accepted: 3, TestsCodec: TestResultsCodec, Tests: []byte{1}}
+
+	got := report.WithoutTests()
+	if got.TestsCodec != 0 || got.Tests != nil || got.Accepted != 3 {
+		t.Errorf("WithoutTests = %+v", got)
+	}
+	if report.TestsCodec != TestResultsCodec || len(report.Tests) != 1 {
+		t.Errorf("the caller's report was changed: %+v", report)
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("it does not validate: %v", err)
+	}
+}

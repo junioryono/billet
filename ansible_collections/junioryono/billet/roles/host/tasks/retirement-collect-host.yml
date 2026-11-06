@@ -166,6 +166,17 @@
           Retirement collection: {{ billet_retirement_collect_host }} did not report a desired node endpoint.
           {{ billet_endpoint_answer.why | default('') }}
 
+    # A RETIREMENT LEAVES ONE CONTROLLER, and the command refuses a node naming
+    # several; said here too, before the request, in the operator's terms.
+    - name: Require this node to name one controller
+      ansible.builtin.assert:
+        that:
+          - billet_endpoint_answer.to_endpoints | default([]) | length < 2
+        fail_msg: >-
+          Retirement collection: {{ billet_retirement_collect_host }} renders
+          {{ billet_endpoint_answer.to_endpoints | default([]) | join(', ') }} in node.server_addrs, and a retirement
+          leaves one controller. Name the survivor alone, which an ordinary converge migrates the node to, then retire.
+
     - name: Carry this node's exact rendering digest and answered endpoint
       ansible.builtin.set_fact:
         billet_retirement_desired_nodes: >-

@@ -292,3 +292,67 @@ func burstWithin(t *testing.T, lookup time.Duration, asked, withdrawn int) {
 			len(reg.askedFor), reg.withdrawn, asked, withdrawn)
 	}
 }
+
+// A BURST OF CANCELLATIONS FREES THE TIER AND THE TIER BEHIND IT, in the one
+// message that carries them (#690). One tier's runners fill the fleet and every
+// job they were launched for is cancelled while GitHub still counts more of that
+// tier's work, and another tier waits for room under the fair order. Left in the
+// pool, those idle runners held the room for 20 minutes or more: the tier's own
+// purchases were refused, and the tier waiting behind it could not start either.
+func TestABurstOfCancellationsFreesTheRoomForTheTierWaiting(t *testing.T) {
+	t.Parallel()
+
+	tiers := contenders()
+	a, err := alloc.New(openState(t), alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerHost(t, a)
+
+	reg := &inspectingRegistry{githubIDs: map[string]int64{}, byName: map[string][]RunnerState{}}
+	log := &launchLog{}
+	s := New(a, nil, tiers, "order-test", nil, WithNodeRunner(log), WithAdmissionOrder(config.AdmissionFair))
+	stuck := NewListener(a, tiers[0].Label, &fakeSession{}, append(s.listenerOpts(nil), WithRunnerRegistry(reg))...)
+	stuck.writeJobResult = func(context.Context, string, string, int64) error { return nil }
+	waiting := NewListener(a, tiers[1].Label, &fakeSession{}, s.listenerOpts(nil)...)
+
+	jobs := []dispatch.Job{job11, job12}
+	if err := stuck.handle(t.Context(), &Message{MessageID: 1, Assigned: jobs,
+		Statistics: &Statistics{TotalAssignedJobs: len(jobs)}}); err != nil {
+		t.Fatalf("launch the pool: %v", err)
+	}
+	cancelled := make([]dispatch.Job, 0, len(jobs))
+	for i := range jobs {
+		runner, err := a.PoolRunnerLaunchedFor(t.Context(), stuck.tier, jobs[i].RequestID)
+		if err != nil {
+			t.Fatalf("the runner launched for %d: %v", jobs[i].RequestID, err)
+		}
+		reg.githubIDs[runner.RunnerName] = 4400 + jobs[i].RequestID
+		reg.byName[runner.RunnerName] = []RunnerState{{Present: true}}
+		job := jobs[i]
+		job.Result = "Canceled"
+		cancelled = append(cancelled, job)
+	}
+
+	if err := waiting.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("the waiting tier's first reconcile: %v", err)
+	}
+	if got := log.tiers(); slices.Contains(got, tiers[1].Label) {
+		t.Fatalf("started %v: the fleet was full, so the fixture has nothing waiting", got)
+	}
+
+	if err := stuck.handle(t.Context(), &Message{MessageID: 2, Completed: cancelled,
+		Statistics: &Statistics{TotalAssignedJobs: len(jobs)}}); err != nil {
+		t.Fatalf("the cancellations were refused: %v", err)
+	}
+	if !slices.Equal(reg.withdrawn, []int64{4411, 4412}) && !slices.Equal(reg.withdrawn, []int64{4412, 4411}) {
+		t.Fatalf("withdrawn ids = %v, want both cancelled jobs' runners", reg.withdrawn)
+	}
+
+	if err := waiting.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("the waiting tier's reconcile after the burst: %v", err)
+	}
+	if got := log.tiers(); !slices.Contains(got, tiers[1].Label) {
+		t.Fatalf("started %v: the burst freed nothing for the tier waiting behind it", got)
+	}
+}

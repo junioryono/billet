@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -103,10 +104,35 @@ type Report struct {
 	// reader can tell them from a missing job.
 	EscrowRows int
 	// DeclinedThenRun counts assignments the scripted service saw billet
-	// acknowledge with no runner and a later runner take: the one figure here
-	// the harness counted rather than read from the ledger, because nothing in
-	// the ledger records a decline.
+	// acknowledge with no runner and a later runner take, and Declined, per
+	// tier, the jobs a purchase for which billet refused at least once, each
+	// job counted once however often it was refused: an offer acknowledged
+	// without being acquired, or a direct assignment acknowledged with no
+	// runner minted. The figures here the harness counted rather than read from
+	// the ledger, because nothing in the ledger records a decline.
 	DeclinedThenRun int
+	Declined        map[string]int
+	// Horizon is the replay's Options.Until, zero when it replayed every event.
+	Horizon time.Time
+	// StillQueued are the jobs that had arrived by the horizon and not started:
+	// work the fleet had not reached when the replay ended. Their waits are kept
+	// out of every percentile, which is #525's rule for jobs still queued, and
+	// LongestQueued is the oldest of them at the horizon.
+	StillQueued   []int64
+	LongestQueued time.Duration
+	// LaterArrivals are trace jobs that arrive after the horizon: outside the
+	// window, neither missing nor queued.
+	LaterArrivals int
+	// LostStarts and LostCompletions are recorded jobs whose start, or whose
+	// completion, the scripted GitHub delivered and the ledger never recorded:
+	// lost, whatever the horizon, and never counted as still queued.
+	LostStarts      []int64
+	LostCompletions []int64
+	// startsSent and completionsSent count the jobs whose start and whose
+	// completion the scripted GitHub delivered.
+	startsSent, completionsSent int
+	// queued are the arrivals of the jobs still queued, by Seq.
+	queued map[int64]Arrival
 	// ByJobID counts the jobs found by their GitHub job id because billet
 	// recorded them under a request id of its own, which is every job a
 	// direct-assignment replay ran and none an offered one did.
@@ -155,8 +181,14 @@ func byJobID(byRequest map[int64]*Arrival, jobID string) (*Arrival, bool) {
 	return a, found
 }
 
-// readReport reads job_history back and joins it to the trace.
-func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, direct bool) (*Report, error) {
+// readReport reads job_history back and joins it to the trace. A trace job
+// arriving after until (when set) is outside the replay's window, and one in it
+// that had not started is still queued when the ledger recorded it or GitHub
+// (waiting, the plane's books) still holds it, and lost otherwise.
+func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, direct, background bool,
+	until time.Time,
+	waiting, startsSent map[int64]bool,
+) (*Report, error) {
 	bound := int64(len(trace.Arrivals)) + historyBound
 
 	rows, err := state.ReadQueries(db.Reader()).ListJobHistory(ctx, bound)
@@ -173,7 +205,7 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, dir
 		byRequest[trace.Arrivals[i].Seq] = &trace.Arrivals[i]
 	}
 
-	r := &Report{Fleet: fleet}
+	r := &Report{Fleet: fleet, Horizon: until}
 	seen := make(map[int64]bool, len(rows))
 	reads := state.ReadQueries(db.Reader())
 
@@ -300,7 +332,7 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, dir
 			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
 		}
 
-		if err := rec.checkOrder(); err != nil {
+		if err := rec.checkOrderWhen(background); err != nil {
 			return nil, fmt.Errorf("lease %s of job %d: %w", row.LeaseID, a.Seq, err)
 		}
 
@@ -329,17 +361,61 @@ func readReport(ctx context.Context, db *state.DB, fleet Fleet, trace Trace, dir
 		r.Records = append(r.Records, rec)
 	}
 
-	for i := range trace.Arrivals {
-		if seq := trace.Arrivals[i].Seq; !seen[seq] {
-			r.Missing = append(r.Missing, seq)
-		}
-	}
+	r.classify(trace, until, seen, waiting, startsSent)
 
 	slices.SortFunc(r.Records, func(a, b Record) int { return int(a.Seq - b.Seq) })
 	r.deriveLocality()
 	r.Violations = r.checkCapacity()
 
 	return r, nil
+}
+
+// classify sorts every trace job the started records do not account for: a
+// later arrival past the horizon, a start the scripted GitHub delivered and
+// the ledger never recorded (lost), a job still queued at the horizon (arrived,
+// not started, and recorded or held by the plane), or one the ledger lost.
+// seen are the jobs the ledger recorded, waiting the jobs the plane still
+// holds, and startsSent the jobs whose start it delivered.
+func (r *Report) classify(trace Trace, until time.Time, seen, waiting, startsSent map[int64]bool) {
+	started := make(map[int64]bool, len(r.Records))
+	for i := range r.Records {
+		started[r.Records[i].Seq] = !r.Records[i].StartedAt.IsZero()
+	}
+
+	r.startsSent = len(startsSent)
+	r.queued = map[int64]Arrival{}
+
+	for i := range trace.Arrivals {
+		a := &trace.Arrivals[i]
+
+		switch {
+		case !until.IsZero() && a.At.After(until):
+			r.LaterArrivals++
+		case seen[a.Seq] && !started[a.Seq] && startsSent[a.Seq]:
+			r.LostStarts = append(r.LostStarts, a.Seq)
+		case !until.IsZero() && !started[a.Seq] && (seen[a.Seq] || waiting[a.Seq]):
+			r.StillQueued = append(r.StillQueued, a.Seq)
+			r.queued[a.Seq] = *a
+			r.LongestQueued = max(r.LongestQueued, until.Sub(a.At))
+		case !seen[a.Seq]:
+			r.Missing = append(r.Missing, a.Seq)
+		}
+	}
+}
+
+// noteLostCompletions records, from the completions the plane delivered, the
+// recorded jobs the ledger never saw finish although their completion was
+// delivered: a completion the harness sent and billet lost, which no horizon
+// explains, judged from what was sent rather than from a deadline the ledger's
+// own times would have to reconstruct.
+func (r *Report) noteLostCompletions(delivered map[int64]bool) {
+	r.completionsSent = len(delivered)
+	for i := range r.Records {
+		rec := &r.Records[i]
+		if rec.FinishedAt.IsZero() && delivered[rec.Seq] {
+			r.LostCompletions = append(r.LostCompletions, rec.Seq)
+		}
+	}
 }
 
 // complete refuses a history read that filled its bound: a truncated ledger
@@ -399,13 +475,19 @@ func (rec *Record) checkAgainstLease(host string, vcpu int, memory config.ByteSi
 // archived, and a job cannot start before it arrived. A row out of that order
 // would yield a negative wait or end a charge before it began, and a report
 // built on it would still look authoritative.
-func (rec *Record) checkOrder() error {
+func (rec *Record) checkOrder() error { return rec.checkOrderWhen(false) }
+
+// checkOrderWhen is checkOrder for a replay whose runners may predate their jobs. A pool
+// member is any job's, and one delivered events wait for cannot have started before the
+// job that caused it. With launches beside the listener's loop one can, and the job it
+// takes later still cannot START before it arrived, which stays refused.
+func (rec *Record) checkOrderWhen(runnerMayPredateJob bool) error {
 	switch {
 	case rec.AssignedAt.IsZero():
 		return errors.New("the job was recorded with no assignment time")
 	case rec.AssignedAt.Before(rec.ChargedFrom):
 		return fmt.Errorf("assigned at %s, before its lease was escrowed at %s", rec.AssignedAt, rec.ChargedFrom)
-	case rec.AssignedAt.Before(rec.Arrival):
+	case !runnerMayPredateJob && rec.AssignedAt.Before(rec.Arrival):
 		return fmt.Errorf("assigned at %s, before it arrived at %s", rec.AssignedAt, rec.Arrival)
 	case !rec.StartedAt.IsZero() && rec.StartedAt.Before(rec.AssignedAt):
 		return fmt.Errorf("started at %s, before it was assigned at %s", rec.StartedAt, rec.AssignedAt)
@@ -656,10 +738,11 @@ func (r *Report) HostsUsed() int {
 	return len(used)
 }
 
-// Percentiles are the queue-wait figures the summary reports for one group.
+// Percentiles are the queue-wait figures the summary reports for one group,
+// each nearest rank over the group's started jobs.
 type Percentiles struct {
-	Count         int
-	P50, P95, Max time.Duration
+	Count                          int
+	P50, P90, P95, P99, P9999, Max time.Duration
 }
 
 // QueueWaitBy groups the started records by a key and reports each group's
@@ -683,8 +766,11 @@ func (r *Report) QueueWaitBy(key func(*Record) string) map[string]Percentiles {
 		slices.Sort(waits)
 		out[k] = Percentiles{
 			Count: len(waits),
-			P50:   percentile(waits, 0.50),
-			P95:   percentile(waits, 0.95),
+			P50:   percentile(waits, 5000),
+			P90:   percentile(waits, 9000),
+			P95:   percentile(waits, 9500),
+			P99:   percentile(waits, 9900),
+			P9999: percentile(waits, 9999),
 			Max:   waits[len(waits)-1],
 		}
 	}
@@ -692,11 +778,66 @@ func (r *Report) QueueWaitBy(key func(*Record) string) map[string]Percentiles {
 	return out
 }
 
-// percentile is the nearest-rank percentile of a sorted, non-empty slice.
-func percentile(sorted []time.Duration, p float64) time.Duration {
-	i := int(float64(len(sorted))*p+0.999999) - 1
+// percentile is the nearest-rank percentile of a sorted, non-empty slice, the
+// percentile given in parts per ten thousand, as every percentile billet
+// reports is (alloc.NearestRank).
+func percentile(sorted []time.Duration, perTenThousand int) time.Duration {
+	return sorted[min(alloc.NearestRank(perTenThousand, len(sorted)), len(sorted))-1]
+}
 
-	return sorted[min(max(i, 0), len(sorted)-1)]
+// text is the percentiles as the summary prints them.
+func (p Percentiles) text() string {
+	return fmt.Sprintf("p50 %s p90 %s p95 %s p99 %s p99.99 %s max %s", p.P50, p.P90, p.P95, p.P99, p.P9999,
+		p.Max)
+}
+
+// QueueWaitByShape is QueueWaitBy grouped by the charged vCPU, the shape a
+// scheduling policy is judged per (#525).
+func (r *Report) QueueWaitByShape() map[int]Percentiles {
+	byLabel := r.QueueWaitBy(func(rec *Record) string { return strconv.Itoa(rec.VCPU) })
+	out := make(map[int]Percentiles, len(byLabel))
+
+	for k, p := range byLabel {
+		vcpu, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+
+		out[vcpu] = p
+	}
+
+	return out
+}
+
+// QueuedByShape is, per tier shape's vCPU, how many jobs were still queued at
+// the horizon and the oldest of them: the backlog the percentiles leave out.
+func (r *Report) QueuedByShape() map[int]Backlog {
+	vcpu := make(map[string]int, len(r.Fleet.Tiers))
+	for _, t := range r.Fleet.Tiers {
+		vcpu[t.Label] = t.VCPU
+	}
+
+	out := map[int]Backlog{}
+
+	for _, seq := range r.StillQueued {
+		a, ok := r.queued[seq]
+		if !ok {
+			continue
+		}
+
+		b := out[vcpu[a.Tier]]
+		b.Count++
+		b.Oldest = max(b.Oldest, r.Horizon.Sub(a.At))
+		out[vcpu[a.Tier]] = b
+	}
+
+	return out
+}
+
+// Backlog is a group of jobs still queued at the horizon.
+type Backlog struct {
+	Count  int
+	Oldest time.Duration
 }
 
 // LocalityRate is the share of started jobs whose repository already had a job
@@ -745,18 +886,38 @@ func (r *Report) Summary() string {
 	fmt.Fprintf(&b, "jobs recorded: %d (missing %d, never started %d, never finished %d, escrow rows %d)\n",
 		len(r.Records), len(r.Missing), len(r.Unstarted), len(r.Unfinished), r.EscrowRows)
 
+	if len(r.LostStarts) > 0 || len(r.LostCompletions) > 0 {
+		fmt.Fprintf(&b, "LOST: the scripted GitHub delivered the start of %v and the completion of %v, and the "+
+			"ledger never recorded them\n", r.LostStarts, r.LostCompletions)
+	}
+
+	if !r.Horizon.IsZero() {
+		fmt.Fprintf(&b, "horizon %s: %d jobs still queued, recorded or held by the scripted GitHub (the "+
+			"oldest for %s), kept out of every percentile; %d arrive after it\n", r.Horizon.Format(time.RFC3339),
+			len(r.StillQueued), r.LongestQueued, r.LaterArrivals)
+	}
+
 	byTier := r.QueueWaitBy(func(rec *Record) string { return rec.Tier })
 	for _, tier := range slices.Sorted(maps.Keys(byTier)) {
 		p := byTier[tier]
-		fmt.Fprintf(&b, "tier %s: %d jobs, queue wait p50 %s p95 %s max %s\n",
-			tier, p.Count, p.P50, p.P95, p.Max)
+		fmt.Fprintf(&b, "tier %s: %d jobs, queue wait %s; %d jobs refused at least once\n", tier, p.Count,
+			p.text(), r.Declined[tier])
 	}
+
+	byShape := r.QueueWaitByShape()
+	for _, vcpu := range slices.Sorted(maps.Keys(byShape)) {
+		p := byShape[vcpu]
+		fmt.Fprintf(&b, "shape %d vCPU: %d jobs, queue wait %s\n", vcpu, p.Count, p.text())
+	}
+
+	vcpu, memory := r.MeanUtilization()
+	fmt.Fprintf(&b, "utilization (charged, escrow included): %.0f%% of the room's vCPU, %.0f%% of its memory; "+
+		"%.1f host-hours empty\n", 100*vcpu, 100*memory, r.EmptyHostHours())
 
 	byRepo := r.QueueWaitBy(func(rec *Record) string { return rec.FullName() })
 	for _, repo := range slices.Sorted(maps.Keys(byRepo)) {
 		p := byRepo[repo]
-		fmt.Fprintf(&b, "repository %s: %d jobs, queue wait p50 %s p95 %s max %s\n",
-			repo, p.Count, p.P50, p.P95, p.Max)
+		fmt.Fprintf(&b, "repository %s: %d jobs, queue wait %s\n", repo, p.Count, p.text())
 	}
 
 	peaks := r.PeakVCPUByNode()

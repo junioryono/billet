@@ -89,5 +89,12 @@
     "energy_idle_uj": 600000000,
     "energy_source": "rapl"
   },
-  "guest": null
+  "prediction": null,
+  "guest": null,
+  "tests": {
+    "notice": "Reported by the job's own VM. The job runs as root there and can change any of it; billet does not act on it.",
+    "results": null
+  },
+  "head_sha": "",
+  "head_branch": ""
 }

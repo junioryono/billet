@@ -72,3 +72,65 @@ func (s *Server) retireJobDetailOnce(ctx context.Context, now time.Time) {
 			"destinations", destinations, "guest_reports", guest, "retention", retention)
 	}
 }
+
+const (
+	// usageNumberBatch is how many finished leases one transaction numbers, and
+	// usageNumberBatches how many of those a pass takes, so the writer slot is held
+	// for one batch at a time and a long history is worked through over many passes:
+	// at this rate a million leases take a little over three hours.
+	usageNumberBatch   = 500
+	usageNumberBatches = 100
+)
+
+// numberUsage gives the leases that finished before there were usage numbers their
+// numbers, until ctx ends. Migration 72 says why this is not the migration's to do. It
+// decides nothing: a pass that fails is logged and the next one tries again.
+func (s *Server) numberUsage(ctx context.Context) {
+	tick := time.NewTicker(retentionEvery)
+	defer tick.Stop()
+
+	for {
+		s.numberUsageOnce(ctx)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+// numberUsageOnce is one pass.
+func (s *Server) numberUsageOnce(ctx context.Context) {
+	total := 0
+
+	for range usageNumberBatches {
+		if ctx.Err() != nil {
+			return
+		}
+
+		ids, err := s.alloc.UnnumberedUsage(ctx, usageNumberBatch)
+		if err != nil {
+			s.log.Warn("could not list leases waiting for a usage number; trying again", "error", err)
+
+			break
+		}
+
+		if len(ids) == 0 {
+			break
+		}
+
+		numbered, err := s.alloc.NumberUsage(ctx, ids)
+		if err != nil {
+			s.log.Warn("could not number leases' usage; trying again", "error", err)
+
+			break
+		}
+
+		total += numbered
+	}
+
+	if total > 0 {
+		s.log.Info("numbered finished leases for the usage export", "leases", total)
+	}
+}

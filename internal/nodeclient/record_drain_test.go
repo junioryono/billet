@@ -120,8 +120,14 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 				})
 			}()
 
+			// RECOVERY IS RELEASED ONCE, by the test or by its cleanup: a test
+			// failing before it releases it would otherwise leave the stop's own
+			// recovery waiting at the gate, and the cleanup waiting on the loop.
+			releaseRecovery := sync.OnceFunc(func() { close(compute.recoverGate) })
+
 			t.Cleanup(func() {
 				cancel()
+				releaseRecovery()
 				compute.setHolding(false)
 				<-loopDone
 			})
@@ -144,7 +150,7 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 			}
 
 			cancel()
-			close(compute.recoverGate)
+			releaseRecovery()
 
 			// The drain's first poll waits at the gate.
 			waitFor(t, func() bool { return h.count(pollPath) > polls })
@@ -192,8 +198,16 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 			waitFor(t, func() bool { return h.count("/v1/register") > regs })
 			regGate <- struct{}{}
 
-			// The failure backs off and polls again.
-			waitFor(t, func() bool { return h.count(pollPath) > polls })
+			// The failure backs off and REGISTERS AGAIN, the next registration
+			// held at the gate, without polling a control plane that has just
+			// said it does not know this node.
+			waitFor(t, func() bool { return h.count("/v1/register") > regs+1 })
+
+			// THE POLL RELEASED ABOVE WAS COUNTED WHEN IT ARRIVED, before polls
+			// was read, so any poll since is one the drain made after failing.
+			if got := h.count(pollPath); got != polls {
+				t.Errorf("the drain polled %d times after its registration failed, want none", got-polls)
+			}
 
 			if installs.Load() != baseline || inodeOf(t, path) != inode {
 				t.Errorf("a failed drain registration published")
@@ -209,17 +223,25 @@ func TestADrainsReRegistrationPublishesAndSupersessionDoesNot(t *testing.T) {
 
 			switch supersededBy {
 			case "the registration":
+				// THE REGISTRATION HELD AT THE GATE is the one superseded.
 				h.answerRegister(func(w http.ResponseWriter, _ *http.Request) bool {
 					superseded(w)
 
 					return true
 				})
-				h.answerPollsUnregistered(t, 1)
-				regs = h.count("/v1/register")
-				pollGate <- struct{}{}
-				waitFor(t, func() bool { return h.count("/v1/register") > regs })
 				regGate <- struct{}{}
 			case "a poll":
+				// THE HELD REGISTRATION IS ACCEPTED, and publishes; the poll after
+				// it is the one superseded, so the baseline is taken after it.
+				h.answerRegister(func(http.ResponseWriter, *http.Request) bool { return false })
+				polls = h.count(pollPath)
+				regGate <- struct{}{}
+				waitFor(t, func() bool { return h.count(pollPath) > polls })
+
+				baseline, inode = installs.Load(), inodeOf(t, path)
+				body, err = os.ReadFile(path)
+				mustOK(t, err)
+
 				h.mu.Lock()
 				h.answer[pollPath] = func(w http.ResponseWriter, _ *http.Request) bool {
 					superseded(w)
@@ -606,9 +628,10 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 	}
 
 	// THE CLIENT IS BUILT WHERE THE NODE IS ASSEMBLED, through the shared
-	// constructor and with the TLS the identity gave: one NewNodeClient(cfg,
-	// tlsConf) in (*Node).open, and no nodeclient.New anywhere in node.go but
-	// the constructor itself.
+	// constructor and with the identity the certificate gave, from which it
+	// makes each controller's TLS: one NewNodeClient(cfg, identity) in
+	// (*Node).open, and no nodeclient.New anywhere in node.go but the
+	// constructor itself.
 	for name, fn := range app {
 		if n := calls(fn, "nodeclient", "New"); name != "NewNodeClient" && n != 0 {
 			t.Errorf("internal/app's %s calls nodeclient.New %d times beside NewNodeClient", name, n)
@@ -635,7 +658,7 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 			cfg, cfgOK := call.Args[0].(*ast.Ident)
 			conf, confOK := call.Args[1].(*ast.Ident)
 
-			if cfgOK && confOK && cfg.Name == "cfg" && conf.Name == "tlsConf" {
+			if cfgOK && confOK && cfg.Name == "cfg" && conf.Name == "identity" {
 				shared++
 			}
 		}
@@ -644,7 +667,7 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 	})
 
 	if shared != 1 {
-		t.Errorf("(*Node).open builds its client with NewNodeClient(cfg, tlsConf) %d times, want once", shared)
+		t.Errorf("(*Node).open builds its client with NewNodeClient(cfg, identity) %d times, want once", shared)
 	}
 
 	// THE PATH REACHES THE LOOP, link by link: cmdNode hands Run the host

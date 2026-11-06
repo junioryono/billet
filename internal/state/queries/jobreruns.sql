@@ -1,5 +1,5 @@
 -- Re-running a job billet disrupted (#541): what the loop asks of the ledger, and
--- what it records on the original job. ADR-023 holds the rule these serve.
+-- what it records on the original job. ADR-028 holds the rule these serve.
 
 -- name: ListRerunCandidates :many
 -- The jobs that ended red on a lease a cause from the closed list disrupted, that

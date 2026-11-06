@@ -100,6 +100,10 @@ func gitHubAccessNote(ctx context.Context, cfg *config.Config) string {
 
 // gitHubTargetAccessNote is one target's paragraph.
 func gitHubTargetAccessNote(ctx context.Context, cfg *config.Config, gh config.GitHubTarget) string {
+	if cfg.Server != nil && cfg.Server.TokenBroker != nil {
+		return brokerAccessNote(ctx, cfg, gh)
+	}
+
 	key, err := app.ResolveAppKey(ctx, cfg, gh)
 	if err != nil {
 		return fmt.Sprintf("billet could not read the App key for target %s at %s to find out why: %v",

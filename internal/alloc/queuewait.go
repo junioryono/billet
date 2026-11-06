@@ -229,7 +229,7 @@ type QueueTimeCursor struct {
 }
 
 // JobsAwaitingQueueTime reads at most limit jobs that started at or after
-// since and have no GitHub queue time, newest start first, from after.
+// since and have no GitHub queue time or no commit, newest start first, from after.
 func (a *Allocator) JobsAwaitingQueueTime(ctx context.Context, since time.Time, after QueueTimeCursor,
 	limit int,
 ) ([]AwaitingQueueTime, error) {
@@ -335,10 +335,14 @@ func Summarize(jobs []JobWait, part func(JobWait) (time.Duration, bool)) WaitSum
 	return out
 }
 
-// nearestRank is the 1-based rank of a percentile given in parts per ten
+// NearestRank is the 1-based rank of a percentile given in parts per ten
 // thousand: the smallest rank whose share of n reaches it, ceil(p*n/10000).
 // In integers, because a float rounding of 0.9999*n is exactly where p99.99
-// would pick the wrong job.
+// would pick the wrong job. Every percentile billet reports is this one.
+func NearestRank(perTenThousand, n int) int {
+	return nearestRank(perTenThousand, n)
+}
+
 func nearestRank(perTenThousand, n int) int {
 	return max((perTenThousand*n+9999)/10000, 1)
 }

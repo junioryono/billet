@@ -31,10 +31,14 @@ func cacheCommand(call []string) (verb, image string, ok bool) {
 			verb = arg
 
 			return target(1)
-		case "clone", "cp":
+		case "clone":
 			verb = arg
 
 			return target(2)
+		case "flatten":
+			verb = arg
+
+			return target(1)
 		}
 	}
 
@@ -111,7 +115,7 @@ func requireCacheImageRules(t *testing.T, calls [][]string, want ...string) {
 			seen[verb] = true
 
 			switch verb {
-			case "create", "clone", "cp":
+			case "create", "clone":
 				have := features(call)
 				for _, feature := range []string{
 					"layering", "exclusive-lock", "object-map", "fast-diff", "deep-flatten",
@@ -120,7 +124,7 @@ func requireCacheImageRules(t *testing.T, calls [][]string, want ...string) {
 						t.Errorf("a cache image was made without %s: %v", feature, call)
 					}
 				}
-			case "rm", "snap create", "snap rm", "snap purge", "trash mv", "image-meta set",
+			case "rm", "flatten", "snap create", "snap rm", "snap purge", "trash mv", "image-meta set",
 				"image-meta remove":
 				if !keepsClient(call) {
 					t.Errorf("a command that changes a cache image could blocklist the host: %v", call)

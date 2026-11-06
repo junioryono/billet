@@ -78,7 +78,7 @@ It shows two facts side by side and no verdict between them: GitHub's own result
 
 ## Re-running a job billet ended
 
-A tier can ask for more: `retry: {disrupted: 1}` lets billet ask GitHub to re-run a job it ended, up to that many times for one workflow run. The App needs `actions: write`, which `billet github-app create --actions-write` asks for; on an App that already exists, add the permission on the App's settings page and accept it on the installation, and `billet check` says when it holds what the tiers need. [ADR-023](../reference/decisions/adr-023-rerunning-disrupted-jobs.md) holds the decision.
+A tier can ask for more: `retry: {disrupted: 1}` lets billet ask GitHub to re-run a job it ended, up to that many times for one workflow run. The App needs `actions: write`, which `billet github-app create --actions-write` asks for; on an App that already exists, add the permission on the App's settings page and accept it on the installation, and `billet check` says when it holds what the tiers need. [ADR-028](../reference/decisions/adr-028-rerunning-disrupted-jobs.md) holds the decision.
 
 A job is re-run only when all of these are true:
 

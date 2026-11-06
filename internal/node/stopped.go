@@ -23,7 +23,7 @@ import (
 // stoppedProved says so. What is left is the next process's Recover to destroy,
 // as it destroys anything nothing is waiting for. `Ended` is the provider's
 // proof, not its silence: firecracker sets it only on a refused connection or an
-// absent socket, docker only for exited and dead.
+// absent socket, docker only for exited and dead, ec2 only for stopped and terminated.
 func (r *Runner) noteStopped(instances []*provider.Instance) {
 	stopped := make(map[string]bool, len(instances))
 

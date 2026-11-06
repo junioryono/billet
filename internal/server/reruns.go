@@ -561,7 +561,7 @@ func (s *Server) decideJob(ctx context.Context, job *alloc.RerunCandidate, decis
 		"repository", job.Repository, "run", job.RunID, "disruption", job.Disruption, "decision", decision)
 }
 
-// decideRerun takes one run as far as it can go on this pass. ADR-023 holds the
+// decideRerun takes one run as far as it can go on this pass. ADR-028 holds the
 // rule; the order below is what keeps it, and each step's refusal is the decision.
 func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[string]int64, sweep *rerunSweep,
 	now time.Time,

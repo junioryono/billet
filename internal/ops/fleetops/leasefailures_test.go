@@ -82,7 +82,7 @@ func seedAttributedFailure(t *testing.T, stateDir, result string, requestID int6
 //
 // That sentence is the deliverable, not decoration. A re-run is a side effect on
 // somebody's repository, so billet asks for one only for a tier that opts in and on
-// GitHub's own proof (ADR-023), and a report that shows an operator "your build
+// GitHub's own proof (ADR-028), and a report that shows an operator "your build
 // failed because the node went away" without saying what billet did NOT do about
 // it invites them to assume it was handled.
 func TestLeaseFailuresReportsBothFactsAndWhatARerunTakes(t *testing.T) {
