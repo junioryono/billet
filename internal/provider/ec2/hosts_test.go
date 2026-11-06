@@ -467,12 +467,20 @@ func TestAPoolLaunchAnsweredWithARedirectIsARedirect(t *testing.T) {
 
 			return http.StatusOK, defaultReply(action)
 		}
-		_, err := newTestProvider(t, f, nil).Hosts().Launch(t.Context(), hostLaunch())
+		p := newTestProvider(t, f, nil)
+		_, err := p.Hosts().Launch(t.Context(), hostLaunch())
 		if !errors.Is(err, errRedirected) || strings.Contains(err.Error(), "token-9QX") {
 			t.Errorf("a %d answered %v, want a refused redirect that quotes nothing", status, err)
 		}
 		if n := f.countOf("RunInstances"); n != 1 {
 			t.Errorf("a %d: RunInstances was sent %d times, want once", status, n)
+		}
+		// AND THE CLIENT'S OWN ERROR, which the launch scrubs before it is seen: another
+		// caller of callOnce renders it as it is.
+		raw := p.api.callOnce(t.Context(), url.Values{"Action": {"RunInstances"}}, nil)
+		if !errors.Is(raw, errRedirected) || strings.Contains(raw.Error(), "token-9QX") ||
+			strings.Contains(raw.Error(), "elsewhere") {
+			t.Errorf("a %d: the client answered %v, want a refused redirect that quotes nothing", status, raw)
 		}
 	}
 }
