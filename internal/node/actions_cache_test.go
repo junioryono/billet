@@ -32,6 +32,9 @@ type fakeActionsVolumeManager struct {
 	unmountErr error
 	// unmountHook runs at every Unmount, before it does anything else.
 	unmountHook func()
+	// readOnlyMountedButFailed mounts a download and then reports the mount failed,
+	// as a mount command killed after the kernel mounted does.
+	readOnlyMountedButFailed bool
 }
 
 type syncCloseRecorder struct {
@@ -94,8 +97,14 @@ func (f *fakeActionsVolumeManager) MountReadOnly(_ context.Context, _, target st
 	if err := os.MkdirAll(target, 0o700); err != nil {
 		return err
 	}
+	if err := os.WriteFile(filepath.Join(target, "archive"), f.published, 0o600); err != nil {
+		return err
+	}
+	if f.readOnlyMountedButFailed {
+		return errors.New("signal: killed: ")
+	}
 
-	return os.WriteFile(filepath.Join(target, "archive"), f.published, 0o600)
+	return nil
 }
 
 func (f *fakeActionsVolumeManager) Unmount(_ context.Context, target string) error {
@@ -192,6 +201,82 @@ func responseJSON(t *testing.T, response *http.Response) map[string]any {
 	}
 
 	return value
+}
+
+// A DOWNLOAD'S CLONE IS THE SESSION'S TO CLEAN UP FROM BEFORE IT IS MOUNTED. A
+// mount command killed after the kernel mounted reports failure, and if the undo
+// cannot unmount either, the clone is still mounted. Recorded only once it opened,
+// as it was, nothing would ever retry it; recorded first, the session's own
+// cleanup unmounts and discards it.
+func TestADownloadWhoseMountCouldNotBeUndoneIsStillCleanedUp(t *testing.T) {
+	t.Parallel()
+
+	service, storage, session, volumes := testActionsService(t)
+	create := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsCreatePath,
+		`{"key":"linux-npm-abc","version":"v1"}`)
+	response, handled, err := service.actionsResponse(create, session)
+	if err != nil || !handled {
+		t.Fatalf("CreateCacheEntry handled=%t error=%v", handled, err)
+	}
+	uploadURL, ok := responseJSON(t, response)["signed_upload_url"].(string)
+	if !ok || uploadURL == "" {
+		t.Fatal("CreateCacheEntry gave no upload URL")
+	}
+	upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "archive-body")
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	if response, handled, err = service.actionsResponse(upload, session); err != nil || !handled ||
+		response.StatusCode != http.StatusCreated {
+		t.Fatalf("blob upload handled=%t status=%v error=%v", handled, response, err)
+	}
+	response.Body.Close()
+	finalize := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"linux-npm-abc","version":"v1","size_bytes":"12"}`)
+	if response, handled, err = service.actionsResponse(finalize, session); err != nil || !handled ||
+		responseJSON(t, response)["ok"] != true {
+		t.Fatalf("FinalizeCacheEntryUpload handled=%t error=%v", handled, err)
+	}
+
+	volumes.readOnlyMountedButFailed = true
+	volumes.unmountErr = errors.New("node: inspect Actions cache mount point: exit status 1")
+	discardedBefore := storage.discarded
+	lookup := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsDownloadPath,
+		`{"key":"linux-npm-abc","version":"v1"}`)
+	if response, _, err = service.actionsResponse(lookup, session); err == nil {
+		found := responseJSON(t, response)
+		if found["signed_download_url"] != nil {
+			t.Fatalf("a download whose mount failed was handed out: %v", found)
+		}
+	}
+
+	session.mu.Lock()
+	var recorded *actionsArchive
+	for _, archive := range session.actions {
+		if archive.Mode == actionsModeDownload {
+			recorded = archive
+		}
+	}
+	session.mu.Unlock()
+	if recorded == nil {
+		t.Fatal("the clone whose mount could not be undone is not the session's to clean up")
+	}
+	if storage.discarded != discardedBefore {
+		t.Fatalf("the clone was discarded while it could still be mounted (%d discards, want %d)",
+			storage.discarded, discardedBefore)
+	}
+
+	volumes.readOnlyMountedButFailed, volumes.unmountErr = false, nil
+	if err := service.Close(t.Context(), session.instance); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	if !slices.ContainsFunc(storage.discardedVolumes, func(v storecontract.Volume) bool {
+		return v.Handle == recorded.Volume.Handle
+	}) {
+		t.Fatalf("the session's cleanup never discarded the clone %s (discarded %v)",
+			recorded.Volume.Handle, storage.discardedVolumes)
+	}
 }
 
 func TestActionsCacheRoundTripPublishesAndServesRanges(t *testing.T) {

@@ -1220,24 +1220,32 @@ func (s *CacheService) findActionsCache(
 		ID: id, Signature: signature, Mode: actionsModeDownload, CacheKey: matchedKey,
 		StoreKey: matched, Version: request.Version, Volume: volume,
 	}
-	mountPath := s.actionsMountPath(session, archive)
-	if err := s.actionIO.MountReadOnly(ctx, volume.Device, mountPath); err != nil {
-		return nil, errors.Join(err, s.store.Discard(ctx, volume))
+	// RECORDED BEFORE IT IS MOUNTED, as an upload is, so a clone whose mount or
+	// discard fails is still the session's to clean up. Recorded only after, a mount
+	// that finished in the kernel and then could not be undone left a mounted clone
+	// that nothing would retry. Its signed URL is handed out only once it opens.
+	session.actions[id] = archive
+	if err := s.persistSession(session); err != nil {
+		discardErr := s.store.Discard(ctx, volume)
+		var retryErr error
+		if discardErr == nil {
+			delete(session.actions, id)
+		} else {
+			retryErr = s.persistSession(session)
+		}
+
+		return nil, errors.Join(err, discardErr, retryErr)
+	}
+	if err := s.actionIO.MountReadOnly(ctx, volume.Device, s.actionsMountPath(session, archive)); err != nil {
+		return nil, errors.Join(err, s.discardActionsArchive(ctx, session, archive))
 	}
 	file, err := s.openActionsArchive(session, archive)
 	if err != nil {
 		return nil, errors.Join(errors.New("published Actions cache has no usable archive"),
-			s.actionIO.Unmount(ctx, mountPath), s.store.Discard(ctx, volume))
+			s.discardActionsArchive(ctx, session, archive))
 	}
 	if err := file.Close(); err != nil {
-		return nil, errors.Join(err, s.actionIO.Unmount(ctx, mountPath), s.store.Discard(ctx, volume))
-	}
-
-	session.actions[id] = archive
-	if err := s.persistSession(session); err != nil {
-		delete(session.actions, id)
-
-		return nil, errors.Join(err, s.actionIO.Unmount(ctx, mountPath), s.store.Discard(ctx, volume))
+		return nil, errors.Join(err, s.discardActionsArchive(ctx, session, archive))
 	}
 
 	return actionsJSONResponse(map[string]any{

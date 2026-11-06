@@ -1,11 +1,13 @@
 package node
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A NEW VOLUME IS FORMATTED WITHOUT A DISCARD PASS. It is a thin rbd image Create
@@ -77,9 +79,12 @@ func TestAFailedMountIsUndoneWhenTheKernelHoldsIt(t *testing.T) {
 			} else {
 				mountpoint += "[ -e '" + mountedFlag + "' ] && exit 0\nexit 32\n"
 			}
+			started := filepath.Join(state, "started")
 			for name, body := range map[string]string{
-				// Killed the way a cancelled exec.CommandContext kills it.
-				"mount":      "#!/bin/sh\nkill -9 $$\n",
+				// Blocks until the caller's context is cancelled, which is what
+				// killed the node's mount: exec.CommandContext kills it then, and
+				// the undo has to work with that context already done.
+				"mount":      "#!/bin/sh\n: > '" + started + "'\nexec sleep 60\n",
 				"mountpoint": mountpoint,
 				"umount":     "#!/bin/sh\nrm -f '" + mountedFlag + "'\n: > '" + umounted + "'\n",
 			} {
@@ -89,8 +94,24 @@ func TestAFailedMountIsUndoneWhenTheKernelHoldsIt(t *testing.T) {
 			}
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			go func() {
+				for ctx.Err() == nil {
+					if _, err := os.Stat(started); err == nil {
+						cancel()
+
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}()
+
 			target := filepath.Join(t.TempDir(), "go")
-			err := hostActionsVolumeManager{}.MountWritable(t.Context(), "/dev/rbd102", target)
+			err := hostActionsVolumeManager{}.MountWritable(ctx, "/dev/rbd102", target)
+			if ctx.Err() == nil {
+				t.Fatal("the mount returned before its context was cancelled; the test proves nothing")
+			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("MountWritable = %v, want an error containing %q", err, tc.wantErr)
 			}
