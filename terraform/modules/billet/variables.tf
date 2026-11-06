@@ -375,6 +375,17 @@ variable "job_instance_profile_role_arn" {
   }
 }
 
+variable "node_permissions_boundary_arn" {
+  description = "A managed policy ARN to set as the node role's permissions boundary, or empty for none. The boundary caps whatever is ever put on the role, inline policies another principal adds included: an operator whose automation may add a deployment-scoped grant to the role for a while (the acceptance matrix puts each run's `billet init iam` policy there) sets one so that grant can never exceed it. It caps the module's own policy too, so it must allow at least what that policy grants."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.node_permissions_boundary_arn == "" || can(regex("^arn:aws[a-z-]*:iam::([0-9]{12}|aws):policy/[a-zA-Z0-9+=,.@_/-]+$", var.node_permissions_boundary_arn))
+    error_message = "node_permissions_boundary_arn must be a managed policy ARN (arn:<partition>:iam::<account>:policy/<name>), which is all IAM takes as a boundary."
+  }
+}
+
 variable "tags" {
   description = "Tags applied to every resource this module creates."
   type        = map(string)
