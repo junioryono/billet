@@ -166,11 +166,20 @@ func originRepository(ctx context.Context, path string) (string, error) {
 // URL, else its URL). More than one destination is a push to several, which one head
 // cannot name, and a destination naming no owner/name is refused.
 func pushOwner(ctx context.Context, path string) (string, error) {
+	owner, _, err := pushTarget(ctx, path)
+
+	return owner, err
+}
+
+// pushTarget is pushOwner's owner and the destination git resolved. Two readings are
+// the same push only when both are the same: one owner holds many repositories, and a
+// push to a path on this machine takes its owner from the configured URL.
+func pushTarget(ctx context.Context, path string) (string, string, error) {
 	pushes, err := runGit(ctx, path, "remote", "get-url", "--push", "--all", "origin")
 	destinations := gitLines(pushes)
 	if err != nil || len(destinations) != 1 {
-		return "", errors.New("billet migrate workflows: --open-pr pushes to origin, and origin has no one URL to push " +
-			"to; nothing was changed")
+		return "", "", errors.New("billet migrate workflows: --open-pr pushes to origin, and origin has no one URL to " +
+			"push to; nothing was changed")
 	}
 
 	remote := destinations[0]
@@ -185,12 +194,12 @@ func pushOwner(ctx context.Context, path string) (string, error) {
 	}
 	repository, ok := repositoryOfRemote(remote)
 	if !ok {
-		return "", errors.New("billet migrate workflows: --open-pr pushes to origin, and where it pushes names no " +
+		return "", "", errors.New("billet migrate workflows: --open-pr pushes to origin, and where it pushes names no " +
 			"owner/name; nothing was changed")
 	}
 	owner, _, _ := config.SplitRepository(repository)
 
-	return owner, nil
+	return owner, destinations[0], nil
 }
 
 // gitLines is git's output one value to a line, each kept whole: a path can hold a
@@ -926,14 +935,16 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 		return fmt.Errorf("billet migrate workflows: nothing was changed: %w", err)
 	}
 	base = strings.TrimSpace(base)
-	pushedTo, err := pushOwner(ctx, path)
+	pushedTo, destination, err := pushTarget(ctx, path)
 	if err != nil {
 		return err
 	}
+	// EACH FILE NAMED LITERALLY: a pathspec is a pattern, so a workflow named
+	// `[ab].yml` would otherwise answer for a tracked `a.yml`, `--` notwithstanding.
 	var changed []string
 	for i := range plan.files {
 		if !bytes.Equal(plan.files[i].before, plan.files[i].after) {
-			changed = append(changed, filepath.FromSlash(plan.files[i].name))
+			changed = append(changed, ":(literal)"+filepath.FromSlash(plan.files[i].name))
 		}
 	}
 	// ONLY FILES GIT TRACKS: an ignored workflow would be written and then refused by
@@ -952,10 +963,16 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 		return fmt.Errorf("billet migrate workflows: stopped on branch %s after %s: %w", branch, done, err)
 	}
 	// WHERE ORIGIN PUSHES IS READ AGAIN ON THE NEW BRANCH: configuration included
-	// only on some branches (includeIf "onbranch:") can name another destination there.
-	if again, err := pushOwner(ctx, path); err != nil || again != pushedTo {
-		if err == nil {
+	// only on some branches (includeIf "onbranch:") can name another destination there,
+	// and another repository of the same owner is another destination. The URLs are
+	// not said: one can carry a token.
+	if again, there, err := pushTarget(ctx, path); err != nil || again != pushedTo || there != destination {
+		switch {
+		case err != nil:
+		case again != pushedTo:
 			err = fmt.Errorf("origin pushes to %s on this branch and to %s on %s", again, pushedTo, base)
+		default:
+			err = fmt.Errorf("origin pushes to another repository of %s on this branch than on %s", again, base)
 		}
 		return stopped(err, "creating it")
 	}

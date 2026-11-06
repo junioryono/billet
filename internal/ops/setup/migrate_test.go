@@ -960,6 +960,57 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 		t.Errorf("a push URL only on the new branch still changed ci.yml to %q", got)
 	}
 
+	// ANOTHER REPOSITORY OF THE SAME OWNER is another destination, and its URL is not
+	// said, since one can carry a token.
+	sameOwner := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	other := filepath.Join(t.TempDir(), "other.gitconfig")
+	if err := os.WriteFile(other, []byte("[remote \"origin\"]\n\tpushurl = https://github.com/acme/other.git\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, sameOwner, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", other)
+	_, _, err = migrateRun(t, "--config", cfg, "--path", sameOwner, "--repo", "acme/api", "--open-pr")
+	if err == nil || !strings.Contains(err.Error(), "origin pushes to another repository of acme on this branch than on main") ||
+		strings.Contains(err.Error(), "other.git") {
+		t.Errorf("another repository of the same owner only on the new branch = %v", err)
+	}
+	if got := readFile(t, filepath.Join(sameOwner, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
+		t.Errorf("another repository of the same owner still changed ci.yml to %q", got)
+	}
+
+	// ANOTHER OWNER FROM THE SAME DESTINATION: on the new branch the push URL names bob
+	// and is rewritten to the same path on this machine, so only the owner the head
+	// would name has changed.
+	sameDestination := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	toBob := filepath.Join(t.TempDir(), "bob.gitconfig")
+	if err := os.WriteFile(toBob, []byte("[remote \"origin\"]\n\tpushurl = https://github.com/bob/api.git\n[url \""+
+		originOf(t, sameDestination)+"\"]\n\tinsteadOf = https://github.com/bob/api.git\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, sameDestination, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", toBob)
+	_, _, err = migrateRun(t, "--config", cfg, "--path", sameDestination, "--repo", "acme/api", "--open-pr")
+	if err == nil || !strings.Contains(err.Error(), "origin pushes to bob on this branch and to acme on main") {
+		t.Errorf("another owner from the same destination only on the new branch = %v", err)
+	}
+
+	// A FILE NAME IS NO PATTERN: an ignored `[ab].yml` is not answered for by a tracked
+	// `a.yml`.
+	pattern := checkout(t, map[string]string{"a.yml": "on: [push]\njobs:\n  a:\n    runs-on: billet-2vcpu\n"})
+	if err := os.WriteFile(filepath.Join(pattern, ".gitignore"), []byte("*.yml\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, pattern, "add", ".gitignore")
+	runIn(t, pattern, "commit", "-q", "-m", "ignore")
+	if err := os.WriteFile(filepath.Join(pattern, ".github", "workflows", "[ab].yml"), []byte(migrateWorkflow), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := migrateRun(t, "--config", cfg, "--path", pattern, "--repo", "acme/api", "--open-pr"); err == nil ||
+		!strings.Contains(err.Error(), "git does not track every one of them; nothing was changed") {
+		t.Errorf("an ignored workflow named like a pattern = %v", err)
+	}
+	if got := head(pattern); got != "main" {
+		t.Errorf("a refusal over a workflow named like a pattern left the checkout on %q", got)
+	}
+
 	// An origin pushing to two places has no one fork a head can name.
 	twice := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
 	runIn(t, twice, "config", "--add", "remote.origin.pushurl", "https://github.com/alice/api.git")
