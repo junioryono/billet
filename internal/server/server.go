@@ -273,7 +273,8 @@ func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
 }
 
 // WithRerunPacing sets how often the re-run loop looks for jobs to decide about,
-// and how long after a job's result its run waits.
+// and how long after a job's result its run waits, which is also when a run found
+// unfinished is read again.
 //
 // Exposed for WithCleanupRetry's reason: the defaults are minutes, and a scenario
 // about a request that settles on a later pass would otherwise wait them out.

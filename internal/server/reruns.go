@@ -293,7 +293,16 @@ func (s *Server) afterRerun(ctx context.Context, w *rerunWork, err error, sweep 
 	case ctx.Err() != nil:
 		return
 	case errors.Is(err, errRunUnfinished):
-		sweep.retries[w.run] = queueTimeRetry{after: now.Add(rerunUnfinishedEvery)}
+		// PACED WITH THE SETTLE IT WAITS ON: a run whose newest result was too new to
+		// decide on is ready once that much more has passed, and a paced loop that
+		// re-read it on the default would wait minutes for a result a millisecond old.
+		again := rerunUnfinishedEvery
+		if s.rerunSettle > 0 {
+			again = max(s.rerunSettle, s.rerunEvery)
+		}
+
+		sweep.retries[w.run] = queueTimeRetry{after: now.Add(again)}
+
 		return
 	case errors.Is(err, ErrRerunThrottled):
 		sweep.paused[w.installation] = now.Add(rerunThrottled)
