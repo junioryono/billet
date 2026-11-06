@@ -83,6 +83,11 @@ func cmdAcceptanceRun(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	// BEFORE ANYTHING IS STARTED, so no service this run starts inherits the lock.
+	if err := keepAcceptanceLock(env.Getenv); err != nil {
+		return err
+	}
+
 	return runAcceptance(ctx, env, ws, acceptanceRunOptions{
 		jobs:       *jobs,
 		wait:       *wait,

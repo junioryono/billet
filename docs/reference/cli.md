@@ -350,13 +350,17 @@ Remove what the record under `/run/billet-uplink/` says a `billet uplink shape` 
 
 ## Acceptance
 
-`billet acceptance` stands an isolated deployment up beside this one against a real account, runs a real job, and destroys exactly what it made. Nothing runs it on a schedule; it is run by hand, never on a pull request.
+`billet acceptance` stands an isolated deployment up beside this one against a real account, runs a real job, and destroys exactly what it made. It is never run on a pull request: by hand, or by the `aws-acceptance` workflow, which runs the matrix below weekly and on dispatch from the `acceptance` environment.
 
 | Command | Meaning |
 |---|---|
 | `billet acceptance up --config <derive-from> --workspace <dir> [--account] [--label-prefix accept] [--region]` | derive the isolated deployment from `--config` (read, never written) into a workspace this run owns entirely; `--account` is the AWS account the credential must be in, and `--region` the one `sts:GetCallerIdentity` is asked in (default the config's); a `--workspace` too long for the node's unix socket (103 bytes on macOS, 107 on Linux) is refused here, before anything exists |
 | `billet acceptance run --workspace <dir> [--jobs 1] [--wait 30m] [--no-teardown]` | run real jobs and wait for that many to reach a terminal outcome; a workspace left sealed, as `--no-teardown` leaves one, is refused before anything starts, naming `billet resume` |
 | `billet acceptance evidence --workspace <dir> [--out]` | write the run's evidence (default under the workspace) |
+| `billet acceptance matrix cells [--json]` | print the acceptance matrix (#554): every backend, architecture, cache and case, each with the workflow job that runs it and the observation it must end with, or why it is not run or not supported |
+| `billet acceptance matrix tiers --workspace <dir>` | print one `<backend> <arch> <label>` line for each combination the workspace has exactly one single-provider tier for, which is the tier a dispatcher sends that combination's workflows to |
+| `billet acceptance matrix jobs --archs <x64,arm64>` | print how many jobs one run of the matrix's workflows on those architectures waits for, which is the number its `billet acceptance run` is told to wait for |
+| `billet acceptance matrix judge --workspace <dir> [--evidence] [--out] [--archs] [--runs] [--repository]` | judge each cell from the run's evidence, reading only the jobs of the GitHub runs `--runs` names (a file of run ids, one per line) in `--repository`, so another run on the same labels never stands in for one this run did not get: a pass needs GitHub's result and the node's observation of every job of the cell to be what the cell wants; writes the verdicts (default `<workspace>/matrix.json`) with each cell's wait, run time and an instance-cost estimate, prints them, and exits 1 on any failed cell, or on any cell that should have run on an architecture named in `--archs` and did not; evidence of another deployment is refused |
 | `billet acceptance down --workspace <dir> [--wait 20m] [--keep-workspace]` | destroy exactly what the run made |
 | `billet acceptance sweep --workspace <dir>` | ask whether anything billable is left, destroying nothing |
 
