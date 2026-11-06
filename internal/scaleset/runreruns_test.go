@@ -122,3 +122,49 @@ func TestAnAttemptReachesTheServerJudged(t *testing.T) {
 		t.Errorf("a client with no App = %v, want ErrRunEvidenceUnavailable", err)
 	}
 }
+
+// stepsPolicy is a policy client whose job record answers from fields, and says
+// which runner it was asked about.
+type stepsPolicy struct {
+	billetgithub.RunnerGroupPolicyClient
+
+	job    billetgithub.WorkflowJob
+	err    error
+	runner *string
+}
+
+func (s stepsPolicy) RunnerJob(_ context.Context, _, _ string, _ int64, runnerName string,
+) (billetgithub.WorkflowJob, error) {
+	*s.runner = runnerName
+
+	return s.job, s.err
+}
+
+// AN ALERT RULE NAMING A STEP READS THE JOB OF THE RUNNER IT NAMES, each step's name
+// and conclusion and nothing else, and GitHub's refusal keeps its chain.
+func TestAJobsStepsAreReadByItsRunner(t *testing.T) {
+	t.Parallel()
+
+	var asked string
+	c := &Client{policy: stepsPolicy{runner: &asked, job: billetgithub.WorkflowJob{Steps: []billetgithub.JobStep{
+		{Number: 1, Name: "Set up job", Status: "completed", Conclusion: "success"},
+		{Number: 2, Name: "Run migrations", Status: "completed", Conclusion: "failure"},
+	}}}}
+
+	steps, err := c.RunnerJobSteps(t.Context(), "acme", "api", 31, "billet-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asked != "billet-abc" {
+		t.Errorf("asked about runner %q", asked)
+	}
+	if len(steps) != 2 || steps[1].Name != "Run migrations" || steps[1].Conclusion != "failure" {
+		t.Errorf("steps = %+v", steps)
+	}
+
+	refused := &billetgithub.APIError{Status: 403}
+	c = &Client{policy: stepsPolicy{runner: &asked, err: refused}}
+	if _, err := c.RunnerJobSteps(t.Context(), "acme", "api", 31, "billet-abc"); !errors.Is(err, refused) {
+		t.Errorf("a refused read = %v, want GitHub's answer in its chain", err)
+	}
+}
