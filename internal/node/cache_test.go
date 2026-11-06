@@ -290,7 +290,7 @@ func (f *fakeCacheStore) PublishCAS(
 		return storecontract.ErrConflict
 	}
 	if f.publishErr == nil && expected != f.current {
-		return storecontract.ErrConflict
+		return &storecontract.PointerMovedError{Key: key, Current: f.current, Expected: expected}
 	}
 	if f.publishErr == nil {
 		// The same write that advances the pointer consumes the writer.
@@ -594,10 +594,15 @@ func TestACasCommitSupersededByAnotherJobSaysSo(t *testing.T) {
 		t.Errorf("a commit whose publication failed answered %v, want cache unavailable", got)
 	}
 
-	// A CONFLICT WITH THE POINTER WHERE THIS DISK FOUND IT is this writer's own lost
-	// authority, which the store answers with the same ErrConflict: an outage, never a
-	// supersession, which would let a matrix cell pass on a fault.
+	// A CONFLICT THE STORE DOES NOT CALL A MOVED POINTER is this writer's own lost
+	// authority, or a store that could not get its write through, both a bare
+	// ErrConflict: an outage, never a supersession, which would let a matrix cell
+	// pass on a fault; and so even when another job has published meanwhile.
 	got = commit(t, func(s *fakeCacheStore) { s.publishConflicts = 1 })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a conflict with an unmoved pointer answered %v, want cache unavailable", got)
+	}
+	got = commit(t, func(s *fakeCacheStore) { s.publishConflicts, s.conflictCurrent = 1, "a-third-writer" })
 	if got["published"] != false || got["reason"] != "cache unavailable" {
 		t.Errorf("a conflict with an unmoved pointer answered %v, want cache unavailable", got)
 	}

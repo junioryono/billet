@@ -6,15 +6,20 @@ Usage:
   matrix-supervise.py await <run-dir> <seconds>
 
 run holds an exclusive lock on <run-dir>/run.lock for as long as the command lives,
-and shares it with the command, so the lock is held while either does and a reboot
-releases it. It refuses to start when another holder has the lock, or when a stop was
-requested (<run-dir>/stop-requested) before it took it. While the command runs it watches
-for that request and, when it appears, sends the command ONE SIGTERM, as an operator's
-Ctrl-C would; a second signal would make `billet acceptance run` leave its jobs running,
-so it is never sent. It signals through Popen.send_signal, which polls first: Python
-reaps its child only when asked, so the pid cannot have been reused while it is
-signalled. It writes the command's exit status (128 + n for signal n) to
-<run-dir>/run.exit and exits with it.
+and hands it down to the command (BILLET_ACCEPTANCE_LOCK_FD names the descriptor, which
+`billet acceptance run` keeps to itself, close-on-exec, so the services it starts do not
+inherit it), so the lock is held while either lives and a reboot releases it. It refuses
+to start when another holder has the lock, or when a stop was requested
+(<run-dir>/stop-requested) before it took it. The command runs in a session of its own,
+so a signal to the supervisor's process group never reaches it beside the supervisor's
+own. While it runs the supervisor watches for that request, or a SIGTERM, SIGINT or
+SIGHUP of its own, which it takes as the same request, and then sends the command ONE
+SIGTERM, as an operator's Ctrl-C would; a second signal would make `billet acceptance
+run` leave its jobs running, so it is never sent. It signals through Popen.send_signal,
+which polls first: Python reaps its child only when asked, so the pid cannot have been
+reused while it is signalled. It writes the command's exit status (128 + n for signal n)
+to <run-dir>/run.exit and exits with it. A SIGKILL ends the supervisor alone: the command
+holds the lock and runs on to its own end, which is its --wait, and a teardown waits.
 
 await waits up to <seconds> for the lock to be free, which is the proof no run is
 live in <run-dir>: 0 once it is, 1 if a run still holds it.
@@ -58,21 +63,32 @@ def run(run_dir, argv, poll):
         say("a stop was requested before the run started; it does not start")
         write_exit(exit_file, 130)
         return 130
+    # A SIGNAL OF THE SUPERVISOR'S OWN IS A STOP REQUEST, sent on through the one gate
+    # below, never forwarded from the handler.
+    asked = []
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: asked.append(signum))
     # THE LOCK GOES WITH THE COMMAND, so a supervisor killed outright leaves it held
     # for as long as the run it started is still writing.
-    proc = subprocess.Popen(argv, pass_fds=(fd,))
+    env = dict(os.environ, BILLET_ACCEPTANCE_LOCK_FD=str(fd))
+    proc = subprocess.Popen(argv, pass_fds=(fd,), env=env, start_new_session=True)
     signalled = False
     while proc.poll() is None:
-        if not signalled and os.path.exists(stop_file):
-            proc.send_signal(signal.SIGTERM)
+        if not signalled and (asked or os.path.exists(stop_file)):
+            stop_once(proc)
             signalled = True
-            say("stopping the run early; it writes its evidence and tears down what it made")
         time.sleep(poll)
     code = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
     write_exit(exit_file, code)
     if code != 0:
         say("the run ended with status " + str(code))
     return code
+
+
+def stop_once(proc):
+    """The one place the run is signalled, and said to be."""
+    proc.send_signal(signal.SIGTERM)
+    say("stopping the run early; it writes its evidence and tears down what it made")
 
 
 def write_exit(path, code):

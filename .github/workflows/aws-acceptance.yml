@@ -284,18 +284,25 @@ jobs:
             echo "could not remove $what: $err" >&2
             status=1
           }
+          down=0
           if ! scripts/acceptance/ssm-run.sh run "$HOST" 2400 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' down '$RUN_DIR'
           down=\$?
           rm -f /srv/billet-accept/app.pem || down=1
           exit \$down"; then
             echo "the deployment may not be down: its workspace is $RUN_DIR on $HOST" >&2
             status=1
+            down=1
           fi
           gone "the run's node policy" NoSuchEntity \
             aws iam delete-role-policy --role-name "$HOST_ROLE" --policy-name "billet-matrix-$RUN"
           gone "the App key's parameter" ParameterNotFound \
             aws ssm delete-parameter --name "/billet-acceptance/runs/$RUN/app-key"
-          if ! aws ec2 stop-instances --instance-ids "$HOST" >/dev/null; then
+          # THE HOST IS LEFT RUNNING when the deployment may not be down: stopping it
+          # would cut a run still tearing down off mid-way and leave its job instances
+          # with nothing to destroy them, which costs more than an idle host.
+          if [ "$down" -ne 0 ]; then
+            echo "the host $HOST is left running for a person to finish the teardown in $RUN_DIR" >&2
+          elif ! aws ec2 stop-instances --instance-ids "$HOST" >/dev/null; then
             echo "could not stop the host $HOST" >&2
             status=1
           fi

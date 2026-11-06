@@ -1983,15 +1983,17 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	candidate, step, err := s.publishAcquired(ctx, session, slot, attachment, lease, fence)
-	if err != nil && step == stepPublish && attachment.Publication == publicationCAS &&
-		errors.Is(err, storecontract.ErrConflict) && s.supersededSince(ctx, attachment) {
-		// A CAS LOSS IS AN ANSWER, NOT AN OUTAGE: another job published after this
-		// disk was cloned, and cas keeps theirs. Said by name, because "cache
+	if moved, ok := errors.AsType[*storecontract.PointerMovedError](err); ok && step == stepPublish &&
+		attachment.Publication == publicationCAS {
+		// A CAS LOSS IS AN ANSWER, NOT AN OUTAGE: the key holds a generation this disk
+		// was not cloned from, and cas keeps it. Said by name, because "cache
 		// unavailable" sends an operator looking for a fault that is not there; and
-		// only on proof the pointer moved, because a conflict is also this writer's
-		// own lost authority, which is an outage.
+		// only on the store's own word, decided under its lock, that the pointer is
+		// not the clone's, because every other conflict (this writer's authority
+		// lost, a store that could not get its write through) is an outage.
 		s.log.Info("a sticky-disk update was superseded; cas keeps the generation published since its clone",
-			"instance", session.instance, "key", attachment.Volume.Key, "error", err)
+			"instance", session.instance, "key", attachment.Volume.Key, "current", moved.Current,
+			"cloned_from", moved.Expected, "error", err)
 		writeCacheJSON(w, http.StatusOK, map[string]any{
 			"published": false, "reason": supersededReason,
 		})
@@ -2009,23 +2011,10 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	})
 }
 
-// supersededReason is what a cas commit answers when another job published after
-// this disk was cloned.
-const supersededReason = "superseded: another job published this key after this disk was cloned, and cas keeps theirs"
-
-// supersededSince reports whether the key's pointer has moved off the generation this
-// disk was cloned from: the one proof that a cas conflict was another job's
-// publication rather than this writer's own lost authority, which a store also answers
-// with ErrConflict. A pointer that cannot be read proves nothing, and neither does one
-// that is gone.
-func (s *CacheService) supersededSince(ctx context.Context, attachment *cacheAttachment) bool {
-	current, err := s.store.Current(ctx, attachment.Volume.Key)
-	if err != nil {
-		return false
-	}
-
-	return current != attachment.Volume.Generation
-}
+// supersededReason is what a cas commit answers when the store says the key's pointer
+// is not the generation this disk was cloned from: another job published it since, or
+// the disk started cold beside one too large to clone.
+const supersededReason = "superseded: the key holds a generation this disk was not cloned from, and cas keeps it"
 
 // publishStep names the step of publishAcquired that failed, for the caller's
 // own diagnostic.
