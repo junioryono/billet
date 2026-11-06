@@ -1,0 +1,134 @@
+name: matrix-warm
+# billet's acceptance matrix (#554), the warm case: each cache's second job, dispatched
+# with the cold run's tag once the cold jobs have finished and their publications have
+# had time to land. Each job asserts it found what the cold job left, and `billet
+# acceptance matrix judge` reads what the node observed. The job names are the matrix's
+# cache names.
+#
+# This file is copied from billet's scripts/acceptance/matrix into the repository the
+# acceptance App serves, and the run refuses a copy that differs.
+run-name: matrix-warm ${{ inputs.runs_on }} ${{ inputs.tag }}
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: the acceptance tier's label
+        required: true
+      tag:
+        description: the cold run's tag
+        required: true
+permissions:
+  contents: read
+# bash, so every step runs under -eo pipefail: GitHub's default shell on Linux is bash -e
+# alone, under which a failed build piped through tee passes.
+defaults:
+  run:
+    shell: bash
+jobs:
+  sticky-disks:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    steps:
+      - id: disk
+        uses: junioryono/billet/actions/stickydisk@main
+        with:
+          key: ${{ github.repository }}-matrix-sticky-${{ inputs.runs_on }}-${{ inputs.tag }}
+          path: /mnt/matrix
+          size-gb: "5"
+      - name: The disk is the cold job's
+        env:
+          HIT: ${{ steps.disk.outputs.cache-hit }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          test "$HIT" = true
+          test "$(cat /mnt/matrix/marker)" = "cold-$TAG"
+  docker-builder:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 30
+    steps:
+      - id: builder
+        uses: junioryono/billet/actions/setup-docker-builder@main
+        with:
+          cache-key: matrix-${{ inputs.runs_on }}-${{ inputs.tag }}
+          cache-size-gb: "10"
+      - name: The cold job's layer is cached
+        env:
+          TAG: ${{ inputs.tag }}
+          BUILDER: ${{ steps.builder.outputs.name }}
+        run: |
+          set -eu
+          mkdir -p ctx
+          printf 'FROM public.ecr.aws/docker/library/busybox:1.36\nRUN echo %s > /tag && sleep 5\n' "$TAG" > ctx/Dockerfile
+          docker buildx build --builder "$BUILDER" --progress=plain ctx 2>&1 | tee build.log
+          # THE TAGGED RUN STEP'S OWN VERTEX, not any CACHED line: the FROM can be cached
+          # while the RUN executes. grep -c prints nothing on an unreadable log, which
+          # fails the test below rather than reading as either answer.
+          vertex=$(sed -n 's/^\(#[0-9]*\) \[[0-9]*\/[0-9]*\] RUN .*/\1/p' build.log | head -n 1)
+          test -n "$vertex"
+          cached=$(grep -cx "$vertex CACHED" build.log || true)
+          echo "MATRIX the RUN step is vertex $vertex, cached $cached time(s)"
+          test "$cached" -ge 1
+  actions:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/cache/restore@v5
+        with:
+          path: matrix-payload
+          key: matrix-actions-${{ inputs.runs_on }}-${{ inputs.tag }}
+          fail-on-cache-miss: true
+      - name: The archive is the cold job's
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          test "$(cat matrix-payload/marker)" = "cold-$TAG"
+          test "$(stat -c %s matrix-payload/blob)" = 8388608
+  git:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+  go:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 30
+    steps:
+      - name: Build the cold job's module through GOCACHEPROG
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          test -n "${GOCACHEPROG:-}"
+          mkdir -p mod && cd mod
+          go mod init matrix.example/m
+          printf 'package main\n\nconst tag = "%s"\n\nfunc main() { println(tag) }\n' "$TAG" > main.go
+          go build -o /dev/null .
+  bazel:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 30
+    steps:
+      - name: Build the cold job's target through the node's remote cache
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          test -s /etc/bazel.bazelrc
+          mkdir -p ws && cd ws
+          echo '7.4.1' > .bazelversion
+          : > MODULE.bazel
+          printf 'genrule(\n    name = "tag",\n    outs = ["tag.txt"],\n    cmd = "echo %s > $@",\n)\n' "$TAG" > BUILD
+          bazel build //:tag 2>&1 | tee build.log
+          grep -Eq '[1-9][0-9]* remote cache hit' build.log
+          bazel shutdown
+  npm:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    steps:
+      - name: Install the cold job's package through the node's registry cache
+        run: |
+          set -eu
+          dir=$(mktemp -d)
+          cd "$dir"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund --cache "$(mktemp -d)" left-pad@1.3.0

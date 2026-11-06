@@ -27,6 +27,9 @@ const cacheEvictionAge = 7 * 24 * time.Hour
 
 const cacheConnectionLimit = 128
 
+// readCacheReap is how often the node's read cache is checked against its fill.
+const readCacheReap = time.Minute
+
 // generationMapLockName is the file in node.lock_dir whose flock keeps two
 // processes on a host from unmapping each other's read-only generation maps.
 const generationMapLockName = "ceph-generation-maps.lock"
@@ -168,14 +171,12 @@ func startNodeCache(
 		MaxHeaderBytes:    16 << 10,
 	}
 	// BAZEL'S AND BUCK2'S REMOTE CACHES SPEAK gRPC, which is HTTP/2, and a guest
-	// reaches this listener in the clear on its own bridge, so it takes HTTP/2
-	// with prior knowledge beside HTTP/1. The read timeout applies per stream,
-	// and a cache transfer extends its own.
-	if cfg.Node.Provider != config.ProviderEC2 {
-		srv.Protocols = new(http.Protocols)
-		srv.Protocols.SetHTTP1(true)
-		srv.Protocols.SetUnencryptedHTTP2(true)
-	}
+	// reaches this listener in the clear on its own bridge, or through its own
+	// relay on an EC2 guest, so it takes HTTP/2 with prior knowledge beside HTTP/1.
+	// The read timeout applies per stream, and a cache transfer extends its own.
+	srv.Protocols = new(http.Protocols)
+	srv.Protocols.SetHTTP1(true)
+	srv.Protocols.SetUnencryptedHTTP2(true)
 	serveListener := ln
 	if cfg.Node.Provider == config.ProviderEC2 {
 		certificate, err := tls.LoadX509KeyPair(cfg.Node.Cache.TLSCert, cfg.Node.Cache.TLSKey)
@@ -184,10 +185,16 @@ func startNodeCache(
 
 			return nil, nil, nil, fmt.Errorf("load the EC2 cache listener certificate: %w", err)
 		}
+		// NO TICKETS, because the relay resumes nothing, and a ticket is a record that
+		// makes its socket readable with nothing for it to read.
 		srv.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
+			SessionTicketsDisabled: true,
 		}
-		serveListener = tls.NewListener(ln, srv.TLSConfig)
+		// TLS IS THE TRANSPORT HERE AND NOTHING ABOVE IT KNOWS: what crosses it is what
+		// crosses a Firecracker guest's bridge, HTTP/2 with prior knowledge included,
+		// which http.Server takes only from a connection that is not a *tls.Conn.
+		serveListener = opaqueTLSListener{tls.NewListener(ln, srv.TLSConfig)}
 	}
 	// BOUND NOW, SERVED ONCE THE NODE IS READY. A failure to bind is a startup
 	// error as it always was, but nothing is answered until this process is
@@ -249,7 +256,13 @@ func startNodeCache(
 					"error", err)
 			}
 		}
-		evict := func() { evictPass(evictCtx, storage, service.ReapGitMirrors, sweeping, slog.Default()) }
+		evict := func() {
+			evictPass(evictCtx, storage, service.ReapGitMirrors, sweeping, slog.Default())
+		}
+
+		// BEFORE THE FIRST PASS, which can run for a publication's whole window after a
+		// restart, with the disk filling meanwhile.
+		go reapReadCache(evictCtx, service)
 
 		retryClosed()
 		renewActive()
@@ -279,6 +292,13 @@ func startNodeCache(
 				renewActive()
 			case <-service.ClosedSessions():
 				retryClosed()
+				// A PASS CAN TAKE HOURS ON A STORE OF OBJECTS, and a chain of them chosen over
+				// a tick that was also ready must not outlast what a lease has left.
+				select {
+				case <-cleanupTicker.C:
+					renewActive()
+				default:
+				}
 			}
 		}
 	}()
@@ -310,6 +330,23 @@ func startNodeCache(
 		}
 	}, nil
 }
+
+// opaqueTLSListener hands http.Server its connections with their TLS hidden, so the
+// server treats what they carry as it treats a cleartext connection. The handshake
+// still runs on the first read, under the server's own deadlines.
+type opaqueTLSListener struct{ net.Listener }
+
+func (l opaqueTLSListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	return opaqueConn{conn}, nil
+}
+
+// opaqueConn is a net.Conn that is no longer a *tls.Conn to a type assertion.
+type opaqueConn struct{ net.Conn }
 
 // nodeCacheSweepWait is how long a stop waits for a kernel-mapping sweep in
 // flight. Once its context is cancelled a sweep starts no unmap, so it ends
@@ -352,6 +389,26 @@ func awaitSweep(sweeping chan struct{}, bound time.Duration) bool {
 		return true
 	case <-timer.C:
 		return false
+	}
+}
+
+// reapReadCache keeps the node's read cache below its fill. Far oftener than an
+// eviction pass, because a build fills it in minutes, and a disk past the line writes
+// refuse at is what the fill exists to keep a job from meeting. A pass under the fill
+// reads one statfs.
+func reapReadCache(ctx context.Context, service *node.CacheService) {
+	ticker := time.NewTicker(readCacheReap)
+	defer ticker.Stop()
+
+	for {
+		if err := service.ReapCASCache(ctx); err != nil && ctx.Err() == nil {
+			slog.Default().Warn("could not make room in the node's read cache; will retry", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 

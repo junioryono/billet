@@ -99,6 +99,15 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 			ErrNoNode, lease.ID, n.name, wire, nodeapi.VersionWindowsGuests)
 	}
 
+	// NOR A TART IMAGE NAMING `@verified`, which an older node hands to `tart fqn` as a
+	// name and fails every launch of (ADR-021).
+	tartVerified := tartTierNamesVerified(tier, selectedProvider)
+	if tartVerified && wire < nodeapi.VersionTartVerified {
+		return fmt.Errorf("%w: tier %s boots a verified Tart image, which node %s cannot read: it "+
+			"speaks wire %d and that needs %d, so upgrade the node",
+			ErrNoNode, tier.Label, n.name, wire, nodeapi.VersionTartVerified)
+	}
+
 	if tier.NeedsCacheAwareNode() && wire < nodeapi.VersionCacheAuthority {
 		return fmt.Errorf("%w: tier %s configures its caches, which node %s cannot honour: it "+
 			"speaks wire %d and a cache block needs %d, so upgrade the node",
@@ -117,12 +126,24 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 		return err
 	}
 
+	spec := nodeapi.TierSpecOf(tier, selectedProvider)
+	guestCaches := selectedProvider == config.ProviderEC2 && spec.Cache != nil &&
+		(spec.Intercept || spec.Cache.NeedsGuestCacheServices())
+	if guestCaches && wire < nodeapi.VersionEC2GuestCaches {
+		r.plane.log.Warn("this EC2 node is too old to serve a guest's caches, so this tier's job "+
+			"runs without them; upgrade the node",
+			"tier", tier.Label, "node", n.name, "wire", wire, "needs", nodeapi.VersionEC2GuestCaches)
+		spec.Cache = new(spec.Cache.WithoutGuestCaches())
+		spec.Intercept = false
+		guestCaches = false
+	}
+
 	pend := &pending{
 		cmd: nodeapi.Command{
 			ID:    id,
 			Kind:  nodeapi.CommandLaunch,
 			Lease: lease,
-			Tier:  nodeapi.TierSpecOf(tier, selectedProvider),
+			Tier:  spec,
 			Job: &nodeapi.Job{
 				RequestID:   job.RequestID,
 				RunID:       job.RunID,
@@ -140,6 +161,10 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 		pend.minWire = nodeapi.VersionCacheAuthority
 	}
 
+	if guestCaches {
+		pend.minWire = max(pend.minWire, nodeapi.VersionEC2GuestCaches)
+	}
+
 	if tier.Arch != "" {
 		pend.minWire = max(pend.minWire, nodeapi.VersionArchitectures)
 		pend.arch = tier.Arch
@@ -151,6 +176,10 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 
 	if lease.GuestOS == config.GuestWindows {
 		pend.minWire = max(pend.minWire, nodeapi.VersionWindowsGuests)
+	}
+
+	if tartVerified {
+		pend.minWire = max(pend.minWire, nodeapi.VersionTartVerified)
 	}
 
 	res, err := r.plane.dispatch(ctx, n, pend)
@@ -931,4 +960,10 @@ func WireCacheAuthority(a dispatch.CacheAuthority) *nodeapi.CacheAuthority {
 		DefaultRef: a.DefaultRef, Proven: a.Proven, WriteOwnRef: a.WriteOwnRef,
 		PublishDefault: a.PublishDefault,
 	}
+}
+
+// tartTierNamesVerified reports whether a launch on this backend boots a Tart image
+// named `@verified`. On any other backend the same spelling means something else.
+func tartTierNamesVerified(tier config.Tier, selected config.ProviderKind) bool {
+	return selected == config.ProviderTart && tier.NamesTartVerified()
 }

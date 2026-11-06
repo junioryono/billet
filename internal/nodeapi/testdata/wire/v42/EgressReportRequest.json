@@ -1,0 +1,34 @@
+{
+  "epoch": 2139902348,
+  "report": {
+    "listed": true,
+    "queries": 1142801086,
+    "refused_queries": 992999,
+    "refused_names": [
+      {
+        "name": "EgressReportRequest.report.refused_names[0].name",
+        "count": 1453721411
+      }
+    ],
+    "names": [
+      {
+        "addr": "EgressReportRequest.report.names[0].addr",
+        "names": [
+          "EgressReportRequest.report.names[0].names[0]"
+        ]
+      }
+    ],
+    "denied_packets": 447518224,
+    "outside_resolver_packets": 1200201353,
+    "ipv6_packets": 2101850270,
+    "denied": [
+      {
+        "addr": "EgressReportRequest.report.denied[0].addr",
+        "protocol": "EgressReportRequest.report.denied[0].protocol",
+        "port": 205624824,
+        "packets": 1813652246
+      }
+    ],
+    "incomplete": true
+  }
+}

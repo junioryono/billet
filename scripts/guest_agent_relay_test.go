@@ -57,8 +57,12 @@ func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 		{name: "the relay never became ready", endpoint: node, ipDir: withBridge,
 			startFails: true, want: node, wantRun: true},
 		{name: "there is no docker bridge to bind", endpoint: node, ipDir: noBridge, want: node},
-		{name: "an https endpoint is left direct", endpoint: "https://10.0.0.5:7718",
-			ipDir: withBridge, want: "https://10.0.0.5:7718"},
+		// THE RELAY DOES THE TLS (ADR-024), so an EC2 guest's clients name it too.
+		{name: "an https endpoint goes through the relay", endpoint: "https://10.0.0.5:7718",
+			ipDir: withBridge, want: relayed, wantRun: true},
+		{name: "an https endpoint whose relay did not start is left direct",
+			endpoint: "https://10.0.0.5:7718", ipDir: withBridge, startFails: true,
+			want: "https://10.0.0.5:7718", wantRun: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -82,7 +86,6 @@ func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 				"BAZELRC_FILE=" + shellQuote(bazelrc),
 				"GITCONFIG_FILE=" + shellQuote(gitconfig),
 				"docker_gateway=172.17.0.1",
-				"cache_relay_port=41322",
 				"runner_env=()",
 				relayBlock,
 				envBlock,
@@ -127,7 +130,7 @@ func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 				for _, want := range []string{
 					"--unit=billet-cache-relay", "--socket-property=ListenStream=172.17.0.1:41322",
 					"/usr/bin/python3", "/usr/local/bin/billet-actions-proxy", "--mode", "node-relay",
-					"--upstream", node,
+					"--upstream", tc.endpoint,
 				} {
 					if !slices.Contains(run, want) {
 						t.Errorf("the relay unit's argv lacks %q: %q", want, run)

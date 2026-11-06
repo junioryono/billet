@@ -1,6 +1,8 @@
-# THE CACHE STORE. S3 holds the small fenced pointer and lease state; the EBS
-# volumes (created by billet at runtime, not here) hold the block generations.
-# Cache bytes never leave the availability zone — the bucket is not a data path.
+# THE CACHE STORE. S3 holds the small fenced pointer and lease state of the caches a
+# job mounts, whose block generations are EBS volumes billet creates at runtime, and
+# the whole objects of the caches the node serves, Actions archives and Go and Bazel
+# entries (ADR-024). Those reach the node through the VPC's S3 endpoint when it has
+# one, which is yours to add to an adopted network: without one they cross a NAT.
 
 resource "aws_kms_key" "cache" {
   count = local.enable_cache_kms ? 1 : 0
@@ -41,10 +43,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "cache" {
   bucket = aws_s3_bucket.cache[0].id
   rule {
     apply_server_side_encryption_by_default {
-      # The S3 bucket carries only the small fenced pointer and lease state, and
-      # billet's node role's KMS grant is scoped to EC2 (the EBS volumes), not S3.
-      # So the bucket stays on S3-managed AES256; the customer key encrypts the
-      # cache's EBS volumes, which billet creates at runtime.
+      # billet's node role's KMS grant is scoped to EC2 (the EBS volumes), not S3, so
+      # the bucket stays on S3-managed AES256; the customer key encrypts the cache's
+      # EBS volumes, which billet creates at runtime.
       sse_algorithm = "AES256"
     }
   }

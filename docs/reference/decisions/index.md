@@ -34,6 +34,7 @@ adr-026-windows-on-ec2
 adr-027-scheduling-from-measured-history
 adr-028-host-enforced-egress
 adr-029-rerunning-disrupted-jobs
+adr-030-rented-bare-metal-pool
 ```
 
 | Record | Decides |
@@ -67,3 +68,4 @@ adr-029-rerunning-disrupted-jobs
 | [ADR-027](adr-027-scheduling-from-measured-history.md) | why scheduling learns each job's runtime from the deployment's own history, under which key and with which fallbacks, why an overdue job is never predicted to end soon, and why a prediction may choose a host but never decides whether capacity is bought, held or released |
 | [ADR-028](adr-028-host-enforced-egress.md) | why a job's network is named and restricted on the host, by its interface and a resolver of its own, with GitHub's runner endpoints in every list and IPv6 refused |
 | [ADR-029](adr-029-rerunning-disrupted-jobs.md) | why billet re-runs a job it ended only for a tier that sets `retry.disrupted` and only on GitHub's own record of a lost runner, which causes count, why the request is exact or there is none, how a request whose answer was lost is settled by reading the run, and why the runner App then holds `actions: write` |
+| [ADR-030](adr-030-rented-bare-metal-pool.md) | how billet rents bare metal for Firecracker from a dedicated-server provider and from AWS behind one host-source contract; the pool's shape, where its caches live so it can shrink to its floor, why it grows ahead of demand and shrinks only by drain on proof, why a pool host is never spot, how an ordered host joins without a person only where its source vouches for its key, what a returned host keeps, and why a guest's traffic is policed on the host |
