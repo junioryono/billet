@@ -331,8 +331,8 @@ func TestJobFactsReadsAWindowAndSaysWhenItIsPartial(t *testing.T) {
 				(lease_id, tier, repo, workflow_ref, job_name, run_id, github_run_id, run_attempt, result,
 				 result_at, disruption, queued_at, started_at, github_queued_at, vcpu, memory,
 				 price_micros_per_hour)
-				VALUES (?, 'small', 'acme/api', 'acme/api/.github/workflows/ci.yml@refs/heads/main', 'test', 5, 6,
-				        ?, 'failed', ?, 'spot', 't', ?, ?, 2, 8, 9)`,
+				VALUES ($1, 'small', 'acme/api', 'acme/api/.github/workflows/ci.yml@refs/heads/main', 'test', 5, 6,
+				        $2, 'failed', $3, 'spot', 't', $4, $5, 2, 8, 9)`,
 				lease, row.attempt, ts(row.started.Add(time.Minute)), ts(row.started),
 				ts(row.started.Add(-time.Second))); err != nil {
 				return err

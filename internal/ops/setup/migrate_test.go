@@ -1672,7 +1672,7 @@ func TestEveryRewriteIsReadBackBeforeItIsKept(t *testing.T) {
 func originOf(t *testing.T, dir string) string {
 	t.Helper()
 
-	out := runIn(t, dir, "config", "--get-regexp", `^url\..*\.pushinsteadof$`)
+	out := runIn(t, dir, "config", "--local", "--get-regexp", `^url\..*\.pushinsteadof$`)
 	key, _, _ := strings.Cut(strings.TrimSpace(out), " ")
 
 	return strings.TrimSuffix(strings.TrimPrefix(key, "url."), ".pushinsteadof")
