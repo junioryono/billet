@@ -90,7 +90,7 @@ is_replay_input() {
 	case "$1" in
 	internal/provider/* | internal/store/*) return 0 ;;
 	internal/alloc/* | internal/app/* | internal/awscreds/* | internal/awsjson/* | \
-		internal/awsquota/* | internal/awss3/* | internal/awssig/* | internal/awsssm/* | internal/config/* | \
+		internal/awsquota/* | internal/awss3/* | internal/awssig/* | internal/awsssm/* | internal/awssts/* | internal/config/* | \
 		internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
 		internal/endpoint/* | internal/fakeactions/* | internal/flightrecorder/* | internal/github/* | internal/guestassets/* | \
 		internal/guestreport/* | \

@@ -209,13 +209,24 @@ func capacityRefusal(code string) bool {
 
 // call issues one action and unmarshals the response into out.
 func (c *client) call(ctx context.Context, params url.Values, out any) error {
+	return c.callUpTo(ctx, params, out, maxAttempts)
+}
+
+// callOnce issues one action exactly once. A pool launch is sent this way: a retry here
+// could carry a refusal back from a second attempt whose first launched a host, and the
+// pool, which reads the order back, is what tries again.
+func (c *client) callOnce(ctx context.Context, params url.Values, out any) error {
+	return c.callUpTo(ctx, params, out, 1)
+}
+
+func (c *client) callUpTo(ctx context.Context, params url.Values, out any, attempts int) error {
 	params.Set("Version", apiVersion)
 
 	body := params.Encode()
 
 	var lastErr error
 
-	for attempt := range maxAttempts {
+	for attempt := range attempts {
 		if attempt > 0 {
 			// EXPONENTIAL, AND CANCELLABLE. A fixed pause is either useless
 			// against a throttle or wasteful against a blip, and a sleep that
@@ -266,7 +277,7 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 	}
 
 	return fmt.Errorf("ec2: %s failed after %d attempts: %w",
-		params.Get("Action"), maxAttempts, lastErr)
+		params.Get("Action"), attempts, lastErr)
 }
 
 func (c *client) wait(ctx context.Context, d time.Duration) error {

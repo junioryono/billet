@@ -81,6 +81,13 @@ func (l *Listener) publishCapacity(ctx context.Context, sent *int, exchange stri
 		report.Refusal = l.refused.String()
 	}
 
+	// AND WHETHER MORE HOSTS WOULD HAVE BOUGHT IT, which a pool of rented bare metal
+	// reads as its demand (ADR-028). A tier with no host that can place it never waits
+	// in the admission queue, so Waiting reads zero for exactly the shortage a pool
+	// exists to fill; this is set from the allocator's reason whatever the queue made
+	// of the tier, and never for a seal, a cap, a share or the ceiling.
+	report.HostShortage = l.waitingFor > 0 && !l.refused.draining && l.refused.room != nil && l.refused.room.HostOnly()
+
 	// A COUNT WITHOUT A DATE IS NOT A WAIT. The two are written by different
 	// parties — the count by this tier's own reconciliation, the date by the
 	// queue every listener shares — so a tier the queue has already released

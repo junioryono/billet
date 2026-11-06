@@ -59,10 +59,11 @@ func TestThePoolCommandListsOrdersAndClosesOnlyAnUncertainOne(t *testing.T) {
 			rows[f[0]] = f
 		}
 	}
-	if r := rows["p-placed"]; len(r) < 8 || r[1] != "x64" || r[2] != "aws-metal" || r[5] != "placed" || r[6] != "i-0abc" {
+	if r := rows["p-placed"]; len(r) < 9 || r[1] != "x64" || r[2] != "aws-metal" ||
+		r[3] != "aws:us-west-2:subnet-0abc:us-west-2a" || r[6] != "placed" || r[7] != "i-0abc" {
 		t.Errorf("the p-placed row = %q", r)
 	}
-	if r := rows["p-lost"]; len(r) < 8 || r[5] != "uncertain" || r[6] != "-" {
+	if r := rows["p-lost"]; len(r) < 9 || r[6] != "uncertain" || r[7] != "-" {
 		t.Errorf("the p-lost row = %q", r)
 	}
 	for _, want := range []string{"the answer was lost", "1 uncertain", "billet pool abandon"} {

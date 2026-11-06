@@ -13,6 +13,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -51,17 +53,26 @@ type Source struct {
 	hosts    hosts
 	location string
 	shapes   map[string]Shape
+	// account answers which AWS account the credentials are in; it is asked once,
+	// then kept.
+	account   func(context.Context) (string, error)
+	accountMu sync.Mutex
+	accountID string
 	// code reads EC2's error code out of an error chain; ec2.Code outside a test.
 	code func(error) (string, bool)
 }
 
 // New builds a source over a provider's pool-host surface. location is the subnet's
-// availability zone, the one place this source orders in.
-func New(h *ec2.Hosts, location string, shapes []Shape) (*Source, error) {
-	return newSource(h, location, shapes)
+// availability zone, the one place this source orders in, and account answers which
+// AWS account the credentials are in.
+func New(h *ec2.Hosts, location string, shapes []Shape, account func(context.Context) (string, error)) (*Source, error) {
+	return newSource(h, location, shapes, account)
 }
 
-func newSource(h hosts, location string, shapes []Shape) (*Source, error) {
+func newSource(h hosts, location string, shapes []Shape, account func(context.Context) (string, error)) (*Source, error) {
+	if account == nil {
+		return nil, errors.New("awsmetal: a source needs to know its account, because a shared subnet has several")
+	}
 	if location == "" {
 		return nil, errors.New("awsmetal: a source needs the availability zone its subnet is in")
 	}
@@ -79,7 +90,7 @@ func newSource(h hosts, location string, shapes []Shape) (*Source, error) {
 		return nil, errors.New("awsmetal: a source needs at least one shape")
 	}
 
-	return &Source{hosts: h, location: location, shapes: byType, code: ec2.Code}, nil
+	return &Source{hosts: h, location: location, shapes: byType, code: ec2.Code, account: account}, nil
 }
 
 var _ hostsource.Source = (*Source)(nil)
@@ -87,8 +98,26 @@ var _ hostsource.Source = (*Source)(nil)
 // Name is the source's kind.
 func (s *Source) Name() string { return Name }
 
-// Scope is the provider's region and subnet, and this source's zone.
-func (s *Source) Scope() string { return s.hosts.Scope() + ":" + s.location }
+// Scope is the account the credentials are in, the provider's region and subnet, and
+// this source's zone. THE ACCOUNT IS PART OF IT because a shared subnet admits several
+// accounts, each blind to the others' instances: credentials that changed account
+// would read an order back as absent and launch it again.
+func (s *Source) Scope(ctx context.Context) (string, error) {
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	if s.accountID == "" {
+		id, err := s.account(ctx)
+		if err != nil {
+			return "", fmt.Errorf("awsmetal: which account the credentials are in: %w", err)
+		}
+		if id == "" {
+			return "", errors.New("awsmetal: the credentials named no account")
+		}
+		s.accountID = id
+	}
+
+	return "aws:" + s.accountID + ":" + strings.TrimPrefix(s.hosts.Scope(), "aws:") + ":" + s.location, nil
+}
 
 // Terms are on-demand EC2's: billed by the second, and a launch measured reaching its
 // first script within a minute. The lead time to a registered node is not measured.

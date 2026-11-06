@@ -45,6 +45,13 @@ func (r RoomRefusal) Binds() bool {
 		r.NoHost || r.Budgets
 }
 
+// HostOnly reports whether hosts, and nothing else, bind: none live can place the shape,
+// or those that can have no room, and no seal, cap, share, ceiling or budget does.
+func (r RoomRefusal) HostOnly() bool {
+	return (r.NoHost || len(r.HostsFull) > 0) &&
+		!r.Sealed && r.AtCap == 0 && !r.ShareBound && !r.CeilingBound && !r.Budgets
+}
+
 // String names every limit that binds, or says none does.
 func (r RoomRefusal) String() string {
 	var parts []string

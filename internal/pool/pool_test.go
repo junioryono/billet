@@ -132,6 +132,7 @@ type fakeSource struct {
 	t          *testing.T
 	ledger     *fakeLedger
 	scope      string
+	scopeErr   error
 	shapes     []string
 	mu         sync.Mutex
 	asked      []hostsource.Request
@@ -143,11 +144,11 @@ type fakeSource struct {
 
 func (s *fakeSource) Name() string { return "fake" }
 
-func (s *fakeSource) Scope() string {
+func (s *fakeSource) Scope(context.Context) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.scope
+	return s.scope, s.scopeErr
 }
 
 func (s *fakeSource) Order(_ context.Context, req hostsource.Request) (hostsource.Host, error) {
@@ -259,18 +260,30 @@ func newRig(t *testing.T, policy Policy, tiers ...config.Tier) *rig {
 	return r
 }
 
-func firecrackerTier(label string, arch config.Arch) config.Tier {
-	return config.Tier{Label: label, Provider: config.ProviderFirecracker, Arch: arch}
+func firecrackerTier(label string) config.Tier {
+	return config.Tier{Label: label, Provider: config.ProviderFirecracker, Arch: config.ArchX64}
 }
 
-// report sets a tier's capacity report as the listener writes it, observed now.
-func (r *rig) report(label string, waiting int, age time.Duration, observationErr string) {
+// report sets a tier's capacity report as the listener writes it, observed age ago:
+// short is whether more hosts would have bought its waiting work.
+func (r *rig) report(label string, short bool, age time.Duration, observationErr string) {
 	r.ledger.mu.Lock()
 	defer r.ledger.mu.Unlock()
 	r.ledger.reports[label] = alloc.TierCapacity{
 		ObservedAt:       r.now.Add(-age).UTC().Format(time.RFC3339Nano),
 		ObservationError: observationErr,
-		Listener:         alloc.ListenerCapacity{Waiting: waiting},
+		Listener:         alloc.ListenerCapacity{HostShortage: short},
+	}
+}
+
+// reportWaiting sets a report of work waiting that more hosts would not have bought: a
+// tier at its own cap, or behind a seal.
+func (r *rig) reportWaiting(label string, waiting int) {
+	r.ledger.mu.Lock()
+	defer r.ledger.mu.Unlock()
+	r.ledger.reports[label] = alloc.TierCapacity{
+		ObservedAt: r.now.UTC().Format(time.RFC3339Nano),
+		Listener:   alloc.ListenerCapacity{Waiting: waiting, Refusal: "the tier holds its max_concurrent of 2"},
 	}
 }
 
@@ -312,23 +325,26 @@ func TestTheFloorIsKept(t *testing.T) {
 	}
 }
 
-// A FIRECRACKER TIER WITH JOBS WAITING, BY A FRESH REPORT, IS DEMAND, for one host while
-// none is on its way; another provider's tier, or one with no architecture, is not. No
-// host is known to join until the join lands, so demand grows the pool by one at most.
+// A FIRECRACKER TIER SHORT OF HOSTS, BY A FRESH REPORT, IS DEMAND, for one host while
+// none is on its way; another provider's tier, one with no architecture, or one whose
+// waiting work more hosts would not buy (its own cap), is not. No host is known to join
+// until the join lands, so demand grows the pool by one at most.
 func TestDemandOrdersOneHostWhileNoneIsOnItsWay(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, Policy{Floor: 0, Max: 3},
-		firecrackerTier("fc-x64", config.ArchX64),
+		firecrackerTier("fc-x64"),
+		firecrackerTier("fc-capped"),
 		config.Tier{Label: "ec2", Provider: config.ProviderEC2, Arch: config.ArchX64},
 		config.Tier{Label: "fc-any", Provider: config.ProviderFirecracker})
-	r.report("fc-x64", 0, 0, "")
-	r.report("ec2", 5, 0, "")
-	r.report("fc-any", 5, 0, "")
+	r.report("fc-x64", false, 0, "")
+	r.reportWaiting("fc-capped", 5)
+	r.report("ec2", true, 0, "")
+	r.report("fc-any", true, 0, "")
 	step(t, r)
 	if n := len(r.ledger.states()); n != 0 {
 		t.Fatalf("%d orders for demand the pool does not serve", n)
 	}
-	r.report("fc-x64", 3, 0, "")
+	r.report("fc-x64", true, 0, "")
 	step(t, r)
 	step(t, r)
 	step(t, r)
@@ -343,7 +359,7 @@ func TestATierOfSeveralProvidersIncludingFirecrackerIsDemand(t *testing.T) {
 	r := newRig(t, Policy{Floor: 0, Max: 2}, config.Tier{
 		Label: "mixed", Providers: []config.ProviderKind{config.ProviderEC2, config.ProviderFirecracker}, Arch: config.ArchX64,
 	})
-	r.report("mixed", 2, 0, "")
+	r.report("mixed", true, 0, "")
 	step(t, r)
 	if n := len(r.ledger.states()); n != 1 {
 		t.Fatalf("%d orders, want 1", n)
@@ -369,16 +385,16 @@ func TestUnreadableDemandKeepsTheFloorAndOrdersNothingForDemand(t *testing.T) {
 	t.Parallel()
 	for name, set := range map[string]func(*rig){
 		"no report":       func(*rig) {},
-		"a stale report":  func(r *rig) { r.report("fc", 5, 6*time.Minute, "") },
-		"a failed report": func(r *rig) { r.report("fc", 5, 0, "malformed snapshot") },
+		"a stale report":  func(r *rig) { r.report("fc", true, 6*time.Minute, "") },
+		"a failed report": func(r *rig) { r.report("fc", true, 0, "malformed snapshot") },
 		"an unreadable ledger": func(r *rig) {
-			r.report("fc", 5, 0, "")
+			r.report("fc", true, 0, "")
 			r.ledger.readErr = errors.New("database is locked")
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			r := newRig(t, Policy{Floor: 0, Max: 3}, firecrackerTier("fc", config.ArchX64))
+			r := newRig(t, Policy{Floor: 0, Max: 3}, firecrackerTier("fc"))
 			set(r)
 			if err := r.pool.Step(t.Context()); !errors.Is(err, ErrDemandUnknown) {
 				t.Fatalf("step = %v, want the demand unknown", err)
@@ -387,7 +403,7 @@ func TestUnreadableDemandKeepsTheFloorAndOrdersNothingForDemand(t *testing.T) {
 				t.Fatalf("%d orders for demand that could not be read", n)
 			}
 
-			r = newRig(t, Policy{Floor: 1, Max: 3}, firecrackerTier("fc", config.ArchX64))
+			r = newRig(t, Policy{Floor: 1, Max: 3}, firecrackerTier("fc"))
 			set(r)
 			if err := r.pool.Step(t.Context()); !errors.Is(err, ErrDemandUnknown) {
 				t.Fatalf("step = %v", err)
@@ -566,7 +582,8 @@ func TestASourceWithoutDeduplicationIsNeverResent(t *testing.T) {
 }
 
 // AN ORDER IS READ BACK ONLY WHERE IT WAS PLACED: a source whose scope changed since
-// is neither asked for it nor sent it again, and the order waits for a person.
+// is neither asked for it nor sent it again; the order is uncertain, for a person to
+// look where it was placed, and nothing more is ordered on its architecture meanwhile.
 func TestAnOrderIsReadBackOnlyWhereItWasPlaced(t *testing.T) {
 	t.Parallel()
 	r := newRig(t, Policy{Floor: 1, Max: 2})
@@ -578,11 +595,71 @@ func TestAnOrderIsReadBackOnlyWhereItWasPlaced(t *testing.T) {
 	r.first.mu.Unlock()
 	step(t, r)
 	step(t, r)
-	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolOrdering {
-		t.Fatalf("orders = %v", got)
+	got := r.ledger.snapshot()
+	if len(got) != 1 || got["o-1"].State != alloc.PoolUncertain ||
+		!strings.Contains(got["o-1"].Reason, "first:us-west-2") || !strings.Contains(got["o-1"].Reason, "first:eu-west-1") {
+		t.Fatalf("orders = %+v, want o-1 uncertain naming both scopes", got)
 	}
 	if len(r.first.finds()) != 0 || len(r.first.requests()) != 1 {
 		t.Fatalf("read back %v and sent %d times somewhere else", r.first.finds(), len(r.first.requests()))
+	}
+}
+
+// A SOURCE THAT CANNOT SAY WHERE IT ORDERS ORDERS NOTHING and resolves nothing: the step
+// reports it, no order is committed, and a lost order is neither read back nor sent.
+func TestASourceThatCannotSayWhereItOrdersOrdersNothing(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 1, Max: 2})
+	r.first.scopeErr = errors.New("sts: throttled")
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "throttled") {
+		t.Fatalf("step = %v, want the scope's error", err)
+	}
+	if n := len(r.ledger.states()); n != 0 {
+		t.Fatalf("%d orders committed with no scope", n)
+	}
+
+	r = newRig(t, Policy{Floor: 1, Max: 2})
+	r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, errors.New("timeout") }
+	step(t, r)
+	r.first.mu.Lock()
+	r.first.scopeErr = errors.New("sts: throttled")
+	r.first.answer = nil
+	r.first.mu.Unlock()
+	if err := r.pool.Step(t.Context()); err == nil {
+		t.Fatal("a resume whose source could not say where it orders was not reported")
+	}
+	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolOrdering ||
+		len(r.first.finds()) != 0 || len(r.first.requests()) != 1 {
+		t.Fatalf("orders = %v, read back %v, sent %d times", got, r.first.finds(), len(r.first.requests()))
+	}
+}
+
+// AN ORDER WHOSE SOURCE IS NO LONGER CONFIGURED IS UNCERTAIN: nothing can read it back,
+// so a person must, and its architecture orders nothing meanwhile.
+func TestAnOrderWhoseSourceIsGoneIsUncertain(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 1, Max: 2})
+	r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, errors.New("timeout") }
+	step(t, r)
+	p, err := New(r.ledger, Config{
+		Archs:   map[config.Arch]Policy{config.ArchX64: {Floor: 1, Max: 2, Choices: []Choice{{Source: "second", Shape: "s2.c2.small"}}}},
+		Sources: map[string]hostsource.Source{"second": r.second},
+		Boot:    func(string, string) ([]byte, error) { return []byte("join"), nil },
+	}, WithClock(func() time.Time { return r.now }))
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	for range 2 {
+		if err := p.Step(t.Context()); err != nil {
+			t.Fatalf("step: %v", err)
+		}
+	}
+	got := r.ledger.snapshot()
+	if len(got) != 1 || got["o-1"].State != alloc.PoolUncertain || !strings.Contains(got["o-1"].Reason, "first") {
+		t.Fatalf("orders = %+v, want o-1 uncertain naming its source", got)
+	}
+	if n := len(r.second.requests()); n != 0 {
+		t.Fatalf("another source was asked %d times while an order was unknown", n)
 	}
 }
 

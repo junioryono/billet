@@ -109,6 +109,46 @@ func TestALaunchRefusalKeepsTheCodeAndDropsTheMessage(t *testing.T) {
 	}
 }
 
+// A POOL LAUNCH IS SENT ONCE, even on an answer the client would retry anywhere else: a
+// second attempt could carry back a refusal from an order whose first attempt launched a
+// host, and the pool, which reads the order back under its client token, is what tries
+// again. Every other call keeps its retries.
+func TestAPoolLaunchIsSentOnce(t *testing.T) {
+	t.Parallel()
+	for name, reply := range map[string]struct {
+		status int
+		body   string
+	}{
+		"a server error": {http.StatusInternalServerError, `<Response><Errors><Error><Code>InternalError</Code></Error></Errors></Response>`},
+		"a throttle":     {http.StatusServiceUnavailable, `<Response><Errors><Error><Code>RequestLimitExceeded</Code></Error></Errors></Response>`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newFakeEC2(t)
+			f.respond = func(action string, _ url.Values) (int, string) {
+				if action == "RunInstances" || action == "DescribeInstances" {
+					return reply.status, reply.body
+				}
+
+				return http.StatusOK, defaultReply(action)
+			}
+			h := newTestProvider(t, f, nil).Hosts()
+			if _, err := h.Launch(t.Context(), hostLaunch()); err == nil {
+				t.Fatal("a failed launch succeeded")
+			}
+			if n := f.countOf("RunInstances"); n != 1 {
+				t.Fatalf("RunInstances was sent %d times, want once", n)
+			}
+			if _, _, err := h.Find(t.Context(), "o-1"); err == nil {
+				t.Fatal("a failed read back succeeded")
+			}
+			if n := f.countOf("DescribeInstances"); n != maxAttempts {
+				t.Fatalf("DescribeInstances was sent %d times, want its %d retries kept", n, maxAttempts)
+			}
+		})
+	}
+}
+
 func TestAnOrderThatCannotBeATokenOrAFilterIsRefused(t *testing.T) {
 	t.Parallel()
 	f := newFakeEC2(t)

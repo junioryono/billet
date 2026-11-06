@@ -143,7 +143,7 @@ func (h *Hosts) Launch(ctx context.Context, l HostLaunch) (HostRecord, error) {
 	params.Set("UserData", base64.StdEncoding.EncodeToString(l.UserData))
 
 	var out runInstancesResponse
-	if err := p.api.call(ctx, params, &out); err != nil {
+	if err := p.api.callOnce(ctx, params, &out); err != nil {
 		return HostRecord{}, fmt.Errorf("ec2: launch pool host %s on %s: %w", l.Order, l.InstanceType, withoutMessage(err))
 	}
 	if len(out.Instances) == 0 || out.Instances[0].InstanceID == "" {

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -48,6 +49,61 @@ func runBoot(t *testing.T, boot []byte, env ...string) (args []string, stderr st
 	}
 
 	return strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n"), errs.String()
+}
+
+// A PRELUDE THAT FAILS STOPS THE BOOT BEFORE THE JOIN: it runs under errexit, nounset
+// and pipefail of its own, so a failed command, an unset variable or a failed stage of a
+// pipeline ends it, the join never spends the token, and the prelude's file is removed.
+func TestAPreludeThatFailsStopsTheBootBeforeTheJoin(t *testing.T) {
+	t.Parallel()
+	for name, prelude := range map[string]string{
+		"a failed command":        "false\necho after >&2\n",
+		"an unset variable":       "echo \"$BILLET_POOL_NEVER_SET\"\n",
+		"a failed pipeline stage": "false | true\necho after >&2\n",
+		"an exit with a failure":  "exit 3\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			boot, err := PoolBoot(poolBootConfig(), prelude, "SHA256:ab", "p01", "tok")
+			if err != nil {
+				t.Fatalf("boot: %v", err)
+			}
+			dir := t.TempDir()
+			script := filepath.Join(dir, "boot.sh")
+			if err := os.WriteFile(script, []byte(strings.ReplaceAll(string(boot), "/run/", dir+"/")), 0o700); err != nil {
+				t.Fatalf("write the boot: %v", err)
+			}
+			argsFile := filepath.Join(dir, "args")
+			cmd := exec.CommandContext(t.Context(), "bash", "-c",
+				`billet() { printf '%s\n' "$@" >"$ARGS"; }; export -f billet; bash "$SCRIPT"`)
+			cmd.Env = append(os.Environ(), "ARGS="+argsFile, "SCRIPT="+script)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("a boot whose prelude failed succeeded:\n%s", out)
+			}
+			if strings.Contains(string(out), "after") {
+				t.Errorf("the prelude ran on past its failure:\n%s", out)
+			}
+			if _, err := os.Stat(argsFile); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("billet join ran after the prelude failed (%v)", err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "billet-pool-prelude.sh")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("the prelude's file was left behind (%v)", err)
+			}
+		})
+	}
+}
+
+// A NUL CANNOT BE CARRIED: bash drops it, so a prelude or a join argument holding one is
+// refused rather than run as something else.
+func TestABootHoldingANULIsRefused(t *testing.T) {
+	t.Parallel()
+	if _, err := PoolBoot(poolBootConfig(), "echo a\x00b\n", "SHA256:ab", "p01", "tok"); err == nil {
+		t.Fatal("a prelude holding a NUL was rendered")
+	}
+	if _, err := PoolBoot(poolBootConfig(), "true\n", "SHA256:ab", "p01", "to\x00k"); err == nil {
+		t.Fatal("a token holding a NUL was rendered")
+	}
 }
 
 // AN ORDERED HOST'S BOOT RUNS THE PRELUDE, THEN JOINS, with its order's own token, the

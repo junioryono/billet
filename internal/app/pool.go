@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/awssts"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
 	"github.com/junioryono/billet/internal/hostsource/awsmetal"
@@ -93,7 +95,13 @@ func poolSources(pc *config.PoolConfig, deployment string) (map[string]hostsourc
 		for _, s := range m.Shapes {
 			shapes = append(shapes, awsmetal.Shape{Type: s.Type, Arch: s.Arch, Image: m.Images[s.Arch]})
 		}
-		src, err := awsmetal.New(prov.Hosts(), m.AvailabilityZone, shapes)
+		region := m.Region
+		account := func(ctx context.Context) (string, error) {
+			id, err := awssts.New(region, "", awscreds.Default(), nil).Whoami(ctx)
+
+			return id.Account, err
+		}
+		src, err := awsmetal.New(prov.Hosts(), m.AvailabilityZone, shapes, account)
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +175,15 @@ func PoolBoot(cfg *config.Config, prelude, fingerprint, order, token string) ([]
 	}
 	quoted := make([]string, len(join))
 	for i, a := range join {
+		// NO NUL IN A WORD OR THE PRELUDE: bash drops it, so what runs is not what was
+		// configured.
+		if strings.ContainsRune(a, 0) {
+			return nil, fmt.Errorf("app: a pool host's join argument %d holds a NUL byte", i)
+		}
 		quoted[i] = singleQuoted(a)
+	}
+	if strings.ContainsRune(prelude, 0) {
+		return nil, errors.New("app: server.pool.boot_prelude holds a NUL byte, which bash would drop")
 	}
 	body := strings.TrimRight(prelude, "\n")
 	for _, line := range strings.Split(body, "\n") {
@@ -179,9 +195,14 @@ func PoolBoot(cfg *config.Config, prelude, fingerprint, order, token string) ([]
 
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\n# billet pool order " + order + "\nset -euo pipefail\n\n")
-	b.WriteString("umask 077\ncat >/run/billet-pool-prelude.sh <<'" + preludeEnd + "'\n")
+	// THE PRELUDE RUNS IN A BASH OF ITS OWN, under the same errexit, nounset and
+	// pipefail as the boot, so whatever it sets, traces or exits cannot reach the join,
+	// and a failure in it stops the boot before the token is used. Its file is removed
+	// however the boot ends.
+	b.WriteString("umask 077\ntrap 'rm -f /run/billet-pool-prelude.sh' EXIT\n")
+	b.WriteString("cat >/run/billet-pool-prelude.sh <<'" + preludeEnd + "'\n")
 	b.WriteString(body + "\n" + preludeEnd + "\n")
-	b.WriteString("bash /run/billet-pool-prelude.sh\nrm -f /run/billet-pool-prelude.sh\n\n")
+	b.WriteString("bash -euo pipefail /run/billet-pool-prelude.sh\nrm -f /run/billet-pool-prelude.sh\n\n")
 	b.WriteString("set +o xtrace +o verbose\n")
 	b.WriteString(strings.Join(quoted, " ") + "\n")
 	if b.Len() > maxBootPayload {

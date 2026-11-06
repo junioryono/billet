@@ -509,3 +509,57 @@ func TestTheReportNamesTheWaiterThatHoldsTheLine(t *testing.T) {
 			head.Listener.Refusal)
 	}
 }
+
+// A TIER NO HOST CAN PLACE PUBLISHES A HOST SHORTAGE, though it never waits in line and
+// so publishes no Waiting; a tier refused at its own cap does not, because more hosts
+// would not buy it anything (ADR-028: the pool's demand).
+func TestATierNoHostCanPlacePublishesAHostShortage(t *testing.T) {
+	t.Parallel()
+
+	arm := tierOf("a-arm", 4)
+	arm.Arch = config.ArchARM64 // the registered hosts report no architecture
+	capped := tierOf("b-capped", 4)
+	capped.MaxConcurrent = 1
+	capped.Arch = config.ArchX64
+
+	a, _, listeners := loggedListeners(t, []config.Tier{arm, capped}, 64, config.AdmissionFair)
+	// ONE LEASE FILLS THE x64 HOST, so the capped tier is at its cap and its hosts are
+	// full at once: only the cap says more hosts would not have bought it anything.
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "x64-host", Provider: config.ProviderFirecracker, VCPU: capped.VCPU, Memory: 64 * config.GiB,
+		Architectures: []config.Arch{config.ArchX64},
+	}); err != nil {
+		t.Fatalf("register an x64 host: %v", err)
+	}
+	for _, l := range listeners {
+		if err := l.reconcilePool(t.Context(), 3); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		l.reportCapacity(t.Context(), nil, "")
+	}
+
+	got, err := a.CapacityReport(t.Context(), "a-arm")
+	if err != nil {
+		t.Fatalf("read the arm tier's report: %v", err)
+	}
+	if !got.Listener.HostShortage || got.Listener.Waiting != 0 {
+		t.Errorf("a tier no host can place: shortage %t, waiting %d (%+v); want a shortage and no wait in line",
+			got.Listener.HostShortage, got.Listener.Waiting, got.Listener)
+	}
+	if !strings.Contains(got.Listener.Refusal, "no live host can place its shape") {
+		t.Errorf("the arm tier's refusal is %q, want no host", got.Listener.Refusal)
+	}
+
+	got, err = a.CapacityReport(t.Context(), "b-capped")
+	if err != nil {
+		t.Fatalf("read the capped tier's report: %v", err)
+	}
+	if got.Listener.HostShortage {
+		t.Errorf("a tier at its own cap published a host shortage: %+v", got.Listener)
+	}
+	for _, want := range []string{"max_concurrent of 1", "no room on its hosts (x64-host)"} {
+		if !strings.Contains(got.Listener.Refusal, want) {
+			t.Errorf("the capped tier's refusal is %q, want %q in it", got.Listener.Refusal, want)
+		}
+	}
+}

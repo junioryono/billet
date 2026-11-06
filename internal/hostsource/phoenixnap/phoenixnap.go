@@ -183,7 +183,7 @@ func (s *Source) LogValue() slog.Value { return slog.StringValue(s.String()) }
 func (s *Source) Name() string { return Name }
 
 // Scope is the account the API client orders in, named by the client.
-func (s *Source) Scope() string { return Name + ":" + s.creds.ClientID }
+func (s *Source) Scope(context.Context) (string, error) { return Name + ":" + s.creds.ClientID, nil }
 
 // Terms are an hourly plan's: billed by the started hour, no minimum term. The lead
 // time is not measured, since no order has been accepted, so it is zero, which the

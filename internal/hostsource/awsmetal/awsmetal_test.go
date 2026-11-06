@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -73,10 +74,16 @@ func (f *fakeHosts) Terminate(_ context.Context, id string) error {
 
 func newTestSource(t *testing.T, f *fakeHosts) *Source {
 	t.Helper()
+
+	return newTestSourceIn(t, f, func(context.Context) (string, error) { return "111122223333", nil })
+}
+
+func newTestSourceIn(t *testing.T, f *fakeHosts, account func(context.Context) (string, error)) *Source {
+	t.Helper()
 	s, err := newSource(f, "us-west-2a", []Shape{
 		{Type: "m7gd.metal", Arch: config.ArchARM64, Image: "ami-arm"},
 		{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"},
-	})
+	}, account)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -241,11 +248,43 @@ func TestALaunchRefusedLocallyIsNotSent(t *testing.T) {
 	}
 }
 
-// THE SCOPE IS WHERE AN ORDER WAS PLACED: the provider's region and subnet, and this
-// source's zone, so a changed config is never mistaken for the same place.
-func TestTheScopeNamesRegionSubnetAndZone(t *testing.T) {
+// THE SCOPE IS WHERE AN ORDER WAS PLACED: the credentials' account, the provider's
+// region and subnet, and this source's zone, so a changed config or credentials in
+// another account sharing the subnet are never mistaken for the same place. The account
+// is asked once and kept; a failed or empty answer is could-not-tell, and is asked again.
+func TestTheScopeNamesAccountRegionSubnetAndZone(t *testing.T) {
 	t.Parallel()
-	if got := newTestSource(t, &fakeHosts{}).Scope(); got != "aws:us-west-2:subnet-0abc:us-west-2a" {
-		t.Fatalf("scope = %q", got)
+	asked := 0
+	answers := []struct {
+		id  string
+		err error
+	}{{"", errors.New("sts: throttled")}, {"", nil}, {"111122223333", nil}, {"444455556666", nil}}
+	s := newTestSourceIn(t, &fakeHosts{}, func(context.Context) (string, error) {
+		a := answers[asked]
+		asked++
+
+		return a.id, a.err
+	})
+	if _, err := s.Scope(t.Context()); err == nil || !strings.Contains(err.Error(), "throttled") {
+		t.Fatalf("a failed account read answered %v", err)
+	}
+	if _, err := s.Scope(t.Context()); err == nil {
+		t.Fatal("an empty account was accepted")
+	}
+	for range 2 {
+		got, err := s.Scope(t.Context())
+		if err != nil || got != "aws:111122223333:us-west-2:subnet-0abc:us-west-2a" {
+			t.Fatalf("scope = %q, %v", got, err)
+		}
+	}
+	if asked != 3 {
+		t.Fatalf("the account was asked %d times, want 3: once kept, never again", asked)
+	}
+}
+
+func TestASourceWithoutAnAccountIsRefused(t *testing.T) {
+	t.Parallel()
+	if _, err := newSource(&fakeHosts{}, "us-west-2a", []Shape{{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"}}, nil); err == nil {
+		t.Fatal("a source that cannot name its account was built")
 	}
 }

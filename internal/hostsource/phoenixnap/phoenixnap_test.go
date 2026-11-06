@@ -687,7 +687,7 @@ func TestARefusalNamesTheServerItAskedFor(t *testing.T) {
 func TestTheScopeIsTheClientsAccount(t *testing.T) {
 	t.Parallel()
 	_, srv := newFake(t)
-	if got := source(t, srv).Scope(); got != "phoenixnap:"+clientID || strings.Contains(got, clientSecret) {
-		t.Fatalf("scope = %q", got)
+	if got, err := source(t, srv).Scope(t.Context()); err != nil || got != "phoenixnap:"+clientID || strings.Contains(got, clientSecret) {
+		t.Fatalf("scope = %q, %v", got, err)
 	}
 }

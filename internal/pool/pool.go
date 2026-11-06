@@ -80,7 +80,7 @@ type Config struct {
 	DemandFreshness time.Duration
 	// Boot renders an ordered host's first boot from its order and join token.
 	Boot func(order, token string) ([]byte, error)
-	// Tiers are the deployment's tiers; a Firecracker tier with jobs waiting is
+	// Tiers are the deployment's tiers; a Firecracker tier short of hosts is
 	// demand for its architecture.
 	Tiers []config.Tier
 }
@@ -219,7 +219,8 @@ func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 	return c
 }
 
-// demand is the architectures a Firecracker tier has jobs waiting on, by a report
+// demand is the architectures a Firecracker tier is short of hosts on (work it could
+// not buy for, and only hosts to blame), by a report
 // fresh enough to say so. A Firecracker tier whose report is missing, stale or in error
 // makes the whole reading unknown.
 func (p *Pool) demand(ctx context.Context) (map[config.Arch]bool, error) {
@@ -242,7 +243,7 @@ func (p *Pool) demand(ctx context.Context) (map[config.Arch]bool, error) {
 
 			continue
 		}
-		if r.Listener.Waiting > 0 {
+		if r.Listener.HostShortage {
 			out[t.Arch] = true
 		}
 	}
@@ -276,12 +277,16 @@ func (p *Pool) order(ctx context.Context, arch config.Arch, a Policy, orders []a
 
 		return nil
 	}
+	scope, err := p.cfg.Sources[choice.Source].Scope(ctx)
+	if err != nil {
+		return fmt.Errorf("pool: where %s orders: %w", choice.Source, err)
+	}
 	id, err := p.newID()
 	if err != nil {
 		return err
 	}
 	o := alloc.PoolOrder{
-		ID: id, Source: choice.Source, Scope: p.cfg.Sources[choice.Source].Scope(),
+		ID: id, Source: choice.Source, Scope: scope,
 		Shape: choice.Shape, Location: choice.Location, Arch: arch,
 	}
 	if err := p.ledger.RecordPoolOrder(ctx, o); err != nil {
@@ -367,16 +372,19 @@ func (p *Pool) send(ctx context.Context, o alloc.PoolOrder, first bool) error {
 // changed since the order, decides nothing.
 func (p *Pool) resume(ctx context.Context, o alloc.PoolOrder) error {
 	src := p.cfg.Sources[o.Source]
-	switch {
-	case src == nil:
-		p.log.Warn("a pool order names a source no longer configured; it waits", "order", o.ID, "source", o.Source)
-
-		return nil
-	case src.Scope() != o.Scope:
-		p.log.Warn("a pool order was placed where its source no longer orders; it waits, because reading it back "+
-			"anywhere else could miss the host it placed", "order", o.ID, "placed", o.Scope, "now", src.Scope())
-
-		return nil
+	if src == nil {
+		return p.ledger.PoolOrderUncertain(ctx, o.ID, fmt.Sprintf(
+			"its source %s is no longer configured, so it cannot be read back", o.Source))
+	}
+	scope, err := src.Scope(ctx)
+	if err != nil {
+		return fmt.Errorf("pool: where order %s's source orders now: %w", o.ID, err)
+	}
+	if scope != o.Scope {
+		// UNCERTAIN, NOT WAITING: a read anywhere else could miss the host it placed,
+		// and a person can look where it was placed and close it.
+		return p.ledger.PoolOrderUncertain(ctx, o.ID, fmt.Sprintf(
+			"it was placed in %s and its source now orders in %s, so it cannot be read back", o.Scope, scope))
 	}
 	host, found, err := src.Find(ctx, o.ID)
 	if err != nil {

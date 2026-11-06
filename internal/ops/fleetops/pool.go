@@ -49,14 +49,14 @@ func Pool(ctx context.Context, env cli.Env, args []string) error {
 
 func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 	w := tabwriter.NewWriter(env.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ORDER\tARCH\tSOURCE\tSHAPE\tLOCATION\tSTATE\tHOST\tNODE\tFIRST ATTEMPT\tREASON")
+	fmt.Fprintln(w, "ORDER\tARCH\tSOURCE\tSCOPE\tSHAPE\tLOCATION\tSTATE\tHOST\tNODE\tFIRST ATTEMPT\tREASON")
 	uncertain := 0
 	for i := range orders {
 		o := &orders[i]
 		if o.State == alloc.PoolUncertain {
 			uncertain++
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.ID, o.Arch, o.Source, o.Shape,
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.ID, o.Arch, o.Source, o.Scope, o.Shape,
 			dash(o.Location), o.State, dash(o.HostID), dash(o.NodeName),
 			o.FirstAttempt.UTC().Format(time.RFC3339), dash(oneLine(o.Reason)))
 	}
@@ -65,8 +65,8 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 	}
 	if uncertain > 0 {
 		fmt.Fprintf(env.Stdout, "\n%d uncertain: the source's answer was lost and a resend could place a second host. "+
-			"Look for the order in the source's own console (an EC2 instance tagged sh.billet.pool-order, a phoenixNAP "+
-			"server named billet-<order>); if there is none, close it with `billet pool abandon --reason ... <order>`.\n",
+			"Look for the order where its SCOPE says it was placed, in the source's own console (an EC2 instance tagged "+
+			"sh.billet.pool-order, a phoenixNAP server named billet-<order>); if there is none, close it with `billet pool abandon --reason ... <order>`.\n",
 			uncertain)
 	}
 
