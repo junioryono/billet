@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -168,6 +169,9 @@ type alertSweep struct {
 	scanning bool
 	scan     alloc.AlertCursor
 	held     map[string]bool
+	// until is where a cycle of scans ends: the moment its first pass began. A scan
+	// that chases results arriving faster than it reads still reaches it.
+	until time.Time
 	// began is when this pass began on the wall clock, which clock measures from.
 	began     time.Time
 	lastPrune time.Time
@@ -247,6 +251,9 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 
 	sweep.began = time.Now()
 
+	// PRUNED WHATEVER THE PASS COMES TO, a scan carried on or a read that failed.
+	defer s.pruneAlerts(ctx, sweep, now)
+
 	pass := &alertPass{spent: map[string]int{}, budgets: installationBudgets(targets),
 		steps: map[rerunRun]map[string]RunnerSteps{}, failed: map[rerunRun]error{},
 		unbranched: map[rerunRun]error{}, deferred: map[string]bool{}}
@@ -254,13 +261,17 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 	// THE ENDED JOBS ARE READ ON TO THE END, page by page, before a running job is
 	// judged: a job held at the cursor does not keep the running ones from being
 	// judged, however many results follow it. A pass reads at most so many pages; the
-	// next reads on from where it stopped, with the streaks it put off still put off,
-	// so the running jobs wait for the end of the scan rather than for ever. The
-	// cursor passes only what is decided, and only a result old enough that no earlier
-	// one can still land, so it moves only on a pass that began at it.
+	// next reads on from where it stopped, with a copy of the streaks it put off,
+	// published only with its progress, and a cycle of passes ends at the moment its
+	// first began, so the running jobs wait for that end rather than for ever. Each page
+	// and each carried scan goes on after the last result old enough that no earlier
+	// one can still land, so a result committed late is read before the end. The
+	// cursor passes only what is decided, so it moves only on a pass that began at it.
 	page, decided := sweep.ended, true
 	if sweep.scanning {
-		page, decided, pass.deferred = sweep.scan, false, sweep.held
+		page, decided, pass.deferred = sweep.scan, false, maps.Clone(sweep.held)
+	} else {
+		sweep.until = now
 	}
 
 	var running []alloc.AlertJob
@@ -278,25 +289,43 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 			running = read.Running
 		}
 
+		next := alloc.AlertCursor{}
 		for i := range read.Ended {
 			if ctx.Err() != nil {
 				return
 			}
 
-			settled := s.judgeAll(ctx, &read.Ended[i], true, targets, sweep, pass, now)
-			if decided && settled && now.Sub(read.Ended[i].ResultAt) > alertSettledAfter {
-				sweep.ended = read.Ended[i].Cursor
+			job := &read.Ended[i]
+			if job.ResultAt.After(sweep.until) {
+				readAll = true
+
+				break
+			}
+
+			landed := now.Sub(job.ResultAt) > alertSettledAfter
+			settled := s.judgeAll(ctx, job, true, targets, sweep, pass, now)
+			if decided && settled && landed {
+				sweep.ended = job.Cursor
 			} else {
 				decided = false
 			}
+			if landed {
+				next = job.Cursor
+			}
 		}
 
-		if len(read.Ended) < rows {
+		if readAll || len(read.Ended) < rows {
 			readAll = true
 
 			break
 		}
-		page = read.Ended[len(read.Ended)-1].Cursor
+
+		// A PAGE WITH NO RESULT OLD ENOUGH goes on after its last, or it would be read
+		// again for nothing.
+		if next == (alloc.AlertCursor{}) {
+			next = read.Ended[len(read.Ended)-1].Cursor
+		}
+		page = next
 	}
 
 	if !readAll {
@@ -313,8 +342,6 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 
 		s.judgeAll(ctx, &running[i], false, targets, sweep, pass, now)
 	}
-
-	s.pruneAlerts(ctx, sweep, now)
 }
 
 // judgeAll takes every rule's every condition as far as it can go on one job, and

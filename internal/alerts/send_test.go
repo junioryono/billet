@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log"
 	"log/slog"
@@ -455,6 +458,55 @@ func TestAConnectionReadsNothingBeforeItsRequest(t *testing.T) {
 	if _, gatedDial := conn.(*gatedConn); !gatedDial {
 		t.Errorf("the sender dials a %T, not a gated connection", conn)
 	}
+	if !transport.DisableKeepAlives || transport.ForceAttemptHTTP2 || transport.Proxy != nil ||
+		transport.DialTLSContext == nil {
+		t.Errorf("the transport keeps connections %v, tries HTTP/2 %v, has a proxy of its own %v, dials TLS itself %v",
+			!transport.DisableKeepAlives, transport.ForceAttemptHTTP2, transport.Proxy != nil, transport.DialTLSContext != nil)
+	}
+}
+
+// AN HTTPS DESTINATION IS DIALLED THROUGH THE ENVIRONMENT'S PROXY AND GATED AFTER ITS
+// HANDSHAKE, which a test cannot reach without a certificate the system trusts, so the
+// source says so: dialTLS goes through dialThroughProxy with the environment's proxy
+// and returns what quietUntilWritten made of the handshaken connection.
+func TestAnHTTPSDestinationIsDialledThroughTheProxyAndGated(t *testing.T) {
+	t.Parallel()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "send.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var proxied, gated bool
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "dialTLS" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.CallExpr:
+				if name, ok := n.Fun.(*ast.Ident); ok && name.Name == "dialThroughProxy" && len(n.Args) > 4 {
+					if sel, ok := n.Args[4].(*ast.SelectorExpr); ok && sel.Sel.Name == "ProxyFromEnvironment" {
+						proxied = true
+					}
+				}
+			case *ast.ReturnStmt:
+				for _, result := range n.Results {
+					if call, ok := result.(*ast.CallExpr); ok {
+						if name, ok := call.Fun.(*ast.Ident); ok && name.Name == "quietUntilWritten" {
+							gated = true
+						}
+					}
+				}
+			}
+
+			return true
+		})
+	}
+	if !proxied || !gated {
+		t.Errorf("dialTLS goes through the environment's proxy %v and returns a gated connection %v", proxied, gated)
+	}
 }
 
 // A PROXY TUNNEL IS BILLET'S OWN: it writes the CONNECT, with the proxy's credentials
@@ -510,7 +562,7 @@ func TestTheSenderOpensItsOwnProxyTunnel(t *testing.T) {
 	}
 
 	address, asked := proxy(t, "HTTP/1.1 200 Connection established\r\n\r\n")
-	conn, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", via(address))
+	conn, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", via(address), time.Second)
 	if err != nil {
 		t.Fatalf("a tunnel the proxy opened: %v", err)
 	}
@@ -526,27 +578,44 @@ func TestTheSenderOpensItsOwnProxyTunnel(t *testing.T) {
 		t.Errorf("through the tunnel came %q, %v", buf[:n], err)
 	}
 
+	// A YES WITH A LENGTH OF NOUGHT is a plain yes.
+	zero, _ := proxy(t, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+	if conn, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", via(zero), time.Second); err != nil {
+		t.Errorf("a yes with a length of nought: %v", err)
+	} else {
+		_ = conn.Close()
+	}
+
 	for name, answer := range map[string]string{
-		"a refusal":                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+		"a refusal":                "HTTP/1.1 403 Forbidden\r\n\r\n",
 		"a yes with more after it": "HTTP/1.1 200 OK\r\n\r\n" + secretPath,
 		"a yes with a body":        "HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n",
+		"a yes in chunks":          "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
 	} {
 		address, _ := proxy(t, answer)
-		if conn, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", via(address)); err == nil {
+		conn, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", via(address), time.Second)
+		if err == nil {
 			_ = conn.Close()
 			t.Errorf("%s opened a tunnel", name)
-		} else if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), secretPath) {
+
+			continue
+		}
+		if !errors.Is(err, errProxyRefused) {
+			t.Errorf("%s = %v, want the proxy's refusal", name, err)
+		}
+		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), secretPath) {
 			t.Errorf("%s: the error quotes the proxy: %v", name, err)
 		}
 	}
 
 	// A PROXY OF ANOTHER KIND is refused for good, not tried again.
 	socks := func(*http.Request) (*url.URL, error) { return &url.URL{Scheme: "socks5", Host: "127.0.0.1:1"}, nil }
-	if _, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", socks); !errors.Is(err, ErrPermanent) {
+	if _, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", socks, time.Second); !errors.Is(err, ErrPermanent) {
 		t.Errorf("a socks proxy = %v, want it refused for good", err)
 	}
 
-	// A PROXY THAT NEVER ANSWERS IS LEFT when the try ends, not waited on.
+	// A PROXY THAT NEVER ANSWERS IS LEFT at the tunnel's own bound, which is what holds
+	// it in production: the transport hands a dialer a context no request's end reaches.
 	silent, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -559,11 +628,9 @@ func TestTheSenderOpensItsOwnProxyTunnel(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = conn.Close() })
 	}()
-	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-	defer cancel()
 	begun := time.Now()
-	if conn, err := dialThroughProxy(ctx, dialer, "tcp", "hooks.example:443",
-		via(&url.URL{Scheme: "http", Host: silent.Addr().String()})); err == nil {
+	if conn, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443",
+		via(&url.URL{Scheme: "http", Host: silent.Addr().String()}), 200*time.Millisecond); err == nil {
 		_ = conn.Close()
 		t.Error("a proxy that never answered opened a tunnel")
 	}
@@ -583,7 +650,7 @@ func TestTheSenderOpensItsOwnProxyTunnel(t *testing.T) {
 		}
 	}()
 	none := func(*http.Request) (*url.URL, error) { return nil, nil }
-	if conn, err := dialThroughProxy(t.Context(), dialer, "tcp", direct.Addr().String(), none); err != nil {
+	if conn, err := dialThroughProxy(t.Context(), dialer, "tcp", direct.Addr().String(), none, time.Second); err != nil {
 		t.Errorf("no proxy: %v", err)
 	} else {
 		_ = conn.Close()

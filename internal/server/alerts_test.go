@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -281,6 +282,43 @@ func (r *alertStack) outcome(lease, condition string) string {
 	return outcome
 }
 
+// THE PASS'S CLOCK MOVES ON WITH THE PASS: a deadline checked after slow reads is
+// checked on the clock as it is, not as the pass began.
+func TestThePassClockMovesOnWithThePass(t *testing.T) {
+	t.Parallel()
+
+	sweep := newAlertSweep()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	if got := sweep.clock(now); !got.Equal(now) {
+		t.Errorf("before any pass = %s, want %s", got, now)
+	}
+
+	sweep.began = time.Now().Add(-time.Hour)
+	if got := sweep.clock(now); got.Sub(now) < time.Hour || got.Sub(now) > time.Hour+time.Minute {
+		t.Errorf("an hour into a pass = %s, want an hour after %s", got, now)
+	}
+}
+
+// lockedBuffer is a log both a delivery and the test can use at once.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
 // atRule is the rule the tests use unless they say otherwise.
 func atRule(mutate ...func(*config.AlertRule)) config.AlertRule {
 	rule := config.AlertRule{Name: "deploys", On: config.AlertConditions{Failed: true}, Notify: []string{"hook"}, Cooldown: "1h"}
@@ -310,7 +348,8 @@ func TestARuleFiresOnceThenRespectsItsCooldownThroughTheLoop(t *testing.T) {
 
 	r := started(t, atRule())
 
-	r.seed(jobRow{lease: "first", result: "failed", ran: 5 * time.Minute, age: time.Second})
+	r.now = r.now.Add(10 * time.Minute)
+	r.seed(jobRow{lease: "first", result: "failed", ran: 5 * time.Minute, age: 6 * time.Minute})
 	r.now = r.now.Add(time.Minute)
 	r.pass()
 	r.deliver()
@@ -625,7 +664,8 @@ func TestAJobNeverAskedIsUnknownBeforeItLeavesTheRead(t *testing.T) {
 		t.Fatalf("%d marks an hour in, want it still waiting for a read", got)
 	}
 
-	r.now = r.now.Add(alertEndedWindow - alertReadWindow)
+	// INSIDE THE MARGIN, well before the read's own edge.
+	r.now = r.now.Add(alertEndedWindow - alertLeaveMargin + time.Minute - alertReadWindow)
 	r.pass()
 	if got := r.marked(); got != 1 || r.record.readCount() != 0 {
 		t.Errorf("%d marks and %d reads near the end of the read, want it judged unknown unread", got,
@@ -727,10 +767,13 @@ func TestAScanHeldAtItsFirstJobIsCarriedOn(t *testing.T) {
 	r.sweep.rows = 1
 	r.now = r.now.Add(30 * time.Minute)
 	r.seed(jobRow{lease: "held", result: "failed", ran: time.Second, age: 25 * time.Minute, name: "held"})
-	for i := range alertEndedPages + 2 {
+	for i := range alertEndedPages + 1 {
 		r.seed(jobRow{lease: fmt.Sprintf("after-%02d", i), result: "succeeded", ran: time.Second,
 			age: time.Duration(24-i) * time.Minute, name: fmt.Sprintf("other-%d", i), branch: "main"})
 	}
+	// A LATER JOB OF THE HELD JOB'S STREAK, on the carried pass's page: still held.
+	r.seed(jobRow{lease: "same-streak", result: "failed", ran: time.Second, age: 12 * time.Minute, name: "held",
+		branch: "main"})
 	r.seed(jobRow{lease: "running", age: 2 * time.Minute, name: "run", branch: "main"})
 	r.now = r.now.Add(5 * time.Minute)
 
@@ -742,6 +785,101 @@ func TestAScanHeldAtItsFirstJobIsCarriedOn(t *testing.T) {
 	r.pass()
 	if got := r.owedLeases(); len(got) != 1 || got[0] != "running:running-long" {
 		t.Errorf("owed = %v, want the running job once the carried scan reached the end", got)
+	}
+	if got := r.outcome("same-streak", "failed"); got != "" {
+		t.Errorf("a later job of a held streak was judged %q on the carried pass", got)
+	}
+
+	// THE HELD JOB IS STILL BEHIND THE CURSOR, so once GitHub answers it is judged,
+	// and then the job of its streak after it.
+	r.record.err, r.record.branch = nil, "main"
+	r.pass()
+	r.pass()
+	if got := r.outcome("held", "failed"); got == "" {
+		t.Error("the held job was never judged: the cursor passed it")
+	}
+	if got := r.outcome("same-streak", "failed"); got != "hit" {
+		t.Errorf("the job after it = %q, want it judged in its turn", got)
+	}
+}
+
+// A CARRIED SCAN GOES ON AFTER THE LAST RESULT OLD ENOUGH, not after a newer one: a
+// result stamped before that one and committed after the read is read in its turn.
+func TestACarriedScanGoesOnAfterTheLastLandedResult(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.Cooldown = "0s" }))
+	r.sweep.rows = 2
+	r.now = r.now.Add(time.Hour)
+	for i := range 2*alertEndedPages - 1 {
+		r.seed(jobRow{lease: fmt.Sprintf("old-%02d", i), result: "succeeded", ran: 0,
+			age: time.Duration(40-i) * time.Minute, name: fmt.Sprintf("old-%d", i)})
+	}
+	r.seed(jobRow{lease: "recent-1", result: "succeeded", ran: 0, age: 20 * time.Second, name: "recent-1"})
+	r.seed(jobRow{lease: "recent-2", result: "succeeded", ran: 0, age: 10 * time.Second, name: "recent-2"})
+
+	r.pass()
+
+	if !r.sweep.scanning || r.sweep.scan.LeaseID != fmt.Sprintf("old-%02d", 2*alertEndedPages-2) {
+		t.Errorf("the scan carries on after %q (scanning %v), want the last result old enough",
+			r.sweep.scan.LeaseID, r.sweep.scanning)
+	}
+}
+
+// A CYCLE OF SCANS ENDS WHERE IT BEGAN, however fast results arrive behind it: a scan
+// that chased them would never judge a running job.
+func TestACycleOfScansEndsWhereItBegan(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{RunningLongerThan: "1m"}
+		c.Match.Job = "run*"
+	}))
+	r.sweep.rows = 1
+	r.now = r.now.Add(time.Hour)
+	for i := range alertEndedPages + 2 {
+		r.seed(jobRow{lease: fmt.Sprintf("before-%02d", i), result: "succeeded", ran: 0,
+			age: time.Duration(50-i) * time.Minute, name: fmt.Sprintf("before-%d", i)})
+	}
+	r.seed(jobRow{lease: "running", age: 5 * time.Minute, name: "run"})
+	r.pass()
+	if !r.sweep.scanning {
+		t.Fatal("the first pass read to the end; the test needs it to carry its scan")
+	}
+
+	// MORE THAN A PASS READS ARRIVE BEFORE THE NEXT PASS, after the cycle began.
+	r.now = r.now.Add(time.Minute)
+	for i := range 2 * alertEndedPages {
+		r.seed(jobRow{lease: fmt.Sprintf("after-%02d", i), result: "succeeded", ran: 0,
+			age: time.Duration(59-i) * time.Second, name: fmt.Sprintf("after-%d", i)})
+	}
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "running:running-long" {
+		t.Errorf("owed = %v, want the running job judged at the end of the cycle", got)
+	}
+}
+
+// A PASS THAT CARRIES ITS SCAN STILL PRUNES, so what is past its retention does not
+// pile up while a backlog is read.
+func TestAPassThatCarriesItsScanStillPrunes(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule())
+	r.sweep.rows = 1
+	r.now = r.now.Add(time.Hour)
+	for i := range alertEndedPages + 2 {
+		r.seed(jobRow{lease: fmt.Sprintf("job-%02d", i), result: "succeeded", ran: 0,
+			age: time.Duration(50-i) * time.Minute, name: fmt.Sprintf("job-%d", i)})
+	}
+	r.now = r.now.Add(alertPruneEvery)
+	r.pass()
+
+	if !r.sweep.scanning {
+		t.Fatal("the pass read to the end; the test needs it to carry its scan")
+	}
+	if !r.sweep.lastPrune.Equal(r.now) {
+		t.Errorf("last pruned at %s, want this pass, at %s", r.sweep.lastPrune, r.now)
 	}
 }
 
@@ -852,7 +990,13 @@ func TestAnArchivedLeaseIsJudgedBeforeItsArchivingAgesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r.now = r.now.Add(alertEndedWindow - alertLeaveMargin + time.Minute)
+	r.now = r.now.Add(time.Hour)
+	r.pass()
+	if got := r.marked(); got != 0 {
+		t.Fatalf("%d marks an hour after its archiving, want it waiting for a read", got)
+	}
+
+	r.now = r.now.Add(alertEndedWindow - alertLeaveMargin - time.Hour + time.Minute)
 	r.pass()
 	if got := r.marked(); got != 1 {
 		t.Errorf("%d marks near the end of its archiving's window, want it judged unknown", got)
@@ -1343,6 +1487,10 @@ func TestADestinationThatHangsHoldsUpOnlyItsOwnQueue(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
+	// WHAT THE STOP IS TAKEN FOR is in the log: a failed try would be recorded there.
+	logged := &lockedBuffer{}
+	r.s.log = slog.New(slog.NewTextHandler(logged, nil))
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -1369,6 +1517,9 @@ func TestADestinationThatHangsHoldsUpOnlyItsOwnQueue(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("a stop did not end a hung delivery")
+	}
+	if strings.Contains(logged.String(), "failed try") || strings.Contains(logged.String(), "gave up") {
+		t.Errorf("a stop was taken for a failed try:\n%s", logged.String())
 	}
 	if took := time.Since(stopped); took > 3*time.Second {
 		t.Errorf("a stop took %s to end a hung delivery", took)

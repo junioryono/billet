@@ -124,13 +124,19 @@ func TestAFailedJobIsToldToAWebhookOnceAndNotAgainInsideTheCooldown(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	matched := 0
 	for _, n := range report.Notices {
 		switch {
 		case n.Destination == "hook" && n.State == "delivered" && n.Notices == 1:
+			matched++
 		case n.Destination == "removed" && n.State == "failed" && n.Notices == 1:
+			matched++
 		default:
-			t.Errorf("the outbox holds %+v, want the one delivered notice and the removed one given up", report.Notices)
+			t.Errorf("the outbox holds %+v", n)
 		}
+	}
+	if matched != 2 {
+		t.Errorf("the outbox holds %+v, want the one delivered notice and the removed one given up", report.Notices)
 	}
 	if got := receiver.received(); len(got) != 1 {
 		t.Errorf("the webhook was told %d times, want once: %v", len(got), got)

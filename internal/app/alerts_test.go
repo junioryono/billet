@@ -110,8 +110,8 @@ func TestAnUnreadableDestinationStopsNothingAndSaysWhy(t *testing.T) {
 		t.Errorf("logged %q", logged.String())
 	}
 	err = set.Destinations["clear"].Sender.Send(t.Context(), []byte(`{}`))
-	if err == nil || strings.Contains(err.Error(), "s3cret") {
-		t.Errorf("the unusable destination's send = %v, want a refusal without the address", err)
+	if err == nil || !strings.Contains(err.Error(), "BILLET_TEST_ALERT_CLEAR_TOO") || strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("the unusable destination's send = %v, want a refusal naming where it looked, without the address", err)
 	}
 	if set.Destinations["good"].Kind != config.AlertSlack {
 		t.Errorf("the readable destination = %+v", set.Destinations["good"])

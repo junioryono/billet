@@ -97,7 +97,7 @@ func NewSender(name string, address URL) *Sender {
 // proxy when it names one, verifying the certificate for the name dialled, and gates
 // the connection on its first write after the handshake.
 func dialTLS(ctx context.Context, dialer *net.Dialer, network, addr string) (net.Conn, error) {
-	raw, err := dialThroughProxy(ctx, dialer, network, addr, http.ProxyFromEnvironment)
+	raw, err := dialThroughProxy(ctx, dialer, network, addr, http.ProxyFromEnvironment, sendTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -126,15 +126,15 @@ func dialTLS(ctx context.Context, dialer *net.Dialer, network, addr string) (net
 // destination. Its answer is not quoted: it is the proxy's to write.
 var errProxyRefused = errors.New("alerts: the proxy refused the tunnel")
 
-// maxConnectAnswer bounds what a proxy's answer to a CONNECT may take, as the
-// standard library bounds its own: a proxy's headers are not a reason to grow.
+// maxConnectAnswer bounds what a proxy's answer to a CONNECT may take: a yes is a line
+// and a few headers, and a proxy's headers are not a reason to grow.
 const maxConnectAnswer = 16 * 1024
 
 // dialThroughProxy is a connection to addr, through the HTTP proxy proxyFor names for
 // it when it names one (the environment's HTTPS_PROXY and NO_PROXY, as the standard
-// library reads them), by a CONNECT billet writes and reads itself.
+// library reads them), by a CONNECT billet writes and reads itself within bound.
 func dialThroughProxy(ctx context.Context, dialer *net.Dialer, network, addr string,
-	proxyFor func(*http.Request) (*url.URL, error),
+	proxyFor func(*http.Request) (*url.URL, error), bound time.Duration,
 ) (net.Conn, error) {
 	proxy, err := proxyFor(&http.Request{URL: &url.URL{Scheme: "https", Host: addr}})
 	if err != nil {
@@ -172,15 +172,13 @@ func dialThroughProxy(ctx context.Context, dialer *net.Dialer, network, addr str
 	}
 
 	// THE TUNNEL IS BOUNDED ON ITS OWN, since the transport hands a dialer a context
-	// with no deadline, and closed if the context ends first; the deadline is lifted
-	// once it is open, so the transport's own bounds govern the request.
-	if err := conn.SetDeadline(time.Now().Add(sendTimeout)); err != nil {
+	// no request's end reaches; the deadline is lifted once it is open, so the
+	// transport's own bounds govern the request.
+	if err := conn.SetDeadline(time.Now().Add(bound)); err != nil {
 		_ = conn.Close()
 
 		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
 	}
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
 
 	reader := bufio.NewReader(io.LimitReader(conn, maxConnectAnswer))
 	if err := connect.Write(conn); err != nil {
@@ -197,16 +195,19 @@ func dialThroughProxy(ctx context.Context, dialer *net.Dialer, network, addr str
 	}
 
 	// A PROXY THAT SAID MORE THAN A PLAIN YES, a body or bytes after it, would write
-	// into what is the destination's stream; nothing it wrote is read or kept.
-	if resp.StatusCode != http.StatusOK || reader.Buffered() > 0 ||
-		resp.Header.Get("Content-Length") != "" || len(resp.TransferEncoding) > 0 {
+	// into what is the destination's stream; nothing it wrote is read or kept. A length
+	// of nought is a plain yes.
+	length := resp.Header.Get("Content-Length")
+	if resp.StatusCode != http.StatusOK || reader.Buffered() > 0 || (length != "" && length != "0") ||
+		len(resp.TransferEncoding) > 0 {
 		// THE CONNECTION FIRST, so closing the body drains nothing a proxy wrote.
 		_ = conn.Close()
 		_ = resp.Body.Close()
 
 		return nil, errProxyRefused
 	}
-	// A YES TO A CONNECT HAS NO BODY to the standard library; closing it reads nothing.
+	// A YES WITH NO LENGTH is read to the connection's end to the standard library,
+	// and closing that body reads nothing more.
 	_ = resp.Body.Close()
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		_ = conn.Close()
@@ -260,6 +261,15 @@ func (c *gatedConn) Read(b []byte) (int, error) {
 
 			return 0, net.ErrClosed
 		case <-expired:
+			// A DEADLINE MOVED since this timer was set is the one that counts.
+			c.mu.Lock()
+			moved := c.changed != changed
+			c.mu.Unlock()
+
+			if moved {
+				continue
+			}
+
 			return 0, os.ErrDeadlineExceeded
 		case <-changed:
 			stopTimer(timer)

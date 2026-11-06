@@ -3,6 +3,7 @@ package integration_test
 import (
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/alerts"
@@ -94,6 +95,13 @@ func TestLiveAlertReads(t *testing.T) {
 	// A JOB WHOSE RUNNER WAS KILLED: GitHub leaves its running step without a
 	// conclusion, so no rule about a step that failed takes it.
 	lost := steps(run("BILLET_LIVE_ALERT_LOST"), required(t, "BILLET_LIVE_ALERT_LOST_RUNNER"))
+	unfinished := false
+	for _, step := range lost {
+		unfinished = unfinished || (strings.HasPrefix(step.Name, "Hold") && step.Conclusion == "")
+	}
+	if !unfinished {
+		t.Errorf("a killed runner's steps %+v hold no `Hold*` step without a conclusion", lost)
+	}
 	if holdRule.MatchesSteps(lost, alerts.Failed) || holdRule.MatchesSteps(lost, alerts.Cancelled) {
 		t.Errorf("a killed runner's steps %+v read as a step that ended", lost)
 	}
