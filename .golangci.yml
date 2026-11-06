@@ -412,6 +412,23 @@ linters:
             - $gostd
             - github.com/junioryono/billet/internal/regularfile$
 
+        # THE HOST'S FIREWALL AND RESOLVER FOR A GUEST, below the provider that
+        # attaches it and the node that reads it, and #510's workspaces beside them.
+        # Its tests enter network namespaces, which production code here never does.
+        egress:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/egress/**"
+            - "!$test"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+            - github.com/junioryono/billet/internal/durablefile$
+            - github.com/junioryono/billet/internal/regularfile$
+            - golang.org/x/net/dns/dnsmessage$
+            - github.com/ti-mo/conntrack$
+            - github.com/ti-mo/netfilter$
+
         # THE IDLE POWER POLICY IS A LEAF. It writes a host's cpufreq ceiling as
         # root, so what it imports is what can reach that write: the standard
         # library and the two file primitives its record goes through.
@@ -752,6 +769,8 @@ linters:
               desc: "A package that opens a write transaction must not run subprocesses: DB.Tx holds SQLite's single writer slot for as long as the command takes."
             - pkg: "github.com/junioryono/billet/internal/provider"
               desc: "The ledger is a lower layer than compute; a provider call inside a transaction holds the single writer slot across a remote API."
+            - pkg: "github.com/junioryono/billet/internal/egress"
+              desc: "The ledger is a lower layer than a guest's network policy, which runs nft and opens sockets; a call inside a transaction holds the writer slot for it."
             - pkg: "github.com/junioryono/billet/internal/store"
               desc: "The ledger is a lower layer than site storage; an rbd call inside a transaction holds the single writer slot."
             - pkg: "github.com/junioryono/billet/internal/tokenbroker"

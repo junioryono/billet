@@ -139,6 +139,10 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, fmt.Errorf("codebuild: %s asks for guest build caches, which only "+
 			"firecracker guests configure", spec.Name)
 	}
+	if spec.Egress != nil {
+		return nil, fmt.Errorf("codebuild: %s has a network policy, which only a firecracker guest's "+
+			"tap can carry", spec.Name)
+	}
 
 	// THE NETWORK IS VERIFIED AGAINST THE PROJECT BEFORE ANYTHING IS STAGED, because
 	// CodeBuild has no StartBuild VPC override: a fork's build runs on whatever

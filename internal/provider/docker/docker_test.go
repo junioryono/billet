@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -223,6 +224,22 @@ func TestLaunchRefusesGuestBuildCaches(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "guest build caches") {
 		t.Fatalf("Launch = %v, want a refusal naming the guest build caches", err)
+	}
+}
+
+// A NETWORK POLICY IS A FIRECRACKER GUEST'S TOO, and a container asked for one is refused
+// rather than started open: only a tap can carry it.
+func TestLaunchRefusesANetworkPolicy(t *testing.T) {
+	stub, _ := stubDocker(t)
+	p := New("billet-test", WithBinary(stub))
+
+	_, err := p.Launch(t.Context(), provider.Spec{
+		Name: "billet-runner-1", Image: "ghcr.io/actions/actions-runner:latest",
+		Trust: provider.TrustTrusted, JITConfig: "jit", Command: []string{"./run.sh"},
+		Egress: egress.Observe(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "network policy") {
+		t.Fatalf("Launch = %v, want a refusal naming the network policy", err)
 	}
 }
 

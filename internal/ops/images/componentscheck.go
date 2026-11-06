@@ -116,6 +116,19 @@ func componentLines(ctx context.Context, store componentsChecker, use tierImageU
 			notAccepted = append(notAccepted, name)
 		}
 	}
+	// ACCEPTED AND NOT OFFERED: the record lists what a completion can bring, which on a
+	// published image is what GitHub's template for its machine installs (ADR-022, Firefox
+	// alone of the five on arm64). It says nothing of what else an image of an operator's
+	// own carries, so this says only what no completion will do.
+	var notOffered []string
+	for _, name := range accepted {
+		if !slices.Contains(record.LeftOut, string(name)) {
+			if _, isInstalled := record.Installed[string(name)]; !isInstalled {
+				notOffered = append(notOffered, string(name))
+			}
+		}
+	}
+
 	missing, unaccepted := completionGap(record, found, accepted)
 
 	next := nextCompletion(ctx, store, use.image, image, booted, generations, accepted, automatic)
@@ -130,6 +143,12 @@ func componentLines(ctx context.Context, store componentsChecker, use tierImageU
 		lines = append(lines, fmt.Sprintf("%s, whose image leaves out %s: this deployment has not "+
 			"accepted them in images.accept, so a job that uses one will not find it", who,
 			strings.Join(notAccepted, ", ")))
+	}
+	if len(notOffered) > 0 {
+		lines = append(lines, fmt.Sprintf("%s, whose image does not offer %s for completion, which "+
+			"this deployment accepts: no completion brings them, and on a published image a job "+
+			"that uses one will not find it, since GitHub's template for its machine does not "+
+			"install them", who, strings.Join(notOffered, ", ")))
 	}
 	if len(missing) > 0 {
 		lines = append(lines, fmt.Sprintf("%s, which lacks %s, which this deployment accepts; %s", who,
