@@ -160,6 +160,9 @@ type rightsizeJob struct {
 	RunsOn string
 	VCPU   int64
 	Memory int64
+	// TierVCPU and TierMemory are the current tier's configured shape, which a fallback
+	// may have bought more than, and zero for a tier this configuration does not hold.
+	TierVCPU, TierMemory int64
 	// Samples is the measured runs on the tier at its newest charged shape, which
 	// every figure but the host's counts is over; OtherTiers is the runs on other
 	// tiers, and OtherShapes the runs on this one at another charged shape, before a
@@ -307,6 +310,7 @@ func rightsizeJobOf(ctx context.Context, a *alloc.Allocator, repo, workflow, job
 	current := tierNamed(tiers, newest.Tier)
 	if current != nil {
 		out.RunsOn = current.ScaleSetName()
+		out.TierVCPU, out.TierMemory = int64(current.VCPU), int64(current.Memory)
 	}
 	summarizeRuns(&out, measured)
 	recommend(&out, current, tiers)
@@ -773,6 +777,11 @@ type rightsizeJobJSON struct {
 	Job           string `json:"job"`
 	CurrentTier   string `json:"current_tier"`
 	CurrentRunsOn string `json:"current_runs_on"`
+	// CurrentTierVCPU and CurrentTierMemory are the current tier's configured shape
+	// when the report was made, null for a tier the configuration does not hold, so a
+	// tier resized since is not moved from on this report's word.
+	CurrentTierVCPU   *int64 `json:"current_tier_vcpu"`
+	CurrentTierMemory *int64 `json:"current_tier_memory_bytes"`
 	// VCPU and MemoryBytes are the charged shape, null where it was not recorded.
 	VCPU             *int64 `json:"vcpu"`
 	MemoryBytes      *int64 `json:"memory_bytes"`
@@ -805,7 +814,8 @@ type rightsizeJobJSON struct {
 	RecommendedTier   string   `json:"recommended_tier"`
 	RecommendedRunsOn string   `json:"recommended_runs_on"`
 	// RecommendedVCPU and RecommendedMemory are the recommended tier's shape when the
-	// report was made, so a tier resized since is not moved to on this report's word.
+	// report was made, null with no tier named, so a tier resized since is not moved to
+	// on this report's word.
 	RecommendedVCPU   *int64 `json:"recommended_vcpu"`
 	RecommendedMemory *int64 `json:"recommended_memory_bytes"`
 }
@@ -829,7 +839,8 @@ func renderRightsizeJSON(w io.Writer, r rightsizeReport) error {
 		job := &r.Jobs[i]
 		row := rightsizeJobJSON{
 			Repository: job.Repository, Workflow: job.Workflow, Job: job.Job, CurrentTier: job.Tier,
-			CurrentRunsOn: job.RunsOn, VCPU: positive(job.VCPU), MemoryBytes: positive(job.Memory), Runs: job.Samples,
+			CurrentRunsOn: job.RunsOn, CurrentTierVCPU: positive(job.TierVCPU),
+			CurrentTierMemory: positive(job.TierMemory), VCPU: positive(job.VCPU), MemoryBytes: positive(job.Memory), Runs: job.Samples,
 			RunsNoReport: job.NoReport, RunsNoSeries: job.NoSeries, RunsUncovered: job.Uncovered,
 			RunsOtherShapes: job.OtherShapes, RunsOnOtherTiers: job.OtherTiers, CPUBusyP90: job.BusyP90,
 			CPUCoresP90: job.DemandP90, GuestMemoryP95: job.GuestP95, MemorySource: job.MemorySource,

@@ -303,8 +303,13 @@ func TestKeepClaimsNoRoomItCouldNotTell(t *testing.T) {
 	if err := renderRightsizeJSON(&out, rightsizeReport{Jobs: []rightsizeJob{{Repository: "acme/api"}}}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), `"vcpu": null`) || !strings.Contains(out.String(), `"memory_bytes": null`) {
-		t.Errorf("an unrecorded shape is not null:\n%s", out.String())
+	for _, want := range []string{
+		`"vcpu": null`, `"memory_bytes": null`, `"current_tier_vcpu": null`, `"current_tier_memory_bytes": null`,
+		`"recommended_vcpu": null`, `"recommended_memory_bytes": null`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("an unrecorded shape is not %s:\n%s", want, out.String())
+		}
 	}
 }
 
@@ -487,6 +492,16 @@ func TestTheRightsizeReportSaysItsThresholdsAndQuotesWhatAWorkflowChose(t *testi
 	}
 	if job.OOMKills != nil || job.CPUPressureP90 != nil {
 		t.Errorf("figures not measured are not null: oom %v, pressure %v", job.OOMKills, job.CPUPressureP90)
+	}
+	// EACH TIER'S SHAPE WHEN THE REPORT WAS MADE, under the names the workflow command
+	// reads, so a tier resized since is refused there.
+	for _, want := range []string{
+		`"current_tier_vcpu": 4,`, `"current_tier_memory_bytes": 16000000000,`,
+		`"recommended_vcpu": 2,`, `"recommended_memory_bytes": 8000000000`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the JSON does not say %s:\n%s", want, out.String())
+		}
 	}
 }
 

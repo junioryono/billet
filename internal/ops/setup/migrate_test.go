@@ -451,7 +451,7 @@ jobs:
 	entry := func(job string) rightsizeEntry {
 		return rightsizeEntry{Repository: "acme/api", Workflow: "acme/api/" + file, Job: job, CurrentRunsOn: onFour,
 			Recommendation: "smaller", Reason: "idle", Confidence: "high", RecommendedTier: "platform-2vcpu",
-			RecommendedRunsOn: onTwo, RecommendedVCPU: 2, RecommendedMemory: int64(8 * config.GiB)}
+			RecommendedRunsOn: onTwo}.judgedAt(4, 2)
 	}
 	forged := entry("forged")
 	forged.RecommendedRunsOn = onTwo + "\n    evil: true"
@@ -1083,8 +1083,7 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 		return out
 	}
 	entry := rightsizeEntry{Repository: "acme/api", Workflow: "acme/api/" + file, Job: "build", CurrentRunsOn: onFour,
-		Recommendation: "smaller", Reason: "idle", Confidence: "high", RecommendedRunsOn: onTwo, RecommendedVCPU: 2,
-		RecommendedMemory: int64(8 * config.GiB)}
+		Recommendation: "smaller", Reason: "idle", Confidence: "high", RecommendedRunsOn: onTwo}.judgedAt(4, 2)
 
 	for _, tc := range []struct {
 		name   string
@@ -1114,10 +1113,34 @@ func TestARecommendationIsCheckedAgainstTheConfiguration(t *testing.T) {
 			}
 			return out
 		}(), says: "the architecture of either cannot be told"},
-		{name: "a recommended tier resized since the report", tiers: tiers(func(t *config.Tier) { t.VCPU = 1 }),
-			says: "make the report again"},
-		{name: "a report with no shape for the tier", entry: func(e *rightsizeEntry) { e.RecommendedVCPU = 0 },
-			says: "make the report again"},
+		{name: "a recommended tier given fewer vCPUs since the report", tiers: tiers(func(t *config.Tier) { t.VCPU = 1 }),
+			says: `tier "platform-2vcpu" is 1 vCPU and 8.0 GiB now, and the report judged it at 2 vCPU and 8.0 GiB`},
+		{name: "a recommended tier given less memory since the report",
+			tiers: tiers(func(t *config.Tier) { t.Memory = 4 * config.GiB }),
+			says:  `tier "platform-2vcpu" is 2 vCPU and 4.0 GiB now, and the report judged it at 2 vCPU and 8.0 GiB`},
+		// A CURRENT TIER GROWN PAST THE ONE RECOMMENDED turns the move into a move down.
+		{name: "a current tier grown since the report", tiers: func() []config.Tier {
+			out := migrateTiers()
+			for i := range out {
+				if out[i].Label == "platform-4vcpu" {
+					out[i].VCPU, out[i].Memory = 16, 64*config.GiB
+				}
+			}
+			return out
+		}(), says: `tier "platform-4vcpu" is 16 vCPU and 64.0 GiB now, and the report judged it at 4 vCPU and 16.0 GiB`},
+		{name: "a current tier given more memory since the report", tiers: func() []config.Tier {
+			out := migrateTiers()
+			for i := range out {
+				if out[i].Label == "platform-4vcpu" {
+					out[i].Memory = 64 * config.GiB
+				}
+			}
+			return out
+		}(), says: `tier "platform-4vcpu" is 4 vCPU and 64.0 GiB now`},
+		{name: "a report without the recommended tier's shape", entry: func(e *rightsizeEntry) { e.RecommendedMemory = nil },
+			says: `the report does not record the shape it judged tier "platform-2vcpu" at`},
+		{name: "a report without the current tier's shape", entry: func(e *rightsizeEntry) { e.CurrentTierVCPU = nil },
+			says: `the report does not record the shape it judged tier "platform-4vcpu" at`},
 		{name: "a recommended tier whose image changed since the report", tiers: tiers(func(t *config.Tier) {
 			t.Image = "ubuntu-2404-x64@g2"
 		}), says: "is not"},
@@ -1350,7 +1373,7 @@ func TestARecommendationLeavesAJobWhoseStrategyCannotBeRead(t *testing.T) {
 	const file = ".github/workflows/ci.yml"
 	data := "x: &legs\n  matrix:\n    n: [1, 2]\njobs:\n  build:\n    strategy: *legs\n    runs-on: " + onFour + "\n"
 	entry := rightsizeEntry{Repository: "acme/api", Workflow: "acme/api/" + file, Job: "build", CurrentRunsOn: onFour,
-		Recommendation: "smaller", RecommendedRunsOn: onTwo, RecommendedVCPU: 2, RecommendedMemory: int64(8 * config.GiB)}
+		Recommendation: "smaller", RecommendedRunsOn: onTwo}.judgedAt(4, 2)
 	got := rewriteWorkflow(file, []byte(data), chooserOf(t, migrateTiers(), labelMaps{}, false),
 		&rightsizeEntries{byFile: map[string][]rightsizeEntry{file: {entry}}})
 	report := (&migrationPlan{findings: got.findings}).reportText()
@@ -1517,5 +1540,31 @@ func TestThePushOwnerIsWhereGitPushes(t *testing.T) {
 		if (err != nil) != tc.fails || got != tc.want {
 			t.Errorf("%s: %q, %v; want %q (fails %t)", tc.name, got, err, tc.want, tc.fails)
 		}
+	}
+}
+
+// judgedAt is the entry with the shapes a report records for its current and
+// recommended tiers, each of this file's test tiers being 4 GiB to the vCPU.
+func (e rightsizeEntry) judgedAt(currentVCPU, recommendedVCPU int64) rightsizeEntry {
+	shape := func(v int64) *int64 { return &v }
+	e.CurrentTierVCPU, e.CurrentTierMemory = shape(currentVCPU), shape(currentVCPU*int64(4*config.GiB))
+	e.RecommendedVCPU, e.RecommendedMemory = shape(recommendedVCPU), shape(recommendedVCPU*int64(4*config.GiB))
+
+	return e
+}
+
+// GIT'S OUTPUT IS ONE VALUE TO A LINE, so a path holding a space is one destination.
+func TestAPushToAPathWithASpaceFallsBackToTheConfiguredURL(t *testing.T) {
+	t.Parallel()
+
+	dir := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	runIn(t, dir, "config", "--unset-all", "url."+originOf(t, dir)+".pushInsteadOf")
+	runIn(t, dir, "config", "url./srv/Git Mirrors/.pushInsteadOf", "https://github.com/acme/")
+	if got, err := pushOwner(t.Context(), dir); err != nil || got != "acme" {
+		t.Errorf("a push to a path with a space: %q, %v; want acme", got, err)
+	}
+	if got := gitLines("/srv/Git Mirrors/api.git\r\n\nhttps://github.com/acme/api.git"); len(got) != 2 ||
+		got[0] != "/srv/Git Mirrors/api.git" {
+		t.Errorf("gitLines: %q", got)
 	}
 }

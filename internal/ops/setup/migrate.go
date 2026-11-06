@@ -167,7 +167,7 @@ func originRepository(ctx context.Context, path string) (string, error) {
 // cannot name, and a destination naming no owner/name is refused.
 func pushOwner(ctx context.Context, path string) (string, error) {
 	pushes, err := runGit(ctx, path, "remote", "get-url", "--push", "--all", "origin")
-	destinations := strings.Fields(pushes)
+	destinations := gitLines(pushes)
 	if err != nil || len(destinations) != 1 {
 		return "", errors.New("billet migrate workflows: --open-pr pushes to origin, and origin has no one URL to push " +
 			"to; nothing was changed")
@@ -176,10 +176,10 @@ func pushOwner(ctx context.Context, path string) (string, error) {
 	remote := destinations[0]
 	if localPath(remote) {
 		configured, err := runGit(ctx, path, "config", "--get-all", "remote.origin.pushurl")
-		if err != nil || strings.TrimSpace(configured) == "" {
+		if err != nil || len(gitLines(configured)) == 0 {
 			configured, err = runGit(ctx, path, "config", "--get-all", "remote.origin.url")
 		}
-		if lines := strings.Fields(configured); err == nil && len(lines) == 1 {
+		if lines := gitLines(configured); err == nil && len(lines) == 1 {
 			remote = lines[0]
 		}
 	}
@@ -191,6 +191,19 @@ func pushOwner(ctx context.Context, path string) (string, error) {
 	owner, _, _ := config.SplitRepository(repository)
 
 	return owner, nil
+}
+
+// gitLines is git's output one value to a line, each kept whole: a path can hold a
+// space, and only a line ends a value.
+func gitLines(output string) []string {
+	var out []string
+	for line := range strings.Lines(output) {
+		if line = strings.TrimRight(line, "\r\n"); line != "" {
+			out = append(out, line)
+		}
+	}
+
+	return out
 }
 
 // localPath says a remote is a path on this machine rather than a URL: one git reaches
@@ -427,10 +440,30 @@ type rightsizeEntry struct {
 	Confidence        string `json:"confidence"`
 	RecommendedTier   string `json:"recommended_tier"`
 	RecommendedRunsOn string `json:"recommended_runs_on"`
-	RecommendedVCPU   int64  `json:"recommended_vcpu"`
-	RecommendedMemory int64  `json:"recommended_memory_bytes"`
 	Repository        string `json:"repository"`
 	MemorySource      string `json:"memory_source"`
+	// The shape each tier was configured at when the report was made; nil where the
+	// report does not say, which an older or hand-made one may not.
+	CurrentTierVCPU   *int64 `json:"current_tier_vcpu"`
+	CurrentTierMemory *int64 `json:"current_tier_memory_bytes"`
+	RecommendedVCPU   *int64 `json:"recommended_vcpu"`
+	RecommendedMemory *int64 `json:"recommended_memory_bytes"`
+}
+
+// resizedSince says why a tier is not the one the report judged: the report does not
+// record its shape, or it has been resized since. Empty when it is the same.
+func resizedSince(tier *config.Tier, vcpu, memory *int64) string {
+	if vcpu == nil || memory == nil {
+		return fmt.Sprintf("the report does not record the shape it judged tier %s at; make the report again",
+			strconv.Quote(tier.Label))
+	}
+	if int64(tier.VCPU) == *vcpu && int64(tier.Memory) == *memory {
+		return ""
+	}
+
+	return fmt.Sprintf("tier %s is %d vCPU and %s now, and the report judged it at %d vCPU and %s; make the "+
+		"report again", strconv.Quote(tier.Label), tier.VCPU, cli.HumanBytes(int64(tier.Memory)), *vcpu,
+		cli.HumanBytes(*memory))
 }
 
 // rightsizeEntries is a report's recommendations for one repository that name a tier
@@ -533,12 +566,15 @@ func (r *workflowRewrite) applyRightsize(file string, jobs []jobRunsOn, lines li
 				strconv.Quote(entry.CurrentRunsOn)))
 
 			continue
-		// A TIER RESIZED SINCE THE REPORT IS NOT THE TIER IT RECOMMENDED: a larger one
-		// shrunk since could take away the room the move was to give.
-		case int64(recommended.VCPU) != entry.RecommendedVCPU || int64(recommended.Memory) != entry.RecommendedMemory:
-			say(0, fmt.Sprintf("tier %s is %d vCPU and %s now, and the report recommended it at %d vCPU and %s; "+
-				"make the report again", strconv.Quote(recommended.Label), recommended.VCPU,
-				cli.HumanBytes(int64(recommended.Memory)), entry.RecommendedVCPU, cli.HumanBytes(entry.RecommendedMemory)))
+		// A TIER RESIZED SINCE THE REPORT IS NOT THE TIER IT JUDGED, on either side: a
+		// larger tier shrunk since, or a current one grown past it, turns a move up into
+		// a move down.
+		case resizedSince(current, entry.CurrentTierVCPU, entry.CurrentTierMemory) != "":
+			say(0, resizedSince(current, entry.CurrentTierVCPU, entry.CurrentTierMemory))
+
+			continue
+		case resizedSince(recommended, entry.RecommendedVCPU, entry.RecommendedMemory) != "":
+			say(0, resizedSince(recommended, entry.RecommendedVCPU, entry.RecommendedMemory))
 
 			continue
 		case !compatibleMove(current, recommended, chooser.repository, file):
