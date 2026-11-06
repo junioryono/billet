@@ -137,7 +137,15 @@ func matrixCellFor(cache, kase string) matrixCell {
 			want = string(lease.ActionsCacheServed)
 		}
 
-		return matrixCell{Run: &matrixRun{Workflow: "matrix-" + kase + ".yml", Job: cache, GitHub: "success",
+		workflow := "matrix-" + kase + ".yml"
+		if cache == "docker-images" {
+			// ALONE ON THE TIER: every EC2 guest attaches the image store at boot, so
+			// every job publishes a generation of it, and one beside the probe could
+			// replace the probe's image with its own clone of an empty store.
+			workflow = "matrix-images-" + kase + ".yml"
+		}
+
+		return matrixCell{Run: &matrixRun{Workflow: workflow, Job: cache, GitHub: "success",
 			Observe: observe, Want: want}}
 	case "two-writers-cas", "two-writers-lww":
 		mode := strings.TrimPrefix(kase, "two-writers-")
@@ -347,10 +355,16 @@ func judgeCell(cell matrixCell, jobs []acceptanceJob, scope matrixScope) matrixR
 	for i := range jobs {
 		j := &jobs[i]
 		t, ok := scope.tiers[j.Tier]
-		if !ok || t.arch != cell.Arch || !slices.Contains(t.providers, cell.Backend) || !scope.belongs(j) {
+		if !ok || t.arch != cell.Arch || !slices.Contains(t.providers, cell.Backend) {
 			continue
 		}
 		if workflowFile(j.WorkflowRef) != cell.Run.Workflow || j.JobName != cell.Run.Job {
+			continue
+		}
+		// A JOB WHOSE HISTORY COULD NOT BE READ HAS NO RUN TO BE TOLD APART BY, so it
+		// is kept, and fails the cell below: dropped by the run filter, it would let a
+		// sibling's pass stand for evidence the judge could not read.
+		if j.Unread == "" && !scope.belongs(j) {
 			continue
 		}
 		mine = append(mine, *j)
@@ -372,6 +386,12 @@ func judgeCell(cell matrixCell, jobs []acceptanceJob, scope matrixScope) matrixR
 		switch {
 		case j.Unread != "":
 			wrong = append(wrong, j.LeaseID+": "+j.Unread)
+		case j.Trust != string(config.WorkloadTrusted):
+			// TRUSTED, because the Actions cache is intercepted only for a trusted
+			// pool, and only a trusted pool's sticky disk is published inside the job
+			// that wrote it, which the two-writer cells' order depends on.
+			wrong = append(wrong, fmt.Sprintf("%s: its tier is %q, and the matrix runs on a trusted one",
+				j.LeaseID, dashIfEmpty(j.Trust)))
 		case j.Provider != "" && j.Provider != string(cell.Backend):
 			wrong = append(wrong, fmt.Sprintf("%s: placed on %s, not %s", j.LeaseID, j.Provider, cell.Backend))
 		case j.GitHub != cell.Run.GitHub:
@@ -432,8 +452,8 @@ func cmdAcceptanceMatrix(env cli.Env, args []string) error {
 }
 
 // matrixJobsPerArch is how many jobs one dispatch of every matrix workflow runs on one
-// tier: the cold and warm runs' eight each, the two-writer run's eight and the failed
-// writer's three. `billet acceptance run --jobs` waits for this many per architecture,
+// tier: the image store's cold and warm one each, the cold and warm runs' seven each, the
+// two-writer run's eight and the failed writer's three. `billet acceptance run --jobs` waits for this many per architecture,
 // and a test holds it to the workflow files.
 const matrixJobsPerArch = 27
 

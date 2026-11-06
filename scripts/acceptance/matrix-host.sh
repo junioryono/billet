@@ -2,6 +2,7 @@
 # Usage:
 #   matrix-host.sh prepare <run-dir> <base-config> <account> <kms-key-arn> [<guest-role-arn>]
 #   matrix-host.sh run <run-dir> <jobs>
+#   matrix-host.sh stop <run-dir>
 #   matrix-host.sh judge <run-dir> <archs> <runs-file> <owner/repo>
 #   matrix-host.sh down <run-dir>
 #
@@ -17,7 +18,13 @@
 # policy's iam:PassRole; omit it when the guests carry no instance profile.
 #
 # run runs the deployment until <jobs> jobs have finished (`billet acceptance run`, which
-# writes the evidence and tears down what it made), and exits with its status.
+# writes the evidence and tears down what it made), and exits with its status. Its pid is
+# kept in <run-dir>/run.pid while it runs.
+#
+# stop ends a run early, as an operator's Ctrl-C would: ONE SIGTERM, which cancels the
+# run's wait and lets it write its evidence and tear down what it made. A second signal
+# would leave the jobs running, so it is never sent. A run that is not running is
+# nothing to stop.
 #
 # judge judges that evidence (`billet acceptance matrix judge`) for the runs named in
 # <runs-file> of <owner/repo> into <run-dir>/out, beside a copy of the evidence, and exits
@@ -28,7 +35,7 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,6p' "$0" >&2
+	sed -n '2,7p' "$0" >&2
 	exit 2
 }
 
@@ -71,12 +78,34 @@ prepare)
 	;;
 run)
 	[ "$#" -eq 3 ] || usage
-	"$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 150m
+	"$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 150m &
+	pid=$!
+	if ! echo "$pid" >"$run_dir/run.pid"; then
+		echo "matrix: could not record the run's pid, so it could not be stopped early; stopping it now" >&2
+		kill -TERM "$pid"
+	fi
+	wait "$pid"
 	ran=$?
+	rm -f "$run_dir/run.pid"
 	if [ "$ran" -ne 0 ]; then
 		echo "matrix: the run ended with status $ran" >&2
 	fi
 	exit "$ran"
+	;;
+stop)
+	[ "$#" -eq 2 ] || usage
+	if ! pid=$(cat "$run_dir/run.pid" 2>/dev/null) || [ -z "$pid" ]; then
+		echo "matrix: no run is recorded as running; nothing to stop"
+		exit 0
+	fi
+	if ! kill -0 "$pid" 2>/dev/null; then
+		echo "matrix: the run ($pid) has already ended"
+		exit 0
+	fi
+	# THE kill ON PATH, not the builtin, so a test can count the signals sent: two of
+	# the same kind merge in the receiver, which therefore cannot.
+	env kill -TERM "$pid"
+	echo "matrix: asked the run ($pid) to stop; it writes its evidence and tears down what it made"
 	;;
 judge)
 	[ "$#" -eq 5 ] || usage

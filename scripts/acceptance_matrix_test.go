@@ -192,6 +192,16 @@ matrix-tiers)
 matrix-judge)
 	echo "judged"
 	;;
+acceptance-run)
+	ws=""
+	while [ "$#" -gt 0 ]; do [ "$1" = --workspace ] && ws=$2; shift; done
+	# The host records this process's pid before it waits on it.
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		[ "$(cat "${ws%/ws}/run.pid" 2>/dev/null)" = "$$" ] && break
+		sleep 0.1
+	done
+	[ "$(cat "${ws%/ws}/run.pid" 2>/dev/null)" = "$$" ] || exit 9
+	;;
 init-iam)
 	echo '{"Version":"2012-10-17"}'
 	;;
@@ -413,10 +423,12 @@ func TestTheSSMHelperSendsInOneStepAndWaitsInAnother(t *testing.T) {
 	}
 }
 
-// fakeDispatchGH dispatches by appending "<workflow> <label> <tag>" to $FAKE/sent; lists
-// the run of a workflow whose title, the matrix's run-name, matches the one asked for (a
-// run's id is its line in $FAKE/sent); and reports a run completed once $FAKE/done-<id>
-// exists, or $FAKE/done-all does. $FAKE/unlisted makes every listing empty.
+// fakeDispatchGH dispatches by appending "<workflow> <label> <tag>" to $FAKE/sent, and
+// lists a workflow's runs as GitHub would, as JSON of each run's id (its line in
+// $FAKE/sent) and title (the matrix's run-name), through the dispatcher's own --jq
+// filter: the fake does not judge which run is the one asked for. A run is completed
+// once $FAKE/done-<id> exists, or $FAKE/done-all does; $FAKE/unlisted makes every
+// listing empty.
 const fakeDispatchGH = `case "$1 $2" in
 "workflow run")
 	label="" tag=""
@@ -425,18 +437,18 @@ const fakeDispatchGH = `case "$1 $2" in
 	;;
 "run list")
 	[ -f "$FAKE/unlisted" ] && exit 0
-	wf="" jq="" prev=""
+	wf="" filter="" prev=""
 	for a in "$@"; do
 		[ "$prev" = --workflow ] && wf=$a
-		[ "$prev" = --jq ] && jq=$a
+		[ "$prev" = --jq ] && filter=$a
 		prev=$a
 	done
 	n=0
 	while read -r w label tag; do
 		n=$((n + 1))
-		title="${w%.yml} $label $tag"
-		case "$jq" in *"\"$title\""*) [ "$w" = "$wf" ] && echo "$n" ;; esac
-	done <"$FAKE/sent"
+		[ "$w" = "$wf" ] || continue
+		jq -cn --argjson id "$n" --arg t "${w%.yml} $label $tag" '{databaseId: $id, displayTitle: $t}'
+	done <"$FAKE/sent" | jq -s . | jq -r "$filter"
 	;;
 "run view")
 	if [ -f "$FAKE/done-all" ] || [ -f "$FAKE/done-$3" ]; then
@@ -465,7 +477,7 @@ var dispatchEnv = []string{"MATRIX_SETTLE=0", "MATRIX_POLL=0", "MATRIX_LIST_WAIT
 // one architecture's still running, it fails rather than let the warm phase start.
 func TestTheMatrixDispatchersColdPhaseWaitsForEveryArchitecture(t *testing.T) {
 	t.Parallel()
-	f := newMatrixFakes(t)
+	f := newMatrixFakes(t, "jq")
 	f.command(t, "gh", fakeDispatchGH)
 	f.fixture(t, "done-all", "")
 	runs := filepath.Join(t.TempDir(), "runs")
@@ -486,7 +498,7 @@ func TestTheMatrixDispatchersColdPhaseWaitsForEveryArchitecture(t *testing.T) {
 	}
 
 	// The x64 cold run (id 1) finishes; the arm one (id 4) does not.
-	f = newMatrixFakes(t)
+	f = newMatrixFakes(t, "jq")
 	f.command(t, "gh", fakeDispatchGH)
 	f.fixture(t, "done-1", "")
 	runs = filepath.Join(t.TempDir(), "runs")
@@ -496,7 +508,7 @@ func TestTheMatrixDispatchersColdPhaseWaitsForEveryArchitecture(t *testing.T) {
 		t.Fatalf("an arm cold run still running: exit %d\n%s", code, out)
 	}
 
-	f = newMatrixFakes(t)
+	f = newMatrixFakes(t, "jq")
 	f.command(t, "gh", fakeDispatchGH)
 	f.fixture(t, "unlisted", "")
 	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cold", "billet-testbed/m", "t3",
@@ -510,7 +522,7 @@ func TestTheMatrixDispatchersColdPhaseWaitsForEveryArchitecture(t *testing.T) {
 // included.
 func TestTheMatrixDispatchersWarmPhaseWaitsForEveryRun(t *testing.T) {
 	t.Parallel()
-	f := newMatrixFakes(t)
+	f := newMatrixFakes(t, "jq")
 	f.command(t, "gh", fakeDispatchGH)
 	f.fixture(t, "done-all", "")
 	runs := filepath.Join(t.TempDir(), "runs")
@@ -527,7 +539,7 @@ func TestTheMatrixDispatchersWarmPhaseWaitsForEveryRun(t *testing.T) {
 	}
 
 	// A two-writer run from the cold phase (id 2) still running fails the warm phase.
-	f = newMatrixFakes(t)
+	f = newMatrixFakes(t, "jq")
 	f.command(t, "gh", fakeDispatchGH)
 	runs = filepath.Join(t.TempDir(), "runs")
 	f.fixture(t, "done-1", "")
@@ -541,5 +553,130 @@ func TestTheMatrixDispatchersWarmPhaseWaitsForEveryRun(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "warm", "billet-testbed/m", "t2", runs,
 		"accept-x64"); code != 1 || !strings.Contains(out, "run 2 did not complete") {
 		t.Fatalf("a cold-phase run still running: exit %d\n%s", code, out)
+	}
+}
+
+// THE IMAGE STORE'S PAIR RUNS ALONE: its cold run for every label, then, only once each
+// has finished, its warm one, and nothing else is sent; a cold run still running sends no
+// warm one.
+func TestTheMatrixDispatchersImagePhaseRunsThePairAlone(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-all", "")
+	runs := filepath.Join(t.TempDir(), "runs")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images", "billet-testbed/m", "t1", runs,
+		"accept-x64", "accept-arm"); code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	want := []string{
+		"matrix-images-cold.yml accept-x64 t1", "matrix-images-cold.yml accept-arm t1",
+		"matrix-images-warm.yml accept-x64 t1", "matrix-images-warm.yml accept-arm t1",
+	}
+	if got := dispatchSent(t, f); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", got, want)
+	}
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "1\n2\n3\n4\n" {
+		t.Fatalf("the runs file is %q, %v", got, err)
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-1", "")
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images", "billet-testbed/m", "t2",
+		filepath.Join(t.TempDir(), "runs"), "accept-x64", "accept-arm")
+	if code != 1 || !strings.Contains(out, "run 2 did not complete") {
+		t.Fatalf("an arm cold run still running: exit %d\n%s", code, out)
+	}
+	for _, line := range dispatchSent(t, f) {
+		if strings.HasPrefix(line, "matrix-images-warm") {
+			t.Fatalf("a warm run was sent before every cold one finished: %q", dispatchSent(t, f))
+		}
+	}
+}
+
+// THE RUN ASKED FOR IS THE ONE WHOSE TITLE IS EXACTLY THIS ONE'S: a run of the same
+// workflow with a title that only begins the same way is not it.
+func TestTheMatrixDispatcherFindsTheRunByItsExactTitle(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-all", "")
+	f.fixture(t, "sent", "matrix-images-cold.yml accept-x64 t10\nmatrix-images-cold.yml accept-x64-old t1\n")
+	runs := filepath.Join(t.TempDir(), "runs")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images", "billet-testbed/m", "t1", runs,
+		"accept-x64"); code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "3\n4\n" {
+		t.Fatalf("the runs file is %q, %v; want this run's own ids, 3 and 4", got, err)
+	}
+}
+
+// A RUN THAT COULD NOT BE RECORDED FAILS THE DISPATCH, naming the run, because the judge
+// would read its cells as never run.
+func TestTheMatrixDispatcherFailsOnARunItCouldNotRecord(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-all", "")
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Errorf("restore %s: %v", dir, err)
+		}
+	})
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images", "billet-testbed/m", "t1",
+		filepath.Join(dir, "runs"), "accept-x64")
+	if code != 1 || !strings.Contains(out, "dispatched run 1 of matrix-images-cold.yml for accept-x64, and could not record it") {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+}
+
+// STOP SIGNALS THE RECORDED RUN ONCE, and a run that is not running is nothing to stop.
+func TestTheMatrixHostStopSignalsTheRecordedRunOnce(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "kill")
+	f.command(t, "billet", fakeBillet)
+	// EVERY SIGNAL SENT IS COUNTED HERE, because two of one kind merge in the receiver.
+	realKill, err := exec.LookPath("kill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.command(t, "kill", `echo "$*" >>"$FAKE/kills"; exec "`+realKill+`" "$@"`+"\n")
+	dir := hostRunDir(t, f)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir); code != 0 || !strings.Contains(out, "nothing to stop") {
+		t.Fatalf("stop with no run: exit %d\n%s", code, out)
+	}
+	// A RUN THAT COUNTS THE TERMS IT GETS and ends on its own two seconds later, so the
+	// count is read once it has ended and every signal the stop sent has landed.
+	got := filepath.Join(dir, "terms")
+	run := exec.CommandContext(t.Context(), "bash", "-c",
+		`n=0; trap 'n=$((n+1))' TERM; for _ in $(seq 20); do sleep 0.1; done; echo $n >"$0"`, got)
+	if err := run.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "run.pid"), []byte(strconv.Itoa(run.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir)
+	if err := run.Wait(); err != nil {
+		t.Fatalf("the run: %v", err)
+	}
+	if code != 0 || !strings.Contains(out, "asked the run") {
+		t.Fatalf("stop: exit %d\n%s", code, out)
+	}
+	if b, err := os.ReadFile(got); err != nil || strings.TrimSpace(string(b)) != "1" {
+		t.Fatalf("the run counted %q TERMs (%v), want one", b, err)
+	}
+	pid := strconv.Itoa(run.Process.Pid)
+	if b, err := os.ReadFile(filepath.Join(f.dir, "kills")); err != nil || string(b) != "-TERM "+pid+"\n" {
+		t.Fatalf("kill was run as %q (%v), want once, as -TERM %s", b, err, pid)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir); code != 0 || !strings.Contains(out, "already ended") {
+		t.Fatalf("stop of a run that has ended: exit %d\n%s", code, out)
 	}
 }

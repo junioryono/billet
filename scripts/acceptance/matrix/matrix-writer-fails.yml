@@ -5,7 +5,10 @@ name: matrix-writer-fails
 # cell; cmd/billet/acceptancematrix.go judges it by name. It runs only after the writer
 # has proved it cloned the seed and wrote, so a writer that failed earlier (a disk that
 # never attached) is no failed writer, and its reader never runs: the cell is not run,
-# which a run covering its architecture fails on.
+# which a run covering its architecture fails on. A trusted tier's sticky disk is
+# published inside the job that wrote it, so each job's completion is its publication's.
+#
+# The matrix runs on a trusted tier, which the judge checks.
 #
 # This file is copied from billet's scripts/acceptance/matrix into the repository the
 # acceptance App serves, and the run refuses a copy that differs.
@@ -46,8 +49,6 @@ jobs:
     outputs:
       wrote: ${{ steps.write.outputs.wrote }}
     steps:
-      - name: Let the seed's publication land
-        run: sleep 120
       - id: disk
         uses: junioryono/billet/actions/stickydisk@main
         with:
@@ -74,8 +75,6 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 20
     steps:
-      - name: Wait out any publication the failed writer could have made
-        run: sleep 120
       - id: disk
         uses: junioryono/billet/actions/stickydisk@main
         with:

@@ -177,6 +177,21 @@ jobs:
           done
           echo "labels=$labels" >>"$GITHUB_OUTPUT"
           : >out/runs
+      - id: images-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Dispatch the image store's runs, alone on each tier, and wait for them
+        env:
+          GH_TOKEN: ${{ steps.images-token.outputs.token }}
+          LABELS: ${{ steps.labels.outputs.labels }}
+        run: |
+          set -euo pipefail
+          read -r -a labels <<<"$LABELS"
+          scripts/acceptance/matrix-dispatch.sh images "$REPO" "$RUN" out/runs "${labels[@]}"
       - id: cold-token
         uses: actions/create-github-app-token@v2
         with:
@@ -207,10 +222,18 @@ jobs:
           set -euo pipefail
           read -r -a labels <<<"$LABELS"
           scripts/acceptance/matrix-dispatch.sh warm "$REPO" "$RUN" out/runs "${labels[@]}"
+      # A FAILED OR CANCELLED DISPATCH STOPS THE HOST'S RUN rather than leave it waiting
+      # out --wait for jobs nobody sent; the wait below then joins it, so neither the
+      # judge nor the teardown runs beside a run still writing.
+      - name: Stop the host's run early
+        if: ${{ (failure() || cancelled()) && steps.host-run.outputs.id != '' }}
+        run: |
+          scripts/acceptance/ssm-run.sh run "$HOST" 120 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' stop '$RUN_DIR'"
       - name: Wait for the host's run, which tears down what it made
+        if: ${{ always() && steps.host-run.outputs.id != '' }}
         run: scripts/acceptance/ssm-run.sh wait "$HOST" "${{ steps.host-run.outputs.id }}" 10800
       - name: Judge the cells
-        if: ${{ !cancelled() && steps.host-run.outputs.id != '' }}
+        if: ${{ always() && steps.host-run.outputs.id != '' }}
         run: |
           set -euo pipefail
           aws s3 cp --only-show-errors out/runs "s3://$BUCKET/runs/$RUN/runs"

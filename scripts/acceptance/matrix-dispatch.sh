@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Usage:
+#   matrix-dispatch.sh images <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh cold <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh warm <owner/repo> <tag> <runs-file> <label>...
 #
 # Dispatches the acceptance matrix's workflows in <owner/repo> for each tier label and
 # appends the id of every run it starts to <runs-file>, which is what `billet acceptance
-# matrix judge --runs` reads. `cold` sends the cold, two-writer and failed-writer runs and
+# matrix judge --runs` reads. `images` runs first and alone on each tier: it sends the
+# image store's cold run, waits for it, waits MATRIX_SETTLE seconds, and sends and waits
+# for the warm one, because every job on a tier publishes an image-store generation and
+# none may run beside that pair. `cold` sends the cold, two-writer and failed-writer runs and
 # waits for the cold ones to finish; `warm` waits MATRIX_SETTLE seconds more, so the cold
 # runs' publications have time to land, sends the warm runs with the same tag, and waits
-# for every run in <runs-file> to finish. Two phases, because each is a step of its own
+# for every run in <runs-file> to finish. Three phases, because each is a step of its own
 # with an installation token of its own, and a token lasts an hour.
 #
 # It judges nothing (a run's conclusion is not the matrix's verdict; the judge reads the
@@ -23,7 +27,7 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,3p' "$0" >&2
+	sed -n '2,4p' "$0" >&2
 	exit 2
 }
 
@@ -51,7 +55,12 @@ dispatch() {
 		id=$(gh run list -R "$repo" --workflow "$workflow" --event workflow_dispatch --limit 50 \
 			--json databaseId,displayTitle --jq ".[] | select(.displayTitle == \"$title\") | .databaseId" | head -n 1)
 		if [ -n "$id" ]; then
-			echo "$id" >>"$runs"
+			# RECORDED OR FAILED: a run the judge is not told of is a run whose cells
+			# read as not run, and that has to be this script's failure, said here.
+			if ! echo "$id" >>"$runs"; then
+				echo "dispatched run $id of $workflow for $label, and could not record it in $runs" >&2
+				return 1
+			fi
 			echo "$id"
 			return 0
 		fi
@@ -84,6 +93,23 @@ await() {
 }
 
 case "$phase" in
+images)
+	cold=()
+	for label in "$@"; do
+		id=$(dispatch matrix-images-cold.yml "$label") || exit 1
+		cold+=("$id")
+	done
+	await "${cold[@]}" || exit 1
+	echo "the image store's cold runs are done; its warm ones are sent in ${settle}s"
+	sleep "$settle"
+	warm=()
+	for label in "$@"; do
+		id=$(dispatch matrix-images-warm.yml "$label") || exit 1
+		warm+=("$id")
+	done
+	await "${warm[@]}" || exit 1
+	echo "the image store's runs are done"
+	;;
 cold)
 	cold=()
 	for label in "$@"; do

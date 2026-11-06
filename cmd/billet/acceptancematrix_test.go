@@ -92,6 +92,23 @@ func matrixWorkflowJobs(t *testing.T, file string) map[string]matrixWorkflowJob 
 	return wf.Jobs
 }
 
+// matrixWorkflowFiles is every workflow in this repository's copy.
+func matrixWorkflowFiles(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join("..", "..", matrixWorkflows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".yml") {
+			out = append(out, e.Name())
+		}
+	}
+
+	return out
+}
+
 type matrixWorkflowJob struct {
 	Name     string `yaml:"name"`
 	RunsOn   string `yaml:"runs-on"`
@@ -119,7 +136,7 @@ func TestEveryRunCellNamesAJobItsWorkflowRuns(t *testing.T) {
 				c.Run.Workflow, c.Run.Job)
 		}
 	}
-	for _, file := range []string{"matrix-cold.yml", "matrix-warm.yml", "matrix-writers.yml", "matrix-writer-fails.yml"} {
+	for _, file := range matrixWorkflowFiles(t) {
 		for id, job := range matrixWorkflowJobs(t, file) {
 			if job.RunsOn != "${{ inputs.runs_on }}" {
 				t.Errorf("%s: job %s runs on %q, not the tier the run names", file, id, job.RunsOn)
@@ -143,7 +160,7 @@ func TestEveryRunCellNamesAJobItsWorkflowRuns(t *testing.T) {
 func TestTheMatrixJobCountIsTheWorkflowsJobs(t *testing.T) {
 	t.Parallel()
 	n := 0
-	for _, file := range []string{"matrix-cold.yml", "matrix-warm.yml", "matrix-writers.yml", "matrix-writer-fails.yml"} {
+	for _, file := range matrixWorkflowFiles(t) {
 		n += len(matrixWorkflowJobs(t, file))
 	}
 	if n != matrixJobsPerArch {
@@ -180,6 +197,7 @@ func matrixTestTiers() map[string]matrixTier {
 func coldGitJob() acceptanceJob {
 	return acceptanceJob{
 		LeaseID: "l-accept-x64", Tier: "accept-x64", GitHub: "success", Provider: "ec2", InstanceType: "c7i.large",
+		Trust:       "trusted",
 		WorkflowRef: "billet-testbed/acceptance-matrix/.github/workflows/matrix-cold.yml@refs/heads/main",
 		JobName:     "git",
 		QueuedAt:    "2026-11-05T10:00:00Z", StartedAt: "2026-11-05T10:00:30Z", FinishedAt: "2026-11-05T10:30:30Z",
@@ -213,17 +231,19 @@ func TestACellIsJudgedOnGitHubsResultAndTheNodesObservation(t *testing.T) {
 		verdict matrixVerdict
 		reason  string
 	}{
-		"both witnesses agree":        {func(*acceptanceJob) {}, verdictPass, ""},
-		"GitHub failed it":            {func(j *acceptanceJob) { j.GitHub = "failure" }, verdictFail, `GitHub reported "failure"`},
-		"the node saw it warm":        {func(j *acceptanceJob) { j.Cache.Git = "warm" }, verdictFail, `observed git "warm", want "cold"`},
-		"the node saw nothing":        {func(j *acceptanceJob) { j.Cache.Git = "" }, verdictFail, "recorded no git observation"},
-		"its history was unread":      {func(j *acceptanceJob) { j.Unread = "disk on fire" }, verdictFail, "disk on fire"},
-		"placed on another provider":  {func(j *acceptanceJob) { j.Provider = "codebuild" }, verdictFail, "placed on codebuild"},
-		"another workflow":            {func(j *acceptanceJob) { j.WorkflowRef = strings.Replace(j.WorkflowRef, "cold", "warm", 1) }, verdictNotRun, "no git job of matrix-cold.yml"},
-		"another job":                 {func(j *acceptanceJob) { j.JobName = "go" }, verdictNotRun, "no git job"},
-		"another architecture's tier": {func(j *acceptanceJob) { j.Tier = "accept-arm" }, verdictNotRun, "ec2 x64 tier"},
-		"another provider's tier":     {func(j *acceptanceJob) { j.Tier = "accept-fc" }, verdictNotRun, "ec2 x64 tier"},
-		"a tier the config lacks":     {func(j *acceptanceJob) { j.Tier = "gone" }, verdictNotRun, "ec2 x64 tier"},
+		"both witnesses agree":               {func(*acceptanceJob) {}, verdictPass, ""},
+		"GitHub failed it":                   {func(j *acceptanceJob) { j.GitHub = "failure" }, verdictFail, `GitHub reported "failure"`},
+		"the node saw it warm":               {func(j *acceptanceJob) { j.Cache.Git = "warm" }, verdictFail, `observed git "warm", want "cold"`},
+		"the node saw nothing":               {func(j *acceptanceJob) { j.Cache.Git = "" }, verdictFail, "recorded no git observation"},
+		"its history was unread":             {func(j *acceptanceJob) { j.Unread = "disk on fire" }, verdictFail, "disk on fire"},
+		"placed on another provider":         {func(j *acceptanceJob) { j.Provider = "codebuild" }, verdictFail, "placed on codebuild"},
+		"an untrusted tier":                  {func(j *acceptanceJob) { j.Trust = "untrusted" }, verdictFail, `its tier is "untrusted"`},
+		"a tier of no trust the config says": {func(j *acceptanceJob) { j.Trust = "" }, verdictFail, `its tier is "-"`},
+		"another workflow":                   {func(j *acceptanceJob) { j.WorkflowRef = strings.Replace(j.WorkflowRef, "cold", "warm", 1) }, verdictNotRun, "no git job of matrix-cold.yml"},
+		"another job":                        {func(j *acceptanceJob) { j.JobName = "go" }, verdictNotRun, "no git job"},
+		"another architecture's tier":        {func(j *acceptanceJob) { j.Tier = "accept-arm" }, verdictNotRun, "ec2 x64 tier"},
+		"another provider's tier":            {func(j *acceptanceJob) { j.Tier = "accept-fc" }, verdictNotRun, "ec2 x64 tier"},
+		"a tier the config lacks":            {func(j *acceptanceJob) { j.Tier = "gone" }, verdictNotRun, "ec2 x64 tier"},
 	} {
 		job := coldGitJob()
 		c.edit(&job)
@@ -252,6 +272,14 @@ func TestOnlyThisMatrixRunsJobsAreJudged(t *testing.T) {
 		repository: "billet-testbed/acceptance-matrix"}
 	if got := judgeCell(cell, []acceptanceJob{job}, scope); got.Verdict != verdictPass {
 		t.Fatalf("this run's job: %+v", got)
+	}
+	// A JOB OF THIS CELL WHOSE HISTORY COULD NOT BE READ fails it, though it names no
+	// run: dropped, it would let this run's passing job stand for evidence unread.
+	unread := job
+	unread.LeaseID, unread.GitHubRunID, unread.Unread = "l-unread", 0, "its history could not be read: locked"
+	if got := judgeCell(cell, []acceptanceJob{job, unread}, scope); got.Verdict != verdictFail ||
+		!strings.Contains(got.Reason, "l-unread") {
+		t.Fatalf("a passing job beside an unread one: %s %q", got.Verdict, got.Reason)
 	}
 	for name, edit := range map[string]func(*acceptanceJob){
 		"another run":          func(j *acceptanceJob) { j.GitHubRunID = 78 },
