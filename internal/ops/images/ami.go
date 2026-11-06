@@ -1,11 +1,14 @@
 package images
 
 import (
+	"bytes"
 	"context"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -77,6 +80,9 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	name := fs.String("name", "", "name for the produced AMI (default: billet-runner-<timestamp>)")
 	caCert := fs.String("ca-cert", "",
 		"PEM file of CA(s) to trust in the image's host store — the cache endpoint's issuer")
+	guestBillet := fs.String("guest-billet", "",
+		"a static linux billet binary of --arch for the image to carry, which its Go and "+
+			"Bazel caches run (default: this binary, where it is one)")
 	payloadBucket := fs.String("payload-bucket", "",
 		"REQUIRED. S3 bucket to stage the build in (GitHub's template, the scripts that "+
 			"run it and billet's layer), fetched by the builder through a presigned URL")
@@ -196,6 +202,11 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		}
 	}
 
+	guest, err := guestBilletFor(*guestBillet, *arch)
+	if err != nil {
+		return err
+	}
+
 	// READ BEFORE THE BUILD STARTS, so a missing or unreadable file fails now
 	// rather than after a paid builder is running. The bytes are validated as a CA
 	// bundle inside BuildImage, before any instance launches.
@@ -244,6 +255,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		RunnerSHA256:       digest,
 		Name:               *name,
 		CACertPEM:          caCertPEM,
+		GuestBillet:        guest,
 		Accept:             accept,
 		PayloadBucket:      *payloadBucket,
 		Verify:             *verify,
@@ -275,6 +287,70 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		fmt.Fprintf(env.Stdout, "    command: [/usr/local/bin/billet-runner]\n\n")
 	}
 	fmt.Fprintf(env.Stdout, "An AMI id is REGION-SCOPED: this one only works in %s.\n", cfg.Region)
+
+	return nil
+}
+
+// guestBilletFor is the billet the image carries for its build caches: the file
+// named, or this very binary where it can run on the image, so an image and the
+// billet that built it are one version unless somebody says otherwise.
+//
+// CHECKED BEFORE A MACHINE IS BOUGHT: an image whose helper cannot run has a Go cache
+// that fails every build (GOCACHEPROG takes precedence and has no fallback when it
+// cannot start), and nothing would say so until a job did.
+func guestBilletFor(path, arch string) ([]byte, error) {
+	if path == "" && (runtime.GOOS != "linux" || runtime.GOARCH != goArch(arch)) {
+		return nil, fmt.Errorf("--guest-billet is required: the image needs a static linux/%s "+
+			"billet for its build caches and this one is %s/%s; use the matching binary from "+
+			"the same release", goArch(arch), runtime.GOOS, runtime.GOARCH)
+	}
+	if path == "" {
+		self, err := os.Executable()
+		if err != nil {
+			return nil, fmt.Errorf("find this binary to put in the image: %w", err)
+		}
+		path = self
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read the billet for the image: %w", err)
+	}
+	if err := checkGuestBillet(body, arch); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+
+	return body, nil
+}
+
+// goArch is Go's name for a runner architecture.
+func goArch(arch string) string {
+	if arch == "arm64" {
+		return "arm64"
+	}
+
+	return "amd64"
+}
+
+// checkGuestBillet refuses a binary the image could not run.
+func checkGuestBillet(body []byte, arch string) error {
+	file, err := elf.NewFile(bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("not a linux binary: %w", err)
+	}
+	defer file.Close()
+
+	want := elf.EM_X86_64
+	if arch == "arm64" {
+		want = elf.EM_AARCH64
+	}
+	if file.Machine != want {
+		return fmt.Errorf("built for %s, and this image is %s", file.Machine, want)
+	}
+	for _, program := range file.Progs {
+		if program.Type == elf.PT_INTERP {
+			return errors.New("not static: it asks for a dynamic linker, and a job's image need not carry that one")
+		}
+	}
 
 	return nil
 }

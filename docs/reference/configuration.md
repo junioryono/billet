@@ -28,7 +28,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `placement` | no | `pack` (default), `spread` or `tightest` (the host left with the least free room, whatever the tier) |
 | `admission_order` | no | `fair` (default), `fill` or `hold`; which waiting tier takes the room a finished job leaves. [Admission orders on replay](records/replay-policies.md) measures all three |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
-| `logs.retention`, `logs.max_bytes` | no | how long this control plane's index of what jobs wrote keeps a day (default `336h`, at least `1h`) and how much of it stays on disk (a byte size, default `32GiB`, at least `64MiB`), the oldest days removed whole; a file of its own a day under `identity_dir`, not in the ledger, and absent unless a tier sets `logs.keep` ([ADR-029](decisions/adr-029-job-logs.md)) |
+| `logs.retention`, `logs.max_bytes` | no | how long this control plane's index of what jobs wrote keeps a day (default `336h`, at least `1h`) and how much of it stays on disk (a byte size, default `32GiB`, at least `64MiB`), the oldest days removed whole; a file of its own a day under `identity_dir`, not in the ledger, and absent unless a tier sets `logs.keep` ([ADR-031](decisions/adr-031-job-logs.md)) |
 | `test_results_retention` | no | how long the ledger keeps a job's test suites and cases, which `billet tests stats` ranks and `billet jobs show` prints (default `336h`, at least `1h`); they are kept apart from the guest report and past it |
 | `test_results_max_bytes` | no | how much of them the ledger keeps in all, the oldest deleted first (a byte size, default `128MiB`, at least `1MiB`); the control plane reads the whole ledger at every start, and this bounds what they add to that |
 | `job_detail_retention` | no | how long the ledger keeps a finished job's per-sample series, destinations and guest report (default `72h`, at least `1h`); past it they are deleted and `billet jobs show` says the job's detail was retired. The usage summary is kept |
@@ -143,7 +143,7 @@ The per-sample series a node reports with each job records the wall time of its 
 
 ### `node.ebs_s3` (for an EC2 site's cache)
 
-`region`, `availability_zone` (must match the subnet's), `bucket`, `prefix`, `kms_key_id`. It exists only to back `node.cache`: without that listener nothing reads it, so `billet check` refuses the pairing rather than letting every job run cold on the instance's root volume.
+`region`, `availability_zone` (must match the subnet's), `bucket`, `prefix`, `kms_key_id`. It exists only to back `node.cache`: without that listener nothing reads it, so `billet check` refuses the pairing rather than letting every job run cold on the instance's root volume. Sticky disks and the Docker image store are EBS volumes under `kms_key_id`, and the Actions, Go and Bazel caches are objects in the bucket under `prefix`, encrypted with S3's own key ([ADR-024](decisions/adr-024-caches-off-firecracker.md)).
 
 ## `tiers`
 
@@ -167,14 +167,15 @@ The per-sample series a node reports with each job records the wall time of its 
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
 | `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference or local VM name, either of which may end `@verified` to boot only a copy of what `billet images verify` booted on that node ([ADR-021](decisions/adr-021-tart-images-verified-not-published.md), never beside a digest, and `billet check` refuses it while a registered host predates wire 41); never one beginning with `-`, which a backend's command line would read as an option |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
-| `logs.keep` | keep this tier's jobs' step logs on the node that ran them and index them for `billet logs search` (default false). Linux Firecracker only, with no other backend: that guest runs the agent that reads them, and a tier that asks elsewhere is refused. A log is as sensitive as its workflow makes it, so this is off unless a tier says ([ADR-029](decisions/adr-029-job-logs.md)) |
-| `debug.attach` | let an operator open a terminal in this tier's jobs' VMs with `billet jobs attach` (default false). Trusted tiers only, since an untrusted tier's jobs are outside work on a machine they control, and Linux Firecracker only, with no other backend. See [ADR-031](decisions/adr-031-job-attach.md) |
+| `logs.keep` | keep this tier's jobs' step logs on the node that ran them and index them for `billet logs search` (default false). Linux Firecracker only, with no other backend: that guest runs the agent that reads them, and a tier that asks elsewhere is refused. A log is as sensitive as its workflow makes it, so this is off unless a tier says ([ADR-031](decisions/adr-031-job-logs.md)) |
+| `debug.attach` | let an operator open a terminal in this tier's jobs' VMs with `billet jobs attach` (default false). Trusted tiers only, since an untrusted tier's jobs are outside work on a machine they control, and Linux Firecracker only, with no other backend. See [ADR-032](decisions/adr-032-job-attach.md) |
 | `debug.hold_on_failure` | keep a failed job's VM this long, or until a session's shell has exited and the last session has closed, its capacity charged: a Go duration above zero and at most `1h`, needing `debug.attach`. Absent, a failed job's VM is destroyed as any other's. A job that passed or was cancelled is never held, and the bound is fixed when the hold opens |
 | `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
 | `intercept` | the deprecated spelling of `cache.actions.enabled`; refused beside `cache.actions` |
 | `network` | what the tier asks of its guests' network; see [`tiers[].network`](#tiersnetwork). Without it the tier is open, as a tier always was |
 | `max_concurrent`, `reserved` | a ceiling and a floor; a macOS tier's ceiling defaults to what its hosts permit between them |
+| `retry` | `disrupted`, 0 to 5, default 0: how many times billet asks GitHub to re-run a workflow run whose job on this tier it proved its own infrastructure ended. The App must hold `actions: write`. See [Re-running a job billet ended](../operating/status-and-leases.md#re-running-a-job-billet-ended) |
 | `warm_pool` | refused when non-zero; no backend implements it |
 
 ### `tiers[].network`
@@ -199,13 +200,13 @@ Everything here is optional; [Build caches](../operating/build-caches.md) explai
 | `docker.enabled`, `docker.max_size` | `true`, `100GiB` | the guest's Docker image store and its ceiling |
 | `sticky_disks.enabled`, `sticky_disks.max_size` | `true`, `100GiB` | `actions/stickydisk` volumes; a larger request is clamped |
 | `actions.enabled`, `actions.max_archive` | on where the scope already holds, `10GiB` | the transparent Actions cache; an untrusted tier needs `default-branch`, a trusted `trusted-only` one a `cache_scope.workflow_ref` in its `workflows` |
-| `git.enabled`, `git.max_size` | `true` on Linux Firecracker, `50GiB` | the Git mirror for `github.com` fetches; a repository above the ceiling is not mirrored |
-| `bazel.enabled`, `bazel.max_size` | `true` on Linux Firecracker where the tier can publish it (trusted under `trusted-only`, or `default-branch`), `50GiB` | Bazel's HTTP cache and the Remote Execution API for Bazel and Buck2 |
-| `go.enabled`, `go.max_size` | `true` on Linux Firecracker where the tier can publish it, as for Bazel, `20GiB` | the Go build cache through `GOCACHEPROG` |
+| `git.enabled`, `git.max_size` | `true` on Linux Firecracker or EC2, `50GiB` | the Git mirror for `github.com` fetches; a repository above the ceiling is not mirrored |
+| `bazel.enabled`, `bazel.max_size` | `true` on Linux Firecracker or EC2 where the tier can publish it (trusted under `trusted-only`, or `default-branch`), `50GiB` | Bazel's HTTP cache and the Remote Execution API for Bazel and Buck2 |
+| `go.enabled`, `go.max_size` | `true` on Linux Firecracker or EC2 where the tier can publish it, as for Bazel, `20GiB` | the Go build cache through `GOCACHEPROG` |
 | `go.test_results` | `false` | also cache `go test` results; off, the guest sets `GOFLAGS=-count=1` |
-| `npm.enabled` | `true` on a firecracker Linux tier, as every cache is; `false` turns it off for a tier whose jobs run a client the node's authority does not reach | the node serves `registry.npmjs.org` to the tier's guests from a store of its own, answering only anonymous reads and splicing everything else to the registry ([ADR-020](decisions/adr-020-npm-registry-interception.md)); Linux Firecracker only. It has no `max_size`: the store is the node's, shared by every tier on it |
+| `npm.enabled` | `true` on a firecracker or EC2 Linux tier, as every cache is; `false` turns it off for a tier whose jobs run a client the node's authority does not reach | the node serves `registry.npmjs.org` to the tier's guests from a store of its own, answering only anonymous reads and splicing everything else to the registry ([ADR-020](decisions/adr-020-npm-registry-interception.md)); Linux Firecracker only. It has no `max_size`: the store is the node's, shared by every tier on it |
 
-A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. A tier an older node would exceed is placed only on a node at protocol 23 or later: every `default-branch` tier (an older node would read the pool's wider pre-#226 keys), a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, and an Actions archive held below `10GiB`.
+A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. On EC2, where the Go and Bazel caches are objects rather than a volume, it bounds what one job adds. A tier an older node would exceed is placed only on a node at protocol 23 or later: every `default-branch` tier (an older node would read the pool's wider pre-#226 keys), a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, and an Actions archive held below `10GiB`.
 
 ## `nodes`
 
@@ -265,6 +266,6 @@ deployments:
 | `apps[].api_url` | no | the REST base, for GitHub Enterprise Server; absent, the real GitHub |
 | `deployments[].id` | yes | the deployment's identity, as `billet broker client-key` printed it |
 | `deployments[].clients` | yes | the fingerprints of the keys that prove this deployment, one per host. A key proves one deployment |
-| `deployments[].installations[]` | no | the only tokens this deployment may ask for: `app_id`, `installation_id`, `target` (`owner`, or `owner/name` for one repository), and `actions_read`, which lets its tokens read GitHub's job records: without it every job keeps an unknown queue time, and a tier publishing caches from a default branch is refused. `billet broker client-key` prints it set |
+| `deployments[].installations[]` | no | the only tokens this deployment may ask for: `app_id`, `installation_id`, `target` (`owner`, or `owner/name` for one repository), and `actions_read`, which lets its tokens read GitHub's job records: without it every job keeps an unknown queue time, and a tier publishing caches from a default branch is refused. `actions_write` grants write, which includes read, for a deployment whose tier sets `retry.disrupted`, and the installation must hold it too. `billet broker client-key` prints the one each target needs |
 
 An owner registered as a whole organization belongs to one deployment, under any App, because its token reaches every repository; two deployments may share an owner by repository, whose tokens are scoped to the repository, and a repository belongs to one deployment.

@@ -101,8 +101,6 @@
       "npm": true
     },
     "arch": "Command.tier.arch",
-    "attach": true,
-    "hold_on_failure": "Command.tier.hold_on_failure",
     "egress": {
       "allow": [
         "Command.tier.egress.allow[0]"
@@ -141,10 +139,5 @@
       }
     ],
     "max_bytes": 1378189617
-  },
-  "attach": {
-    "lease": "Command.attach.lease",
-    "stream": "Command.attach.stream",
-    "token": "Command.attach.token"
   }
 }

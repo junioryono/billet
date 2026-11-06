@@ -459,7 +459,7 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 			return nil, err
 		}
 
-		// A CONTROL PLANE WITH NO INDEX STILL SCHEDULES: it loses search and no decision (ADR-029).
+		// A CONTROL PLANE WITH NO INDEX STILL SCHEDULES: it loses search and no decision (ADR-031).
 		// Its nodes are told of no index, and keep what they hold until one is back. An id that
 		// cannot be read is never replaced by a new one, since that would ship everything again.
 		index, err := state.OpenLogIndex(LogIndexDir(cp.cfg))

@@ -85,8 +85,9 @@ func New(cfg config.EBSS3Config, owner string, credentials CredentialSource) (*S
 	now := time.Now
 	blocks := newEBSAPI(cfg, owner, credentials, httpClient, ebsEndpoint, now, waitContext)
 	objects := newS3API(cfg, credentials, httpClient, s3Endpoint, now)
+	objects.bulk = bulkClient()
 
-	return newStore(cfg, owner, blocks, objects), nil
+	return newStore(cfg, owner, blocks, objects, withBulk(objects)), nil
 }
 
 func nilCredentialSource(credentials CredentialSource) bool {
@@ -111,9 +112,11 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 }
 
 type s3API struct {
-	cfg      config.EBSS3Config
-	creds    CredentialSource
-	http     *http.Client
+	cfg   config.EBSS3Config
+	creds CredentialSource
+	http  *http.Client
+	// bulk carries whole objects, whose bodies outlast http's bound on an exchange.
+	bulk     *http.Client
 	endpoint string
 	now      func() time.Time
 }

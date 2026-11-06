@@ -22,6 +22,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/guestassets"
+	"github.com/junioryono/billet/internal/notices"
 	"github.com/junioryono/billet/internal/runnerimages"
 	"github.com/junioryono/billet/scripts"
 )
@@ -201,6 +202,17 @@ func TestThePayloadLaysTheBuildOutAsTheTreeDoes(t *testing.T) {
 		}{0o644, body}
 	}
 
+	assets, err := guestCacheAssets()
+	if err != nil {
+		t.Fatalf("guestCacheAssets: %v", err)
+	}
+	for name, body := range assets {
+		want["var/lib/billet-ami/repo/internal/guestassets/"+name] = struct {
+			mode int64
+			body []byte
+		}{0o644, []byte(body)}
+	}
+
 	env, err := buildEnvFile(spec)
 	if err != nil {
 		t.Fatalf("buildEnvFile: %v", err)
@@ -212,6 +224,8 @@ func TestThePayloadLaysTheBuildOutAsTheTreeDoes(t *testing.T) {
 	}{
 		"var/lib/billet-ami/repo/internal/runnerimages/pinned.txt":        {0o644, runnerimages.PinnedFile()},
 		"var/lib/billet-ami/repo/internal/guestassets/docker-daemon.json": {0o644, []byte(guestassets.DockerDaemonJSON)},
+		"var/lib/billet-ami/repo/internal/notices/THIRD_PARTY_NOTICES":    {0o644, []byte(notices.Text())},
+		"var/lib/billet-ami/guest-billet":                                 {0o755, spec.GuestBillet},
 		"var/lib/billet-ami/build.env":                                    {0o600, []byte(env)},
 		"var/lib/billet-ami/ec2-layer.sh":                                 {0o755, []byte(testLayer)},
 	} {

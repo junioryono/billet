@@ -87,9 +87,14 @@ jobs:
           if [ -n "$EXPECTED_RUNNER_VERSION" ]; then
             test "$(sed -n 's/^RUNNER_VERSION=//p' /etc/billet-image)" = "$EXPECTED_RUNNER_VERSION"
           fi
-          if [ -n "$EXPECTED_GUEST_CONTRACT" ]; then
-            test "$(sed -n 's/^WANT_CONTRACT=//p' /usr/local/bin/billet-agent | head -1)" = "$EXPECTED_GUEST_CONTRACT"
-          fi
+          # AN EC2 IMAGE CARRIES ITS CONTRACT IN ITS RECORD, A FIRECRACKER GUEST IN ITS
+          # AGENT, and the candidate is named as one or the other, so neither is
+          # accepted for lack of the other's file.
+          case "$EXPECTED_GUEST_CONTRACT" in
+            "") ;;
+            ec2:*) test "$(sed -n 's/^AMI_CONTRACT=//p' /etc/billet-image)" = "${EXPECTED_GUEST_CONTRACT#ec2:}" ;;
+            *) test "$(sed -n 's/^WANT_CONTRACT=//p' /usr/local/bin/billet-agent | head -1)" = "$EXPECTED_GUEST_CONTRACT" ;;
+          esac
       # A PLAIN RUN STEP DOES NOT SEE THE ACTIONS RUNTIME. ACTIONS_RESULTS_URL and
       # ACTIONS_RUNTIME_TOKEN are handed only to action steps, so the probe below
       # borrows them through a node action — measured live: the first run to reach

@@ -128,16 +128,23 @@ func TestTheSudoersDropInNamesTheBundleWhereTheAgentPutsIt(t *testing.T) {
 	t.Parallel()
 
 	build := readScriptFile(t, "build-guest-image.sh")
-	dir, file, ok := strings.Cut(agentTrustBundle[1:], "/actions-cache-ca.pem")
+	// THE HOME DEFAULTS TO WHERE A FIRECRACKER GUEST'S RUNNER LIVES, and the EC2 image
+	// names its own: the two uses share one default.
+	const home = "/home/runner/runner"
+	if !strings.HasPrefix(agentTrustBundle, home+"/") || !strings.HasPrefix(hookTrustBundle, home+"/") {
+		t.Fatalf("the bundles %q and %q are not under %q", agentTrustBundle, hookTrustBundle, home)
+	}
+	dir, file, ok := strings.Cut(strings.TrimPrefix(agentTrustBundle, home), "/actions-cache-ca.pem")
 	if !ok || file != "" {
 		t.Fatalf("the agent's bundle path %q is not the directory and file this test reads", agentTrustBundle)
 	}
 	for _, definition := range []string{
-		"\tactions_ca_dir=/" + dir + "\n",
+		"\tactions_ca_dir=${BILLET_RUNNER_HOME:-" + home + "}" + dir + "\n",
 		"\tactions_ca_path=\"$actions_ca_dir/actions-cache-ca.pem\"\n",
 		"\ntarget=\"$RUNNER_TEMP/billet-actions-cache-ca.pem\"\n",
-		"\tlocal agent_bundle=" + agentTrustBundle + "\n",
-		"\tlocal hook_bundle=" + hookTrustBundle + "\n",
+		"\tlocal runner_home=${BILLET_RUNNER_HOME:-" + home + "}\n",
+		"\tlocal agent_bundle=$runner_home" + strings.TrimPrefix(agentTrustBundle, home) + "\n",
+		"\tlocal hook_bundle=$runner_home" + strings.TrimPrefix(hookTrustBundle, home) + "\n",
 	} {
 		if !strings.Contains(build, definition) {
 			t.Errorf("the build does not define %q", strings.TrimSpace(definition))

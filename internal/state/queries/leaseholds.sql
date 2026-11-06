@@ -1,4 +1,4 @@
--- Lease holds: a failed job's VM kept for someone to look at (migration 74). A hold delays a
+-- Lease holds: a failed job's VM kept for someone to look at (migration 75). A hold delays a
 -- destroy a completion already asked for; nothing here touches capacity.
 
 -- name: OpenLeaseHold :exec

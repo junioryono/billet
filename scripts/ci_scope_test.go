@@ -451,6 +451,8 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"internal/provider/simulated/sim.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/store/ceph/ceph.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/provider/testdata/shape.json", families(append([]string{"replay"}, application...)...)},
+		// The EC2 provider embeds its text, so it is part of every binary.
+		{"scripts/build-guest-image.sh", families(append([]string{"replay"}, application...)...)},
 		{"internal/store/embedded/schema.json", families(append([]string{"replay"}, application...)...)},
 		{"tools/lint/go.work", "all"},
 		{"internal/state/migrations/0099_x.sql", families(append([]string{"postgres", "replay"}, application...)...)},
