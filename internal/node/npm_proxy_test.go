@@ -188,7 +188,13 @@ type npmAnswer struct {
 	ContentLength int64
 }
 
-// npmGet sends one raw request through a new tunnel and reads the answer whole.
+// npmGet sends one raw request through a new tunnel, reads the answer whole, and
+// returns once the node has finished with a whole answer or a splice.
+//
+// JOINED, NOT ONLY READ: the node notes what it did for the job after the
+// answer's last byte is written, so a client that has read the whole answer can
+// look before it is noted. Its close, and the node's close after it, end the
+// handler first. A cut answer is closed before it is noted, and is not joined.
 func npmGet(t *testing.T, service *CacheService, credentials CacheCredentials, raw string) (npmAnswer, string) {
 	t.Helper()
 
@@ -200,14 +206,21 @@ func npmGet(t *testing.T, service *CacheService, credentials CacheCredentials, r
 		t.Fatalf("write the request: %v", err)
 	}
 	method := strings.Fields(raw)[0]
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: method})
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: method})
 	if err != nil {
 		t.Fatalf("read the answer: %v", err)
 	}
-	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 	if err != nil {
 		t.Fatalf("read the answer's body: %v", err)
+	}
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatalf("the client's close: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, reader); err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("the node did not end the connection after the client's close: %v", err)
 	}
 
 	return npmAnswer{StatusCode: resp.StatusCode, Header: resp.Header, Close: resp.Close,
