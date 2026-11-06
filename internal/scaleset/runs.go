@@ -73,14 +73,23 @@ func (c *Client) RunQueueTimes(
 	if err == nil {
 		return times, nil
 	}
-	refused, ok := errors.AsType[*billetgithub.APIError](err)
+
+	return nil, installationError(err, server.ErrQueueTimesThrottled, server.ErrQueueTimesRefused)
+}
+
+// installationError says whether GitHub's answer stops the App installation rather
+// than the one request: a throttle wraps throttled, and a refused credential or
+// permission refused. The one reading of those two answers, for every sweep that
+// pauses an installation on them.
+func installationError(err, throttled, refused error) error {
+	answer, ok := errors.AsType[*billetgithub.APIError](err)
 	switch {
-	case ok && refused.RateLimited:
-		return nil, fmt.Errorf("scaleset: %w: %w", server.ErrQueueTimesThrottled, err)
-	case ok && (refused.Status == http.StatusUnauthorized || refused.Status == http.StatusForbidden):
-		return nil, fmt.Errorf("scaleset: %w: %w", server.ErrQueueTimesRefused, err)
+	case ok && answer.RateLimited:
+		return fmt.Errorf("scaleset: %w: %w", throttled, err)
+	case ok && (answer.Status == http.StatusUnauthorized || answer.Status == http.StatusForbidden):
+		return fmt.Errorf("scaleset: %w: %w", refused, err)
 	default:
-		return nil, fmt.Errorf("scaleset: %w", err)
+		return fmt.Errorf("scaleset: %w", err)
 	}
 }
 
@@ -149,15 +158,7 @@ func rerunError(err error) error {
 		return fmt.Errorf("scaleset: %w: %w", server.ErrRerunRunning, err)
 	}
 
-	refused, ok := errors.AsType[*billetgithub.APIError](err)
-	switch {
-	case ok && refused.RateLimited:
-		return fmt.Errorf("scaleset: %w: %w", server.ErrRerunThrottled, err)
-	case ok && (refused.Status == http.StatusUnauthorized || refused.Status == http.StatusForbidden):
-		return fmt.Errorf("scaleset: %w: %w", server.ErrRerunRefused, err)
-	default:
-		return fmt.Errorf("scaleset: %w", err)
-	}
+	return installationError(err, server.ErrRerunThrottled, server.ErrRerunRefused)
 }
 
 // RESTBudget is the installation's REST budget as GitHub last stated it to the

@@ -280,6 +280,10 @@ func (s *Server) settleOverdue(ctx context.Context, w *rerunWork, now time.Time,
 	}
 }
 
+// errRerunSettled marks an installation's refusal or throttle that settled the run's
+// request in doubt: the installation is paused, and the run is not held back.
+var errRerunSettled = errors.New("server: the run's request in doubt was settled")
+
 // afterRerun records what a run's turn asks of the next pass.
 func (s *Server) afterRerun(ctx context.Context, w *rerunWork, err error, sweep *rerunSweep, now time.Time) {
 	switch {
@@ -303,6 +307,12 @@ func (s *Server) afterRerun(ctx context.Context, w *rerunWork, err error, sweep 
 	default:
 		s.log.Warn("could not decide a re-run; trying again later",
 			"target", w.target, "repository", w.run.repository, "run", w.run.run, "error", err)
+	}
+
+	if errors.Is(err, errRerunSettled) {
+		delete(sweep.retries, w.run)
+
+		return
 	}
 
 	retry := sweep.retries[w.run]
@@ -519,18 +529,20 @@ func (s *Server) rerunWindowPassed(request alloc.RerunRequest, now time.Time) bo
 // unconfirmed: it may have landed, and counting it only makes billet ask less. Its
 // jobs are decided at last, which a job covered by a request in doubt otherwise never
 // is.
-func (s *Server) settleUnread(ctx context.Context, request alloc.RerunRequest, why string) {
+func (s *Server) settleUnread(ctx context.Context, request alloc.RerunRequest, why string) bool {
 	if err := s.alloc.SettleRerun(ctx, request, alloc.RerunUnconfirmed, why); err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn("could not settle a re-run in doubt past its window; trying again",
 				"repository", request.Repository, "run", request.RunID, "error", err)
 		}
 
-		return
+		return false
 	}
 
 	s.log.Warn("settled a re-run in doubt as unconfirmed, counted as landed since it may have; nothing was sent",
 		"repository", request.Repository, "run", request.RunID, "attempt", request.Attempt, "why", why)
+
+	return true
 }
 
 // decideJob records a decision on one job, and logs a write that failed: the job
@@ -598,9 +610,13 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 		transient := errors.Is(err, ErrRerunThrottled) || errors.Is(err, ErrRerunRefused)
 		if doubted && s.rerunWindowPassed(open, now) && ctx.Err() == nil &&
 			(!transient || rerunOverdue(&open, now)) {
-			s.settleUnread(ctx, open, rerunDetail(err))
+			settled := s.settleUnread(ctx, open, rerunDetail(err))
 
-			// THE INSTALLATION'S ANSWER STILL PAUSES IT, for the other runs it reads.
+			// THE INSTALLATION'S ANSWER STILL PAUSES IT, for the other runs it reads; the
+			// run, settled, waits for nothing of its own.
+			if transient && settled {
+				return fmt.Errorf("%w: %w", errRerunSettled, err)
+			}
 			if transient {
 				return err
 			}
@@ -656,51 +672,13 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 		return nil
 	}
 
-	// THE WINDOW ON THE CLOCK AS IT IS NOW, after the reads, so no job is asked about
-	// past it however slow GitHub was. A job past it is decided alone and the others go
-	// on, as they would had it expired before the pass: it is then a failed job the
-	// request does not ask for.
-	clock := sweep.clock(now)
-	inWindow := make([]provedJob, 0, len(proved))
-	for i := range proved {
-		if clock.Sub(proved[i].candidate.ResultAt) > rerunWindow {
-			s.decideJob(ctx, proved[i].candidate, alloc.RerunExpired, attempt.Attempt)
-
-			continue
-		}
-		inWindow = append(inWindow, proved[i])
-	}
-	if len(inWindow) == 0 {
-		return nil
-	}
-	proved = inWindow
-
-	used, err := s.alloc.RunReruns(ctx, w.run.repository, w.run.run)
-	if err != nil {
+	request, proved, ok, err := s.rerunInWindow(ctx, w, attempt, proved, limits, sweep, now)
+	if err != nil || !ok {
 		return err
 	}
-	if used >= allowedFor(proved, limits) {
-		s.decideAll(ctx, proved, alloc.RerunLimit, attempt.Attempt)
 
-		return nil
-	}
-
-	request, ok := exactRequest(w.run, attempt, proved)
-	if !ok {
-		s.decideAll(ctx, proved, alloc.RerunMixed, attempt.Attempt)
-
-		return nil
-	}
-
-	// AND AGAIN AFTER THE WRITES AND READS ABOVE, the last look before the request
-	// leaves: a job that crossed the window meanwhile sends nothing this pass, and the
-	// next decides the run from where it then stands.
-	clock = sweep.clock(now)
 	leases := make([]string, 0, len(proved))
 	for i := range proved {
-		if clock.Sub(proved[i].candidate.ResultAt) > rerunWindow {
-			return nil
-		}
 		leases = append(leases, proved[i].candidate.LeaseID)
 	}
 	if err := s.alloc.BeginRerun(ctx, request, leases); err != nil {
@@ -708,6 +686,74 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 	}
 
 	return s.sendRerun(ctx, w, request, owner, repository, sweep)
+}
+
+// rerunInWindow is the request for the proved jobs still inside the window, false
+// when the jobs were decided instead.
+//
+// THE WINDOW ON THE CLOCK AS IT IS NOW, after the reads, so no job is asked about past
+// it however slow GitHub was, and looked at again right before what the jobs come to
+// is written: a job past it is decided alone, and the rest is worked out again from
+// the others, as it would be had the job expired before the pass. It is then a failed
+// job the request must not run again. Each turn round decides one job at least, so it
+// ends.
+func (s *Server) rerunInWindow(ctx context.Context, w *rerunWork, attempt RunAttempt, proved []provedJob,
+	limits map[string]int64, sweep *rerunSweep, now time.Time,
+) (alloc.RerunRequest, []provedJob, bool, error) {
+	for {
+		proved = s.expireCrossed(ctx, proved, attempt.Attempt, sweep.clock(now))
+		if len(proved) == 0 {
+			return alloc.RerunRequest{}, nil, false, nil
+		}
+
+		used, err := s.alloc.RunReruns(ctx, w.run.repository, w.run.run)
+		if err != nil {
+			return alloc.RerunRequest{}, nil, false, err
+		}
+
+		request, exact := exactRequest(w.run, attempt, proved)
+		if anyPastWindow(proved, sweep.clock(now)) {
+			continue
+		}
+
+		switch {
+		case used >= allowedFor(proved, limits):
+			s.decideAll(ctx, proved, alloc.RerunLimit, attempt.Attempt)
+		case !exact:
+			s.decideAll(ctx, proved, alloc.RerunMixed, attempt.Attempt)
+		default:
+			return request, proved, true, nil
+		}
+
+		return alloc.RerunRequest{}, nil, false, nil
+	}
+}
+
+// expireCrossed decides expired every proved job past the window at clock, and
+// returns the others.
+func (s *Server) expireCrossed(ctx context.Context, proved []provedJob, attempt int64, clock time.Time) []provedJob {
+	inWindow := make([]provedJob, 0, len(proved))
+	for i := range proved {
+		if clock.Sub(proved[i].candidate.ResultAt) > rerunWindow {
+			s.decideJob(ctx, proved[i].candidate, alloc.RerunExpired, attempt)
+
+			continue
+		}
+		inWindow = append(inWindow, proved[i])
+	}
+
+	return inWindow
+}
+
+// anyPastWindow says whether any proved job is past the window at clock.
+func anyPastWindow(proved []provedJob, clock time.Time) bool {
+	for i := range proved {
+		if clock.Sub(proved[i].candidate.ResultAt) > rerunWindow {
+			return true
+		}
+	}
+
+	return false
 }
 
 // runCandidates reads every job of a run awaiting a decision that its tier asks

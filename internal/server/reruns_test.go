@@ -1679,25 +1679,31 @@ func TestAnOverdueRequestIsSettledFromAReadWhereThereIsOne(t *testing.T) {
 			if used, err := r.a.RunReruns(t.Context(), "acme/api", 31); err != nil || used != tc.counted {
 				t.Errorf("counted %d (%v), want %d", used, err, tc.counted)
 			}
-			// A REFUSAL OR A THROTTLE STILL PAUSES THE INSTALLATION, for its other runs.
+			// A REFUSAL OR A THROTTLE STILL PAUSES THE INSTALLATION, for its other runs,
+			// and the run, settled, is not held back from a job of its that comes next.
 			paused := r.sweep.paused[installationOf(r.targets[rerunTier])]
 			if wantPaused := tc.readErr != nil; paused.After(r.now) != wantPaused {
 				t.Errorf("installation paused until %v at %v, want paused %v", paused, r.now, wantPaused)
+			}
+			if retry, held := r.sweep.retries[rerunRun{repository: "acme/api", run: 31}]; held {
+				t.Errorf("the settled run waits until %v", retry.after)
 			}
 		})
 	}
 }
 
 // A JOB THAT CROSSES THE WINDOW AFTER THE FIRST LOOK, while the run's other jobs are
-// decided, sends nothing: the last look is right before the request. Here the write
-// that expires one job carries the pass past the other's window.
+// decided, is not sent: the last look is right before the request. It is decided
+// alone, and a job still inside the window is asked for by itself. Here the write
+// that expires the oldest job carries the pass past the middle one's window.
 func TestTheLastLookAtTheWindowIsBeforeTheRequest(t *testing.T) {
 	t.Parallel()
 
 	r := newRerunStack(t)
 	r.job("old", 31, rerunWindow-time.Minute)
-	r.job("young", 31, rerunWindow-30*time.Minute)
-	r.lists(1, listed("old", 77, true), listed("young", 88, true))
+	r.job("middle", 31, rerunWindow-30*time.Minute)
+	r.job("young", 31, 10*time.Minute)
+	r.lists(1, listed("old", 77, true), listed("middle", 88, true), listed("young", 99, true))
 
 	// THE READ TOOK TWO MINUTES, which carries the old job past the window at the first
 	// look and leaves the young one inside it.
@@ -1710,14 +1716,15 @@ func TestTheLastLookAtTheWindowIsBeforeTheRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if r.github.asked() != 0 {
-		t.Error("sent past the window")
+	if len(r.github.failedAsk) != 0 || len(r.github.jobAsk) != 1 || r.github.jobAsk[0] != 99 {
+		t.Errorf("asked failed-jobs %v, jobs %v, want job 99 alone", r.github.failedAsk, r.github.jobAsk)
 	}
-	if got := r.decision("old"); got != alloc.RerunExpired {
-		t.Errorf("the job past the window = %q", got)
-	}
-	if got := r.decision("young"); got != "" {
-		t.Errorf("the job that crossed it = %q, want it left for the next pass", got)
+	for lease, want := range map[string]alloc.RerunDecision{
+		"old": alloc.RerunExpired, "middle": alloc.RerunExpired, "young": alloc.RerunRequested,
+	} {
+		if got := r.decision(lease); got != want {
+			t.Errorf("%s = %q, want %q", lease, got, want)
+		}
 	}
 }
 
