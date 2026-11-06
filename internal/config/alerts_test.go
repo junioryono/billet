@@ -108,7 +108,7 @@ func TestAlertsRefuse(t *testing.T) {
 	for _, tc := range []struct {
 		name, from, to, want string
 	}{
-		{"an unknown kind", "kind: slack", "kind: teams", `kind "teams" is not one of`},
+		{"an unknown kind", "kind: slack", "kind: teams", "kind is not one of webhook and slack"},
 		{"a destination with no address", "    url_env: BILLET_ALERT_ONCALL\n", "", "one of url_env and url_file is required"},
 		{"a destination with two", "    url_env: BILLET_ALERT_ONCALL\n", "    url_env: BILLET_ALERT_ONCALL\n    url_file: /x\n", "both set"},
 		{"an illegal variable", "url_env: BILLET_ALERT_ONCALL", "url_env: 9-lives", "not a legal environment variable name"},
@@ -163,6 +163,7 @@ func TestAnAddressInTheConfigIsNotQuotedBack(t *testing.T) {
 		"name: oncall":   "name: \"https://hooks.slack.example/services/T/B/" + secret + "\"",
 		"name: slow":     "name: \"https://hooks.slack.example/services/T/B/" + secret + "\"",
 		"notify: [hook]": "notify: [\"https://hooks.slack.example/services/T/B/" + secret + "\"]",
+		"kind: slack":    "kind: \"https://hooks.slack.example/services/T/B/" + secret + "\"",
 	} {
 		if !strings.Contains(goodAlerts, from) {
 			t.Fatalf("the good block has no %q, so this edit tests nothing", from)

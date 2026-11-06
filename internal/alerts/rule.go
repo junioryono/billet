@@ -54,6 +54,9 @@ type Job struct {
 	StartedAt  time.Time
 	ResultAt   time.Time
 	QueuedAt   time.Time
+	// FinishedAt is when a job with no result had its lease archived: it is not
+	// running, and how long it ran is GitHub's to say.
+	FinishedAt time.Time
 }
 
 // Workflow is the job's workflow file within its repository,
@@ -263,7 +266,7 @@ func judgeDuration(j *Job, over time.Duration, now time.Time) Verdict {
 		return Later
 	}
 	if j.Result == "" {
-		if now.Sub(j.StartedAt) > over {
+		if j.FinishedAt.IsZero() && now.Sub(j.StartedAt) > over {
 			return Hit
 		}
 

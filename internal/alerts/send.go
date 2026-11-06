@@ -3,6 +3,7 @@ package alerts
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -32,7 +34,8 @@ var ErrPermanent = errors.New("alerts: the destination will not accept this")
 // IT HOLDS A CREDENTIAL IN AN UNEXPORTED FIELD, so it redacts itself: fmt, encoding/json
 // and slog reach an unexported field by reflection without calling its methods, so
 // the URL's own redaction does not cover a struct holding one. On value receivers, so
-// a Sender reached as a value, or through a field, is covered too.
+// a Sender reached as a value, or through an exported field, is covered too; one held
+// in an unexported field is not, since fmt calls no method through one.
 type Sender struct {
 	name    string
 	url     URL
@@ -43,6 +46,8 @@ type Sender struct {
 
 // NewSender builds the sender for one destination's address.
 func NewSender(name string, address URL) *Sender {
+	dialer := &net.Dialer{Timeout: sendDialTimeout, KeepAlive: 30 * time.Second}
+
 	return &Sender{name: name, url: address, timeout: sendTimeout, client: &http.Client{
 		Timeout: sendTimeout,
 		// A REDIRECT IS REFUSED, NOT FOLLOWED: a notice is not for wherever a destination
@@ -50,8 +55,24 @@ func NewSender(name string, address URL) *Sender {
 		// receive it. The refusal's own error is discarded with the rest.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: sendDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+			Proxy: http.ProxyFromEnvironment,
+			// NOTHING IS READ FROM A CONNECTION BEFORE ITS REQUEST IS WRITTEN. The
+			// transport reports bytes it finds on a connection that owes it no answer
+			// through the standard logger, quoting them, and a destination that writes the
+			// moment it is reached would otherwise land there. An HTTPS connection is
+			// gated after billet's own handshake, so its first write is the request; one
+			// through a proxy is handshaken by the transport, after the gate's first write.
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := dialer.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+				}
+
+				return quietUntilWritten(conn), nil
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialTLS(ctx, dialer, network, addr)
+			},
 			TLSHandshakeTimeout:   sendTLSTimeout,
 			ResponseHeaderTimeout: sendHeaderTimeout,
 			// NO CONNECTION IS KEPT. An idle HTTP/1.1 connection that a destination
@@ -64,6 +85,71 @@ func NewSender(name string, address URL) *Sender {
 			ForceAttemptHTTP2: false,
 		},
 	}}
+}
+
+// dialTLS dials and handshakes a destination itself, verifying its certificate for
+// the name dialled, and gates the connection on its first write after the handshake.
+func dialTLS(ctx context.Context, dialer *net.Dialer, network, addr string) (net.Conn, error) {
+	raw, err := dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+	}
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		_ = raw.Close()
+
+		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+	}
+
+	handshake, cancel := context.WithTimeout(ctx, sendTLSTimeout)
+	defer cancel()
+
+	conn := tls.Client(raw, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+	if err := conn.HandshakeContext(handshake); err != nil {
+		_ = raw.Close()
+
+		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
+	}
+
+	return quietUntilWritten(conn), nil
+}
+
+// gatedConn reads nothing until it has written once, or until it is closed.
+type gatedConn struct {
+	net.Conn
+
+	wrote, closed         chan struct{}
+	wroteOnce, closedOnce sync.Once
+}
+
+func quietUntilWritten(conn net.Conn) net.Conn {
+	return &gatedConn{Conn: conn, wrote: make(chan struct{}), closed: make(chan struct{})}
+}
+
+// Read waits for the first write: a destination's bytes before the request are not
+// an answer to anything.
+func (c *gatedConn) Read(b []byte) (int, error) {
+	select {
+	case <-c.wrote:
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+
+	return c.Conn.Read(b) //nolint:wrapcheck // the connection's own error, for the transport.
+}
+
+func (c *gatedConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.wroteOnce.Do(func() { close(c.wrote) })
+
+	return n, err //nolint:wrapcheck // the connection's own error, for the transport.
+}
+
+func (c *gatedConn) Close() error {
+	c.closedOnce.Do(func() { close(c.closed) })
+
+	return c.Conn.Close() //nolint:wrapcheck // the connection's own error, for the transport.
 }
 
 // UnusableSender is a destination whose address could not be had. It stays in the

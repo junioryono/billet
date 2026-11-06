@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -66,6 +67,13 @@ func TestAFailedJobIsToldToAWebhookOnceAndNotAgainInsideTheCooldown(t *testing.T
 		}
 	}))
 
+	// A NOTICE OWED TO A DESTINATION THE CONFIG NO LONGER NAMES, from before this start.
+	if _, err := s.alloc.RecordAlertJudgement(t.Context(), &alloc.AlertJudgement{Rule: "old", LeaseID: "old",
+		Condition: "failed", Key: `["failed","acme/old",".github/workflows/x.yml","x"]`, Outcome: alloc.AlertHit,
+		InARow: 1, Notices: []alloc.AlertNotice{{Destination: "removed", Payload: []byte("{}")}}}); err != nil {
+		t.Fatal(err)
+	}
+
 	stop := s.run(t)
 	defer stop()
 
@@ -96,7 +104,11 @@ func TestAFailedJobIsToldToAWebhookOnceAndNotAgainInsideTheCooldown(t *testing.T
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(report.Streaks) == 1 && report.Streaks[0].Streak == 2 {
+		counted := false
+		for _, streak := range report.Streaks {
+			counted = counted || (streak.Rule == "red" && streak.Streak == 2)
+		}
+		if counted {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -113,8 +125,11 @@ func TestAFailedJobIsToldToAWebhookOnceAndNotAgainInsideTheCooldown(t *testing.T
 		t.Fatal(err)
 	}
 	for _, n := range report.Notices {
-		if n.Destination != "hook" || n.State != "delivered" || n.Notices != 1 {
-			t.Errorf("the outbox holds %+v, want the one delivered notice", report.Notices)
+		switch {
+		case n.Destination == "hook" && n.State == "delivered" && n.Notices == 1:
+		case n.Destination == "removed" && n.State == "failed" && n.Notices == 1:
+		default:
+			t.Errorf("the outbox holds %+v, want the one delivered notice and the removed one given up", report.Notices)
 		}
 	}
 	if got := receiver.received(); len(got) != 1 {

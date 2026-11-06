@@ -31,6 +31,9 @@ type AlertJob struct {
 	StartedAt  time.Time
 	ResultAt   time.Time
 	QueuedAt   time.Time
+	// FinishedAt is when a job with no result yet had its lease archived: it is not
+	// running, and its result is still to come.
+	FinishedAt time.Time
 	// Cursor is where an ended job stands in the order AlertJobs reads them.
 	Cursor AlertCursor
 }
@@ -84,7 +87,8 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 			out.Running = append(out.Running, AlertJob{LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node, Repository: r.Repo,
 				WorkflowRef: r.WorkflowRef, JobName: r.JobName, RunID: r.RunID, Result: r.Result, Disruption: r.Disruption,
 				Rerun: r.RerunDecision, HeadBranch: r.HeadBranch, StartedAt: parseStamp(r.StartedAt),
-				ResultAt: parseStamp(r.ResultAt), QueuedAt: parseStamp(r.GithubQueuedAt)})
+				ResultAt: parseStamp(r.ResultAt), QueuedAt: parseStamp(r.GithubQueuedAt),
+				FinishedAt: parseStamp(r.FinishedAt)})
 		}
 		for i := range ended {
 			r := &ended[i]

@@ -169,7 +169,7 @@ func readAll(t *testing.T, r *http.Request) string {
 type jobRow struct {
 	lease, result, disruption string
 	name, repo, queued        string
-	branch                    string
+	branch, tier              string
 	run                       int64
 	age                       time.Duration
 	ran                       time.Duration
@@ -191,6 +191,9 @@ func (r *alertStack) seed(job jobRow) {
 	if job.run == 0 {
 		job.run = 31
 	}
+	if job.tier == "" {
+		job.tier = alertTier
+	}
 
 	started := r.now.Add(-job.age)
 	resultAt := ""
@@ -203,7 +206,7 @@ func (r *alertStack) seed(job jobRow) {
 			(lease_id, tier, queued_at, started_at, repo, workflow_ref, job_name, github_run_id, result, result_at,
 			 github_queued_at, disruption, head_branch)
 			VALUES ($1, $2, '', $3, $4, 'acme/api/.github/workflows/deploy.yml@refs/heads/main', $5, $6, $7, $8, $9, $10, $11)`,
-			job.lease, alertTier, stamp(started), job.repo, job.name, job.run, job.result, resultAt, job.queued,
+			job.lease, job.tier, stamp(started), job.repo, job.name, job.run, job.result, resultAt, job.queued,
 			job.disruption, job.branch)
 
 		return err
@@ -452,6 +455,215 @@ func TestAJobPutOffHoldsTheLaterJobsOfItsStreak(t *testing.T) {
 
 	if got := r.owedLeases(); len(got) != 1 || got[0] != "unread:failed" {
 		t.Errorf("owed = %v, want the second failure in a row, counted before the success", got)
+	}
+}
+
+// A JOB NOTHING COULD EVER READ ABOUT IS UNKNOWN AT ONCE, and holds nothing back: its
+// tier is gone from the config, so no request for it can start a clock.
+func TestAJobNothingCanReadIsUnknownAtOnce(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.Match.Branch = "main"
+		c.Cooldown = "0s"
+	}))
+	r.record.branch = "main"
+	r.now = r.now.Add(5 * time.Minute)
+
+	r.seed(jobRow{lease: "orphan", result: "failed", ran: time.Second, age: 2 * time.Minute, tier: "removed-tier"})
+	r.seed(jobRow{lease: "later", result: "failed", ran: time.Second, age: time.Minute})
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+
+	if got := r.marked(); got != 2 {
+		t.Errorf("%d marks, want the orphan judged unknown and the later job judged", got)
+	}
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "later:failed" {
+		t.Errorf("owed = %v, want the later job, held back by nothing", got)
+	}
+}
+
+// A RUNNING JOB HOLDS NOTHING BACK: one still running cannot be out of order, and one
+// on a branch the ledger shows the rule does not name is not its job at all. Neither
+// keeps another's disruption from being told at once.
+func TestARunningJobHoldsBackNoDisruption(t *testing.T) {
+	t.Parallel()
+
+	for name, earlier := range map[string]jobRow{
+		"still running, undisrupted": {lease: "earlier", age: 20 * time.Second, branch: "main"},
+		"on another branch":          {lease: "earlier", age: 20 * time.Second, branch: "feature"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := started(t, atRule(func(c *config.AlertRule) {
+				c.On = config.AlertConditions{Disrupted: true}
+				c.Match.Branch = "main"
+			}))
+			r.seed(earlier)
+			r.seed(jobRow{lease: "disrupted", disruption: "guest-absent", age: 10 * time.Second, branch: "main"})
+			r.pass()
+
+			if got := r.owedLeases(); len(got) != 1 || got[0] != "disrupted:disrupted" {
+				t.Errorf("owed = %v, want the disruption told at once", got)
+			}
+		})
+	}
+}
+
+// A LEASE A DISRUPTION ARCHIVED BEFORE GITHUB SPOKE is told at once, and is not taken
+// for a job still running long.
+func TestAnArchivedDisruptionIsToldAtOnce(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{Disrupted: true, RunningLongerThan: "1m"}
+	}))
+	r.seed(jobRow{lease: "gone", disruption: "guest-absent", age: 30 * time.Second})
+	if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET finished_at = $1 WHERE lease_id = 'gone'`, stamp(r.now))
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.now = r.now.Add(time.Hour)
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "gone:disrupted" {
+		t.Errorf("owed = %v, want the disruption alone", got)
+	}
+}
+
+// A JOB ON A BRANCH THE LEDGER SHOWS THE RULE DOES NOT NAME is not its job, and holds
+// nothing back even while it cannot be judged: a wait with no queue time yet on
+// another branch does not keep a wait on the rule's own branch waiting with it.
+func TestAJobOnAnotherBranchHoldsNothingBack(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{WaitedLongerThan: "10m"}
+		c.Match.Branch = "main"
+	}))
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "feature", result: "succeeded", ran: time.Second, age: 2 * time.Minute, branch: "feature"})
+	r.seed(jobRow{lease: "main", result: "succeeded", ran: time.Second, age: time.Minute, branch: "main",
+		queued: stamp(r.now.Add(-time.Hour))})
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "main:waited-long" {
+		t.Errorf("owed = %v, want the wait on main told now", got)
+	}
+}
+
+// AN HOUR AFTER GITHUB WAS FIRST ASKED IT IS UNKNOWN, whatever the budget does after:
+// an installation sitting at its reserve does not hold a job, or its streak, for ever.
+func TestTheHourRunsOutAfterAnAskWhateverTheBudget(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.Match.Branch = "main" }))
+	r.record.err = errors.New("connection reset")
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "asked", result: "failed", ran: time.Second, age: time.Second})
+	r.now = r.now.Add(5 * time.Minute)
+	r.pass()
+	if got := r.record.readCount(); got != 1 {
+		t.Fatalf("%d reads, want the one ask", got)
+	}
+
+	r.record.remaining, r.record.limit = 100, 5000
+	r.now = r.now.Add(alertReadWindow + time.Minute)
+	r.pass()
+
+	if got := r.marked(); got != 1 {
+		t.Errorf("%d marks, want the job judged unknown an hour after it was asked", got)
+	}
+}
+
+// A JOB NEVER ASKED ABOUT IS JUDGED UNKNOWN BEFORE IT LEAVES THE READ, and logged, so
+// an installation that never has a read to spare cannot let it age out unseen.
+func TestAJobNeverAskedIsUnknownBeforeItLeavesTheRead(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.Match.Branch = "main" }))
+	r.record.remaining, r.record.limit = 100, 5000
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "starved", result: "failed", ran: time.Second, age: time.Second})
+
+	r.now = r.now.Add(time.Hour)
+	r.pass()
+	if got := r.marked(); got != 0 {
+		t.Fatalf("%d marks an hour in, want it still waiting for a read", got)
+	}
+
+	r.now = r.now.Add(alertEndedWindow - alertReadWindow)
+	r.pass()
+	if got := r.marked(); got != 1 || r.record.readCount() != 0 {
+		t.Errorf("%d marks and %d reads near the end of the read, want it judged unknown unread", got,
+			r.record.readCount())
+	}
+}
+
+// A WAIT GITHUB NEVER GAVE A QUEUE TIME FOR IS RECORDED AS UNKNOWN once none can be
+// expected, so a queue time that arrives later cannot judge it, out of order.
+func TestAWaitNeverKnownIsRecordedUnknown(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.On = config.AlertConditions{WaitedLongerThan: "10m"} }))
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "unwaited", result: "succeeded", ran: time.Second, age: time.Second})
+
+	r.now = r.now.Add(alertReadWindow + time.Minute)
+	r.pass()
+	if got := r.marked(); got != 1 {
+		t.Errorf("%d marks, want the unknown wait recorded", got)
+	}
+}
+
+// A RUNNING JOB WAITS FOR A PASS THAT READ EVERY ENDED JOB: one not yet read could come
+// before it and break the streak it would add to.
+func TestARunningJobWaitsForTheEndedJobsToBeRead(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.On = config.AlertConditions{RunningLongerThan: "1m"} }))
+	r.sweep.rows = 1
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "ended-a", result: "succeeded", ran: time.Second, age: 4 * time.Minute, name: "a"})
+	r.seed(jobRow{lease: "ended-b", result: "succeeded", ran: time.Second, age: 3 * time.Minute, name: "b"})
+	r.seed(jobRow{lease: "running", age: 2 * time.Minute})
+	r.now = r.now.Add(5 * time.Minute)
+
+	r.pass()
+	if got := r.owedLeases(); len(got) != 0 {
+		t.Fatalf("owed %v with an ended page still full", got)
+	}
+
+	for range 3 {
+		r.pass()
+	}
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "running:running-long" {
+		t.Errorf("owed = %v, want the running job once the ended jobs were read", got)
+	}
+}
+
+// THE CURSOR PASSES ONLY A RESULT OLD ENOUGH that no earlier one can still land: a
+// result stamped before another's but committed after it is still read.
+func TestTheCursorWaitsForResultsStillLanding(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.Cooldown = "0s" }))
+	r.now = r.now.Add(5 * time.Minute)
+
+	r.seed(jobRow{lease: "newer", result: "failed", ran: 0, age: 30 * time.Second, name: "newer"})
+	r.pass()
+
+	r.seed(jobRow{lease: "older", result: "failed", ran: 0, age: 40 * time.Second, name: "older"})
+	r.pass()
+
+	if got := r.marked(); got != 2 {
+		t.Errorf("%d marks, want the result that landed late judged too", got)
 	}
 }
 
@@ -705,6 +917,24 @@ func TestAlertReadsLeaveTheReserveAndTakeTheirShare(t *testing.T) {
 	r.pass()
 	if got := r.record.readCount(); got != alertRunsPerInstallation {
 		t.Errorf("%d reads in one pass, want the share's %d", got, alertRunsPerInstallation)
+	}
+
+	// A READ IS ADMITTED BY WHAT IT CAN COST: a thousand and five left of five thousand
+	// leaves a one-page read above the reserve and an eight-page one below it.
+	pages := started(t, stepRule)
+	pages.record.remaining, pages.record.limit = 1005, 5000
+	pages.seed(jobRow{lease: "steps", result: "failed", ran: time.Second, age: time.Second})
+	pages.pass()
+	if got := pages.record.readCount(); got != 0 {
+		t.Errorf("an eight-page read was made %d times into the reserve", got)
+	}
+
+	branch := started(t, atRule(func(c *config.AlertRule) { c.Match.Branch = "main" }))
+	branch.record.remaining, branch.record.limit, branch.record.branch = 1005, 5000, "main"
+	branch.seed(jobRow{lease: "branch", result: "failed", ran: time.Second, age: time.Second})
+	branch.pass()
+	if got := branch.record.readCount(); got != 1 {
+		t.Errorf("a one-page read above the reserve was made %d times, want 1", got)
 	}
 
 	same := started(t, stepRule)

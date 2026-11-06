@@ -483,9 +483,9 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, w
        CAST(CASE WHEN github_run_id > 0 THEN github_run_id ELSE COALESCE(run_id, 0) END
             AS BIGINT) AS run_id,
        result, result_at, COALESCE(started_at, '') AS started_at, github_queued_at, disruption, rerun_decision,
-       head_branch
+       head_branch, COALESCE(finished_at, '') AS finished_at
   FROM job_history
- WHERE result = '' AND started_at IS NOT NULL AND started_at >= $1 AND COALESCE(finished_at, '') = ''
+ WHERE result = '' AND started_at IS NOT NULL AND started_at >= $1
  ORDER BY started_at, lease_id
  LIMIT CAST($2 AS BIGINT)
 `
@@ -510,14 +510,17 @@ type ListRunningJobsForAlertsRow struct {
 	Disruption     string
 	RerunDecision  string
 	HeadBranch     string
+	FinishedAt     string
 }
 
 // Alerts (#537): which jobs `server.alerts` looks at, what it has decided, and what
 // it owes a destination. Migration 74 holds why each table is shaped as it is.
-// The jobs running now that started since a moment, oldest first and bounded, with
-// what a rule is judged against. The run is the one that started, as
-// ListJobsAwaitingQueueTime reads it. A lease that finished without a result is not
-// running, whatever its result says. They are as many as the fleet's runners.
+// The jobs with no result yet that started since a moment, oldest first and bounded,
+// with what a rule is judged against. The run is the one that started, as
+// ListJobsAwaitingQueueTime reads it. finished_at says the lease is archived though
+// GitHub has said nothing: a lease a disruption archived is here, so the disruption
+// is told at once, and its finish says it is not running. They are as many as the
+// fleet's runners and the leases waiting for GitHub's word.
 func (q *Queries) ListRunningJobsForAlerts(ctx context.Context, arg ListRunningJobsForAlertsParams) ([]ListRunningJobsForAlertsRow, error) {
 	rows, err := q.db.QueryContext(ctx, listRunningJobsForAlerts, arg.Since, arg.MaxRows)
 	if err != nil {
@@ -542,6 +545,7 @@ func (q *Queries) ListRunningJobsForAlerts(ctx context.Context, arg ListRunningJ
 			&i.Disruption,
 			&i.RerunDecision,
 			&i.HeadBranch,
+			&i.FinishedAt,
 		); err != nil {
 			return nil, err
 		}

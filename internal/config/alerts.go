@@ -200,7 +200,8 @@ func (d *AlertDestination) errors(where string) []error {
 	switch d.Kind {
 	case AlertWebhook, AlertSlack:
 	default:
-		errs = append(errs, fmt.Errorf("%s: kind %q is not one of [webhook slack]", where, d.Kind))
+		// NOT QUOTED, as no slot of a destination is: what fills it may be the address.
+		errs = append(errs, fmt.Errorf("%s: kind is not one of webhook and slack", where))
 	}
 
 	switch {

@@ -328,6 +328,144 @@ func TestWhatADestinationWritesAfterItsAnswerReachesNoLog(t *testing.T) {
 	assertNoSecret(t, "the standard logger", logged.String(), address)
 }
 
+// A GATED CONNECTION READS NOTHING UNTIL IT HAS WRITTEN, and a close ends a read that
+// waits; the sender dials through one. What the transport would log is decided by a
+// race a test cannot hold, so the gate is proved here and its use below.
+func TestAConnectionReadsNothingBeforeItsRequest(t *testing.T) {
+	t.Parallel()
+
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	gated := quietUntilWritten(client)
+
+	go func() {
+		if _, err := server.Write([]byte("unasked")); err != nil {
+			return
+		}
+	}()
+
+	read := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 16)
+		n, err := gated.Read(buf)
+		if err != nil {
+			read <- "error: " + err.Error()
+
+			return
+		}
+		read <- string(buf[:n])
+	}()
+
+	select {
+	case got := <-read:
+		t.Fatalf("read %q before anything was written", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	go func() {
+		if _, err := server.Read(make([]byte, 16)); err != nil {
+			return
+		}
+	}()
+	if _, err := gated.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-read:
+		if got != "unasked" {
+			t.Errorf("read %q after the write", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read did not follow the write")
+	}
+
+	waiting, _ := net.Pipe()
+	closing := quietUntilWritten(waiting)
+	ended := make(chan error, 1)
+	go func() {
+		_, err := closing.Read(make([]byte, 1))
+		ended <- err
+	}()
+	if err := closing.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-ended:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Errorf("a waiting read after a close = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a close did not end a waiting read")
+	}
+
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		if conn, err := listener.Accept(); err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	transport, ok := NewSender("oncall", URL("https://hooks.example"+secretPath)).client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("the sender's transport is not an *http.Transport")
+	}
+	conn, err := transport.DialContext(t.Context(), "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, gatedDial := conn.(*gatedConn); !gatedDial {
+		t.Errorf("the sender dials a %T, not a gated connection", conn)
+	}
+}
+
+// NOTHING A DESTINATION WRITES BEFORE ITS REQUEST IS READ, so none of it reaches the
+// standard logger the transport reports such bytes through. Not parallel: it watches
+// the standard logger.
+func TestWhatADestinationWritesFirstReachesNoLog(t *testing.T) {
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	address := URL("http://" + listener.Addr().String() + secretPath)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				// FIRST, UNASKED: the address, back, before any request.
+				if _, err := io.WriteString(conn, "HTTP/1.1 200 OK\r\n\r\n"+secretPath); err != nil {
+					return
+				}
+				time.Sleep(500 * time.Millisecond)
+			}()
+		}
+	}()
+
+	var logged bytes.Buffer
+	saved := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(saved) })
+
+	// WHAT THE SEND COMES TO IS NOT THE QUESTION; what reaches the log is.
+	if err := NewSender("oncall", address).Send(t.Context(), []byte(`{}`)); err != nil {
+		assertNoSecret(t, "the error", err.Error(), address)
+	}
+	time.Sleep(time.Second)
+
+	assertNoSecret(t, "the standard logger", logged.String(), address)
+}
+
 // A DESTINATION WHOSE ADDRESS COULD NOT BE HAD SAYS SO ON EVERY NOTICE, and is never
 // tried again: a missing secret does not stop a control plane, and is not silent.
 func TestAnUnusableDestinationSaysWhyItTookNothing(t *testing.T) {

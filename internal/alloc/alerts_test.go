@@ -472,8 +472,8 @@ func TestPruningKeepsWhatIsStillOwed(t *testing.T) {
 
 // THE TWO READS ARE EACH THEIR OWN: the running by when they started, the ended by when
 // their result came and after a cursor, both oldest first and bounded, and neither
-// lists a job that never started, a lease that finished without a result, or an
-// ended job that started before the running window.
+// lists a job that never started or an ended job that started before the running
+// window. A lease archived with no result is in the running read, saying so.
 func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 	t.Parallel()
 
@@ -532,8 +532,12 @@ func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 
 		return out
 	}
-	if r := leases(got.Running); len(r) != 2 || r[0] != "running-older" || r[1] != "running" {
-		t.Errorf("running = %v, want the two, oldest first", r)
+	if r := leases(got.Running); len(r) != 3 || r[0] != "running-older" || r[1] != "finished-without-a-result" ||
+		r[2] != "running" {
+		t.Errorf("running = %v, want the three, oldest first", r)
+	}
+	if archived := got.Running[1]; !archived.FinishedAt.Equal(now.Add(-time.Hour)) || !got.Running[2].FinishedAt.IsZero() {
+		t.Errorf("finished = %s and %s, want only the archived one's", archived.FinishedAt, got.Running[2].FinishedAt)
 	}
 	if e := leases(got.Ended); len(e) != 2 || e[0] != "ended-older" || e[1] != "ended" {
 		t.Fatalf("ended = %v, want the two, oldest first", e)
@@ -549,7 +553,7 @@ func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 	if !ended.QueuedAt.IsZero() {
 		t.Errorf("a queue time nobody recorded = %s", ended.QueuedAt)
 	}
-	if running := got.Running[1]; running.Result != "" || !running.ResultAt.IsZero() || running.HeadBranch != "main" {
+	if running := got.Running[2]; running.Result != "" || !running.ResultAt.IsZero() || running.HeadBranch != "main" {
 		t.Errorf("the running job = %+v", running)
 	}
 
@@ -569,6 +573,18 @@ func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 	}
 	if e := leases(next.Ended); len(e) != 1 || e[0] != "ended" {
 		t.Errorf("after the cursor = %v, want the next one", e)
+	}
+
+	// TWO RESULTS STAMPED THE SAME INSTANT are told apart by lease, so a cursor on the
+	// first reads the second and not the first again.
+	insert("tie-a", hour(-2), "failed", hour(-1), "")
+	insert("tie-b", hour(-2), "failed", hour(-1), "")
+	tied, err := a.AlertJobs(t.Context(), runningSince, endedSince, AlertCursor{ResultAt: hour(-1), LeaseID: "tie-a"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := leases(tied.Ended); len(e) != 1 || e[0] != "tie-b" {
+		t.Errorf("after a cursor on tie-a = %v, want tie-b alone", e)
 	}
 }
 

@@ -48,6 +48,8 @@ func TestEachConditionJudgesAJob(t *testing.T) {
 		{"ended under it", RanLong, Job{StartedAt: started, Result: "succeeded", ResultAt: started.Add(time.Minute)}, Miss},
 		{"ended exactly at it", RanLong, Job{StartedAt: started, Result: "succeeded", ResultAt: started.Add(time.Hour)}, Miss},
 		{"never started", RanLong, Job{}, Later},
+		{"archived past it, with no result", RanLong, Job{StartedAt: started, FinishedAt: started.Add(time.Minute)}, Later},
+		{"archived and disrupted, with no result", Disrupted, Job{Disruption: "guest-absent", FinishedAt: started}, Hit},
 
 		{"waited past it", WaitedLong, Job{StartedAt: started, QueuedAt: queued(time.Hour)}, Hit},
 		{"waited under it", WaitedLong, Job{StartedAt: started, QueuedAt: queued(time.Minute)}, Miss},
