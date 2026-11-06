@@ -159,7 +159,16 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 			base, got, wantFingerprint)
 	}
 
-	return []byte(body.CAPEM), body.Deployment, nil
+	// ONLY THE CERTIFICATE THE FINGERPRINT NAMES: the rest of the bundle came on a
+	// connection nothing has authenticated, and a root appended to it would be trusted
+	// for the enrollment, which carries the join token, the request and a pool host's
+	// signed identity (Codex, 2026-11-06).
+	pinned, err := pinnedAuthority([]byte(body.CAPEM), wantFingerprint)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return pinned, body.Deployment, nil
 }
 
 // ConfirmAuthority asks the control plane at base for its authority again,

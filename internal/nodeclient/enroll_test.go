@@ -1,13 +1,16 @@
 package nodeclient
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -81,5 +84,32 @@ func TestOnlyAPoolHostsEnrollmentCarriesAnIdentity(t *testing.T) {
 	}
 	if bodies[1]["identity_document"] != `{"instanceId":"i-1"}` || bodies[1]["identity_signature"] != "c2ln" {
 		t.Errorf("a pool host's enrollment carried %v", bodies[1])
+	}
+}
+
+// FETCHCA RETURNS ONLY THE CERTIFICATE THE FINGERPRINT NAMES: a root appended to the
+// bundle on the unverified connection is never trusted for the enrollment after it.
+func TestFetchCAReturnsOnlyThePinnedAuthority(t *testing.T) {
+	t.Parallel()
+	ca, err := wirecert.LoadOrCreateCA(filepath.Join(t.TempDir(), "ca"), "0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := wirecert.LoadOrCreateCA(filepath.Join(t.TempDir(), "ca"), "fedcba9876543210fedcba9876543210")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(nodeapi.CAResponse{
+			CAPEM: string(ca.CertPEM()) + string(other.CertPEM()), Deployment: "0123456789abcdef0123456789abcdef",
+		})
+	}))
+	t.Cleanup(srv.Close)
+	got, _, err := FetchCA(t.Context(), srv.URL, ca.Fingerprint())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if !bytes.Equal(got, ca.CertPEM()) {
+		t.Fatalf("FetchCA returned %d bytes, want only the pinned certificate's %d", len(got), len(ca.CertPEM()))
 	}
 }

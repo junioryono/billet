@@ -132,6 +132,12 @@ func TestAPoolNeedsAnEnrollmentListenerItsHostsCanDial(t *testing.T) {
 	for name, c := range map[string]struct{ from, to, want string }{
 		"no enrollment listener": {"  bootstrap_listen: 10.77.0.10:7718\n", "", "needs server.bootstrap_listen"},
 		"a wildcard listener":    {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: 0.0.0.0:7718", "bootstrap_addr is required"},
+		"a loopback listener":    {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: 127.0.0.1:7718", "bootstrap_addr is required"},
+		"an ipv6 loopback":       {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: '[::1]:7718'", "bootstrap_addr is required"},
+		"localhost":              {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: localhost:7718", "bootstrap_addr is required"},
+		"a loopback override":    {"    boot_prelude:", "    bootstrap_addr: 127.0.0.1:7718\n    boot_prelude:", "no wildcard and no loopback"},
+		"a wildcard override":    {"    boot_prelude:", "    bootstrap_addr: '[::]:7718'\n    boot_prelude:", "no wildcard and no loopback"},
+		"a loopback join server": {"join_server: 10.77.0.10:7717", "join_server: localhost:7717", "join_server"},
 	} {
 		raw := poolConfig(poolBlock)
 		if !strings.Contains(raw, c.from) {

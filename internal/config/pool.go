@@ -142,11 +142,23 @@ func (s *ServerConfig) PoolEnrollAddr() string {
 		return strings.TrimSpace(s.TLSRouter.EnrollAddr)
 	}
 	addr := strings.TrimSpace(s.BootstrapListen)
-	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" && !net.ParseIP(host).IsUnspecified() {
+	if host, _, err := net.SplitHostPort(addr); err == nil && dialableFromElsewhere(host) {
 		return addr
 	}
 
 	return ""
+}
+
+// dialableFromElsewhere is whether host names this machine to another one: not empty,
+// not a wildcard, and not loopback, which a rented host would dial as itself.
+func dialableFromElsewhere(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if h == "" || h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return false
+	}
+	ip := net.ParseIP(h)
+
+	return ip == nil || !(ip.IsLoopback() || ip.IsUnspecified())
 }
 
 // validatePool checks server.pool.
@@ -157,14 +169,14 @@ func (s *ServerConfig) validatePool() []error {
 	}
 	var errs []error
 
-	if host, port, err := net.SplitHostPort(p.JoinServer); err != nil || host == "" || port == "" ||
-		host == "0.0.0.0" || host == "::" {
+	if host, port, err := net.SplitHostPort(p.JoinServer); err != nil || port == "" || !dialableFromElsewhere(host) {
 		errs = append(errs, fmt.Errorf("server.pool.join_server %q must be the host:port an ordered host dials "+
-			"to reach the node wire", p.JoinServer))
+			"to reach the node wire: no wildcard and no loopback, which the host would dial as itself", p.JoinServer))
 	}
 	if p.BootstrapAddr != "" {
-		if host, port, err := net.SplitHostPort(p.BootstrapAddr); err != nil || host == "" || port == "" {
-			errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr %q must be host:port", p.BootstrapAddr))
+		if host, port, err := net.SplitHostPort(p.BootstrapAddr); err != nil || port == "" || !dialableFromElsewhere(host) {
+			errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr %q must be the host:port an ordered host "+
+				"dials: no wildcard and no loopback", p.BootstrapAddr))
 		}
 	}
 	// AN ORDERED HOST JOINS OVER THE NETWORK OR NOT AT ALL: the node wire wants a
@@ -176,7 +188,7 @@ func (s *ServerConfig) validatePool() []error {
 			"plane enrolls nothing over the network, so no host the pool orders could ever join"))
 	case s.PoolEnrollAddr() == "":
 		errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr is required: server.bootstrap_listen %q "+
-			"names no host an ordered host can dial", s.BootstrapListen))
+			"names no host an ordered host can dial (a wildcard or loopback)", s.BootstrapListen))
 	}
 	if p.BootPrelude == "" || !filepath.IsAbs(p.BootPrelude) {
 		errs = append(errs, fmt.Errorf("server.pool.boot_prelude %q must be an absolute path to the script a "+

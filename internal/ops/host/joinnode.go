@@ -122,8 +122,8 @@ func joinNode(ctx context.Context, env cli.Env, args []string) (err error) {
 
 		// THE ANSWER TOO, which the caller prints past the guard.
 		defer func() {
-			_ = stdout.Flush() //nolint:errcheck // the join's own answer is what this returns
-			_ = stderr.Flush() //nolint:errcheck // the join's own answer is what this returns
+			_ = stdout.Flush()
+			_ = stderr.Flush()
 			err = joinconsole.GuardError(err)
 		}()
 	}

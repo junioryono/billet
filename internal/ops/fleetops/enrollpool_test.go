@@ -104,6 +104,9 @@ type joinRecorder struct {
 	// deployment the authority's answer names.
 	servedBy   *wirecert.CA
 	deployment string
+	// appendServer appends servedBy's certificate to the authority the recorder answers,
+	// as a responder on the unverified connection may.
+	appendServer bool
 }
 
 // The faults a joinRecorder answers with: the connection ended before any answer, an
@@ -133,8 +136,8 @@ func fault(w http.ResponseWriter, name string) bool {
 			panic(http.ErrAbortHandler)
 		}
 		_, _ = buf.WriteString("HTTP/1.1 404 " + secretReason + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") //nolint:errcheck // the host sees what arrived
-		_ = buf.Flush()                                                                                               //nolint:errcheck // the host sees what arrived
-		_ = conn.Close()                                                                                              //nolint:errcheck // the answer is written
+		_ = buf.Flush()
+		_ = conn.Close()
 
 		return true
 	case faultBody:
@@ -194,7 +197,11 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if deployment == "" {
 			deployment = "0123456789abcdef0123456789abcdef"
 		}
-		answer(w, nodeapi.CAResponse{CAPEM: string(j.ca.CertPEM()), Fingerprint: j.ca.Fingerprint(),
+		authority := string(j.ca.CertPEM())
+		if j.appendServer {
+			authority += string(j.servedBy.CertPEM())
+		}
+		answer(w, nodeapi.CAResponse{CAPEM: authority, Fingerprint: j.ca.Fingerprint(),
 			Deployment: deployment})
 	case "/v1/enroll":
 		var req nodeapi.EnrollRequest
@@ -337,6 +344,13 @@ func TestAnAnswerEndsAPoolHostsJoin(t *testing.T) { //nolint:paralleltest // sha
 				t.Fatal(err)
 			}
 			j.servedBy = other
+		}, caAsks: 1},
+		"a root appended to the authority": {set: func(j *joinRecorder) {
+			other, err := wirecert.LoadOrCreateCA(filepath.Join(t.TempDir(), "ca"), "fedcba9876543210fedcba9876543210")
+			if err != nil {
+				t.Fatal(err)
+			}
+			j.servedBy, j.appendServer = other, true
 		}, caAsks: 1},
 	} {
 		rec, srv, cfg, ca, _ := servePoolJoin(t, c.set)

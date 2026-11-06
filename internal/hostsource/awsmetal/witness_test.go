@@ -137,7 +137,7 @@ func TestAPositiveAnswerForSomethingElseContradicts(t *testing.T) {
 		"a document of another account": {doc: map[string]string{"accountId": "444455556666"}, reason: "another account"},
 		"a document of another address": {doc: map[string]string{"privateIp": "10.0.0.9"}, reason: "address 10.0.0.9"},
 		"a console naming another key": {host: func(f *fakeHosts) {
-			f.console = joinconsole.Line("pa", fp("imposter"))
+			f.console = "\n" + joinconsole.Line("pa", fp("imposter")) + "\n"
 		}, reason: "names " + fp("imposter")},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -184,7 +184,7 @@ func TestWhatTheSourceCannotReadIsCouldNotTell(t *testing.T) {
 		"a failed console read":   {host: func(f *fakeHosts) { f.consoleErr = errors.New("throttled") }},
 		"a console not named yet": {host: func(f *fakeHosts) { f.console = "[  1.0] booting\n" }},
 		"a console naming two keys": {host: func(f *fakeHosts) {
-			f.console = joinconsole.Line("pa", fp("key")) + "\n" + joinconsole.Line("pa", fp("second"))
+			f.console = "\n" + joinconsole.Line("pa", fp("key")) + "\n" + joinconsole.Line("pa", fp("second")) + "\n"
 		}},
 		"a console cut short": {host: func(f *fakeHosts) {
 			line := joinconsole.Line("pa", fp("key"))

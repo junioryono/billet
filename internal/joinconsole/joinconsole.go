@@ -23,26 +23,35 @@ func Line(order, fingerprint string) string {
 	return prefix + "order=" + order + " fingerprint=" + fingerprint
 }
 
-// wholeLine is one whole line, from a newline (or the console's start) to the next
-// (or its end), a carriage return before it allowed: a fingerprint is SHA-256 in
-// unpadded base64 (43 characters, wirecert.Fingerprint). A line the console cut short,
-// or that another write ran into, matches nothing, so it is never read as a key.
+// wholeLine is one whole line, a carriage return before its newline allowed: a
+// fingerprint is SHA-256 in unpadded base64 (43 characters, wirecert.Fingerprint). A
+// line the console cut short, or that another write ran into, matches nothing, so it
+// is never read as a key.
 //
 // ONLY A LINE THAT IS NOTHING ELSE: text quoted inside another line (an error a
 // network answer wrote, a status) is boot output on the same console, and read wherever
 // it sat it would name a key the host never wrote. A carriage return does not start a
 // line, for the same reason.
 var wholeLine = regexp.MustCompile(
-	`(?m)^billet-pool-join order=([a-z0-9][a-z0-9-]*) fingerprint=(SHA256:[A-Za-z0-9+/]{43})\r?$`)
+	`^billet-pool-join order=([a-z0-9][a-z0-9-]*) fingerprint=(SHA256:[A-Za-z0-9+/]{43})\r?$`)
 
 // Fingerprints is every distinct fingerprint a console names for order, in the order
 // first written. A console carries a boot's whole output, terminal escapes and carriage
 // returns included, and is read as text: only a whole line is read.
+//
+// A LINE IS WHAT TWO NEWLINES BOUND, never the edge of what was read: a console is read
+// as its newest bytes, which can begin part way through a line or end before its
+// newline, and either edge would make a fragment of another line read as a whole one.
 func Fingerprints(console, order string) []string {
+	first, last := strings.IndexByte(console, '\n'), strings.LastIndexByte(console, '\n')
+	if first < 0 || first == last {
+		return nil
+	}
 	var out []string
 	seen := map[string]bool{}
-	for _, m := range wholeLine.FindAllStringSubmatch(console, -1) {
-		if m[1] != order {
+	for _, line := range strings.Split(console[first+1:last], "\n") {
+		m := wholeLine.FindStringSubmatch(line)
+		if m == nil || m[1] != order {
 			continue
 		}
 		fp := strings.TrimSpace(m[2])

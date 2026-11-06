@@ -21,7 +21,7 @@ func TestAPoolConsoleLineIsReadBackForItsOrderOnly(t *testing.T) {
 		Line("p1", a) + "\r\n" +
 		Line("p12", c) + "\n" +
 		Line("p1", a) + "\r\n" +
-		Line("p1", b)
+		Line("p1", b) + "\n"
 	if got := Fingerprints(console, "p1"); !slices.Equal(got, []string{a, b}) {
 		t.Fatalf("p1 read %v", got)
 	}
@@ -53,8 +53,8 @@ func TestAPoolConsoleLineCutShortIsNoKey(t *testing.T) {
 			t.Errorf("%s: read %v, want nothing", name, got)
 		}
 	}
-	if got := Fingerprints(whole, "p1"); !slices.Equal(got, []string{fp("k")}) {
-		t.Fatalf("the whole line at the console's end read %v", got)
+	if got := Fingerprints("\n"+whole+"\n", "p1"); !slices.Equal(got, []string{fp("k")}) {
+		t.Fatalf("a whole line read %v", got)
 	}
 }
 
@@ -129,5 +129,23 @@ func TestAGuardWritesALongLineAsItGoes(t *testing.T) {
 	}
 	if console.Len() != maxGuardedLine+2 || !strings.HasSuffix(console.String(), "y\n") {
 		t.Fatalf("after a line longer than a console holds, %d bytes were written", console.Len())
+	}
+}
+
+// THE EDGES OF WHAT WAS READ ARE NO LINE'S BOUNDS: a console read as its newest bytes
+// can begin part way through a line, or end before a line's newline, and the part at
+// either edge is a fragment, whatever it spells.
+func TestTheEdgesOfAConsoleAreNoLine(t *testing.T) {
+	t.Parallel()
+	forged := Line("p1", fp("forged"))
+	for name, console := range map[string]string{
+		"a window beginning at a quoted line": forged + "\nlater output\n",
+		"a line its newline has not reached":  "earlier output\n" + forged,
+		"nothing but the line":                forged,
+		"one newline after it":                forged + "\n",
+	} {
+		if got := Fingerprints(console, "p1"); len(got) != 0 {
+			t.Errorf("%s: read %v, want nothing", name, got)
+		}
 	}
 }
