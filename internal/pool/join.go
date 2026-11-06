@@ -35,11 +35,12 @@ type Joins struct {
 	every   time.Duration
 
 	mu sync.Mutex
-	// last is each claim's verdict and when it was asked; asked is when each order's
-	// source was last asked, and asking the orders being asked now.
-	last   map[judgedKey]judged
-	asked  map[string]time.Time
-	asking map[string]bool
+	// last is each claim's verdict and when it was asked, and asked when each order's
+	// source was last asked. An order is marked asked as its ask starts, so a second
+	// request while it is being asked is could-not-tell like any other in the interval:
+	// an ask, bounded by JudgeTimeout, ends well inside it.
+	last  map[judgedKey]judged
+	asked map[string]time.Time
 }
 
 // judgedKey is one claim on one order as the order stood: a hold or its release moves
@@ -62,7 +63,7 @@ func NewJoins(ledger JoinLedger, sources map[string]hostsource.Source, now func(
 
 	return &Joins{
 		ledger: ledger, sources: sources, now: now, every: DefaultJudgeEvery,
-		last: map[judgedKey]judged{}, asked: map[string]time.Time{}, asking: map[string]bool{},
+		last: map[judgedKey]judged{}, asked: map[string]time.Time{},
 	}
 }
 
@@ -105,13 +106,13 @@ func (j *Joins) JudgePoolJoin(ctx context.Context, claim hostsource.Claim) hosts
 
 		return v.testimony
 	}
-	if _, recently := j.asked[claim.Order]; recently || j.asking[claim.Order] {
+	if _, recently := j.asked[claim.Order]; recently {
 		j.mu.Unlock()
 
 		return hostsource.Testimony{Verdict: hostsource.VerdictUnknown,
 			Reason: "the order's source was asked about it moments ago; it is asked again shortly"}
 	}
-	j.asking[claim.Order], j.asked[claim.Order] = true, now
+	j.asked[claim.Order] = now
 	j.mu.Unlock()
 
 	askCtx, cancel := context.WithTimeout(ctx, JudgeTimeout)
@@ -119,7 +120,6 @@ func (j *Joins) JudgePoolJoin(ctx context.Context, claim hostsource.Claim) hosts
 	cancel()
 
 	j.mu.Lock()
-	delete(j.asking, claim.Order)
 	j.last[key] = judged{at: now, testimony: t}
 	j.mu.Unlock()
 

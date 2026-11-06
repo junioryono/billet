@@ -366,6 +366,16 @@ func TestASpentTokenAsksOnlyForTheRequestItRecorded(t *testing.T) {
 	if len(rig.claims) != 1 {
 		t.Fatalf("the source was asked %d times, want once", len(rig.claims))
 	}
+
+	// THE SAME KEY RECORDED UNDER NO ORDER is not the order's request, so the spent
+	// token asks nothing for it either.
+	rig.known.PoolOrder = ""
+	if status, _, _ := askToJoin(t, srv, req); status != http.StatusUnauthorized {
+		t.Fatalf("a spent token for a request recorded under no order answered %d", status)
+	}
+	if len(rig.claims) != 1 {
+		t.Fatalf("the source was asked %d times, want once", len(rig.claims))
+	}
 }
 
 // WHAT THE SOURCE CANNOT TELL IS RECORDED PENDING under the ordinary path, for a person

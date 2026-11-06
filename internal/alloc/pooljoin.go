@@ -126,8 +126,6 @@ func (a *Allocator) RecordHeldPoolRequest(ctx context.Context, order, fingerprin
 			out = existing
 
 			return nil
-		case err == nil && existing.State != EnrollDenied && existing.Fingerprint != fingerprint:
-			return fmt.Errorf("%w: %s is held by %s", ErrEnrollmentConflict, name, existing.Fingerprint)
 		case err != nil && !errors.Is(err, sql.ErrNoRows):
 			return err
 		}
