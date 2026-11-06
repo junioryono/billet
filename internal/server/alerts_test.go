@@ -683,6 +683,38 @@ func TestARunningJobWaitsForTheEndedJobsToBeRead(t *testing.T) {
 	}
 }
 
+// A SCAN THE CURSOR CANNOT FOLLOW IS CARRIED ON BY THE NEXT PASS: with the cursor held at
+// its first job, more pages than a pass reads would otherwise be read again from the
+// same place for ever, and the running jobs never judged.
+func TestAScanHeldAtItsFirstJobIsCarriedOn(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{RunningLongerThan: "1m", Failed: true}
+		c.Match.Branch = "main"
+	}))
+	r.record.err = errors.New("connection reset")
+	r.sweep.rows = 1
+	r.now = r.now.Add(30 * time.Minute)
+	r.seed(jobRow{lease: "held", result: "failed", ran: time.Second, age: 25 * time.Minute, name: "held"})
+	for i := range alertEndedPages + 2 {
+		r.seed(jobRow{lease: fmt.Sprintf("after-%02d", i), result: "succeeded", ran: time.Second,
+			age: time.Duration(24-i) * time.Minute, name: fmt.Sprintf("other-%d", i), branch: "main"})
+	}
+	r.seed(jobRow{lease: "running", age: 2 * time.Minute, name: "run", branch: "main"})
+	r.now = r.now.Add(5 * time.Minute)
+
+	r.pass()
+	if got := r.owedLeases(); len(got) != 0 {
+		t.Fatalf("owed %v before the scan reached the end", got)
+	}
+
+	r.pass()
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "running:running-long" {
+		t.Errorf("owed = %v, want the running job once the carried scan reached the end", got)
+	}
+}
+
 // A JOB WHOSE REPOSITORY IS NOT WRITTEN YET WAITS FOR IT: the identity lands after the
 // result, and a job with none yet is not one nothing could ever read about.
 func TestAJobWithNoRepositoryYetWaitsForIt(t *testing.T) {
@@ -711,8 +743,8 @@ func TestAJobWithNoRepositoryYetWaitsForIt(t *testing.T) {
 	}
 }
 
-// A JOB'S LAST HOUR IN THE READ DOES NOT CUT ITS HOUR SHORT: one first asked late gets
-// until the earlier of an hour after the ask and a few passes before it leaves.
+// A JOB'S LAST HOURS IN THE READ DO NOT CUT ITS HOUR SHORT: one first asked late gets
+// until the earlier of an hour after the ask and the margin before it leaves.
 func TestALateFirstAskStillGetsItsTime(t *testing.T) {
 	t.Parallel()
 
@@ -721,22 +753,73 @@ func TestALateFirstAskStillGetsItsTime(t *testing.T) {
 	r.now = r.now.Add(5 * time.Minute)
 	r.seed(jobRow{lease: "late", result: "failed", ran: time.Second, age: time.Second})
 
-	r.now = r.now.Add(5*time.Hour + time.Minute)
+	// FIRST ASKED LATE ENOUGH that the read's own deadline comes before its hour does.
+	first := alertEndedWindow - alertLeaveMargin - 45*time.Minute
+	r.now = r.now.Add(first)
 	r.pass()
 	if got := r.marked(); got != 0 {
-		t.Fatalf("%d marks on the first ask, at five hours, want it still waiting", got)
+		t.Fatalf("%d marks on the first ask, want it still waiting", got)
 	}
 
-	r.now = r.now.Add(50 * time.Minute)
+	r.now = r.now.Add(alertEndedWindow - alertLeaveMargin - first - 5*time.Minute)
 	r.pass()
 	if got := r.marked(); got != 0 {
 		t.Fatalf("%d marks before its deadline, want it still waiting", got)
 	}
 
-	r.now = r.now.Add(5 * time.Minute)
+	r.now = r.now.Add(10 * time.Minute)
 	r.pass()
 	if got := r.marked(); got != 1 {
-		t.Errorf("%d marks just before it leaves the read, want it judged unknown", got)
+		t.Errorf("%d marks past its deadline, want it judged unknown", got)
+	}
+}
+
+// A REPOSITORY NEVER WRITTEN IS WAITED FOR AN HOUR, not the job's whole time in the
+// read: it is written within moments of the job's result.
+func TestARepositoryNeverWrittenIsWaitedForAnHour(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.Match.Branch = "main" }))
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "nameless", result: "failed", ran: time.Second, age: time.Second, noRepo: true})
+
+	r.now = r.now.Add(alertReadWindow - time.Minute)
+	r.pass()
+	if got := r.marked(); got != 0 {
+		t.Fatalf("%d marks within the hour, want it waiting", got)
+	}
+
+	r.now = r.now.Add(2 * time.Minute)
+	r.pass()
+	if got := r.marked(); got != 1 {
+		t.Errorf("%d marks past the hour, want it judged unknown", got)
+	}
+}
+
+// AN ARCHIVED LEASE LEAVES THE READ WITH ITS ARCHIVING, so its deadline is that, not its
+// start's: a disruption on it never asked about is judged unknown before it goes.
+func TestAnArchivedLeaseIsJudgedBeforeItsArchivingAgesOut(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On = config.AlertConditions{Disrupted: true}
+		c.Match.Branch = "main"
+	}))
+	r.record.remaining, r.record.limit = 100, 5000
+	r.now = r.now.Add(5 * time.Minute)
+	r.seed(jobRow{lease: "archived", disruption: "guest-absent", age: time.Second})
+	if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET finished_at = $1 WHERE lease_id = 'archived'`, stamp(r.now))
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.now = r.now.Add(alertEndedWindow - alertLeaveMargin + time.Minute)
+	r.pass()
+	if got := r.marked(); got != 1 {
+		t.Errorf("%d marks near the end of its archiving's window, want it judged unknown", got)
 	}
 }
 

@@ -53,12 +53,13 @@ type AlertJobsRead struct {
 }
 
 // AlertJobs reads the jobs a pass judges: those running that started since
-// runningSince, with those archived without a result since endedSince, and those
-// that started since runningSince whose result arrived since endedSince and after
-// the cursor, each oldest first and at most limit. Two reads
-// rather than one, each served by its partial index, so neither scans a history
-// that only grows.
+// runningSince, with those archived without a result since endedSince, when
+// withRunning, and those that started since runningSince whose result arrived since
+// endedSince and after the cursor, each oldest first and at most limit. Two reads
+// rather than one, each served by its partial index, so neither scans a history that
+// only grows.
 func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time.Time, after AlertCursor, limit int,
+	withRunning bool,
 ) (AlertJobsRead, error) {
 	var out AlertJobsRead
 
@@ -66,13 +67,18 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 		reads := state.ReadQueries(q)
 		started := ts(runningSince.UTC())
 
-		running, err := reads.ListRunningJobsForAlerts(ctx, ledgerdb.ListRunningJobsForAlertsParams{
-			Since:         sql.NullString{String: started, Valid: true},
-			ArchivedSince: sql.NullString{String: ts(endedSince.UTC()), Valid: true},
-			MaxRows:       int64(limit),
-		})
-		if err != nil {
-			return fmt.Errorf("alloc: list the running jobs for alerts: %w", err)
+		var running []ledgerdb.ListRunningJobsForAlertsRow
+		if withRunning {
+			var err error
+
+			running, err = reads.ListRunningJobsForAlerts(ctx, ledgerdb.ListRunningJobsForAlertsParams{
+				Since:         sql.NullString{String: started, Valid: true},
+				ArchivedSince: sql.NullString{String: ts(endedSince.UTC()), Valid: true},
+				MaxRows:       int64(limit),
+			})
+			if err != nil {
+				return fmt.Errorf("alloc: list the running jobs for alerts: %w", err)
+			}
 		}
 
 		ended, err := reads.ListEndedJobsForAlerts(ctx, ledgerdb.ListEndedJobsForAlertsParams{

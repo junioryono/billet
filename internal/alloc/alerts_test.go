@@ -520,7 +520,7 @@ func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 
 	runningSince, endedSince := now.Add(-7*24*time.Hour), now.Add(-6*time.Hour)
 
-	got, err := a.AlertJobs(t.Context(), runningSince, endedSince, AlertCursor{}, 100)
+	got, err := a.AlertJobs(t.Context(), runningSince, endedSince, AlertCursor{}, 100, true)
 	if err != nil {
 		t.Fatalf("AlertJobs: %v", err)
 	}
@@ -559,7 +559,7 @@ func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 	}
 
 	// A LIMIT BINDS EACH READ, keeping the oldest, and the cursor goes on from there.
-	bounded, err := a.AlertJobs(t.Context(), runningSince, endedSince, AlertCursor{}, 1)
+	bounded, err := a.AlertJobs(t.Context(), runningSince, endedSince, AlertCursor{}, 1, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,19 +568,22 @@ func TestAlertJobsAreTheRunningAndTheRecentlyEnded(t *testing.T) {
 		t.Errorf("a limit of 1 = running %v, ended %v", r, e)
 	}
 
-	next, err := a.AlertJobs(t.Context(), runningSince, endedSince, bounded.Ended[0].Cursor, 1)
+	next, err := a.AlertJobs(t.Context(), runningSince, endedSince, bounded.Ended[0].Cursor, 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if e := leases(next.Ended); len(e) != 1 || e[0] != "ended" {
 		t.Errorf("after the cursor = %v, want the next one", e)
 	}
+	if len(next.Running) != 0 {
+		t.Errorf("a read without the running jobs read %d", len(next.Running))
+	}
 
 	// TWO RESULTS STAMPED THE SAME INSTANT are told apart by lease, so a cursor on the
 	// first reads the second and not the first again.
 	insert("tie-a", hour(-2), "failed", hour(-1), "")
 	insert("tie-b", hour(-2), "failed", hour(-1), "")
-	tied, err := a.AlertJobs(t.Context(), runningSince, endedSince, AlertCursor{ResultAt: hour(-1), LeaseID: "tie-a"}, 10)
+	tied, err := a.AlertJobs(t.Context(), runningSince, endedSince, AlertCursor{ResultAt: hour(-1), LeaseID: "tie-a"}, 10, false)
 	if err != nil {
 		t.Fatal(err)
 	}

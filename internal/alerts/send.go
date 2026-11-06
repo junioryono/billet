@@ -126,6 +126,10 @@ func dialTLS(ctx context.Context, dialer *net.Dialer, network, addr string) (net
 // destination. Its answer is not quoted: it is the proxy's to write.
 var errProxyRefused = errors.New("alerts: the proxy refused the tunnel")
 
+// maxConnectAnswer bounds what a proxy's answer to a CONNECT may take, as the
+// standard library bounds its own: a proxy's headers are not a reason to grow.
+const maxConnectAnswer = 16 * 1024
+
 // dialThroughProxy is a connection to addr, through the HTTP proxy proxyFor names for
 // it when it names one (the environment's HTTPS_PROXY and NO_PROXY, as the standard
 // library reads them), by a CONNECT billet writes and reads itself.
@@ -145,7 +149,8 @@ func dialThroughProxy(ctx context.Context, dialer *net.Dialer, network, addr str
 		return conn, nil
 	}
 	if proxy.Scheme != "http" {
-		return nil, fmt.Errorf("%w: only an http:// proxy is supported", errProxyRefused)
+		// THE CONFIG'S, NOT THE NETWORK'S: no try will change it.
+		return nil, fmt.Errorf("%w: %w: only an http:// proxy is supported", ErrPermanent, errProxyRefused)
 	}
 
 	proxyAddr := proxy.Host
@@ -166,17 +171,18 @@ func dialThroughProxy(ctx context.Context, dialer *net.Dialer, network, addr str
 			"Basic "+base64.StdEncoding.EncodeToString([]byte(user.Username()+":"+password)))
 	}
 
-	// THE TUNNEL IS BOUNDED BY THE TRY, and the deadline is lifted once it is open, so
-	// the transport's own bounds govern the request.
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			_ = conn.Close()
+	// THE TUNNEL IS BOUNDED ON ITS OWN, since the transport hands a dialer a context
+	// with no deadline, and closed if the context ends first; the deadline is lifted
+	// once it is open, so the transport's own bounds govern the request.
+	if err := conn.SetDeadline(time.Now().Add(sendTimeout)); err != nil {
+		_ = conn.Close()
 
-			return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
-		}
+		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
 	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReader(io.LimitReader(conn, maxConnectAnswer))
 	if err := connect.Write(conn); err != nil {
 		_ = conn.Close()
 
@@ -189,15 +195,19 @@ func dialThroughProxy(ctx context.Context, dialer *net.Dialer, network, addr str
 
 		return nil, err //nolint:wrapcheck // classed by sendFailureClass, never quoted.
 	}
-	_ = resp.Body.Close()
 
-	// A PROXY THAT SAID MORE THAN YES has written into what is the destination's
-	// stream; nothing it wrote is kept.
-	if resp.StatusCode != http.StatusOK || reader.Buffered() > 0 {
+	// A PROXY THAT SAID MORE THAN A PLAIN YES, a body or bytes after it, would write
+	// into what is the destination's stream; nothing it wrote is read or kept.
+	if resp.StatusCode != http.StatusOK || reader.Buffered() > 0 ||
+		resp.Header.Get("Content-Length") != "" || len(resp.TransferEncoding) > 0 {
+		// THE CONNECTION FIRST, so closing the body drains nothing a proxy wrote.
 		_ = conn.Close()
+		_ = resp.Body.Close()
 
 		return nil, errProxyRefused
 	}
+	// A YES TO A CONNECT HAS NO BODY to the standard library; closing it reads nothing.
+	_ = resp.Body.Close()
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		_ = conn.Close()
 
@@ -215,56 +225,84 @@ type gatedConn struct {
 	wrote, closed         chan struct{}
 	wroteOnce, closedOnce sync.Once
 
+	// mu guards the read deadline and changed, which is closed and replaced each time
+	// the deadline is set, so a read waiting at the gate takes the new one.
 	mu       sync.Mutex
 	deadline time.Time
+	changed  chan struct{}
 }
 
 func quietUntilWritten(conn net.Conn) net.Conn {
-	return &gatedConn{Conn: conn, wrote: make(chan struct{}), closed: make(chan struct{})}
+	return &gatedConn{Conn: conn, wrote: make(chan struct{}), closed: make(chan struct{}),
+		changed: make(chan struct{})}
 }
 
 // Read waits for the first write. What a destination wrote before the request is
 // held until then, and read as its answer; it never reaches the transport as bytes
 // owed to no request.
 func (c *gatedConn) Read(b []byte) (int, error) {
-	c.mu.Lock()
-	deadline := c.deadline
-	c.mu.Unlock()
+	for {
+		c.mu.Lock()
+		deadline, changed := c.deadline, c.changed
+		c.mu.Unlock()
 
-	var expired <-chan time.Time
-	if !deadline.IsZero() {
-		timer := time.NewTimer(time.Until(deadline))
-		defer timer.Stop()
-		expired = timer.C
+		var expired <-chan time.Time
+		var timer *time.Timer
+		if !deadline.IsZero() {
+			timer = time.NewTimer(time.Until(deadline))
+			expired = timer.C
+		}
+
+		select {
+		case <-c.wrote:
+		case <-c.closed:
+			stopTimer(timer)
+
+			return 0, net.ErrClosed
+		case <-expired:
+			return 0, os.ErrDeadlineExceeded
+		case <-changed:
+			stopTimer(timer)
+
+			continue
+		}
+		stopTimer(timer)
+
+		return c.Conn.Read(b) //nolint:wrapcheck // the connection's own error, for the transport.
 	}
-
-	select {
-	case <-c.wrote:
-	case <-c.closed:
-		return 0, net.ErrClosed
-	case <-expired:
-		return 0, os.ErrDeadlineExceeded
-	}
-
-	return c.Conn.Read(b) //nolint:wrapcheck // the connection's own error, for the transport.
 }
 
-// SetDeadline and SetReadDeadline are kept for a read waiting at the gate, as well
-// as passed on to the connection.
+func stopTimer(timer *time.Timer) {
+	if timer != nil {
+		timer.Stop()
+	}
+}
+
+// SetDeadline and SetReadDeadline are kept for a read waiting at the gate, which
+// they wake to take the new one, as well as passed on to the connection, under the
+// one lock so the two never disagree.
 func (c *gatedConn) SetDeadline(t time.Time) error {
 	c.mu.Lock()
-	c.deadline = t
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+
+	c.setDeadlineLocked(t)
 
 	return c.Conn.SetDeadline(t) //nolint:wrapcheck // the connection's own error, for the transport.
 }
 
 func (c *gatedConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
-	c.deadline = t
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+
+	c.setDeadlineLocked(t)
 
 	return c.Conn.SetReadDeadline(t) //nolint:wrapcheck // the connection's own error, for the transport.
+}
+
+func (c *gatedConn) setDeadlineLocked(t time.Time) {
+	c.deadline = t
+	close(c.changed)
+	c.changed = make(chan struct{})
 }
 
 func (c *gatedConn) Write(b []byte) (int, error) {
@@ -341,6 +379,12 @@ func (s Sender) Send(ctx context.Context, body []byte) error {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
+		// A FAILURE NO TRY CAN CHANGE, an unsupported proxy, is said so, still in fixed
+		// words.
+		if errors.Is(err, ErrPermanent) {
+			return fmt.Errorf("%w: the request failed: %s", ErrPermanent, sendFailureClass(err))
+		}
+
 		return fmt.Errorf("alerts: the request failed: %s", sendFailureClass(err))
 	}
 	defer resp.Body.Close()
@@ -362,6 +406,9 @@ func (s Sender) Send(ctx context.Context, body []byte) error {
 
 // sendFailureClass names what stopped a request, from fixed words only.
 func sendFailureClass(err error) string {
+	if errors.Is(err, errProxyRefused) {
+		return "the proxy refused the tunnel"
+	}
 	if errors.Is(err, context.Canceled) {
 		return "it was cancelled"
 	}

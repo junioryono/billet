@@ -392,6 +392,27 @@ func TestAConnectionReadsNothingBeforeItsRequest(t *testing.T) {
 		t.Errorf("a read past its deadline at the gate = %v", err)
 	}
 
+	// AND A DEADLINE SET WHILE A READ WAITS WAKES IT.
+	later, _ := net.Pipe()
+	moved := quietUntilWritten(later)
+	woken := make(chan error, 1)
+	go func() {
+		_, err := moved.Read(make([]byte, 1))
+		woken <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := moved.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-woken:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Errorf("a read given a deadline while it waited = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a deadline set while a read waited did not end it")
+	}
+
 	waiting, _ := net.Pipe()
 	closing := quietUntilWritten(waiting)
 	ended := make(chan error, 1)
@@ -508,6 +529,7 @@ func TestTheSenderOpensItsOwnProxyTunnel(t *testing.T) {
 	for name, answer := range map[string]string{
 		"a refusal":                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
 		"a yes with more after it": "HTTP/1.1 200 OK\r\n\r\n" + secretPath,
+		"a yes with a body":        "HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n",
 	} {
 		address, _ := proxy(t, answer)
 		if conn, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", via(address)); err == nil {
@@ -516,6 +538,37 @@ func TestTheSenderOpensItsOwnProxyTunnel(t *testing.T) {
 		} else if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), secretPath) {
 			t.Errorf("%s: the error quotes the proxy: %v", name, err)
 		}
+	}
+
+	// A PROXY OF ANOTHER KIND is refused for good, not tried again.
+	socks := func(*http.Request) (*url.URL, error) { return &url.URL{Scheme: "socks5", Host: "127.0.0.1:1"}, nil }
+	if _, err := dialThroughProxy(t.Context(), dialer, "tcp", "hooks.example:443", socks); !errors.Is(err, ErrPermanent) {
+		t.Errorf("a socks proxy = %v, want it refused for good", err)
+	}
+
+	// A PROXY THAT NEVER ANSWERS IS LEFT when the try ends, not waited on.
+	silent, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = silent.Close() })
+	go func() {
+		conn, err := silent.Accept()
+		if err != nil {
+			return
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	begun := time.Now()
+	if conn, err := dialThroughProxy(ctx, dialer, "tcp", "hooks.example:443",
+		via(&url.URL{Scheme: "http", Host: silent.Addr().String()})); err == nil {
+		_ = conn.Close()
+		t.Error("a proxy that never answered opened a tunnel")
+	}
+	if took := time.Since(begun); took > 3*time.Second {
+		t.Errorf("a silent proxy held the try for %s", took)
 	}
 
 	// NO PROXY NAMED: the destination is dialled directly.
