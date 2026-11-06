@@ -71,13 +71,28 @@ GitHub's store gave this host about 54 to 64 MiB/s on 8 streams. A volume per ar
 `TestRealArchiveStore` ran on the same host on 2026-11-04, under the node's own role with exactly the policy the module renders, through billet's own signer, in 2.25 s. What a fake accepts and S3 might not, and did not refuse:
 
 - `UNSIGNED-PAYLOAD` over TLS on a streamed put, and on a part and a completion.
-- A commit whose declared size differs, refused before S3 is asked for anything.
+- A commit whose declared size differs, refused from the listing of its blocks, before a multipart upload is started.
 - `UploadPartCopy` of a staged block above the part minimum followed by a smaller last one, and `CompleteMultipartUpload` with `If-None-Match: *` over a free key.
 - The same completion over a taken key, which S3 answers with a status billet reads as the second writer having lost, and the metadata on the object read back with `HeadObject` to tell whose it is.
 - `AbortMultipartUpload`, twice, the second of an upload already gone.
 - A key holding a space, a percent sign, a `+`, `?`, `#` and non-ASCII, matched back through a restore prefix.
 - Three 7-byte blocks rejoined into one archive, in the order committed rather than staged.
 - The eviction pass's own listings and reads, multipart listing included, under the grant the node holds: `s3:ListBucketMultipartUploads` carries no prefix condition, and the object half's `s3:DeleteObject` is on its own names and never on a state object.
+
+## One job through the whole boot, on 2026-11-04
+
+A `c7i.2xlarge` launched from an image of this contract, by a node of this change's build (whose EC2 guest caches were wire 38 then, and are 40 since main took 38 for job test results and 39 for Windows guests) under the deployment-scoped policy `billet init iam` renders, ran one job that used no cache: it held the runner for four minutes on an untrusted tier with a repository scope and `publish: default-branch`.
+
+| From launch | What had happened |
+|---|---|
+| 3 s | the instance was launched, 1 s of it the runner's registration |
+| 90 s | `cloud-final` began, 72 s after the kernel started |
+| 144 s | the runner connected to GitHub, about 54 s after `cloud-final` began, which includes creating and attaching the Docker store, restarting Docker on it, the relay and the probe |
+| 145 s | GitHub assigned the job |
+
+The job succeeded. Its completion proved the run to the repository's default branch, the Docker store was unchanged and was discarded with no snapshot, the instance terminated, and no volume or snapshot was left. No line in the boot output reported a failed relay or a node that did not answer.
+
+This is not comparable with the 48 to 59 seconds in [AWS acceptance](aws-acceptance.md), which was a smaller image than GitHub's full template and attached no cache. How much of the difference each accounts for was not measured.
 
 ## What this does not prove
 

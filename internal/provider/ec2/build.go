@@ -45,13 +45,19 @@ import (
 // components images.accept named that the template offers, recorded in
 // /etc/billet-image-components and in the components tag.
 //
+// 5: and the image carries the guest half of every cache the node serves (ADR-024):
+// the library cut from the firecracker guest's agent, the passthrough and the
+// container resolver, the docker shim and the container hook, and billet itself for
+// the Go and Bazel helpers. An older image ignores what the boot script exports for
+// them and runs the job cold, which `billet check` reports as needing a rebuild.
+//
 // THE TAG IS A PROMOTION, NOT A CREATE-TIME CLAIM, and that is the whole content
 // of the number now. CreateImage stamps who owns the image and which billet made
 // it; the contract tag is added afterwards, by CreateTags, once billet has BOOTED
 // the image and proved the properties on the artifact. So an unstamped image is
 // one nothing has verified — which both readers already treat as "no answer,
 // rebuild" — rather than a claim nobody checked.
-const AMIContract = 4
+const AMIContract = 5
 
 // contractFor is the contract a build of this architecture actually meets.
 //
@@ -260,6 +266,12 @@ type BuildSpec struct {
 	// (config.ImageComponents' names). The builder installs each one GitHub's
 	// template for Arch offers and leaves out, and says so, each one it does not.
 	Accept []string
+
+	// GuestBillet is the billet binary the image carries for its build caches: a
+	// static linux build of Arch, read by the caller. Required, because a Go or Bazel
+	// tier on this image needs it, and the running binary is what provides it where
+	// it is of that platform.
+	GuestBillet []byte
 
 	// PayloadBucket is where the build's payload is staged: GitHub's template, the
 	// scripts that run it and billet's EC2 layer, far past EC2's 16384 bytes of
@@ -869,6 +881,9 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 const (
 	toolcacheDir = "/opt/hostedtoolcache"
 	imageEnvFile = "/etc/billet-image-env"
+	// imageRecordPath is what the image says it carries, by the name the Firecracker
+	// image writes it under.
+	imageRecordPath = "/etc/billet-image"
 )
 
 // privilegeDrop is how the runner stops being root, written ONCE.
@@ -1306,7 +1321,9 @@ func layerScript(spec BuildSpec) (string, error) {
 	b.WriteString("id runner || useradd -m -s /bin/bash runner\n")
 	b.WriteString("usermod -aG docker runner\n")
 
-	b.WriteString("mkdir -p /opt/actions-runner\n")
+	// _work BEFORE THE OWNERSHIP BELOW, because the guest caches' files land in it at
+	// boot as root and the runner has to be able to make its own beside them.
+	b.WriteString("mkdir -p /opt/actions-runner/_work\n")
 	b.WriteString("cd /opt/actions-runner\n")
 
 	release := "https://github.com/actions/runner/releases/download/v" + spec.RunnerVersion +
@@ -1330,6 +1347,13 @@ func layerScript(spec BuildSpec) (string, error) {
 	b.WriteString("fi\n")
 	b.WriteString("tar xzf runner.tar.gz\n")
 	b.WriteString("rm runner.tar.gz\n")
+	// THE SAME RECORD THE FIRECRACKER IMAGE CARRIES, written where the runner was
+	// verified and unpacked, the one point where what was downloaded and what was
+	// installed are the same fact. The cache conformance workflow reads it to refuse
+	// a candidate image that is not the one under test.
+	b.WriteString("printf 'RUNNER_VERSION=%s\\nAMI_CONTRACT=%s\\nBUILT_AT=%s\\n' '" + spec.RunnerVersion +
+		"' '" + strconv.Itoa(AMIContract) + "' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > " + imageRecordPath + "\n")
+	b.WriteString("chmod 0644 " + imageRecordPath + "\n")
 	b.WriteString("cat > /opt/actions-runner/billet-runner-service <<'BILLETRUNNEREOF'\n")
 	b.WriteString(guestassets.RunnerServiceScript)
 	if !strings.HasSuffix(guestassets.RunnerServiceScript, "\n") {
@@ -1360,6 +1384,12 @@ func layerScript(spec BuildSpec) (string, error) {
 	}
 	b.WriteString("BILLETEXECENVEOF\n")
 	b.WriteString("chmod 0755 " + execEnvPath + "\n")
+
+	install, err := guestCacheInstall()
+	if err != nil {
+		return "", err
+	}
+	b.WriteString(install)
 
 	// THE ENTRY POINT A TIER NAMES. billet's boot script exports the JIT config and
 	// execs the tier's command AS ROOT, so something has to drop privileges without
@@ -1481,13 +1511,34 @@ func layerScript(spec BuildSpec) (string, error) {
 func entryPointScript() string {
 	var b strings.Builder
 
-	b.WriteString("#!/bin/sh\nset -eu\n")
+	// BASH WITH pipefail, BECAUSE THE GUEST CACHES' LIBRARY IS THE FIRECRACKER AGENT'S
+	// OWN TEXT, which assumes both.
+	b.WriteString("#!/bin/bash\nset -euo pipefail\n")
+
+	// WHAT THE LIBRARY READS: the node's address and the session's bearer, the same
+	// the firecracker agent reads from the metadata service.
+	b.WriteString("cache_endpoint=${BILLET_CACHE_ENDPOINT:-}\n")
+	b.WriteString("cache_token=${BILLET_CACHE_TOKEN:-}\n")
+	b.WriteString("buildkit_cache_mount_limit_bytes=${BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES:-}\n")
+	b.WriteString("registry_mirrors_json=\n")
+	b.WriteString("runner_env=()\n")
+	b.WriteString(". " + guestCachesPath + "\n")
+
+	// BEFORE DOCKER: the node's authority and the resolver are read when the daemon
+	// starts, and it does not read them again.
+	b.WriteString("billet_guest_caches_prepare\n")
 
 	// ATTACH THE IMAGE STORE BEFORE STARTING THE RUNNER. The helper stops Docker if
 	// cloud-init already started it, mounts the cache, and starts it again before
 	// service containers can be pulled. Every cache failure falls back to the root
-	// disk and a cold pull.
-	b.WriteString("/usr/local/bin/billet-docker-cache prepare\n")
+	// disk and a cold pull. This image enables Docker at boot, so the daemon may have
+	// read daemon.json before the line above changed it, and the helper is told: a
+	// container would otherwise be answered that the npm registry is its own loopback.
+	// A daemon that cannot be brought up does not stop the runner, by the rule the wait
+	// below holds to: a job that needs no Docker still runs, and one that does says so.
+	b.WriteString("if ! BILLET_DOCKER_CONFIG_CHANGED=${container_dns_active:-} /usr/local/bin/billet-docker-cache prepare; then\n")
+	b.WriteString("  log \"Docker could not be brought up with this job's configuration\"\n")
+	b.WriteString("fi\n")
 
 	// WAIT FOR DOCKER BEFORE STARTING THE RUNNER, because billet's boot script
 	// invokes this the moment cloud-init reaches it and the daemon may not be up.
@@ -1506,6 +1557,20 @@ func entryPointScript() string {
 	b.WriteString("while [ $i -lt 60 ] && ! docker info >/dev/null 2>&1; do\n")
 	b.WriteString("  i=$((i+1)); sleep 1\n")
 	b.WriteString("done\n")
+
+	// AFTER DOCKER, because everything here listens on its bridge: the relay first,
+	// which the passthroughs tunnel through on this image, then the passthroughs and
+	// the container resolver. None of it can fail the job.
+	b.WriteString("billet_guest_caches_relay\n")
+	b.WriteString("billet_guest_caches_probe\n")
+	b.WriteString("billet_guest_caches_through_relay\n")
+	b.WriteString("billet_guest_caches_start\n")
+	// THE CONFIGURATION IT WRITES IS EVERY TOOL'S, read as the runner: the boot script's
+	// umask keeps the registration to root, and a bazelrc made under it is one Bazel
+	// refuses to start with (measured 2026-11-05: errno 13, exit 37). Only for this.
+	b.WriteString("umask 022\n")
+	b.WriteString("billet_guest_caches_env\n")
+	b.WriteString("umask 077\n")
 	b.WriteString("runner_started=$(date +%s%N 2>/dev/null || true)\n")
 
 	// ONE INVOCATION, SHARED WITH THE VALIDATION BELOW, so a change here cannot
@@ -1540,10 +1605,16 @@ func entryPointScript() string {
 	b.WriteString("billet_env_add ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE " +
 		"\"${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}\"\n")
 	b.WriteString("billet_env_add " + jitEnvVar + " \"$" + jitEnvVar + "\"\n")
-	b.WriteString("billet_env_add BILLET_CACHE_ENDPOINT \"${BILLET_CACHE_ENDPOINT:-}\"\n")
-	b.WriteString("billet_env_add BILLET_CACHE_TOKEN \"${BILLET_CACHE_TOKEN:-}\"\n")
-	b.WriteString("billet_env_add BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES " +
-		"\"${BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES:-}\"\n")
+
+	// WHAT THE LIBRARY ASKED FOR, its cache endpoint among it, which names the relay
+	// where one is serving. Interception's job-started hook takes the runner's one
+	// hook, and runs this image's after its own.
+	b.WriteString("for billet_entry in ${runner_env[@]+\"${runner_env[@]}\"}; do\n")
+	b.WriteString("  if [ \"${billet_entry%%=*}\" = ACTIONS_RUNNER_HOOK_JOB_STARTED ]; then\n")
+	b.WriteString("    billet_env_add BILLET_JOB_STARTED_NEXT " + jobTimingHookPath + "\n")
+	b.WriteString("  fi\n")
+	b.WriteString("  billet_env_add \"${billet_entry%%=*}\" \"${billet_entry#*=}\"\n")
+	b.WriteString("done\n")
 
 	b.WriteString("set +e\n")
 	b.WriteString("if [ -n \"$billet_refused\" ]; then\n")
@@ -1553,6 +1624,14 @@ func entryPointScript() string {
 	b.WriteString("job_status=$?\n")
 	b.WriteString("fi\n")
 	b.WriteString("set -e\n")
+	// STOPPED BEFORE THE IMAGE STORE IS SETTLED, as the firecracker agent stops them:
+	// a late connection would re-activate a socket's service.
+	b.WriteString("systemctl stop billet-actions-proxy.socket billet-actions-proxy.service " +
+		"2>/dev/null || true\n")
+	b.WriteString("systemctl stop billet-actions-cache-adapter.socket " +
+		"billet-actions-cache-adapter.service 2>/dev/null || true\n")
+	b.WriteString("systemctl stop billet-cache-relay.socket billet-cache-relay.service " +
+		"2>/dev/null || true\n")
 	b.WriteString("/usr/local/bin/billet-docker-cache complete \"$job_status\"\n")
 	b.WriteString("service_status=$(/usr/local/bin/billet-docker-cache service-status \"$job_status\") || service_status=$job_status\n")
 	b.WriteString("exit \"$service_status\"\n")

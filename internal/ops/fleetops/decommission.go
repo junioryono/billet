@@ -157,6 +157,9 @@ func decommissionCache(
 
 	fmt.Fprintf(env.Stdout, "cache    purged %d snapshot(s), %d volume(s), %d state object(s)",
 		report.Snapshots, report.Volumes, report.StateObjects)
+	if report.CacheObjects > 0 {
+		fmt.Fprintf(env.Stdout, ", %d cache object(s)", report.CacheObjects)
+	}
 	if report.SkippedForeign > 0 {
 		fmt.Fprintf(env.Stdout, "; skipped %d resource(s) owned by another deployment", report.SkippedForeign)
 	}
