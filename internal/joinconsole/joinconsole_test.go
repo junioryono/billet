@@ -42,14 +42,16 @@ func TestAPoolConsoleLineIsReadBackForItsOrderOnly(t *testing.T) {
 func TestAPoolConsoleLineCutShortIsNoKey(t *testing.T) {
 	t.Parallel()
 	whole := Line("p1", fp("k"))
-	for name, console := range map[string]string{
-		"cut at the end":          whole[:len(whole)-5],
-		"cut and then a new line": whole[:len(whole)-5] + "\n[ 3.1] next\n",
+	// BETWEEN TWO NEWLINES, so it is the regex that refuses each, not the edge of what
+	// was read; TestTheEdgesOfAConsoleAreNoLine holds the edges.
+	for name, line := range map[string]string{
+		"cut short": whole[:len(whole)-5],
 		"run into by another write": whole[:len(whole)-10] + "[  3.2] usb 1-1: new device" +
-			whole[len(whole)-10:] + "\n",
-		"a short fingerprint": Line("p1", "SHA256:abc") + "\n",
+			whole[len(whole)-10:],
+		"a short fingerprint": Line("p1", "SHA256:abc"),
+		"a long fingerprint":  Line("p1", fp("k")+"Q"),
 	} {
-		if got := Fingerprints(console, "p1"); len(got) != 0 {
+		if got := Fingerprints("\n"+line+"\n", "p1"); len(got) != 0 {
 			t.Errorf("%s: read %v, want nothing", name, got)
 		}
 	}

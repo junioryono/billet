@@ -157,7 +157,9 @@ func (s *ServerConfig) PoolEnrollAddr() string {
 // not a wildcard, and not loopback, which a rented host would dial as itself.
 func dialableFromElsewhere(host string) bool {
 	h := strings.ToLower(strings.TrimSuffix(host, "."))
-	if h == "" || h == "localhost" || strings.HasSuffix(h, ".localhost") {
+	// A ZONE NAMES AN INTERFACE OF THE MACHINE THAT WROTE IT, never one a rented host
+	// has, and net.ParseIP reads a zoned literal as no address at all.
+	if h == "" || h == "localhost" || strings.HasSuffix(h, ".localhost") || strings.Contains(h, "%") {
 		return false
 	}
 	ip := net.ParseIP(h)

@@ -137,6 +137,8 @@ func TestAPoolNeedsAnEnrollmentListenerItsHostsCanDial(t *testing.T) {
 		"localhost":              {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: localhost:7718", "bootstrap_addr is required"},
 		"a loopback override":    {"    boot_prelude:", "    bootstrap_addr: 127.0.0.1:7718\n    boot_prelude:", "no wildcard and no loopback"},
 		"a wildcard override":    {"    boot_prelude:", "    bootstrap_addr: '[::]:7718'\n    boot_prelude:", "no wildcard and no loopback"},
+		"a zoned override":       {"    boot_prelude:", "    bootstrap_addr: '[::1%lo]:7718'\n    boot_prelude:", "no wildcard and no loopback"},
+		"a zoned listener":       {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: '[fe80::1%eth0]:7718'", "bootstrap_addr is required"},
 		"a loopback join server": {"join_server: 10.77.0.10:7717", "join_server: localhost:7717", "join_server"},
 	} {
 		raw := poolConfig(poolBlock)
@@ -164,7 +166,7 @@ func TestAPoolNeedsAnEnrollmentListenerItsHostsCanDial(t *testing.T) {
 // dials it, and loopback there is the host itself.
 func TestAPoolRefusesAnInheritedEnrollmentAddressItsHostsCannotDial(t *testing.T) {
 	t.Parallel()
-	for _, addr := range []string{"localhost:443", "billet.localhost:443", "127.0.0.1:443", "billet.example:443"} {
+	for _, addr := range []string{"localhost:443", "billet.localhost:443", "127.0.0.1:443", "[::1%lo]:443", "billet.example:443"} {
 		s := &ServerConfig{BootstrapListen: "127.0.0.1:7718", TLSRouter: &TLSRouterConfig{EnrollAddr: addr},
 			Pool: &PoolConfig{}}
 		want := ""

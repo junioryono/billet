@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -634,5 +635,49 @@ func TestAVerdictFromBeforeAHoldAndItsReleaseAdmitsNothing(t *testing.T) {
 
 	if e, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", tok, "0a")); err != nil || e.State != EnrollApproved {
 		t.Fatalf("a verdict on the order as it reads now: %+v, %v", e, err)
+	}
+}
+
+// A PERSON DECIDES ONLY A REQUEST STILL WAITING: a denial that arrives after the source's
+// word admitted the key is refused, the admission and its certificate standing, and
+// says to revoke; a denial before it stands against the source's word, and the
+// admission hands back the denial.
+func TestADenialAndAnAdmissionDecideOnceInEitherOrder(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+
+	tok := placedOrder(t, a, "pa")
+	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pa"), "SHA256:k", "csr-SHA256:k", tok); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", tok, "0a")); err != nil {
+		t.Fatal(err)
+	}
+	err := a.DecideEnrollment(ctx, PoolNodeName("pa"), "SHA256:k", EnrollDenied, "", "")
+	if !errors.Is(err, ErrNotPending) || !strings.Contains(err.Error(), "billet nodes revoke") {
+		t.Fatalf("a denial after the admission answered %v", err)
+	}
+	if e, _, err := a.LookupEnrollment(ctx, PoolNodeName("pa")); err != nil || e.State != EnrollApproved || e.CertPEM == "" {
+		t.Fatalf("the admission after a refused denial: %+v, %v", e, err)
+	}
+	if err := a.DecideEnrollment(ctx, PoolNodeName("pa"), "SHA256:k", EnrollApproved, "cert-2", "0b"); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("a second approval answered %v", err)
+	}
+
+	tokB := placedOrder(t, a, "pb")
+	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pb"), "SHA256:b", "csr-SHA256:b", tokB); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.DecideEnrollment(ctx, PoolNodeName("pb"), "SHA256:b", EnrollDenied, "", ""); err != nil {
+		t.Fatalf("a denial of a waiting request: %v", err)
+	}
+	e, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pb", "SHA256:b", tokB, "0c"))
+	if err != nil || e.State != EnrollDenied {
+		t.Fatalf("the admission after a denial: %+v, %v", e, err)
+	}
+	if o := readOrder(t, a, "pb"); o.NodeName != "" {
+		t.Fatalf("a denied key's order was linked: %+v", o)
 	}
 }

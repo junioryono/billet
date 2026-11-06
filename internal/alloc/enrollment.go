@@ -26,6 +26,10 @@ const (
 // machine today, under a name they already trust.
 var ErrEnrollmentConflict = errors.New("alloc: another key has already requested this node name")
 
+// ErrNotPending means the request a person is deciding about was decided already, by
+// another person or, for a pool host, by its source's word.
+var ErrNotPending = errors.New("alloc: this request is not waiting for a decision")
+
 // Enrollment is a machine asking to join, and what was decided.
 type Enrollment struct {
 	Name        string
@@ -381,6 +385,19 @@ func (a *Allocator) DecideEnrollment(
 				"alloc: %s is asking to join with fingerprint %s, not %s; check the value the "+
 					"node printed, and do not approve one you cannot account for",
 				name, existing.Fingerprint, fingerprint)
+		}
+
+		// ONLY A REQUEST STILL WAITING, read in the transaction that decides it: a pool
+		// host its source vouched for is admitted between a person's reading and their
+		// word, and a denial written over that admission would leave its certificate
+		// working, unrevoked, and the record saying denied.
+		if existing.State != EnrollPending {
+			if existing.State == EnrollApproved {
+				return fmt.Errorf("%w: %s was approved already and holds a certificate; take it back with "+
+					"`billet nodes revoke %s`", ErrNotPending, name, name)
+			}
+
+			return fmt.Errorf("%w: %s is %s already", ErrNotPending, name, existing.State)
 		}
 
 		if err := q.DecideEnrollment(ctx, ledgerdb.DecideEnrollmentParams{
