@@ -839,6 +839,8 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 	runIn(t, dir, "tag", "-a", "-m", "unreleased", "v1.0.0")
 	runIn(t, dir, "config", "push.followTags", "true")
 	runIn(t, dir, "config", "push.recurseSubmodules", "only")
+	// AN INHERITED GIT_LITERAL_PATHSPECS still finds the tracked workflow by its name.
+	t.Setenv("GIT_LITERAL_PATHSPECS", "1")
 
 	// The repository named in another case than origin's: the pull request goes to it
 	// as named, from the branch on the fork origin pushes to.

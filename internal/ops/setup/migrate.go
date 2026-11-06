@@ -904,7 +904,11 @@ func runToolWith(ctx context.Context, dir string, stdin io.Reader, name string, 
 	proc.Stderr = &stderr
 	output, err := proc.Output()
 	if err != nil {
-		return "", fmt.Errorf("%s %s: %w: %s", name, args[0], err, withoutCredentials(strings.TrimSpace(stderr.String())))
+		subcommand := ""
+		if i := slices.IndexFunc(args, func(a string) bool { return !strings.HasPrefix(a, "-") }); i >= 0 {
+			subcommand = args[i]
+		}
+		return "", fmt.Errorf("%s %s: %w: %s", name, subcommand, err, withoutCredentials(strings.TrimSpace(stderr.String())))
 	}
 
 	return string(output), nil
@@ -939,17 +943,21 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 	if err != nil {
 		return err
 	}
-	// EACH FILE NAMED LITERALLY: a pathspec is a pattern, so a workflow named
-	// `[ab].yml` would otherwise answer for a tracked `a.yml`, `--` notwithstanding.
+	// EACH FILE NAMED LITERALLY, by git's own --literal-pathspecs: a pathspec is a
+	// pattern, so a workflow named `[ab].yml` would otherwise answer for a tracked
+	// `a.yml`, `--` notwithstanding. A `:(literal)` prefix is no answer, since an
+	// inherited GIT_LITERAL_PATHSPECS makes it part of the name; another inherited
+	// pathspec setting makes git refuse the flag, and the check below with it.
 	var changed []string
 	for i := range plan.files {
 		if !bytes.Equal(plan.files[i].before, plan.files[i].after) {
-			changed = append(changed, ":(literal)"+filepath.FromSlash(plan.files[i].name))
+			changed = append(changed, filepath.FromSlash(plan.files[i].name))
 		}
 	}
 	// ONLY FILES GIT TRACKS: an ignored workflow would be written and then refused by
 	// git add, with the branch already made.
-	if _, err := runGit(ctx, path, append([]string{"ls-files", "--error-unmatch", "--"}, changed...)...); err != nil {
+	if _, err := runGit(ctx, path, append([]string{"--literal-pathspecs", "ls-files", "--error-unmatch", "--"},
+		changed...)...); err != nil {
 		return fmt.Errorf("billet migrate workflows: --open-pr commits the workflows it changes, and git does not "+
 			"track every one of them; nothing was changed: %w", err)
 	}
@@ -980,7 +988,7 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 		return stopped(err, "creating it")
 	}
 
-	if _, err := runGit(ctx, path, append([]string{"add", "--"}, changed...)...); err != nil {
+	if _, err := runGit(ctx, path, append([]string{"--literal-pathspecs", "add", "--"}, changed...)...); err != nil {
 		return stopped(err, "writing the files")
 	}
 
