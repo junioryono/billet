@@ -162,7 +162,7 @@ func dialableFromElsewhere(host string) bool {
 	}
 	ip := net.ParseIP(h)
 
-	return ip == nil || !(ip.IsLoopback() || ip.IsUnspecified())
+	return ip == nil || (!ip.IsLoopback() && !ip.IsUnspecified())
 }
 
 // validatePool checks server.pool.

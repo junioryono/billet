@@ -100,9 +100,11 @@ func TestFetchCAReturnsOnlyThePinnedAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(nodeapi.CAResponse{
+		if err := json.NewEncoder(w).Encode(nodeapi.CAResponse{
 			CAPEM: string(ca.CertPEM()) + string(other.CertPEM()), Deployment: "0123456789abcdef0123456789abcdef",
-		})
+		}); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
 	}))
 	t.Cleanup(srv.Close)
 	got, _, err := FetchCA(t.Context(), srv.URL, ca.Fingerprint())

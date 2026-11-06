@@ -51,7 +51,7 @@ func Fingerprints(console, order string) []string {
 	seen := map[string]bool{}
 	for _, line := range strings.Split(console[first+1:last], "\n") {
 		m := wholeLine.FindStringSubmatch(line)
-		if m == nil || m[1] != order {
+		if len(m) != 3 || m[1] != order {
 			continue
 		}
 		fp := strings.TrimSpace(m[2])
