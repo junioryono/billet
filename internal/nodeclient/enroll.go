@@ -126,14 +126,16 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 
 	defer res.Body.Close()
 
+	// THE STATUS CODE, NEVER ITS TEXT: nothing on this connection is believed yet, and
+	// what an answer wrote reaches a pool host's console.
 	if res.StatusCode >= http.StatusInternalServerError {
-		return nil, "", fmt.Errorf("%w: the control plane returned %s for its authority", ErrUnreachable,
-			res.Status)
+		return nil, "", fmt.Errorf("%w: the control plane answered HTTP %d for its authority", ErrUnreachable,
+			res.StatusCode)
 	}
 
 	if res.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("nodeclient: the control plane returned %s for its authority",
-			res.Status)
+		return nil, "", fmt.Errorf("nodeclient: the control plane answered HTTP %d for its authority",
+			res.StatusCode)
 	}
 
 	var body nodeapi.CAResponse

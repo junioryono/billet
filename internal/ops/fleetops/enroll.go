@@ -17,6 +17,7 @@ import (
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/joinconsole"
 	"github.com/junioryono/billet/internal/nodeclient"
@@ -520,6 +521,12 @@ func EnrollNode(
 		return err
 	}
 
+	// THE FINGERPRINT PROVED THE AUTHORITY, NOT THE DEPLOYMENT BESIDE IT, which came on the
+	// same unverified connection, so it is printed only once it is a deployment's id.
+	if deploymentid.Validate(deployment) != nil {
+		return errors.New("the control plane names no deployment billet would mint")
+	}
+
 	name := cfg.Node.Name
 	if name == "" {
 		return errors.New("enrolling needs node.name: the certificate does not exist yet, so " +
@@ -677,7 +684,9 @@ func announceOnConsole(order, fingerprint string) error {
 		return err
 	}
 
-	_, werr := fmt.Fprintf(f, "%s\n", joinconsole.Line(order, fingerprint))
+	// ON A LINE OF ITS OWN, since only a whole line is read and the console may be
+	// part way through another.
+	_, werr := fmt.Fprintf(f, "\n%s\n", joinconsole.Line(order, fingerprint))
 
 	return errors.Join(werr, f.Close())
 }

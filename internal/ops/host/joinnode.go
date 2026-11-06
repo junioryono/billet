@@ -17,6 +17,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/initconfig"
+	"github.com/junioryono/billet/internal/joinconsole"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/ops/fleetops"
 	opsimages "github.com/junioryono/billet/internal/ops/images"
@@ -103,7 +104,7 @@ type joinRequest struct {
 //     operator to approve it;
 //  6. on a Mac the tier images, which a node refuses to pull inside a launch;
 //  7. `billet local up`.
-func joinNode(ctx context.Context, env cli.Env, args []string) error {
+func joinNode(ctx context.Context, env cli.Env, args []string) (err error) {
 	req, err := parseJoin(env, args)
 	if err != nil {
 		return err
@@ -111,6 +112,20 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 
 	if err := refuseJoin(req); err != nil {
 		return err
+	}
+
+	// A POOL HOST'S OUTPUT REACHES ITS CONSOLE, which its source reads for the one line
+	// naming its key, so nothing it prints may stand for that line.
+	if req.poolOrder != "" {
+		stdout, stderr := joinconsole.NewGuard(env.Stdout), joinconsole.NewGuard(env.Stderr)
+		env.Stdout, env.Stderr = stdout, stderr
+
+		// THE ANSWER TOO, which the caller prints past the guard.
+		defer func() {
+			_ = stdout.Flush() //nolint:errcheck // the join's own answer is what this returns
+			_ = stderr.Flush() //nolint:errcheck // the join's own answer is what this returns
+			err = joinconsole.GuardError(err)
+		}()
 	}
 
 	base := "https://" + req.server

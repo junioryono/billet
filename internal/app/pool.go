@@ -220,8 +220,8 @@ func PoolBoot(cfg *config.Config, prelude, fingerprint, order, token string) ([]
 		"--token", token, "--node-name", alloc.PoolNodeName(order), "--pool-order", order,
 		"--provider", string(config.ProviderFirecracker),
 	}
-	if pc.BootstrapAddr != "" {
-		join = append(join, "--bootstrap-addr", pc.BootstrapAddr)
+	if addr := cfg.Server.PoolEnrollAddr(); addr != "" {
+		join = append(join, "--bootstrap-addr", addr)
 	}
 	switch {
 	case cfg.GitHub != nil && cfg.GitHub.Org != "":

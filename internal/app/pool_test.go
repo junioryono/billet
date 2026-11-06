@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -325,5 +326,21 @@ func TestTheHostsAddressIsSeenOnlyWithoutARouter(t *testing.T) {
 	cfg.Server.TLSRouter = &config.TLSRouterConfig{}
 	if seesHostAddress(cfg) {
 		t.Fatal("a listener behind a router sees the host's address")
+	}
+}
+
+// A BOOT WITH NO bootstrap_addr DIALS THE ENROLLMENT LISTENER ITSELF, never the node wire,
+// which wants a certificate an ordered host does not have yet.
+func TestAPoolHostsBootDialsTheEnrollmentListener(t *testing.T) {
+	t.Parallel()
+	cfg := poolBootConfig()
+	cfg.Server.Pool.BootstrapAddr, cfg.Server.BootstrapListen = "", "10.77.0.10:7719"
+	boot, err := PoolBoot(cfg, "true\n", "SHA256:ab", "p01", "tok")
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	args, _ := runBoot(t, boot)
+	if i := slices.Index(args, "--bootstrap-addr"); i < 0 || i+1 >= len(args) || args[i+1] != "10.77.0.10:7719" {
+		t.Fatalf("join ran as %q, want it to dial the enrollment listener", args)
 	}
 }

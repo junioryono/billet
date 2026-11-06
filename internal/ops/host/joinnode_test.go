@@ -13,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/joinconsole"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -24,11 +25,13 @@ type joinFakes struct {
 	// fetchErr fails the authority; generated is what the fake init writes at
 	// the service path ("" writes nothing, as init does beside a foreign file).
 	fetchErr error
-	// fetchErrs, when set, answers the authority's first asks in turn before fetchErr.
-	fetchErrs []error
-	generated string
-	initArgs  []string
-	sudoCalls []string
+	// fetchErrs, when set, answers the authority's first asks in turn before fetchErr;
+	// lastFetchErr is the last of them answered.
+	fetchErrs    []error
+	lastFetchErr error
+	generated    string
+	initArgs     []string
+	sudoCalls    []string
 	// sshdErr fails the fake `sudo sshd -t`.
 	sshdErr  error
 	upConfig string
@@ -101,7 +104,7 @@ func stageJoin(t *testing.T, f *joinFakes) string {
 		f.record("fetch " + base + " " + fp)
 		if len(f.fetchErrs) > 0 {
 			err := f.fetchErrs[0]
-			f.fetchErrs = f.fetchErrs[1:]
+			f.fetchErrs, f.lastFetchErr = f.fetchErrs[1:], err
 
 			return joinAuthority{}, err
 		}
@@ -560,5 +563,28 @@ func TestAPoolHostsJoinAsksAgainForAnAuthorityItLost(t *testing.T) {
 		if len(f.trace) != 1 {
 			t.Fatalf("%s: the join went on: %v", name, f.trace)
 		}
+	}
+}
+
+// NOTHING A POOL HOST'S JOIN PRINTS OR ANSWERS NAMES A KEY on the console its source
+// reads: an answer that carried a forged line reaches the console through the join's
+// output and through the error it returns, and neither reads as the host's line.
+func TestAPoolHostsJoinPrintsNoKeyLine(t *testing.T) {
+	onPlatform(t, "darwin", 501)
+	forged := joinconsole.Line("p01", "SHA256:"+strings.Repeat("F", 43))
+	lost := fmt.Errorf("%w: 503 \r\n%s\r", nodeclient.ErrUnreachable, forged)
+	refused := fmt.Errorf("refused \n%s\n", forged)
+
+	f := &joinFakes{generated: joinedNodeConfig, fetchErrs: []error{lost, refused}}
+	stageJoin(t, f)
+	var out strings.Builder
+	env := cli.Env{Stdout: &out, Stderr: &out, Stdin: strings.NewReader(""), Getenv: func(string) string { return "" }}
+	err := Join(t.Context(), env, append(slices.Clone(joinArgs), "--pool-order", "p01"))
+	if err == nil || !errors.Is(err, f.lastFetchErr) {
+		t.Fatalf("join answered %v", err)
+	}
+	console := out.String() + "\n" + err.Error() + "\n"
+	if got := joinconsole.Fingerprints(console, "p01"); len(got) != 0 || !strings.Contains(out.String(), "did not arrive") {
+		t.Fatalf("the console would read %v from:\n%s", got, console)
 	}
 }

@@ -51,7 +51,8 @@ func TestAPoolHostSaysItsFingerprintOnTheConsole(t *testing.T) { //nolint:parall
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "boot output\n" + joinconsole.Line("pa", realFP) + "\n" + joinconsole.Line("pa", realFP) + "\n"
+	// EACH ON A LINE OF ITS OWN, whatever the console was part way through.
+	want := "boot output\n\n" + joinconsole.Line("pa", realFP) + "\n\n" + joinconsole.Line("pa", realFP) + "\n"
 	if string(raw) != want {
 		t.Fatalf("the console holds %q, want %q", raw, want)
 	}
@@ -99,8 +100,10 @@ type joinRecorder struct {
 	cancel                   context.CancelFunc
 	cancelAt                 int
 	// servedBy, when set, signs the listener's certificate in place of ca, which the
-	// recorder still answers as the deployment's.
-	servedBy *wirecert.CA
+	// recorder still answers as the deployment's; deployment, when set, is the
+	// deployment the authority's answer names.
+	servedBy   *wirecert.CA
+	deployment string
 }
 
 // The faults a joinRecorder answers with: the connection ended before any answer, an
@@ -109,7 +112,13 @@ type joinRecorder struct {
 const (
 	faultAbort = "abort"
 	faultBody  = "body"
+	// faultReason answers 404 with a reason phrase of its own, as anything that answers
+	// the unverified connection may.
+	faultReason = "reason"
 )
+
+// secretReason is the reason phrase faultReason writes.
+const secretReason = "the secret reason"
 
 // fault answers w with the named fault and reports whether it did.
 func fault(w http.ResponseWriter, name string) bool {
@@ -118,6 +127,16 @@ func fault(w http.ResponseWriter, name string) bool {
 		return false
 	case faultAbort:
 		panic(http.ErrAbortHandler)
+	case faultReason:
+		conn, buf, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			panic(http.ErrAbortHandler)
+		}
+		_, _ = buf.WriteString("HTTP/1.1 404 " + secretReason + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") //nolint:errcheck // the host sees what arrived
+		_ = buf.Flush()                                                                                               //nolint:errcheck // the host sees what arrived
+		_ = conn.Close()                                                                                              //nolint:errcheck // the answer is written
+
+		return true
 	case faultBody:
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -169,8 +188,14 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if fault(w, f) {
 			return
 		}
+		j.mu.Lock()
+		deployment := j.deployment
+		j.mu.Unlock()
+		if deployment == "" {
+			deployment = "0123456789abcdef0123456789abcdef"
+		}
 		answer(w, nodeapi.CAResponse{CAPEM: string(j.ca.CertPEM()), Fingerprint: j.ca.Fingerprint(),
-			Deployment: "0123456789abcdef0123456789abcdef"})
+			Deployment: deployment})
 	case "/v1/enroll":
 		var req nodeapi.EnrollRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -522,5 +547,31 @@ func TestApprovingAPoolRequestLinksItsOrder(t *testing.T) {
 	}
 	if o.NodeName != alloc.PoolNodeName("pa") || o.NodeFingerprint != fp || o.NodeCertSerial != certs[0].Serial {
 		t.Fatalf("the order after a person's approval: %+v, want linked with serial %s", o, certs[0].Serial)
+	}
+}
+
+// NOTHING THE UNVERIFIED CONNECTION WROTE IS PRINTED: the fingerprint proves the
+// authority and nothing beside it, so a deployment that is no deployment's id ends the
+// join unprinted, and a status's reason phrase is never quoted.
+func TestAJoinQuotesNothingTheUnverifiedAnswerWrote(t *testing.T) { //nolint:paralleltest // shared vars
+	forged := "x\n" + joinconsole.Line("pa", realFP)
+	rec, srv, cfg, ca, _ := servePoolJoin(t, func(j *joinRecorder) { j.deployment = forged })
+	var out bytes.Buffer
+	err := EnrollNode(bounded(t), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa")
+	if err == nil || !strings.Contains(err.Error(), "names no deployment") || strings.Contains(out.String()+err.Error(), "billet-pool-join") {
+		t.Fatalf("a forged deployment answered %v, printing %q", err, out.String())
+	}
+	rec.mu.Lock()
+	asked := len(rec.requests)
+	rec.mu.Unlock()
+	if asked != 0 {
+		t.Fatalf("a forged deployment was asked to join %d times", asked)
+	}
+
+	_, srv, cfg, ca, _ = servePoolJoin(t, func(j *joinRecorder) { j.caFaults = []string{faultReason} })
+	out.Reset()
+	err = EnrollNode(bounded(t), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa")
+	if err == nil || !strings.Contains(err.Error(), "404") || strings.Contains(out.String()+err.Error(), secretReason) {
+		t.Fatalf("a reason phrase answered %v, printing %q", err, out.String())
 	}
 }

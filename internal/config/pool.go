@@ -130,6 +130,25 @@ func (p *PoolConfig) ShapeArch(source, shape string) (Arch, bool) {
 	return "", false
 }
 
+// PoolEnrollAddr is the enrollment listener an ordered host dials: server.pool's
+// bootstrap_addr when it is given, else the TLS router's enroll_addr, else
+// server.bootstrap_listen when it names a host one can dial. Empty when there is none,
+// which validation refuses.
+func (s *ServerConfig) PoolEnrollAddr() string {
+	if s.Pool != nil && strings.TrimSpace(s.Pool.BootstrapAddr) != "" {
+		return strings.TrimSpace(s.Pool.BootstrapAddr)
+	}
+	if s.TLSRouter != nil && strings.TrimSpace(s.TLSRouter.EnrollAddr) != "" {
+		return strings.TrimSpace(s.TLSRouter.EnrollAddr)
+	}
+	addr := strings.TrimSpace(s.BootstrapListen)
+	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" && !net.ParseIP(host).IsUnspecified() {
+		return addr
+	}
+
+	return ""
+}
+
 // validatePool checks server.pool.
 func (s *ServerConfig) validatePool() []error {
 	p := s.Pool
@@ -147,6 +166,17 @@ func (s *ServerConfig) validatePool() []error {
 		if host, port, err := net.SplitHostPort(p.BootstrapAddr); err != nil || host == "" || port == "" {
 			errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr %q must be host:port", p.BootstrapAddr))
 		}
+	}
+	// AN ORDERED HOST JOINS OVER THE NETWORK OR NOT AT ALL: the node wire wants a
+	// certificate it does not have yet, so without an enrollment listener it could
+	// never ask, and it is billed meanwhile.
+	switch {
+	case strings.TrimSpace(s.BootstrapListen) == "":
+		errs = append(errs, errors.New("server.pool needs server.bootstrap_listen: without it this control "+
+			"plane enrolls nothing over the network, so no host the pool orders could ever join"))
+	case s.PoolEnrollAddr() == "":
+		errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr is required: server.bootstrap_listen %q "+
+			"names no host an ordered host can dial", s.BootstrapListen))
 	}
 	if p.BootPrelude == "" || !filepath.IsAbs(p.BootPrelude) {
 		errs = append(errs, fmt.Errorf("server.pool.boot_prelude %q must be an absolute path to the script a "+
