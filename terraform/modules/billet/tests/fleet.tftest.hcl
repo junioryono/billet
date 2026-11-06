@@ -1392,3 +1392,21 @@ run "a_boundary_that_is_no_policy_arn_is_refused" {
 
   expect_failures = [var.node_permissions_boundary_arn]
 }
+
+# A ROLE IS NO BOUNDARY: IAM takes only a managed policy, and an ARN that names a role
+# would plan and then fail at apply.
+run "a_boundary_that_names_a_role_is_refused" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id                        = "vpc-0f0f0f0f0f0f0f0f0"
+    name                          = "billet-test"
+    node_permissions_boundary_arn = "arn:aws:iam::123456789012:role/billet-test-boundary"
+  }
+
+  expect_failures = [var.node_permissions_boundary_arn]
+}

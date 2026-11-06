@@ -236,7 +236,7 @@ variable "job_instance_profile_role_arn" {
 }
 
 variable "node_permissions_boundary_arn" {
-  description = "A managed policy ARN to set as the node role's permissions boundary, or empty for none. The boundary caps whatever is ever put on the role, inline policies another principal adds included: an operator whose automation may add a deployment-scoped grant to the role for a while (the acceptance matrix puts each run's `billet init iam` policy there) sets one so that grant can never exceed it. It caps the module's own policy too, so it must allow at least what that policy grants."
+  description = "A managed policy ARN to set as the node role's permissions boundary, or empty for none. The boundary caps whatever is ever put on the role, inline policies another principal adds included: an operator whose automation may add a deployment-scoped grant to the role for a while (the acceptance matrix puts each run's `billet init iam` policy there) sets one so that grant can never exceed it. It caps every policy this module puts on the role too (the node policy, pass_role, spot and builder, and in the root the controller's backup grant, because there the node role is the control plane's), so it must allow all of them, or backups, spot and PassRole launches are refused. It does not cap job_instance_profile_role_arn, a role the node may pass, which must be bounded or narrower on its own."
   type        = string
   default     = ""
 
