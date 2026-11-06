@@ -41,6 +41,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -174,6 +175,9 @@ type Provider struct {
 	// snapshot was not taken on.
 	cpuinfoPath string
 	hostKernel  func() (string, error)
+	// goarch is this host's machine, and so its guests'. A seam because the other
+	// machine's boot arguments would otherwise be unreachable from a test.
+	goarch string
 	// digests remembers the digests of the VMM binary and the guest kernels.
 	digests fileDigests
 	// jailWrote reports whether a file in a jail is one its VMM wrote. A seam
@@ -363,6 +367,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		tapOwner:    sysTapOwner,
 		cpuinfoPath: "/proc/cpuinfo",
 		hostKernel:  unameKernel,
+		goarch:      runtime.GOARCH,
 		jailWrote:   jailWritten,
 		bootWait:    DefaultBootWait,
 	}
@@ -1048,7 +1053,7 @@ func (p *Provider) configure(
 		}},
 		{"/boot-source", map[string]any{
 			"kernel_image_path": "/" + guestKernel,
-			"boot_args":         bootArgs,
+			"boot_args":         bootArgs(p.goarch),
 		}},
 		{"/drives/rootfs", map[string]any{
 			"drive_id":       "rootfs",
@@ -1239,7 +1244,8 @@ const GuestContract = "10"
 // fails on an HTTP request.
 const mmdsSizeLimit = 51200
 
-// bootArgs is the guest kernel command line.
+// bootArgs is the guest kernel command line on a host of goarch, which is the guest's
+// machine too.
 //
 // `console=` IS ABSENT ON PURPOSE. A serial console costs boot time on every job,
 // and under --daemonize the VMM's stdout is /dev/null, so it would be written
@@ -1248,9 +1254,16 @@ const mmdsSizeLimit = 51200
 //
 // `pci=off` and the i8042 options are Firecracker's own documented arguments for a
 // machine with no PCI bus and no keyboard controller; without them the guest spends
-// its first seconds probing hardware that is not there.
-const bootArgs = "reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd " +
-	"root=/dev/vda rw"
+// its first seconds probing hardware that is not there. An arm64 kernel has no i8042
+// driver to tell, so only x86 is given them.
+func bootArgs(goarch string) string {
+	if goarch == "arm64" {
+		return "reboot=k panic=1 pci=off root=/dev/vda rw"
+	}
+
+	return "reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd " +
+		"root=/dev/vda rw"
+}
 
 // guestInterface is the one network device a guest gets.
 const guestInterface = "eth0"

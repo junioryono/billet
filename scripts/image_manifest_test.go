@@ -133,7 +133,7 @@ func writeManifest(t *testing.T, dir string, partBytes int, leftOut, measured st
 
 	image := makeRootfs(t, dir, 4096)
 	kernel := filepath.Join(dir, "vmlinux-billet")
-	if err := os.WriteFile(kernel, []byte("Linux version 6.1.155 (billet@test)\n"), 0o600); err != nil {
+	if err := os.WriteFile(kernel, x86Kernel(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	info := filepath.Join(dir, "build-info.env")
@@ -305,7 +305,7 @@ func runManifestWriterIn(t *testing.T, dir, image string, partBytes int) imageso
 
 	// THE WRITER READS A VERSION OUT OF THE KERNEL with `strings`, and refuses a
 	// binary it cannot identify -- so the fixture has to carry that exact line.
-	if err := os.WriteFile(kernel, []byte("Linux version 6.1.155 (billet@test)\n"), 0o600); err != nil {
+	if err := os.WriteFile(kernel, x86Kernel(), 0o600); err != nil {
 		t.Fatalf("write a kernel: %v", err)
 	}
 
@@ -340,6 +340,83 @@ func runManifestWriterIn(t *testing.T, dir, image string, partBytes int) imageso
 	}
 
 	return *m
+}
+
+// kernelBanner is the line the writer reads a kernel's version from.
+const kernelBanner = "\nLinux version 6.1.155 (billet@test)\n"
+
+// x86Kernel is as much of an x86-64 ELF vmlinux as the writer reads.
+func x86Kernel() []byte {
+	return append(elfHeader(62), kernelBanner...)
+}
+
+// arm64Kernel is as much of an arm64 Image as the writer reads: its magic at offset 56.
+func arm64Kernel() []byte {
+	header := make([]byte, 60, 60+len(kernelBanner))
+	copy(header[56:], "ARM\x64")
+
+	return append(header, kernelBanner...)
+}
+
+// A KERNEL THE MACHINE'S VMM CANNOT LOAD IS NOT DESCRIBED. Firecracker refuses it at
+// every boot, on every node of that machine, after the manifest naming it was signed,
+// and a kernel from the wrong cache or the wrong tree is how one gets here.
+func TestTheManifestRefusesAKernelItsMachineCannotLoad(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		arch   string
+		kernel []byte
+		says   string
+	}{
+		"x86_64 and its ELF":     {arch: "x86_64", kernel: x86Kernel()},
+		"aarch64 and its Image":  {arch: "aarch64", kernel: arm64Kernel()},
+		"x86_64 and an Image":    {arch: "x86_64", kernel: arm64Kernel(), says: "not an x86-64 ELF"},
+		"x86_64 and arm64's ELF": {arch: "x86_64", kernel: append(elfHeader(183), kernelBanner...), says: "not an x86-64 ELF"},
+		// x86-64'S MACHINE NUMBER IN WHAT IS NO ELF, which only the magic can tell.
+		"x86_64 and no ELF": {arch: "x86_64", kernel: func() []byte {
+			corrupt := x86Kernel()
+			corrupt[0] = 0
+
+			return corrupt
+		}(), says: "not an x86-64 ELF"},
+		"aarch64 and an ELF":      {arch: "aarch64", kernel: x86Kernel(), says: "no arm64 Image magic"},
+		"a machine with no guest": {arch: "riscv64", kernel: x86Kernel(), says: "x86_64 and aarch64 only"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			kernel := filepath.Join(dir, "vmlinux-billet")
+
+			if err := os.WriteFile(kernel, tc.kernel, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			info := filepath.Join(dir, "build-info.env")
+			body := "RUNNER_VERSION=2.336.0\nGUEST_CONTRACT=9\nARCH=" + tc.arch + "\n"
+
+			if err := os.WriteFile(info, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.CommandContext(t.Context(), repoScript(t, "write-image-manifest.sh"))
+			cmd.Env = append(os.Environ(), "ROOTFS="+makeRootfs(t, dir, 4096), "KERNEL="+kernel, "INFO="+info)
+
+			out, err := cmd.CombinedOutput()
+			if tc.says == "" {
+				if err != nil {
+					t.Fatalf("refused it (%v):\n%s", err, out)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(string(out), tc.says) {
+				t.Fatalf("answered %v, want a refusal saying %q:\n%s", err, tc.says, out)
+			}
+		})
+	}
 }
 
 func repoScript(t *testing.T, name string) string {
