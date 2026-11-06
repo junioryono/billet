@@ -70,7 +70,14 @@ type Store struct {
 	owner   string
 	blocks  blockAPI
 	objects objectAPI
-	now     func() time.Time
+	// bulk reaches whole objects: the half of the store for a cache whose unit is a
+	// file (archive.go, ADR-024).
+	bulk bulkAPI
+	// readAhead is a slot per read allowed to hold chunks in memory.
+	readAhead chan struct{}
+	// rejoining is a slot per commit allowed to hold a part in memory.
+	rejoining chan struct{}
+	now       func() time.Time
 }
 
 var _ storecontract.Store = (*Store)(nil)
@@ -104,6 +111,10 @@ func withNow(now func() time.Time) option {
 	}
 }
 
+func withBulk(bulk bulkAPI) option {
+	return func(s *Store) { s.bulk = bulk }
+}
+
 func newStore(
 	cfg config.EBSS3Config,
 	owner string,
@@ -111,7 +122,11 @@ func newStore(
 	objects objectAPI,
 	opts ...option,
 ) *Store {
-	s := &Store{cfg: cfg, owner: owner, blocks: blocks, objects: objects, now: time.Now}
+	s := &Store{
+		cfg: cfg, owner: owner, blocks: blocks, objects: objects, now: time.Now,
+		readAhead: make(chan struct{}, readAheadReaders),
+		rejoining: make(chan struct{}, rejoinsAtOnce),
+	}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -747,6 +762,13 @@ func (s Store) Evict(ctx context.Context, olderThan time.Duration) error {
 		return errors.New("ebs-s3: cache eviction needs a positive inactivity age")
 	}
 
+	// EACH HALF WHATEVER THE OTHER DID: one snapshot that refuses deletion must not
+	// leave every archive and unfinished upload billing.
+	return errors.Join(s.evictVolumes(ctx, olderThan), s.evictObjects(ctx, olderThan))
+}
+
+// evictVolumes is eviction's half for what jobs mount.
+func (s Store) evictVolumes(ctx context.Context, olderThan time.Duration) error {
 	keys, err := s.objects.List(ctx, s.statePrefix())
 	if err != nil {
 		return err
@@ -914,9 +936,12 @@ func (s Store) evictDelete(
 
 // PurgeReport counts what Purge removed.
 type PurgeReport struct {
-	Snapshots      int
-	Volumes        int
-	StateObjects   int
+	Snapshots    int
+	Volumes      int
+	StateObjects int
+	// CacheObjects counts archives, content-addressed entries, their records and
+	// unfinished uploads.
+	CacheObjects   int
 	SkippedForeign int
 }
 
@@ -1003,6 +1028,11 @@ func (s Store) Purge(ctx context.Context) (PurgeReport, error) {
 		} else {
 			report.SkippedForeign++
 		}
+	}
+
+	report.CacheObjects, err = s.purgeObjects(ctx)
+	if err != nil {
+		return report, err
 	}
 
 	// The state index LAST, so an interrupted purge leaves it pointing at blocks a

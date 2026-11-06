@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 41
+	Version = 43
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -560,6 +560,26 @@ const (
 	// test holds equal), and such a tier is refused to one at dispatch and again at
 	// delivery.
 	VersionTartVerified = 41
+
+	// VersionEC2GuestCaches is the version from which an EC2 node carries the caches
+	// it serves to a guest into that guest's boot script (ADR-024).
+	//
+	// REPORTED BY DOING LESS, WHERE THE LAUNCH IS SENT: an older EC2 node refuses a
+	// launch that names a guest cache, which would fail every job on a tier that
+	// merely has them by default. So the plane sends it the tier's cache block with
+	// them off, and its job runs as it did before them. Delivery holds a launch that
+	// names them to a node at this version or above.
+	VersionEC2GuestCaches = 42
+
+	// VersionPoolJoin is the version from which an enrollment may carry what a pool
+	// host's platform signed about it (EnrollRequest's identity_document and
+	// identity_signature), which its order's source checks before it vouches (ADR-030).
+	//
+	// ENROLLMENT NEGOTIATES NO VERSION, so the gate is who sends them: only a pool
+	// host, `billet join --pool-order`, which a pool's own boot runs, so its control
+	// plane runs a pool and is at this version. An older plane's strict decoder refuses
+	// a request carrying them; an ordinary node never sends them.
+	VersionPoolJoin = 43
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
