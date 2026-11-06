@@ -5,7 +5,7 @@
 
 -- name: InsertJoinToken :exec
 -- Mint one join token. pool_order is the order a pool minted it for, and empty for
--- one an operator minted (migration 75).
+-- one an operator minted (migration 76).
 INSERT INTO join_tokens (token_sha256, note, uses_remaining, created_at, expires_at, pool_order)
 VALUES (@token_sha256, @note, @uses_remaining, @created_at, @expires_at, @pool_order);
 

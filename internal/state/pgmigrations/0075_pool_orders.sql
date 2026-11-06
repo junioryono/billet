@@ -1,6 +1,6 @@
--- migration 74: pool_orders, for PostgreSQL
+-- migration 75: pool_orders, for PostgreSQL
 --
--- The twin of migrations/0074_pool_orders.sql.
+-- The twin of migrations/0075_pool_orders.sql.
 
 -- +billet:statement
 CREATE TABLE pool_orders (

@@ -1,4 +1,4 @@
--- migration 75: pool_join
+-- migration 76: pool_join
 --
 -- HOW A POOL HOST JOINS FROM ITS ORDER (ADR-030, #553).
 --
@@ -20,7 +20,7 @@
 -- pool_orders.join_hold is why a person must look before the order admits anything:
 -- an enrollment whose key, document or address contradicted what the source says
 -- of the host, or a host whose tokens all lapsed with nothing admitted. It is a
--- column, not a state, because migration 74's states are frozen, and it is set once,
+-- column, not a state, because migration 75's states are frozen, and it is set once,
 -- the first reason kept.
 
 -- +billet:statement
@@ -47,7 +47,7 @@ ALTER TABLE pool_orders ADD COLUMN node_cert_serial TEXT NOT NULL DEFAULT ''
 ALTER TABLE pool_orders ADD COLUMN join_hold TEXT NOT NULL DEFAULT ''
 -- +billet:end
 
--- WHAT MIGRATION 74 LEFT IS BOUND TO ITS ORDER: a pool then minted each order's token
+-- WHAT MIGRATION 75 LEFT IS BOUND TO ITS ORDER: a pool then minted each order's token
 -- with the note `pool order <order>` and named the host `pool-<order>`, so a token and a
 -- request of a recorded order are that order's, and a host booted before this joins
 -- under the rules after it.

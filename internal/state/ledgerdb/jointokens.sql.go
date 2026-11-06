@@ -30,7 +30,7 @@ type InsertJoinTokenParams struct {
 // The token is never stored. What the table holds is its sha256, which is why
 // every statement here takes a hash rather than a secret.
 // Mint one join token. pool_order is the order a pool minted it for, and empty for
-// one an operator minted (migration 75).
+// one an operator minted (migration 76).
 func (q *Queries) InsertJoinToken(ctx context.Context, arg InsertJoinTokenParams) error {
 	_, err := q.db.ExecContext(ctx, insertJoinToken,
 		arg.TokenSha256,

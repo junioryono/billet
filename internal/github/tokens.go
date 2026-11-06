@@ -134,8 +134,8 @@ type TokenScope struct {
 
 // ScopeFor is the scope a deployment needs for one target: exactly the permissions
 // billet asks of an App for it, and for a repository target that repository alone.
-func ScopeFor(target Target, runEvidence bool) TokenScope {
-	scope := TokenScope{Permissions: Permissions(target.Scope(), runEvidence)}
+func ScopeFor(target Target, actions ActionsAccess) TokenScope {
+	scope := TokenScope{Permissions: Permissions(target.Scope(), actions)}
 	if target.Scope() == ScopeRepository {
 		scope.Repositories = []string{target.Repository}
 	}

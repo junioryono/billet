@@ -151,7 +151,7 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo,
 -- unknown result is "could not tell", and collapsing that into "fine" would hide
 -- exactly the job an operator came here looking for.
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
-       result, failure_reason, disruption, disrupted_at, result_at
+       result, failure_reason, disruption, disrupted_at, result_at, rerun_decision, rerun_attempt
   FROM job_history
  WHERE disruption != '' AND result != '' AND result != @succeeded
    AND result_at >= @since
@@ -525,7 +525,7 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
-       holder_incarnation, head_sha, head_branch, run_attempt
+       holder_incarnation, head_sha, head_branch, run_attempt, rerun_decision, rerun_decided_at, rerun_attempt
   FROM job_history WHERE lease_id = @lease_id;
 
 -- name: ListJobsOfRun :many

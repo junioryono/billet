@@ -5,13 +5,13 @@ import (
 	"testing"
 )
 
-// MIGRATION 75 BINDS WHAT MIGRATION 74 LEFT TO ITS ORDER: a token a pool minted with the
+// MIGRATION 76 BINDS WHAT MIGRATION 75 LEFT TO ITS ORDER: a token a pool minted with the
 // note `pool order <order>`, and a request named `pool-<order>`, are that order's when
 // the order is recorded, and nothing else is: an operator's token, a note or a name
 // naming no recorded order. A host already approved from a placed order is linked to it
 // with its key and its newest certificate's serial, and the order's tokens are retired;
 // one still pending is not linked.
-func TestMigration75BindsAnOrdersEarlierTokensAndRequests(t *testing.T) {
+func TestMigration76BindsAnOrdersEarlierTokensAndRequests(t *testing.T) {
 	t.Parallel()
 
 	dir := rewoundLedger(t)

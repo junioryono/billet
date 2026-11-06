@@ -1,6 +1,6 @@
--- migration 75: pool_join, for PostgreSQL
+-- migration 76: pool_join, for PostgreSQL
 --
--- The twin of migrations/0075_pool_join.sql.
+-- The twin of migrations/0076_pool_join.sql.
 --
 -- It carries that file's statements with SQLite's spellings translated and
 -- nothing else changed, so the two read side by side. The reasoning lives

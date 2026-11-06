@@ -12,7 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
-// Pool order states (migration 74). Every move is one way.
+// Pool order states (migration 75). Every move is one way.
 const (
 	PoolOrdering  = "ordering"
 	PoolPlaced    = "placed"

@@ -99,9 +99,13 @@ type installation struct {
 	appID          int64
 	installationID int64
 	target         github.Target
-	runEvidence    bool
-	key            github.AppKey
-	base           string
+	// actions is what this registration's tokens carry, and installationActions the
+	// most any registration of the same installation asks: what the installation
+	// itself must hold, since it is one grant whoever shares it.
+	actions             github.ActionsAccess
+	installationActions github.ActionsAccess
+	key                 github.AppKey
+	base                string
 
 	tokens github.TokenSource
 
@@ -186,14 +190,41 @@ func NewServer(cfg *config.BrokerConfig, log *slog.Logger) (*Server, error) {
 			s.installations[keyOf(d.ID, reg.AppID, reg.InstallationID, reg.Target)] = &installation{
 				gate:       make(chan struct{}, 1),
 				deployment: d.ID, appID: reg.AppID, installationID: reg.InstallationID, target: target,
-				runEvidence: reg.ActionsRead, key: app.key, base: app.base,
+				actions: actionsOf(reg), key: app.key, base: app.base,
 				tokens: github.NewAppKeyTokensFor(app.base, reg.AppID, reg.InstallationID, app.key,
-					github.ScopeFor(target, reg.ActionsRead), mintFresh),
+					github.ScopeFor(target, actionsOf(reg)), mintFresh),
 			}
 		}
 	}
 
+	// AN INSTALLATION IS VERIFIED AGAINST WHAT EVERY REGISTRATION OF IT ASKS: two
+	// deployments may share one, and the grant one of them needs, write for a re-run,
+	// is then the installation's, while each token still carries only its own
+	// registration's. Verified against its own, a read-only deployment would be refused
+	// an installation another deployment's write had widened.
+	most := map[[2]int64]github.ActionsAccess{}
+	for _, inst := range s.installations {
+		id := [2]int64{inst.appID, inst.installationID}
+		most[id] = max(most[id], inst.actions)
+	}
+	for _, inst := range s.installations {
+		inst.installationActions = most[[2]int64{inst.appID, inst.installationID}]
+	}
+
 	return s, nil
+}
+
+// actionsOf is how much of `actions` a registration grants its tokens: write includes
+// read.
+func actionsOf(reg *config.BrokerInstallation) github.ActionsAccess {
+	switch {
+	case reg.ActionsWrite:
+		return github.ActionsWrite
+	case reg.ActionsRead:
+		return github.ActionsRead
+	default:
+		return github.ActionsNone
+	}
 }
 
 func keyOf(deployment string, appID, installationID int64, target string) installationKey {
@@ -454,7 +485,7 @@ func (s *Server) proved(r *http.Request, inst *installation) (int, string, strin
 
 func verifyInstallation(r *http.Request, inst *installation) error {
 	_, err := github.VerifyAppAt(r.Context(), nil, inst.base, inst.appID, inst.key, inst.target,
-		inst.installationID, inst.runEvidence)
+		inst.installationID, inst.installationActions)
 
 	return err //nolint:wrapcheck // read through by proved, and logged whole.
 }
