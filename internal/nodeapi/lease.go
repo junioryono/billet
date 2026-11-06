@@ -246,3 +246,12 @@ func ParsePhase(s string) (lease.Phase, bool) {
 		return "", false
 	}
 }
+
+// LogChunkRequest sends one chunk of a job's log to be indexed (VersionJobLogs). Data is
+// the chunk as the guest sent it and the node stored it, joblog's codec, and FirstLine
+// where the node numbered its lines from.
+type LogChunkRequest struct {
+	Lease     string `json:"lease"`
+	FirstLine int64  `json:"first_line"`
+	Data      []byte `json:"data"`
+}

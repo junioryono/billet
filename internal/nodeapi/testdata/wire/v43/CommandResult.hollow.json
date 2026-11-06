@@ -1,4 +1,7 @@
 {
   "id": "",
-  "ok": false
+  "ok": false,
+  "log": {
+    "held": false
+  }
 }

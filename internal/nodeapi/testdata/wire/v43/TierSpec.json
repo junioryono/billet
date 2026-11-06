@@ -20,6 +20,7 @@
   },
   "cache": {
     "publish": "TierSpec.cache.publish",
+    "keep_logs": true,
     "owner": "TierSpec.cache.owner",
     "repository": "TierSpec.cache.repository",
     "docker": {

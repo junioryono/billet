@@ -12,6 +12,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/guestreport"
+	"github.com/junioryono/billet/internal/joblog"
 )
 
 // The guest-facing routes of billet's in-VM agent, served beside the caches on the
@@ -74,9 +75,11 @@ type guestChannel struct {
 	// so they are not refusals of a batch.
 	accepted, refused, dropped int64
 	limited, busy              int64
-	// tokens and refilled are the bucket.
-	tokens   float64
-	refilled time.Time
+	// tokens and refilled are the bucket, and logTokens and logRefilled the log route's.
+	tokens      float64
+	refilled    time.Time
+	logTokens   float64
+	logRefilled time.Time
 	// taken says the report has been taken for the destroy; nothing more is
 	// accepted, because nothing more would reach the ledger.
 	taken bool
@@ -144,6 +147,14 @@ func (s *CacheService) serveGuest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.acceptGuestBatch(w, r, session)
+	case guestLogsPath:
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+			return
+		}
+
+		s.acceptGuestLog(w, r, session)
 	default:
 		http.NotFound(w, r)
 	}
@@ -154,6 +165,9 @@ type guestLimits struct {
 	Schemas    []int `json:"schemas"`
 	IntervalMS int64 `json:"interval_ms"`
 	MaxBody    int   `json:"max_body"`
+	// Logs offers a home for the job's step logs, only where its tier asked and this
+	// node keeps them.
+	Logs *guestLogOffer `json:"logs,omitempty"`
 }
 
 // guestHello answers the limits and records that the agent asked.
@@ -173,11 +187,16 @@ func (s *CacheService) guestHello(w http.ResponseWriter, session *cacheSession) 
 		return
 	}
 
-	writeCacheJSON(w, http.StatusOK, guestLimits{
+	limits := guestLimits{
 		Schemas:    []int{guestreport.SchemaBase, guestreport.SchemaCases},
 		IntervalMS: guestreport.BatchInterval.Milliseconds(),
 		MaxBody:    guestreport.MaxBatchBytes,
-	})
+	}
+	if s.keepsLogs(session) {
+		limits.Logs = &guestLogOffer{IntervalMS: guestLogInterval.Milliseconds(), MaxBody: joblog.MaxChunkBytes}
+	}
+
+	writeCacheJSON(w, http.StatusOK, limits)
 }
 
 // acceptGuestBatch keeps one batch for the job, or refuses it.

@@ -90,6 +90,8 @@ type NodeWireRequest struct {
 	// without a pool.
 	PoolJoins       nodeplane.PoolJoins
 	SeesHostAddress bool
+	// Logs takes chunks of jobs' logs; nil is a control plane that keeps no index.
+	Logs nodeplane.LogIndexer
 }
 
 // BuildNodeWire assembles the authenticated node wire from a deployment's
@@ -121,6 +123,10 @@ func BuildNodeWire(req NodeWireRequest) (NodeWire, error) {
 	// THE CACHE KILL SWITCH IS ON BOTH WIRES, authenticated or not: a loopback
 	// deployment can still be told to stop intercepting.
 	opts := []nodeplane.HandlerOption{nodeplane.WithCachePolicy(req.CachePolicy)}
+	if req.Logs != nil {
+		opts = append(opts, nodeplane.WithLogIndex(req.Logs))
+	}
+
 	if req.Resizer != nil {
 		opts = append(opts, nodeplane.WithResizer(req.Resizer))
 	}

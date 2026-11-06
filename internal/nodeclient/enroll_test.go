@@ -15,7 +15,7 @@ import (
 )
 
 // AN ORDINARY ENROLLMENT CARRIES NO IDENTITY AT ALL, not even as empty keys, because a
-// control plane older than wire 43 decodes strictly and would refuse the request; a pool
+// control plane older than wire 44 decodes strictly and would refuse the request; a pool
 // host's carries the document and signature it was handed.
 func TestOnlyAPoolHostsEnrollmentCarriesAnIdentity(t *testing.T) {
 	t.Parallel()

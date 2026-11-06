@@ -117,6 +117,7 @@ func newAgent(n *node, cfg Config, log *limitedLog) *agent {
 		node:       n,
 		col:        newCollector(cfg.Proc, log),
 		steps:      newTailer(cfg.DiagDir, log),
+		diagDir:    cfg.DiagDir,
 		junitRoots: cfg.JUnitRoots,
 		version:    textOrMark(guestreport.Clean(cfg.Version, guestreport.MaxNameBytes)),
 		log:        log,
@@ -131,9 +132,12 @@ type agent struct {
 	node       *node
 	col        *collector
 	steps      *tailer
+	diagDir    string
 	junitRoots []string
 	version    string
-	log        *limitedLog
+	// logs ships the job's step logs, nil until a node offers a home for them.
+	logs *logShipper
+	log  *limitedLog
 
 	seq uint64
 	// lim is the node's limits, nil until a hello was answered.
@@ -215,6 +219,10 @@ func (a *agent) serve(ctx context.Context, socket string) {
 	a.run(ctx)
 	// An agent that stopped without a final flush answers whoever is waiting.
 	a.flushDone()
+
+	if a.logs != nil {
+		a.logs.wait()
+	}
 }
 
 // outgoing is a batch as it is sent.
@@ -279,9 +287,21 @@ func (a *agent) run(ctx context.Context) {
 				return
 			}
 
+			a.startLogs(ctx)
 			next.Reset(time.Until(at))
 		}
 	}
+}
+
+// startLogs begins shipping the job's step logs once the node has offered a home for
+// them, beside the agent's own loop, so nothing a job writes to its log can hold up its
+// report.
+func (a *agent) startLogs(ctx context.Context) {
+	if a.logs != nil || a.lim == nil || a.lim.logs == nil || a.diagDir == "" {
+		return
+	}
+
+	a.logs = startLogs(ctx, a.node, a.diagDir, a.lim.logs, a.log)
 }
 
 // contact sends the node what is due: a hello until one is answered, then the

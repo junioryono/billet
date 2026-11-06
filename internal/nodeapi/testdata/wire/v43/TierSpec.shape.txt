@@ -24,6 +24,8 @@ TierSpec.cache_scope.WorkflowRef string
 TierSpec.cache tag omitempty
 TierSpec.cache pointer
 TierSpec.cache.publish string
+TierSpec.cache.keep_logs tag omitempty
+TierSpec.cache.keep_logs bool
 TierSpec.cache.owner tag omitempty
 TierSpec.cache.owner string
 TierSpec.cache.repository tag omitempty

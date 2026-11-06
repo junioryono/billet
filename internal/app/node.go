@@ -356,6 +356,9 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		cacheService.SetGitObserver(n.gitObserved)
 	}
 
+	stopShipping := shipJobLogs(ctx, cacheService, n.client)
+	defer stopShipping()
+
 	maxCustody, err := cfg.Node.MaxCustodyDuration()
 	if err != nil {
 		return err
