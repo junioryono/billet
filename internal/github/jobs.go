@@ -141,6 +141,7 @@ type jobRecord struct {
 	CreatedAt  *string         `json:"created_at"`
 	HeadSHA    *string         `json:"head_sha"`
 	HeadBranch *string         `json:"head_branch"`
+	StartedAt  *string         `json:"started_at"`
 	Steps      *[]struct {
 		Number      *int64  `json:"number"`
 		Name        *string `json:"name"`
@@ -208,10 +209,11 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 // attempt 3 created 20:03:23, both started 17:22:38). The runner ran it once, in the
 // lowest attempt it is listed under, and that entry holds what is true of it.
 //
-// A NAME TWO JOBS SHARE OTHERWISE IS LEFT OUT rather than given either's record: one
-// the attempts cannot separate could be either. So is a name any entry of which has
-// an absent or unreadable created_at, and the caller reads a missing name as
-// could-not-tell.
+// A NAME TWO JOBS SHARE OTHERWISE IS LEFT OUT rather than given either's record: a
+// name listed more than once is a carried job only when every entry names its own
+// attempt and they all give the same start, which a copy keeps and two runs on one
+// runner do not. So is a name any entry of which has an absent or unreadable
+// created_at, and the caller reads a missing name as could-not-tell.
 func (c *runnerGroupPolicyClient) RunJobs(
 	ctx context.Context, owner, repository string, runID int64,
 ) (map[string]RunJob, error) {
@@ -224,7 +226,7 @@ func (c *runnerGroupPolicyClient) RunJobs(
 
 	// EVERY ENTRY OF A NAME IS READ BEFORE THE NAME IS DECIDED, so the answer cannot
 	// depend on the order GitHub lists them in.
-	listed := map[string][]RunJob{}
+	listed := map[string][]runEntry{}
 	unreadable := map[string]bool{}
 	err := c.listRunJobs(ctx, owner, repository, runID, MaxQueueTimeRunJobs, func(record jobRecord,
 		name string,
@@ -247,7 +249,11 @@ func (c *runnerGroupPolicyClient) RunJobs(
 		if record.RunAttempt != nil && *record.RunAttempt > 0 {
 			job.RunAttempt = *record.RunAttempt
 		}
-		listed[name] = append(listed[name], job)
+		entry := runEntry{job: job}
+		if record.StartedAt != nil {
+			entry.started = *record.StartedAt
+		}
+		listed[name] = append(listed[name], entry)
 		return nil
 	})
 	if err != nil {
@@ -267,28 +273,36 @@ func (c *runnerGroupPolicyClient) RunJobs(
 	return jobs, nil
 }
 
+// runEntry is one entry of a run's job list under a runner's name: what it says of
+// the job, and its started_at as GitHub spelled it, which a carried copy repeats.
+type runEntry struct {
+	job     RunJob
+	started string
+}
+
 // ranOn is the entry of the job a runner ran, from every entry GitHub lists under the
 // runner's name: the one entry there is, or the lowest attempt of several, which
 // every later attempt carried forward. False is a name the entries cannot settle: an
-// entry with no attempt beside another, or two entries of one attempt.
-func ranOn(entries []RunJob) (RunJob, bool) {
+// entry with no attempt beside another, two entries of one attempt, or entries that
+// do not all give the same recorded start, which are two runs and no copy.
+func ranOn(entries []runEntry) (RunJob, bool) {
 	if len(entries) == 1 {
-		return entries[0], true
+		return entries[0].job, true
 	}
 
 	seen := map[int64]bool{}
 	lowest := entries[0]
 	for _, e := range entries {
-		if e.RunAttempt <= 0 || seen[e.RunAttempt] {
+		if e.job.RunAttempt <= 0 || seen[e.job.RunAttempt] || e.started == "" || e.started != entries[0].started {
 			return RunJob{}, false
 		}
-		seen[e.RunAttempt] = true
-		if e.RunAttempt < lowest.RunAttempt {
+		seen[e.job.RunAttempt] = true
+		if e.job.RunAttempt < lowest.job.RunAttempt {
 			lowest = e
 		}
 	}
 
-	return lowest, true
+	return lowest.job, true
 }
 
 // listRunJobs hands visit every job of a run, across every attempt, with the
