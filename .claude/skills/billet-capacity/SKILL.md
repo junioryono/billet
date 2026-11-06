@@ -62,6 +62,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A lost answer is sent again only inside the source's deduplication window; past it, the order is uncertain and a person decides.**
 - **Nothing is ordered on an architecture while an order there is unknown, and demand grows the pool one host at a time while any placed host has not joined.**
 - **An order records its source's scope and is read back only there; a resend the source refuses is uncertain, not refused.**
+- **A pool host joins on its source's word only when every check vouches for its key; a contradiction holds its order, and could-not-tell waits for a person (ADR-030).**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

@@ -70,6 +70,19 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 			uncertain)
 	}
 
+	// A HELD JOIN IS A HOST BILLED AND NOT SERVING, which only a person moves.
+	held := false
+	for i := range orders {
+		if o := &orders[i]; o.JoinHold != "" {
+			if !held {
+				fmt.Fprintf(env.Stdout, "\nJoins held for a person (ADR-030): the order admits no node on its source's word until "+
+					"you approve a request it recorded (`billet nodes pending`, `billet nodes approve`), or release its host.\n")
+				held = true
+			}
+			fmt.Fprintf(env.Stdout, "  held %s: %s\n", o.ID, oneLine(o.JoinHold))
+		}
+	}
+
 	return nil
 }
 

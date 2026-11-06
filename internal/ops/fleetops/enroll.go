@@ -219,11 +219,19 @@ func NodesPending(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(env.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NODE\tFINGERPRINT\tSTATE\tHOW\tASKED")
+	fmt.Fprintln(w, "NODE\tFINGERPRINT\tSTATE\tHOW\tPOOL ORDER\tASKED")
 
 	for i := range pending {
 		e := &pending[i]
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name, e.Fingerprint, e.State, e.Source, e.RequestedAt)
+
+		// THE ORDER A POOL HOST ASKED UNDER, so a person comparing its fingerprint can
+		// find the host its source placed (ADR-030).
+		order := e.PoolOrder
+		if order == "" {
+			order = "-"
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", e.Name, e.Fingerprint, e.State, e.Source, order, e.RequestedAt)
 	}
 
 	if err := w.Flush(); err != nil {
