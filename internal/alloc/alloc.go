@@ -167,6 +167,12 @@ type Limits struct {
 	// config.Config.TargetShares: a ceiling inside MaxVCPU/MaxMemory that the
 	// tiers of one target buy from together. A target absent from it has none.
 	Shares map[string]config.TargetShare
+
+	// Weights is each target's weight by target name, from
+	// config.Config.TargetWeights: empty unless some target writes one, and then
+	// what the admission order ranks waiting targets by (TierAdmission.TargetRank).
+	// It decides nothing inside a purchase.
+	Weights map[string]int
 }
 
 // Usage is the vector of what is currently held.
@@ -210,6 +216,9 @@ type Allocator struct {
 	// waits is told each job's queue wait; see ObserveQueueWaits. Atomic,
 	// because it is set once the metrics endpoint serves, while writes run.
 	waits atomic.Pointer[QueueWaitObserver]
+
+	// runtimes is what the history taught of how long jobs run (RuntimePriors).
+	runtimes runtimeBook
 }
 
 // Option configures an Allocator.
@@ -296,6 +305,12 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 	}
 
 	limits.Shares = maps.Clone(limits.Shares)
+
+	if errs := config.TargetWeightErrors(limits.Weights); len(errs) > 0 {
+		return nil, fmt.Errorf("alloc: %w", errors.Join(errs...))
+	}
+
+	limits.Weights = maps.Clone(limits.Weights)
 
 	// THE ARCHITECTURE RULE, re-applied as every catalogue rule is here: a
 	// catalogue built in code that names arch on some tiers would place the rest
@@ -386,6 +401,9 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		case len(t.InterceptionErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
 			return nil, fmt.Errorf("alloc: %w",
 				errors.Join(t.InterceptionErrors(fmt.Sprintf("tier %q", t.Label))...))
+		case len(t.EgressErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
+			return nil, fmt.Errorf("alloc: %w",
+				errors.Join(t.EgressErrors(fmt.Sprintf("tier %q", t.Label))...))
 		case len(t.PoolPolicyErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
 			return nil, fmt.Errorf("alloc: %w",
 				errors.Join(t.PoolPolicyErrors(fmt.Sprintf("tier %q", t.Label))...))
@@ -573,6 +591,28 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 // moved another tier's floor onto the waiter's only host, leaving it nothing.
 // Fewer are then tried, one transaction each.
 func (a *Allocator) EscrowLeaving(ctx context.Context, tier string, want int, protect []string) ([]*Lease, error) {
+	return a.EscrowFor(ctx, tier, want, Purchase{Protect: protect})
+}
+
+// Purchase is what a purchase must leave alone.
+type Purchase struct {
+	// Protect is the tiers each of which must still be granted one lease
+	// afterwards (EscrowLeaving).
+	Protect []string
+	// Avoid is the hosts held against each tier, each with its owner (HoldCandidates).
+	// It names this purchase's tier and each it must protect, which is measured the
+	// same way, and each may use only the room above what the owner needs. A tier below
+	// its floor uses a host's whole room only if it has room nowhere else, and only up
+	// to its floor.
+	Avoid map[string]map[string]string
+	// Keep is the tiers ahead of this purchase that it lets past without leaving them
+	// a lease, because none could use the room it takes. One that can use some now is
+	// left it: a purchase that takes room a tier here fits in now is rolled back.
+	Keep []string
+}
+
+// EscrowFor is Escrow under what the admission order asks of this purchase.
+func (a *Allocator) EscrowFor(ctx context.Context, tier string, want int, purchase Purchase) ([]*Lease, error) {
 	if want < 0 {
 		return nil, fmt.Errorf("alloc: want must not be negative, got %d", want)
 	}
@@ -582,15 +622,21 @@ func (a *Allocator) EscrowLeaving(ctx context.Context, tier string, want int, pr
 		return nil, fmt.Errorf("%w: %q", ErrUnknownTier, tier)
 	}
 
-	var guarded []config.Tier
-	for _, label := range protect {
+	var guarded, kept []config.Tier
+	for _, label := range purchase.Protect {
 		if w, ok := a.tiers[label]; ok && label != tier {
 			guarded = append(guarded, w)
 		}
 	}
 
+	for _, label := range purchase.Keep {
+		if w, ok := a.tiers[label]; ok && label != tier {
+			kept = append(kept, w)
+		}
+	}
+
 	for take := want; take > 0; take-- {
-		leases, err := a.escrow(ctx, t, take, guarded)
+		leases, err := a.escrow(ctx, t, take, guarded, kept, purchase.Avoid)
 		if errors.Is(err, errWaiterLeftShort) {
 			continue
 		}
@@ -614,7 +660,9 @@ var (
 // escrow buys up to want leases of t in one transaction, rolling it back with
 // errWaiterShortNow or errWaiterLeftShort when it would leave a tier in guarded
 // unable to be granted one.
-func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded []config.Tier) ([]*Lease, error) {
+func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded, kept []config.Tier,
+	avoid map[string]map[string]string,
+) ([]*Lease, error) {
 	if want == 0 {
 		return nil, nil
 	}
@@ -638,26 +686,57 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 		// transaction commits: asking the ledger again per lease would return the same
 		// fleet every time and aim every reservation at the same machine. The same
 		// measurement answers how much room there is and where to put it.
-		room, place, err := a.headroomWithPlacer(ctx, tx, t)
+		room, unheld, err := a.headroomWithPlacer(ctx, tx, t)
+		if err != nil {
+			return err
+		}
+
+		place, limit, err := a.placerAvoiding(ctx, tx, t, unheld, avoid[t.Label], want)
 		if err != nil {
 			return err
 		}
 
 		// A WAITER THAT CANNOT BE GRANTED ONE NOW IS ACCUMULATING ROOM, and
 		// nothing is bought ahead of it.
-		if err := guardedHaveRoom(ctx, a, tx, guarded, errWaiterShortNow); err != nil {
+		if err := guardedHaveRoom(ctx, a, tx, guarded, avoid, errWaiterShortNow); err != nil {
 			return err
 		}
 
-		take := min(want, room)
+		// A TIER KEPT THAT FITS NOW KEEPS THAT ROOM: it waited on a lease as large, and the
+		// room that lease left is what it waited for.
+		var fitting []config.Tier
+
+		for i := range kept {
+			room, err := a.roomOf(ctx, tx, kept[i], avoid[kept[i].Label])
+			if err != nil {
+				return err
+			}
+
+			if room > 0 {
+				fitting = append(fitting, kept[i])
+			}
+		}
+
+		// WHO HOLDS A HOST AND FITS THERE KEEPS THAT, unless this tier is below its floor,
+		// whose room is promised.
+		var fitted map[string]bool
+		if place != unheld {
+			fitted, err = a.ownersWithRoom(ctx, tx, avoid[t.Label])
+			if err != nil {
+				return err
+			}
+		}
+
+		take := min(limit, room)
 		leases = make([]*Lease, 0, take)
 
 		for range take {
 			target, cost, ok := place.next(t)
 			if !ok {
-				// The fleet ran out before the ceiling did. Headroom is the smaller of the two, so
-				// this should not happen — but returning what was placed is the safe reading, and
-				// inserting an unplaced lease is the failure this design exists to prevent.
+				// The fleet ran out before the ceiling did: the room left is on a host held
+				// for another tier, which headroom counted. Returning what was placed is the
+				// safe reading, and inserting an unplaced lease is the failure this design
+				// exists to prevent.
 				break
 			}
 
@@ -672,7 +751,26 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 
 		// READ BACK WITH THE LEASES IN THE LEDGER, floors re-placed and all.
 		if len(leases) > 0 {
-			return guardedHaveRoom(ctx, a, tx, guarded, errWaiterLeftShort)
+			if err := guardedHaveRoom(ctx, a, tx, guarded, avoid, errWaiterLeftShort); err != nil {
+				return err
+			}
+
+			if err := guardedHaveRoom(ctx, a, tx, fitting, avoid, errWaiterLeftShort); err != nil {
+				return err
+			}
+
+			if place != unheld {
+				after, err := a.ownersWithRoom(ctx, tx, avoid[t.Label])
+				if err != nil {
+					return err
+				}
+
+				for host := range fitted {
+					if !after[host] {
+						return errWaiterLeftShort
+					}
+				}
+			}
 		}
 
 		return nil
@@ -684,11 +782,64 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 	return leases, nil
 }
 
+// placerAvoiding is the placer a purchase of up to want leases of t uses, leaving held
+// hosts what their owners need, and how many it may grant. A TIER BELOW ITS FLOOR with room
+// nowhere else uses them, as far as its floor and no further: its room is promised, and
+// its backlog is not.
+func (a *Allocator) placerAvoiding(ctx context.Context, tx querier, t config.Tier, place *placer,
+	holds map[string]string, want int,
+) (*placer, int, error) {
+	if len(holds) == 0 {
+		return place, want, nil
+	}
+
+	floors, err := a.countFloorLeasesPerTier(ctx, tx)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	open := place.clone()
+	open.keepFor(holds, a.tiers)
+
+	if short := t.Reserved - floors[t.Label]; short > 0 && open.total(t) == 0 {
+		return place, min(want, short), nil
+	}
+
+	return open, want, nil
+}
+
+// ownersWithRoom is the held hosts whose owner fits there now. An owner is no waiter a
+// purchase protects, and a floor a purchase moves can take its room, wherever that purchase
+// lands: pack and spread each send an unmet floor by what is left on every host.
+func (a *Allocator) ownersWithRoom(ctx context.Context, tx querier, holds map[string]string) (map[string]bool, error) {
+	out := make(map[string]bool, len(holds))
+
+	for host, owner := range holds {
+		shape, known := a.tiers[owner]
+		if !known {
+			continue
+		}
+
+		_, place, err := a.headroomWithPlacer(ctx, tx, shape)
+		if err != nil {
+			return nil, err
+		}
+
+		if place.roomFor(host, shape) > 0 {
+			out[host] = true
+		}
+	}
+
+	return out, nil
+}
+
 // guardedHaveRoom returns short unless every tier in guarded could be granted one
-// lease by an escrow in this transaction now.
-func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []config.Tier, short error) error {
+// lease by an escrow in this transaction now, on a host it may use.
+func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []config.Tier,
+	avoid map[string]map[string]string, short error,
+) error {
 	for i := range guarded {
-		room, err := a.headroom(ctx, tx, guarded[i])
+		room, err := a.roomOf(ctx, tx, guarded[i], avoid[guarded[i].Label])
 		if err != nil {
 			return err
 		}
@@ -699,6 +850,26 @@ func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []co
 	}
 
 	return nil
+}
+
+// roomOf is how many leases of t an escrow in this transaction could grant now, off
+// the room held against it.
+func (a *Allocator) roomOf(ctx context.Context, tx querier, t config.Tier, holds map[string]string) (int, error) {
+	room, place, err := a.headroomWithPlacer(ctx, tx, t)
+	if err != nil {
+		return 0, err
+	}
+
+	if room > 0 && len(holds) > 0 {
+		place, _, err = a.placerAvoiding(ctx, tx, t, place, holds, room)
+		if err != nil {
+			return 0, err
+		}
+
+		room = place.total(t)
+	}
+
+	return room, nil
 }
 
 // encodeProviders renders a preference list for the ledger.
@@ -1445,8 +1616,10 @@ func (a *Allocator) ResizeLeaving(
 		}
 
 		// READ BACK WITH THE NEW SHAPE CHARGED, floors re-placed and all, and
-		// rolled back if a waiter ahead is left without a lease.
-		if err := guardedHaveRoom(ctx, a, tx, guarded, errWaiterLeftShort); err != nil {
+		// rolled back if a waiter ahead is left without a lease. No host's hold is read
+		// here: a fallback grows on a remote backend, where none sits, and a waiter's
+		// room on a held host is room it has when that hold moves.
+		if err := guardedHaveRoom(ctx, a, tx, guarded, nil, errWaiterLeftShort); err != nil {
 			return resizeRefused(err, instanceType, protect)
 		}
 

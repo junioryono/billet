@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/metrics"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
@@ -20,9 +22,13 @@ import (
 // FirecrackerOptions are the provider options node configuration implies
 // beyond the logger: with node.monitoring, the jailer is asked to account for
 // memory and io where the host proves it can. billet check builds its provider
-// with them too, so it refuses what the node would.
+// with them too, so it refuses what the node would. The egress host does nothing
+// until a node prepares it, so a provider built only to ask changes nothing.
 func FirecrackerOptions(cfg *config.Config) []firecracker.Option {
-	opts := []firecracker.Option{firecracker.WithLogger(slog.Default())}
+	opts := []firecracker.Option{
+		firecracker.WithLogger(slog.Default()),
+		firecracker.WithEgress(egress.NewHost(filepath.Join(cfg.Node.StateDir, egressStateDir), slog.Default())),
+	}
 	if cfg.Node.Monitoring != nil {
 		opts = append(opts, firecracker.WithJobAccounting())
 	}
@@ -228,6 +234,30 @@ func startFlows(ctx context.Context, root string, interval time.Duration) (*flow
 		"leases", config.DHCPLeaseDir)
 
 	return watcher, nil
+}
+
+// egressStateDir is where, under the node's state directory, each guest's policy is
+// kept for the next node process.
+const egressStateDir = "egress"
+
+// nodeEgressOptions readies the host's network policy and returns the runner option
+// that reads it, and what stops its resolvers. A provider with none (every backend
+// but firecracker) has nothing to ready, and refuses a listed tier.
+//
+// A HOST THAT IS NOT READY STILL STARTS: this node may never be sent a list, so the
+// refusal belongs to the launch that needs one, and it names why. Prepare has said so.
+func nodeEgressOptions(ctx context.Context, cfg *config.Config, p provider.Provider) ([]node.Option, func()) {
+	fc, ok := p.(*firecracker.Provider)
+	if !ok || fc.EgressHost() == nil {
+		return nil, func() {}
+	}
+
+	host := fc.EgressHost()
+	host.Prepare(ctx)
+
+	observe := cfg.Node.Monitoring != nil && cfg.Node.Monitoring.Flows
+
+	return []node.Option{node.WithEgress(host, observe)}, host.Close
 }
 
 // counterSource is the hardware counter reader node.monitoring.perf asks for.

@@ -22,6 +22,9 @@ import (
 // separating it means a test that fails after this point failed for a reason
 // worth reading.
 func TestMain(m *testing.M) {
+	// BEFORE ANYTHING DIALS, because net.DefaultResolver is read without a lock.
+	resolveRouterNames()
+
 	if _, err := exec.LookPath("docker"); err == nil {
 		if err := pullTestImage(); err != nil {
 			fmt.Fprintf(os.Stderr, "billet e2e: could not pull %s: %v\n", testImage, err)

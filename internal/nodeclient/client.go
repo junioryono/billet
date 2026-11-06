@@ -133,6 +133,8 @@ type Client struct {
 	// negotiated wire does not carry one, so that is said once and not once a
 	// job.
 	guestUnsent atomic.Bool
+	// egressUnsent is the same, for an egress report.
+	egressUnsent atomic.Bool
 }
 
 // Options configures a Client.
@@ -1190,6 +1192,32 @@ func (c *Client) RecordGuestReport(ctx context.Context, leaseID string, epoch in
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/guest"),
 		nodeapi.GuestReportRequest{Epoch: epoch, Report: report}, nil)
+}
+
+// RecordLeaseEgress tells the control plane what the host saw of a lease's network.
+//
+// CHECKED WHERE IT IS EMITTED, for RecordGuestReport's reasons: below VersionEgress
+// the plane has no route for it, and what the pairing loses is the report, never a
+// job, so it is dropped as success and said once. With no wire negotiated the
+// version cannot be told, which is ErrUnregistered.
+func (c *Client) RecordLeaseEgress(ctx context.Context, leaseID string, epoch int64, report alloc.JobEgress) error {
+	wire := c.WireVersion()
+	if wire == 0 {
+		return fmt.Errorf("%w: no wire is negotiated, so whether it carries an egress report "+
+			"cannot be told", ErrUnregistered)
+	}
+
+	if wire < nodeapi.VersionEgress {
+		if !c.egressUnsent.Swap(true) {
+			slog.Default().Info("the control plane's wire does not carry egress reports, so none is sent",
+				"negotiated", wire, "needs", nodeapi.VersionEgress)
+		}
+
+		return nil
+	}
+
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/egress"),
+		nodeapi.EgressReportRequest{Epoch: epoch, Report: report}, nil)
 }
 
 // beforeSeriesClock is the series a plane older than VersionSeriesClock can

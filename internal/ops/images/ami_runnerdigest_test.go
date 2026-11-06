@@ -128,7 +128,7 @@ func TestTheBuildChecksTheDigestRunnerDigestResolved(t *testing.T) {
 		switch n := n.(type) {
 		case *ast.AssignStmt:
 			if call, ok := n.Rhs[0].(*ast.CallExpr); ok && len(n.Rhs) == 1 {
-				if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "runnerDigest" {
+				if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "runnerDigestForOS" {
 					if id, ok := n.Lhs[0].(*ast.Ident); ok {
 						assigned = id.Name
 					}
@@ -160,11 +160,11 @@ func TestTheBuildChecksTheDigestRunnerDigestResolved(t *testing.T) {
 	})
 
 	if assigned == "" {
-		t.Fatal("cmdAMIBuild does not assign runnerDigest's answer to a variable")
+		t.Fatal("cmdAMIBuild does not assign runnerDigestForOS's answer to a variable")
 	}
 
 	if specField != assigned {
-		t.Errorf("the BuildSpec's RunnerSHA256 is %q, not %q, the digest runnerDigest resolved",
+		t.Errorf("the BuildSpec's RunnerSHA256 is %q, not %q, the digest runnerDigestForOS resolved",
 			specField, assigned)
 	}
 }

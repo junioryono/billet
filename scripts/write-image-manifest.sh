@@ -60,6 +60,26 @@ kernel_version=$(strings -a "$KERNEL" |
 [ -n "$kernel_version" ] || die "could not read a version out of $KERNEL; refusing to
 describe a kernel this cannot identify"
 
+# AND IT IS THE FILE THIS MACHINE'S FIRECRACKER LOADS (ADR-022): an ELF for x86-64
+# on x86_64, and on aarch64 the PE Image, with arm64's magic at its fixed offset.
+# Described from the wrong machine's tree or a wrong cache, either one is signed,
+# pulled by every node of the machine and refused by the VMM at every boot, and
+# nothing before the boot looks at it.
+case "$ARCH" in
+x86_64)
+	kernel_magic=$(od -An -tx1 -N4 "$KERNEL" | tr -d ' \n')
+	kernel_machine=$(od -An -tu2 -j18 -N2 "$KERNEL" | tr -d ' \n')
+	[ "$kernel_magic" = 7f454c46 ] && [ "$kernel_machine" = 62 ] ||
+		die "$KERNEL is not an x86-64 ELF, which is what Firecracker loads on x86_64"
+	;;
+aarch64)
+	kernel_magic=$(od -An -tx1 -j56 -N4 "$KERNEL" | tr -d ' \n')
+	[ "$kernel_magic" = 41524d64 ] ||
+		die "$KERNEL has no arm64 Image magic at offset 56, and an Image is what Firecracker loads on aarch64"
+	;;
+*) die "$INFO names the architecture $ARCH, and billet builds guests for x86_64 and aarch64 only" ;;
+esac
+
 digest() { sha256sum "$1" | cut -d' ' -f1; }
 
 # `stat -c` ON GNU, `stat -f` ON BSD. This runs on a hosted runner (GNU) and on a

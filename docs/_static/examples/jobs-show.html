@@ -135,6 +135,7 @@ footer { margin-top: 2.5rem; color: var(--muted); font-size: .85em; }
 <dt>finished</dt><dd>2026-10-09T12:02:51.000000000Z</dd>
 <dt>github times</dt><dd>queued not recorded, assigned to the scale set not recorded, to a runner not recorded</dd>
 <dt>waited</dt><dd>unknown (at github unknown, for room unknown, to start 3s)</dd>
+<dt>runtime</dt><dd>ran 2m51s; predicted 10m0s, the default, with nothing learned, and it ran 7m9s shorter</dd>
 <dt>detail</dt><dd>kept</dd>
 <dt>tier</dt><dd>billet-2vcpu</dd>
 <dt>node</dt><dd>epyc-1</dd>
@@ -344,6 +345,13 @@ footer { margin-top: 2.5rem; color: var(--muted); font-size: .85em; }
 <dt>tap</dt><dd>sent 3.4 MiB, received 394.2 MiB; tap minus attributed: sent &#43;16.6 KiB, received &#43;213.9 KiB</dd>
 </dl>
 <p class="note">A comparison of two counters read a moment apart, not a measurement of what was missed.</p>
+</section>
+
+<section id="egress">
+<h2>Network</h2>
+<dl class="fields">
+<dt>egress</dt><dd>no report recorded (one arrives as the job&#39;s compute goes, from a firecracker node with node.monitoring.flows on or a tier with network.egress)</dd>
+</dl>
 </section>
 
 <section id="guest">

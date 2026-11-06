@@ -10,6 +10,3 @@ RegisterResponse.poll_seconds int
 RegisterResponse.images_accept tag omitempty
 RegisterResponse.images_accept slice
 RegisterResponse.images_accept[] string
-RegisterResponse.macos_vm_limit tag omitempty
-RegisterResponse.macos_vm_limit pointer
-RegisterResponse.macos_vm_limit int

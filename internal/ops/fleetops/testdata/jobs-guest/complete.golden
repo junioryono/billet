@@ -10,6 +10,7 @@ result     github "succeeded"; billet done
 times      queued 2026-10-09T11:59:57.000000000Z, assigned 2026-10-09T11:59:57.000000000Z, started 2026-10-09T12:00:00.000000000Z, finished 2026-10-09T12:02:51.000000000Z
 github     queued -, assigned to the scale set -, to a runner -
 waited     unknown (at github unknown, for room unknown, to start 3s)
+runtime    ran 2m51s; predicted 10m0s, the default, with nothing learned, and it ran 7m9s shorter
 phases     bought      2026-10-09T11:59:57.000000000Z
            assigned    2026-10-09T11:59:57.000000000Z  +0s
            launched    2026-10-09T11:59:58.000000000Z  +1s
@@ -47,6 +48,8 @@ slow       3 of 327 timed replies came after more than 1 s, TCP's first retransm
 complete   yes
 tap        sent 3.4 MiB, received 394.2 MiB; tap minus attributed: sent +16.6 KiB, received +213.9 KiB
            (a comparison of two counters read a moment apart, not a measurement of what was missed)
+
+egress     no report recorded (one arrives as the job's compute goes, from a firecracker node with node.monitoring.flows on or a tier with network.egress)
 
 series     169 samples on the host's clock from 2026-10-09T12:00:00.000Z to 2026-10-09T12:02:47.500Z; 1 interval not seen, 1s in all, which no window counts
            2026-10-09T12:00:59.000Z to 2026-10-09T12:01:00.000Z (1s): failed_read, a counter the sampler had read before could not be read

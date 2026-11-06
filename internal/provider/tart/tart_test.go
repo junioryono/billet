@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -1011,6 +1012,7 @@ func TestASpecAskingForWhatTartCannotDoIsRefused(t *testing.T) {
 		"actions proxy":  func(s *provider.Spec) { s.ActionsProxy = "https://127.0.0.1:1" },
 		"instance type":  func(s *provider.Spec) { s.InstanceType = "m7g.large" },
 		"shm":            func(s *provider.Spec) { s.SHM = config.GiB },
+		"network policy": func(s *provider.Spec) { s.Egress = egress.Observe() },
 		"no command":     func(s *provider.Spec) { s.Command = nil },
 		"no jit":         func(s *provider.Spec) { s.JITConfig = "" },
 		"no image":       func(s *provider.Spec) { s.Image = "" },
