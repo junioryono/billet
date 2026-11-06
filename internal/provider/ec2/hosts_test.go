@@ -157,6 +157,9 @@ func TestAPoolLaunchIsSentOnce(t *testing.T) {
 			if n := f.countOf("DescribeInstances"); n != maxAttempts {
 				t.Fatalf("DescribeInstances was sent %d times, want its %d retries kept", n, maxAttempts)
 			}
+			if n := len(rewound.of("DescribeInstances")); n != maxAttempts {
+				t.Fatalf("the recorder saw %d reads, want %d: it is not wrapping the client Find uses", n, maxAttempts)
+			}
 			for _, r := range rewound.of("DescribeInstances") {
 				if !r {
 					t.Fatal("a retried read went out with a body that cannot be rewound")

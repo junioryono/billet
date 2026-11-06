@@ -127,13 +127,20 @@ func TestWhyNoRoomNamesTheLimitThatBinds(t *testing.T) {
 		pinned := tier("pinned", 4, 8*config.GiB)
 		pinned.Node = "gone"
 		a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 128 * config.GiB},
-			[]config.Tier{pinned, tier("other", 8, 8*config.GiB)})
+			[]config.Tier{pinned, tier("half", 4, 120*config.GiB), tier("other", 1, 1*config.GiB)})
 		mustRegister(t, a, NodeRegistration{
 			Name: "here", Provider: config.ProviderFirecracker, VCPU: 64, Memory: 128 * config.GiB,
 		})
 
 		if got := whyNoRoom(t, a, "pinned"); !got.NoHost || got.CeilingBound || !got.HostOnly() {
 			t.Fatalf("no host under a roomy ceiling reports %+v, want no host alone", got)
+		}
+
+		// ROOM FOR EXACTLY ONE MORE on both axes (4 vCPU and 8 GiB left) is room.
+		reserve(t, a, "half")
+
+		if got := whyNoRoom(t, a, "pinned"); !got.NoHost || got.CeilingBound || !got.HostOnly() {
+			t.Fatalf("no host under a ceiling with room for exactly one reports %+v, want no host alone", got)
 		}
 
 		reserve(t, a, "other")
