@@ -404,8 +404,8 @@ pause() {
 
 # THE DECLARATION IS THE PINNED ONE before anything reads it, on this path as on
 # the Go side: it decides what every image built from it contains, and a target
-# that is not the guest build (whose own check reads only the x64 line) would
-# otherwise install whatever is on disk.
+# that is not the guest build, whose own check runs before this, would otherwise
+# install whatever is on disk.
 case "$scope_toolset" in
 toolset-2404.json) want_toolset=$(awk 'NR == 1 { print $2 }' "$toolset_pin") ;;
 *) want_toolset=$(awk '$1 == "arm64" { print $2 }' "$toolset_pin") ;;

@@ -105,6 +105,13 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 			ErrNoNode, tier.Label, n.name, wire, nodeapi.VersionCacheAuthority)
 	}
 
+	// NOR IS AN ALLOWLIST: an older node would ignore it and run the job open.
+	if tier.NeedsEgressAwareNode() && wire < nodeapi.VersionEgress {
+		return fmt.Errorf("%w: tier %s has an egress allowlist, which node %s cannot honour: it "+
+			"speaks wire %d and an allowlist needs %d, so upgrade the node",
+			ErrNoNode, tier.Label, n.name, wire, nodeapi.VersionEgress)
+	}
+
 	id, err := commandID()
 	if err != nil {
 		return err
@@ -136,6 +143,10 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 	if tier.Arch != "" {
 		pend.minWire = max(pend.minWire, nodeapi.VersionArchitectures)
 		pend.arch = tier.Arch
+	}
+
+	if tier.NeedsEgressAwareNode() {
+		pend.minWire = max(pend.minWire, nodeapi.VersionEgress)
 	}
 
 	if lease.GuestOS == config.GuestWindows {

@@ -1,6 +1,6 @@
 # What GitHub.com records about a job whose runner ended
 
-On 2026-11-04 billet measured, against GitHub.com, what [ADR-028](../decisions/adr-028-rerunning-disrupted-jobs.md) rests on and GitHub does not document: what its record of a job says when the runner ended under it, whether that can be told from a job failing on its own, and what the two re-run routes answer.
+On 2026-11-04 billet measured, against GitHub.com, what [ADR-029](../decisions/adr-029-rerunning-disrupted-jobs.md) rests on and GitHub does not document: what its record of a job says when the runner ended under it, whether that can be told from a job failing on its own, and what the two re-run routes answer.
 
 ## How it was measured
 
@@ -23,7 +23,7 @@ Three things follow.
 
 **A runner that vanished leaves a positive signature.** A step that never finished, on a job concluded `failure`, with no step concluded `failure`. Nothing else measured leaves it: a failing step always ends with a conclusion, because the runner that ran it reported it.
 
-**A runner stopped gracefully cannot be told from a job's own failure.** On SIGTERM the runner cancels its job and reports the running step `failure`, and its own log says `completed with result: Canceled`, but the scale-set message, the REST job and every step are the same as a job that failed by itself. Nothing billet can read separates them, so [ADR-028](../decisions/adr-028-rerunning-disrupted-jobs.md) treats it as what it cannot be proved not to be.
+**A runner stopped gracefully cannot be told from a job's own failure.** On SIGTERM the runner cancels its job and reports the running step `failure`, and its own log says `completed with result: Canceled`, but the scale-set message, the REST job and every step are the same as a job that failed by itself. Nothing billet can read separates them, so [ADR-029](../decisions/adr-029-rerunning-disrupted-jobs.md) treats it as what it cannot be proved not to be.
 
 **`TerminateInstances` is a vanished runner, not a graceful stop.** The runner in billet's EC2 image reported nothing in the time the machine took to go away. That is one job on one instance type, ended by the call billet makes when it destroys an instance, including on a Spot warning. A reclaim AWS performs itself, with billet not having terminated first, was not measured.
 

@@ -14,7 +14,7 @@ import (
 // again, which is what `retry.disrupted` is made of.
 //
 // docs/reference/records/job-reruns.md holds what each of these was measured to
-// answer on GitHub.com on 2026-11-04, and ADR-028 what billet decides from it.
+// answer on GitHub.com on 2026-11-04, and ADR-029 what billet decides from it.
 //
 // The reads need the App's `actions: read` and the requests its `actions: write`.
 type RunReruns interface {

@@ -246,7 +246,7 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 		// THE WIDER GRANT IS SAID OUT LOUD, as the repository one is above.
 		fmt.Fprintf(env.Stdout, "Actions write is the ONLY permission GitHub offers for re-running a job. It also\n"+
 			"covers dispatching workflows and deleting logs, artifacts and caches. billet uses\n"+
-			"it for the two re-run requests and nothing else (ADR-028).\n")
+			"it for the two re-run requests and nothing else (ADR-029).\n")
 	}
 
 	fmt.Fprintf(env.Stdout, "GitHub allows one hour to finish; if it lapses, just run this again.\n\n")

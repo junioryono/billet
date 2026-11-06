@@ -275,7 +275,7 @@ type ListRerunCandidatesRow struct {
 }
 
 // Re-running a job billet disrupted (#541): what the loop asks of the ledger, and
-// what it records on the original job. ADR-028 holds the rule these serve.
+// what it records on the original job. ADR-029 holds the rule these serve.
 // The jobs that ended red on a lease a cause from the closed list disrupted, that
 // GitHub saw start, and that no re-run decision has been recorded for yet. Newest
 // result first and paged from a cursor, (before_result, before_lease), the last

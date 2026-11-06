@@ -32,6 +32,10 @@ type nodeRow struct {
 // equal), because nodeapi imports this package.
 const CacheAuthorityWireVersion = 23
 
+// EgressWireVersion is the oldest wire a node can honour a tier's allowlist on,
+// mirrored from nodeapi.VersionEgress as CacheAuthorityWireVersion is.
+const EgressWireVersion = 40
+
 // WindowsGuestsWireVersion is the oldest wire a node boots a Windows guest on,
 // mirrored from nodeapi.VersionWindowsGuests for the same reason (ADR-026).
 const WindowsGuestsWireVersion = 39
@@ -182,6 +186,13 @@ func (a *Allocator) eligibleFrom(rows []nodeRow, t config.Tier, minWire int) []n
 		// CANDIDATE, or placement would choose it again and again for a launch the
 		// plane then refuses to send, and newer hosts beside it would sit unused.
 		if n.wire < minWire {
+			continue
+		}
+
+		// NOR ONE THAT CANNOT HONOUR ITS ALLOWLIST, for the same reason, and always:
+		// a report asking what a tier would have without the cache rule still may
+		// not count a host that would run the job open if it were sent.
+		if n.wire < EgressWireVersion && t.NeedsEgressAwareNode() {
 			continue
 		}
 

@@ -139,6 +139,15 @@ type GuestReportStore interface {
 // keeps guest reports; this fails the build if it ever stops.
 var _ GuestReportStore = (*alloc.Allocator)(nil)
 
+// EgressReportStore keeps what the host saw of a lease's network, fenced on the
+// epoch, the first report kept. Asked of the lease store for GuestReportStore's
+// reason.
+type EgressReportStore interface {
+	RecordLeaseEgress(ctx context.Context, leaseID string, epoch int64, report alloc.JobEgress) error
+}
+
+var _ EgressReportStore = (*alloc.Allocator)(nil)
+
 // CachePolicy answers the kill switch for one cache of one repository.
 type CachePolicy interface {
 	CacheAllowed(ctx context.Context, kind, owner, repository string) (bool, error)
@@ -323,6 +332,10 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 		h.guests = guests
 	}
 
+	if egress, ok := store.(EgressReportStore); ok {
+		h.egress = egress
+	}
+
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -360,6 +373,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/cache", h.forOwnLease(h.cacheObservation))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/usage", h.forOwnLease(h.leaseUsage))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/guest", h.forOwnLease(h.guestReport))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/egress", h.forOwnLease(h.egressReport))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}/cache-authority", h.forOwnLease(h.cacheAuthority))
@@ -441,6 +455,9 @@ type handler struct {
 	// guests keeps guest reports; nil when the lease store keeps none, and the
 	// route then refuses.
 	guests GuestReportStore
+	// egress keeps egress reports; nil when the lease store keeps none, and the
+	// route refuses.
+	egress EgressReportStore
 	// authorities remembers what GitHub's record said about a running job, so a
 	// job whose cache calls cannot be proved does not ask GitHub on every call.
 	authorities authorityMemory
@@ -1726,6 +1743,46 @@ func (h *handler) guestReport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.guests.RecordGuestReport(r.Context(), r.PathValue("lease"), req.Epoch, req.Report); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// egressReport keeps what the host saw of a lease's network, which nothing on the
+// control plane decides from.
+//
+// REFUSED FROM A PAIRING THAT NEGOTIATED BELOW VersionEgress, and VALIDATED AT THE
+// BOUNDARY, for guestReport's reasons.
+func (h *handler) egressReport(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.EgressReportRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionEgress {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, fmt.Sprintf(
+			"an egress report needs wire %d and this node negotiated %d", nodeapi.VersionEgress, wire))
+
+		return
+	}
+
+	if err := req.Report.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+
+	if h.egress == nil {
+		writeErr(w, http.StatusNotImplemented, nodeapi.CodeRefused, "this control plane keeps no egress reports")
+
+		return
+	}
+
+	if err := h.egress.RecordLeaseEgress(r.Context(), r.PathValue("lease"), req.Epoch, req.Report); err != nil {
 		writeStoreErr(w, err)
 
 		return

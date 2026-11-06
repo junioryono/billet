@@ -236,6 +236,7 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator,
 	}
 
 	guest := readJobGuest(ctx, a, leaseID)
+	network := readJobEgress(ctx, a, leaseID)
 
 	// THE JSON RECORD IS THE LEDGER'S ALONE, and asks GitHub nothing.
 	if asJSON {
@@ -245,7 +246,7 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator,
 			wj = windowJSONOf(tl, unaligned, *w)
 		}
 
-		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest,
+		return rec.DetailRetiredAt, renderJobJSON(out, rec, measured, tl, unaligned, guest, network,
 			readJobTests(ctx, a, leaseID), wj)
 	}
 	steps := jobSteps{measured: measured, runner: provider.InstanceName(rec.LeaseID),
@@ -255,14 +256,15 @@ func showJob(ctx context.Context, out io.Writer, a *alloc.Allocator,
 		steps = readJobSteps(ctx, cfgPath, a, rec, measured)
 	}
 	if asHTML {
-		return rec.DetailRetiredAt, renderJobPage(out, buildJobPage(ctx, a, rec, measured, steps, guest))
+		return rec.DetailRetiredAt, renderJobPage(out, buildJobPage(ctx, a, rec, measured, steps, guest, network))
 	}
 	// THE SERIES THE STEPS WERE PLACED ON, read here when no step was asked about.
 	tl, unaligned := steps.timeline, steps.unaligned
 	if steps.none != "" {
 		tl, unaligned = jobTimeline(ctx, a, rec, measured)
 	}
-	renderJob(out, rec, measured)
+	renderJob(out, rec, measured, network.names())
+	renderEgress(out, network, rec)
 	renderSeries(out, tl, unaligned, measured)
 	renderSteps(out, steps)
 	renderGuest(out, retiredGuest(guestViewOf(guest, measured, steps), guest, rec))
@@ -346,6 +348,10 @@ type jobJSON struct {
 	PredictionUnavailable string `json:"prediction_unavailable,omitempty"`
 	// Guest is what the job's own VM reported, null when no row was recorded.
 	Guest *guestJSON `json:"guest"`
+	// Egress is what the host saw of the job's network, null when no row was
+	// recorded, and EgressUnreadable why a row that was could not be read.
+	Egress           *egressJSON `json:"egress"`
+	EgressUnreadable string      `json:"egress_unreadable,omitempty"`
 	// Tests is the test suites and cases the job's own VM reported.
 	Tests testsJSON `json:"tests"`
 	// HeadSHA and HeadBranch are the commit and branch from GitHub's record of the job.
@@ -385,11 +391,19 @@ type usageJSON struct {
 var usageGroups = []string{alloc.UsageCPU, alloc.UsageThreads, alloc.UsageMemory, alloc.UsageOOM,
 	alloc.UsageIO, alloc.UsageNet, alloc.UsagePressure, alloc.UsageEnergy}
 
+// egressJSON is the job's network in `billet jobs show --json`.
+type egressJSON struct {
+	Node       string `json:"node"`
+	RecordedAt string `json:"recorded_at"`
+	alloc.JobEgress
+}
+
 // renderJobJSON writes one job's record as an indented JSON object. A job with
 // no usage report has a null usage, and one with no guest report a null guest,
 // never a report of zeros.
 func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl *usage.Timeline, unaligned string,
 	g *jobGuest,
+	network jobEgress,
 	tests jobTests,
 	win *windowJSON,
 ) error {
@@ -418,6 +432,10 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 			Npm: string(rec.Caches.Npm),
 		},
 	}
+	out.EgressUnreadable = network.unreadable
+	if r := network.row; r != nil {
+		out.Egress = &egressJSON{Node: r.Node, RecordedAt: r.RecordedAt, JobEgress: r.JobEgress}
+	}
 	if u != nil {
 		groups := make(map[string]bool, len(usageGroups))
 		for _, g := range usageGroups {
@@ -443,7 +461,7 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 // EVERY STRING GITHUB OR A WORKFLOW CHOSE IS QUOTED: a job name is whatever the
 // workflow file says, and an unquoted newline in it would forge a line of this
 // report.
-func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
+func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, names map[string][]string) {
 	line := func(label, format string, args ...any) {
 		fmt.Fprintf(w, "%-11s%s\n", label, fmt.Sprintf(format, args...))
 	}
@@ -498,14 +516,14 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		fmt.Fprintln(w, "destinations "+detailRetired(rec))
 		return
 	}
-	renderDestinations(w, u.Destinations)
+	renderDestinations(w, u.Destinations, names)
 }
 
 // detailRetired says that a job's per-sample series, destinations and guest
 // report were deleted past the deployment's retention, and when.
 func detailRetired(rec alloc.JobRecord) string {
 	return "retired " + rec.DetailRetiredAt + ", past server.job_detail_retention: the per-sample series, " +
-		"the destinations and the guest report are gone, and the usage summary is kept"
+		"the destinations, the egress report and the guest report are gone, and the usage summary is kept"
 }
 
 // noUsageReport is what a job with no usage report says in place of one.
