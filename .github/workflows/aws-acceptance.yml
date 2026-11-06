@@ -125,7 +125,8 @@ jobs:
           done
           echo "the host's SSM agent never came online" >&2
           exit 1
-      - name: Stand the deployment up
+      - id: prepare
+        name: Stand the deployment up
         env:
           ACCOUNT: ${{ secrets.ACCEPTANCE_ACCOUNT }}
           KMS_KEY_ARN: ${{ vars.ACCEPTANCE_KMS_KEY_ARN }}
@@ -271,6 +272,8 @@ jobs:
           role-session-name: billet-acceptance-${{ github.run_id }}-down
       - name: Take everything down
         if: always()
+        env:
+          PREPARED: ${{ steps.prepare.outcome }}
         run: |
           set -uo pipefail
           status=0
@@ -298,6 +301,12 @@ jobs:
           # node policy, which is what lets it destroy its instances, and its App key
           # and that key's parameter, which its GitHub teardown reads. A person ends
           # them with the teardown.
+          # NOTHING WAS DEPLOYED when the step that stands the deployment up never ran:
+          # then there is no run to leave anything for, whatever `down` could reach.
+          if [ "$down" -ne 0 ] && [ "$PREPARED" = skipped ]; then
+            echo "the deployment was never stood up, so nothing is left for a person" >&2
+            down=0
+          fi
           if [ "$down" -ne 0 ]; then
             echo "left for a person to finish the teardown in $RUN_DIR on $HOST, which is left running:" >&2
             echo "  the policy billet-matrix-$RUN on $HOST_ROLE, /srv/billet-accept/app.pem on the host," >&2

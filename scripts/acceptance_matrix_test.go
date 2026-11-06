@@ -199,6 +199,9 @@ acceptance-run)
 	lock=${BILLET_ACCEPTANCE_LOCK_FD:-}
 	if [ -n "$lock" ] && [ -e "/dev/fd/$lock" ]; then echo "$lock open" >"$FAKE/lock"; else echo "${lock:-none} closed" >"$FAKE/lock"; fi
 	echo "the fake run is running"
+	echo "the fake run, on stderr" >&2
+	# The process group it runs in, against its supervisor's.
+	ps -o pgid= -p "$$" | tr -d ' ' >"$FAKE/pgid"
 	if [ -f "$FAKE/run-late" ]; then
 		sleep 0.5
 		echo "the fake run, still writing"
@@ -319,9 +322,16 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 	f := newMatrixFakes(t)
 	f.command(t, "billet", fakeBillet)
 	dir := hostRunDir(t, f)
+	if err := os.WriteFile(filepath.Join(dir, "run.log"), []byte("the run, still writing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "judge", dir, "x64", dir+"/runs", "billet-testbed/m"); code != 1 ||
 		!strings.Contains(out, "no recorded exit") {
 		t.Fatalf("a judge of a run with no recorded exit: exit %d\n%s", code, out)
+	}
+	// THE LOG IS KEPT ALL THE SAME: it is what explains a run with no exit.
+	if got, err := os.ReadFile(filepath.Join(dir, "out", "run.log")); err != nil || string(got) != "the run, still writing\n" {
+		t.Fatalf("a judge that refused left out/run.log %q, %v", got, err)
 	}
 	if _, err := os.Stat(filepath.Join(f.dir, "billet.log")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("billet was asked to judge a run that had not ended (%v)", err)
@@ -830,6 +840,8 @@ func TestTheMatrixRunOutlivesItsSupervisorsOutput(t *testing.T) {
 	f := newMatrixFakes(t, "python3")
 	f.command(t, "billet", fakeBillet)
 	f.fixture(t, "run-late", "")
+	// A run that fails, so the supervisor has its own line to say with nobody reading.
+	f.fixture(t, "acceptance-run.exit", "5")
 	dir := hostRunDir(t, f)
 	abs, err := filepath.Abs("acceptance/matrix-host.sh")
 	if err != nil {
@@ -853,16 +865,19 @@ func TestTheMatrixRunOutlivesItsSupervisorsOutput(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := run.Wait(); err != nil {
-		t.Fatalf("the supervisor with no reader: %v", err)
+	err = run.Wait()
+	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 5 {
+		t.Fatalf("the supervisor with no reader answered %v, want the run's own 5", err)
 	}
-	if b, err := os.ReadFile(filepath.Join(dir, "run.exit")); err != nil || string(b) != "0\n" {
-		t.Fatalf("run.exit = %q, %v; want the run's own 0", b, err)
+	if b, err := os.ReadFile(filepath.Join(dir, "run.exit")); err != nil || string(b) != "5\n" {
+		t.Fatalf("run.exit = %q, %v; want the run's own 5", b, err)
 	}
 	log, err := os.ReadFile(filepath.Join(dir, "run.log"))
-	if err != nil || !strings.Contains(string(log), "the fake run is running") ||
-		!strings.Contains(string(log), "the fake run, still writing") {
-		t.Fatalf("run.log = %q, %v; want the run's own lines, the late one included", log, err)
+	for _, want := range []string{"the fake run is running", "the fake run, on stderr", "the fake run, still writing",
+		"matrix: the run ended with status 5"} {
+		if err != nil || !strings.Contains(string(log), want) {
+			t.Fatalf("run.log = %q, %v; want %q in it", log, err, want)
+		}
 	}
 }
 
@@ -913,5 +928,11 @@ func TestAGroupSignalReachesTheRunOnce(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(f.dir, "terms")); err != nil || string(b) != "term\n" {
 		t.Fatalf("the run got %q TERMs (%v), want one: the group's signal reached it beside the supervisor's", b, err)
+	}
+	// AND IT WAS IN NO GROUP THE SIGNAL WENT TO, which is what keeps it to one: two
+	// TERMs to one process can merge, and so cannot be counted at the receiver.
+	if b, err := os.ReadFile(filepath.Join(f.dir, "pgid")); err != nil ||
+		strings.TrimSpace(string(b)) == strconv.Itoa(run.Process.Pid) || strings.TrimSpace(string(b)) == "" {
+		t.Fatalf("the run's process group is %q (%v), the supervisor's %d: the group's signal reached it", b, err, run.Process.Pid)
 	}
 }

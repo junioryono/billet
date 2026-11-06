@@ -96,16 +96,18 @@ stop)
 judge)
 	[ "$#" -eq 5 ] || usage
 	archs=$3 runs=$4 repo=$5
+	mkdir -p "$run_dir/out"
+	# THE LOG FIRST, whatever is judged: it is what explains a run with no exit.
+	if [ -f "$run_dir/run.log" ]; then
+		cp "$run_dir/run.log" "$run_dir/out/"
+	fi
 	if [ ! -s "$run_dir/run.exit" ]; then
 		echo "matrix: the run has no recorded exit, so it may still be writing; judging nothing" >&2
 		exit 1
 	fi
-	mkdir -p "$run_dir/out"
-	for kept in "$ws/evidence.json" "$run_dir/run.log"; do
-		if [ -f "$kept" ]; then
-			cp "$kept" "$run_dir/out/"
-		fi
-	done
+	if [ -f "$ws/evidence.json" ]; then
+		cp "$ws/evidence.json" "$run_dir/out/"
+	fi
 	"$billet" acceptance matrix judge --workspace "$ws" --archs "$archs" --runs "$runs" --repository "$repo" \
 		--out "$run_dir/out/matrix.json" >"$run_dir/out/matrix.txt"
 	judged=$?
