@@ -201,6 +201,15 @@ server:
   # test_results_retention: 336h
   # test_results_max_bytes: 128MiB
 
+  # This control plane's index of what jobs wrote, where a tier sets logs.keep: a file
+  # of its own a day under identity_dir, not in the ledger, about three times the text
+  # it covers. The text stays on the node that ran the job. At least 1h and 64MiB;
+  # absent, 336h and 32GiB. See ADR-031.
+  #
+  # logs:
+  #   retention: 336h
+  #   max_bytes: 32GiB
+
   # Prometheus metrics for this control plane, at http://<listen>/metrics.
   # Absent, nothing is served. A literal loopback address (127.0.0.1 or [::1],
   # not localhost) unless allow_remote is true: the endpoint has no
@@ -1096,8 +1105,18 @@ node:
   #   tls_cert: /etc/billet/cache/tls.crt
   #   tls_key: /etc/billet/cache/tls.key
 
+  # What this node keeps of its jobs' step logs, where a tier sets logs.keep: compressed
+  # under state_dir, the oldest jobs evicted whole. At least 1h, 64MiB and 1MiB; absent, 336h,
+  # 64GiB and 64MiB. Only a node with monitoring.guest receives any. See ADR-031.
+  #
+  # logs:
+  #   retention: 336h
+  #   max_bytes: 64GiB
+  #   max_job_bytes: 64MiB
+
 # Tiers are yours to define — this is not a fixed catalog. The label is what
 # users put in `runs-on`.
+
 tiers:
   # SEVERAL SIZES OF ONE TIER, WITHOUT WRITING EACH ONE OUT.
   #
@@ -1250,6 +1269,8 @@ tiers:
     #   bazel:        { enabled: true, max_size: 50GiB }
     #   go:           { enabled: true, max_size: 20GiB, test_results: false }
     #   npm:          { enabled: true }    # on, as every cache is; the store is the node's (ADR-020)
+    # logs:
+    #   keep: true                     # this tier's jobs' step logs, for `billet logs search`
 
   - label: billet-8vcpu-ubuntu-2404
     provider: firecracker

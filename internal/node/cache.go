@@ -125,6 +125,10 @@ type CacheService struct {
 	// start it; guestDecode bounds the batches the node decodes at once.
 	guestMonitoring bool
 	guestDecode     chan struct{}
+	logDecode       chan struct{}
+	// jobLogs keeps the step logs of a job whose tier asks, nil where this node keeps
+	// none.
+	jobLogs *JobLogStore
 }
 
 type cacheSession struct {
@@ -374,6 +378,7 @@ func NewCacheService(
 		closed:     make(chan struct{}, 1),
 
 		guestDecode: make(chan struct{}, guestDecodeSlots),
+		logDecode:   make(chan struct{}, jobLogDecodeSlots),
 	}
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
 	service.git = newGitProxy(filepath.Join(stateDir, gitMirrorsDirectory))

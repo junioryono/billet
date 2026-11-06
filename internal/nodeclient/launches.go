@@ -50,6 +50,30 @@ func (s *launchSet) start(ctx context.Context, launch func() error) bool {
 	return true
 }
 
+// tryStart runs work if a slot is free now, and reports false if none is, in which case work
+// did not run. For what is never worth stopping the loop to wait for.
+func (s *launchSet) tryStart(work func() error) bool {
+	select {
+	case s.slots <- struct{}{}:
+	default:
+		return false
+	}
+
+	s.wg.Go(func() {
+		defer func() { <-s.slots }()
+
+		if err := work(); err != nil {
+			s.mu.Lock()
+			if s.err == nil {
+				s.err = err
+			}
+			s.mu.Unlock()
+		}
+	})
+
+	return true
+}
+
 // wait returns once every launch started has finished.
 func (s *launchSet) wait() { s.wg.Wait() }
 

@@ -131,6 +131,8 @@ type Plane struct {
 	// imagesAccept is the deployment's images.accept, which a registration's
 	// answer carries to the node from VersionImageAcceptance.
 	imagesAccept []string
+	// logIndexID names the index of job logs this control plane holds, empty for none.
+	logIndexID string
 	// macOSLimit is the macOS guests the deployment places on a named node, which a
 	// registration's answer carries; nil answers none, as a plane in a test does.
 	macOSLimit func(node string) int
@@ -1433,6 +1435,10 @@ func (p *Plane) wireResponse(negotiated int, node string) nodeapi.RegisterRespon
 		MaxVersion:      nodeapi.Version,
 		LeaseTTLSeconds: int(p.ttl.Seconds()),
 		PollSeconds:     int(p.poll.Seconds()),
+	}
+
+	if negotiated >= nodeapi.VersionJobLogs {
+		res.LogIndexID = p.logIndexID
 	}
 
 	switch {
@@ -3000,4 +3006,47 @@ func acceptsGuestOS(n *node, lease *alloc.Lease) bool {
 	}
 
 	return false
+}
+
+// WithLogIndexID names the index of job logs this control plane holds, which each
+// registration's answer carries.
+func WithLogIndexID(id string) Option {
+	return func(p *Plane) { p.logIndexID = id }
+}
+
+// ReadJobLog asks the node that holds a job's log for lines of it. A node that is not
+// registered here is ErrNoNode: could-not-tell, and never no such lines.
+func (p *Plane) ReadJobLog(ctx context.Context, nodeName string, spec nodeapi.LogReadSpec,
+) (nodeapi.LogReadResult, error) {
+	p.mu.Lock()
+	n, known := p.nodes[nodeName]
+	p.mu.Unlock()
+
+	if !known {
+		return nodeapi.LogReadResult{}, fmt.Errorf("%w: node %s is not registered", ErrNoNode, nodeName)
+	}
+
+	id, err := commandID()
+	if err != nil {
+		return nodeapi.LogReadResult{}, err
+	}
+
+	res, err := p.dispatch(ctx, n, &pending{
+		cmd:     nodeapi.Command{ID: id, Kind: nodeapi.CommandReadLog, LogRead: &spec},
+		done:    make(chan nodeapi.CommandResult, 1),
+		minWire: nodeapi.VersionJobLogs,
+	})
+	if err != nil {
+		return nodeapi.LogReadResult{}, err
+	}
+
+	if !res.OK {
+		return nodeapi.LogReadResult{}, fmt.Errorf("nodeplane: node %s could not read a job's log: %s", nodeName, res.Error)
+	}
+
+	if res.Log == nil {
+		return nodeapi.LogReadResult{}, fmt.Errorf("nodeplane: node %s answered a log read with nothing", nodeName)
+	}
+
+	return *res.Log, nil
 }
