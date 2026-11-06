@@ -106,6 +106,13 @@ type CacheService struct {
 	// casFill is casFillDefault, a field so a test is not decided by the fill
 	// of the disk it runs on.
 	casFill float64
+	// casCacheFill is the package's constant, a field for the same reason.
+	casCacheFill float64
+	// casPolicyEvery is how often an upload asks the kill switch, and closedSessionRetry
+	// how often a pass tries again what it has not finished, fields so a test does not
+	// wait on them.
+	casPolicyEvery     time.Duration
+	closedSessionRetry time.Duration
 	// npmSettleWait is defaultNpmSettleWait, a field so a test can reach its
 	// bound without waiting it out.
 	npmSettleWait time.Duration
@@ -376,6 +383,9 @@ func NewCacheService(
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
 	service.git = newGitProxy(filepath.Join(stateDir, gitMirrorsDirectory))
 	service.casFill = casFillDefault
+	service.casCacheFill = casCacheFill
+	service.casPolicyEvery = casPolicyAge
+	service.closedSessionRetry = time.Minute
 	service.npmSettleWait = defaultNpmSettleWait
 	service.answerCloseWait = defaultAnswerCloseWait
 	if err := service.loadSessions(); err != nil {
@@ -966,6 +976,10 @@ func (s *CacheService) signalClosed() {
 
 // RetryClosed releases cache volumes whose earlier cleanup was interrupted.
 func (s *CacheService) RetryClosed(ctx context.Context) error {
+	if s.blobStore() != nil {
+		return s.retryClosedSideBySide(ctx)
+	}
+
 	s.mu.Lock()
 	sessions := make([]*cacheSession, 0, len(s.byToken))
 	for _, session := range s.byToken {
@@ -1201,6 +1215,18 @@ func (s *CacheService) cleanupSession(
 			s.log.Warn("an Actions cache save was reserved and never finalized; nothing was published",
 				"instance", session.instance, "key", archive.CacheKey, "version", archive.Version)
 		}
+		if archive.Upload != "" {
+			s.releaseStagedBlocks(ctx, session, archive.Upload)
+		}
+		if archive.objectBacked() {
+			archive.mu.Unlock()
+			delete(session.actions, id)
+			if err := s.persistSession(session); err != nil {
+				return fmt.Errorf("node: record released Actions cache of %s: %w", session.instance, err)
+			}
+
+			continue
+		}
 		if !archive.Unmounted {
 			if err := s.actionIO.Unmount(ctx, s.actionsMountPath(session, archive)); err != nil {
 				failures = append(failures, fmt.Errorf("actions cache %s unmount: %w", id, err))
@@ -1220,6 +1246,13 @@ func (s *CacheService) cleanupSession(
 		if err := s.persistSession(session); err != nil {
 			return fmt.Errorf("node: record discarded Actions cache of %s: %w",
 				session.instance, err)
+		}
+	}
+	// A FINALIZATION THAT NEVER COMPLETED LEFT ITS BLOCKS, its archive having become
+	// this receipt.
+	for _, receipt := range session.receipts {
+		if receipt.Upload != "" && !receipt.Complete {
+			s.releaseStagedBlocks(ctx, session, receipt.Upload)
 		}
 	}
 

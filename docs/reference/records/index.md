@@ -19,6 +19,7 @@ ci-capacity
 job-logs
 assignment-protocol
 guest-release-removal
+job-reruns
 cpu-placement
 image-store-wait
 docker-published-ports

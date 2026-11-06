@@ -226,7 +226,9 @@ func newLaunchFixture(t *testing.T, imageEnv string) launchFixture {
 	}
 
 	return launchFixture{
-		script: "set -eu\nrunner_started=222\n" + runnable +
+		script: "set -eu\nrunner_started=222\nrunner_env=(\"BILLET_CACHE_ENDPOINT=${BILLET_CACHE_ENDPOINT:-}\" " +
+			"\"BILLET_CACHE_TOKEN=${BILLET_CACHE_TOKEN:-}\" " +
+			"\"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=${BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES:-}\")\n" + runnable +
 			"echo \"after the launch: $job_status\" >&2\nexit \"$job_status\"\n",
 		argvLog: argvLog,
 		path:    bin + ":/usr/bin:/bin",
@@ -239,7 +241,9 @@ func newLaunchFixture(t *testing.T, imageEnv string) launchFixture {
 func (f launchFixture) run(t *testing.T, exported map[string]string) (string, string, error) {
 	t.Helper()
 
-	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", f.script)
+	// BASH, as the entry point is: what the guest caches' library put in runner_env
+	// is added from an array.
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", f.script)
 	cmd.Env = []string{"PATH=" + f.path, "HOME=/root", "USER=root", "POISON=inherited"}
 	for name, value := range exported {
 		cmd.Env = append(cmd.Env, name+"="+value)
@@ -251,6 +255,41 @@ func (f launchFixture) run(t *testing.T, exported map[string]string) (string, st
 	err := cmd.Run()
 
 	return stdout.String(), stderr.String(), err
+}
+
+// THE RUNNER RUNS ONE JOB-STARTED HOOK. Interception's takes it, and runs this image's
+// after its own, so a job on an intercepted tier still gets its timing line. The
+// stream names the hook twice, and the helper exports in order, so the library's wins.
+func TestInterceptionsHookTakesTheRunnersOneSlotAndNamesTheImagesNext(t *testing.T) {
+	t.Parallel()
+
+	f := newLaunchFixture(t, "ImageOS=ubuntu24\n")
+	const hook = "/opt/actions-runner/_work/_billet/actions-cache-job-started.sh"
+	script := strings.Replace(f.script, "runner_env=(", "runner_env=(\"ACTIONS_RUNNER_HOOK_JOB_STARTED="+hook+"\" ", 1)
+	if script == f.script {
+		t.Fatal("the fixture's runner_env is no longer where this adds to it")
+	}
+	f.script = script
+
+	out, stderr, err := f.run(t, map[string]string{jitEnvVar: "jit", "BILLET_LAUNCH_EPOCH_NS": "111"})
+	if err != nil {
+		t.Fatalf("the launch failed: %v\n%s", err, stderr)
+	}
+	var hooks, next []string
+	for _, line := range strings.Split(out, "\n") {
+		if value, ok := strings.CutPrefix(line, "ACTIONS_RUNNER_HOOK_JOB_STARTED="); ok {
+			hooks = append(hooks, value)
+		}
+		if value, ok := strings.CutPrefix(line, "BILLET_JOB_STARTED_NEXT="); ok {
+			next = append(next, value)
+		}
+	}
+	if !slices.Equal(hooks, []string{hook}) {
+		t.Errorf("the runner's job-started hook is %q, want interception's alone", hooks)
+	}
+	if !slices.Equal(next, []string{jobTimingHookPath}) {
+		t.Errorf("the hook after it is %q, want this image's timing hook", next)
+	}
 }
 
 // THE RUNNER'S ENVIRONMENT IS EXACTLY THE LISTED SET, AND NO VALUE IS IN AN

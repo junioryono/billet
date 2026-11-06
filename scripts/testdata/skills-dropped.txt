@@ -203,3 +203,6 @@ f8453d8ae0f0 #689 moves the helper's local cache into the go command's own GOCAC
 a3f25894a93d The build is two legs on two tiers (ADR-022); image-build.md restates it with both.
 c45561b93a34 The pointer lives on the guest-channel branch, which imagesource reads; `release-channel` holds the binaries' channel, so the sentence named the wrong branch.
 e9d725ea9eeb A resolve job now reads the channel and both legs build what it resolved; image-build.md restates it.
+c98615d09bc8 ADR-024 serves `actions/cache` on EC2 tiers too; the sentence now says so and names the two files that hold the object path.
+40d9aac87d10 ADR-029 (#541): `actions: write` is in billet's set where a tier sets retry.disrupted, so the rule now says what widening it is never the answer to.
+d340aa161466 ADR-029 (#541): a tier can now ask for a re-run, on GitHub's proof of a lost runner; the invariant says so, and the default stays never.

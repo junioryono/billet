@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 42
+	Version = 43
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -561,6 +561,16 @@ const (
 	// delivery.
 	VersionTartVerified = 41
 
+	// VersionEC2GuestCaches is the version from which an EC2 node carries the caches
+	// it serves to a guest into that guest's boot script (ADR-024).
+	//
+	// REPORTED BY DOING LESS, WHERE THE LAUNCH IS SENT: an older EC2 node refuses a
+	// launch that names a guest cache, which would fail every job on a tier that
+	// merely has them by default. So the plane sends it the tier's cache block with
+	// them off, and its job runs as it did before them. Delivery holds a launch that
+	// names them to a node at this version or above.
+	VersionEC2GuestCaches = 42
+
 	// VersionJobLogs is the version from which a node can send a job's step logs to be
 	// indexed (POST /v1/nodes/{node}/logs, LogChunkRequest), a registration's answer names
 	// the index (RegisterResponse's log_index_id), and the plane can ask a node for lines
@@ -571,7 +581,7 @@ const (
 	// an unknown command after a wait, and no log_index_id. CHECKED WHERE IT IS READ: a
 	// chunk from a pairing below it is refused, and an id below it is no index. Its text
 	// stays on the node either way, so what an older pairing loses is finding it.
-	VersionJobLogs = 42
+	VersionJobLogs = 43
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

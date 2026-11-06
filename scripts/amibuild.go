@@ -9,8 +9,10 @@ package scripts
 
 import (
 	"embed"
+	"fmt"
 	"io/fs"
 	"slices"
+	"strings"
 )
 
 // amiBuild is every file the EC2 builder runs, at its path under scripts/.
@@ -58,6 +60,37 @@ var amiBuildExecutables = []string{
 	"runner-images/install-completer.sh",
 	"runner-images/upstream/images/ubuntu/scripts/build/install-copilot-cli.sh",
 	"runner-images/write-image-env.sh",
+}
+
+// guestImageScript is the firecracker guest's build, which holds the guest half of
+// every cache. The EC2 image is built from a region of it rather than from a copy.
+//
+//go:embed build-guest-image.sh
+var guestImageScript string
+
+// GuestImageBlock is one region of the guest build between `# <marker>_BEGIN` and
+// `# <marker>_END`, whole lines and unchanged, so the EC2 image runs what the
+// firecracker guest runs.
+func GuestImageBlock(marker string) (string, error) {
+	return cutGuestImageBlock(guestImageScript, marker)
+}
+
+func cutGuestImageBlock(script, marker string) (string, error) {
+	begin, end := "# "+marker+"_BEGIN", "# "+marker+"_END\n"
+	_, rest, found := strings.Cut(script, begin)
+	if !found {
+		return "", fmt.Errorf("the guest build no longer marks %s", marker)
+	}
+	_, rest, found = strings.Cut(rest, "\n")
+	if !found {
+		return "", fmt.Errorf("%s_BEGIN ends the guest build", marker)
+	}
+	block, _, found := strings.Cut(rest, end)
+	if !found {
+		return "", fmt.Errorf("the guest build's %s has no end marker", marker)
+	}
+
+	return block, nil
 }
 
 // AMIBuildService is the systemd unit's path under scripts/; the builder installs

@@ -163,6 +163,11 @@ type AttributedFailure struct {
 	Disruption  Disruption
 	DisruptedAt string
 	ResultAt    string
+	// RerunDecision is what became of its chance of a re-run, empty until decided
+	// and for a tier that does not ask for one. RerunAttempt is the attempt it was
+	// decided against.
+	RerunDecision RerunDecision
+	RerunAttempt  int64
 }
 
 // AttributedFailures lists jobs that did not succeed while billet's own
@@ -213,6 +218,9 @@ func (a *Allocator) AttributedFailures(
 				Disruption:  Disruption(row.Disruption),
 				DisruptedAt: row.DisruptedAt,
 				ResultAt:    row.ResultAt,
+
+				RerunDecision: RerunDecision(row.RerunDecision),
+				RerunAttempt:  row.RerunAttempt,
 			}
 
 			// THE PROVISIONAL MARKER IS BILLET'S OWN BOOKKEEPING SENTINEL rather

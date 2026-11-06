@@ -164,8 +164,13 @@ func printBrokerStanza(env cli.Env, cfg *config.Config, path, deployment, finger
 	for _, target := range cfg.GitHubTargets() {
 		// actions_read ALWAYS, AS `github-app create` DEFAULTS IT: every deployment reads
 		// GitHub's job records for its queue times, and a publishing tier needs them.
-		fmt.Fprintf(env.Stdout, "      - {app_id: %d, installation_id: %d, target: %q, actions_read: true}\n",
-			target.AppID, target.InstallationID, target.Path())
+		// actions_write too where a tier of the target re-runs a job billet disrupted.
+		actions := "actions_read: true"
+		if cfg.TargetNeedsActionsWrite(target.Name) {
+			actions = "actions_write: true"
+		}
+		fmt.Fprintf(env.Stdout, "      - {app_id: %d, installation_id: %d, target: %q, %s}\n",
+			target.AppID, target.InstallationID, target.Path(), actions)
 	}
 }
 
