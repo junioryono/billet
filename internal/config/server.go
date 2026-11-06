@@ -243,7 +243,7 @@ type ServerConfig struct {
 	// no target names a key and this host holds none.
 	TokenBroker *TokenBrokerConfig `yaml:"token_broker,omitempty"`
 
-	// Pool orders Firecracker hosts from rented bare metal ahead of demand (ADR-028).
+	// Pool orders Firecracker hosts from rented bare metal ahead of demand (ADR-030).
 	Pool *PoolConfig `yaml:"pool,omitempty"`
 	// MaxVCPU and MaxMemory bound what the allocator will ever hand out across every
 	// tier combined. Required and positive: capacity is escrowed before each listener

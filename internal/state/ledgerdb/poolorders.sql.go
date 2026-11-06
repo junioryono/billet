@@ -26,7 +26,7 @@ type InsertPoolOrderParams struct {
 	UpdatedAt      string
 }
 
-// The orders a pool of rented bare metal placed (ADR-028). Every move is one way,
+// The orders a pool of rented bare metal placed (ADR-030). Every move is one way,
 // so each update names the state it moves from and reports how many rows moved.
 func (q *Queries) InsertPoolOrder(ctx context.Context, arg InsertPoolOrderParams) error {
 	_, err := q.db.ExecContext(ctx, insertPoolOrder,

@@ -1,4 +1,4 @@
--- The orders a pool of rented bare metal placed (ADR-028). Every move is one way,
+-- The orders a pool of rented bare metal placed (ADR-030). Every move is one way,
 -- so each update names the state it moves from and reports how many rows moved.
 
 -- name: InsertPoolOrder :exec

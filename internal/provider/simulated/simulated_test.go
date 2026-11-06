@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -123,9 +124,10 @@ func TestALaunchWithoutWhatItNeedsIsRefused(t *testing.T) {
 		mutate func(*provider.Spec)
 		want   string
 	}{
-		"no name":         {func(s *provider.Spec) { s.Name = "" }, "name"},
-		"no registration": {func(s *provider.Spec) { s.JITConfig = "" }, "JIT config"},
-		"no command":      {func(s *provider.Spec) { s.Command = nil }, "RunFor"},
+		"no name":          {func(s *provider.Spec) { s.Name = "" }, "name"},
+		"a network policy": {func(s *provider.Spec) { s.Egress = egress.Observe() }, "network policy"},
+		"no registration":  {func(s *provider.Spec) { s.JITConfig = "" }, "JIT config"},
+		"no command":       {func(s *provider.Spec) { s.Command = nil }, "RunFor"},
 		"another backend's command": {func(s *provider.Spec) {
 			s.Command = []string{"./run.sh"}
 		}, "RunFor"},

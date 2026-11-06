@@ -597,7 +597,7 @@ func (c *Controller) Schedule(
 	// otherwise ever put that question to a node.
 	c.loops.Background("compute barrier", func(ctx context.Context) { wire.nodes.BarrierLoop(ctx) })
 
-	// AND THE POOL, when the config names one (ADR-028). Only the controller runs it,
+	// AND THE POOL, when the config names one (ADR-030). Only the controller runs it,
 	// because two would each order what the floor and the demand call for; a dry run
 	// orders nothing, as it accepts no job.
 	poolLoop, pooled, err := schedulePool(cp.cfg, cp.allocator, cp.deployment, opts.DryRun)

@@ -16,7 +16,7 @@ const poolUsage = "usage: billet pool [--config PATH]\n" +
 	"       billet pool abandon [--config PATH] --reason TEXT <order>"
 
 // Pool is `billet pool`: what the pool of rented bare metal ordered and what became of
-// each order (ADR-028), and closing an uncertain order on a person's word.
+// each order (ADR-030), and closing an uncertain order on a person's word.
 func Pool(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) > 0 && args[0] == "abandon" {
 		return poolAbandon(ctx, env, args[1:])

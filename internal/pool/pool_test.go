@@ -15,7 +15,7 @@ import (
 	"github.com/junioryono/billet/internal/hostsource"
 )
 
-// fakeLedger keeps orders the way migration 73 does: one-way moves from one state, and
+// fakeLedger keeps orders the way migration 74 does: one-way moves from one state, and
 // a placed order names its host.
 type fakeLedger struct {
 	mu        sync.Mutex

@@ -240,7 +240,7 @@ func (a *Allocator) whichPotRefuses(ctx context.Context, tx querier, t config.Ti
 // no room for the least a lease of t charges on any host, its own shape, for a tier no
 // live host can place or whose hosts are full. NAMED THERE TOO, because a pool reads a
 // refusal that names hosts and nothing else as a shortage more hosts would fill, and a
-// spent pot would leave every host it ordered idle (ADR-028).
+// spent pot would leave every host it ordered idle (ADR-030).
 func (a *Allocator) potsWhateverTheHosts(ctx context.Context, tx querier, t config.Tier,
 	floors floorCharge, out *RoomRefusal,
 ) error {

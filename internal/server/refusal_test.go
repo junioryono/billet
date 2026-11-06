@@ -513,7 +513,7 @@ func TestTheReportNamesTheWaiterThatHoldsTheLine(t *testing.T) {
 // A TIER NO HOST CAN PLACE PUBLISHES A HOST SHORTAGE, though it never waits in line and
 // so publishes no Waiting, and so does one whose hosts are full; a tier refused at its own
 // cap does not, because more hosts would not buy it anything, and neither does a tier
-// whose work has gone, whatever refusal it last kept (ADR-028: the pool's demand).
+// whose work has gone, whatever refusal it last kept (ADR-030: the pool's demand).
 func TestATierNoHostCanPlacePublishesAHostShortage(t *testing.T) {
 	t.Parallel()
 

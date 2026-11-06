@@ -736,6 +736,9 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 	// Edit 4: delete the guest cache listener.
 	text = deleteBlock(t, text, "  cache:")
 
+	// Edit 6: delete the allowlist, which only a firecracker guest's tap can carry.
+	text = deleteBlock(t, text, "    network:")
+
 	// Edit 5: a pullable image.
 	if !strings.Contains(text, "image: ubuntu-2404-x64") {
 		t.Fatal("the example no longer names a golden image, so edit 3 patches nothing")

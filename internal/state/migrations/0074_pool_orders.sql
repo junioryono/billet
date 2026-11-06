@@ -1,6 +1,6 @@
--- migration 73: pool_orders
+-- migration 74: pool_orders
 --
--- WHAT A POOL OF RENTED BARE METAL ORDERED, AND WHAT BECAME OF IT (ADR-028, #553).
+-- WHAT A POOL OF RENTED BARE METAL ORDERED, AND WHAT BECAME OF IT (ADR-030, #553).
 --
 -- One row per order, written BEFORE the source is asked, so an order whose answer is
 -- lost is read back under its identifier rather than placed a second time. The row is

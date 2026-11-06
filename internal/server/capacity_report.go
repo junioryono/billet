@@ -82,7 +82,7 @@ func (l *Listener) publishCapacity(ctx context.Context, sent *int, exchange stri
 	}
 
 	// AND WHETHER MORE HOSTS WOULD HAVE BOUGHT IT, which a pool of rented bare metal
-	// reads as its demand (ADR-028). A tier with no host that can place it never waits
+	// reads as its demand (ADR-030). A tier with no host that can place it never waits
 	// in the admission queue, so Waiting reads zero for exactly the shortage a pool
 	// exists to fill; this is set from the allocator's reason whatever the queue made
 	// of the tier, and never for a seal, a cap, a share or the ceiling. ONLY ON A

@@ -107,7 +107,7 @@ func TestWhyNoRoomNamesTheLimitThatBinds(t *testing.T) {
 	})
 
 	// A SPENT POT IS NAMED BESIDE FULL HOSTS OR NONE, because a refusal naming hosts
-	// alone reads to a pool as a shortage more hosts would fill (ADR-028).
+	// alone reads to a pool as a shortage more hosts would fill (ADR-030).
 	t.Run("hosts full and the ceiling spent", func(t *testing.T) {
 		a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 128 * config.GiB},
 			[]config.Tier{tier("work", 8, 8*config.GiB)})
@@ -322,7 +322,7 @@ func TestWhyNoRoomNamesTheLimitThatBinds(t *testing.T) {
 
 // HOSTS, AND NOTHING ELSE: a refusal is a host shortage only when no live host can place
 // the shape, or those that can are full, and no seal, cap, share, ceiling or budget binds
-// too, because more hosts would not buy a tier held by any of those (ADR-028).
+// too, because more hosts would not buy a tier held by any of those (ADR-030).
 func TestHostOnlyIsHostsAndNothingElse(t *testing.T) {
 	t.Parallel()
 	full := []string{"h1"}

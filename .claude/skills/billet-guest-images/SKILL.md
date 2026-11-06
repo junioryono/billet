@@ -26,8 +26,10 @@ Each invariant below is one line here and stated in full, with the incident or m
 ### The kernel and the gates: [references/kernel-and-gates.md](references/kernel-and-gates.md)
 
 - **The kernel and the filesystem are a matched pair.**
+- **One machine's guest is chosen in one table, in the build and again in the gate that holds it (ADR-022).**
+- **A kernel is its machine's file, chosen from its own config (ADR-022).**
 - **The kernel gate's verdict is its exit status, and billet's own rule is the artifact-level claim.**
-- **The gate refuses an image that carries any of the five, and one without its completer or a manifest that declares them (#584).**
+- **The gate refuses an image that carries any of the five, and one without its completer or a manifest that declares what its template offers (#584).**
 - **The gate refuses an image that ships a tool without the license text the tool's license asks for (#584).**
 - **The source manifest is written while apt still has its lists, and the gate holds it to exactly what dpkg installed (#584).**
 - **Every guest release carries the corresponding source of what it redistributes under a GNU license, fetched at each exact version from where that version is kept (ADR-019).**

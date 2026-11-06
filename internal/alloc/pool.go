@@ -12,7 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
-// Pool order states (migration 73). Every move is one way.
+// Pool order states (migration 74). Every move is one way.
 const (
 	PoolOrdering  = "ordering"
 	PoolPlaced    = "placed"
@@ -28,7 +28,7 @@ const (
 // from: another process moved it first, or it never was.
 var ErrPoolOrderMoved = errors.New("alloc: the pool order is not in the state that move starts from")
 
-// PoolOrder is one order a pool of rented bare metal placed (ADR-028).
+// PoolOrder is one order a pool of rented bare metal placed (ADR-030).
 type PoolOrder struct {
 	ID     string
 	Source string

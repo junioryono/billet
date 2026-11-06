@@ -49,7 +49,7 @@ func Code(err error) (string, bool) { return codeOf(err) }
 // synchronously and having started nothing.
 func CapacityRefusal(code string) bool { return capacityRefusal(code) }
 
-// Hosts launches, reads and ends the long-lived bare-metal hosts of a pool (ADR-028)
+// Hosts launches, reads and ends the long-lived bare-metal hosts of a pool (ADR-030)
 // through this provider's client, so there is one EC2 client.
 type Hosts struct{ p *Provider }
 
@@ -249,7 +249,7 @@ func (h *Hosts) Terminate(ctx context.Context, id string) error {
 }
 
 // Console is the latest of what a pool host wrote to its serial console, which only
-// that instance can write; the join reads the host's key fingerprint there (ADR-028).
+// that instance can write; the join reads the host's key fingerprint there (ADR-030).
 func (h *Hosts) Console(ctx context.Context, id string) (string, error) {
 	if _, err := h.Describe(ctx, id); err != nil {
 		return "", err

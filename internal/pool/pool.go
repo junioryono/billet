@@ -1,5 +1,5 @@
 // Package pool orders Firecracker hosts from rented bare metal ahead of demand
-// (ADR-028). The control plane runs it, because it holds the demand.
+// (ADR-030). The control plane runs it, because it holds the demand.
 //
 // AN ORDER IS COMMITTED BEFORE ITS SOURCE IS ASKED, with the scope its source orders
 // in, and read back with Find before anything else is done about it, so an order whose
@@ -14,7 +14,7 @@
 // a host takes minutes to join. The floor is kept otherwise.
 //
 // SHRINKING IS NOT HERE. A host leaves only by drain, on proof it holds nothing
-// (ADR-028), and that proof needs the host linked to the node that joined from it,
+// (ADR-030), and that proof needs the host linked to the node that joined from it,
 // which the join brings. Until it does, no host is known to have joined, and demand
 // grows the pool by one host past the floor at most.
 package pool

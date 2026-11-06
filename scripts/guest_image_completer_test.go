@@ -508,7 +508,7 @@ func TestTheCompletedComponentsAreConfigsList(t *testing.T) {
 		t.Errorf("check-guest-component.sh names %q, want %q", got, want)
 	}
 	build := readScriptFile(t, "build-guest-image.sh")
-	if !strings.Contains(build, `COMPONENTS=$("$SCRIPT_DIR/check-guest-component.sh" names`) {
+	if !strings.Contains(build, `COMPONENTS=$("$SCRIPT_DIR/check-guest-component.sh" offered "$PLAN_FILE"`) {
 		t.Error("build-guest-image.sh does not read its components from check-guest-component.sh")
 	}
 	// THE ONE INSTALLER OF THE COMPLETER, which the guest build and the AMI build

@@ -52,6 +52,7 @@
    operating/guest-images
    operating/build-caches
    operating/actions-cache
+   operating/egress
    operating/compatibility
    operating/upgrades
    operating/backup-restore-recover

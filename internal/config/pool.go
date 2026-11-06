@@ -23,7 +23,7 @@ const (
 )
 
 // PoolConfig is server.pool: a pool of rented bare metal the control plane orders
-// Firecracker hosts from, ahead of demand (ADR-028).
+// Firecracker hosts from, ahead of demand (ADR-030).
 type PoolConfig struct {
 	// JoinServer is the node-wire address an ordered host dials to join, host:port,
 	// as that host reaches it.

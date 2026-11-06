@@ -125,7 +125,7 @@ func TestTheCoverageCheckIteratesTheDeclarationAndNotTheDirectory(t *testing.T) 
 				// this harness simply omitted it -- which under `set -u` is not an
 				// error but an empty loop, so the check passed having checked
 				// nothing.
-				gateAssignment(t, "TOOLCACHE_TOOLS") + "\n" +
+				gateAssignment(t, "TOOLCACHE_TOOLS") + "\nTOOLCACHE_ARCH=x64\n" +
 				// AND CODEQL, WHICH THE GATE NO LONGER WALKS (#584): its declared `*`
 				// is the one in the real declaration, so it is the vehicle that
 				// proves a declared glob is read rather than expanded.

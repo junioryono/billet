@@ -30,7 +30,7 @@ func renderedDestinations(t *testing.T, d *alloc.JobDestinations) string {
 		Unmeasured: []string{alloc.UsageEnergy}, Destinations: d,
 	}}
 	var out bytes.Buffer
-	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage, nil)
 
 	return out.String()
 }
@@ -274,7 +274,7 @@ func TestThePageWordsUnansweredAsTheTextReportDoes(t *testing.T) {
 		"timed, none late": {Destinations: timedDestinations(2), UnansweredCounted: true, RepliesTimed: true},
 	} {
 		text := renderedDestinations(t, d)
-		page := destinationsSection(alloc.JobRecord{}, &alloc.RecordedUsage{JobUsage: alloc.JobUsage{Destinations: d}})
+		page := destinationsSection(alloc.JobRecord{}, &alloc.RecordedUsage{JobUsage: alloc.JobUsage{Destinations: d}}, nil)
 		if page.Timed != d.RepliesTimed {
 			t.Errorf("%s: the page draws the slowest-reply column %v, want %v", name, page.Timed, d.RepliesTimed)
 		}

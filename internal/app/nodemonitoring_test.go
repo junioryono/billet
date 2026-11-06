@@ -498,3 +498,41 @@ func TestPerfIsRefusedOnASourceThatNeverCounts(t *testing.T) {
 		t.Fatal("a source that counted, on a platform that cannot = accepted, want a refusal")
 	}
 }
+
+// A FIRECRACKER NODE'S PROVIDER CAN APPLY A LIST ONCE ITS HOST IS PREPARED, AND THE RUNNER
+// HEARS ABOUT IT: without the option every listed tier is refused, and without the runner's
+// option nothing reports, recovers or hands over. An open tier's names follow the flows
+// switch, and another backend gets none of it.
+func TestAFirecrackerNodeAssemblesItsNetworkPolicy(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{Node: &config.NodeConfig{StateDir: t.TempDir()}}
+
+	p, err := firecracker.New(deploymentid.Preflight, stagedFirecracker(t), unusedDisk{}, FirecrackerOptions(cfg)...)
+	if err != nil {
+		t.Fatalf("firecracker.New: %v", err)
+	}
+
+	if p.EgressHost() == nil {
+		t.Fatal("a firecracker node's provider has no egress host, so every listed tier is refused")
+	}
+
+	opts, stop := nodeEgressOptions(t.Context(), cfg, p)
+	defer stop()
+
+	if len(opts) != 1 {
+		t.Fatalf("the runner got %d egress options, want 1", len(opts))
+	}
+
+	sim, err := simulated.New(deploymentid.Preflight)
+	if err != nil {
+		t.Fatalf("simulated.New: %v", err)
+	}
+
+	other, stopOther := nodeEgressOptions(t.Context(), cfg, sim)
+	defer stopOther()
+
+	if len(other) != 0 {
+		t.Fatalf("another backend got %d egress options", len(other))
+	}
+}
