@@ -553,6 +553,11 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, errors.New("ec2: a spec needs a name")
 	}
 
+	if spec.Egress != nil {
+		return nil, fmt.Errorf("ec2: %s has a network policy, which only a firecracker guest's tap "+
+			"can carry", spec.Name)
+	}
+
 	if spec.Image == "" {
 		return nil, fmt.Errorf("ec2: %s has no image; this backend reads the tier's image as an "+
 			"AMI id", spec.Name)

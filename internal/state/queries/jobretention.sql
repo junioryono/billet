@@ -15,8 +15,8 @@
 -- usage was recorded (they are written in its transaction), and a guest
 -- report, by its own time.
 --
--- DISCOVERED FROM WHAT IS LEFT TO RETIRE, never from the history: job_series
--- and job_guest_reports hold only unretired detail, and the usage rows that
+-- DISCOVERED FROM WHAT IS LEFT TO RETIRE, never from the history: job_series,
+-- job_guest_reports and job_egress hold only unretired detail, and the usage rows that
 -- still claim destinations are the partial index migration 63 adds, which a
 -- retirement empties. So the read's work is the unretired detail, which the
 -- retention bounds, and not every job the deployment ever ran.
@@ -36,6 +36,9 @@ SELECT c.lease_id
       UNION ALL
       SELECT g.lease_id AS lease_id, g.recorded_at AS at
         FROM job_guest_reports g
+      UNION ALL
+      SELECT e.lease_id AS lease_id, e.recorded_at AS at
+        FROM job_egress e
   ) AS c
   JOIN job_history h ON h.lease_id = c.lease_id
  WHERE h.detail_retired_at = '' AND COALESCE(h.finished_at, '') != ''
@@ -87,4 +90,9 @@ UPDATE job_usage
 -- name: DeleteRetiredJobGuestReports :execrows
 -- The guest reports of the jobs a batch stamped.
 DELETE FROM job_guest_reports
+ WHERE lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST(@stamp AS TEXT));
+
+-- name: DeleteRetiredJobEgress :execrows
+-- The egress reports of the jobs a batch stamped.
+DELETE FROM job_egress
  WHERE lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST(@stamp AS TEXT));

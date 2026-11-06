@@ -1,0 +1,21 @@
+# What billet's aarch64 guest must carry beside required-builtins.txt, as =y, and the second list both readers read (ADR-022): scripts/build-guest-kernel.sh enables each of these on an aarch64 host, and scripts/check-guest-kernel-config.sh requires them of a config that names CONFIG_ARM64.
+#
+# WHAT FIRECRACKER'S aarch64 MICROVM IS MADE OF, which an x86 kernel reaches through other options entirely. Firecracker describes the machine in a device tree and gives it a GICv3 or GICv2 interrupt controller, the architected timer, a 16550 serial port, a PL031 real-time clock, and PSCI, through which a guest powers off and reboots. A kernel without one of these hangs early, loses its only console, or never ends, and none of that is a boot failure anything before a boot can see.
+#
+# Blank lines and # comments are ignored; one option per line, without CONFIG_.
+
+# the device tree the VMM hands the guest, and the only way it says where its devices are.
+OF
+
+# the interrupt controller and the clock.
+ARM_GIC_V3
+ARM_ARCH_TIMER
+
+# how a guest ends: panic=1 and a reboot reach the VMM through PSCI.
+ARM_PSCI_FW
+
+# the serial port, found through the device tree, and the clock the guest reads the date from at boot.
+SERIAL_8250
+SERIAL_8250_CONSOLE
+SERIAL_OF_PLATFORM
+RTC_DRV_PL031

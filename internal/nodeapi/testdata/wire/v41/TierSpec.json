@@ -51,6 +51,9 @@
     "npm": true
   },
   "arch": "TierSpec.arch",
-  "attach": true,
-  "hold_on_failure": "TierSpec.hold_on_failure"
+  "egress": {
+    "allow": [
+      "TierSpec.egress.allow[0]"
+    ]
+  }
 }

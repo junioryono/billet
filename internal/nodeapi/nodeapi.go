@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 41
+	Version = 42
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -533,6 +533,21 @@ const (
 	// status` says so. A Linux lease is as it always was.
 	VersionWindowsGuests = 39
 
+	// VersionEgress is the version from which a launch can carry a tier's allowlist
+	// (TierSpec's egress) and a node can report what the host saw of a job's network
+	// (POST /v1/nodes/{node}/leases/{lease}/egress, a lease.JobEgress) (ADR-028).
+	//
+	// THE TWO DIRECTIONS GO DIFFERENT WAYS, because they mean different things.
+	// REFUSED WHERE A LAUNCH IS SENT: an older node ignores TierSpec's egress and
+	// would run the job open, so a listed tier is refused to a node below this at
+	// dispatch and again at delivery, as a cache block and an architecture are.
+	// REPORTED, AND CHECKED WHERE IT IS EMITTED, for the report: it is an
+	// observation nothing decides from, and an older plane answers the route with a
+	// bare 404, so a node negotiated below this drops it as success and says so
+	// once. A pairing that negotiated below this and sends one anyway is refused.
+	// MinVersion does not move.
+	VersionEgress = 40
+
 	// VersionJobLogs is the version from which a node can send a job's step logs to be
 	// indexed (POST /v1/nodes/{node}/logs, LogChunkRequest), a registration's answer names
 	// the index (RegisterResponse's log_index_id), and the plane can ask a node for lines
@@ -543,7 +558,7 @@ const (
 	// an unknown command after a wait, and no log_index_id. CHECKED WHERE IT IS READ: a
 	// chunk from a pairing below it is refused, and an id below it is no index. Its text
 	// stays on the node either way, so what an older pairing loses is finding it.
-	VersionJobLogs = 40
+	VersionJobLogs = 41
 
 	// VersionJobAttach is the version from which the plane can ask a node for a stream to a
 	// lease's guest (CommandAttach), which the node dials back on
@@ -555,7 +570,7 @@ const (
 	// so. NEITHER REFUSED NOR REPORTED for the tier's word: an older node decodes it leniently
 	// and starts a guest with no terminal, which an attach then says, and which costs the job
 	// nothing.
-	VersionJobAttach = 41
+	VersionJobAttach = 42
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -1051,6 +1066,9 @@ type TierSpec struct {
 	// older node ignores both and starts a guest with no terminal.
 	Attach        bool   `json:"attach,omitempty"`
 	HoldOnFailure string `json:"hold_on_failure,omitempty"`
+	// Egress is the tier's allowlist, nil for an open tier (VersionEgress). A node
+	// that cannot apply it refuses the launch.
+	Egress *config.TierEgress `json:"egress,omitempty"`
 }
 
 // TierSpecOf renders the parts of a tier that travel to the selected provider's
@@ -1078,6 +1096,7 @@ func TierSpecOf(t config.Tier, provider config.ProviderKind) *TierSpec {
 
 			return ""
 		}(),
+		Egress: t.EgressOf(),
 		BuildKitCacheMountLimit: func() config.ByteSize {
 			if t.BuildKitCacheMountLimit > 0 {
 				return t.BuildKitCacheMountLimit

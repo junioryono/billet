@@ -54,7 +54,7 @@ TierSpec.cache.npm tag omitempty
 TierSpec.cache.npm bool
 TierSpec.arch tag omitempty
 TierSpec.arch string
-TierSpec.attach tag omitempty
-TierSpec.attach bool
-TierSpec.hold_on_failure tag omitempty
-TierSpec.hold_on_failure string
+TierSpec.egress tag omitempty
+TierSpec.egress pointer
+TierSpec.egress.allow slice
+TierSpec.egress.allow[] string

@@ -116,7 +116,7 @@ type OpenLeaseHoldParams struct {
 	UntilAt string
 }
 
-// Lease holds: a failed job's VM kept for someone to look at (migration 73). A hold delays a
+// Lease holds: a failed job's VM kept for someone to look at (migration 74). A hold delays a
 // destroy a completion already asked for; nothing here touches capacity.
 // Open a lease's hold. DO NOTHING ON CONFLICT, because this is what keeps a hold to its bound:
 // until_at is written once, and a retry, a restart or a second completion cannot move it.

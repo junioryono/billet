@@ -169,12 +169,13 @@
 {{- if .Rows}}
 {{- $counted := .Counted}}
 {{- $timed := .Timed}}
+{{- $named := .Named}}
 <div class="scroll">
 <table>
-<thead><tr><th>Address</th><th>Sent</th><th>Received</th><th>Connections</th>{{if $counted}}<th>Unanswered</th>{{end}}{{if $timed}}<th>Slowest reply</th>{{end}}</tr></thead>
+<thead><tr><th>Address</th><th>Sent</th><th>Received</th><th>Connections</th>{{if $counted}}<th>Unanswered</th>{{end}}{{if $timed}}<th>Slowest reply</th>{{end}}{{if $named}}<th>Names (from the node's resolver, best effort)</th>{{end}}</tr></thead>
 <tbody>
 {{- range .Rows}}
-<tr><th scope="row">{{.Addr}}</th><td>{{.Sent}}</td><td>{{.Received}}</td><td>{{.Connections}}</td>{{if $counted}}<td>{{.Unanswered}}</td>{{end}}{{if $timed}}<td>{{.SlowestReply}}</td>{{end}}</tr>
+<tr><th scope="row">{{.Addr}}</th><td>{{.Sent}}</td><td>{{.Received}}</td><td>{{.Connections}}</td>{{if $counted}}<td>{{.Unanswered}}</td>{{end}}{{if $timed}}<td>{{.SlowestReply}}</td>{{end}}{{if $named}}<td>{{.Names}}</td>{{end}}</tr>
 {{- end}}
 </tbody>
 </table>
@@ -195,6 +196,15 @@
 {{- end}}
 {{- end}}
 {{- end}}
+</section>
+
+<section id="egress">
+<h2>Network</h2>
+<dl class="fields">
+{{- range .Egress}}
+<dt>{{.Label}}</dt><dd>{{.Value}}</dd>
+{{- end}}
+</dl>
 </section>
 
 <section id="guest">

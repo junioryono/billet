@@ -70,6 +70,9 @@
       "go": {
         "enabled": false
       }
+    },
+    "egress": {
+      "allow": []
     }
   },
   "cache_authority": {
@@ -93,10 +96,5 @@
     "lease": "",
     "ranges": [],
     "max_bytes": 0
-  },
-  "attach": {
-    "lease": "",
-    "stream": "",
-    "token": ""
   }
 }
