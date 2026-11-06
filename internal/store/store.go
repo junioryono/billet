@@ -137,6 +137,24 @@ func (e *WriterHeldError) Error() string {
 
 func (e *WriterHeldError) Unwrap() error { return ErrConflict }
 
+// PointerMovedError is PublishCAS's refusal when the key's pointer is not the
+// generation the caller expected, decided under the same lock as the publication.
+// It unwraps to ErrConflict, so a caller asking only "conflict?" is unchanged, and
+// it is the one conflict that says the key holds a generation the caller's clone
+// did not come from: a lost or replaced writer, or a store that could not get its
+// write through, is a bare ErrConflict and never this.
+type PointerMovedError struct {
+	Key      string
+	Current  string
+	Expected string
+}
+
+func (e *PointerMovedError) Error() string {
+	return fmt.Sprintf("%v: cache %q is at generation %q, not %q", ErrConflict, e.Key, e.Current, e.Expected)
+}
+
+func (e *PointerMovedError) Unwrap() error { return ErrConflict }
+
 // Store owns cache generations at one site.
 type Store interface {
 	// Current reports the site's published generation for a key. ErrMiss means

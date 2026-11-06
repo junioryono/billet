@@ -989,8 +989,7 @@ func (c *Client) publishCASAt(
 		}
 
 		if actual != expected {
-			return fmt.Errorf("%w: cache %q is at generation %q, not %q",
-				storecontract.ErrConflict, key, actual, expected)
+			return &storecontract.PointerMovedError{Key: key, Current: actual, Expected: expected}
 		}
 
 		if _, err := c.rbdCmd(ctx, true, "info", candidate.Handle+"@"+candidate.Generation); err != nil {
