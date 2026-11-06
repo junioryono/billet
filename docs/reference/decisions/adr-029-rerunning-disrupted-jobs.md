@@ -1,4 +1,4 @@
-# ADR-028: billet re-runs a job it ended, for a tier that asks, on GitHub's proof
+# ADR-029: billet re-runs a job it ended, for a tier that asks, on GitHub's proof
 
 Accepted, 2026-11-04. Issue #541.
 

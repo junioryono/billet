@@ -102,6 +102,13 @@ type GuestReportRequest struct {
 	Report lease.GuestReport `json:"report"`
 }
 
+// EgressReportRequest carries what the host saw of a lease's network, once, as its
+// compute goes (VersionEgress).
+type EgressReportRequest struct {
+	Epoch  int64           `json:"epoch"`
+	Report lease.JobEgress `json:"report"`
+}
+
 // ReleaseRequest ends a lease with a terminal outcome.
 type ReleaseRequest struct {
 	Epoch   int64  `json:"epoch"`

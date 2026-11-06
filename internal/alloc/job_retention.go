@@ -18,6 +18,7 @@ type RetiredJobDetail struct {
 	Series       int
 	Destinations int
 	GuestReports int
+	Egress       int
 }
 
 // JobsWithRetirableDetail lists at most limit finished, unretired jobs all of
@@ -108,8 +109,12 @@ func (a *Allocator) RetireJobDetail(ctx context.Context, leaseIDs []string) (Ret
 		if err != nil {
 			return fmt.Errorf("alloc: delete retired guest reports: %w", err)
 		}
+		egress, err := q.DeleteRetiredJobEgress(ctx, stamp)
+		if err != nil {
+			return fmt.Errorf("alloc: delete retired egress reports: %w", err)
+		}
 		out = RetiredJobDetail{Jobs: jobs, Series: int(series), Destinations: int(destinations),
-			GuestReports: int(guest)}
+			GuestReports: int(guest), Egress: int(egress)}
 
 		return nil
 	})

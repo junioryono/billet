@@ -1,4 +1,4 @@
--- migration 73: job_reruns
+-- migration 74: job_reruns
 --
 -- WHAT BILLET ASKED GITHUB TO RUN AGAIN, AND WHY IT DID OR DID NOT (#541).
 --

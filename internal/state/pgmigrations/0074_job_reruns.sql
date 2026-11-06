@@ -1,6 +1,6 @@
--- migration 73: job_reruns
+-- migration 74: job_reruns
 --
--- The twin of internal/state/migrations/0073_job_reruns.sql; the reasoning is there.
+-- The twin of internal/state/migrations/0074_job_reruns.sql; the reasoning is there.
 --
 -- Everything between the markers below is PUBLISHED BYTES; the prose is not.
 -- Reformat one tab and every ledger that applied this migration refuses to open.

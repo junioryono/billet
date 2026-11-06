@@ -17,7 +17,7 @@ import (
 // ATTRIBUTION, AND WHAT BECAME OF IT. Re-running is a side effect on somebody's
 // repository, and a deploy or a migration must not happen twice because a machine
 // went away, so billet re-runs only for a tier that asks and only on the proof
-// ADR-028 holds, and says here what it decided. GitHub does not requeue a job whose
+// ADR-029 holds, and says here what it decided. GitHub does not requeue a job whose
 // runner vanished mid-execution, so for every other row what this view gives is any
 // way at all for the person whose build went red to tell a broken host from a
 // broken test.

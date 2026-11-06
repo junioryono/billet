@@ -184,6 +184,8 @@ type Tier struct {
 	// Cache configures every cache the tier's jobs get: whose writes publish,
 	// which caches are on, and how large each may grow. See TierCache.
 	Cache *TierCache `yaml:"cache,omitempty"`
+	// Network is what the tier asks of its guests' network; see TierEgress.
+	Network *TierNetwork `yaml:"network,omitempty"`
 
 	// MaxConcurrent caps simultaneous instances of this tier, counting warm ones.
 	// Zero means "no per-tier cap" and is only legal for non-macOS tiers.
@@ -217,7 +219,7 @@ const MaxDisruptedReruns = 5
 type TierRetry struct {
 	// Disrupted is how many times billet asks GitHub to re-run a workflow run whose
 	// job on this tier it proved its own infrastructure ended, counted across the
-	// run's attempts. Zero, the default, is never. ADR-028 holds what counts as that
+	// run's attempts. Zero, the default, is never. ADR-029 holds what counts as that
 	// proof, and the App must hold `actions: write` for a tier that sets it.
 	Disrupted int `yaml:"disrupted"`
 }
@@ -866,6 +868,7 @@ func (c *Config) validateTiers() []error {
 
 		errs = append(errs, t.ProviderErrors(where)...)
 		errs = append(errs, t.InterceptionErrors(where)...)
+		errs = append(errs, t.EgressErrors(where)...)
 		errs = append(errs, t.ReservationErrors(where)...)
 		errs = append(errs, t.RetryErrors(where)...)
 		if !t.GuestOS.Valid() {

@@ -136,6 +136,10 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, fmt.Errorf("docker: %s asks for guest build caches, which only "+
 			"firecracker guests configure", spec.Name)
 	}
+	if spec.Egress != nil {
+		return nil, fmt.Errorf("docker: %s has a network policy, which only a firecracker guest's "+
+			"tap can carry", spec.Name)
+	}
 
 	// REFUSED, not defaulted. Every stock runner image's default command is a
 	// shell, so a spec with no command produces a container that starts, exits at
