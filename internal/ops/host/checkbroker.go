@@ -72,7 +72,7 @@ func checkBrokerTokens(ctx context.Context, env cli.Env, cfg *config.Config, tar
 
 	held := github.Installation{Permissions: token.Permissions()}
 	if problems := held.PermissionMismatches(app.GitHubTargetOf(target).Scope(),
-		cfg.TargetNeedsRunEvidence(target.Name)); len(problems) > 0 {
+		app.ActionsAccessOf(cfg, target.Name)); len(problems) > 0 {
 		err := fmt.Errorf("github: the broker's token for %s does not hold what billet asks for: %v",
 			target.Path(), problems)
 		fmt.Fprintf(env.Stdout, "github   FAILED: %v\n", err)

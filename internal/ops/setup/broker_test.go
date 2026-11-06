@@ -17,8 +17,26 @@ import (
 // THE STANZA client-key PRINTS IS ONE THE BROKER LOADS, AND IT GRANTS THE JOB RECORDS.
 // Without `actions_read` a broker's token is refused GitHub's job records, every job
 // keeps an unknown queue time, and the control plane warns about it each hour: found
-// on a live run (2026-11-04), because a key's unscoped token never had that problem.
+// on a live run (2026-11-04), because a key's unscoped token never had that problem. A
+// target whose tier re-runs a job billet disrupted is granted `actions_write` instead,
+// which includes read.
 func TestTheClientKeyStanzaIsOneTheBrokerLoadsAndGrantsJobRecords(t *testing.T) {
+	for _, tc := range []struct {
+		name, tier, grant string
+		write             bool
+	}{
+		{"a tier that re-runs nothing", "", "actions_read: true", false},
+		{"a tier that re-runs a disrupted job", "    retry: {disrupted: 1}\n", "actions_write: true", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientKeyStanza(t, tc.tier, tc.grant, tc.write)
+		})
+	}
+}
+
+func clientKeyStanza(t *testing.T, tierExtra, grant string, write bool) {
+	t.Helper()
+
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "billet.yaml")
 
@@ -44,7 +62,7 @@ tiers:
     disk: 20GiB
     image: ghcr.io/actions/actions-runner:latest
     command: ["./run.sh"]
-`), 0o600); err != nil {
+`+tierExtra), 0o600); err != nil {
 		t.Fatalf("write the config: %v", err)
 	}
 
@@ -60,8 +78,8 @@ tiers:
 		t.Fatalf("no stanza in:\n%s", out.String())
 	}
 
-	if !strings.Contains(stanza, "actions_read: true") {
-		t.Errorf("the stanza does not grant the job records:\n%s", stanza)
+	if !strings.Contains(stanza, grant) {
+		t.Errorf("the stanza does not say %s:\n%s", grant, stanza)
 	}
 
 	keyPath := filepath.Join(dir, "app.pem")
@@ -87,7 +105,8 @@ deployments:
 	}
 
 	got := loaded.Deployments[0].Installations[0]
-	if got.Target != "acme" || !got.ActionsRead || got.AppID != 12345 || got.InstallationID != 67890 {
+	if got.Target != "acme" || got.ActionsRead == write || got.ActionsWrite != write || got.AppID != 12345 ||
+		got.InstallationID != 67890 {
 		t.Errorf("the stanza loaded as %+v", got)
 	}
 }

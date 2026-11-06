@@ -848,28 +848,41 @@ func TestASuccessForgetsAFailure(t *testing.T) {
 	}
 }
 
-// A REGISTRATION'S actions_read IS WHAT ITS TOKEN CARRIES, in both directions: without it a
-// deployment is refused GitHub's job records, and with it the broker has to ask for them.
+// A REGISTRATION'S actions_read AND actions_write ARE WHAT ITS TOKEN CARRIES, in every
+// direction: without either a deployment is refused GitHub's job records, with read
+// the broker has to ask for them, and with write it asks for the re-runs too.
 func TestARegistrationsActionsReadReachesTheScope(t *testing.T) {
 	t.Parallel()
 
-	for name, read := range map[string]bool{"granted": true, "not granted": false} {
+	for name, tc := range map[string]struct {
+		read, write bool
+		want        string
+	}{
+		"granted":       {read: true, want: "read"},
+		"not granted":   {want: ""},
+		"write granted": {write: true, want: "write"},
+	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+
+			held := "read"
+			if tc.write {
+				held = "write"
+			}
 
 			gh := newFakeGitHub(t)
 			gh.lookup = func(w http.ResponseWriter, _ *http.Request) {
 				answerJSON(w, map[string]any{
 					"id": 22, "account": map[string]string{"login": "acme", "type": "Organization"},
 					"permissions": map[string]string{
-						"metadata": "read", "organization_self_hosted_runners": "write", "actions": "read",
+						"metadata": "read", "organization_self_hosted_runners": "write", "actions": held,
 					},
 				})
 			}
 			cert, fingerprint := testClient(t)
 
 			reg := org(22)
-			reg.ActionsRead = read
+			reg.ActionsRead, reg.ActionsWrite = tc.read, tc.write
 
 			broker := newTestBroker(t, gh, []config.BrokerDeployment{
 				{ID: deploymentA, Clients: []string{fingerprint}, Installations: []config.BrokerInstallation{reg}},
@@ -881,10 +894,55 @@ func TestARegistrationsActionsReadReachesTheScope(t *testing.T) {
 				t.Fatalf("token: %v", err)
 			}
 
-			if got := token.Permissions()["actions"] == "read"; got != read {
-				t.Errorf("registered %v, and the token holds %v", read, token.Permissions())
+			if got := token.Permissions()["actions"]; got != tc.want {
+				t.Errorf("registered read %v and write %v, and the token holds %v", tc.read, tc.write,
+					token.Permissions())
 			}
 		})
+	}
+}
+
+// TWO DEPLOYMENTS SHARING AN INSTALLATION, one re-running jobs and one not, are each
+// served: the installation is proved against the write the first needs, and each token
+// carries only what its own registration grants.
+func TestASharedInstallationServesEachRegistrationItsOwnScope(t *testing.T) {
+	t.Parallel()
+
+	gh := newFakeGitHub(t)
+	gh.lookup = func(w http.ResponseWriter, _ *http.Request) {
+		answerJSON(w, map[string]any{
+			"id": 22, "account": map[string]string{"login": "acme", "type": "Organization"},
+			"permissions": map[string]string{
+				"metadata": "read", "organization_self_hosted_runners": "write", "actions": "write",
+			},
+		})
+	}
+	writer, writerPrint := testClient(t)
+	reader, readerPrint := testClient(t)
+
+	write, read := org(22), org(22)
+	write.ActionsWrite, read.ActionsRead = true, true
+
+	broker := newTestBroker(t, gh, []config.BrokerDeployment{
+		{ID: deploymentA, Clients: []string{writerPrint}, Installations: []config.BrokerInstallation{write}},
+		{ID: deploymentB, Clients: []string{readerPrint}, Installations: []config.BrokerInstallation{read}},
+	})
+
+	for name, tc := range map[string]struct {
+		cert tls.Certificate
+		want string
+	}{
+		"the deployment re-running jobs": {writer, "write"},
+		"the deployment reading only":    {reader, "read"},
+	} {
+		token, err := broker.client(t, tc.cert, nil).Tokens(github.OrganizationTarget("acme"), appID, 22).
+			InstallationToken(t.Context())
+		if err != nil {
+			t.Fatalf("%s: token: %v", name, err)
+		}
+		if got := token.Permissions()["actions"]; got != tc.want {
+			t.Errorf("%s: the token holds actions %q, want %q", name, got, tc.want)
+		}
 	}
 }
 

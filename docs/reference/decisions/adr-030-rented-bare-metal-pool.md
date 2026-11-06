@@ -79,7 +79,7 @@ A hosting provider locks a server that scans, mines or sends packets at a high r
 - A pool on phoenixNAP needs a monthly storage tier before its caches turn on, a person at each enrollment until a source-authenticated channel exists, and a raised server quota before it can grow past one host.
 - A Firecracker node on AWS metal needs the site rule that requires Ceph relaxed for `ebs-s3`, and a store volume attached to a metal instance and handed to a guest proved, before its caches turn on.
 - The metal source shares the `ec2` provider's EC2 client rather than growing its own.
-- The ledger grows one table, `pool_orders` (migration 74): an order is its host once the source names one, and its node once one joins from it, so one row carries the whole life, with every move one way.
+- The ledger grows one table, `pool_orders` (migration 75): an order is its host once the source names one, and its node once one joins from it, so one row carries the whole life, with every move one way.
 
 ## What was rejected
 

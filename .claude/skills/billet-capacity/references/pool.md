@@ -1,6 +1,6 @@
 # The pool of rented bare metal
 
-Part of the `billet-capacity` skill. ADR-030 is the design; `internal/pool` is the scaler, `internal/hostsource` the contract its sources implement, and `pool_orders` (migration 74) its ledger. `docs/operating/bare-metal-pool.md` is what an operator reads.
+Part of the `billet-capacity` skill. ADR-030 is the design; `internal/pool` is the scaler, `internal/hostsource` the contract its sources implement, and `pool_orders` (migration 75) its ledger. `docs/operating/bare-metal-pool.md` is what an operator reads.
 
 **A pool order is committed before its source is asked, and read back before anything else is done about it (ADR-030).** `Pool.order` writes the row with `RecordPoolOrder`, then mints the order's single-use join token, then calls `Source.Order`. The next step's first act is `resume` on every order still `ordering`: `Source.Find` by the order's identifier, which the source recorded on the host (EC2's `ClientToken` and `sh.billet.pool-order` tag, phoenixNAP's hostname). An answer that is not a host and not a refusal leaves the order `ordering`; it never decides anything by itself. `ErrNotSent` is the one failure that proves no host exists (a local refusal, or a quota or stock read before the request), and it is recorded as refused, like the source's own refusals. Every move of an order is one way and starts from one state (`movePoolOrder` refuses with `ErrPoolOrderMoved` otherwise), so two processes cannot both decide what became of one order.
 

@@ -286,6 +286,15 @@ func TestNewRefusesTiersConfigWouldRefuse(t *testing.T) {
 			Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,
 			Providers: []config.ProviderKind{"quantum"},
 		},
+		// A NEGATIVE COUNT WOULD READ AS NO LIMIT to the re-run loop's comparison.
+		"a negative re-run count": {
+			Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,
+			Provider: config.ProviderFirecracker, Retry: &config.TierRetry{Disrupted: -1},
+		},
+		"too many re-runs": {
+			Label: "billet-8vcpu", VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,
+			Provider: config.ProviderFirecracker, Retry: &config.TierRetry{Disrupted: config.MaxDisruptedReruns + 1},
+		},
 		"a macos tier that can leave apple hardware": {
 			Label: "billet-6vcpu-macos", VCPU: 6, Memory: 16 * config.GiB, GuestOS: config.GuestMacOS,
 			// PINNED, because alloc.New refuses an unpinned macOS tier for a
