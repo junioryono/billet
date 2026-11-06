@@ -46,10 +46,21 @@ for local in "$dir"/*.yml; do
 		echo "$name: $repo's content would not decode" >&2
 		exit 2
 	fi
-	if ! cmp -s "$local" "$work/remote"; then
+	# cmp IS THREE-VALUED TOO: 1 is a difference, and anything past it is a comparison
+	# that could not be made, which is never read as either.
+	cmp -s "$local" "$work/remote"
+	compared=$?
+	case "$compared" in
+	0) ;;
+	1)
 		echo "$name: $repo's copy differs from this checkout's" >&2
 		differs=1
-	fi
+		;;
+	*)
+		echo "$name: could not compare it with $repo's copy (cmp exit $compared)" >&2
+		exit 2
+		;;
+	esac
 done
 
 if [ "$differs" -ne 0 ]; then

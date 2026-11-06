@@ -187,14 +187,16 @@ func coldGitJob() acceptanceJob {
 	}
 }
 
-func cellOf(t *testing.T, backend config.ProviderKind, arch config.Arch, cache, kase string) matrixCell {
+// cellOf is the EC2 cell of an architecture, cache and case: EC2 is the one backend the
+// matrix declares yet.
+func cellOf(t *testing.T, arch config.Arch, cache, kase string) matrixCell {
 	t.Helper()
 	for _, c := range matrixCells() {
-		if c.Backend == backend && c.Arch == arch && c.Cache == cache && c.Case == kase {
+		if c.Backend == config.ProviderEC2 && c.Arch == arch && c.Cache == cache && c.Case == kase {
 			return c
 		}
 	}
-	t.Fatalf("no cell %s/%s/%s/%s", backend, arch, cache, kase)
+	t.Fatalf("no cell ec2/%s/%s/%s", arch, cache, kase)
 
 	return matrixCell{}
 }
@@ -204,7 +206,7 @@ func cellOf(t *testing.T, backend config.ProviderKind, arch config.Arch, cache, 
 // nothing. A job of another workflow, job, architecture or provider is not the cell's.
 func TestACellIsJudgedOnGitHubsResultAndTheNodesObservation(t *testing.T) {
 	t.Parallel()
-	cell := cellOf(t, config.ProviderEC2, config.ArchX64, "git", "cold")
+	cell := cellOf(t, config.ArchX64, "git", "cold")
 	prices := map[string]config.USDPerHour{"c7i.large": 89_250}
 	for name, c := range map[string]struct {
 		edit    func(*acceptanceJob)
@@ -225,16 +227,68 @@ func TestACellIsJudgedOnGitHubsResultAndTheNodesObservation(t *testing.T) {
 	} {
 		job := coldGitJob()
 		c.edit(&job)
-		got := judgeCell(cell, []acceptanceJob{job}, matrixTestTiers(), prices)
+		got := judgeCell(cell, []acceptanceJob{job}, matrixScope{tiers: matrixTestTiers(), prices: prices})
 		if got.Verdict != c.verdict || !strings.Contains(got.Reason, c.reason) {
 			t.Errorf("%s: %s %q, want %s with %q", name, got.Verdict, got.Reason, c.verdict, c.reason)
 		}
 	}
 
-	got := judgeCell(cell, []acceptanceJob{coldGitJob()}, matrixTestTiers(), prices)
+	got := judgeCell(cell, []acceptanceJob{coldGitJob()}, matrixScope{tiers: matrixTestTiers(), prices: prices})
 	if got.WaitSeconds != 30 || got.RunSeconds != 1800 || got.CostUSD < 0.0446 || got.CostUSD > 0.0447 ||
 		!slices.Equal(got.Observed, []string{"cold"}) || !slices.Equal(got.Jobs, []string{"l-accept-x64"}) {
 		t.Errorf("the numbers are %+v; want 30 s waiting, 1800 s running, half an hour at $0.08925", got)
+	}
+}
+
+// ONLY THIS MATRIX RUN'S JOBS ARE A CELL'S: a job of a run it did not dispatch, or of
+// another repository, does not stand in for one it never got, however its tier,
+// workflow and name match.
+func TestOnlyThisMatrixRunsJobsAreJudged(t *testing.T) {
+	t.Parallel()
+	cell := cellOf(t, config.ArchX64, "git", "cold")
+	job := coldGitJob()
+	job.Repository, job.GitHubRunID = "billet-testbed/acceptance-matrix", 77
+	scope := matrixScope{tiers: matrixTestTiers(), runs: map[int64]bool{77: true},
+		repository: "billet-testbed/acceptance-matrix"}
+	if got := judgeCell(cell, []acceptanceJob{job}, scope); got.Verdict != verdictPass {
+		t.Fatalf("this run's job: %+v", got)
+	}
+	for name, edit := range map[string]func(*acceptanceJob){
+		"another run":          func(j *acceptanceJob) { j.GitHubRunID = 78 },
+		"an unread run":        func(j *acceptanceJob) { j.GitHubRunID = 0 },
+		"another repository":   func(j *acceptanceJob) { j.Repository = "billet-testbed/elsewhere" },
+		"an unread repository": func(j *acceptanceJob) { j.Repository = "" },
+	} {
+		other := job
+		edit(&other)
+		if got := judgeCell(cell, []acceptanceJob{other}, scope); got.Verdict != verdictNotRun {
+			t.Errorf("%s: %s %q, want not run", name, got.Verdict, got.Reason)
+		}
+	}
+}
+
+// THE DISPATCHED RUNS ARE READ AS IDS, and a file naming none, or anything that is not
+// one, is refused rather than read as a filter that admits nothing.
+func TestTheDispatchedRunsAreRead(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	file := filepath.Join(dir, "runs")
+	for body, want := range map[string]string{
+		"11\n22\n\n":    "",
+		"":              "names no GitHub run",
+		"11\nnot-a-run": "not a GitHub run id",
+		"-4\n":          "not a GitHub run id",
+	} {
+		if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := readMatrixRuns(file)
+		switch {
+		case want == "" && (err != nil || len(got) != 2 || !got[11] || !got[22]):
+			t.Errorf("%q: %v, %v", body, got, err)
+		case want != "" && (err == nil || !strings.Contains(err.Error(), want)):
+			t.Errorf("%q: %v, want %q", body, err, want)
+		}
 	}
 }
 
@@ -242,10 +296,10 @@ func TestACellIsJudgedOnGitHubsResultAndTheNodesObservation(t *testing.T) {
 // cell, rather than the passing one standing for both.
 func TestEveryJobOfACellIsJudged(t *testing.T) {
 	t.Parallel()
-	cell := cellOf(t, config.ProviderEC2, config.ArchX64, "git", "cold")
+	cell := cellOf(t, config.ArchX64, "git", "cold")
 	again := coldGitJob()
 	again.LeaseID, again.GitHub = "l-again", "failure"
-	got := judgeCell(cell, []acceptanceJob{coldGitJob(), again}, matrixTestTiers(), nil)
+	got := judgeCell(cell, []acceptanceJob{coldGitJob(), again}, matrixScope{tiers: matrixTestTiers()})
 	if got.Verdict != verdictFail || !strings.Contains(got.Reason, "l-again") || len(got.Jobs) != 2 {
 		t.Fatalf("%+v", got)
 	}
@@ -256,7 +310,7 @@ func TestEveryJobOfACellIsJudged(t *testing.T) {
 func TestTheActionsCellsWantServed(t *testing.T) {
 	t.Parallel()
 	for _, kase := range []string{"cold", "warm"} {
-		c := cellOf(t, config.ProviderEC2, config.ArchARM64, "actions", kase)
+		c := cellOf(t, config.ArchARM64, "actions", kase)
 		if c.Run == nil || c.Run.Want != string(lease.ActionsCacheServed) || c.Run.Workflow != "matrix-"+kase+".yml" {
 			t.Errorf("actions/%s is %+v", kase, c.Run)
 		}
@@ -269,7 +323,7 @@ func TestARunFailsOnAFailedCellOrOneThatShouldHaveRun(t *testing.T) {
 	t.Parallel()
 	job := coldGitJob()
 	doc := judgeMatrix(matrixCells(), acceptanceEvidenceDoc{DeploymentID: "d1", Jobs: []acceptanceJob{job}},
-		matrixTestTiers(), nil)
+		matrixScope{tiers: matrixTestTiers()})
 	if doc.Passed != 1 || doc.Failed != 0 || doc.Passed+doc.Failed+doc.NotRun+doc.Unsupported != len(doc.Results) {
 		t.Fatalf("counts %d/%d/%d/%d of %d", doc.Passed, doc.Failed, doc.NotRun, doc.Unsupported, len(doc.Results))
 	}
@@ -286,7 +340,7 @@ func TestARunFailsOnAFailedCellOrOneThatShouldHaveRun(t *testing.T) {
 		t.Errorf("a run covering x64 with its cells unrun answered %v", err)
 	}
 	job.GitHub = "failure"
-	doc = judgeMatrix(matrixCells(), acceptanceEvidenceDoc{Jobs: []acceptanceJob{job}}, matrixTestTiers(), nil)
+	doc = judgeMatrix(matrixCells(), acceptanceEvidenceDoc{Jobs: []acceptanceJob{job}}, matrixScope{tiers: matrixTestTiers()})
 	if err := matrixOutcome(doc, nil); err == nil || !strings.Contains(err.Error(), "1 cell(s) failed") {
 		t.Errorf("a failed cell answered %v", err)
 	}

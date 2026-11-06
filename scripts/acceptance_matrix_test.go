@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -59,7 +60,9 @@ func (f matrixFakes) run(t *testing.T, script string, env []string, args ...stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.CommandContext(t.Context(), "bash", append([]string{abs}, args...)...)
+	// EXECUTED BY ITS PATH, as the workflow runs it, so a script committed without its
+	// executable bit fails here too.
+	cmd := exec.CommandContext(t.Context(), abs, args...)
 	cmd.Env = append([]string{"PATH=" + f.path, "HOME=" + t.TempDir(), "FAKE=" + f.dir}, env...)
 	out, err := cmd.CombinedOutput()
 	if exit, ok := errors.AsType[*exec.ExitError](err); ok {
@@ -146,6 +149,11 @@ func TestTheMatrixWorkflowCopyCheckAnswersThreeWays(t *testing.T) {
 			t.Helper()
 			f.fixture(t, file, "HTTP/2.0 200 OK\n\n{\"message\":\"a directory\"}\n")
 		}, 2, "has no content"},
+		"a comparison that could not be made": {func(t *testing.T, f matrixFakes, file string, body []byte) {
+			t.Helper()
+			f.command(t, "cmp", "exit 2\n")
+			f.fixture(t, file, contentsResponse(t, body))
+		}, 2, "could not compare it"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -201,8 +209,19 @@ func hostRunDir(t *testing.T, f matrixFakes) string {
 	return dir
 }
 
-// PREPARE STANDS THE DEPLOYMENT UP AND RENDERS ITS POLICY, and refuses to go on when the
-// base config gives the matrix no tier, whose run would judge every cell not run.
+func billetLog(t *testing.T, f matrixFakes) string {
+	t.Helper()
+	log, err := os.ReadFile(filepath.Join(f.dir, "billet.log"))
+	if err != nil {
+		t.Fatalf("billet never ran: %v", err)
+	}
+
+	return string(log)
+}
+
+// PREPARE STANDS THE DEPLOYMENT UP AND RENDERS ITS POLICY, naming a guest role for
+// iam:PassRole only when one is given, and refuses to go on when the base config gives
+// the matrix no tier, whose run would judge every cell not run.
 func TestTheMatrixHostPreparesADeploymentWithItsTiersAndPolicy(t *testing.T) {
 	t.Parallel()
 	f := newMatrixFakes(t, "jq")
@@ -210,7 +229,7 @@ func TestTheMatrixHostPreparesADeploymentWithItsTiersAndPolicy(t *testing.T) {
 	f.fixture(t, "tiers", "ec2 x64 accept-x64\n")
 	dir := hostRunDir(t, f)
 	out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prepare", dir, "/base.yaml", "111122223333",
-		"arn:aws:iam::111122223333:role/r", "arn:aws:kms:us-west-2:111122223333:key/k")
+		"arn:aws:kms:us-west-2:111122223333:key/k")
 	if code != 0 || !strings.Contains(out, "deployment dep-1 is up") {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
@@ -223,55 +242,68 @@ func TestTheMatrixHostPreparesADeploymentWithItsTiersAndPolicy(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(dir, "iam.json")); err != nil || !strings.Contains(string(got), "2012-10-17") {
 		t.Errorf("iam.json = %q, %v", got, err)
 	}
-	log, err := os.ReadFile(filepath.Join(f.dir, "billet.log"))
-	if err != nil || !strings.Contains(string(log), "acceptance up --config /base.yaml --workspace "+dir+"/ws --account 111122223333") ||
-		!strings.Contains(string(log), "init iam --config "+dir+"/ws/billet.yaml --role-arn arn:aws:iam::111122223333:role/r") {
+	log := billetLog(t, f)
+	if !strings.Contains(log, "acceptance up --config /base.yaml --workspace "+dir+"/ws --account 111122223333") ||
+		!strings.Contains(log, "init iam --config "+dir+"/ws/billet.yaml --kms-key-arn arn:aws:kms:us-west-2:111122223333:key/k\n") {
 		t.Errorf("billet was run as:\n%s", log)
 	}
 
 	f = newMatrixFakes(t, "jq")
 	f.command(t, "billet", fakeBillet)
+	f.fixture(t, "tiers", "ec2 x64 accept-x64\n")
 	dir = hostRunDir(t, f)
-	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prepare", dir, "/b", "1", "r", "k"); code == 0 ||
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prepare", dir, "/b", "1", "k", "arn:aws:iam::1:role/guest"); code != 0 ||
+		!strings.Contains(billetLog(t, f), "--kms-key-arn k --role-arn arn:aws:iam::1:role/guest") {
+		t.Errorf("a guest role: exit %d\n%s\n%s", code, out, billetLog(t, f))
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "billet", fakeBillet)
+	dir = hostRunDir(t, f)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prepare", dir, "/b", "1", "k"); code == 0 ||
 		!strings.Contains(out, "no tier to dispatch to") {
 		t.Errorf("a base config with no matrix tier: exit %d\n%s", code, out)
 	}
 }
 
-// RUN SAYS THE WORSE OF ITS TWO ANSWERS: a run that failed is the exit status, and is
-// still judged; a run that passed exits with the judge's verdict.
-func TestTheMatrixHostRunExitsWithTheRunsOrTheJudgesFailure(t *testing.T) {
+// RUN EXITS WITH THE RUN'S STATUS, and JUDGE WITH THE JUDGE'S, for exactly the runs and
+// repository it is named, keeping the evidence beside the verdicts.
+func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 	t.Parallel()
-	for name, c := range map[string]struct {
-		run, judge string
-		want       int
-	}{
-		"both passed":       {"0", "0", 0},
-		"a cell failed":     {"0", "1", 1},
-		"the run failed":    {"3", "0", 3},
-		"both failed":       {"3", "1", 3},
-		"the run timed out": {"1", "1", 1},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			f := newMatrixFakes(t)
-			f.command(t, "billet", fakeBillet)
-			f.fixture(t, "acceptance-run.exit", c.run)
-			f.fixture(t, "matrix-judge.exit", c.judge)
-			dir := hostRunDir(t, f)
-			out, code := f.run(t, "acceptance/matrix-host.sh", nil, "run", dir, "27", "x64")
-			if code != c.want {
-				t.Fatalf("exit %d, want %d:\n%s", code, c.want, out)
-			}
-			log, err := os.ReadFile(filepath.Join(f.dir, "billet.log"))
-			if err != nil || !strings.Contains(string(log), "acceptance matrix judge --workspace "+dir+"/ws --archs x64") ||
-				!strings.Contains(string(log), "acceptance run --workspace "+dir+"/ws --jobs 27") {
-				t.Fatalf("billet was run as:\n%s", log)
-			}
-			if !strings.Contains(out, "judged") {
-				t.Errorf("the verdicts were not printed:\n%s", out)
-			}
-		})
+	for _, status := range []string{"0", "3"} {
+		f := newMatrixFakes(t)
+		f.command(t, "billet", fakeBillet)
+		f.fixture(t, "acceptance-run.exit", status)
+		dir := hostRunDir(t, f)
+		if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "run", dir, "27"); strconv.Itoa(code) != status {
+			t.Fatalf("a run that ended %s: exit %d\n%s", status, code, out)
+		}
+		if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 150m") {
+			t.Fatalf("billet was run as:\n%s", log)
+		}
+	}
+	for _, status := range []string{"0", "1"} {
+		f := newMatrixFakes(t)
+		f.command(t, "billet", fakeBillet)
+		f.fixture(t, "matrix-judge.exit", status)
+		dir := hostRunDir(t, f)
+		if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "ws", "evidence.json"), []byte(`{"version":1}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, code := f.run(t, "acceptance/matrix-host.sh", nil, "judge", dir, "x64", dir+"/runs", "billet-testbed/m")
+		if strconv.Itoa(code) != status || !strings.Contains(out, "judged") {
+			t.Fatalf("a judge that ended %s: exit %d\n%s", status, code, out)
+		}
+		if log := billetLog(t, f); !strings.Contains(log, "acceptance matrix judge --workspace "+dir+"/ws --archs x64 --runs "+
+			dir+"/runs --repository billet-testbed/m --out "+dir+"/out/matrix.json") {
+			t.Fatalf("billet was run as:\n%s", log)
+		}
+		if got, err := os.ReadFile(filepath.Join(dir, "out", "evidence.json")); err != nil || string(got) != `{"version":1}` {
+			t.Errorf("the evidence was not kept beside the verdicts: %q, %v", got, err)
+		}
 	}
 }
 
@@ -307,6 +339,10 @@ send-command)
 	;;
 get-command-invocation)
 	case "$*" in
+	*"--command-id cmd-1"*) ;;
+	*) echo "asked about another command: $*" >&2; exit 1 ;;
+	esac
+	case "$*" in
 	*"--query Status"*) cat "$FAKE/status" ;;
 	*StandardOutputContent*) cat "$FAKE/stdout" 2>/dev/null ;;
 	*StandardErrorContent*) ;;
@@ -340,7 +376,8 @@ func TestTheSSMHelperExitsWithTheHostCommandsStatus(t *testing.T) {
 			f.fixture(t, "status", c.status+"\n")
 			f.fixture(t, "code", c.code+"\n")
 			f.fixture(t, "stdout", "matrix: done\n")
-			out, code := f.run(t, "acceptance/ssm-run.sh", []string{"SSM_POLL=0", "SSM_GRACE=0"}, "i-1", "1", "echo 'hi there'")
+			env := []string{"SSM_POLL=0", "SSM_GRACE=0"}
+			out, code := f.run(t, "acceptance/ssm-run.sh", env, "run", "i-1", "1", "echo 'hi there'")
 			if code != c.want {
 				t.Fatalf("exit %d, want %d:\n%s", code, c.want, out)
 			}
@@ -355,10 +392,31 @@ func TestTheSSMHelperExitsWithTheHostCommandsStatus(t *testing.T) {
 	}
 }
 
-// fakeDispatchGH dispatches by appending "<workflow> <label>" to $FAKE/sent, lists one
-// run per sent workflow titled as the matrix's run-name, and reports a run completed
-// once $FAKE/done-<id> exists, or at once when $FAKE/instant exists. $FAKE/unlisted makes
-// the listing empty.
+// SEND PRINTS THE COMMAND'S ID AND RETURNS; WAIT, GIVEN IT, ANSWERS AS RUN DOES, so a
+// long command can be awaited in a later step.
+func TestTheSSMHelperSendsInOneStepAndWaitsInAnother(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "aws", fakeSSM)
+	f.fixture(t, "status", "Failed\n")
+	f.fixture(t, "code", "7\n")
+	env := []string{"SSM_POLL=0", "SSM_GRACE=0"}
+	out, code := f.run(t, "acceptance/ssm-run.sh", env, "send", "i-1", "60", "true")
+	if code != 0 || strings.TrimSpace(out) != "cmd-1" {
+		t.Fatalf("send: exit %d, printed %q", code, out)
+	}
+	if out, code := f.run(t, "acceptance/ssm-run.sh", env, "wait", "i-1", "cmd-1", "60"); code != 7 {
+		t.Fatalf("wait: exit %d, want the command's 7:\n%s", code, out)
+	}
+	if out, code := f.run(t, "acceptance/ssm-run.sh", env, "wait", "i-1"); code != 2 || !strings.Contains(out, "Usage") {
+		t.Fatalf("a wait with no command id: exit %d\n%s", code, out)
+	}
+}
+
+// fakeDispatchGH dispatches by appending "<workflow> <label> <tag>" to $FAKE/sent; lists
+// the run of a workflow whose title, the matrix's run-name, matches the one asked for (a
+// run's id is its line in $FAKE/sent); and reports a run completed once $FAKE/done-<id>
+// exists, or $FAKE/done-all does. $FAKE/unlisted makes every listing empty.
 const fakeDispatchGH = `case "$1 $2" in
 "workflow run")
 	label="" tag=""
@@ -367,16 +425,21 @@ const fakeDispatchGH = `case "$1 $2" in
 	;;
 "run list")
 	[ -f "$FAKE/unlisted" ] && exit 0
-	wf="" ; prev=""
-	for a in "$@"; do [ "$prev" = --workflow ] && wf=$a; prev=$a; done
+	wf="" jq="" prev=""
+	for a in "$@"; do
+		[ "$prev" = --workflow ] && wf=$a
+		[ "$prev" = --jq ] && jq=$a
+		prev=$a
+	done
 	n=0
 	while read -r w label tag; do
 		n=$((n + 1))
-		if [ "$w" = "$wf" ]; then echo "$n"; fi
+		title="${w%.yml} $label $tag"
+		case "$jq" in *"\"$title\""*) [ "$w" = "$wf" ] && echo "$n" ;; esac
 	done <"$FAKE/sent"
 	;;
 "run view")
-	if [ -f "$FAKE/instant" ] || [ -f "$FAKE/done-$3" ]; then
+	if [ -f "$FAKE/done-all" ] || [ -f "$FAKE/done-$3" ]; then
 		case "$*" in *conclusion*) echo success ;; *) echo completed ;; esac
 	else
 		echo in_progress
@@ -385,49 +448,98 @@ const fakeDispatchGH = `case "$1 $2" in
 esac
 `
 
-// THE WARM RUNS GO ONLY AFTER THE COLD ONES HAVE FINISHED, for every label, with the
-// cold run's tag; and a run GitHub never lists stops the dispatcher rather than leaving it
-// waiting on nothing.
-func TestTheMatrixDispatcherSendsWarmOnlyAfterCold(t *testing.T) {
+func dispatchSent(t *testing.T, f matrixFakes) []string {
+	t.Helper()
+	sent, err := os.ReadFile(filepath.Join(f.dir, "sent"))
+	if err != nil {
+		return nil
+	}
+
+	return strings.Split(strings.TrimSpace(string(sent)), "\n")
+}
+
+var dispatchEnv = []string{"MATRIX_SETTLE=0", "MATRIX_POLL=0", "MATRIX_LIST_WAIT=1", "MATRIX_TIMEOUT=3"}
+
+// THE COLD PHASE SENDS EVERY LABEL'S COLD, TWO-WRITER AND FAILED-WRITER RUNS, records
+// each run it started, and returns only once EVERY label's cold run has finished: with
+// one architecture's still running, it fails rather than let the warm phase start.
+func TestTheMatrixDispatchersColdPhaseWaitsForEveryArchitecture(t *testing.T) {
 	t.Parallel()
 	f := newMatrixFakes(t)
 	f.command(t, "gh", fakeDispatchGH)
-	f.fixture(t, "instant", "")
-	env := []string{"MATRIX_SETTLE=0", "MATRIX_POLL=0", "MATRIX_LIST_WAIT=1", "MATRIX_TIMEOUT=5"}
-	out, code := f.run(t, "acceptance/matrix-dispatch.sh", env, "billet-testbed/m", "t1", "accept-x64", "accept-arm")
+	f.fixture(t, "done-all", "")
+	runs := filepath.Join(t.TempDir(), "runs")
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cold", "billet-testbed/m", "t1", runs,
+		"accept-x64", "accept-arm")
 	if code != 0 {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
-	sent, err := os.ReadFile(filepath.Join(f.dir, "sent"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(sent)), "\n")
 	want := []string{
 		"matrix-cold.yml accept-x64 t1", "matrix-writers.yml accept-x64 t1", "matrix-writer-fails.yml accept-x64 t1",
 		"matrix-cold.yml accept-arm t1", "matrix-writers.yml accept-arm t1", "matrix-writer-fails.yml accept-arm t1",
-		"matrix-warm.yml accept-x64 t1", "matrix-warm.yml accept-arm t1",
 	}
-	if strings.Join(lines, "|") != strings.Join(want, "|") {
-		t.Fatalf("sent\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+	if got := dispatchSent(t, f); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "1\n2\n3\n4\n5\n6\n" {
+		t.Fatalf("the runs file is %q, %v; want every run started, by id", got, err)
 	}
 
-	// A COLD RUN THAT NEVER FINISHES sends no warm run.
+	// The x64 cold run (id 1) finishes; the arm one (id 4) does not.
 	f = newMatrixFakes(t)
 	f.command(t, "gh", fakeDispatchGH)
-	out, code = f.run(t, "acceptance/matrix-dispatch.sh", env, "billet-testbed/m", "t2", "accept-x64")
-	if code != 1 || !strings.Contains(out, "did not complete within 5s") {
-		t.Fatalf("a cold run that never finished: exit %d\n%s", code, out)
-	}
-	if sent, err := os.ReadFile(filepath.Join(f.dir, "sent")); err != nil || strings.Contains(string(sent), "matrix-warm") {
-		t.Fatalf("a warm run was sent before the cold one finished:\n%s", sent)
+	f.fixture(t, "done-1", "")
+	runs = filepath.Join(t.TempDir(), "runs")
+	out, code = f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cold", "billet-testbed/m", "t2", runs,
+		"accept-x64", "accept-arm")
+	if code != 1 || !strings.Contains(out, "run 4 did not complete") {
+		t.Fatalf("an arm cold run still running: exit %d\n%s", code, out)
 	}
 
 	f = newMatrixFakes(t)
 	f.command(t, "gh", fakeDispatchGH)
 	f.fixture(t, "unlisted", "")
-	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", env, "billet-testbed/m", "t3", "accept-x64"); code != 1 ||
-		!strings.Contains(out, "lists no run of matrix-cold.yml") {
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cold", "billet-testbed/m", "t3",
+		filepath.Join(t.TempDir(), "runs"), "accept-x64"); code != 1 || !strings.Contains(out, "lists no run of matrix-cold.yml") {
 		t.Fatalf("a run GitHub never listed: exit %d\n%s", code, out)
+	}
+}
+
+// THE WARM PHASE SENDS EACH LABEL'S WARM RUN WITH THE COLD RUNS' TAG, and waits for
+// every run the runs file names, the cold phase's two-writer and failed-writer runs
+// included.
+func TestTheMatrixDispatchersWarmPhaseWaitsForEveryRun(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t)
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-all", "")
+	runs := filepath.Join(t.TempDir(), "runs")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cold", "billet-testbed/m", "t1", runs,
+		"accept-x64"); code != 0 {
+		t.Fatalf("cold: exit %d\n%s", code, out)
+	}
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "warm", "billet-testbed/m", "t1", runs, "accept-x64")
+	if code != 0 || !strings.Contains(out, "every matrix run for tag t1 has completed") {
+		t.Fatalf("warm: exit %d\n%s", code, out)
+	}
+	if got := dispatchSent(t, f); len(got) != 4 || got[3] != "matrix-warm.yml accept-x64 t1" {
+		t.Fatalf("sent %q", got)
+	}
+
+	// A two-writer run from the cold phase (id 2) still running fails the warm phase.
+	f = newMatrixFakes(t)
+	f.command(t, "gh", fakeDispatchGH)
+	runs = filepath.Join(t.TempDir(), "runs")
+	f.fixture(t, "done-1", "")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cold", "billet-testbed/m", "t2", runs,
+		"accept-x64"); code != 0 {
+		t.Fatalf("cold: exit %d\n%s", code, out)
+	}
+	for _, id := range []string{"3", "4"} {
+		f.fixture(t, "done-"+id, "")
+	}
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "warm", "billet-testbed/m", "t2", runs,
+		"accept-x64"); code != 1 || !strings.Contains(out, "run 2 did not complete") {
+		t.Fatalf("a cold-phase run still running: exit %d\n%s", code, out)
 	}
 }

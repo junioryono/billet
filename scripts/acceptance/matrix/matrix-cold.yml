@@ -18,6 +18,11 @@ on:
         required: true
 permissions:
   contents: read
+# bash, so every step runs under -eo pipefail: GitHub's default shell on Linux is bash -e
+# alone, under which a failed build piped through tee passes.
+defaults:
+  run:
+    shell: bash
 jobs:
   docker-images:
     runs-on: ${{ inputs.runs_on }}
@@ -51,6 +56,10 @@ jobs:
           test "$HIT" != true
           echo "cold-$TAG" | sudo tee /mnt/matrix/marker
   docker-builder:
+    # AFTER THE IMAGE PROBE: the builder's BuildKit image lands in the same image store,
+    # whose publication is last-write-wins, and a builder that cloned the empty store
+    # beside the probe would publish a generation without the probe's image.
+    needs: docker-images
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 30
     steps:
@@ -68,10 +77,14 @@ jobs:
           mkdir -p ctx
           printf 'FROM public.ecr.aws/docker/library/busybox:1.36\nRUN echo %s > /tag && sleep 5\n' "$TAG" > ctx/Dockerfile
           docker buildx build --builder "$BUILDER" --progress=plain ctx 2>&1 | tee build.log
-          if grep -q 'CACHED' build.log; then
-            echo "MATRIX a cold builder answered from its cache" >&2
-            exit 1
-          fi
+          # THE TAGGED RUN STEP'S OWN VERTEX, not any CACHED line: the FROM can be cached
+          # while the RUN executes. grep -c prints nothing on an unreadable log, which
+          # fails the test below rather than reading as either answer.
+          vertex=$(sed -n 's/^\(#[0-9]*\) \[[0-9]*\/[0-9]*\] RUN .*/\1/p' build.log | head -n 1)
+          test -n "$vertex"
+          cached=$(grep -cx "$vertex CACHED" build.log || true)
+          echo "MATRIX the RUN step is vertex $vertex, cached $cached time(s)"
+          test "$cached" = 0
   actions:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 20
@@ -99,9 +112,9 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 20
     steps:
+      # ONE FETCH: a second would find the mirror the first made, and the node keeps
+      # the warm observation over the cold one for the session.
       - uses: actions/checkout@v6
-      - name: Fetch through the node's mirror
-        run: git fetch --depth=50 origin
   go:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 30

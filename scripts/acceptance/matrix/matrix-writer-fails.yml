@@ -2,7 +2,10 @@ name: matrix-writer-fails
 # billet's acceptance matrix (#554), a sticky-disk writer that fails after writing. A
 # seed publishes a generation; a writer clones it, writes, and fails; a reader then finds
 # the seed's generation and nothing the failed writer wrote. The reader is the matrix's
-# cell; cmd/billet/acceptancematrix.go judges it by name.
+# cell; cmd/billet/acceptancematrix.go judges it by name. It runs only after the writer
+# has proved it cloned the seed and wrote, so a writer that failed earlier (a disk that
+# never attached) is no failed writer, and its reader never runs: the cell is not run,
+# which a run covering its architecture fails on.
 #
 # This file is copied from billet's scripts/acceptance/matrix into the repository the
 # acceptance App serves, and the run refuses a copy that differs.
@@ -18,6 +21,11 @@ on:
         required: true
 permissions:
   contents: read
+# bash, so every step runs under -eo pipefail: GitHub's default shell on Linux is bash -e
+# alone, under which a failed build piped through tee passes.
+defaults:
+  run:
+    shell: bash
 jobs:
   seed:
     runs-on: ${{ inputs.runs_on }}
@@ -35,22 +43,34 @@ jobs:
     needs: seed
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 20
+    outputs:
+      wrote: ${{ steps.write.outputs.wrote }}
     steps:
       - name: Let the seed's publication land
         run: sleep 120
-      - uses: junioryono/billet/actions/stickydisk@main
+      - id: disk
+        uses: junioryono/billet/actions/stickydisk@main
         with:
           key: ${{ github.repository }}-matrix-fails-${{ inputs.tag }}
           path: /mnt/matrix
           size-gb: "5"
-      - name: Write, then fail
+      - id: write
+        name: Clone the seed, and write
+        env:
+          HIT: ${{ steps.disk.outputs.cache-hit }}
+          TAG: ${{ inputs.tag }}
         run: |
+          set -eu
+          test "$HIT" = true
+          test "$(cat /mnt/matrix/marker)" = "seed-$TAG"
           echo failed | sudo tee /mnt/matrix/failed-writer
           sync
-          exit 1
+          echo wrote=true >>"$GITHUB_OUTPUT"
+      - name: Fail, having written
+        run: exit 1
   reader:
     needs: failer
-    if: ${{ always() && needs.failer.result == 'failure' }}
+    if: ${{ always() && needs.failer.result == 'failure' && needs.failer.outputs.wrote == 'true' }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 20
     steps:

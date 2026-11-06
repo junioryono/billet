@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -284,14 +285,35 @@ func workflowFile(ref string) string {
 	return path.Base(before)
 }
 
+// matrixScope is what a job must belong to for the judge to read it, and what it is
+// measured against.
+type matrixScope struct {
+	tiers  map[string]matrixTier
+	prices map[string]config.USDPerHour
+	// runs are the GitHub runs this matrix run dispatched, and repository the one it
+	// dispatched them in. A job of any other run, or another repository, is not a
+	// cell's, however its tier, workflow and name match: someone else's run on the same
+	// labels must not stand in for a job this run never got. Nil runs reads every run,
+	// which only a hand-run judge without --runs does.
+	runs       map[int64]bool
+	repository string
+}
+
+// belongs reports whether a job is one of this matrix run's.
+func (s matrixScope) belongs(j *acceptanceJob) bool {
+	if s.repository != "" && !strings.EqualFold(j.Repository, s.repository) {
+		return false
+	}
+
+	return s.runs == nil || s.runs[j.GitHubRunID]
+}
+
 // judgeMatrix judges every cell from the evidence.
-func judgeMatrix(cells []matrixCell, doc acceptanceEvidenceDoc, tiers map[string]matrixTier,
-	prices map[string]config.USDPerHour,
-) matrixDoc {
+func judgeMatrix(cells []matrixCell, doc acceptanceEvidenceDoc, scope matrixScope) matrixDoc {
 	out := matrixDoc{Version: matrixDocVersion, JudgedAt: time.Now().UTC().Format(time.RFC3339),
 		DeploymentID: doc.DeploymentID}
 	for _, cell := range cells {
-		r := judgeCell(cell, doc.Jobs, tiers, prices)
+		r := judgeCell(cell, doc.Jobs, scope)
 		switch r.Verdict {
 		case verdictPass:
 			out.Passed++
@@ -308,9 +330,7 @@ func judgeMatrix(cells []matrixCell, doc acceptanceEvidenceDoc, tiers map[string
 	return out
 }
 
-func judgeCell(cell matrixCell, jobs []acceptanceJob, tiers map[string]matrixTier,
-	prices map[string]config.USDPerHour,
-) matrixResult {
+func judgeCell(cell matrixCell, jobs []acceptanceJob, scope matrixScope) matrixResult {
 	r := matrixResult{matrixCell: cell}
 	switch {
 	case cell.Unsupported:
@@ -326,8 +346,8 @@ func judgeCell(cell matrixCell, jobs []acceptanceJob, tiers map[string]matrixTie
 	var mine []acceptanceJob
 	for i := range jobs {
 		j := &jobs[i]
-		t, ok := tiers[j.Tier]
-		if !ok || t.arch != cell.Arch || !slices.Contains(t.providers, cell.Backend) {
+		t, ok := scope.tiers[j.Tier]
+		if !ok || t.arch != cell.Arch || !slices.Contains(t.providers, cell.Backend) || !scope.belongs(j) {
 			continue
 		}
 		if workflowFile(j.WorkflowRef) != cell.Run.Workflow || j.JobName != cell.Run.Job {
@@ -364,7 +384,7 @@ func judgeCell(cell matrixCell, jobs []acceptanceJob, tiers map[string]matrixTie
 			wrong = append(wrong, fmt.Sprintf("%s: the node observed %s %q, want %q", j.LeaseID,
 				cell.Run.Observe, got, cell.Run.Want))
 		}
-		measureJob(&r, j, prices)
+		measureJob(&r, j, scope.prices)
 	}
 	if len(wrong) > 0 {
 		r.Verdict, r.Reason = verdictFail, strings.Join(wrong, "; ")
@@ -519,6 +539,10 @@ func cmdMatrixJudge(env cli.Env, args []string) error {
 	out := fs.String("out", "", "where to write the verdicts (default: <workspace>/matrix.json)")
 	archs := fs.String("archs", "", "the architectures this run covered, comma-separated; a cell on one of "+
 		"them that was not run fails the run (default: none, so a cell not run is reported, not failed)")
+	runsFile := fs.String("runs", "", "a file of the GitHub run ids this matrix run dispatched, one per line; "+
+		"only their jobs are judged (default: every job in the evidence)")
+	repository := fs.String("repository", "", "the owner/repository the runs were dispatched in; a job of any "+
+		"other is not judged")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -545,7 +569,13 @@ func cmdMatrixJudge(env cli.Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	verdicts := judgeMatrix(matrixCells(), doc, matrixTiers(cfg), matrixPrices(cfg))
+	scope := matrixScope{tiers: matrixTiers(cfg), prices: matrixPrices(cfg), repository: *repository}
+	if *runsFile != "" {
+		if scope.runs, err = readMatrixRuns(*runsFile); err != nil {
+			return err
+		}
+	}
+	verdicts := judgeMatrix(matrixCells(), doc, scope)
 	body, err := json.MarshalIndent(verdicts, "", "  ")
 	if err != nil {
 		return err
@@ -579,6 +609,33 @@ func readMatrixEvidence(file, deploymentID string) (acceptanceEvidenceDoc, error
 	}
 
 	return doc, nil
+}
+
+// readMatrixRuns reads the run ids a dispatcher wrote, one per line. A file naming none
+// is refused: every cell would read as not run, which is a dispatcher's failure to say
+// rather than a matrix's verdict.
+func readMatrixRuns(file string) (map[int64]bool, error) {
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("read the dispatched runs: %w", err)
+	}
+	out := map[int64]bool{}
+	for i, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(line, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("%s:%d: %q is not a GitHub run id", file, i+1, line)
+		}
+		out[id] = true
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s names no GitHub run", file)
+	}
+
+	return out, nil
 }
 
 // matrixOutcome fails a run with any failed cell, or a cell that should have run on an
