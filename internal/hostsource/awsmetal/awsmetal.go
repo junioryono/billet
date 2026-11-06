@@ -1,4 +1,4 @@
-// Package awsmetal is the host source for AWS bare-metal instances (ADR-028), through
+// Package awsmetal is the host source for AWS bare-metal instances (ADR-030), through
 // the ec2 provider's pool-host surface, so there is one EC2 client.
 //
 // WHAT IS MEASURED. On 2026-11-05 four metal types reached their first script 21 to

@@ -41,6 +41,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -54,6 +55,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
+	"github.com/junioryono/billet/internal/egress"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -130,6 +132,9 @@ type Provider struct {
 	// lockClaims.
 	claimsMu sync.Mutex
 
+	// egress puts each guest's network policy on its tap; nil refuses a listed one.
+	egress *egress.Host
+
 	// execPath and execName are the firecracker binary with its symlinks already
 	// followed, and the directory name the jailer derives from it.
 	//
@@ -170,6 +175,9 @@ type Provider struct {
 	// snapshot was not taken on.
 	cpuinfoPath string
 	hostKernel  func() (string, error)
+	// goarch is this host's machine, and so its guests'. A seam because the other
+	// machine's boot arguments would otherwise be unreachable from a test.
+	goarch string
 	// digests remembers the digests of the VMM binary and the guest kernels.
 	digests fileDigests
 	// jailWrote reports whether a file in a jail is one its VMM wrote. A seam
@@ -359,6 +367,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		tapOwner:    sysTapOwner,
 		cpuinfoPath: "/proc/cpuinfo",
 		hostKernel:  unameKernel,
+		goarch:      runtime.GOARCH,
 		jailWrote:   jailWritten,
 		bootWait:    DefaultBootWait,
 	}
@@ -554,6 +563,15 @@ func (p *Provider) start(
 		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
 
+	// AND SO IS AN ALLOWLIST, for the same reason. Without this a provider built
+	// with no host would launch a listed tier's guest open.
+	if spec.Egress.Listed() {
+		if err := p.EgressReady(); err != nil {
+			return nil, fmt.Errorf("firecracker: %s has a network allowlist that cannot be applied: %w",
+				spec.Name, err)
+		}
+	}
+
 	// A RESTORE'S DISK IS THE SNAPSHOT'S, read before anything is claimed: the
 	// golden's system disk its memory was taken with, and the exact generation that
 	// disk was cloned from, which pairs the restore with the guest's kernel.
@@ -704,7 +722,16 @@ func (p *Provider) start(
 	// launch failed with the reason a cleanup failed.
 	inst, err := p.launch(ctx, j, spec, device, kernel, res, snapshot, want)
 	if err != nil {
-		return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
+		unwound := p.unwind(ctx, j, spec, res, err)
+
+		// ONLY IF THE GUEST IS PROVED GONE: a guest the unwind could not stop keeps
+		// its rules, and the Destroy that does prove it removes them.
+		if unwound == nil {
+			p.detachEgress(ctx, spec.Name)
+			p.forgetEgress(spec.Name)
+		}
+
+		return nil, errors.Join(err, unwound)
 	}
 
 	p.log.Info("launched a microVM", "runner", spec.Name, "vcpu", spec.VCPU,
@@ -737,6 +764,13 @@ func (p *Provider) launch(
 		if err := p.placeSnapshot(j, snapshot, kernel, spec, want); err != nil {
 			return nil, err
 		}
+	}
+
+	// BEFORE THE TAP EXISTS, because the rules match its name and need no device:
+	// there is no moment at which the guest's interface is on the bridge without
+	// them, and a failure here refuses the launch with nothing started.
+	if err := p.attachEgress(ctx, spec, res.Tap); err != nil {
+		return nil, err
 	}
 
 	if err := p.addTap(ctx, res.Tap, p.bridgeFor(spec.Trust), res.UID); err != nil {
@@ -1019,7 +1053,7 @@ func (p *Provider) configure(
 		}},
 		{"/boot-source", map[string]any{
 			"kernel_image_path": "/" + guestKernel,
-			"boot_args":         bootArgs,
+			"boot_args":         bootArgs(p.goarch),
 		}},
 		{"/drives/rootfs", map[string]any{
 			"drive_id":       "rootfs",
@@ -1210,7 +1244,8 @@ const GuestContract = "10"
 // fails on an HTTP request.
 const mmdsSizeLimit = 51200
 
-// bootArgs is the guest kernel command line.
+// bootArgs is the guest kernel command line on a host of goarch, which is the guest's
+// machine too.
 //
 // `console=` IS ABSENT ON PURPOSE. A serial console costs boot time on every job,
 // and under --daemonize the VMM's stdout is /dev/null, so it would be written
@@ -1219,9 +1254,16 @@ const mmdsSizeLimit = 51200
 //
 // `pci=off` and the i8042 options are Firecracker's own documented arguments for a
 // machine with no PCI bus and no keyboard controller; without them the guest spends
-// its first seconds probing hardware that is not there.
-const bootArgs = "reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd " +
-	"root=/dev/vda rw"
+// its first seconds probing hardware that is not there. An arm64 kernel has no i8042
+// driver to tell, so only x86 is given them.
+func bootArgs(goarch string) string {
+	if goarch == "arm64" {
+		return "reboot=k panic=1 pci=off root=/dev/vda rw"
+	}
+
+	return "reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd " +
+		"root=/dev/vda rw"
+}
 
 // guestInterface is the one network device a guest gets.
 const guestInterface = "eth0"
@@ -1477,6 +1519,8 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 	if !found {
 		// NO JAIL, BUT NOT NECESSARILY NOTHING. Claims outlive the jail they
 		// named, and a root clone is addressed independently by lease id.
+		p.detachEgress(ctx, id)
+
 		return p.cleanupLifecycleOnly(ctx, id)
 	}
 	if err := ctx.Err(); err != nil {
@@ -1509,6 +1553,11 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 	if err := p.stopVMM(ctx, j); err != nil {
 		return err
 	}
+
+	// AFTER THE PROOF, since rules taken off a guest that may still run would leave it
+	// open, AND UNDER THE LEASE'S LOCK, since a launch of this name after it is released
+	// has rules of its own that this must not take.
+	p.detachEgress(ctx, id)
 
 	res, err := resourcesOf(j)
 	if err != nil {

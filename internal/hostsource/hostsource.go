@@ -1,5 +1,5 @@
 // Package hostsource is the contract a source of rented bare metal implements
-// (ADR-028): order a host, describe it, prove it gone, release it, and say what its
+// (ADR-030): order a host, describe it, prove it gone, release it, and say what its
 // terms are. A pool on top of it grows and shrinks; a source only answers.
 //
 // BESIDE internal/provider, BELOW THE SCHEDULER. A provider starts one job's compute
@@ -149,7 +149,7 @@ type Terms struct {
 	// show it. Zero, the zero value, is not idempotent.
 	IdempotentFor time.Duration
 	// Preemptible is a host the source may take back with warning. A pool never runs
-	// jobs on one (ADR-028), and a source that offers only these is refused.
+	// jobs on one (ADR-030), and a source that offers only these is refused.
 	Preemptible bool
 }
 
@@ -199,7 +199,7 @@ type Holdings struct {
 	Inventory int
 }
 
-// NewDrainedProof builds the proof a drained host is released on (ADR-028): sealed
+// NewDrainedProof builds the proof a drained host is released on (ADR-030): sealed
 // against placement, and holding no lease, no quarantine and no custody, with its
 // node's last inventory empty. A count that could not be read refuses like a holding.
 func NewDrainedProof(h Holdings) (ReleaseProof, error) {
@@ -231,7 +231,7 @@ type Unjoined struct {
 }
 
 // NewUnjoinedProof builds the proof a host that never joined is released on: it never
-// held anything a job could use, so it has no drain to prove (ADR-028).
+// held anything a job could use, so it has no drain to prove (ADR-030).
 func NewUnjoinedProof(u Unjoined) (ReleaseProof, error) {
 	switch {
 	case u.Host == "":

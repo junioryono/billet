@@ -1,4 +1,4 @@
-# ADR-028: A pool of rented bare metal
+# ADR-030: A pool of rented bare metal
 
 Accepted, 2026-11-05, except where a section says what it still owes. Issue #553.
 

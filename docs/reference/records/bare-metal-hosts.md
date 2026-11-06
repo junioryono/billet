@@ -1,6 +1,6 @@
 # Bare-metal hosts
 
-What was measured of the two kinds of rented bare metal [ADR-028](../decisions/adr-028-rented-bare-metal-pool.md) builds a pool from, and when. Every AWS number is from `us-west-2`, every phoenixNAP number from its API on the day named.
+What was measured of the two kinds of rented bare metal [ADR-030](../decisions/adr-030-rented-bare-metal-pool.md) builds a pool from, and when. Every AWS number is from `us-west-2`, every phoenixNAP number from its API on the day named.
 
 ## AWS bare-metal instances, 2026-11-05
 
@@ -36,10 +36,10 @@ What was measured of the two kinds of rented bare metal [ADR-028](../decisions/a
 ## Still to measure
 
 - A no-stock and a quota refusal from each source, read as the scaler will read them.
-- The time from an order to a registered node, with the order-bound join of ADR-028.
+- The time from an order to a registered node, with the order-bound join of ADR-030.
 - Single-thread speed inside a Firecracker guest under full load, on each candidate, with cpus pinned so a sibling hyperthread is told apart from the rest of the load.
 - `m6id.metal`, `m8gd.metal-24xl` and `m8id.metal-48xl`, which fit the shape on paper and were not launched.
 - What `DescribeInstances` answers for a terminated metal instance, and for how long, which is what proves an AWS pool host gone.
-- Reading a host's key fingerprint from its console with `GetConsoleOutput`, as the join of ADR-028 does.
+- Reading a host's key fingerprint from its console with `GetConsoleOutput`, as the join of ADR-030 does.
 - A store volume attached to a metal instance and handed to a Firecracker guest.
 - phoenixNAP: everything after an accepted order.

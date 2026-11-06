@@ -144,8 +144,16 @@ api PUT /machine-config "{\"vcpu_count\":$VCPUS,\"mem_size_mib\":$MEM_MIB}"
 # console=ttyS0 IS THE WHOLE POINT: the console is the only channel this test
 # reads. reboot=k and panic=1 make a panicking guest exit rather than hang until
 # the timeout, which turns a crash into a fast, legible failure.
-api PUT /boot-source "$(jq -n --arg k "$KERNEL" \
-	'{kernel_image_path:$k, boot_args:"console=ttyS0 reboot=k panic=1 pci=off"}')"
+#
+# keep_bootcon ON aarch64, as Firecracker's own getting-started guide boots it: its
+# serial console there starts as the early console the VMM names on the command line.
+boot_args="console=ttyS0 reboot=k panic=1 pci=off"
+if [ "$(uname -m)" = aarch64 ]; then
+	boot_args="keep_bootcon $boot_args"
+fi
+
+api PUT /boot-source "$(jq -n --arg k "$KERNEL" --arg a "$boot_args" \
+	'{kernel_image_path:$k, boot_args:$a}')"
 
 api PUT /drives/rootfs "$(jq -n --arg p "$WORK/rootfs.ext4" \
 	'{drive_id:"rootfs", path_on_host:$p, is_root_device:true, is_read_only:false}')"
