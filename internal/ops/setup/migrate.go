@@ -224,8 +224,10 @@ func repositoryOfRemote(remote string) (string, bool) {
 	path := ""
 	if u, err := url.Parse(remote); err == nil && u.Scheme != "" && u.Host != "" {
 		path = u.Path
-	} else if _, rest, ok := strings.Cut(remote, ":"); ok && !strings.Contains(remote, "://") {
-		path = rest
+	} else if !localPath(remote) && !strings.Contains(remote, "://") {
+		// AN SCP-STYLE ADDRESS ONLY: a path on this machine names no owner, even with a
+		// colon in it (`../mirrors:alice/api.git`).
+		_, path, _ = strings.Cut(remote, ":")
 	}
 
 	path = strings.TrimSuffix(strings.Trim(path, "/"), ".git")
@@ -950,7 +952,11 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 	if _, err := runGit(ctx, path, "commit", "-q", "-m", title); err != nil {
 		return stopped(err, "staging the files")
 	}
-	if _, err := runGit(ctx, path, "push", "-q", "-u", "origin", branch); err != nil {
+	// THE DESTINATION IS SPELLED OUT: a bare branch name lets an upstream the new
+	// branch tracks (branch.autoSetupMerge, push.default=upstream) or a remote's push
+	// refspec send the commit to another branch, main among them.
+	ref := "refs/heads/" + branch
+	if _, err := runGit(ctx, path, "push", "-q", "-u", "origin", ref+":"+ref); err != nil {
 		return stopped(err, "committing")
 	}
 

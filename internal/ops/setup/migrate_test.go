@@ -553,7 +553,9 @@ func TestARemoteIsReadForItsRepository(t *testing.T) {
 			t.Errorf("%s = %q, %t; want %q", remote, got, ok, want)
 		}
 	}
-	for _, remote := range []string{"", "/srv/git/api.git", "https://github.com/acme", "https://github.com/a/b/c", "github.com"} {
+	// A path on this machine names no owner, a colon in it included.
+	for _, remote := range []string{"", "/srv/git/api.git", "https://github.com/acme", "https://github.com/a/b/c", "github.com",
+		"../mirrors:alice/api.git", "/srv/mirrors:alice/api.git", "file:///srv/alice/api.git"} {
 		if got, ok := repositoryOfRemote(remote); ok {
 			t.Errorf("%q = %q; want no answer", remote, got)
 		}
@@ -819,6 +821,16 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 	runIn(t, dir, "config", "remote.origin.pushurl", "https://github.com/alice/api.git")
 	// pushInsteadOf IS NOT APPLIED TO AN EXPLICIT PUSH URL, insteadOf is.
 	runIn(t, dir, "config", "url."+originOf(t, dir)+".insteadOf", "https://github.com/alice/api.git")
+	// A NEW BRANCH THAT TRACKS main, pushed by a bare name under push.default=upstream,
+	// would land on origin's main; the push names its destination.
+	runIn(t, dir, "config", "branch.autoSetupMerge", "always")
+	runIn(t, dir, "config", "push.default", "upstream")
+	bare := originOf(t, dir)
+	runIn(t, dir, "push", "-q", "origin", "refs/heads/main:refs/heads/main")
+	mainBefore := runIn(t, bare, "rev-parse", "refs/heads/main")
+	if mainBefore == "" {
+		t.Fatal("origin has no main to compare with")
+	}
 
 	// The repository named in another case than origin's: the pull request goes to it
 	// as named, from the branch on the fork origin pushes to.
@@ -828,6 +840,10 @@ func TestMigrateWorkflowsOpensThePullRequestWithTheOperatorsTools(t *testing.T) 
 	}
 	if !strings.HasSuffix(stdout, "https://github.com/acme/api/pull/7\n") {
 		t.Errorf("stdout does not end with the pull request:\n%s", stdout)
+	}
+
+	if mainAfter := runIn(t, bare, "rev-parse", "refs/heads/main"); mainAfter != mainBefore {
+		t.Errorf("origin's main moved from %q to %q", mainBefore, mainAfter)
 	}
 
 	branch := strings.TrimSpace(runIn(t, dir, "rev-parse", "--abbrev-ref", "HEAD"))
