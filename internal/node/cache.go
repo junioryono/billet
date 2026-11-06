@@ -1983,6 +1983,19 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	candidate, step, err := s.publishAcquired(ctx, session, slot, attachment, lease, fence)
+	if err != nil && step == stepPublish && attachment.Publication == publicationCAS &&
+		errors.Is(err, storecontract.ErrConflict) {
+		// A CAS LOSS IS AN ANSWER, NOT AN OUTAGE: another job published after this
+		// disk was cloned, and cas keeps theirs. Said by name, because "cache
+		// unavailable" sends an operator looking for a fault that is not there.
+		s.log.Info("a sticky-disk update was superseded; cas keeps the generation published since its clone",
+			"instance", session.instance, "key", attachment.Volume.Key)
+		writeCacheJSON(w, http.StatusOK, map[string]any{
+			"published": false, "reason": supersededReason,
+		})
+
+		return
+	}
 	if err != nil {
 		s.nonFatalCommit(w, session, commitOperation(step), err)
 
@@ -1993,6 +2006,10 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		"published": true, "generation": candidate.Generation,
 	})
 }
+
+// supersededReason is what a cas commit answers when another job published after
+// this disk was cloned.
+const supersededReason = "superseded: another job published this key after this disk was cloned, and cas keeps theirs"
 
 // publishStep names the step of publishAcquired that failed, for the caller's
 // own diagnostic.

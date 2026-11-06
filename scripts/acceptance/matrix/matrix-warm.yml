@@ -32,7 +32,7 @@ jobs:
       - id: disk
         uses: junioryono/billet/actions/stickydisk@main
         with:
-          key: ${{ github.repository }}-matrix-sticky-${{ inputs.tag }}
+          key: ${{ github.repository }}-matrix-sticky-${{ inputs.runs_on }}-${{ inputs.tag }}
           path: /mnt/matrix
           size-gb: "5"
       - name: The disk is the cold job's
@@ -50,7 +50,7 @@ jobs:
       - id: builder
         uses: junioryono/billet/actions/setup-docker-builder@main
         with:
-          cache-key: matrix-${{ inputs.tag }}
+          cache-key: matrix-${{ inputs.runs_on }}-${{ inputs.tag }}
           cache-size-gb: "10"
       - name: The cold job's layer is cached
         env:
@@ -76,7 +76,7 @@ jobs:
       - uses: actions/cache/restore@v5
         with:
           path: matrix-payload
-          key: matrix-actions-${{ inputs.tag }}
+          key: matrix-actions-${{ inputs.runs_on }}-${{ inputs.tag }}
           fail-on-cache-miss: true
       - name: The archive is the cold job's
         env:

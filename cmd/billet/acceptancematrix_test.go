@@ -113,6 +113,38 @@ type matrixWorkflowJob struct {
 	Name     string `yaml:"name"`
 	RunsOn   string `yaml:"runs-on"`
 	Strategy any    `yaml:"strategy"`
+	Steps    []struct {
+		Uses string            `yaml:"uses"`
+		With map[string]string `yaml:"with"`
+	} `yaml:"steps"`
+}
+
+// EVERY CACHE KEY A MATRIX JOB NAMES CARRIES ITS TIER AND ITS RUN'S TAG: the matrix
+// dispatches the same tag to every architecture's tier, and a key two tiers share
+// would let one architecture's writer stand in for another's, or a rerun find its
+// own last run's entry.
+func TestEveryMatrixCacheKeyCarriesItsTierAndTag(t *testing.T) {
+	t.Parallel()
+	keyed := 0
+	for _, file := range matrixWorkflowFiles(t) {
+		for id, job := range matrixWorkflowJobs(t, file) {
+			for _, step := range job.Steps {
+				for _, field := range []string{"key", "cache-key"} {
+					key, ok := step.With[field]
+					if !ok {
+						continue
+					}
+					keyed++
+					if !strings.Contains(key, "${{ inputs.runs_on }}") || !strings.Contains(key, "${{ inputs.tag }}") {
+						t.Errorf("%s: job %s's %s %s (%q) does not carry its tier and tag", file, id, step.Uses, field, key)
+					}
+				}
+			}
+		}
+	}
+	if keyed == 0 {
+		t.Fatal("no matrix job names a cache key; this test reads nothing")
+	}
 }
 
 // EVERY RUN CELL NAMES A JOB ITS WORKFLOW RUNS, on the tier the run names, under the

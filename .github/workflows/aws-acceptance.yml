@@ -223,10 +223,12 @@ jobs:
           read -r -a labels <<<"$LABELS"
           scripts/acceptance/matrix-dispatch.sh warm "$REPO" "$RUN" out/runs "${labels[@]}"
       # A FAILED OR CANCELLED DISPATCH STOPS THE HOST'S RUN rather than leave it waiting
-      # out --wait for jobs nobody sent; the wait below then joins it, so neither the
-      # judge nor the teardown runs beside a run still writing.
+      # out --wait for jobs nobody sent; the wait below then joins it, and the judge
+      # refuses a run with no recorded exit. Asked whether or not the run's command id
+      # was recorded, because a run SSM accepted before the step that sent it failed is
+      # still a run; the teardown's `down` waits for it too.
       - name: Stop the host's run early
-        if: ${{ (failure() || cancelled()) && steps.host-run.outputs.id != '' }}
+        if: ${{ failure() || cancelled() }}
         run: |
           scripts/acceptance/ssm-run.sh run "$HOST" 120 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' stop '$RUN_DIR'"
       - name: Wait for the host's run, which tears down what it made

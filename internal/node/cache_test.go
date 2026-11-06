@@ -548,6 +548,53 @@ func TestLastWriteWinsRebasesABuilderCandidateAfterAConcurrentCommit(t *testing.
 	}
 }
 
+// A CAS COMMIT THAT LOSES TO A CONCURRENT PUBLICATION SAYS SO, rather than "cache
+// unavailable": the store kept the other job's generation, which is the policy
+// working, and the guest's warning names it. Any other failure still reads as one.
+func TestACasCommitSupersededByAnotherJobSaysSo(t *testing.T) {
+	t.Parallel()
+
+	commit := func(t *testing.T, edit func(*fakeCacheStore)) map[string]any {
+		t.Helper()
+		service, storage, token := testCacheService(t, provider.TrustTrusted)
+		storage.current = "baseline"
+		edit(storage)
+		attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+			"key": "acme/api/sticky", "size_bytes": int64(1 << 30), "publication": publicationCAS,
+		})
+		if attached.Code != http.StatusCreated {
+			t.Fatalf("attach status = %d: %s", attached.Code, attached.Body.String())
+		}
+		committed := cacheRequest(t, service, token, "/v1/volumes/0/commit", nil)
+		if committed.Code != http.StatusOK {
+			t.Fatalf("commit status = %d: %s", committed.Code, committed.Body.String())
+		}
+		var answer map[string]any
+		if err := json.Unmarshal(committed.Body.Bytes(), &answer); err != nil {
+			t.Fatalf("decode the commit's answer: %v", err)
+		}
+
+		return answer
+	}
+
+	got := commit(t, func(s *fakeCacheStore) { s.advanceOnSnapshot = true })
+	if got["published"] != false || got["reason"] != supersededReason {
+		t.Errorf("a cas commit another job superseded answered %v, want %q", got, supersededReason)
+	}
+
+	got = commit(t, func(s *fakeCacheStore) { s.snapshotErr = errors.New("snapshot quota") })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a commit whose snapshot failed answered %v, want cache unavailable", got)
+	}
+
+	// THE SAME STEP, ANOTHER FAILURE: a publication the store refused for anything
+	// but a conflict is an outage, not a loss.
+	got = commit(t, func(s *fakeCacheStore) { s.publishErr = errors.New("s3: throttled") })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a commit whose publication failed answered %v, want cache unavailable", got)
+	}
+}
+
 func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
 	t.Parallel()
 

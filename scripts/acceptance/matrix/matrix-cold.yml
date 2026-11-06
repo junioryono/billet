@@ -31,7 +31,7 @@ jobs:
       - id: disk
         uses: junioryono/billet/actions/stickydisk@main
         with:
-          key: ${{ github.repository }}-matrix-sticky-${{ inputs.tag }}
+          key: ${{ github.repository }}-matrix-sticky-${{ inputs.runs_on }}-${{ inputs.tag }}
           path: /mnt/matrix
           size-gb: "5"
       - name: The disk is new, and a marker is written to it
@@ -49,7 +49,7 @@ jobs:
       - id: builder
         uses: junioryono/billet/actions/setup-docker-builder@main
         with:
-          cache-key: matrix-${{ inputs.tag }}
+          cache-key: matrix-${{ inputs.runs_on }}-${{ inputs.tag }}
           cache-size-gb: "10"
       - name: Build a layer the warm job must find cached
         env:
@@ -76,7 +76,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: matrix-payload
-          key: matrix-actions-${{ inputs.tag }}
+          key: matrix-actions-${{ inputs.runs_on }}-${{ inputs.tag }}
       - name: The key is not there yet
         env:
           HIT: ${{ steps.restore.outputs.cache-hit }}
@@ -90,7 +90,7 @@ jobs:
       - uses: actions/cache/save@v5
         with:
           path: matrix-payload
-          key: matrix-actions-${{ inputs.tag }}
+          key: matrix-actions-${{ inputs.runs_on }}-${{ inputs.tag }}
   git:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 20

@@ -18,20 +18,25 @@
 # policy's iam:PassRole; omit it when the guests carry no instance profile.
 #
 # run runs the deployment until <jobs> jobs have finished (`billet acceptance run`, which
-# writes the evidence and tears down what it made), and exits with its status. Its pid is
-# kept in <run-dir>/run.pid while it runs.
+# writes the evidence and tears down what it made), and exits with its status, which it
+# also writes to <run-dir>/run.exit; <run-dir>/run.running says one is live. It watches
+# for <run-dir>/stop-requested and, when it appears, sends its own child ONE SIGTERM, as
+# an operator's Ctrl-C would: the run's wait is cancelled and it writes its evidence and
+# tears down what it made. A second signal would leave the jobs running, so it is never
+# sent. Only the run signals, and only its own child, whose pid cannot have been reused
+# while it is still that child. A stop requested before it starts means it never starts.
 #
-# stop ends a run early, as an operator's Ctrl-C would: ONE SIGTERM, which cancels the
-# run's wait and lets it write its evidence and tear down what it made. A second signal
-# would leave the jobs running, so it is never sent. A run that is not running is
-# nothing to stop.
+# stop requests that, and returns; it signals nothing itself.
 #
 # judge judges that evidence (`billet acceptance matrix judge`) for the runs named in
 # <runs-file> of <owner/repo> into <run-dir>/out, beside a copy of the evidence, and exits
-# with the judge's status.
+# with the judge's status. It judges nothing for a run with no recorded exit, which may
+# still be writing.
 #
-# down destroys whatever the run left (`billet acceptance down`, idempotent) and removes
-# the workspace. It is the step every path ends with.
+# down requests a stop, waits up to MATRIX_DOWN_WAIT seconds (default 1800) for a live
+# run to end, then destroys whatever the run left (`billet acceptance down`, idempotent)
+# and removes the workspace; a run still live after that is said, and nothing is taken
+# down beside it. It is the step every path ends with.
 set -uo pipefail
 
 usage() {
@@ -78,15 +83,33 @@ prepare)
 	;;
 run)
 	[ "$#" -eq 3 ] || usage
+	rm -f "$run_dir/run.exit"
+	if [ -e "$run_dir/stop-requested" ]; then
+		echo "matrix: a stop was requested before the run started; it does not start" >&2
+		echo 130 >"$run_dir/run.exit"
+		exit 130
+	fi
+	if ! : >"$run_dir/run.running"; then
+		echo "matrix: could not mark the run live, so nothing could wait for it; not starting it" >&2
+		exit 1
+	fi
 	"$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 150m &
 	pid=$!
-	if ! echo "$pid" >"$run_dir/run.pid"; then
-		echo "matrix: could not record the run's pid, so it could not be stopped early; stopping it now" >&2
-		kill -TERM "$pid"
-	fi
+	signalled=""
+	while kill -0 "$pid" 2>/dev/null; do
+		if [ -z "$signalled" ] && [ -e "$run_dir/stop-requested" ]; then
+			# THE kill ON PATH, not the builtin, so a test can count the signals sent:
+			# two of one kind merge in the receiver, which therefore cannot.
+			env kill -TERM "$pid" || echo "matrix: could not signal the run ($pid)" >&2
+			signalled=1
+			echo "matrix: stopping the run early; it writes its evidence and tears down what it made" >&2
+		fi
+		sleep "${MATRIX_POLL:-2}"
+	done
 	wait "$pid"
 	ran=$?
-	rm -f "$run_dir/run.pid"
+	echo "$ran" >"$run_dir/run.exit"
+	rm -f "$run_dir/run.running"
 	if [ "$ran" -ne 0 ]; then
 		echo "matrix: the run ended with status $ran" >&2
 	fi
@@ -94,22 +117,20 @@ run)
 	;;
 stop)
 	[ "$#" -eq 2 ] || usage
-	if ! pid=$(cat "$run_dir/run.pid" 2>/dev/null) || [ -z "$pid" ]; then
-		echo "matrix: no run is recorded as running; nothing to stop"
+	if [ ! -d "$run_dir" ]; then
+		echo "matrix: no run directory at $run_dir; nothing to stop"
 		exit 0
 	fi
-	if ! kill -0 "$pid" 2>/dev/null; then
-		echo "matrix: the run ($pid) has already ended"
-		exit 0
-	fi
-	# THE kill ON PATH, not the builtin, so a test can count the signals sent: two of
-	# the same kind merge in the receiver, which therefore cannot.
-	env kill -TERM "$pid"
-	echo "matrix: asked the run ($pid) to stop; it writes its evidence and tears down what it made"
+	: >"$run_dir/stop-requested" || exit 1
+	echo "matrix: a stop is requested; a live run is signalled once by its own supervisor"
 	;;
 judge)
 	[ "$#" -eq 5 ] || usage
 	archs=$3 runs=$4 repo=$5
+	if [ ! -s "$run_dir/run.exit" ]; then
+		echo "matrix: the run has no recorded exit, so it may still be writing; judging nothing" >&2
+		exit 1
+	fi
 	mkdir -p "$run_dir/out"
 	if [ -f "$ws/evidence.json" ]; then
 		cp "$ws/evidence.json" "$run_dir/out/evidence.json"
@@ -122,6 +143,17 @@ judge)
 	;;
 down)
 	[ "$#" -eq 2 ] || usage
+	if [ -d "$run_dir" ]; then
+		: >"$run_dir/stop-requested" || exit 1
+		deadline=$((SECONDS + ${MATRIX_DOWN_WAIT:-1800}))
+		while [ -e "$run_dir/run.running" ] && [ ! -e "$run_dir/run.exit" ]; do
+			if [ "$SECONDS" -ge "$deadline" ]; then
+				echo "matrix: the run is still live; nothing is taken down beside it, and its workspace is $ws" >&2
+				exit 1
+			fi
+			sleep "${MATRIX_POLL:-2}"
+		done
+	fi
 	if [ ! -f "$ws/acceptance.json" ]; then
 		echo "matrix: no workspace at $ws; nothing to take down"
 		exit 0

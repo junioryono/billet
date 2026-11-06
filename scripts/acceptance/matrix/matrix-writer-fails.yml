@@ -36,7 +36,7 @@ jobs:
     steps:
       - uses: junioryono/billet/actions/stickydisk@main
         with:
-          key: ${{ github.repository }}-matrix-fails-${{ inputs.tag }}
+          key: ${{ github.repository }}-matrix-fails-${{ inputs.runs_on }}-${{ inputs.tag }}
           path: /mnt/matrix
           size-gb: "5"
       - env:
@@ -52,7 +52,7 @@ jobs:
       - id: disk
         uses: junioryono/billet/actions/stickydisk@main
         with:
-          key: ${{ github.repository }}-matrix-fails-${{ inputs.tag }}
+          key: ${{ github.repository }}-matrix-fails-${{ inputs.runs_on }}-${{ inputs.tag }}
           path: /mnt/matrix
           size-gb: "5"
       - id: write
@@ -78,7 +78,7 @@ jobs:
       - id: disk
         uses: junioryono/billet/actions/stickydisk@main
         with:
-          key: ${{ github.repository }}-matrix-fails-${{ inputs.tag }}
+          key: ${{ github.repository }}-matrix-fails-${{ inputs.runs_on }}-${{ inputs.tag }}
           path: /mnt/matrix
           size-gb: "5"
       - name: The seed's generation, and nothing of the failed writer's

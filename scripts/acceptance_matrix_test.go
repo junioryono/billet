@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The acceptance matrix's shell (#554) is executed here against a fake gh and a fake
@@ -193,14 +194,18 @@ matrix-judge)
 	echo "judged"
 	;;
 acceptance-run)
-	ws=""
-	while [ "$#" -gt 0 ]; do [ "$1" = --workspace ] && ws=$2; shift; done
-	# The host records this process's pid before it waits on it.
-	for _ in 1 2 3 4 5 6 7 8 9 10; do
-		[ "$(cat "${ws%/ws}/run.pid" 2>/dev/null)" = "$$" ] && break
-		sleep 0.1
-	done
-	[ "$(cat "${ws%/ws}/run.pid" 2>/dev/null)" = "$$" ] || exit 9
+	# With $FAKE/run-waits, a run that waits to be stopped: it says when its TERM trap is
+	# installed, records each TERM it gets, and ends once it has had one, or after ten
+	# seconds as a guard; a second TERM would show as a second line.
+	if [ -f "$FAKE/run-waits" ]; then
+		trap 'echo term >>"$FAKE/terms"' TERM
+		echo "$$" >"$FAKE/ready"
+		for _ in $(seq 100); do
+			[ -s "$FAKE/terms" ] && break
+			sleep 0.1
+		done
+		sleep 0.5
+	fi
 	;;
 init-iam)
 	echo '{"Version":"2012-10-17"}'
@@ -276,8 +281,9 @@ func TestTheMatrixHostPreparesADeploymentWithItsTiersAndPolicy(t *testing.T) {
 	}
 }
 
-// RUN EXITS WITH THE RUN'S STATUS, and JUDGE WITH THE JUDGE'S, for exactly the runs and
-// repository it is named, keeping the evidence beside the verdicts.
+// RUN EXITS WITH THE RUN'S STATUS AND RECORDS IT, and is live only while it runs; JUDGE
+// EXITS WITH THE JUDGE'S, for exactly the runs and repository it is named, keeping the
+// evidence beside the verdicts, and judges nothing for a run with no recorded exit.
 func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 	t.Parallel()
 	for _, status := range []string{"0", "3"} {
@@ -285,13 +291,31 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 		f.command(t, "billet", fakeBillet)
 		f.fixture(t, "acceptance-run.exit", status)
 		dir := hostRunDir(t, f)
-		if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "run", dir, "27"); strconv.Itoa(code) != status {
+		if out, code := f.run(t, "acceptance/matrix-host.sh", []string{"MATRIX_POLL=0.1"}, "run", dir, "27"); strconv.Itoa(code) != status {
 			t.Fatalf("a run that ended %s: exit %d\n%s", status, code, out)
 		}
 		if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 150m") {
 			t.Fatalf("billet was run as:\n%s", log)
 		}
+		if got, err := os.ReadFile(filepath.Join(dir, "run.exit")); err != nil || string(got) != status+"\n" {
+			t.Errorf("run.exit = %q, %v; want %s", got, err, status)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "run.running")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("a run that ended is still marked live (%v)", err)
+		}
 	}
+
+	f := newMatrixFakes(t)
+	f.command(t, "billet", fakeBillet)
+	dir := hostRunDir(t, f)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "judge", dir, "x64", dir+"/runs", "billet-testbed/m"); code != 1 ||
+		!strings.Contains(out, "no recorded exit") {
+		t.Fatalf("a judge of a run with no recorded exit: exit %d\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(f.dir, "billet.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("billet was asked to judge a run that had not ended (%v)", err)
+	}
+
 	for _, status := range []string{"0", "1"} {
 		f := newMatrixFakes(t)
 		f.command(t, "billet", fakeBillet)
@@ -300,8 +324,10 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, "ws", "evidence.json"), []byte(`{"version":1}`), 0o600); err != nil {
-			t.Fatal(err)
+		for file, body := range map[string]string{"ws/evidence.json": `{"version":1}`, "run.exit": "0\n"} {
+			if err := os.WriteFile(filepath.Join(dir, file), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
 		}
 		out, code := f.run(t, "acceptance/matrix-host.sh", nil, "judge", dir, "x64", dir+"/runs", "billet-testbed/m")
 		if strconv.Itoa(code) != status || !strings.Contains(out, "judged") {
@@ -317,9 +343,78 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 	}
 }
 
-// DOWN IS IDEMPOTENT: with no workspace there is nothing to take down, and with one its
-// status is down's.
-func TestTheMatrixHostDownIsIdempotent(t *testing.T) {
+// A STOP IS A REQUEST THE RUN HONOURS: the run signals its own child once, and records
+// how it ended; a stop requested before the run starts means it never starts.
+func TestTheMatrixHostStopIsHonouredByTheRunOnce(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "kill")
+	f.command(t, "billet", fakeBillet)
+	realKill, err := exec.LookPath("kill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// EVERY SIGNAL SENT IS COUNTED HERE, because two of one kind merge in the receiver.
+	f.command(t, "kill", `echo "$*" >>"$FAKE/kills"; exec "`+realKill+`" "$@"`+"\n")
+	f.fixture(t, "run-waits", "")
+	dir := hostRunDir(t, f)
+	abs, err := filepath.Abs("acceptance/matrix-host.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := exec.CommandContext(t.Context(), abs, "run", dir, "27")
+	run.Env = []string{"PATH=" + f.path, "HOME=" + t.TempDir(), "FAKE=" + f.dir, "MATRIX_POLL=0.1"}
+	if err := run.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// READY, by the fake run's own word that its trap is installed.
+	var child string
+	for range 100 {
+		if b, err := os.ReadFile(filepath.Join(f.dir, "ready")); err == nil && len(b) > 0 {
+			child = strings.TrimSpace(string(b))
+
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if child == "" {
+		t.Fatal("the run never said it was ready")
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir); code != 0 || !strings.Contains(out, "a stop is requested") {
+		t.Fatalf("stop: exit %d\n%s", code, out)
+	}
+	if err := run.Wait(); err != nil {
+		t.Fatalf("the run: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(f.dir, "kills")); err != nil || string(b) != "-TERM "+child+"\n" {
+		t.Fatalf("kill was run as %q (%v), want once, as -TERM %s", b, err, child)
+	}
+	if b, err := os.ReadFile(filepath.Join(f.dir, "terms")); err != nil || string(b) != "term\n" {
+		t.Fatalf("the run got %q TERMs (%v), want one", b, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "run.exit")); err != nil || string(b) != "0\n" {
+		t.Fatalf("run.exit = %q, %v", b, err)
+	}
+
+	// Requested before it started.
+	f = newMatrixFakes(t)
+	f.command(t, "billet", fakeBillet)
+	dir = hostRunDir(t, f)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir); code != 0 {
+		t.Fatalf("stop: exit %d\n%s", code, out)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "run", dir, "27"); code != 130 ||
+		!strings.Contains(out, "does not start") {
+		t.Fatalf("a run stopped before it started: exit %d\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(f.dir, "billet.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("billet was started after a stop was requested (%v)", err)
+	}
+}
+
+// DOWN IS IDEMPOTENT AND NEVER RUNS BESIDE A LIVE RUN: with no workspace there is
+// nothing to take down; a run still live past the wait is said and nothing is taken
+// down; with the run ended, its status is down's.
+func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	t.Parallel()
 	f := newMatrixFakes(t)
 	f.command(t, "billet", fakeBillet)
@@ -330,11 +425,26 @@ func TestTheMatrixHostDownIsIdempotent(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "ws", "acceptance.json"), []byte("{}"), 0o600); err != nil {
+	for file, body := range map[string]string{"ws/acceptance.json": "{}", "run.running": ""} {
+		if err := os.WriteFile(filepath.Join(dir, file), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := []string{"MATRIX_DOWN_WAIT=1", "MATRIX_POLL=0.1"}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "down", dir); code != 1 || !strings.Contains(out, "still live") {
+		t.Fatalf("down beside a live run: exit %d\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "stop-requested")); err != nil {
+		t.Fatalf("down did not ask the run to stop: %v", err)
+	}
+	if log, err := os.ReadFile(filepath.Join(f.dir, "billet.log")); err == nil && strings.Contains(string(log), "acceptance down") {
+		t.Fatalf("down ran beside a live run:\n%s", log)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "run.exit"), []byte("0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f.fixture(t, "acceptance-down.exit", "4")
-	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 4 {
+	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "down", dir); code != 4 {
 		t.Fatalf("a down that failed: exit %d\n%s", code, out)
 	}
 }
@@ -620,63 +730,15 @@ func TestTheMatrixDispatcherFailsOnARunItCouldNotRecord(t *testing.T) {
 	f := newMatrixFakes(t, "jq")
 	f.command(t, "gh", fakeDispatchGH)
 	f.fixture(t, "done-all", "")
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o500); err != nil {
+	// A DIRECTORY WHERE THE FILE SHOULD BE, which refuses the append whoever runs it,
+	// root included, where a read-only directory would not.
+	runs := filepath.Join(t.TempDir(), "runs")
+	if err := os.Mkdir(runs, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			t.Errorf("restore %s: %v", dir, err)
-		}
-	})
 	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images", "billet-testbed/m", "t1",
-		filepath.Join(dir, "runs"), "accept-x64")
+		runs, "accept-x64")
 	if code != 1 || !strings.Contains(out, "dispatched run 1 of matrix-images-cold.yml for accept-x64, and could not record it") {
 		t.Fatalf("exit %d:\n%s", code, out)
-	}
-}
-
-// STOP SIGNALS THE RECORDED RUN ONCE, and a run that is not running is nothing to stop.
-func TestTheMatrixHostStopSignalsTheRecordedRunOnce(t *testing.T) {
-	t.Parallel()
-	f := newMatrixFakes(t, "kill")
-	f.command(t, "billet", fakeBillet)
-	// EVERY SIGNAL SENT IS COUNTED HERE, because two of one kind merge in the receiver.
-	realKill, err := exec.LookPath("kill")
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.command(t, "kill", `echo "$*" >>"$FAKE/kills"; exec "`+realKill+`" "$@"`+"\n")
-	dir := hostRunDir(t, f)
-	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir); code != 0 || !strings.Contains(out, "nothing to stop") {
-		t.Fatalf("stop with no run: exit %d\n%s", code, out)
-	}
-	// A RUN THAT COUNTS THE TERMS IT GETS and ends on its own two seconds later, so the
-	// count is read once it has ended and every signal the stop sent has landed.
-	got := filepath.Join(dir, "terms")
-	run := exec.CommandContext(t.Context(), "bash", "-c",
-		`n=0; trap 'n=$((n+1))' TERM; for _ in $(seq 20); do sleep 0.1; done; echo $n >"$0"`, got)
-	if err := run.Start(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "run.pid"), []byte(strconv.Itoa(run.Process.Pid)+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir)
-	if err := run.Wait(); err != nil {
-		t.Fatalf("the run: %v", err)
-	}
-	if code != 0 || !strings.Contains(out, "asked the run") {
-		t.Fatalf("stop: exit %d\n%s", code, out)
-	}
-	if b, err := os.ReadFile(got); err != nil || strings.TrimSpace(string(b)) != "1" {
-		t.Fatalf("the run counted %q TERMs (%v), want one", b, err)
-	}
-	pid := strconv.Itoa(run.Process.Pid)
-	if b, err := os.ReadFile(filepath.Join(f.dir, "kills")); err != nil || string(b) != "-TERM "+pid+"\n" {
-		t.Fatalf("kill was run as %q (%v), want once, as -TERM %s", b, err, pid)
-	}
-	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir); code != 0 || !strings.Contains(out, "already ended") {
-		t.Fatalf("stop of a run that has ended: exit %d\n%s", code, out)
 	}
 }
