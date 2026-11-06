@@ -593,6 +593,14 @@ func TestACasCommitSupersededByAnotherJobSaysSo(t *testing.T) {
 	if got["published"] != false || got["reason"] != "cache unavailable" {
 		t.Errorf("a commit whose publication failed answered %v, want cache unavailable", got)
 	}
+
+	// A CONFLICT WITH THE POINTER WHERE THIS DISK FOUND IT is this writer's own lost
+	// authority, which the store answers with the same ErrConflict: an outage, never a
+	// supersession, which would let a matrix cell pass on a fault.
+	got = commit(t, func(s *fakeCacheStore) { s.publishConflicts = 1 })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a conflict with an unmoved pointer answered %v, want cache unavailable", got)
+	}
 }
 
 func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {

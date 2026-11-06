@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -300,9 +301,6 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 		if got, err := os.ReadFile(filepath.Join(dir, "run.exit")); err != nil || string(got) != status+"\n" {
 			t.Errorf("run.exit = %q, %v; want %s", got, err, status)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "run.running")); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("a run that ended is still marked live (%v)", err)
-		}
 	}
 
 	f := newMatrixFakes(t)
@@ -343,50 +341,70 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 	}
 }
 
-// A STOP IS A REQUEST THE RUN HONOURS: the run signals its own child once, and records
-// how it ended; a stop requested before the run starts means it never starts.
-func TestTheMatrixHostStopIsHonouredByTheRunOnce(t *testing.T) {
-	t.Parallel()
-	f := newMatrixFakes(t, "kill")
-	f.command(t, "billet", fakeBillet)
-	realKill, err := exec.LookPath("kill")
+// holdRunLock holds a run directory's lock as a live run's supervisor would, until
+// the test ends.
+func holdRunLock(t *testing.T, dir string) {
+	t.Helper()
+	f, err := os.OpenFile(filepath.Join(dir, "run.lock"), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// EVERY SIGNAL SENT IS COUNTED HERE, because two of one kind merge in the receiver.
-	f.command(t, "kill", `echo "$*" >>"$FAKE/kills"; exec "`+realKill+`" "$@"`+"\n")
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("release the lock: %v", err)
+		}
+	})
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("take the lock: %v", err)
+	}
+}
+
+// A STOP IS A REQUEST THE RUN'S SUPERVISOR HONOURS ONCE: it signals the run one TERM,
+// records how the run ended, and says so once; a stop requested before the run starts
+// means it never starts; and a second run is never started beside one that holds the
+// lock.
+func TestTheMatrixHostStopIsHonouredByTheRunOnce(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "python3")
+	f.command(t, "billet", fakeBillet)
 	f.fixture(t, "run-waits", "")
 	dir := hostRunDir(t, f)
 	abs, err := filepath.Abs("acceptance/matrix-host.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
+	var stderr strings.Builder
 	run := exec.CommandContext(t.Context(), abs, "run", dir, "27")
 	run.Env = []string{"PATH=" + f.path, "HOME=" + t.TempDir(), "FAKE=" + f.dir, "MATRIX_POLL=0.1"}
+	run.Stderr = &stderr
 	if err := run.Start(); err != nil {
 		t.Fatal(err)
 	}
 	// READY, by the fake run's own word that its trap is installed.
-	var child string
-	for range 100 {
+	ready := false
+	for range 200 {
 		if b, err := os.ReadFile(filepath.Join(f.dir, "ready")); err == nil && len(b) > 0 {
-			child = strings.TrimSpace(string(b))
+			ready = true
 
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if child == "" {
+	if !ready {
 		t.Fatal("the run never said it was ready")
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "run", dir, "27"); code != 1 ||
+		!strings.Contains(out, "not starting a second") {
+		t.Fatalf("a second run beside a live one: exit %d\n%s", code, out)
 	}
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir); code != 0 || !strings.Contains(out, "a stop is requested") {
 		t.Fatalf("stop: exit %d\n%s", code, out)
 	}
 	if err := run.Wait(); err != nil {
-		t.Fatalf("the run: %v", err)
+		t.Fatalf("the run: %v\n%s", err, stderr.String())
 	}
-	if b, err := os.ReadFile(filepath.Join(f.dir, "kills")); err != nil || string(b) != "-TERM "+child+"\n" {
-		t.Fatalf("kill was run as %q (%v), want once, as -TERM %s", b, err, child)
+	if n := strings.Count(stderr.String(), "stopping the run early"); n != 1 {
+		t.Fatalf("the supervisor signalled %d times, want once:\n%s", n, stderr.String())
 	}
 	if b, err := os.ReadFile(filepath.Join(f.dir, "terms")); err != nil || string(b) != "term\n" {
 		t.Fatalf("the run got %q TERMs (%v), want one", b, err)
@@ -396,7 +414,7 @@ func TestTheMatrixHostStopIsHonouredByTheRunOnce(t *testing.T) {
 	}
 
 	// Requested before it started.
-	f = newMatrixFakes(t)
+	f = newMatrixFakes(t, "python3")
 	f.command(t, "billet", fakeBillet)
 	dir = hostRunDir(t, f)
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "stop", dir); code != 0 {
@@ -412,11 +430,12 @@ func TestTheMatrixHostStopIsHonouredByTheRunOnce(t *testing.T) {
 }
 
 // DOWN IS IDEMPOTENT AND NEVER RUNS BESIDE A LIVE RUN: with no workspace there is
-// nothing to take down; a run still live past the wait is said and nothing is taken
-// down; with the run ended, its status is down's.
+// nothing to take down; with the run's lock held past the wait it is said and nothing
+// is taken down; with the lock free, as a reboot leaves it whatever files remain, its
+// status is down's.
 func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	t.Parallel()
-	f := newMatrixFakes(t)
+	f := newMatrixFakes(t, "python3")
 	f.command(t, "billet", fakeBillet)
 	dir := hostRunDir(t, f)
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "nothing to take down") {
@@ -425,23 +444,29 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for file, body := range map[string]string{"ws/acceptance.json": "{}", "run.running": ""} {
-		if err := os.WriteFile(filepath.Join(dir, file), []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.WriteFile(filepath.Join(dir, "ws", "acceptance.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	env := []string{"MATRIX_DOWN_WAIT=1", "MATRIX_POLL=0.1"}
-	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "down", dir); code != 1 || !strings.Contains(out, "still live") {
+	locked := t.TempDir()
+	if err := os.Symlink(filepath.Join(f.bin, "billet"), filepath.Join(locked, "billet")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(locked, "ws"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "ws", "acceptance.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	holdRunLock(t, locked)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "down", locked); code != 1 || !strings.Contains(out, "still live") {
 		t.Fatalf("down beside a live run: exit %d\n%s", code, out)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "stop-requested")); err != nil {
+	if _, err := os.Stat(filepath.Join(locked, "stop-requested")); err != nil {
 		t.Fatalf("down did not ask the run to stop: %v", err)
 	}
 	if log, err := os.ReadFile(filepath.Join(f.dir, "billet.log")); err == nil && strings.Contains(string(log), "acceptance down") {
 		t.Fatalf("down ran beside a live run:\n%s", log)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "run.exit"), []byte("0\n"), 0o600); err != nil {
-		t.Fatal(err)
 	}
 	f.fixture(t, "acceptance-down.exit", "4")
 	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "down", dir); code != 4 {

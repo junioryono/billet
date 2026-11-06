@@ -18,13 +18,11 @@
 # policy's iam:PassRole; omit it when the guests carry no instance profile.
 #
 # run runs the deployment until <jobs> jobs have finished (`billet acceptance run`, which
-# writes the evidence and tears down what it made), and exits with its status, which it
-# also writes to <run-dir>/run.exit; <run-dir>/run.running says one is live. It watches
-# for <run-dir>/stop-requested and, when it appears, sends its own child ONE SIGTERM, as
-# an operator's Ctrl-C would: the run's wait is cancelled and it writes its evidence and
-# tears down what it made. A second signal would leave the jobs running, so it is never
-# sent. Only the run signals, and only its own child, whose pid cannot have been reused
-# while it is still that child. A stop requested before it starts means it never starts.
+# writes the evidence and tears down what it made), under matrix-supervise.py beside this
+# script: it holds <run-dir>/run.lock for as long as the run lives, writes the run's exit
+# to <run-dir>/run.exit, and, when <run-dir>/stop-requested appears, sends the run ONE
+# SIGTERM, as an operator's Ctrl-C would, so the run writes its evidence and tears down
+# what it made. A stop requested before it starts means it never starts.
 #
 # stop requests that, and returns; it signals nothing itself.
 #
@@ -33,8 +31,8 @@
 # with the judge's status. It judges nothing for a run with no recorded exit, which may
 # still be writing.
 #
-# down requests a stop, waits up to MATRIX_DOWN_WAIT seconds (default 1800) for a live
-# run to end, then destroys whatever the run left (`billet acceptance down`, idempotent)
+# down requests a stop, waits up to MATRIX_DOWN_WAIT seconds (default 1800) for the run's
+# lock to be free (a reboot frees it; nothing else does while the run lives), then destroys whatever the run left (`billet acceptance down`, idempotent)
 # and removes the workspace; a run still live after that is said, and nothing is taken
 # down beside it. It is the step every path ends with.
 set -uo pipefail
@@ -49,6 +47,7 @@ run_dir=${2:-}
 [ -n "$phase" ] && [ -n "$run_dir" ] || usage
 billet="$run_dir/billet"
 ws="$run_dir/ws"
+supervise="$(dirname "$0")/matrix-supervise.py"
 
 case "$phase" in
 prepare)
@@ -83,37 +82,7 @@ prepare)
 	;;
 run)
 	[ "$#" -eq 3 ] || usage
-	rm -f "$run_dir/run.exit"
-	if [ -e "$run_dir/stop-requested" ]; then
-		echo "matrix: a stop was requested before the run started; it does not start" >&2
-		echo 130 >"$run_dir/run.exit"
-		exit 130
-	fi
-	if ! : >"$run_dir/run.running"; then
-		echo "matrix: could not mark the run live, so nothing could wait for it; not starting it" >&2
-		exit 1
-	fi
-	"$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 150m &
-	pid=$!
-	signalled=""
-	while kill -0 "$pid" 2>/dev/null; do
-		if [ -z "$signalled" ] && [ -e "$run_dir/stop-requested" ]; then
-			# THE kill ON PATH, not the builtin, so a test can count the signals sent:
-			# two of one kind merge in the receiver, which therefore cannot.
-			env kill -TERM "$pid" || echo "matrix: could not signal the run ($pid)" >&2
-			signalled=1
-			echo "matrix: stopping the run early; it writes its evidence and tears down what it made" >&2
-		fi
-		sleep "${MATRIX_POLL:-2}"
-	done
-	wait "$pid"
-	ran=$?
-	echo "$ran" >"$run_dir/run.exit"
-	rm -f "$run_dir/run.running"
-	if [ "$ran" -ne 0 ]; then
-		echo "matrix: the run ended with status $ran" >&2
-	fi
-	exit "$ran"
+	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 150m
 	;;
 stop)
 	[ "$#" -eq 2 ] || usage
@@ -145,14 +114,10 @@ down)
 	[ "$#" -eq 2 ] || usage
 	if [ -d "$run_dir" ]; then
 		: >"$run_dir/stop-requested" || exit 1
-		deadline=$((SECONDS + ${MATRIX_DOWN_WAIT:-1800}))
-		while [ -e "$run_dir/run.running" ] && [ ! -e "$run_dir/run.exit" ]; do
-			if [ "$SECONDS" -ge "$deadline" ]; then
-				echo "matrix: the run is still live; nothing is taken down beside it, and its workspace is $ws" >&2
-				exit 1
-			fi
-			sleep "${MATRIX_POLL:-2}"
-		done
+		if ! python3 -I "$supervise" await "$run_dir" "${MATRIX_DOWN_WAIT:-1800}"; then
+			echo "matrix: the run is still live; nothing is taken down beside it, and its workspace is $ws" >&2
+			exit 1
+		fi
 	fi
 	if [ ! -f "$ws/acceptance.json" ]; then
 		echo "matrix: no workspace at $ws; nothing to take down"

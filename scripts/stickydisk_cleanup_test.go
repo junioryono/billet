@@ -38,9 +38,10 @@ func TestTheStickyDiskPostStepSaysWhatBecameOfItsWrite(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			var asked string
+			// HANDED OVER, not shared: the handler runs on the server's goroutine.
+			asked := make(chan string, 4)
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				asked = r.Method + " " + r.URL.Path + " " + r.Header.Get("Authorization")
+				asked <- r.Method + " " + r.URL.Path + " " + r.Header.Get("Authorization")
 				if err := json.NewEncoder(w).Encode(c.answer); err != nil {
 					t.Errorf("answer the commit: %v", err)
 				}
@@ -71,8 +72,16 @@ func TestTheStickyDiskPostStepSaysWhatBecameOfItsWrite(t *testing.T) {
 			if string(out) != c.says {
 				t.Fatalf("the post step said %q, want %q", out, c.says)
 			}
-			if asked != "POST /v1/volumes/3/commit Bearer tok" {
-				t.Fatalf("the post step asked %q", asked)
+			select {
+			case got := <-asked:
+				if got != "POST /v1/volumes/3/commit Bearer tok" {
+					t.Fatalf("the post step asked %q", got)
+				}
+			default:
+				t.Fatal("the post step asked the node nothing")
+			}
+			if len(asked) != 0 {
+				t.Fatalf("the post step asked the node %d more times", len(asked))
 			}
 		})
 	}

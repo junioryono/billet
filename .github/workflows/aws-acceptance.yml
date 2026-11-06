@@ -98,7 +98,7 @@ jobs:
       - name: Send this run's binary and scripts
         run: |
           set -euo pipefail
-          for f in dist/billet scripts/acceptance/matrix-host.sh; do
+          for f in dist/billet scripts/acceptance/matrix-host.sh scripts/acceptance/matrix-supervise.py; do
             aws s3 cp --only-show-errors "$f" "s3://$BUCKET/runs/$RUN/$(basename "$f")"
           done
       - name: Hand the host the App's key through Parameter Store
@@ -135,6 +135,7 @@ jobs:
           mkdir -p '$RUN_DIR'
           aws s3 cp --only-show-errors 's3://$BUCKET/runs/$RUN/billet' '$RUN_DIR/billet'
           aws s3 cp --only-show-errors 's3://$BUCKET/runs/$RUN/matrix-host.sh' '$RUN_DIR/matrix-host.sh'
+          aws s3 cp --only-show-errors 's3://$BUCKET/runs/$RUN/matrix-supervise.py' '$RUN_DIR/matrix-supervise.py'
           chmod 0755 '$RUN_DIR/billet'
           (umask 077; aws ssm get-parameter --name '/billet-acceptance/runs/$RUN/app-key' --with-decryption \
             --query Parameter.Value --output text >/srv/billet-accept/app.pem)
