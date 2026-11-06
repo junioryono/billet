@@ -1,4 +1,4 @@
-// Package poolconsole is the line a pool host writes to its system console before it
+// Package joinconsole is the line a pool host writes to its system console before it
 // asks to join, naming its order and its key's fingerprint, so a source that reads the
 // console of the exact host it placed can say which key is that host's (ADR-030). It is
 // the one spelling, in a package of its own because both sides use it: the host writes
@@ -6,7 +6,7 @@
 // neither may import the other's layer.
 //
 // A leaf: the standard library only.
-package poolconsole
+package joinconsole
 
 import (
 	"regexp"

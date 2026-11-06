@@ -20,7 +20,7 @@ import (
 	"github.com/junioryono/billet/internal/awsidentity"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
-	"github.com/junioryono/billet/internal/poolconsole"
+	"github.com/junioryono/billet/internal/joinconsole"
 	"github.com/junioryono/billet/internal/provider/ec2"
 )
 
@@ -57,7 +57,7 @@ func newWitnessRig(t *testing.T) *witnessRig {
 	f := &fakeHosts{
 		record: ec2.HostRecord{ID: "i-1", State: "running", PrivateIP: "10.0.0.7", Order: "pa", LaunchTime: launched},
 		console: "\x1b[0m[  12.3] cloud-init: ...\r\n" +
-			poolconsole.Line("pa", fp("key")) + "\r\n" + poolconsole.Line("pb", fp("other")) + "\r\n",
+			joinconsole.Line("pa", fp("key")) + "\r\n" + joinconsole.Line("pb", fp("other")) + "\r\n",
 	}
 	// THROUGH THE CONSTRUCTOR, so a verifier the source is handed and drops is caught.
 	s, err := newSource(f, Config{Region: "us-west-2", Location: "us-west-2a", Shapes: []Shape{
@@ -137,7 +137,7 @@ func TestAPositiveAnswerForSomethingElseContradicts(t *testing.T) {
 		"a document of another account": {doc: map[string]string{"accountId": "444455556666"}, reason: "another account"},
 		"a document of another address": {doc: map[string]string{"privateIp": "10.0.0.9"}, reason: "address 10.0.0.9"},
 		"a console naming another key": {host: func(f *fakeHosts) {
-			f.console = poolconsole.Line("pa", fp("imposter"))
+			f.console = joinconsole.Line("pa", fp("imposter"))
 		}, reason: "names " + fp("imposter")},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -184,10 +184,10 @@ func TestWhatTheSourceCannotReadIsCouldNotTell(t *testing.T) {
 		"a failed console read":   {host: func(f *fakeHosts) { f.consoleErr = errors.New("throttled") }},
 		"a console not named yet": {host: func(f *fakeHosts) { f.console = "[  1.0] booting\n" }},
 		"a console naming two keys": {host: func(f *fakeHosts) {
-			f.console = poolconsole.Line("pa", fp("key")) + "\n" + poolconsole.Line("pa", fp("second"))
+			f.console = joinconsole.Line("pa", fp("key")) + "\n" + joinconsole.Line("pa", fp("second"))
 		}},
 		"a console cut short": {host: func(f *fakeHosts) {
-			line := poolconsole.Line("pa", fp("key"))
+			line := joinconsole.Line("pa", fp("key"))
 			f.console = line[:len(line)-4]
 		}},
 		"another address":     {change: func(c *hostsource.Claim) { c.Address = "10.0.0.8" }},

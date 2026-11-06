@@ -16,17 +16,17 @@ import (
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
+	"github.com/junioryono/billet/internal/joinconsole"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/pool"
-	"github.com/junioryono/billet/internal/poolconsole"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // consoleSource is a source whose hosts' consoles are a buffer a test writes, read the
-// way the AWS source reads them, through poolconsole.Fingerprints, and judged as
+// way the AWS source reads them, through joinconsole.Fingerprints, and judged as
 // it judges them: no key is could-not-tell, this key alone vouches, other keys alone
 // contradict, and this key among others is could-not-tell. Only Witness is ever asked
 // of it here; the AWS source's own tests cover its document and address.
@@ -47,7 +47,7 @@ func (s *consoleSource) Witness(_ context.Context, c hostsource.Claim) hostsourc
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.asked = append(s.asked, c.HostID)
-	keys := poolconsole.Fingerprints(s.console[c.HostID], c.Order)
+	keys := joinconsole.Fingerprints(s.console[c.HostID], c.Order)
 	switch {
 	case len(keys) == 0:
 		return hostsource.Testimony{Reason: "nothing on the console yet"}
@@ -206,7 +206,7 @@ func TestAPoolHostJoinsOnceItsSourceVouches(t *testing.T) {
 		t.Fatalf("the first ask left %+v, %v, %v", e, ok, err)
 	}
 
-	w.src.write("host-pa", poolconsole.Line("pa", fp))
+	w.src.write("host-pa", joinconsole.Line("pa", fp))
 	w.advance(pool.DefaultJudgeEvery)
 	cert, err := w.ask(t, name, token, csr)
 	if err != nil {
@@ -253,7 +253,7 @@ func TestAPoolHostTheConsoleContradictsWaitsForAPerson(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.src.write("host-pb", poolconsole.Line("pb", hostFP))
+	w.src.write("host-pb", joinconsole.Line("pb", hostFP))
 	if _, err := w.ask(t, name, token, imposter); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("a contradicted ask: %v, want told to wait", err)
 	}
@@ -318,7 +318,7 @@ func TestAHeldHostWhoseTokenLapsedJoinsOnAPersonsWord(t *testing.T) {
 		t.Fatal(err)
 	}
 	// THE CONSOLE NAMES A KEY THE HOST NO LONGER HOLDS, so its own ask is contradicted.
-	w.src.write("host-pc", poolconsole.Line("pc", otherFP))
+	w.src.write("host-pc", joinconsole.Line("pc", otherFP))
 	if _, err := w.ask(t, name, token, host); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("a contradicted ask: %v", err)
 	}

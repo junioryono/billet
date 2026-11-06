@@ -17,8 +17,8 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/joinconsole"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/poolconsole"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -47,11 +47,11 @@ func TestAPoolHostSaysItsFingerprintOnTheConsole(t *testing.T) { //nolint:parall
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "boot output\n" + poolconsole.Line("pa", realFP) + "\n" + poolconsole.Line("pa", realFP) + "\n"
+	want := "boot output\n" + joinconsole.Line("pa", realFP) + "\n" + joinconsole.Line("pa", realFP) + "\n"
 	if string(raw) != want {
 		t.Fatalf("the console holds %q, want %q", raw, want)
 	}
-	if got := poolconsole.Fingerprints(string(raw), "pa"); len(got) != 1 || got[0] != realFP {
+	if got := joinconsole.Fingerprints(string(raw), "pa"); len(got) != 1 || got[0] != realFP {
 		t.Fatalf("the plane would read %v", got)
 	}
 
@@ -204,7 +204,7 @@ func TestAPoolHostsEnrollmentSaysItsKeyAndSendsItsIdentity(t *testing.T) { //nol
 		t.Fatal(err)
 	}
 	for i, c := range rec.consoles {
-		if got := poolconsole.Fingerprints(c, "pa"); len(got) != 1 || got[0] != fp {
+		if got := joinconsole.Fingerprints(c, "pa"); len(got) != 1 || got[0] != fp {
 			t.Fatalf("ask %d: the console named %v, want the key %s", i+1, got, fp)
 		}
 	}

@@ -402,10 +402,10 @@ linters:
         # THE POOL HOST'S CONSOLE LINE IS A LEAF. A host writes it and a host source
         # reads it, and neither may import the other's layer, so the one spelling
         # imports nothing either does: the standard library only.
-        poolconsole:
+        joinconsole:
           list-mode: strict
           files:
-            - "${config-path}/internal/poolconsole/**"
+            - "${config-path}/internal/joinconsole/**"
           allow:
             - $gostd
 

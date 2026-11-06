@@ -1,4 +1,4 @@
-package poolconsole
+package joinconsole
 
 import (
 	"slices"
