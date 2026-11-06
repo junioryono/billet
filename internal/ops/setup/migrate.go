@@ -837,8 +837,10 @@ func (p *migrationPlan) install(path string) error {
 
 				return err
 			}); err != nil {
-			return fmt.Errorf("billet migrate workflows: write %s, having written %d of the %d files to change: %w",
-				strconv.Quote(f.name), written, changing, err)
+			// THE FAILING FILE MAY BE IN PLACE ALREADY: an install can fail syncing the
+			// directory after the rename that replaced it.
+			return fmt.Errorf("billet migrate workflows: write %s, which may already be replaced, after %d of the %d "+
+				"files to change were written: %w", strconv.Quote(f.name), written, changing, err)
 		}
 		written++
 	}
@@ -958,7 +960,7 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 	if !strings.EqualFold(pushedTo.repository, repository) &&
 		strings.EqualFold(pushedTo.owner(), (pushTarget{repository: repository}).owner()) {
 		return fmt.Errorf("billet migrate workflows: origin pushes to %s, and a pull request into %s names its head "+
-			"by owner alone; nothing was changed", pushedTo.repository, repository)
+			"by owner alone; nothing was changed", strconv.Quote(pushedTo.repository), strconv.Quote(repository))
 	}
 	// EACH FILE NAMED LITERALLY, by git's own --literal-pathspecs: a pathspec is a
 	// pattern, so a workflow named `[ab].yml` would otherwise answer for a tracked
@@ -996,11 +998,11 @@ func openMigrationPR(ctx context.Context, env cli.Env, path, repository string, 
 	case err != nil:
 		return stopped(err, "creating it")
 	case again.repository != pushedTo.repository:
-		return stopped(fmt.Errorf("origin pushes to %s on this branch and to %s on %s", again.repository,
-			pushedTo.repository, base), "creating it")
+		return stopped(fmt.Errorf("origin pushes to %s on this branch and to %s on %s", strconv.Quote(again.repository),
+			strconv.Quote(pushedTo.repository), base), "creating it")
 	case again.destination != pushedTo.destination:
-		return stopped(fmt.Errorf("origin pushes %s through another URL on this branch than on %s", again.repository,
-			base), "creating it")
+		return stopped(fmt.Errorf("origin pushes %s through another URL on this branch than on %s",
+			strconv.Quote(again.repository), base), "creating it")
 	}
 	if err := plan.install(path); err != nil {
 		return stopped(err, "creating it")

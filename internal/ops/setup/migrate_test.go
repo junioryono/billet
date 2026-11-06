@@ -957,7 +957,7 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	}
 	runIn(t, onBranch, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", include)
 	_, _, err := migrateRun(t, "--config", cfg, "--path", onBranch, "--repo", "acme/api", "--open-pr")
-	if err == nil || !strings.Contains(err.Error(), "origin pushes to bob/api on this branch and to acme/api on main") {
+	if err == nil || !strings.Contains(err.Error(), `origin pushes to "bob/api" on this branch and to "acme/api" on main`) {
 		t.Errorf("a push URL only on the new branch = %v", err)
 	}
 	if got := readFile(t, filepath.Join(onBranch, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
@@ -973,7 +973,7 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	}
 	runIn(t, sameOwner, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", other)
 	_, _, err = migrateRun(t, "--config", cfg, "--path", sameOwner, "--repo", "acme/api", "--open-pr")
-	if err == nil || !strings.Contains(err.Error(), "origin pushes to acme/other on this branch and to acme/api on main") ||
+	if err == nil || !strings.Contains(err.Error(), `origin pushes to "acme/other" on this branch and to "acme/api" on main`) ||
 		strings.Contains(err.Error(), "https://") {
 		t.Errorf("another repository of the same owner only on the new branch = %v", err)
 	}
@@ -992,7 +992,7 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	}
 	runIn(t, sameDestination, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", toBob)
 	_, _, err = migrateRun(t, "--config", cfg, "--path", sameDestination, "--repo", "acme/api", "--open-pr")
-	if err == nil || !strings.Contains(err.Error(), "origin pushes to bob/api on this branch and to acme/api on main") {
+	if err == nil || !strings.Contains(err.Error(), `origin pushes to "bob/api" on this branch and to "acme/api" on main`) {
 		t.Errorf("another owner from the same destination only on the new branch = %v", err)
 	}
 	if got := readFile(t, filepath.Join(sameDestination, ".github", "workflows", "ci.yml")); got != migrateWorkflow {
@@ -1008,7 +1008,7 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	}
 	runIn(t, otherURL, "config", "includeIf.onbranch:billet/migrate-workflows-*.path", viaSSH)
 	_, _, err = migrateRun(t, "--config", cfg, "--path", otherURL, "--repo", "acme/api", "--open-pr")
-	if err == nil || !strings.Contains(err.Error(), "origin pushes acme/api through another URL on this branch than on main") ||
+	if err == nil || !strings.Contains(err.Error(), `origin pushes "acme/api" through another URL on this branch than on main`) ||
 		strings.Contains(err.Error(), "git@github.com") {
 		t.Errorf("the same repository through another URL only on the new branch = %v", err)
 	}
@@ -1023,11 +1023,20 @@ func TestMigrateWorkflowsOpenPRRefusesAndReportsWhereItStopped(t *testing.T) {
 	runIn(t, sibling, "config", "url."+originOf(t, sibling)+".insteadOf", "https://github.com/acme/web.git")
 	_, _, err = migrateRun(t, "--config", cfg, "--path", sibling, "--repo", "acme/api", "--open-pr")
 	if err == nil || !strings.Contains(err.Error(),
-		"origin pushes to acme/web, and a pull request into acme/api names its head by owner alone; nothing was changed") {
+		`origin pushes to "acme/web", and a pull request into "acme/api" names its head by owner alone; nothing was changed`) {
 		t.Errorf("a push to another repository of the same owner = %v", err)
 	}
 	if got := head(sibling); got != "main" {
 		t.Errorf("a push to another repository of the same owner left the checkout on %q", got)
+	}
+
+	// A REPOSITORY'S NAME IS QUOTED, since a URL's escapes can put a line in it.
+	forged := checkout(t, map[string]string{"ci.yml": migrateWorkflow})
+	runIn(t, forged, "config", "remote.origin.pushurl", "https://github.com/acme/other%0AFORGED.git")
+	_, _, err = migrateRun(t, "--config", cfg, "--path", forged, "--repo", "acme/api", "--open-pr")
+	if err == nil || !strings.Contains(err.Error(), `origin pushes to "acme/other\nFORGED"`) ||
+		strings.Contains(err.Error(), "\nFORGED") {
+		t.Errorf("a repository name with a line in it = %q", err)
 	}
 
 	// A FILE NAME IS NO PATTERN: an ignored `[ab].yml` is not answered for by a tracked
