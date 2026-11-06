@@ -1,4 +1,4 @@
-# ADR-030: Attaching to a job, and holding a failed job's VM
+# ADR-031: Attaching to a job, and holding a failed job's VM
 
 Accepted, 2026-11-04. Issue #533.
 

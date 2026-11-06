@@ -41,6 +41,7 @@ type fakeCacheStore struct {
 	publishConflicts   int
 	conflictCurrent    string
 	advanceOnSnapshot  bool
+	vanishOnSnapshot   bool
 	publishExpected    []string
 	writerAcquisitions int
 	writers            map[string]fakeWriter
@@ -251,6 +252,9 @@ func (f *fakeCacheStore) Snapshot(
 	if f.advanceOnSnapshot {
 		f.current = "concurrent"
 	}
+	if f.vanishOnSnapshot {
+		f.current = ""
+	}
 
 	return storecontract.Candidate{
 		Key: volume.Key, Generation: "next", Handle: "candidate",
@@ -290,7 +294,7 @@ func (f *fakeCacheStore) PublishCAS(
 		return storecontract.ErrConflict
 	}
 	if f.publishErr == nil && expected != f.current {
-		return storecontract.ErrConflict
+		return &storecontract.PointerMovedError{Key: key, Current: f.current, Expected: expected}
 	}
 	if f.publishErr == nil {
 		// The same write that advances the pointer consumes the writer.
@@ -545,6 +549,74 @@ func TestLastWriteWinsRebasesABuilderCandidateAfterAConcurrentCommit(t *testing.
 	}
 	if got := storage.publishExpected; len(got) != 2 || got[0] != "baseline" || got[1] != "concurrent" {
 		t.Errorf("publication expectations = %v, want baseline then concurrent", got)
+	}
+}
+
+// A CAS COMMIT THAT LOSES TO A CONCURRENT PUBLICATION SAYS SO, rather than "cache
+// unavailable": the store kept the other job's generation, which is the policy
+// working, and the guest's warning names it. Any other failure still reads as one.
+func TestACasCommitSupersededByAnotherJobSaysSo(t *testing.T) {
+	t.Parallel()
+
+	commit := func(t *testing.T, edit func(*fakeCacheStore)) map[string]any {
+		t.Helper()
+		service, storage, token := testCacheService(t, provider.TrustTrusted)
+		storage.current = "baseline"
+		edit(storage)
+		attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+			"key": "acme/api/sticky", "size_bytes": int64(1 << 30), "publication": publicationCAS,
+		})
+		if attached.Code != http.StatusCreated {
+			t.Fatalf("attach status = %d: %s", attached.Code, attached.Body.String())
+		}
+		committed := cacheRequest(t, service, token, "/v1/volumes/0/commit", nil)
+		if committed.Code != http.StatusOK {
+			t.Fatalf("commit status = %d: %s", committed.Code, committed.Body.String())
+		}
+		var answer map[string]any
+		if err := json.Unmarshal(committed.Body.Bytes(), &answer); err != nil {
+			t.Fatalf("decode the commit's answer: %v", err)
+		}
+
+		return answer
+	}
+
+	got := commit(t, func(s *fakeCacheStore) { s.advanceOnSnapshot = true })
+	if got["published"] != false || got["reason"] != supersededReason {
+		t.Errorf("a cas commit another job superseded answered %v, want %q", got, supersededReason)
+	}
+
+	got = commit(t, func(s *fakeCacheStore) { s.snapshotErr = errors.New("snapshot quota") })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a commit whose snapshot failed answered %v, want cache unavailable", got)
+	}
+
+	// THE SAME STEP, ANOTHER FAILURE: a publication the store refused for anything
+	// but a conflict is an outage, not a loss.
+	got = commit(t, func(s *fakeCacheStore) { s.publishErr = errors.New("s3: throttled") })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a commit whose publication failed answered %v, want cache unavailable", got)
+	}
+
+	// A CONFLICT THE STORE DOES NOT CALL A MOVED POINTER is this writer's own lost
+	// authority, or a store that could not get its write through, both a bare
+	// ErrConflict: an outage, never a supersession, which would let a matrix cell
+	// pass on a fault; and so even when another job has published meanwhile.
+	got = commit(t, func(s *fakeCacheStore) { s.publishConflicts = 1 })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a conflict with an unmoved pointer answered %v, want cache unavailable", got)
+	}
+	got = commit(t, func(s *fakeCacheStore) { s.publishConflicts, s.conflictCurrent = 1, "a-third-writer" })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a conflict with an unmoved pointer answered %v, want cache unavailable", got)
+	}
+
+	// A POINTER THAT IS GONE IS NO GENERATION KEPT: a store whose key holds nothing,
+	// though this disk was cloned from a generation, answers a moved pointer at "",
+	// which is an outage to say, never a supersession.
+	got = commit(t, func(s *fakeCacheStore) { s.advanceOnSnapshot, s.vanishOnSnapshot = false, true })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a moved pointer at no generation answered %v, want cache unavailable", got)
 	}
 }
 
