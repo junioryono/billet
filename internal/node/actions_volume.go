@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 )
 
 type actionsVolumeManager interface {
@@ -77,12 +78,30 @@ func mountActionsVolume(ctx context.Context, device, target, options string) err
 	if output, err := exec.CommandContext(ctx, mount, "-t", "ext4", "-o", options,
 		device, target).CombinedOutput(); err != nil {
 		mountErr := fmt.Errorf("node: mount Actions cache volume: %w: %s", err, boundedOutput(output))
-		if removeErr := os.Remove(target); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return errors.Join(mountErr,
-				fmt.Errorf("node: remove failed Actions cache mount point: %w", removeErr))
-		}
 
-		return mountErr
+		return errors.Join(mountErr, undoFailedMount(ctx, target))
+	}
+
+	return nil
+}
+
+// failedMountUndoLimit bounds undoing a mount whose command failed, on a context
+// of its own: the command's own context is often the reason it failed.
+const failedMountUndoLimit = 30 * time.Second
+
+// undoFailedMount leaves nothing mounted at target after a mount command failed.
+//
+// A FAILED COMMAND IS NOT A FAILED MOUNT. A mount killed by its context can have
+// finished in the kernel: on 2026-11-06 one was killed and its Go cache volume
+// stayed mounted in the node's namespace, so removing the mount point failed and
+// the volume's discard could not unmap it, retrying for hours. So the kernel is
+// asked, and what it holds is unmounted before the mount point goes.
+func undoFailedMount(ctx context.Context, target string) error {
+	undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failedMountUndoLimit)
+	defer cancel()
+
+	if err := (hostActionsVolumeManager{}).Unmount(undoCtx, target); err != nil {
+		return fmt.Errorf("node: undo the failed Actions cache mount, which may still be mounted: %w", err)
 	}
 
 	return nil

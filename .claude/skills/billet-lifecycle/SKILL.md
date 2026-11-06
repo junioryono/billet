@@ -34,6 +34,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 ### The local commands and the seal: [references/local-commands.md](references/local-commands.md)
 
 - **`up` writes nothing structural on systemd and does write the service definition on launchd.**
+- **`down --node` stops one role and seals nothing.**
 - **`up` enables the timers as a reported last step outside the unit plan.**
 - **When a check cannot be built, observe.**
 - **The seal is not the authority; the barrier is.**
