@@ -8,7 +8,9 @@ import (
 // MIGRATION 75 BINDS WHAT MIGRATION 74 LEFT TO ITS ORDER: a token a pool minted with the
 // note `pool order <order>`, and a request named `pool-<order>`, are that order's when
 // the order is recorded, and nothing else is: an operator's token, a note or a name
-// naming no recorded order.
+// naming no recorded order. A host already approved from a placed order is linked to it
+// with its key and its newest certificate's serial, and the order's tokens are retired;
+// one still pending is not linked.
 func TestMigration75BindsAnOrdersEarlierTokensAndRequests(t *testing.T) {
 	t.Parallel()
 
@@ -26,13 +28,16 @@ func TestMigration75BindsAnOrdersEarlierTokensAndRequests(t *testing.T) {
 
 	for _, stmt := range []string{
 		`INSERT INTO pool_orders (order_id, source, scope, shape, arch, state, host_id, first_attempt_at, updated_at)
-		 VALUES ('p1', 'aws-metal', 'aws:a:r:s:z', 'm', 'x64', 'placed', 'i-1', 't', 't')`,
+		 VALUES ('p1', 'aws-metal', 'aws:a:r:s:z', 'm', 'x64', 'placed', 'i-1', 't', 't'),
+		        ('p2', 'aws-metal', 'aws:a:r:s:z', 'm', 'x64', 'placed', 'i-2', 't', 't')`,
 		`INSERT INTO join_tokens (token_sha256, note, uses_remaining, created_at, expires_at)
 		 VALUES ('h-pool', 'pool order p1', 1, 't', 't'), ('h-gone', 'pool order p9', 1, 't', 't'),
-		        ('h-op', 'for epyc-1', 1, 't', 't')`,
+		        ('h-op', 'for epyc-1', 1, 't', 't'), ('h-joined', 'pool order p2', 1, 't', 't')`,
 		`INSERT INTO node_enrollments (name, fingerprint, csr_pem, state, requested_at)
 		 VALUES ('pool-p1', 'SHA256:a', 'csr', 'pending', 't'), ('pool-p9', 'SHA256:b', 'csr', 'pending', 't'),
-		        ('epyc-1', 'SHA256:c', 'csr', 'pending', 't')`,
+		        ('epyc-1', 'SHA256:c', 'csr', 'pending', 't'), ('pool-p2', 'SHA256:d', 'csr', 'approved', 't')`,
+		`INSERT INTO issued_certs (serial, node, source, not_after, issued_at)
+		 VALUES ('0a', 'pool-p2', 'enrolled', 'x', '2026-11-01'), ('0b', 'pool-p2', 'renewed', 'x', '2026-11-05')`,
 	} {
 		if _, err := w.ExecContext(t.Context(), stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
@@ -67,9 +72,22 @@ func TestMigration75BindsAnOrdersEarlierTokensAndRequests(t *testing.T) {
 		}
 	}
 
-	for name, want := range map[string]string{"pool-p1": "p1", "pool-p9": "", "epyc-1": ""} {
+	for name, want := range map[string]string{"pool-p1": "p1", "pool-p9": "", "epyc-1": "", "pool-p2": "p2"} {
 		if got := read(`SELECT pool_order FROM node_enrollments WHERE name = ?`, name); got != want {
 			t.Errorf("request %s is bound to %q, want %q", name, got, want)
+		}
+	}
+
+	for order, want := range map[string]string{"p1": "||", "p2": "pool-p2|SHA256:d|0b"} {
+		got := read(`SELECT node_name || '|' || node_fingerprint || '|' || node_cert_serial FROM pool_orders WHERE order_id = ?`, order)
+		if got != want {
+			t.Errorf("order %s is linked as %q, want %q", order, got, want)
+		}
+	}
+
+	for token, want := range map[string]string{"h-joined": "0", "h-pool": "1"} {
+		if got := read(`SELECT CAST(uses_remaining AS TEXT) FROM join_tokens WHERE token_sha256 = ?`, token); got != want {
+			t.Errorf("token %s has %s uses, want %s", token, got, want)
 		}
 	}
 }

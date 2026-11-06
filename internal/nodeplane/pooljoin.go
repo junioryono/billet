@@ -258,12 +258,16 @@ func isPoolRefusal(err error) bool {
 
 // poolRefusal answers what the ledger said of a pool host's enrollment, on either path:
 // an order not yet placed is asked again, a held order or a conflict waits for a person
-// as pending, a closed order is refused, and a token no longer usable is a credential
-// problem. Nothing the ledger said is quoted to the caller.
+// as pending, a closed order is refused, and a token of the order that could not be
+// spent is asked again. Nothing the ledger said is quoted to the caller.
 func (h *handler) poolRefusal(w http.ResponseWriter, node, fingerprint string, err error) {
 	switch {
 	case errors.Is(err, alloc.ErrBadJoinToken):
-		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated, badJoinToken)
+		// A TOKEN OF THIS ORDER THAT COULD NOT BE SPENT lapsed, or was spent, while the
+		// request was on its way: not a bad credential, so the host asks again, and the
+		// pool holds an order nothing can join from, after which it is recorded for a
+		// person.
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
 	case errors.Is(err, alloc.ErrPoolOrderNotPlaced):
 		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolOrderNotPlaced)
 	case errors.Is(err, alloc.ErrPoolJoinHeld), errors.Is(err, alloc.ErrEnrollmentConflict):

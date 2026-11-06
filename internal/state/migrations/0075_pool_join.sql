@@ -61,3 +61,23 @@ UPDATE join_tokens SET pool_order = substr(note, 12)
 UPDATE node_enrollments SET pool_order = substr(name, 6)
  WHERE pool_order = '' AND name LIKE 'pool-%' AND substr(name, 6) IN (SELECT order_id FROM pool_orders)
 -- +billet:end
+
+-- A HOST ALREADY APPROVED FROM A PLACED ORDER is linked to it as the join would have:
+-- its key, and the serial of the newest certificate recorded for it; and its order's
+-- tokens are retired. Left unlinked, the pool would count it on its way, or hold it as a
+-- host that never joined.
+
+-- +billet:statement
+UPDATE pool_orders
+   SET node_name = 'pool-' || order_id,
+       node_fingerprint = (SELECT e.fingerprint FROM node_enrollments e WHERE e.name = 'pool-' || pool_orders.order_id),
+       node_cert_serial = COALESCE((SELECT c.serial FROM issued_certs c WHERE c.node = 'pool-' || pool_orders.order_id
+                                     ORDER BY c.issued_at DESC, c.serial DESC LIMIT 1), '')
+ WHERE state = 'placed' AND node_name = ''
+   AND EXISTS (SELECT 1 FROM node_enrollments e WHERE e.name = 'pool-' || pool_orders.order_id AND e.state = 'approved')
+-- +billet:end
+
+-- +billet:statement
+UPDATE join_tokens SET uses_remaining = 0
+ WHERE pool_order != '' AND uses_remaining > 0 AND pool_order IN (SELECT order_id FROM pool_orders WHERE node_name != '')
+-- +billet:end

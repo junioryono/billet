@@ -1016,7 +1016,7 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// A POOL HOST'S REQUEST IS ANSWERED AS ONE on this path too, a conflict
 		// included: pending, quoting nothing, so the host keeps asking.
-		if isPoolRefusal(err) || (poolOrder != "" && errors.Is(err, alloc.ErrEnrollmentConflict)) {
+		if isPoolRefusal(err) || (poolOrder != "" && (errors.Is(err, alloc.ErrEnrollmentConflict) || errors.Is(err, alloc.ErrBadJoinToken))) {
 			h.poolRefusal(w, req.Node, fingerprint, err)
 
 			return

@@ -276,16 +276,24 @@ func TestAPoolWithAnEmptyCredentialVariableIsRefused(t *testing.T) {
 	}
 }
 
-// A POOL'S JOINS REACH THE NODE WIRE WHEN THE CONFIG NAMES A POOL, and nothing is added
-// when it names none.
+// A POOL'S JOINS REACH THE NODE WIRE WHEN THE CONFIG NAMES A POOL, and when it names
+// none, because a pool's orders and tokens outlive the config that placed them.
 func TestAPoolsJoinsReachTheWire(t *testing.T) {
 	t.Parallel()
 	base := withResizer(nil)
 	cfg := poolBootConfig()
 	cfg.Server.Pool = nil
 	opts, err := poolWireOptions(cfg, nil, "0123456789abcdef0123456789abcdef", base)
-	if err != nil || len(opts) != 1 {
+	if err != nil || len(opts) != 2 {
 		t.Fatalf("no pool: %d options, %v", len(opts), err)
+	}
+	// STILL ANSWERED BY THE LEDGER: orders and tokens outlive a config naming no pool.
+	var none wireSettings
+	for _, o := range opts {
+		o(&none)
+	}
+	if none.poolJoins == nil {
+		t.Fatal("with no pool configured, a pool's hosts are not answered at all")
 	}
 
 	cfg = poolBootConfig()

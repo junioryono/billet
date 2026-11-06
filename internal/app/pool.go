@@ -96,9 +96,13 @@ func NewPoolJoins(cfg *config.Config, ledger *alloc.Allocator, deployment string
 // poolWireOptions is the wire's options with a pool's joins added when the config names
 // a pool (ADR-030), so its hosts join on their source's word through the sources the
 // pool orders from.
+//
+// AND WITHOUT ONE: orders a pool placed, and their tokens, outlive a config that names
+// no pool any more, so their hosts are still answered by the ledger, and with no source
+// to ask, each waits for a person.
 func poolWireOptions(cfg *config.Config, ledger *alloc.Allocator, deployment string, opts ...wireOption) ([]wireOption, error) {
 	if cfg.Server.Pool == nil {
-		return opts, nil
+		return append(opts, withPoolJoins(poolJoins{Allocator: ledger, Joins: pool.NewJoins(ledger, nil, nil)})), nil
 	}
 	joins, err := NewPoolJoins(cfg, ledger, deployment)
 	if err != nil {

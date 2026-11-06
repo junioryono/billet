@@ -417,8 +417,8 @@ func TestAPoolJoinFallsToTheOrdinaryPathOnlyWhereItShould(t *testing.T) {
 
 // THE LEDGER'S REFUSALS OF A POOL JOIN ARE ANSWERED BY WHAT THE HOST SHOULD DO, on
 // either path: an order not yet placed is asked again, a held order or a conflict waits
-// as pending, a closed one is refused, and a token no longer usable is a credential
-// problem; none quotes what the ledger said.
+// as pending, a closed one is refused, and a token of the order that lapsed on its way
+// is asked again; none quotes what the ledger said.
 func TestAPoolJoinsRefusalsAreAnsweredByWhatTheHostDoes(t *testing.T) {
 	t.Parallel()
 	type want struct {
@@ -430,11 +430,11 @@ func TestAPoolJoinsRefusalsAreAnsweredByWhatTheHostDoes(t *testing.T) {
 		err  error
 		want want
 	}{
-		"not yet placed": {alloc.ErrPoolOrderNotPlaced, want{http.StatusServiceUnavailable, "", "not yet recorded as placed"}},
-		"held":           {fmt.Errorf("%w: the secret reason", alloc.ErrPoolJoinHeld), want{http.StatusOK, alloc.EnrollPending, ""}},
-		"closed":         {fmt.Errorf("%w: the secret reason", alloc.ErrPoolOrderClosed), want{http.StatusConflict, "", "admits no node"}},
-		"a spent token":  {alloc.ErrBadJoinToken, want{http.StatusUnauthorized, "", "join token"}},
-		"a conflict":     {fmt.Errorf("%w: the secret key", alloc.ErrEnrollmentConflict), want{http.StatusOK, alloc.EnrollPending, ""}},
+		"not yet placed":            {alloc.ErrPoolOrderNotPlaced, want{http.StatusServiceUnavailable, "", "not yet recorded as placed"}},
+		"held":                      {fmt.Errorf("%w: the secret reason", alloc.ErrPoolJoinHeld), want{http.StatusOK, alloc.EnrollPending, ""}},
+		"closed":                    {fmt.Errorf("%w: the secret reason", alloc.ErrPoolOrderClosed), want{http.StatusConflict, "", "admits no node"}},
+		"a token lapsed on its way": {alloc.ErrBadJoinToken, want{http.StatusServiceUnavailable, "", "join waits"}},
+		"a conflict":                {fmt.Errorf("%w: the secret key", alloc.ErrEnrollmentConflict), want{http.StatusOK, alloc.EnrollPending, ""}},
 	}
 	for name, c := range cases {
 		t.Run("recording "+name, func(t *testing.T) {
