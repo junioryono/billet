@@ -1983,8 +1983,10 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	candidate, step, err := s.publishAcquired(ctx, session, slot, attachment, lease, fence)
-	if moved, ok := errors.AsType[*storecontract.PointerMovedError](err); ok && step == stepPublish &&
-		attachment.Publication == publicationCAS {
+	// AND A GENERATION THERE: a pointer that is gone is the store's word that the key
+	// holds nothing, which is no generation for cas to keep.
+	if moved, ok := errors.AsType[*storecontract.PointerMovedError](err); ok && moved.Current != "" &&
+		step == stepPublish && attachment.Publication == publicationCAS {
 		// A CAS LOSS IS AN ANSWER, NOT AN OUTAGE: the key holds a generation this disk
 		// was not cloned from, and cas keeps it. Said by name, because "cache
 		// unavailable" sends an operator looking for a fault that is not there; and

@@ -101,9 +101,11 @@ judge)
 		exit 1
 	fi
 	mkdir -p "$run_dir/out"
-	if [ -f "$ws/evidence.json" ]; then
-		cp "$ws/evidence.json" "$run_dir/out/evidence.json"
-	fi
+	for kept in "$ws/evidence.json" "$run_dir/run.log"; do
+		if [ -f "$kept" ]; then
+			cp "$kept" "$run_dir/out/"
+		fi
+	done
 	"$billet" acceptance matrix judge --workspace "$ws" --archs "$archs" --runs "$runs" --repository "$repo" \
 		--out "$run_dir/out/matrix.json" >"$run_dir/out/matrix.txt"
 	judged=$?

@@ -41,6 +41,7 @@ type fakeCacheStore struct {
 	publishConflicts   int
 	conflictCurrent    string
 	advanceOnSnapshot  bool
+	vanishOnSnapshot   bool
 	publishExpected    []string
 	writerAcquisitions int
 	writers            map[string]fakeWriter
@@ -250,6 +251,9 @@ func (f *fakeCacheStore) Snapshot(
 	}
 	if f.advanceOnSnapshot {
 		f.current = "concurrent"
+	}
+	if f.vanishOnSnapshot {
+		f.current = ""
 	}
 
 	return storecontract.Candidate{
@@ -605,6 +609,14 @@ func TestACasCommitSupersededByAnotherJobSaysSo(t *testing.T) {
 	got = commit(t, func(s *fakeCacheStore) { s.publishConflicts, s.conflictCurrent = 1, "a-third-writer" })
 	if got["published"] != false || got["reason"] != "cache unavailable" {
 		t.Errorf("a conflict with an unmoved pointer answered %v, want cache unavailable", got)
+	}
+
+	// A POINTER THAT IS GONE IS NO GENERATION KEPT: a store whose key holds nothing,
+	// though this disk was cloned from a generation, answers a moved pointer at "",
+	// which is an outage to say, never a supersession.
+	got = commit(t, func(s *fakeCacheStore) { s.advanceOnSnapshot, s.vanishOnSnapshot = false, true })
+	if got["published"] != false || got["reason"] != "cache unavailable" {
+		t.Errorf("a moved pointer at no generation answered %v, want cache unavailable", got)
 	}
 }
 

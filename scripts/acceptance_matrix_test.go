@@ -198,6 +198,11 @@ acceptance-run)
 	# What lock it was handed, and whether that descriptor is open in it.
 	lock=${BILLET_ACCEPTANCE_LOCK_FD:-}
 	if [ -n "$lock" ] && [ -e "/dev/fd/$lock" ]; then echo "$lock open" >"$FAKE/lock"; else echo "${lock:-none} closed" >"$FAKE/lock"; fi
+	echo "the fake run is running"
+	if [ -f "$FAKE/run-late" ]; then
+		sleep 0.5
+		echo "the fake run, still writing"
+	fi
 	# With $FAKE/run-waits, a run that waits to be stopped: it says when its TERM trap is
 	# installed, records each TERM it gets, and ends once it has had one, or after ten
 	# seconds as a guard; a second TERM would show as a second line.
@@ -814,5 +819,99 @@ func TestTheMatrixDispatcherFailsOnARunItCouldNotRecord(t *testing.T) {
 		runs, "accept-x64")
 	if code != 1 || !strings.Contains(out, "dispatched run 1 of matrix-images-cold.yml for accept-x64, and could not record it") {
 		t.Fatalf("exit %d:\n%s", code, out)
+	}
+}
+
+// THE RUN WRITES TO ITS LOG, NEVER TO THE SUPERVISOR'S OUTPUT: with every reader of the
+// supervisor's output gone, as SSM leaves a command it timed out, the run goes on
+// writing, ends as itself, and its exit is still recorded.
+func TestTheMatrixRunOutlivesItsSupervisorsOutput(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "python3")
+	f.command(t, "billet", fakeBillet)
+	f.fixture(t, "run-late", "")
+	dir := hostRunDir(t, f)
+	abs, err := filepath.Abs("acceptance/matrix-host.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := exec.CommandContext(t.Context(), abs, "run", dir, "27")
+	run.Env = []string{"PATH=" + f.path, "HOME=" + t.TempDir(), "FAKE=" + f.dir, "MATRIX_POLL=0.1"}
+	run.Stdout, run.Stderr = w, w
+	if err := run.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// NOBODY READS: both ends close in this process, so the supervisor's next write
+	// to its output fails as SSM's closed pipe would.
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Wait(); err != nil {
+		t.Fatalf("the supervisor with no reader: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "run.exit")); err != nil || string(b) != "0\n" {
+		t.Fatalf("run.exit = %q, %v; want the run's own 0", b, err)
+	}
+	log, err := os.ReadFile(filepath.Join(dir, "run.log"))
+	if err != nil || !strings.Contains(string(log), "the fake run is running") ||
+		!strings.Contains(string(log), "the fake run, still writing") {
+		t.Fatalf("run.log = %q, %v; want the run's own lines, the late one included", log, err)
+	}
+}
+
+// A SIGNAL TO THE SUPERVISOR'S WHOLE PROCESS GROUP, beside a stop request, reaches the
+// run as ONE TERM: the run is in a session of its own, so the group's signal reaches
+// only the supervisor, which sends it on once through the gate.
+func TestAGroupSignalReachesTheRunOnce(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "python3")
+	f.command(t, "billet", fakeBillet)
+	f.fixture(t, "run-waits", "")
+	dir := hostRunDir(t, f)
+	abs, err := filepath.Abs("acceptance/matrix-host.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	run := exec.CommandContext(t.Context(), abs, "run", dir, "27")
+	run.Env = []string{"PATH=" + f.path, "HOME=" + t.TempDir(), "FAKE=" + f.dir, "MATRIX_POLL=0.5"}
+	run.Stderr = &stderr
+	run.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := run.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := false
+	for range 200 {
+		if b, err := os.ReadFile(filepath.Join(f.dir, "ready")); err == nil && len(b) > 0 {
+			ready = true
+
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !ready {
+		t.Fatal("the run never said it was ready")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stop-requested"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(-run.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Wait(); err != nil {
+		t.Fatalf("the run: %v\n%s", err, stderr.String())
+	}
+	if n := strings.Count(stderr.String(), "stopping the run early"); n != 1 {
+		t.Fatalf("the supervisor signalled %d times, want once:\n%s", n, stderr.String())
+	}
+	if b, err := os.ReadFile(filepath.Join(f.dir, "terms")); err != nil || string(b) != "term\n" {
+		t.Fatalf("the run got %q TERMs (%v), want one: the group's signal reached it beside the supervisor's", b, err)
 	}
 }

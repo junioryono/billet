@@ -21,6 +21,12 @@ reused while it is signalled. It writes the command's exit status (128 + n for s
 to <run-dir>/run.exit and exits with it. A SIGKILL ends the supervisor alone: the command
 holds the lock and runs on to its own end, which is its --wait, and a teardown waits.
 
+THE COMMAND WRITES TO <run-dir>/run.log, never to the supervisor's own output: SSM
+closes a command's output pipes when it times the command out or cancels it, and a
+process in a session of its own that outlived that would die of SIGPIPE on its next
+write, mid-teardown, and give up the lock. The supervisor's own lines go to the same log
+and to its stderr while that still reads, and it echoes the log's tail at the end.
+
 await waits up to <seconds> for the lock to be free, which is the proof no run is
 live in <run-dir>: 0 once it is, 1 if a run still holds it.
 
@@ -46,17 +52,31 @@ def take_lock(run_dir):
     return fd
 
 
+LOG = None
+
+
 def say(message):
-    print("matrix: " + message, file=sys.stderr, flush=True)
+    line = "matrix: " + message + "\n"
+    if LOG is not None:
+        LOG.write(line)
+        LOG.flush()
+    # BEST EFFORT: a stderr whose reader is gone must not end the supervisor.
+    try:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    except OSError:
+        silence(sys.stderr)
 
 
 def run(run_dir, argv, poll):
+    global LOG
     fd = take_lock(run_dir)
     if fd is None:
         say("another run holds " + run_dir + "; not starting a second")
         return 1
     exit_file = os.path.join(run_dir, "run.exit")
     stop_file = os.path.join(run_dir, "stop-requested")
+    LOG = open(os.path.join(run_dir, "run.log"), "a", encoding="utf-8")
     if os.path.exists(exit_file):
         os.remove(exit_file)
     if os.path.exists(stop_file):
@@ -71,7 +91,8 @@ def run(run_dir, argv, poll):
     # THE LOCK GOES WITH THE COMMAND, so a supervisor killed outright leaves it held
     # for as long as the run it started is still writing.
     env = dict(os.environ, BILLET_ACCEPTANCE_LOCK_FD=str(fd))
-    proc = subprocess.Popen(argv, pass_fds=(fd,), env=env, start_new_session=True)
+    proc = subprocess.Popen(argv, pass_fds=(fd,), env=env, start_new_session=True,
+                            stdin=subprocess.DEVNULL, stdout=LOG, stderr=subprocess.STDOUT)
     signalled = False
     while proc.poll() is None:
         if not signalled and (asked or os.path.exists(stop_file)):
@@ -82,7 +103,30 @@ def run(run_dir, argv, poll):
     write_exit(exit_file, code)
     if code != 0:
         say("the run ended with status " + str(code))
+    echo_tail(os.path.join(run_dir, "run.log"))
     return code
+
+
+def echo_tail(path, lines=200):
+    """Copy the log's last lines to stdout, for whoever is still reading it."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-lines:]
+        sys.stdout.write("".join(tail))
+        sys.stdout.flush()
+    except OSError:
+        silence(sys.stdout)
+
+
+def silence(stream):
+    """Point a stream whose reader is gone at /dev/null, so nothing written later, the
+    interpreter's own flush at exit included, fails the supervisor (exit 120)."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, stream.fileno())
+        os.close(devnull)
+    except OSError:
+        pass
 
 
 def stop_once(proc):
