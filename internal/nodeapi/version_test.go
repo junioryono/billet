@@ -169,6 +169,9 @@ func TestBarrierVersionsAgree(t *testing.T) {
 		t.Errorf("nodeapi.VersionCacheAuthority = %d, alloc.CacheAuthorityWireVersion = %d",
 			VersionCacheAuthority, alloc.CacheAuthorityWireVersion)
 	}
+	if VersionEgress != alloc.EgressWireVersion {
+		t.Errorf("nodeapi.VersionEgress = %d, alloc.EgressWireVersion = %d", VersionEgress, alloc.EgressWireVersion)
+	}
 	if VersionWindowsGuests != alloc.WindowsGuestsWireVersion {
 		t.Errorf("nodeapi.VersionWindowsGuests = %d, alloc.WindowsGuestsWireVersion = %d",
 			VersionWindowsGuests, alloc.WindowsGuestsWireVersion)
