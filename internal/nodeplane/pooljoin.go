@@ -173,7 +173,7 @@ func (h *handler) poolEnroll(
 
 		return true
 	case hostsource.VerdictVouches:
-		h.admitPoolHost(w, r, req, fingerprint, order, t.Reason)
+		h.admitPoolHost(w, r, req, fingerprint, order, t.Reason, o.Updated)
 
 		return true
 	case hostsource.VerdictDeferred:
@@ -229,7 +229,7 @@ func poolPending(w http.ResponseWriter, fingerprint string) {
 // CERTIFICATE IS HANDED OVER ONLY ONCE THE ADMISSION HAS COMMITTED, the order the
 // renewal keeps: one signed for a request the ledger then refused is never sent.
 func (h *handler) admitPoolHost(
-	w http.ResponseWriter, r *http.Request, req *nodeapi.EnrollRequest, fingerprint, order, why string,
+	w http.ResponseWriter, r *http.Request, req *nodeapi.EnrollRequest, fingerprint, order, why string, seen time.Time,
 ) {
 	bundle, err := h.ca.SignNodeCSR(req.Node, []byte(req.CSRPEM))
 	if err != nil {
@@ -248,6 +248,7 @@ func (h *handler) admitPoolHost(
 	enrollment, err := h.poolJoins.AdmitPoolEnrollment(r.Context(), alloc.PoolAdmission{
 		Order: order, Fingerprint: fingerprint, CSRPEM: req.CSRPEM, Token: req.JoinToken,
 		CertPEM: string(bundle.CertPEM), Serial: wirecert.Serial(leaf), NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
+		Seen: seen,
 	})
 	if err != nil {
 		h.poolRefusal(w, req.Node, fingerprint, err)
@@ -285,6 +286,10 @@ func (h *handler) poolRefusal(w http.ResponseWriter, node, fingerprint string, e
 		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
 	case errors.Is(err, alloc.ErrPoolOrderNotPlaced):
 		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolOrderNotPlaced)
+	case errors.Is(err, alloc.ErrPoolOrderMoved):
+		// THE ORDER MOVED WHILE ITS SOURCE WAS ASKED, so the verdict is not acted on: the
+		// host asks again and is judged afresh.
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolJoinWaits)
 	case errors.Is(err, alloc.ErrPoolJoinHeld), errors.Is(err, alloc.ErrEnrollmentConflict):
 		h.log.Warn("a pool host's enrollment waits for a person", "node", node, "fingerprint", fingerprint, "why", err)
 		poolPending(w, fingerprint)

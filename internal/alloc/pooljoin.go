@@ -293,7 +293,8 @@ func (a *Allocator) HoldLapsedPoolJoin(ctx context.Context, order string) (bool,
 }
 
 // PoolAdmission is a pool host's enrollment its source vouched for, and the
-// certificate signed for it.
+// certificate signed for it. Seen is the order's Updated as it was read before the
+// source was asked: the source's word stands only for the order it was asked about.
 type PoolAdmission struct {
 	Order       string
 	Fingerprint string
@@ -302,6 +303,7 @@ type PoolAdmission struct {
 	CertPEM     string
 	Serial      string
 	NotAfter    string
+	Seen        time.Time
 }
 
 // AdmitPoolEnrollment admits a pool host on its source's word, in one transaction
@@ -355,6 +357,13 @@ func (a *Allocator) AdmitPoolEnrollment(ctx context.Context, adm PoolAdmission) 
 		open, err := openPoolOrderTx(ctx, q, adm.Order)
 		if err != nil {
 			return err
+		}
+
+		// THE ORDER THE SOURCE WAS ASKED ABOUT, OR NONE: a hold and its release while the
+		// source was asked leave the order open and the request pending, and only the
+		// order's revision tells the verdict from before them. A zero Seen matches none.
+		if open.UpdatedAt != ts(adm.Seen) {
+			return fmt.Errorf("%w: pool order %s changed after it was judged", ErrPoolOrderMoved, adm.Order)
 		}
 
 		existing, err := readEnrollment(ctx, q, name)

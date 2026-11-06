@@ -285,6 +285,25 @@ func (q *Queries) MarkPoolOrderUncertain(ctx context.Context, arg MarkPoolOrderU
 	return result.RowsAffected()
 }
 
+const markUncertainPoolOrderFound = `-- name: MarkUncertainPoolOrderFound :execrows
+UPDATE pool_orders SET state = 'placed', host_id = $1, reason = '', updated_at = $2
+WHERE order_id = $3 AND state = 'uncertain'
+`
+
+type MarkUncertainPoolOrderFoundParams struct {
+	HostID    string
+	UpdatedAt string
+	OrderID   string
+}
+
+func (q *Queries) MarkUncertainPoolOrderFound(ctx context.Context, arg MarkUncertainPoolOrderFoundParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markUncertainPoolOrderFound, arg.HostID, arg.UpdatedAt, arg.OrderID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const readPoolOrder = `-- name: ReadPoolOrder :one
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
        node_fingerprint, node_cert_serial, join_hold

@@ -515,7 +515,7 @@ func EnrollNode(
 			poolOrder, alloc.PoolNodeName(poolOrder), cfg.Node.Name)
 	}
 
-	caPEM, deployment, err := nodeclient.FetchCA(ctx, base, caFingerprint)
+	caPEM, deployment, err := fetchCA(ctx, env, base, caFingerprint, poolOrder != "")
 	if err != nil {
 		return err
 	}
@@ -614,6 +614,11 @@ func EnrollNode(
 			// request the control plane had already recorded and a join token it had
 			// already spent, over a busy ledger.
 			fmt.Fprintf(env.Stdout, "  the control plane is busy; still waiting\n")
+		case errors.Is(err, nodeclient.ErrUnreachable) && ctx.Err() == nil:
+			// NOT A VERDICT EITHER: the answer lost may have been an approval, which
+			// the same key is handed again. A pool host's boot runs this once, so
+			// giving up here left an admitted host that never started its node.
+			fmt.Fprintf(env.Stdout, "  the control plane's answer did not arrive; asking again: %v\n", err)
 		default:
 			return err
 		}
@@ -625,6 +630,30 @@ func EnrollNode(
 			wait.Stop()
 
 			return ctx.Err()
+		case <-wait.C:
+		}
+	}
+}
+
+// fetchCA reads the control plane's authority. A pool host, which nobody is watching,
+// asks again while the answer does not arrive, so a boot that reaches the network
+// before the control plane is reachable still joins; a person sees the failure.
+func fetchCA(ctx context.Context, env cli.Env, base, caFingerprint string, unattended bool) ([]byte, string, error) {
+	for {
+		caPEM, deployment, err := nodeclient.FetchCA(ctx, base, caFingerprint)
+		if err == nil || !unattended || !errors.Is(err, nodeclient.ErrUnreachable) || ctx.Err() != nil {
+			return caPEM, deployment, err
+		}
+
+		fmt.Fprintf(env.Stderr, "the control plane's authority did not arrive; asking again: %v\n", err)
+
+		wait := time.NewTimer(enrollPollEvery)
+
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+
+			return nil, "", ctx.Err()
 		case <-wait.C:
 		}
 	}

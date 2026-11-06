@@ -57,10 +57,17 @@ func readOrder(t *testing.T, a *Allocator, id string) PoolOrder {
 	return o
 }
 
-func admission(order, fingerprint, token, serial string) PoolAdmission {
+// admission is a vouched admission judged against the order as it reads now.
+func admission(t *testing.T, a *Allocator, order, fingerprint, token, serial string) PoolAdmission {
+	t.Helper()
+	var seen time.Time
+	if o, err := a.ReadPoolOrder(t.Context(), order); err == nil {
+		seen = o.Updated
+	}
+
 	return PoolAdmission{
 		Order: order, Fingerprint: fingerprint, CSRPEM: "csr-" + fingerprint, Token: token,
-		CertPEM: "cert-" + serial, Serial: serial, NotAfter: "2027-11-06T00:00:00Z",
+		CertPEM: "cert-" + serial, Serial: serial, NotAfter: "2027-11-06T00:00:00Z", Seen: seen,
 	}
 }
 
@@ -112,7 +119,7 @@ func TestAPoolTokenWaitsForItsOrderAndIsRefusedOnceTheOrderCloses(t *testing.T) 
 	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pa"), "SHA256:k", "csr", tok); !errors.Is(err, ErrPoolOrderNotPlaced) {
 		t.Fatalf("an order being ordered answered %v, want ErrPoolOrderNotPlaced", err)
 	}
-	if _, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", tok, "01")); !errors.Is(err, ErrPoolOrderNotPlaced) {
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", tok, "01")); !errors.Is(err, ErrPoolOrderNotPlaced) {
 		t.Fatalf("admitting from an order being ordered answered %v", err)
 	}
 	if err := a.PoolOrderUncertain(ctx, "pa", "lost"); err != nil {
@@ -145,7 +152,7 @@ func TestAPoolAdmissionLinksTheOrderAndRetiresItsTokens(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", second, "0a"))
+	e, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", second, "0a"))
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
@@ -168,14 +175,14 @@ func TestAPoolAdmissionLinksTheOrderAndRetiresItsTokens(t *testing.T) {
 		t.Fatal("a retired token recorded a request")
 	}
 
-	again, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", "", "0b"))
+	again, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", "", "0b"))
 	if err != nil || again.CertPEM != "cert-0a" {
 		t.Fatalf("a retry with the same key answered %+v, %v; want the first certificate", again, err)
 	}
 	if certs, err := a.LiveCertsFor(ctx, PoolNodeName("pa")); err != nil || len(certs) != 1 {
 		t.Fatalf("a retry recorded another certificate: %+v", certs)
 	}
-	if _, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:other", tok, "0c")); !errors.Is(err, ErrPoolOrderClosed) {
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:other", tok, "0c")); !errors.Is(err, ErrPoolOrderClosed) {
 		t.Fatalf("another key after the admission answered %v, want ErrPoolOrderClosed", err)
 	}
 }
@@ -192,7 +199,7 @@ func TestAPendingPoolRequestIsAdmittedAndAnotherKeyHoldsTheOrder(t *testing.T) {
 	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pa"), "SHA256:k", "csr-SHA256:k", tok); err != nil {
 		t.Fatal(err)
 	}
-	e, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", tok, "0a"))
+	e, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", tok, "0a"))
 	if err != nil || e.State != EnrollApproved || e.Source != CertPool {
 		t.Fatalf("admitting the pending request: %+v, %v", e, err)
 	}
@@ -208,7 +215,7 @@ func TestAPendingPoolRequestIsAdmittedAndAnotherKeyHoldsTheOrder(t *testing.T) {
 	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pb"), "SHA256:first", "csr", tokB); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.AdmitPoolEnrollment(ctx, admission("pb", "SHA256:vouched", spare, "0b")); !errors.Is(err, ErrEnrollmentConflict) {
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pb", "SHA256:vouched", spare, "0b")); !errors.Is(err, ErrEnrollmentConflict) {
 		t.Fatalf("a vouched key against another's request answered %v, want ErrEnrollmentConflict", err)
 	}
 	o := readOrder(t, a, "pb")
@@ -246,7 +253,7 @@ func TestAHeldOrderWaitsForAPerson(t *testing.T) {
 	if o := readOrder(t, a, "pa"); o.JoinHold != "the console named another key" {
 		t.Fatalf("hold = %q, want the first reason kept", o.JoinHold)
 	}
-	if _, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", spare, "0a")); !errors.Is(err, ErrPoolJoinHeld) {
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", spare, "0a")); !errors.Is(err, ErrPoolJoinHeld) {
 		t.Fatalf("admitting a held order answered %v", err)
 	}
 	if left := usesLeft(t, a, "pa"); !slices.Equal(left, []int{0, 1}) {
@@ -270,7 +277,7 @@ func TestAHeldOrderWaitsForAPerson(t *testing.T) {
 	if err := a.DecideEnrollment(ctx, PoolNodeName("pb"), "SHA256:denied", EnrollDenied, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	e, err := a.AdmitPoolEnrollment(ctx, admission("pb", "SHA256:denied", "", "0b"))
+	e, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pb", "SHA256:denied", "", "0b"))
 	if err != nil || e.State != EnrollDenied {
 		t.Fatalf("the source vouching for a denied key answered %+v, %v; want the denial", e, err)
 	}
@@ -328,7 +335,7 @@ func TestALapsedJoinIsHeld(t *testing.T) {
 	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("waiting"), "SHA256:w", "csr", waiting); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.AdmitPoolEnrollment(ctx, admission("joined", "SHA256:j", joined, "0j")); err != nil {
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "joined", "SHA256:j", joined, "0j")); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(2 * time.Hour)
@@ -357,7 +364,7 @@ func TestAHoldIsOnlyOnAnOpenOrder(t *testing.T) {
 	a := poolAllocator(t, &now)
 	ctx := t.Context()
 	tok := placedOrder(t, a, "joined")
-	if _, err := a.AdmitPoolEnrollment(ctx, admission("joined", "SHA256:j", tok, "0j")); err != nil {
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "joined", "SHA256:j", tok, "0j")); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.HoldPoolJoin(ctx, "joined", "too late", readOrder(t, a, "joined").Updated); err != nil {
@@ -389,13 +396,13 @@ func TestAHeldJoinIsReleasedOnAPersonsWord(t *testing.T) {
 	if err := a.HoldPoolJoin(ctx, "pa", "a key nobody can account for", readOrder(t, a, "pa").Updated); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", tok, "0a")); !errors.Is(err, ErrPoolJoinHeld) {
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", tok, "0a")); !errors.Is(err, ErrPoolJoinHeld) {
 		t.Fatalf("admitting a held order answered %v", err)
 	}
 	if err := a.ReleasePoolJoin(ctx, "pa"); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if _, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", tok, "0a")); err != nil {
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", tok, "0a")); err != nil {
 		t.Fatalf("admitting once the hold was released: %v", err)
 	}
 	if err := a.ReleasePoolJoin(ctx, "pa"); !errors.Is(err, ErrPoolOrderClosed) && !errors.Is(err, ErrPoolJoinNotHeld) {
@@ -578,5 +585,52 @@ func TestOneOrdersLapseIsHeldOnItsOwn(t *testing.T) {
 	}
 	if _, err := a.HoldLapsedPoolJoin(ctx, "missing"); !errors.Is(err, ErrPoolOrderClosed) {
 		t.Fatalf("no such order: %v", err)
+	}
+}
+
+// A VERDICT FROM BEFORE A HOLD AND ITS RELEASE ADMITS NOTHING: the hold recorded this
+// key's request pending, the release left the order open, and only the order's
+// revision tells the source's word from before them. Nothing is spent or decided, and
+// a verdict on the order as it now reads admits.
+func TestAVerdictFromBeforeAHoldAndItsReleaseAdmitsNothing(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	tok := placedOrder(t, a, "pa")
+	before := admission(t, a, "pa", "SHA256:k", tok, "0a")
+
+	now = now.Add(time.Second)
+	if err := a.HoldPoolJoin(ctx, "pa", "a key nobody can account for", before.Seen); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.RecordHeldPoolRequest(ctx, "pa", "SHA256:k", "csr-SHA256:k"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if err := a.ReleasePoolJoin(ctx, "pa"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.AdmitPoolEnrollment(ctx, before); !errors.Is(err, ErrPoolOrderMoved) {
+		t.Fatalf("a verdict from before the hold answered %v, want ErrPoolOrderMoved", err)
+	}
+	if e, _, err := a.LookupEnrollment(ctx, PoolNodeName("pa")); err != nil || e.State != EnrollPending {
+		t.Fatalf("the stale verdict decided the request: %+v, %v", e, err)
+	}
+	if o := readOrder(t, a, "pa"); o.NodeName != "" {
+		t.Fatalf("the stale verdict linked the order: %+v", o)
+	}
+	if left := usesLeft(t, a, "pa"); len(left) != 1 || left[0] != 1 {
+		t.Fatalf("the stale verdict spent the token: %v", left)
+	}
+	zero := admission(t, a, "pa", "SHA256:k", tok, "0a")
+	zero.Seen = time.Time{}
+	if _, err := a.AdmitPoolEnrollment(ctx, zero); !errors.Is(err, ErrPoolOrderMoved) {
+		t.Fatalf("a verdict judged against no revision answered %v, want ErrPoolOrderMoved", err)
+	}
+
+	if e, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:k", tok, "0a")); err != nil || e.State != EnrollApproved {
+		t.Fatalf("a verdict on the order as it reads now: %+v, %v", e, err)
 	}
 }

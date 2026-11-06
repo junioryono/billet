@@ -36,6 +36,12 @@ var ErrDenied = errors.New("nodeclient: an operator denied this node")
 // spent, so the operator's approval landed on a node that had stopped asking.
 var ErrEnrollUnavailable = errors.New("nodeclient: the control plane cannot take this enrollment right now")
 
+// ErrUnreachable means the control plane's answer did not arrive: the request failed
+// on its way, or its answer was cut off. NOT A VERDICT: an enrollment whose answer was
+// lost may have been recorded, or admitted, so the caller asks again with the same key
+// and is answered what was decided.
+var ErrUnreachable = errors.New("nodeclient: the control plane's answer did not arrive")
+
 // FetchCA reads a control plane's authority and checks it against a fingerprint
 // the operator supplied.
 //
@@ -86,14 +92,19 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 		// errors.As against tls.AlertError is false and there is nothing structural
 		// to match. Matching the prose instead would be a string comparison against
 		// somebody else's error text.
-		return nil, "", fmt.Errorf("nodeclient: read the control plane's authority: %w\n"+
+		return nil, "", fmt.Errorf("%w: read the control plane's authority: %w\n"+
 			"(a control plane that serves enrollment on an address of its own — "+
 			"server.bootstrap_listen — cannot be reached for this on its node wire, which "+
 			"requires a client certificate this machine does not have yet. Dial that address "+
-			"with --bootstrap-addr)", err)
+			"with --bootstrap-addr)", ErrUnreachable, err)
 	}
 
 	defer res.Body.Close()
+
+	if res.StatusCode >= http.StatusInternalServerError {
+		return nil, "", fmt.Errorf("%w: the control plane returned %s for its authority", ErrUnreachable,
+			res.Status)
+	}
 
 	if res.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("nodeclient: the control plane returned %s for its authority",
@@ -102,7 +113,7 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 
 	var body nodeapi.CAResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return nil, "", fmt.Errorf("nodeclient: decode the authority: %w", err)
+		return nil, "", fmt.Errorf("%w: decode the authority: %w", ErrUnreachable, err)
 	}
 
 	got, err := wirecert.FingerprintOfCAPEM([]byte(body.CAPEM))
@@ -293,7 +304,7 @@ func EnrollWithIdentity(
 
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("nodeclient: ask to enroll: %w", err)
+		return nil, nil, fmt.Errorf("%w: ask to enroll: %w", ErrUnreachable, err)
 	}
 
 	defer res.Body.Close()
@@ -313,7 +324,7 @@ func EnrollWithIdentity(
 
 	var body nodeapi.EnrollResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return nil, nil, fmt.Errorf("nodeclient: decode the enrollment response: %w", err)
+		return nil, nil, fmt.Errorf("%w: decode the enrollment response: %w", ErrUnreachable, err)
 	}
 
 	switch body.State {

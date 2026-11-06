@@ -250,7 +250,8 @@ func TestAPoolHostItsSourceVouchesForIsAdmitted(t *testing.T) {
 			t.Fatalf("sees=%v: the claim's address is %q, want %q", sees, rig.claims[0].Address, want)
 		}
 		if len(rig.admitted) != 1 || rig.admitted[0].Serial != wirecert.Serial(leaf) || rig.admitted[0].Token != "tok-pa" ||
-			rig.admitted[0].CertPEM != res.CertPEM || rig.admitted[0].Fingerprint != fp {
+			rig.admitted[0].CertPEM != res.CertPEM || rig.admitted[0].Fingerprint != fp ||
+			!rig.admitted[0].Seen.Equal(rig.order.Updated) {
 			t.Fatalf("sees=%v: admitted %+v", sees, rig.admitted)
 		}
 		if len(rig.requested) != 0 {
@@ -471,6 +472,11 @@ func TestAPoolJoinsRefusalsAreAnsweredByWhatTheHostDoes(t *testing.T) {
 		err  error
 		want want
 	}{errors.New("the secret reason"), want{http.StatusServiceUnavailable, "", "could not record"}}
+	// AN ORDER THAT MOVED WHILE ITS SOURCE WAS ASKED is judged again.
+	cases["an order that moved"] = struct {
+		err  error
+		want want
+	}{fmt.Errorf("%w: the secret reason", alloc.ErrPoolOrderMoved), want{http.StatusServiceUnavailable, "", "join waits"}}
 	for name, c := range cases {
 		t.Run("admitting "+name, func(t *testing.T) {
 			t.Parallel()

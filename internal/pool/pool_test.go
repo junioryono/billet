@@ -86,6 +86,14 @@ func (l *fakeLedger) PoolOrderUncertain(_ context.Context, id, reason string) er
 	return l.move(id, alloc.PoolOrdering, alloc.PoolUncertain, "", reason)
 }
 
+func (l *fakeLedger) UncertainPoolOrderFound(_ context.Context, id, host string) error {
+	if host == "" {
+		return errors.New("a placed order without its host")
+	}
+
+	return l.move(id, alloc.PoolUncertain, alloc.PoolPlaced, host, "")
+}
+
 func (l *fakeLedger) PoolOrderRefused(_ context.Context, id, reason string) error {
 	return l.move(id, alloc.PoolOrdering, alloc.PoolRefused, "", reason)
 }
@@ -636,6 +644,58 @@ func TestASourceWithoutDeduplicationIsNeverResent(t *testing.T) {
 	step(t, r)
 	if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain || len(r.first.requests()) != 1 {
 		t.Fatalf("%v, asked %d times", got, len(r.first.requests()))
+	}
+}
+
+// AN UNCERTAIN ORDER WHOSE HOST ITS SOURCE NOW LISTS, WHERE IT WAS PLACED, IS PLACED and
+// never sent again, so the host whose answer was lost can join; a failed read, or a
+// source that now orders somewhere else, leaves it uncertain and reads nothing there.
+func TestAnUncertainOrderItsSourceNowListsIsPlaced(t *testing.T) {
+	t.Parallel()
+	uncertain := func(t *testing.T) *rig {
+		t.Helper()
+		r := newRig(t, Policy{Floor: 1, Max: 1})
+		r.first.idempotent = 0
+		r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, errors.New("timeout") }
+		step(t, r)
+		step(t, r)
+		if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain {
+			t.Fatalf("the order is %v, want uncertain", got)
+		}
+
+		return r
+	}
+	listed := func(order string) (hostsource.Host, bool, error) {
+		return hostsource.Host{ID: "found-" + order}, true, nil
+	}
+
+	r := uncertain(t)
+	r.first.mu.Lock()
+	r.first.find = func(string) (hostsource.Host, bool, error) { return hostsource.Host{}, false, errors.New("throttled") }
+	r.first.mu.Unlock()
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "read back uncertain order o-1") {
+		t.Fatalf("a failed read back answered %v", err)
+	}
+	if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain {
+		t.Fatalf("a failed read back decided %v", got)
+	}
+	r.first.mu.Lock()
+	r.first.find = listed
+	r.first.mu.Unlock()
+	step(t, r)
+	got := r.ledger.snapshot()
+	if len(got) != 1 || got["o-1"].State != alloc.PoolPlaced || got["o-1"].HostID != "found-o-1" || len(r.first.requests()) != 1 {
+		t.Fatalf("listed where it was placed: %+v, sent %d times", got, len(r.first.requests()))
+	}
+
+	r = uncertain(t)
+	before := len(r.first.finds())
+	r.first.mu.Lock()
+	r.first.scope, r.first.find = "first:eu-west-1", listed
+	r.first.mu.Unlock()
+	step(t, r)
+	if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain || len(r.first.finds()) != before {
+		t.Fatalf("a source ordering elsewhere: %v, read back %v", got, r.first.finds())
 	}
 }
 

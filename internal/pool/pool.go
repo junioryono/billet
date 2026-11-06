@@ -53,6 +53,7 @@ type Ledger interface {
 	PoolOrders(ctx context.Context) ([]alloc.PoolOrder, error)
 	PoolOrderPlaced(ctx context.Context, id, hostID string) error
 	PoolOrderUncertain(ctx context.Context, id, reason string) error
+	UncertainPoolOrderFound(ctx context.Context, id, hostID string) error
 	PoolOrderRefused(ctx context.Context, id, reason string) error
 	NewPoolJoinToken(ctx context.Context, order string, ttl time.Duration) (string, error)
 	HoldLapsedPoolJoins(ctx context.Context) (int, error)
@@ -168,10 +169,15 @@ func (p *Pool) Step(ctx context.Context) error {
 		return errors.Join(append(errs, err)...)
 	}
 	for i := range orders {
-		if o := orders[i]; o.State == alloc.PoolOrdering {
-			if err := p.resume(ctx, o); err != nil {
-				errs = append(errs, err)
-			}
+		var err error
+		switch o := orders[i]; o.State {
+		case alloc.PoolOrdering:
+			err = p.resume(ctx, o)
+		case alloc.PoolUncertain:
+			err = p.findUncertain(ctx, o)
+		}
+		if err != nil {
+			errs = append(errs, err)
 		}
 	}
 	if orders, err = p.ledger.PoolOrders(ctx); err != nil {
@@ -420,6 +426,35 @@ func (p *Pool) resume(ctx context.Context, o alloc.PoolOrder) error {
 	return p.ledger.PoolOrderUncertain(ctx, o.ID, fmt.Sprintf(
 		"%s lists no host for this order, and a resend %v after the first attempt could place a second one",
 		o.Source, p.now().Sub(o.FirstAttempt).Round(time.Second)))
+}
+
+// findUncertain reads an uncertain order back where it was placed, and only there:
+// a host its source now lists is the order's, placed and never sent again, so the
+// host whose answer was lost can join. Anywhere else, with its source gone, or listed
+// as absent, the order waits for a person as before.
+func (p *Pool) findUncertain(ctx context.Context, o alloc.PoolOrder) error {
+	src := p.cfg.Sources[o.Source]
+	if src == nil {
+		return nil
+	}
+	scope, err := src.Scope(ctx)
+	if err != nil {
+		return fmt.Errorf("pool: where uncertain order %s's source orders now: %w", o.ID, err)
+	}
+	if scope != o.Scope {
+		return nil
+	}
+	host, found, err := src.Find(ctx, o.ID)
+	if err != nil {
+		return fmt.Errorf("pool: read back uncertain order %s: %w", o.ID, err)
+	}
+	if !found {
+		return nil
+	}
+	p.log.Info("an uncertain pool order's host is listed where it was placed; the order is placed",
+		"order", o.ID, "host", host.ID)
+
+	return p.ledger.UncertainPoolOrderFound(ctx, o.ID, host.ID)
 }
 
 func newOrderID() (string, error) {

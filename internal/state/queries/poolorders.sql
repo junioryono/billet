@@ -21,6 +21,10 @@ WHERE order_id = @order_id;
 UPDATE pool_orders SET state = 'placed', host_id = @host_id, reason = '', updated_at = @updated_at
 WHERE order_id = @order_id AND state = 'ordering';
 
+-- name: MarkUncertainPoolOrderFound :execrows
+UPDATE pool_orders SET state = 'placed', host_id = @host_id, reason = '', updated_at = @updated_at
+WHERE order_id = @order_id AND state = 'uncertain';
+
 -- name: MarkPoolOrderUncertain :execrows
 UPDATE pool_orders SET state = 'uncertain', reason = @reason, updated_at = @updated_at
 WHERE order_id = @order_id AND state = 'ordering';

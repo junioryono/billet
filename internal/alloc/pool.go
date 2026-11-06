@@ -133,6 +133,20 @@ func (a *Allocator) PoolOrderUncertain(ctx context.Context, id, reason string) e
 	})
 }
 
+// UncertainPoolOrderFound records the host its source now lists for an uncertain order,
+// read back where the order was placed: the order is placed, never sent again.
+func (a *Allocator) UncertainPoolOrderFound(ctx context.Context, id, hostID string) error {
+	if hostID == "" {
+		return fmt.Errorf("alloc: pool order %s: a placed order needs the host the source named", id)
+	}
+
+	return a.movePoolOrder(ctx, id, PoolUncertain, func(w state.WriteOps, now string) (int64, error) {
+		return w.MarkUncertainPoolOrderFound(ctx, ledgerdb.MarkUncertainPoolOrderFoundParams{
+			OrderID: id, HostID: hostID, UpdatedAt: now,
+		})
+	})
+}
+
 // PoolOrderRefused records the source's refusal of an order being ordered.
 func (a *Allocator) PoolOrderRefused(ctx context.Context, id, reason string) error {
 	return a.movePoolOrder(ctx, id, PoolOrdering, func(w state.WriteOps, now string) (int64, error) {

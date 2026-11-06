@@ -283,6 +283,7 @@ type WriteOps interface {
 	InsertPoolOrder(ctx context.Context, arg ledgerdb.InsertPoolOrderParams) error
 	MarkPoolOrderPlaced(ctx context.Context, arg ledgerdb.MarkPoolOrderPlacedParams) (int64, error)
 	MarkPoolOrderUncertain(ctx context.Context, arg ledgerdb.MarkPoolOrderUncertainParams) (int64, error)
+	MarkUncertainPoolOrderFound(ctx context.Context, arg ledgerdb.MarkUncertainPoolOrderFoundParams) (int64, error)
 	MarkPoolOrderRefused(ctx context.Context, arg ledgerdb.MarkPoolOrderRefusedParams) (int64, error)
 	MarkPoolOrderAbandoned(ctx context.Context, arg ledgerdb.MarkPoolOrderAbandonedParams) (int64, error)
 	LinkPoolOrderNode(ctx context.Context, arg ledgerdb.LinkPoolOrderNodeParams) (int64, error)

@@ -85,6 +85,20 @@ type joinRecorder struct {
 	console  string
 	requests []nodeapi.EnrollRequest
 	consoles []string
+	// cutCAs and cutApprovals are how many answers of each to cut off on their way, as a
+	// connection lost after the plane decided would.
+	cutCAs, cutApprovals int
+}
+
+// cut ends the connection mid-answer, so the host reads a body cut short.
+func cut(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"state":"appr`)) //nolint:errcheck // the answer is being cut off anyway
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	panic(http.ErrAbortHandler)
 }
 
 // answer writes a JSON body; a write that fails reaches the host as a failed ask, which
@@ -98,6 +112,13 @@ func answer(w http.ResponseWriter, v any) {
 func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/v1/ca":
+		j.mu.Lock()
+		drop := j.cutCAs > 0
+		j.cutCAs--
+		j.mu.Unlock()
+		if drop {
+			panic(http.ErrAbortHandler)
+		}
 		answer(w, nodeapi.CAResponse{CAPEM: string(j.ca.CertPEM()), Fingerprint: j.ca.Fingerprint(),
 			Deployment: "0123456789abcdef0123456789abcdef"})
 	case "/v1/enroll":
@@ -137,6 +158,13 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
+		j.mu.Lock()
+		drop := j.cutApprovals > 0
+		j.cutApprovals--
+		j.mu.Unlock()
+		if drop {
+			cut(w)
+		}
 		answer(w, nodeapi.EnrollResponse{State: "approved", Fingerprint: fp,
 			CertPEM: string(bundle.CertPEM), CAPEM: string(j.ca.CertPEM())})
 	default:
@@ -149,46 +177,7 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // give on the first ask is read again before the next, and the console already names
 // the key the first ask carries.
 func TestAPoolHostsEnrollmentSaysItsKeyAndSendsItsIdentity(t *testing.T) { //nolint:paralleltest // shared vars
-	dir := t.TempDir()
-	ca, err := wirecert.LoadOrCreateCA(filepath.Join(dir, "ca"), "0123456789abcdef0123456789abcdef")
-	if err != nil {
-		t.Fatal(err)
-	}
-	serving, err := ca.IssueServer([]string{"127.0.0.1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	conf, err := wirecert.BootstrapTLS(serving)
-	if err != nil {
-		t.Fatal(err)
-	}
-	console := filepath.Join(dir, "console")
-	if err := os.WriteFile(console, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	rec := &joinRecorder{ca: ca, console: console}
-	srv := httptest.NewUnstartedServer(rec)
-	srv.TLS = conf
-	srv.StartTLS()
-	t.Cleanup(srv.Close)
-
-	wasConsole, wasIdentity, wasEvery := consolePath, instanceIdentity, enrollPollEvery
-	t.Cleanup(func() { consolePath, instanceIdentity, enrollPollEvery = wasConsole, wasIdentity, wasEvery })
-	consolePath, enrollPollEvery = console, 0
-	reads := 0
-	instanceIdentity = func(context.Context) ([]byte, string, error) {
-		reads++
-		if reads == 1 {
-			return nil, "", errors.New("the metadata service is not answering yet")
-		}
-
-		return []byte(`{"instanceId":"i-1"}`), "c2ln", nil
-	}
-
-	tlsDir := filepath.Join(dir, "tls")
-	cfg := &config.Config{Node: &config.NodeConfig{Name: "pool-pa", TLS: &config.NodeTLS{
-		CertPath: filepath.Join(tlsDir, "node.crt"), KeyPath: filepath.Join(tlsDir, "node.key"), CAPath: filepath.Join(tlsDir, "ca.crt"),
-	}}}
+	rec, srv, cfg, ca, reads := servePoolJoin(t, 0, 0)
 	var out bytes.Buffer
 	if err := EnrollNode(t.Context(), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa"); err != nil {
 		t.Fatalf("enroll: %v\n%s", err, out.String())
@@ -209,12 +198,86 @@ func TestAPoolHostsEnrollmentSaysItsKeyAndSendsItsIdentity(t *testing.T) { //nol
 		}
 	}
 	if rec.requests[0].IdentityDocument != "" || rec.requests[1].IdentityDocument != `{"instanceId":"i-1"}` ||
-		rec.requests[1].IdentitySignature != "c2ln" || reads != 2 {
-		t.Fatalf("identities sent %+v after %d reads", rec.requests, reads)
+		rec.requests[1].IdentitySignature != "c2ln" || *reads != 2 {
+		t.Fatalf("identities sent %+v after %d reads", rec.requests, *reads)
 	}
 	if _, err := os.Stat(cfg.Node.TLS.CertPath); err != nil {
 		t.Fatalf("the certificate was not written: %v", err)
 	}
+}
+
+// AN ANSWER CUT OFF ON ITS WAY IS NO VERDICT: a pool host whose boot runs its join once
+// asks again for the authority it could not read, and again with the same key for an
+// approval it lost, and is handed the certificate.
+func TestAPoolHostAsksAgainForAnAnswerItLost(t *testing.T) { //nolint:paralleltest // shared vars
+	rec, srv, cfg, ca, _ := servePoolJoin(t, 2, 1)
+	var out bytes.Buffer
+	if err := EnrollNode(t.Context(), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa"); err != nil {
+		t.Fatalf("enroll: %v\n%s", err, out.String())
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.cutCAs != -1 || rec.cutApprovals != -1 || len(rec.requests) != 3 {
+		t.Fatalf("authorities left to cut %d, approvals %d, asked %d times", rec.cutCAs, rec.cutApprovals, len(rec.requests))
+	}
+	for i, r := range rec.requests {
+		if r.CSRPEM != rec.requests[0].CSRPEM {
+			t.Fatalf("ask %d carried another key", i+1)
+		}
+	}
+	if _, err := os.Stat(cfg.Node.TLS.CertPath); err != nil {
+		t.Fatalf("the certificate was not written: %v", err)
+	}
+}
+
+// servePoolJoin serves a joinRecorder that cuts off the first cutCAs authorities and
+// cutApprovals approvals, and points the pool host's console and metadata at test
+// doubles; the identity is readable from the second read on.
+func servePoolJoin(t *testing.T, cutCAs, cutApprovals int) (*joinRecorder, *httptest.Server, *config.Config, *wirecert.CA, *int) {
+	t.Helper()
+	dir := t.TempDir()
+	ca, err := wirecert.LoadOrCreateCA(filepath.Join(dir, "ca"), "0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serving, err := ca.IssueServer([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf, err := wirecert.BootstrapTLS(serving)
+	if err != nil {
+		t.Fatal(err)
+	}
+	console := filepath.Join(dir, "console")
+	if err := os.WriteFile(console, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := &joinRecorder{ca: ca, console: console, cutCAs: cutCAs, cutApprovals: cutApprovals}
+	srv := httptest.NewUnstartedServer(rec)
+	srv.TLS = conf
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	wasConsole, wasIdentity, wasEvery := consolePath, instanceIdentity, enrollPollEvery
+	t.Cleanup(func() { consolePath, instanceIdentity, enrollPollEvery = wasConsole, wasIdentity, wasEvery })
+	consolePath, enrollPollEvery = console, 0
+	reads := new(int)
+	instanceIdentity = func(context.Context) ([]byte, string, error) {
+		*reads++
+		if *reads == 1 {
+			return nil, "", errors.New("the metadata service is not answering yet")
+		}
+
+		return []byte(`{"instanceId":"i-1"}`), "c2ln", nil
+	}
+
+	tlsDir := filepath.Join(dir, "tls")
+	cfg := &config.Config{Node: &config.NodeConfig{Name: "pool-pa", TLS: &config.NodeTLS{
+		CertPath: filepath.Join(tlsDir, "node.crt"), KeyPath: filepath.Join(tlsDir, "node.key"), CAPath: filepath.Join(tlsDir, "ca.crt"),
+	}}}
+
+	return rec, srv, cfg, ca, reads
 }
 
 // A PERSON'S APPROVAL OF A POOL HOST'S REQUEST LINKS ITS ORDER TO ITS NODE with the
