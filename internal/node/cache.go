@@ -1983,6 +1983,25 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	candidate, step, err := s.publishAcquired(ctx, session, slot, attachment, lease, fence)
+	// AND A GENERATION THERE: a pointer that is gone is the store's word that the key
+	// holds nothing, which is no generation for cas to keep.
+	if moved, ok := errors.AsType[*storecontract.PointerMovedError](err); ok && moved.Current != "" &&
+		step == stepPublish && attachment.Publication == publicationCAS {
+		// A CAS LOSS IS AN ANSWER, NOT AN OUTAGE: the key holds a generation this disk
+		// was not cloned from, and cas keeps it. Said by name, because "cache
+		// unavailable" sends an operator looking for a fault that is not there; and
+		// only on the store's own word, decided under its lock, that the pointer is
+		// not the clone's, because every other conflict (this writer's authority
+		// lost, a store that could not get its write through) is an outage.
+		s.log.Info("a sticky-disk update was superseded; cas keeps the generation published since its clone",
+			"instance", session.instance, "key", attachment.Volume.Key, "current", moved.Current,
+			"cloned_from", moved.Expected, "error", err)
+		writeCacheJSON(w, http.StatusOK, map[string]any{
+			"published": false, "reason": supersededReason,
+		})
+
+		return
+	}
 	if err != nil {
 		s.nonFatalCommit(w, session, commitOperation(step), err)
 
@@ -1993,6 +2012,11 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		"published": true, "generation": candidate.Generation,
 	})
 }
+
+// supersededReason is what a cas commit answers when the store says the key's pointer
+// is not the generation this disk was cloned from: another job published it since, or
+// the disk started cold beside one too large to clone.
+const supersededReason = "superseded: the key holds a generation this disk was not cloned from, and cas keeps it"
 
 // publishStep names the step of publishAcquired that failed, for the caller's
 // own diagnostic.
