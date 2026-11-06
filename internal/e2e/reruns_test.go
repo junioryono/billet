@@ -210,6 +210,21 @@ func reclaim(t *testing.T, s *stack) func(string) {
 	}
 }
 
+// askedBeforeItsJobs records that the stack's tier asks for re-runs before any of its
+// jobs ends, as a loop that had already passed once would have. The loop's first pass
+// records the same through the same method, which keeps the earlier time, and passes
+// over a job that ended before its tier asked. Under CI's load that pass came after
+// the first job's result, which then was never decided (2026-11-06,
+// TestTheLimitOfRerunsHolds on main): an order a test must establish, not leave to
+// the scheduler.
+func askedBeforeItsJobs(t *testing.T, s *stack) {
+	t.Helper()
+
+	if _, err := s.alloc.AskReruns(t.Context(), []string{simulatedTier}); err != nil {
+		t.Fatalf("AskReruns: %v", err)
+	}
+}
+
 // awaitRerunDecision waits for the loop to decide a job, on its real ticker.
 func awaitRerunDecision(t *testing.T, s *stack, lease string, want alloc.RerunDecision) {
 	t.Helper()
@@ -238,6 +253,7 @@ func TestADisruptedJobIsRerunOnceAndOneThatFailedOnItsOwnIsLeftAlone(t *testing.
 	s, _, _ := simulatedStack(t, overTheWire, withRetryDisrupted(1))
 	runs := newGitHubRuns(t)
 	s.plane.setREST(runs.serve)
+	askedBeforeItsJobs(t, s)
 
 	stop := s.run(t)
 	defer stop()
@@ -299,6 +315,7 @@ func TestTheLimitOfRerunsHolds(t *testing.T) {
 	s, _, _ := simulatedStack(t, overTheWire, withRetryDisrupted(1))
 	runs := newGitHubRuns(t)
 	s.plane.setREST(runs.serve)
+	askedBeforeItsJobs(t, s)
 
 	stop := s.run(t)
 	defer stop()

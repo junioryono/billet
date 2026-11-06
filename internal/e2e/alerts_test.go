@@ -74,6 +74,15 @@ func TestAFailedJobIsToldToAWebhookOnceAndNotAgainInsideTheCooldown(t *testing.T
 		t.Fatal(err)
 	}
 
+	// THE RULE IS SEEN BEFORE ITS FIRST JOB STARTS, as a loop that had already passed
+	// once would have seen it. The loop's first pass records the same through the same
+	// method, which keeps the earlier time, and passes over a job that started before;
+	// under CI's load that pass can come after the job's start, the race the re-run
+	// tests met on 2026-11-06 (askedBeforeItsJobs).
+	if _, err := s.alloc.EnsureAlertRules(t.Context(), []string{"red"}); err != nil {
+		t.Fatal(err)
+	}
+
 	stop := s.run(t)
 	defer stop()
 
