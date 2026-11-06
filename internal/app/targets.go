@@ -25,12 +25,14 @@ func GitHubTargetOf(t config.GitHubTarget) github.Target {
 // ActionsAccessOf is how much of the `actions` permission a target's App must
 // hold under this config, the one answer `billet check` and a startup failure's
 // diagnosis both ask. Re-running a job needs write, which includes the read a
-// cache publication needs.
+// cache publication and an alert rule naming a branch or a step need. A rule is
+// not scoped to a target, so one that reads GitHub's records asks it of every
+// target.
 func ActionsAccessOf(cfg *config.Config, name string) github.ActionsAccess {
 	switch {
 	case cfg.TargetNeedsActionsWrite(name):
 		return github.ActionsWrite
-	case cfg.TargetNeedsRunEvidence(name):
+	case cfg.TargetNeedsRunEvidence(name), cfg.AlertsNeedRunRecords():
 		return github.ActionsRead
 	default:
 		return github.ActionsNone

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/junioryono/billet/internal/alerts"
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/server"
 )
@@ -98,6 +99,30 @@ func installationError(err, throttled, refused error) error {
 	default:
 		return fmt.Errorf("scaleset: %w", err)
 	}
+}
+
+var _ server.JobSteps = (*Client)(nil)
+
+// RunnerJobSteps reads the steps of the job that ran on runnerName, for an alert rule
+// that names a step, through the target's App client.
+func (c *Client) RunnerJobSteps(ctx context.Context, owner, repository string, runID int64, runnerName string,
+) ([]alerts.Step, error) {
+	records, ok := c.policy.(billetgithub.JobRecords)
+	if c.policy == nil || !ok {
+		return nil, billetgithub.ErrRunEvidenceUnavailable
+	}
+
+	job, err := records.RunnerJob(ctx, owner, repository, runID, runnerName)
+	if err != nil {
+		return nil, fmt.Errorf("scaleset: %w", err)
+	}
+
+	steps := make([]alerts.Step, 0, len(job.Steps))
+	for _, step := range job.Steps {
+		steps = append(steps, alerts.Step{Name: step.Name, Conclusion: step.Conclusion})
+	}
+
+	return steps, nil
 }
 
 var _ server.RunReruns = (*Client)(nil)

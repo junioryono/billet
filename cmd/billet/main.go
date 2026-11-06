@@ -65,6 +65,8 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: fleetops.Tests},
 		{Name: "usage", Summary: "export what each finished lease was charged, for a billing system",
 			Run: fleetops.Usage},
+		{Name: "alerts", Summary: "show what the alert rules have done, mute or unmute one, or send a destination a test notice",
+			Run: fleetops.Alerts},
 		{Name: "cache", Summary: "manage transparent Actions caching and install its conformance gate",
 			Run: cache.Run},
 		{Name: "check", Summary: "validate the config and state directory, then exit",

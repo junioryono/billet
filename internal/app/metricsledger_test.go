@@ -594,3 +594,102 @@ func TestActionsAccessOfATarget(t *testing.T) {
 		}
 	}
 }
+
+// AN ALERT RULE THAT READS GITHUB'S RECORDS ASKS EVERY TARGET FOR READ, a rule being
+// scoped to no target, and leaves write where a tier re-runs; one that reads only the
+// ledger asks nothing.
+func TestAnAlertRuleReadingGitHubAsksEveryTargetForRead(t *testing.T) {
+	t.Parallel()
+
+	rerun := config.Tier{Label: "rerun", Target: "writes", Retry: &config.TierRetry{Disrupted: 1}}
+
+	for _, tc := range []struct {
+		name  string
+		match config.AlertMatch
+		want  github.ActionsAccess
+	}{
+		{"a rule naming a branch", config.AlertMatch{Branch: "main"}, github.ActionsRead},
+		{"a rule naming a step", config.AlertMatch{Step: "Deploy*"}, github.ActionsRead},
+		{"a rule reading the ledger alone", config.AlertMatch{Repository: "acme/*"}, github.ActionsNone},
+	} {
+		cfg := &config.Config{
+			Targets: []config.GitHubConfig{{Name: "plain", Org: "a"}, {Name: "writes", Org: "b"}},
+			Tiers:   []config.Tier{rerun},
+			Server: &config.ServerConfig{Alerts: &config.AlertsConfig{Rules: []config.AlertRule{
+				{Name: "r", Match: tc.match, On: config.AlertConditions{Failed: true}, Notify: []string{"d"}},
+			}}},
+		}
+
+		if got := ActionsAccessOf(cfg, "plain"); got != tc.want {
+			t.Errorf("%s: the plain target = %d, want %d", tc.name, got, tc.want)
+		}
+		if got := ActionsAccessOf(cfg, "writes"); got != github.ActionsWrite {
+			t.Errorf("%s: the re-running target = %d, want write", tc.name, got)
+		}
+	}
+}
+
+// THE NOTICES GAUGE COUNTS WHAT THE LEDGER OWES EACH DESTINATION, by state, with the
+// labels its family declares, and a destination never owed one is no sample.
+func TestTheAlertGaugeCountsTheNotices(t *testing.T) {
+	t.Parallel()
+
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	tier := metricsTestTier()
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	read := ledgerSnapshot(a, []config.Tier{tier}, time.Now)
+
+	snap, err := read(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snap[familyAlertNotices]; len(got) != 0 {
+		t.Fatalf("samples with nothing owed: %+v", got)
+	}
+
+	if _, err := a.EnsureAlertRules(t.Context(), []string{"r"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, lease := range []string{"a", "b"} {
+		if _, err := a.RecordAlertJudgement(t.Context(), &alloc.AlertJudgement{Rule: "r", LeaseID: lease,
+			Condition: "failed", Key: "k-" + lease, Outcome: alloc.AlertHit, InARow: 1,
+			Notices: []alloc.AlertNotice{{Destination: "oncall", Payload: []byte("{}")}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	due, err := a.DueAlertNotices(t.Context(), "oncall", time.Now().Add(time.Hour), 10)
+	if err != nil || len(due) != 2 {
+		t.Fatalf("owed %d (%v), want 2", len(due), err)
+	}
+	if err := a.SettleAlertNotice(t.Context(), due[0].ID, true, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err = read(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[string]float64{}
+	for _, sample := range snap[familyAlertNotices] {
+		if len(sample.Labels) != 2 || sample.Labels[0] != "oncall" {
+			t.Fatalf("sample %+v", sample)
+		}
+		got[sample.Labels[1]] = sample.Value
+	}
+	if len(got) != 2 || got[alloc.AlertNoticePending] != 1 || got[alloc.AlertNoticeDelivered] != 1 {
+		t.Errorf("by state = %v, want one pending and one delivered", got)
+	}
+}

@@ -110,9 +110,11 @@ func (g *githubRuns) serve(w http.ResponseWriter, r *http.Request) {
 // redJob is one job a test takes to GitHub's red completion. record, when set, is
 // what GitHub holds about its run by the time it completes, called with its runner:
 // the run is finished before its last job's completion reaches billet, so a pass
-// never reads a run GitHub has no record of. disrupt runs while the job does.
+// never reads a run GitHub has no record of. disrupt runs while the job does. name
+// is the job's display name, the scripted plane's own when empty.
 type redJob struct {
 	request, run int64
+	name         string
 	record       func(runner string)
 	disrupt      func(lease string)
 }
@@ -124,7 +126,7 @@ func runJobToItsEnd(t *testing.T, s *stack, job redJob) string {
 
 	request, run, disrupt := job.request, job.run, job.disrupt
 
-	fields := fakeactions.JobFields{RunID: run}
+	fields := fakeactions.JobFields{RunID: run, Name: job.name}
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fields.Apply(fakeactions.JobJSON("JobAvailable", request, "push", simulatedTier)))
 
@@ -146,7 +148,7 @@ func runJobToItsEnd(t *testing.T, s *stack, job redJob) string {
 		t.Fatalf("instance %q does not carry a lease", names[0])
 	}
 
-	started := fakeactions.JobFields{RunID: run, RunnerID: 99, RunnerName: names[0]}
+	started := fakeactions.JobFields{RunID: run, Name: job.name, RunnerID: 99, RunnerName: names[0]}
 	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
 		started.Apply(fakeactions.JobJSON("JobStarted", request, "push", simulatedTier)))
 
@@ -170,7 +172,8 @@ func runJobToItsEnd(t *testing.T, s *stack, job redJob) string {
 		job.record(names[0])
 	}
 
-	completed := fakeactions.JobFields{RunID: run, RunnerID: 99, RunnerName: names[0], Result: "failed"}
+	completed := fakeactions.JobFields{RunID: run, Name: job.name, RunnerID: 99, RunnerName: names[0],
+		Result: "failed"}
 	s.plane.queue(fakeactions.StatisticsJSON(0, 0),
 		completed.Apply(fakeactions.JobJSON("JobCompleted", request, "push", simulatedTier)))
 
