@@ -243,7 +243,12 @@ func (s *Server) rerunOnce(ctx context.Context, targets map[string]Target, limit
 		if ctx.Err() != nil {
 			return
 		}
-		if read[w.installation] == rerunRunsPerInstallation || now.Before(sweep.paused[w.installation]) {
+		// A SHARE SPENT IS NOT A RUN THAT CANNOT BE READ: the runs go round in turn, and
+		// this one is read on a pass soon after, which settles it from what GitHub says.
+		if read[w.installation] == rerunRunsPerInstallation {
+			continue
+		}
+		if now.Before(sweep.paused[w.installation]) {
 			s.settleOverdue(ctx, w, now, "its installation could not read its run within two days")
 
 			continue
@@ -595,6 +600,11 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 			(!transient || rerunOverdue(&open, now)) {
 			s.settleUnread(ctx, open, rerunDetail(err))
 
+			// THE INSTALLATION'S ANSWER STILL PAUSES IT, for the other runs it reads.
+			if transient {
+				return err
+			}
+
 			return nil
 		}
 
@@ -682,8 +692,15 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 		return nil
 	}
 
+	// AND AGAIN AFTER THE WRITES AND READS ABOVE, the last look before the request
+	// leaves: a job that crossed the window meanwhile sends nothing this pass, and the
+	// next decides the run from where it then stands.
+	clock = sweep.clock(now)
 	leases := make([]string, 0, len(proved))
 	for i := range proved {
+		if clock.Sub(proved[i].candidate.ResultAt) > rerunWindow {
+			return nil
+		}
 		leases = append(leases, proved[i].candidate.LeaseID)
 	}
 	if err := s.alloc.BeginRerun(ctx, request, leases); err != nil {

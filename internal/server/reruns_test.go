@@ -36,8 +36,10 @@ type rerunGitHub struct {
 	failedAsk []int64
 	jobAsk    []int64
 	asks      []string
-	// remaining and limit are the installation's REST budget, when limit is set.
+	// remaining and limit are the installation's REST budget, when limit is set, and
+	// reset when it is refilled, an hour from the wall clock when zero.
 	remaining, limit int64
+	reset            time.Time
 	// onAsk runs inside a request, for a run whose state a request changes.
 	onAsk func(*rerunGitHub)
 }
@@ -82,7 +84,12 @@ func (g *rerunGitHub) RerunJob(_ context.Context, owner, repository string, jobI
 }
 
 func (g *rerunGitHub) RESTHeadroom() (int64, int64, time.Time, bool) {
-	return g.remaining, g.limit, time.Now().Add(time.Hour), g.limit > 0
+	reset := g.reset
+	if reset.IsZero() {
+		reset = time.Now().Add(time.Hour)
+	}
+
+	return g.remaining, g.limit, reset, g.limit > 0
 }
 
 func (g *rerunGitHub) asked() int {
@@ -106,6 +113,9 @@ type rerunStack struct {
 	sweep   *rerunSweep
 	now     time.Time
 	ledger  *time.Time
+	// onClock, when set, runs each time the allocator reads its clock, which is inside
+	// every ledger write: what moves time on in the middle of a decision.
+	onClock *func()
 }
 
 func newRerunStack(t *testing.T) *rerunStack {
@@ -115,9 +125,16 @@ func newRerunStack(t *testing.T) *rerunStack {
 	tiers := []config.Tier{tier(rerunTier), tier(rerunTierB)}
 	now := time.Now()
 	ledger := now.Add(-72 * time.Hour)
+	onClock := new(func())
 
 	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithClock(func() time.Time { return ledger }))
+		alloc.WithClock(func() time.Time {
+			if *onClock != nil {
+				(*onClock)()
+			}
+
+			return ledger
+		}))
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
@@ -127,7 +144,8 @@ func newRerunStack(t *testing.T) *rerunStack {
 
 	r := &rerunStack{t: t, s: New(a, nil, tiers, "owner", nil), a: a, db: db, github: github,
 		targets: map[string]Target{rerunTier: target, rerunTierB: target},
-		limits:  map[string]int64{rerunTier: 1}, sweep: newRerunSweep(), now: now, ledger: &ledger}
+		limits:  map[string]int64{rerunTier: 1}, sweep: newRerunSweep(), now: now, ledger: &ledger,
+		onClock: onClock}
 
 	asked, err := a.AskReruns(t.Context(), []string{rerunTier, rerunTierB})
 	if err != nil {
@@ -1511,6 +1529,114 @@ func TestARefusedInstallationHoldsARequestOnlyUntilTwiceTheWindow(t *testing.T) 
 	}
 }
 
+// PAST TWO DAYS A PASS THAT CANNOT READ A RUN SETTLES ITS REQUEST WITHOUT A READ:
+// its installation paused or at its reserve, or the run waiting between failed reads.
+func TestAnOverdueRequestThePassCannotReadIsSettledWithoutARead(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		hold func(r *rerunStack)
+	}{
+		{"its installation is paused", func(r *rerunStack) {
+			r.sweep.paused[installationOf(r.targets[rerunTier])] = r.now.Add(time.Hour)
+		}},
+		{"its installation is at its reserve", func(r *rerunStack) {
+			r.github.remaining, r.github.limit, r.github.reset = 100, 5000, r.now.Add(time.Hour)
+		}},
+		{"its run waits between failed reads", func(r *rerunStack) {
+			r.sweep.retries[rerunRun{repository: "acme/api", run: 31}] = queueTimeRetry{after: r.now.Add(time.Hour)}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRerunStack(t)
+			r.job("lost", 31, 10*time.Minute)
+			if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: 31, Attempt: 1,
+				Kind: alloc.RerunFailedJobs}, []string{"lost"}); err != nil {
+				t.Fatal(err)
+			}
+			r.lists(1)
+
+			// A DAY IN, IT IS HELD: the pass cannot read it, and two days are not up.
+			r.after(rerunWindow + time.Hour)
+			tc.hold(r)
+			r.pass()
+			if got, _, _ := r.request(1); got != "asking" {
+				t.Fatalf("a day in = %s, want it held", got)
+			}
+
+			r.after(rerunWindow)
+			tc.hold(r)
+			r.pass()
+
+			if got := r.decision("lost"); got != alloc.RerunUnconfirmed {
+				t.Errorf("past two days = %q", got)
+			}
+			if got := r.reads(); got != 0 {
+				t.Errorf("read GitHub %d times", got)
+			}
+			if r.github.asked() != 0 {
+				t.Error("sent")
+			}
+			if used, err := r.a.RunReruns(t.Context(), "acme/api", 31); err != nil || used != 1 {
+				t.Errorf("counted %d (%v), want 1", used, err)
+			}
+		})
+	}
+}
+
+// A RUN THAT WAITS ONLY FOR ITS INSTALLATION'S SHARE IS READ IN ITS TURN, never settled
+// unread: four requests past two days on one installation are each read, three on one
+// pass and the fourth on the next, and none is counted.
+func TestAnOverdueRequestOutOfTheShareIsReadInItsTurn(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	leases := []string{"a", "b", "c", "d"}
+	for i, lease := range leases {
+		run := int64(31 + i)
+		r.job(lease, run, 10*time.Minute)
+		if err := r.a.BeginRerun(t.Context(), alloc.RerunRequest{Repository: "acme/api", RunID: run, Attempt: 1,
+			Kind: alloc.RerunFailedJobs}, []string{lease}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.lists(1)
+
+	count := func() (expired, open int) {
+		for _, lease := range leases {
+			switch r.decision(lease) {
+			case alloc.RerunExpired:
+				expired++
+			case "":
+				open++
+			default:
+				t.Errorf("%s = %q", lease, r.decision(lease))
+			}
+		}
+
+		return expired, open
+	}
+
+	r.after(2*rerunWindow + time.Hour).pass()
+	if expired, open := count(); expired != rerunRunsPerInstallation || open != len(leases)-rerunRunsPerInstallation {
+		t.Fatalf("after one pass %d expired and %d open, want the share read and the rest held", expired, open)
+	}
+
+	r.after(time.Minute).pass()
+	if expired, open := count(); expired != len(leases) || open != 0 {
+		t.Errorf("after two passes %d expired and %d open", expired, open)
+	}
+	if got := r.reads(); got != len(leases) {
+		t.Errorf("%d reads, want one a run", got)
+	}
+	if r.github.asked() != 0 {
+		t.Error("sent")
+	}
+}
+
 // PAST TWO DAYS A RUN THAT CAN BE READ IS SETTLED FROM THE READ, and only one that
 // cannot is settled without it: a request GitHub never took, found after a long
 // outage, is given up rather than counted, and a refusal at the read still ends it.
@@ -1553,7 +1679,45 @@ func TestAnOverdueRequestIsSettledFromAReadWhereThereIsOne(t *testing.T) {
 			if used, err := r.a.RunReruns(t.Context(), "acme/api", 31); err != nil || used != tc.counted {
 				t.Errorf("counted %d (%v), want %d", used, err, tc.counted)
 			}
+			// A REFUSAL OR A THROTTLE STILL PAUSES THE INSTALLATION, for its other runs.
+			paused := r.sweep.paused[installationOf(r.targets[rerunTier])]
+			if wantPaused := tc.readErr != nil; paused.After(r.now) != wantPaused {
+				t.Errorf("installation paused until %v at %v, want paused %v", paused, r.now, wantPaused)
+			}
 		})
+	}
+}
+
+// A JOB THAT CROSSES THE WINDOW AFTER THE FIRST LOOK, while the run's other jobs are
+// decided, sends nothing: the last look is right before the request. Here the write
+// that expires one job carries the pass past the other's window.
+func TestTheLastLookAtTheWindowIsBeforeTheRequest(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("old", 31, rerunWindow-time.Minute)
+	r.job("young", 31, rerunWindow-30*time.Minute)
+	r.lists(1, listed("old", 77, true), listed("young", 88, true))
+
+	// THE READ TOOK TWO MINUTES, which carries the old job past the window at the first
+	// look and leaves the young one inside it.
+	r.sweep.began = time.Now().Add(-2 * time.Minute)
+	var once sync.Once
+	*r.onClock = func() { once.Do(func() { r.sweep.began = r.sweep.began.Add(-time.Hour) }) }
+	w := rerunWork{run: rerunRun{repository: "acme/api", run: 31}, target: "default", installation: "i",
+		client: r.github}
+	if err := r.s.decideRerun(t.Context(), &w, r.limits, r.sweep, r.now); err != nil {
+		t.Fatal(err)
+	}
+
+	if r.github.asked() != 0 {
+		t.Error("sent past the window")
+	}
+	if got := r.decision("old"); got != alloc.RerunExpired {
+		t.Errorf("the job past the window = %q", got)
+	}
+	if got := r.decision("young"); got != "" {
+		t.Errorf("the job that crossed it = %q, want it left for the next pass", got)
 	}
 }
 

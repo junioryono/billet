@@ -37,8 +37,9 @@ const (
 	// RerunUnproven means GitHub's record of the job does not prove a lost runner,
 	// so it may have failed on its own.
 	RerunUnproven RerunDecision = "unproven"
-	// RerunMixed means more than one proved job sits beside jobs that failed on
-	// their own, which neither GitHub request can run again without the others.
+	// RerunMixed means more than one proved job sits beside failed jobs a request must
+	// not run again: jobs that failed on their own, or proved jobs past the window.
+	// Neither GitHub request can run the proved jobs again without them.
 	RerunMixed RerunDecision = "mixed"
 	// RerunLimit means the run already had every re-run its tiers allow.
 	RerunLimit RerunDecision = "limit"
