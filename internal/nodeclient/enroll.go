@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -41,6 +42,32 @@ var ErrEnrollUnavailable = errors.New("nodeclient: the control plane cannot take
 // lost may have been recorded, or admitted, so the caller asks again with the same key
 // and is answered what was decided.
 var ErrUnreachable = errors.New("nodeclient: the control plane's answer did not arrive")
+
+// lost wraps a failed request in ErrUnreachable unless TLS answered it: a certificate
+// that does not verify, a peer that speaks no TLS, or an alert the peer sent (a
+// listener that wants a client certificate) is the same answer every time, so asking
+// again would wait for good on something only a person can change.
+func lost(err error) error {
+	var (
+		verify   *tls.CertificateVerificationError
+		unknown  x509.UnknownAuthorityError
+		hostname x509.HostnameError
+		invalid  x509.CertificateInvalidError
+		record   tls.RecordHeaderError
+		op       *net.OpError
+	)
+
+	switch {
+	case errors.As(err, &verify), errors.As(err, &unknown), errors.As(err, &hostname), errors.As(err, &invalid),
+		errors.As(err, &record):
+		return err
+	case errors.As(err, &op) && op.Op == "remote error":
+		// crypto/tls reports an alert its peer sent as a net.OpError of this Op.
+		return err
+	}
+
+	return fmt.Errorf("%w: %w", ErrUnreachable, err)
+}
 
 // FetchCA reads a control plane's authority and checks it against a fingerprint
 // the operator supplied.
@@ -92,11 +119,11 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 		// errors.As against tls.AlertError is false and there is nothing structural
 		// to match. Matching the prose instead would be a string comparison against
 		// somebody else's error text.
-		return nil, "", fmt.Errorf("%w: read the control plane's authority: %w\n"+
+		return nil, "", fmt.Errorf("nodeclient: read the control plane's authority: %w\n"+
 			"(a control plane that serves enrollment on an address of its own — "+
 			"server.bootstrap_listen — cannot be reached for this on its node wire, which "+
 			"requires a client certificate this machine does not have yet. Dial that address "+
-			"with --bootstrap-addr)", ErrUnreachable, err)
+			"with --bootstrap-addr)", lost(err))
 	}
 
 	defer res.Body.Close()
@@ -187,10 +214,14 @@ func ConfirmAuthority(ctx context.Context, base string, caPEM []byte, fingerprin
 		return "", nil, fmt.Errorf("nodeclient: the control plane at %s did not prove it holds a key the "+
 			"authority %s signed (a control plane in the middle of a CA rotation presents the previous "+
 			"authority's certificate; finish it with `billet ca retire` and join again): %w",
-			base, fingerprint, err)
+			base, fingerprint, lost(err))
 	}
 
 	defer res.Body.Close()
+
+	if res.StatusCode >= http.StatusInternalServerError {
+		return "", nil, fmt.Errorf("%w: the control plane returned %s for its authority", ErrUnreachable, res.Status)
+	}
 
 	if res.StatusCode != http.StatusOK {
 		return "", nil, fmt.Errorf("nodeclient: the control plane returned %s for its authority", res.Status)
@@ -198,7 +229,7 @@ func ConfirmAuthority(ctx context.Context, base string, caPEM []byte, fingerprin
 
 	var body nodeapi.CAResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return "", nil, fmt.Errorf("nodeclient: decode the authority: %w", err)
+		return "", nil, fmt.Errorf("%w: decode the authority: %w", ErrUnreachable, err)
 	}
 
 	return body.Deployment, pinned, nil
@@ -304,7 +335,7 @@ func EnrollWithIdentity(
 
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: ask to enroll: %w", ErrUnreachable, err)
+		return nil, nil, fmt.Errorf("nodeclient: ask to enroll: %w", lost(err))
 	}
 
 	defer res.Body.Close()

@@ -3,12 +3,15 @@ package fleetops
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +22,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/joinconsole"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -85,20 +89,66 @@ type joinRecorder struct {
 	console  string
 	requests []nodeapi.EnrollRequest
 	consoles []string
-	// cutCAs and cutApprovals are how many answers of each to cut off on their way, as a
-	// connection lost after the plane decided would.
-	cutCAs, cutApprovals int
+	// caFaults and approvalFaults are what the next authority and the next approval are
+	// answered instead, one each (a fault's name, below); enrollStatus, when set, answers
+	// every enrollment. caAsks counts the authorities asked for, and cancel is called at
+	// the cancelAt'th ask of either route.
+	caFaults, approvalFaults []string
+	enrollStatus             int
+	caAsks                   int
+	cancel                   context.CancelFunc
+	cancelAt                 int
+	// servedBy, when set, signs the listener's certificate in place of ca, which the
+	// recorder still answers as the deployment's.
+	servedBy *wirecert.CA
 }
 
-// cut ends the connection mid-answer, so the host reads a body cut short.
-func cut(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"state":"appr`)) //nolint:errcheck // the answer is being cut off anyway
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
+// The faults a joinRecorder answers with: the connection ended before any answer, an
+// answer cut off mid-body, as a connection lost after the plane decided would, or a
+// status code.
+const (
+	faultAbort = "abort"
+	faultBody  = "body"
+)
+
+// fault answers w with the named fault and reports whether it did.
+func fault(w http.ResponseWriter, name string) bool {
+	switch name {
+	case "":
+		return false
+	case faultAbort:
+		panic(http.ErrAbortHandler)
+	case faultBody:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"state":"appr`)) //nolint:errcheck // the answer is being cut off anyway
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		panic(http.ErrAbortHandler)
 	}
-	panic(http.ErrAbortHandler)
+	status, err := strconv.Atoi(name)
+	if err != nil {
+		panic("no fault " + name)
+	}
+	w.WriteHeader(status)
+
+	return true
+}
+
+// next takes the first of faults, under the recorder's lock, and calls cancel when this
+// is the cancelAt'th ask.
+func (j *joinRecorder) next(faults *[]string, asks int) string {
+	if j.cancel != nil && asks == j.cancelAt {
+		j.cancel()
+	}
+	if len(*faults) == 0 {
+		return ""
+	}
+	f := (*faults)[0]
+	*faults = (*faults)[1:]
+
+	return f
 }
 
 // answer writes a JSON body; a write that fails reaches the host as a failed ask, which
@@ -113,11 +163,11 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/v1/ca":
 		j.mu.Lock()
-		drop := j.cutCAs > 0
-		j.cutCAs--
+		j.caAsks++
+		f := j.next(&j.caFaults, j.caAsks)
 		j.mu.Unlock()
-		if drop {
-			panic(http.ErrAbortHandler)
+		if fault(w, f) {
+			return
 		}
 		answer(w, nodeapi.CAResponse{CAPEM: string(j.ca.CertPEM()), Fingerprint: j.ca.Fingerprint(),
 			Deployment: "0123456789abcdef0123456789abcdef"})
@@ -140,7 +190,15 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		j.requests = append(j.requests, req)
 		j.consoles = append(j.consoles, string(raw))
 		n := len(j.requests)
+		var none []string
+		j.next(&none, n)
+		status := j.enrollStatus
 		j.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+
+			return
+		}
 		fp, err := wirecert.FingerprintOfCSR([]byte(req.CSRPEM))
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -159,11 +217,10 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		j.mu.Lock()
-		drop := j.cutApprovals > 0
-		j.cutApprovals--
+		f := j.next(&j.approvalFaults, 0)
 		j.mu.Unlock()
-		if drop {
-			cut(w)
+		if fault(w, f) {
+			return
 		}
 		answer(w, nodeapi.EnrollResponse{State: "approved", Fingerprint: fp,
 			CertPEM: string(bundle.CertPEM), CAPEM: string(j.ca.CertPEM())})
@@ -177,9 +234,9 @@ func (j *joinRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // give on the first ask is read again before the next, and the console already names
 // the key the first ask carries.
 func TestAPoolHostsEnrollmentSaysItsKeyAndSendsItsIdentity(t *testing.T) { //nolint:paralleltest // shared vars
-	rec, srv, cfg, ca, reads := servePoolJoin(t, 0, 0)
+	rec, srv, cfg, ca, reads := servePoolJoin(t, nil)
 	var out bytes.Buffer
-	if err := EnrollNode(t.Context(), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa"); err != nil {
+	if err := EnrollNode(bounded(t), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa"); err != nil {
 		t.Fatalf("enroll: %v\n%s", err, out.String())
 	}
 
@@ -206,20 +263,25 @@ func TestAPoolHostsEnrollmentSaysItsKeyAndSendsItsIdentity(t *testing.T) { //nol
 	}
 }
 
-// AN ANSWER CUT OFF ON ITS WAY IS NO VERDICT: a pool host whose boot runs its join once
-// asks again for the authority it could not read, and again with the same key for an
-// approval it lost, and is handed the certificate.
+// AN ANSWER THAT DID NOT ARRIVE IS NO VERDICT: a pool host whose boot runs its join once
+// asks again for an authority it could not read (no answer, an answer cut off, a 503),
+// and again with the same key for an approval it lost the same two ways, and is handed
+// the certificate.
 func TestAPoolHostAsksAgainForAnAnswerItLost(t *testing.T) { //nolint:paralleltest // shared vars
-	rec, srv, cfg, ca, _ := servePoolJoin(t, 2, 1)
+	rec, srv, cfg, ca, _ := servePoolJoin(t, func(j *joinRecorder) {
+		j.caFaults = []string{faultAbort, faultBody, "503"}
+		j.approvalFaults = []string{faultAbort, faultBody}
+	})
 	var out bytes.Buffer
-	if err := EnrollNode(t.Context(), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa"); err != nil {
+	if err := EnrollNode(bounded(t), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa"); err != nil {
 		t.Fatalf("enroll: %v\n%s", err, out.String())
 	}
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if rec.cutCAs != -1 || rec.cutApprovals != -1 || len(rec.requests) != 3 {
-		t.Fatalf("authorities left to cut %d, approvals %d, asked %d times", rec.cutCAs, rec.cutApprovals, len(rec.requests))
+	if len(rec.caFaults) != 0 || len(rec.approvalFaults) != 0 || rec.caAsks != 4 || len(rec.requests) != 4 {
+		t.Fatalf("faults left %v %v, the authority asked for %d times, enrollment %d", rec.caFaults, rec.approvalFaults,
+			rec.caAsks, len(rec.requests))
 	}
 	for i, r := range rec.requests {
 		if r.CSRPEM != rec.requests[0].CSRPEM {
@@ -231,10 +293,126 @@ func TestAPoolHostAsksAgainForAnAnswerItLost(t *testing.T) { //nolint:parallelte
 	}
 }
 
-// servePoolJoin serves a joinRecorder that cuts off the first cutCAs authorities and
-// cutApprovals approvals, and points the pool host's console and metadata at test
-// doubles; the identity is readable from the second read on.
-func servePoolJoin(t *testing.T, cutCAs, cutApprovals int) (*joinRecorder, *httptest.Server, *config.Config, *wirecert.CA, *int) {
+// AN ANSWER IS NOT ASKED AGAIN: a refusal of the enrollment, an authority the plane
+// does not have, and an authority that is not the one named each end the join after one
+// ask, and none reads as a lost answer.
+func TestAnAnswerEndsAPoolHostsJoin(t *testing.T) { //nolint:paralleltest // shared vars
+	for name, c := range map[string]struct {
+		set                func(*joinRecorder)
+		otherCA            bool
+		caAsks, enrollAsks int
+	}{
+		"a refusal":         {set: func(j *joinRecorder) { j.enrollStatus = http.StatusConflict }, caAsks: 1, enrollAsks: 1},
+		"a bad token":       {set: func(j *joinRecorder) { j.enrollStatus = http.StatusUnauthorized }, caAsks: 1, enrollAsks: 1},
+		"no authority":      {set: func(j *joinRecorder) { j.caFaults = []string{"404"} }, caAsks: 1},
+		"another authority": {otherCA: true, caAsks: 1},
+		"a listener the authority did not sign": {set: func(j *joinRecorder) {
+			other, err := wirecert.LoadOrCreateCA(filepath.Join(t.TempDir(), "ca"), "fedcba9876543210fedcba9876543210")
+			if err != nil {
+				t.Fatal(err)
+			}
+			j.servedBy = other
+		}, caAsks: 1},
+	} {
+		rec, srv, cfg, ca, _ := servePoolJoin(t, c.set)
+		fp := ca.Fingerprint()
+		if c.otherCA {
+			fp = "SHA256:" + strings.Repeat("A", 43)
+		}
+		var out bytes.Buffer
+		err := EnrollNode(bounded(t), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, fp, "tok", "pa")
+		rec.mu.Lock()
+		caAsks, enrollAsks := rec.caAsks, len(rec.requests)
+		rec.mu.Unlock()
+		if err == nil || errors.Is(err, nodeclient.ErrUnreachable) || caAsks != c.caAsks || enrollAsks != c.enrollAsks {
+			t.Fatalf("%s: answered %v after %d authorities and %d enrollments, want an answer after %d and %d",
+				name, err, caAsks, enrollAsks, c.caAsks, c.enrollAsks)
+		}
+	}
+}
+
+// A PERSON'S JOIN IS NOT ASKED AGAIN FOR AN AUTHORITY that did not arrive: they see the
+// failure, where a pool host nobody is watching asks again.
+func TestAPersonsJoinSaysTheAuthorityDidNotArrive(t *testing.T) { //nolint:paralleltest // shared vars
+	rec, srv, cfg, ca, _ := servePoolJoin(t, func(j *joinRecorder) { j.caFaults = []string{faultAbort} })
+	var out bytes.Buffer
+	err := EnrollNode(bounded(t), cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "")
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if !errors.Is(err, nodeclient.ErrUnreachable) || rec.caAsks != 1 || len(rec.requests) != 0 {
+		t.Fatalf("answered %v after %d authorities and %d enrollments", err, rec.caAsks, len(rec.requests))
+	}
+}
+
+// A CANCELLED JOIN STOPS ASKING AGAIN, while it waits for an authority and while it
+// waits for its enrollment's answer.
+func TestACancelledJoinStopsAskingAgain(t *testing.T) { //nolint:paralleltest // shared vars
+	for name, set := range map[string]func(*joinRecorder){
+		"the authority":  func(j *joinRecorder) { j.caFaults = slices.Repeat([]string{faultAbort}, 1000) },
+		"the enrollment": func(j *joinRecorder) { j.enrollStatus = http.StatusServiceUnavailable },
+	} {
+		ctx, cancel := context.WithCancel(bounded(t))
+		rec, srv, cfg, ca, _ := servePoolJoin(t, func(j *joinRecorder) {
+			set(j)
+			j.cancel, j.cancelAt = cancel, 2
+		})
+		var out bytes.Buffer
+		err := EnrollNode(ctx, cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa")
+		cancel()
+		rec.mu.Lock()
+		asks := rec.caAsks + len(rec.requests)
+		rec.mu.Unlock()
+		if !errors.Is(err, context.Canceled) || asks > 4 {
+			t.Fatalf("%s: answered %v after %d asks", name, err, asks)
+		}
+	}
+}
+
+// A TLS ANSWER IS NOT A LOST ONE: a listener that wants a client certificate, which a
+// join pointed at the node wire rather than the bootstrap listener meets, ends a pool
+// host's join rather than asking again for good.
+func TestAPoolHostsJoinEndsOnATLSAnswer(t *testing.T) { //nolint:paralleltest // shared vars
+	rec, _, cfg, ca, _ := servePoolJoin(t, nil)
+	serving, err := ca.IssueServer([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf, err := wirecert.BootstrapTLS(serving)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf.ClientAuth = tls.RequireAnyClientCert
+	srv := httptest.NewUnstartedServer(rec)
+	srv.TLS = conf
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithTimeout(t.Context(), joinBound)
+	defer cancel()
+	var out bytes.Buffer
+	err = EnrollNode(ctx, cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa")
+	if err == nil || errors.Is(err, nodeclient.ErrUnreachable) || ctx.Err() != nil {
+		t.Fatalf("a listener that wants a client certificate answered %v\n%s", err, out.String())
+	}
+}
+
+// joinBound is how long a join in these tests may take: a retry that never stops ends
+// the test there, asking every 10 ms meanwhile rather than as fast as it can.
+const joinBound = 20 * time.Second
+
+// bounded is the test's context, ended at joinBound.
+func bounded(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), joinBound)
+	t.Cleanup(cancel)
+
+	return ctx
+}
+
+// servePoolJoin serves a joinRecorder set as set says, and points the pool host's
+// console and metadata at test doubles; the identity is readable from the second read
+// on.
+func servePoolJoin(t *testing.T, set func(*joinRecorder)) (*joinRecorder, *httptest.Server, *config.Config, *wirecert.CA, *int) {
 	t.Helper()
 	dir := t.TempDir()
 	ca, err := wirecert.LoadOrCreateCA(filepath.Join(dir, "ca"), "0123456789abcdef0123456789abcdef")
@@ -253,7 +431,18 @@ func servePoolJoin(t *testing.T, cutCAs, cutApprovals int) (*joinRecorder, *http
 	if err := os.WriteFile(console, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	rec := &joinRecorder{ca: ca, console: console, cutCAs: cutCAs, cutApprovals: cutApprovals}
+	rec := &joinRecorder{ca: ca, console: console}
+	if set != nil {
+		set(rec)
+	}
+	if rec.servedBy != nil {
+		if serving, err = rec.servedBy.IssueServer([]string{"127.0.0.1"}); err != nil {
+			t.Fatal(err)
+		}
+		if conf, err = wirecert.BootstrapTLS(serving); err != nil {
+			t.Fatal(err)
+		}
+	}
 	srv := httptest.NewUnstartedServer(rec)
 	srv.TLS = conf
 	srv.StartTLS()
@@ -261,7 +450,7 @@ func servePoolJoin(t *testing.T, cutCAs, cutApprovals int) (*joinRecorder, *http
 
 	wasConsole, wasIdentity, wasEvery := consolePath, instanceIdentity, enrollPollEvery
 	t.Cleanup(func() { consolePath, instanceIdentity, enrollPollEvery = wasConsole, wasIdentity, wasEvery })
-	consolePath, enrollPollEvery = console, 0
+	consolePath, enrollPollEvery = console, 10*time.Millisecond
 	reads := new(int)
 	instanceIdentity = func(context.Context) ([]byte, string, error) {
 		*reads++

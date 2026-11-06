@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -21,7 +23,9 @@ type joinFakes struct {
 	trace []string
 	// fetchErr fails the authority; generated is what the fake init writes at
 	// the service path ("" writes nothing, as init does beside a foreign file).
-	fetchErr  error
+	fetchErr error
+	// fetchErrs, when set, answers the authority's first asks in turn before fetchErr.
+	fetchErrs []error
 	generated string
 	initArgs  []string
 	sudoCalls []string
@@ -73,6 +77,9 @@ func stageJoin(t *testing.T, f *joinFakes) string {
 
 	fetch, generate, enroll, pull, up, svc := joinFetchAuthority, joinGenerate, joinEnroll, joinPullImages, joinUp,
 		serviceConfigPath
+	every := joinRetryEvery
+	t.Cleanup(func() { joinRetryEvery = every })
+	joinRetryEvery = 0
 	run, sudo, look, lookup := prereqRun, prereqSudo, prereqLookPath, prereqLookupUser
 	dirs, cellars, rootUID, trust, dropIn := macServiceDirs, softnetCellars, prereqRootUID, prereqTrustRoot, sshdDropIn
 	t.Cleanup(func() {
@@ -92,6 +99,12 @@ func stageJoin(t *testing.T, f *joinFakes) string {
 	mustOK(t, err)
 	joinFetchAuthority = func(_ context.Context, base, fp string) (joinAuthority, error) {
 		f.record("fetch " + base + " " + fp)
+		if len(f.fetchErrs) > 0 {
+			err := f.fetchErrs[0]
+			f.fetchErrs = f.fetchErrs[1:]
+
+			return joinAuthority{}, err
+		}
 
 		return joinAuthority{deployment: testJoinDeployment, caPEM: caPEM}, f.fetchErr
 	}
@@ -506,5 +519,46 @@ func TestAPoolHostsJoinCarriesItsOrderToEnrollment(t *testing.T) {
 	}
 	if !slices.Contains(f.trace, "enroll mac-1 https://cp.example:7717 SHA256:abc tok-1 pool-order=p01") {
 		t.Fatalf("join did %v, want enrollment for order p01", f.trace)
+	}
+}
+
+// A POOL HOST ASKS AGAIN FOR AN AUTHORITY WHOSE ANSWER DID NOT ARRIVE, since its boot
+// runs the join once; an answer, or a person's join, ends at the first ask with nothing
+// changed.
+func TestAPoolHostsJoinAsksAgainForAnAuthorityItLost(t *testing.T) {
+	onPlatform(t, "darwin", 501)
+	lost := fmt.Errorf("%w: connection reset", nodeclient.ErrUnreachable)
+	poolArgs := append(slices.Clone(joinArgs), "--pool-order", "p01")
+
+	f := &joinFakes{generated: joinedNodeConfig, fetchErrs: []error{lost, lost}}
+	stageJoin(t, f)
+	if err := Join(t.Context(), processEnv(), poolArgs); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	fetches := 0
+	for _, step := range f.trace {
+		if strings.HasPrefix(step, "fetch ") {
+			fetches++
+		}
+	}
+	if fetches != 3 || !slices.Contains(f.trace, "enroll mac-1 https://cp.example:7717 SHA256:abc tok-1 pool-order=p01") {
+		t.Fatalf("join asked for the authority %d times and did %v", fetches, f.trace)
+	}
+
+	for name, c := range map[string]struct {
+		args []string
+		err  error
+	}{
+		"a person's join": {joinArgs, lost},
+		"an answer":       {poolArgs, errors.New("fingerprint mismatch")},
+	} {
+		f := &joinFakes{generated: joinedNodeConfig, fetchErrs: []error{c.err}}
+		stageJoin(t, f)
+		if err := Join(t.Context(), processEnv(), c.args); err == nil || !strings.Contains(err.Error(), "nothing on this machine was changed") {
+			t.Fatalf("%s: answered %v", name, err)
+		}
+		if len(f.trace) != 1 {
+			t.Fatalf("%s: the join went on: %v", name, f.trace)
+		}
 	}
 }

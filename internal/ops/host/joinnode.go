@@ -54,9 +54,12 @@ var (
 	joinPullImages = func(ctx context.Context, env cli.Env, cfg *config.Config) error {
 		return opsimages.PullTartImages(ctx, env, cfg, "")
 	}
-	joinUp      = runLocalUp
-	joinGOARCH  = runtime.GOARCH
-	joinGeteuid = os.Geteuid
+	joinUp = runLocalUp
+	// joinRetryEvery is how long a pool host waits before asking again for an authority
+	// whose answer did not arrive.
+	joinRetryEvery = 5 * time.Second
+	joinGOARCH     = runtime.GOARCH
+	joinGeteuid    = os.Geteuid
 )
 
 // joinAuthority is the control plane a join confirmed: its deployment, and
@@ -116,6 +119,24 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	authority, err := joinFetchAuthority(ctx, base, req.fingerprint)
+	// A POOL HOST ASKS AGAIN for an authority whose answer did not arrive: its boot runs
+	// this once, and nobody is watching to run it again.
+	for req.poolOrder != "" && errors.Is(err, nodeclient.ErrUnreachable) && ctx.Err() == nil {
+		fmt.Fprintf(env.Stderr, "join     the control plane's authority did not arrive; asking again: %v\n", err)
+
+		wait := time.NewTimer(joinRetryEvery)
+
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+
+			return ctx.Err()
+		case <-wait.C:
+		}
+
+		authority, err = joinFetchAuthority(ctx, base, req.fingerprint)
+	}
+
 	if err != nil {
 		return fmt.Errorf("billet join: the control plane's authority at %s: %w (nothing on this machine "+
 			"was changed)", base, err)

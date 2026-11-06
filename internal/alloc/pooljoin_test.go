@@ -63,6 +63,8 @@ func admission(t *testing.T, a *Allocator, order, fingerprint, token, serial str
 	var seen time.Time
 	if o, err := a.ReadPoolOrder(t.Context(), order); err == nil {
 		seen = o.Updated
+	} else if !errors.Is(err, ErrPoolOrderClosed) {
+		t.Fatalf("read %s: %v", order, err)
 	}
 
 	return PoolAdmission{

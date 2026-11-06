@@ -670,7 +670,21 @@ func TestAnUncertainOrderItsSourceNowListsIsPlaced(t *testing.T) {
 	}
 
 	r := uncertain(t)
+	before := len(r.first.finds())
+	step(t, r)
+	if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain || len(r.first.requests()) != 1 ||
+		len(r.first.finds()) != before+1 {
+		t.Fatalf("listed as absent: %v, sent %d times, read back %d more", got, len(r.first.requests()),
+			len(r.first.finds())-before)
+	}
 	r.first.mu.Lock()
+	r.first.scopeErr = errors.New("sts: throttled")
+	r.first.mu.Unlock()
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "where uncertain order o-1's source orders now") {
+		t.Fatalf("a scope that could not be read answered %v", err)
+	}
+	r.first.mu.Lock()
+	r.first.scopeErr = nil
 	r.first.find = func(string) (hostsource.Host, bool, error) { return hostsource.Host{}, false, errors.New("throttled") }
 	r.first.mu.Unlock()
 	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "read back uncertain order o-1") {
@@ -689,7 +703,7 @@ func TestAnUncertainOrderItsSourceNowListsIsPlaced(t *testing.T) {
 	}
 
 	r = uncertain(t)
-	before := len(r.first.finds())
+	before = len(r.first.finds())
 	r.first.mu.Lock()
 	r.first.scope, r.first.find = "first:eu-west-1", listed
 	r.first.mu.Unlock()
