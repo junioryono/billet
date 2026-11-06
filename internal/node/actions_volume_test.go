@@ -39,6 +39,73 @@ func TestANewCacheVolumeIsFormattedWithoutADiscardPass(t *testing.T) {
 	}
 }
 
+// A MOUNT WHOSE COMMAND FAILED IS UNDONE IF THE KERNEL HOLDS IT. A mount killed by
+// its context can have finished mounting: on 2026-11-06 one left a Go cache
+// volume mounted that the node believed was not, and its discard could not unmap
+// the device for hours. The kernel is asked, and only what it holds is unmounted;
+// a look that fails says the mount may remain rather than calling it gone.
+//
+// NOT PARALLEL: the fake mount, mountpoint and umount reach the manager through PATH.
+func TestAFailedMountIsUndoneWhenTheKernelHoldsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mounted     bool
+		look        string
+		wantUnmount bool
+		wantKept    bool
+		wantErr     string
+	}{
+		{name: "killed after the kernel mounted", mounted: true, look: "ok",
+			wantUnmount: true, wantErr: "signal: killed"},
+		{name: "failed without mounting", mounted: false, look: "ok",
+			wantErr: "mount Actions cache volume"},
+		{name: "could not tell", mounted: true, look: "fail",
+			wantKept: true, wantErr: "may still be mounted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin, state := t.TempDir(), t.TempDir()
+			mountedFlag := filepath.Join(state, "mounted")
+			umounted := filepath.Join(state, "umounted")
+			if tc.mounted {
+				if err := os.WriteFile(mountedFlag, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mountpoint := "#!/bin/sh\n"
+			if tc.look == "fail" {
+				mountpoint += "exit 1\n"
+			} else {
+				mountpoint += "[ -e '" + mountedFlag + "' ] && exit 0\nexit 32\n"
+			}
+			for name, body := range map[string]string{
+				// Killed the way a cancelled exec.CommandContext kills it.
+				"mount":      "#!/bin/sh\nkill -9 $$\n",
+				"mountpoint": mountpoint,
+				"umount":     "#!/bin/sh\nrm -f '" + mountedFlag + "'\n: > '" + umounted + "'\n",
+			} {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			target := filepath.Join(t.TempDir(), "go")
+			err := hostActionsVolumeManager{}.MountWritable(t.Context(), "/dev/rbd102", target)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("MountWritable = %v, want an error containing %q", err, tc.wantErr)
+			}
+			_, unmountErr := os.Stat(umounted)
+			if ran := unmountErr == nil; ran != tc.wantUnmount {
+				t.Fatalf("umount ran = %t, want %t", ran, tc.wantUnmount)
+			}
+			_, statErr := os.Stat(target)
+			if kept := statErr == nil; kept != tc.wantKept {
+				t.Fatalf("mount point kept = %t (%v), want %t", kept, statErr, tc.wantKept)
+			}
+		})
+	}
+}
+
 // AN UNMOUNTED MOUNT POINT IS REMOVED, AND A FAILURE TO LOOK IS NOT UNMOUNTED.
 // util-linux's mountpoint exits 32 for "not a mount point" and 1 for an error;
 // reading 1 as unmounted left 159 closed sessions on the reference deployment
