@@ -189,12 +189,14 @@ type npmAnswer struct {
 }
 
 // npmGet sends one raw request through a new tunnel, reads the answer whole, and
-// returns once the node has finished with a whole answer or a splice.
+// returns once the node has noted what it did for the request.
 //
 // JOINED, NOT ONLY READ: the node notes what it did for the job after the
 // answer's last byte is written, so a client that has read the whole answer can
-// look before it is noted. Its close, and the node's close after it, end the
-// handler first. A cut answer is closed before it is noted, and is not joined.
+// look before it is noted. Its close, and the node's close after it, come after
+// a whole answer's note, its fill and the end of its accounting. A splice's are
+// done before it starts, though the splice may still be closing; a cut answer's
+// accounting ends only after its close.
 func npmGet(t *testing.T, service *CacheService, credentials CacheCredentials, raw string) (npmAnswer, string) {
 	t.Helper()
 
