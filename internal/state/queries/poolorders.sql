@@ -35,16 +35,24 @@ WHERE order_id = @order_id AND state = 'uncertain';
 
 -- name: LinkPoolOrderNode :execrows
 -- The node that joined from a placed order, the key it was admitted with and the
--- certificate it was handed. Once: an order's node is never replaced.
+-- certificate it was handed. Once: an order's node is never replaced. The hold is the
+-- one the caller read, so a hold committed since moves nothing, and a link clears it:
+-- a person's approval of a held order is what the hold waited for.
 UPDATE pool_orders
    SET node_name = @node_name, node_fingerprint = @node_fingerprint, node_cert_serial = @node_cert_serial,
-       updated_at = @updated_at
- WHERE order_id = @order_id AND state = 'placed' AND node_name = '';
+       join_hold = '', updated_at = @updated_at
+ WHERE order_id = @order_id AND state = 'placed' AND node_name = '' AND join_hold = @join_hold;
 
 -- name: HoldPoolOrderJoin :execrows
--- Hold an order's join for a person, with the first reason kept.
+-- Hold an order's join for a person, with the first reason kept, and only while a node
+-- may still join from it.
 UPDATE pool_orders SET join_hold = @join_hold, updated_at = @updated_at
- WHERE order_id = @order_id AND join_hold = '';
+ WHERE order_id = @order_id AND join_hold = '' AND state = 'placed' AND node_name = '';
+
+-- name: ReleasePoolOrderJoin :execrows
+-- A person releases an order's held join, so its host's next request is judged again.
+UPDATE pool_orders SET join_hold = '', updated_at = @updated_at
+ WHERE order_id = @order_id AND join_hold != '' AND state = 'placed' AND node_name = '';
 
 -- name: HoldLapsedPoolJoins :execrows
 -- Hold every placed order nothing joined from that has no live token left and no

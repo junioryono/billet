@@ -211,13 +211,20 @@ func isKnownEnrollmentTx(ctx context.Context, q state.ReadOps, name, fingerprint
 // placed, its join held for no one, and no node joined from it yet (ADR-030). The
 // name comes from the order, never from the request, so a request naming anything
 // else is refused as an unusable token, and nothing is spent: the transaction rolls
-// back with the refusal.
+// back with the refusal. AND A POOL'S NAMES ARE ITS TOKENS' ALONE: an operator's token
+// under a name beginning `pool-` is refused, or it could claim the name of a host the
+// pool ordered before that host asks.
 func (a *Allocator) spendEnrollmentTokenTx(ctx context.Context, tx *sql.Tx, name, token string) (string, error) {
 	q := state.WriteQueries(tx)
 
-	order, err := q.ReadJoinTokenOrder(ctx, hashJoinToken(token))
+	row, err := q.ReadJoinTokenOrder(ctx, ledgerdb.ReadJoinTokenOrderParams{
+		TokenSha256: hashJoinToken(token), Now: ts(a.now().UTC()),
+	})
+	order := row.PoolOrder
 
 	switch {
+	case (errors.Is(err, sql.ErrNoRows) || (err == nil && order == "")) && IsPoolNodeName(name):
+		return "", ErrBadJoinToken
 	case errors.Is(err, sql.ErrNoRows) || (err == nil && order == ""):
 		return "", a.spendJoinTokenTx(ctx, tx, token)
 	case err != nil:

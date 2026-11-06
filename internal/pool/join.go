@@ -10,11 +10,17 @@ import (
 	"github.com/junioryono/billet/internal/hostsource"
 )
 
-// DefaultJudgeEvery is how often one order's join is asked of its source. A host asks
-// every five seconds until it is answered, and the console read is one EC2 throttles,
-// so a verdict is reused for this long; the console showed a line within 48 s of its
-// writing (measured 2026-11-06), so a minute is never the wait that matters.
+// DefaultJudgeEvery is how often one order's source is asked about it. A host asks
+// every five seconds until it is answered, the console read is one EC2 throttles, and a
+// caller chooses the key it presents, so the budget is the order's, not the key's: the
+// console showed a line within 48 s of its writing (measured 2026-11-06), so a few
+// seconds more is never the wait that matters.
 const DefaultJudgeEvery = 15 * time.Second
+
+// JudgeTimeout bounds one ask of a source: the enrollment listener answers within its
+// ten-second write timeout, so a source slower than this is could-not-tell, answered in
+// time, rather than a request that never gets an answer.
+const JudgeTimeout = 5 * time.Second
 
 // JoinLedger is what the judge reads of the ledger.
 type JoinLedger interface {
@@ -28,8 +34,12 @@ type Joins struct {
 	now     func() time.Time
 	every   time.Duration
 
-	mu   sync.Mutex
-	last map[judgedKey]judged
+	mu sync.Mutex
+	// last is each claim's verdict and when it was asked; asked is when each order's
+	// source was last asked, and asking the orders being asked now.
+	last   map[judgedKey]judged
+	asked  map[string]time.Time
+	asking map[string]bool
 }
 
 type judgedKey struct{ order, fingerprint, address string }
@@ -45,20 +55,33 @@ func NewJoins(ledger JoinLedger, sources map[string]hostsource.Source, now func(
 		now = time.Now
 	}
 
-	return &Joins{ledger: ledger, sources: sources, now: now, every: DefaultJudgeEvery, last: map[judgedKey]judged{}}
+	return &Joins{
+		ledger: ledger, sources: sources, now: now, every: DefaultJudgeEvery,
+		last: map[judgedKey]judged{}, asked: map[string]time.Time{}, asking: map[string]bool{},
+	}
 }
 
 // JudgePoolJoin asks the claim's order's source whether the host it placed is the one
 // asking, and answers could-not-tell for an order with no host yet, a source no longer
 // configured, or one with no channel to its hosts (phoenixNAP), whose hosts wait for a
-// person. One claim is asked at most once per DefaultJudgeEvery.
+// person.
+//
+// AN ORDER'S SOURCE IS ASKED AT MOST ONCE PER DefaultJudgeEvery, AND ONE ASK AT A TIME,
+// whatever key a caller presents: a claim asked within it gets its own verdict back,
+// and any other claim on the order is could-not-tell until the interval passes.
 func (j *Joins) JudgePoolJoin(ctx context.Context, claim hostsource.Claim) hostsource.Testimony {
 	key := judgedKey{claim.Order, claim.Fingerprint, claim.Address}
 	now := j.now()
+
 	j.mu.Lock()
 	for k, v := range j.last {
 		if now.Sub(v.at) >= j.every {
 			delete(j.last, k)
+		}
+	}
+	for order, at := range j.asked {
+		if now.Sub(at) >= j.every {
+			delete(j.asked, order)
 		}
 	}
 	if v, ok := j.last[key]; ok {
@@ -66,11 +89,21 @@ func (j *Joins) JudgePoolJoin(ctx context.Context, claim hostsource.Claim) hosts
 
 		return v.testimony
 	}
+	if _, recently := j.asked[claim.Order]; recently || j.asking[claim.Order] {
+		j.mu.Unlock()
+
+		return hostsource.Testimony{Verdict: hostsource.VerdictUnknown,
+			Reason: "the order's source was asked about it moments ago; it is asked again shortly"}
+	}
+	j.asking[claim.Order], j.asked[claim.Order] = true, now
 	j.mu.Unlock()
 
-	t := j.judge(ctx, claim)
+	askCtx, cancel := context.WithTimeout(ctx, JudgeTimeout)
+	t := j.judge(askCtx, claim)
+	cancel()
 
 	j.mu.Lock()
+	delete(j.asking, claim.Order)
 	j.last[key] = judged{at: now, testimony: t}
 	j.mu.Unlock()
 
@@ -86,7 +119,7 @@ func (j *Joins) judge(ctx context.Context, claim hostsource.Claim) hostsource.Te
 	case errors.Is(err, alloc.ErrPoolOrderClosed):
 		return unknown("no such pool order")
 	case err != nil:
-		return unknown("the order could not be read: " + err.Error())
+		return unknown("the order could not be read")
 	case o.HostID == "":
 		return unknown("the order's host is not recorded yet")
 	}

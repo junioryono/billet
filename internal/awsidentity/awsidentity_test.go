@@ -2,6 +2,8 @@ package awsidentity
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -124,28 +126,50 @@ func TestADocumentVerifiesOnlyUnderItsRegionsCertificate(t *testing.T) {
 			west.sign(t, document(t, map[string]string{"instanceId": ""}))},
 		"signed with no pendingTime": {"us-west-2", document(t, map[string]string{"pendingTime": ""}),
 			west.sign(t, document(t, map[string]string{"pendingTime": ""}))},
-		"a document past the bound": {"us-west-2", []byte(strings.Repeat("a", MaxDocument+1)),
-			west.sign(t, []byte(strings.Repeat("a", MaxDocument+1)))},
 	} {
 		if _, err := v.Verify(c.region, c.doc, c.signature); !errors.Is(err, ErrUnverified) {
 			t.Errorf("%s: %v, want ErrUnverified", name, err)
 		}
 	}
+
+	// PAST THE BOUND, A SIGNED DOCUMENT THAT WOULD OTHERWISE BE READ IS REFUSED BY THE
+	// BOUND: valid JSON naming the instance, padded past MaxDocument.
+	big := document(t, map[string]string{"imageId": strings.Repeat("a", MaxDocument)})
+	if _, err := v.Verify("us-west-2", big, west.sign(t, big)); !errors.Is(err, ErrUnverified) ||
+		!strings.Contains(err.Error(), "a document of") {
+		t.Errorf("a document past the bound: %v, want refused by its size", err)
+	}
+	if _, err := v.Verify("us-west-2", doc, strings.Repeat("A", MaxSignature+1)); !errors.Is(err, ErrUnverified) ||
+		!strings.Contains(err.Error(), "a signature of") {
+		t.Errorf("a signature past the bound: %v, want refused by its size", err)
+	}
 }
 
-// A CERTIFICATE FILE THAT CANNOT BE READ WHOLE IS REFUSED: a region with no
-// certificate after it, a region listed twice, a key that is not RSA, or nothing.
+// A CERTIFICATE FILE THAT CANNOT BE READ WHOLE IS REFUSED, each for its own reason: a
+// region with no certificate after it, a region listed twice, a key that is not RSA, a
+// region line with nothing after it, or nothing at all.
 func TestACertificateFileIsReadWholeOrRefused(t *testing.T) {
 	t.Parallel()
 	a := newSigner(t, "us-west-2")
-	for name, raw := range map[string]string{
-		"nothing":             "# only a header\n",
-		"a region and no pem": "\nregion: us-west-2\nnothing here\n",
-		"a region twice":      "\n" + a.pem + "\n" + a.pem,
-		"a trailing region":   "\n" + a.pem + "\nregion: us-east-1",
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: time.Now(), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ec := "region: eu-west-1\n" + string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	for name, c := range map[string]struct{ raw, says string }{
+		"nothing":               {"# only a header\n", "no certificates"},
+		"a region and no pem":   {"\nregion: us-west-2\nnothing here\n", "no certificate follows"},
+		"a region twice":        {"\n" + a.pem + "\n" + a.pem, "listed twice"},
+		"a trailing region":     {"\n" + a.pem + "\nregion: us-east-1", "ends the certificates"},
+		"a key that is not RSA": {"\n" + ec, "not RSA"},
 	} {
-		if _, err := FromCertificates([]byte(raw)); err == nil {
-			t.Errorf("%s: parsed", name)
+		if _, err := FromCertificates([]byte(c.raw)); err == nil || !strings.Contains(err.Error(), c.says) {
+			t.Errorf("%s: %v, want a refusal saying %q", name, err, c.says)
 		}
 	}
 }

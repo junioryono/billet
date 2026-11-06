@@ -287,7 +287,7 @@ func ServeNodeWire(
 		PoolJoins:   limits.poolJoins,
 		// A ROUTER IN FRONT OF THE LISTENERS IS EVERY ENROLLMENT'S PEER, so the peer
 		// is not the host's own address there.
-		SeesHostAddress: cfg.Server.TLSRouter == nil,
+		SeesHostAddress: seesHostAddress(cfg),
 	})
 	if err := errors.Join(err, release()); err != nil {
 		return nil, err

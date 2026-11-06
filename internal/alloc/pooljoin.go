@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/state"
@@ -26,7 +27,14 @@ var ErrPoolJoinHeld = errors.New("alloc: this pool order's join is held for a pe
 // PoolNodeName is the name a node that joins from a pool order takes. It is the one
 // place the name is derived: the boot that orders the host and the admission that
 // names its node both read it here, so a request naming anything else is refused.
-func PoolNodeName(order string) string { return "pool-" + order }
+func PoolNodeName(order string) string { return poolNodePrefix + order }
+
+// poolNodePrefix begins every pool node's name, which only a pool's own token enrolls.
+const poolNodePrefix = "pool-"
+
+// IsPoolNodeName reports whether a name is one a pool order gives its node, which an
+// operator's token may not claim.
+func IsPoolNodeName(name string) bool { return strings.HasPrefix(name, poolNodePrefix) }
 
 // NewPoolJoinToken mints one single-use join token for an order being ordered or
 // placed. Every send of an order mints one, and any live one admits the order's host:
@@ -65,25 +73,61 @@ func (a *Allocator) NewPoolJoinToken(ctx context.Context, order string, ttl time
 
 // PoolJoinOrder is the pool order a join token was minted for, spent or not, and
 // empty for an operator's token or for no token at all: a host keeps polling with the
-// token it booted with after its admission spent it.
-func (a *Allocator) PoolJoinOrder(ctx context.Context, token string) (string, error) {
-	var order string
+// token it booted with after its admission spent it. live is whether the token could
+// still be spent now.
+func (a *Allocator) PoolJoinOrder(ctx context.Context, token string) (string, bool, error) {
+	var row ledgerdb.ReadJoinTokenOrderRow
 
 	err := a.db.View(ctx, func(q querier) error {
 		var err error
 
-		order, err = state.ReadQueries(q).ReadJoinTokenOrder(ctx, hashJoinToken(token))
+		row, err = state.ReadQueries(q).ReadJoinTokenOrder(ctx, ledgerdb.ReadJoinTokenOrderParams{
+			TokenSha256: hashJoinToken(token), Now: ts(a.now().UTC()),
+		})
 		if errors.Is(err, sql.ErrNoRows) {
-			order, err = "", nil
+			row, err = ledgerdb.ReadJoinTokenOrderRow{}, nil
 		}
 
 		return err
 	})
 	if err != nil {
-		return "", fmt.Errorf("alloc: read which order a join token is for: %w", err)
+		return "", false, fmt.Errorf("alloc: read which order a join token is for: %w", err)
 	}
 
-	return order, nil
+	return row.PoolOrder, row.Live == 1, nil
+}
+
+// ErrPoolJoinNotHeld is a release of a hold the order does not have.
+var ErrPoolJoinNotHeld = errors.New("alloc: this pool order's join is not held")
+
+// ReleasePoolJoin releases an order's held join on a person's word, so its host's next
+// request is judged again. Only an order a node may still join from has one to release.
+func (a *Allocator) ReleasePoolJoin(ctx context.Context, order string) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+
+		n, err := q.ReleasePoolOrderJoin(ctx, ledgerdb.ReleasePoolOrderJoinParams{OrderID: order, UpdatedAt: ts(a.now())})
+		if err != nil {
+			return fmt.Errorf("alloc: release the held join of pool order %s: %w", order, err)
+		}
+
+		if n == 1 {
+			return nil
+		}
+
+		row, err := q.ReadPoolOrder(ctx, order)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: no pool order %s", ErrPoolOrderClosed, order)
+		case err != nil:
+			return fmt.Errorf("alloc: read pool order %s: %w", order, err)
+		case row.JoinHold == "":
+			return fmt.Errorf("%w: %s", ErrPoolJoinNotHeld, order)
+		}
+
+		return fmt.Errorf("%w: pool order %s is %s, joined by %q", ErrPoolOrderClosed, order, row.State, row.NodeName)
+	})
 }
 
 // ReadPoolOrder reads one order.
@@ -127,8 +171,11 @@ func (a *Allocator) HoldPoolJoin(ctx context.Context, order, reason string) erro
 			return nil
 		}
 
-		// HELD ALREADY, OR NO SUCH ORDER: only the second is a failure.
-		if _, err := q.ReadPoolOrder(ctx, order); err != nil {
+		// HELD ALREADY, OR CLOSED (a node joined, or it is no longer placed), so there is
+		// nothing to hold: only no such order is a failure.
+		if _, err := q.ReadPoolOrder(ctx, order); errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: no pool order %s", ErrPoolOrderClosed, order)
+		} else if err != nil {
 			return fmt.Errorf("alloc: hold pool order %s: %w", order, err)
 		}
 
@@ -244,7 +291,17 @@ func (a *Allocator) AdmitPoolEnrollment(ctx context.Context, adm PoolAdmission) 
 		case err != nil:
 			return err
 		case existing.Fingerprint != adm.Fingerprint && existing.State != EnrollDenied:
+			// HELD IN THIS TRANSACTION, which read the order open and the name taken, so
+			// nothing can admit or decide between the reading and the hold.
 			conflict = existing.Fingerprint
+
+			if _, err := q.HoldPoolOrderJoin(ctx, ledgerdb.HoldPoolOrderJoinParams{
+				OrderID: adm.Order, UpdatedAt: now,
+				JoinHold: fmt.Sprintf("the source vouched for key %s, and %s already holds the name %s",
+					adm.Fingerprint, conflict, name),
+			}); err != nil {
+				return fmt.Errorf("alloc: hold pool order %s: %w", adm.Order, err)
+			}
 
 			return nil
 		case existing.Fingerprint == adm.Fingerprint && existing.State == EnrollDenied:
@@ -297,10 +354,7 @@ func (a *Allocator) AdmitPoolEnrollment(ctx context.Context, adm PoolAdmission) 
 	}
 
 	if conflict != "" {
-		herr := a.HoldPoolJoin(ctx, adm.Order, fmt.Sprintf(
-			"the source vouched for key %s, and %s already holds the name %s", adm.Fingerprint, conflict, name))
-
-		return Enrollment{}, errors.Join(fmt.Errorf("%w: %s is held by %s", ErrEnrollmentConflict, name, conflict), herr)
+		return Enrollment{}, fmt.Errorf("%w: %s is held by %s", ErrEnrollmentConflict, name, conflict)
 	}
 
 	return out, nil
@@ -383,13 +437,16 @@ func (a *Allocator) linkPoolNodeTx(
 		return fmt.Errorf("%w: %s is not the node pool order %s names", ErrPoolOrderClosed, name, order)
 	}
 
-	if _, err := openPoolOrderTx(ctx, q, order); err != nil && !(heldMay && errors.Is(err, ErrPoolJoinHeld)) {
+	row, err := openPoolOrderTx(ctx, q, order)
+	if err != nil && !(heldMay && errors.Is(err, ErrPoolJoinHeld)) {
 		return err
 	}
 
+	// THE HOLD AS IT WAS READ, so a hold committed between that read and this write
+	// links nothing on either engine.
 	n, err := q.LinkPoolOrderNode(ctx, ledgerdb.LinkPoolOrderNodeParams{
 		NodeName: name, NodeFingerprint: fingerprint, NodeCertSerial: serial,
-		UpdatedAt: ts(a.now()), OrderID: order,
+		UpdatedAt: ts(a.now()), OrderID: order, JoinHold: row.JoinHold,
 	})
 	if err != nil {
 		return fmt.Errorf("alloc: link %s to pool order %s: %w", name, order, err)

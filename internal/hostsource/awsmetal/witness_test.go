@@ -18,11 +18,16 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/awsidentity"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider/ec2"
 )
 
 var launched = time.Date(2026, 11, 6, 14, 26, 45, 0, time.UTC)
+
+// fp is a fingerprint of the shape wirecert writes, distinct per seed.
+func fp(seed string) string { return "SHA256:" + (seed + strings.Repeat("A", 43))[:43] }
 
 // witnessRig is a source whose host EC2 describes as running at 10.0.0.7, whose
 // console names the key, and whose identity documents a key of the test's own signs.
@@ -52,7 +57,7 @@ func newWitnessRig(t *testing.T) *witnessRig {
 	f := &fakeHosts{
 		record: ec2.HostRecord{ID: "i-1", State: "running", PrivateIP: "10.0.0.7", Order: "pa", LaunchTime: launched},
 		console: "\x1b[0m[  12.3] cloud-init: ...\r\n" +
-			hostsource.ConsoleLine("pa", "SHA256:key") + "\r\n" + hostsource.ConsoleLine("pb", "SHA256:other") + "\r\n",
+			nodeapi.PoolConsoleLine("pa", fp("key")) + "\r\n" + nodeapi.PoolConsoleLine("pb", fp("other")) + "\r\n",
 	}
 	s := newTestSource(t, f)
 	s.identity = v
@@ -88,7 +93,7 @@ func (r *witnessRig) claim(t *testing.T) hostsource.Claim {
 	t.Helper()
 	doc, sig := r.document(t, nil)
 
-	return hostsource.Claim{Order: "pa", HostID: "i-1", Fingerprint: "SHA256:key", Address: "10.0.0.7",
+	return hostsource.Claim{Order: "pa", HostID: "i-1", Fingerprint: fp("key"), Address: "10.0.0.7",
 		Document: doc, Signature: sig}
 }
 
@@ -109,9 +114,9 @@ func TestTheSourceVouchesWhenEverythingAgrees(t *testing.T) {
 	}
 }
 
-// A POSITIVE ANSWER FOR SOMETHING ELSE CONTRADICTS: an ending instance, another
-// address, a verified document naming another instance, account, address or launch,
-// or a console naming only other keys for the order.
+// A POSITIVE ANSWER ABOUT THE HOST ITSELF CONTRADICTS: an ending instance, a verified
+// document naming another instance, account or address, or a console naming only other
+// keys for the order.
 func TestAPositiveAnswerForSomethingElseContradicts(t *testing.T) {
 	t.Parallel()
 	for name, c := range map[string]struct {
@@ -122,15 +127,12 @@ func TestAPositiveAnswerForSomethingElseContradicts(t *testing.T) {
 	}{
 		"an ending instance":            {host: func(f *fakeHosts) { f.record.State = "shutting-down" }, reason: "shutting-down"},
 		"a terminated instance":         {host: func(f *fakeHosts) { f.record.State = "terminated" }, reason: "terminated"},
-		"another address":               {change: func(c *hostsource.Claim) { c.Address = "10.0.0.8" }, reason: "came from 10.0.0.8"},
 		"a document of another host":    {doc: map[string]string{"instanceId": "i-2"}, reason: "names instance i-2"},
 		"a document of another account": {doc: map[string]string{"accountId": "444455556666"}, reason: "another account"},
 		"a document of another address": {doc: map[string]string{"privateIp": "10.0.0.9"}, reason: "address 10.0.0.9"},
-		"a document of another launch": {doc: map[string]string{"pendingTime": "2026-11-06T14:00:00Z"},
-			reason: "signed for a launch"},
 		"a console naming another key": {host: func(f *fakeHosts) {
-			f.console = hostsource.ConsoleLine("pa", "SHA256:imposter")
-		}, reason: "names SHA256:imposter"},
+			f.console = nodeapi.PoolConsoleLine("pa", fp("imposter"))
+		}, reason: "names " + fp("imposter")},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -156,11 +158,12 @@ func TestAPositiveAnswerForSomethingElseContradicts(t *testing.T) {
 	}
 }
 
-// ANYTHING THE SOURCE CANNOT READ IS COULD-NOT-TELL, and never a contradiction: a
-// failed describe or console read, an instance not yet running, a console that has
-// not named a key or names two, no document, a document no certificate verifies, a
+// ANYTHING ELSE IS COULD-NOT-TELL, and never a contradiction: a failed describe or
+// console read, an instance not yet running, a console that has not named a key, names
+// two or was cut short, no document, a document no certificate verifies, an address or
+// a launch time that does not match (a NAT, a proxy, a launch recorded differently), a
 // launch time EC2 did not give, an account that cannot be read, and a claim that names
-// no host.
+// no host, order or key.
 func TestWhatTheSourceCannotReadIsCouldNotTell(t *testing.T) {
 	t.Parallel()
 	for name, c := range map[string]struct {
@@ -175,8 +178,19 @@ func TestWhatTheSourceCannotReadIsCouldNotTell(t *testing.T) {
 		"a failed console read":   {host: func(f *fakeHosts) { f.consoleErr = errors.New("throttled") }},
 		"a console not named yet": {host: func(f *fakeHosts) { f.console = "[  1.0] booting\n" }},
 		"a console naming two keys": {host: func(f *fakeHosts) {
-			f.console = hostsource.ConsoleLine("pa", "SHA256:key") + "\n" + hostsource.ConsoleLine("pa", "SHA256:second")
+			f.console = nodeapi.PoolConsoleLine("pa", fp("key")) + "\n" + nodeapi.PoolConsoleLine("pa", fp("second"))
 		}},
+		"a console cut short": {host: func(f *fakeHosts) {
+			line := nodeapi.PoolConsoleLine("pa", fp("key"))
+			f.console = line[:len(line)-4]
+		}},
+		"another address":     {change: func(c *hostsource.Claim) { c.Address = "10.0.0.8" }},
+		"another launch time": {host: func(f *fakeHosts) { f.record.LaunchTime = launched.Add(time.Hour) }},
+		"an empty account": {src: func(s *Source) {
+			s.account = func(context.Context) (string, error) { return "", nil }
+		}},
+		"no order":    {change: func(c *hostsource.Claim) { c.Order = "" }},
+		"no key":      {change: func(c *hostsource.Claim) { c.Fingerprint = "" }},
 		"no document": {change: func(c *hostsource.Claim) { c.Document, c.Signature = nil, "" }},
 		"a document that is altered": {change: func(c *hostsource.Claim) {
 			c.Document = append(c.Document[:len(c.Document)-1:len(c.Document)-1], ' ', '}')
@@ -225,5 +239,40 @@ func TestTheConsoleIsReadOnlyOnceEverythingElseAgrees(t *testing.T) {
 	r.src.Witness(t.Context(), r.claim(t))
 	if r.hosts.consoleReads != 1 {
 		t.Fatalf("the console was read %d times for a claim that needed it", r.hosts.consoleReads)
+	}
+}
+
+// A REASON NEVER QUOTES WHAT AWS ANSWERED: an error's prose can name the caller's
+// account and role, so a failure is said by EC2's code, or in billet's words.
+func TestAReasonNeverQuotesWhatAWSAnswered(t *testing.T) {
+	t.Parallel()
+	leaky := errors.New("arn:aws:iam::111122223333:role/billet is not authorized")
+	for name, set := range map[string]func(*fakeHosts){
+		"a describe":  func(f *fakeHosts) { f.describe = leaky },
+		"a console":   func(f *fakeHosts) { f.consoleErr = leaky },
+		"a coded one": func(f *fakeHosts) { f.describe = errors.Join(codedError{"UnauthorizedOperation"}, leaky) },
+	} {
+		r := newWitnessRig(t)
+		set(r.hosts)
+		got := r.src.Witness(t.Context(), r.claim(t))
+		if got.Verdict != hostsource.VerdictUnknown || strings.Contains(got.Reason, "111122223333") ||
+			strings.Contains(got.Reason, "arn:") {
+			t.Errorf("%s: %+v", name, got)
+		}
+		if name == "a coded one" && !strings.Contains(got.Reason, "UnauthorizedOperation") {
+			t.Errorf("%s: %q does not name the code", name, got.Reason)
+		}
+	}
+}
+
+// A SOURCE IS BUILT WITH AWS'S CERTIFICATES OR NOT AT ALL: without them it could never
+// vouch, and a pool on AWS would wait for a person at every join without saying why.
+func TestASourceNeedsTheCertificates(t *testing.T) {
+	t.Parallel()
+	account := func(context.Context) (string, error) { return "111122223333", nil }
+	_, err := New(nil, Config{Region: "us-west-2", Location: "us-west-2a",
+		Shapes: []Shape{{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"}}, Account: account})
+	if err == nil || !strings.Contains(err.Error(), "certificates") {
+		t.Fatalf("a source without the certificates answered %v", err)
 	}
 }

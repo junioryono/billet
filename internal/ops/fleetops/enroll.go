@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
-	"github.com/junioryono/billet/internal/hostsource"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -28,7 +29,7 @@ import (
 // Slow, because the thing it is waiting for is a HUMAN reading a fingerprint. A
 // tight loop would fill the control plane's log with one line per node per
 // second while somebody walks to another machine to compare a value.
-const enrollPollEvery = 5 * time.Second
+var enrollPollEvery = 5 * time.Second
 
 // cmdNodes is the operator's side of enrollment.
 func Nodes(ctx context.Context, env cli.Env, args []string) error {
@@ -546,10 +547,7 @@ func EnrollNode(
 	fmt.Fprintf(env.Stdout, "Asking to join deployment %s as %q.\n\n", deployment, name)
 	fmt.Fprintf(env.Stdout, "  this node's fingerprint  %s\n\n", fingerprint)
 
-	var identity nodeclient.Identity
-
 	if poolOrder != "" {
-		identity = poolIdentity(ctx, env)
 		fmt.Fprintf(env.Stdout, "A pool host: its order's source may vouch for it. Otherwise, on the control plane,\n")
 		fmt.Fprintf(env.Stdout, "check the fingerprint matches and approve:\n\n")
 	} else {
@@ -558,7 +556,10 @@ func EnrollNode(
 
 	fmt.Fprintf(env.Stdout, "  billet nodes approve %s --fingerprint %s\n\n", name, fingerprint)
 
-	warned := false
+	var (
+		identity         nodeclient.Identity
+		warned, unsigned bool
+	)
 
 	for {
 		if poolOrder != "" {
@@ -568,6 +569,14 @@ func EnrollNode(
 				warned = true
 				fmt.Fprintf(env.Stderr, "this pool host could not write its fingerprint to %s, so its source "+
 					"cannot vouch for it and a person approves it: %v\n", consolePath, err)
+			}
+
+			// UNTIL ONE IS READ, because the metadata service can be slow to answer
+			// early in a boot, and a host that sent none once would wait for a person
+			// for good.
+			if identity.Document == nil {
+				identity = poolIdentity(ctx, env, !unsigned)
+				unsigned = identity.Document == nil
 			}
 		}
 
@@ -630,14 +639,16 @@ var (
 
 // announceOnConsole writes the pool host's line to the system console, opened for
 // writing only and never created: a console that is not there is a failure to say so,
-// not a file to make.
+// not a file to make. O_NOCTTY, because a process leading its own session (a service)
+// would otherwise take the console as its controlling terminal, and a hangup or an
+// interrupt typed there would reach it.
 func announceOnConsole(order, fingerprint string) error {
-	f, err := os.OpenFile(consolePath, os.O_WRONLY|os.O_APPEND, 0)
+	f, err := os.OpenFile(consolePath, os.O_WRONLY|os.O_APPEND|syscall.O_NOCTTY, 0)
 	if err != nil {
 		return err
 	}
 
-	_, werr := fmt.Fprintf(f, "%s\n", hostsource.ConsoleLine(order, fingerprint))
+	_, werr := fmt.Fprintf(f, "%s\n", nodeapi.PoolConsoleLine(order, fingerprint))
 
 	return errors.Join(werr, f.Close())
 }
@@ -645,10 +656,13 @@ func announceOnConsole(order, fingerprint string) error {
 // poolIdentity is the identity document the host's platform signed, or none: a host
 // that is not on EC2, or whose metadata service is closed, has none, and its join waits
 // for a person instead.
-func poolIdentity(ctx context.Context, env cli.Env) nodeclient.Identity {
+func poolIdentity(ctx context.Context, env cli.Env, say bool) nodeclient.Identity {
 	doc, sig, err := instanceIdentity(ctx)
 	if err != nil {
-		fmt.Fprintf(env.Stdout, "No identity document to send (%v); the source cannot vouch without one.\n\n", err)
+		if say {
+			fmt.Fprintf(env.Stdout, "No identity document to send yet (%v); the source cannot vouch without one, "+
+				"and it is read again before every attempt.\n\n", err)
+		}
 
 		return nodeclient.Identity{}
 	}

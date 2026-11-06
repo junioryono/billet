@@ -16,8 +16,10 @@ import (
 // PoolJoins admits a pool host on its order's source's word (ADR-030).
 type PoolJoins interface {
 	// PoolJoinOrder is the pool order a join token was minted for, spent or not, and
-	// empty for any other token.
-	PoolJoinOrder(ctx context.Context, token string) (string, error)
+	// empty for any other token; live is whether it could still be spent.
+	PoolJoinOrder(ctx context.Context, token string) (order string, live bool, err error)
+	// ReadPoolOrder reads the order, alloc.ErrPoolOrderClosed when there is none.
+	ReadPoolOrder(ctx context.Context, id string) (alloc.PoolOrder, error)
 	// JudgePoolJoin asks the order's source whether the host it placed is the one
 	// asking with this key.
 	JudgePoolJoin(ctx context.Context, claim hostsource.Claim) hostsource.Testimony
@@ -41,33 +43,74 @@ func WithPoolJoins(p PoolJoins, seesHostAddress bool) HandlerOption {
 // ordinary path, which records it pending under its order for a person, spending the
 // token, and asks the source again on the next poll.
 //
-// THE NAME IS THE ORDER'S, and a request naming anything else is refused before any
-// source is asked. A KNOWN, DECIDED KEY asks nothing either: the ordinary path answers
-// its approval or denial without a read. A CONTRADICTION holds the order and spends
-// nothing (ADR-030): the host's own request then admits nothing until a person acts.
+// THE LEDGER IS ASKED BEFORE THE SOURCE, so an unauthenticated caller reaches no AWS
+// call without a live token of an open order, or the request it already recorded: the
+// name is the order's, a known decided key is the ordinary path's to answer, a closed
+// order is refused, and a held one is answered pending without asking anything.
+//
+// A HELD ORDER, A CONTRADICTION AND A CONFLICT ARE ALL ANSWERED PENDING. The host keeps
+// asking while a person looks, so a person's approval, or the release of a hold,
+// reaches a host that is still there to collect it; and the answer carries none of
+// what the source said, which is the ledger's and the log's. A contradiction holds the
+// order and spends nothing (ADR-030).
 //
 // THE ADDRESS IS THE CONNECTION'S PEER, never a header a caller wrote: the enrollment
 // listener is dialled directly unless seesHostAddress says otherwise.
 func (h *handler) poolEnroll(
-	w http.ResponseWriter, r *http.Request, req *nodeapi.EnrollRequest, fingerprint, order string,
+	w http.ResponseWriter, r *http.Request, req *nodeapi.EnrollRequest, fingerprint, order string, live bool,
 ) bool {
+	ctx := r.Context()
+
 	if req.Node != alloc.PoolNodeName(order) {
 		h.log.Warn("a pool order's join token was presented under another name", "node", req.Node, "order", order)
-		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
-			"enrolling needs a join token: run `billet ca token` on the control plane and pass it as --join-token")
+		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated, badJoinToken)
 
 		return true
 	}
 
-	existing, found, err := h.enrollments.LookupEnrollment(r.Context(), req.Node)
+	existing, found, err := h.enrollments.LookupEnrollment(ctx, req.Node)
 	if err != nil {
 		h.log.Error("could not read a pool host's enrollment", "node", req.Node, "error", err)
 		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, "billet could not read this request; try again")
 
 		return true
 	}
-	if found && existing.Fingerprint == fingerprint && existing.State != alloc.EnrollPending {
+
+	mine := found && existing.Fingerprint == fingerprint
+	if mine && existing.State != alloc.EnrollPending {
 		return false
+	}
+
+	o, err := h.poolJoins.ReadPoolOrder(ctx, order)
+
+	switch {
+	case errors.Is(err, alloc.ErrPoolOrderClosed):
+		writeErr(w, http.StatusConflict, nodeapi.CodeRefused, poolOrderClosed)
+
+		return true
+	case err != nil:
+		h.log.Error("could not read a pool order", "order", order, "error", err)
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, "billet could not read this request; try again")
+
+		return true
+	case o.State == alloc.PoolOrdering:
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolOrderNotPlaced)
+
+		return true
+	case o.State != alloc.PoolPlaced || o.NodeName != "":
+		writeErr(w, http.StatusConflict, nodeapi.CodeRefused, poolOrderClosed)
+
+		return true
+	case o.JoinHold != "":
+		h.log.Info("a pool host asked to join from an order held for a person", "node", req.Node, "order", order,
+			"fingerprint", fingerprint, "held", o.JoinHold)
+		poolPending(w, fingerprint)
+
+		return true
+	case !live && !(mine && existing.PoolOrder == order):
+		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated, badJoinToken)
+
+		return true
 	}
 
 	claim := hostsource.Claim{
@@ -80,17 +123,16 @@ func (h *handler) poolEnroll(
 		}
 	}
 
-	t := h.poolJoins.JudgePoolJoin(r.Context(), claim)
+	t := h.poolJoins.JudgePoolJoin(ctx, claim)
 
 	switch t.Verdict {
 	case hostsource.VerdictContradicts:
 		h.log.Warn("a pool host's source contradicted its enrollment; the order is held for a person",
 			"node", req.Node, "order", order, "fingerprint", fingerprint, "why", t.Reason)
-		if err := h.poolJoins.HoldPoolJoin(r.Context(), order, t.Reason); err != nil {
+		if err := h.poolJoins.HoldPoolJoin(ctx, order, t.Reason); err != nil {
 			h.log.Error("could not hold a pool order's join", "order", order, "error", err)
 		}
-		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
-			"this pool host's join is held for a person: its source said "+t.Reason)
+		poolPending(w, fingerprint)
 
 		return true
 	case hostsource.VerdictVouches:
@@ -103,6 +145,19 @@ func (h *handler) poolEnroll(
 		"node", req.Node, "order", order, "fingerprint", fingerprint, "why", t.Reason)
 
 	return false
+}
+
+// The answers an unauthenticated caller reads, in billet's words only.
+const (
+	badJoinToken = "enrolling needs a join token: run `billet ca token` on the control plane and pass it as " +
+		"--join-token"
+	poolOrderClosed    = "this pool order admits no node"
+	poolOrderNotPlaced = "this pool host's order is not yet recorded as placed; ask again in a moment"
+)
+
+// poolPending answers a pool host that waits for a person.
+func poolPending(w http.ResponseWriter, fingerprint string) {
+	writeJSON(w, http.StatusOK, nodeapi.EnrollResponse{State: alloc.EnrollPending, Fingerprint: fingerprint})
 }
 
 // admitPoolHost signs the host's request and admits it in one transaction. THE
@@ -151,22 +206,22 @@ func isPoolRefusal(err error) bool {
 		errors.Is(err, alloc.ErrPoolOrderClosed)
 }
 
-// poolRefusal answers what the ledger said of a pool host's enrollment, on either path.
+// poolRefusal answers what the ledger said of a pool host's enrollment, on either path:
+// an order not yet placed is asked again, a held order or a conflict waits for a person
+// as pending, a closed order is refused, and a token no longer usable is a credential
+// problem. Nothing the ledger said is quoted to the caller.
 func (h *handler) poolRefusal(w http.ResponseWriter, node, fingerprint string, err error) {
 	switch {
 	case errors.Is(err, alloc.ErrBadJoinToken):
-		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
-			"enrolling needs a join token: run `billet ca token` on the control plane and pass it as --join-token")
+		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated, badJoinToken)
 	case errors.Is(err, alloc.ErrPoolOrderNotPlaced):
-		// NOT A VERDICT: the order's answer is still being read back, and the host asks
-		// again.
-		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
-			"this pool host's order is not yet recorded as placed; ask again in a moment")
-	case errors.Is(err, alloc.ErrPoolJoinHeld):
-		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, err.Error())
-	case errors.Is(err, alloc.ErrPoolOrderClosed), errors.Is(err, alloc.ErrEnrollmentConflict):
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, poolOrderNotPlaced)
+	case errors.Is(err, alloc.ErrPoolJoinHeld), errors.Is(err, alloc.ErrEnrollmentConflict):
+		h.log.Warn("a pool host's enrollment waits for a person", "node", node, "fingerprint", fingerprint, "why", err)
+		poolPending(w, fingerprint)
+	case errors.Is(err, alloc.ErrPoolOrderClosed):
 		h.log.Warn("a pool host's enrollment was refused", "node", node, "fingerprint", fingerprint, "error", err)
-		writeErr(w, http.StatusConflict, nodeapi.CodeRefused, err.Error())
+		writeErr(w, http.StatusConflict, nodeapi.CodeRefused, poolOrderClosed)
 	default:
 		h.log.Error("could not record a pool host's enrollment", "node", node, "error", err)
 		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, "billet could not record this request; try again")

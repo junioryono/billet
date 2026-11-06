@@ -5,14 +5,17 @@ import (
 	"errors"
 	"log/slog"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/pool"
@@ -22,8 +25,10 @@ import (
 )
 
 // consoleSource is a source whose hosts' consoles are a buffer a test writes, read the
-// way a real source reads them: through hostsource.ConsoleFingerprints. Only Witness is
-// ever asked of it here.
+// way the AWS source reads them, through nodeapi.PoolConsoleFingerprints, and judged as
+// it judges them: no key is could-not-tell, this key alone vouches, other keys alone
+// contradict, and this key among others is could-not-tell. Only Witness is ever asked
+// of it here; the AWS source's own tests cover its document and address.
 type consoleSource struct {
 	hostsource.Source
 	mu      sync.Mutex
@@ -41,15 +46,31 @@ func (s *consoleSource) Witness(_ context.Context, c hostsource.Claim) hostsourc
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.asked = append(s.asked, c.HostID)
-	keys := hostsource.ConsoleFingerprints(s.console[c.HostID], c.Order)
+	keys := nodeapi.PoolConsoleFingerprints(s.console[c.HostID], c.Order)
 	switch {
 	case len(keys) == 0:
 		return hostsource.Testimony{Reason: "nothing on the console yet"}
 	case len(keys) == 1 && keys[0] == c.Fingerprint:
 		return hostsource.Testimony{Verdict: hostsource.VerdictVouches, Reason: "the console names it"}
+	case slices.Contains(keys, c.Fingerprint):
+		return hostsource.Testimony{Reason: "the console names several keys"}
 	}
 
 	return hostsource.Testimony{Verdict: hostsource.VerdictContradicts, Reason: "the console names " + strings.Join(keys, ",")}
+}
+
+func (s *consoleSource) asks() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return len(s.asked)
+}
+
+// advance moves the judge's clock past its interval.
+func (w *poolJoinWire) advance(d time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.now = w.now.Add(d)
 }
 
 // poolJoinWire is the enrollment listener as the control plane assembles it for a pool:
@@ -84,15 +105,8 @@ func newPoolJoinWire(t *testing.T) *poolJoinWire {
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
-	ca, err := wirecert.LoadOrCreateCA(t.TempDir(), wireDeployment)
-	if err != nil {
-		t.Fatal(err)
-	}
-	serving, err := ca.IssueServer([]string{"127.0.0.1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	conf, err := wirecert.BootstrapTLS(serving)
+	identity := t.TempDir()
+	ca, err := wirecert.LoadOrCreateCA(identity, wireDeployment)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,8 +119,22 @@ func newPoolJoinWire(t *testing.T) *poolJoinWire {
 	}
 	joins := joinsOf{Allocator: a, Joins: pool.NewJoins(a, map[string]hostsource.Source{"metal": w.src}, clock)}
 	log := slog.New(slog.DiscardHandler)
-	srv := httptest.NewUnstartedServer(nodeplane.BootstrapHandler(log, nodeplane.New(log, wireDeployment, time.Minute), ca,
-		nodeplane.WithEnrollment(a), nodeplane.WithPoolJoins(joins, true)))
+
+	// THE WIRE AS THE CONTROL PLANE ASSEMBLES IT, so a pool's joins that never reach the
+	// enrollment listener fail here.
+	wire, err := app.BuildNodeWire(app.NodeWireRequest{
+		StateDir: identity, Deployment: wireDeployment, Hosts: []string{"127.0.0.1"}, Log: log,
+		Plane: nodeplane.New(log, wireDeployment, time.Minute), Enrollments: a,
+		PoolJoins: joins, SeesHostAddress: true,
+	})
+	if err != nil {
+		t.Fatalf("BuildNodeWire: %v", err)
+	}
+	conf, err := wirecert.BootstrapTLS(wire.Serving)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(wire.Bootstrap)
 	srv.TLS = conf
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
@@ -173,10 +201,8 @@ func TestAPoolHostJoinsOnceItsSourceVouches(t *testing.T) {
 		t.Fatalf("the first ask left %+v, %v", e, ok)
 	}
 
-	w.src.write("host-pa", hostsource.ConsoleLine("pa", fp))
-	w.mu.Lock()
-	w.now = w.now.Add(pool.DefaultJudgeEvery)
-	w.mu.Unlock()
+	w.src.write("host-pa", nodeapi.PoolConsoleLine("pa", fp))
+	w.advance(pool.DefaultJudgeEvery)
 	cert, err := w.ask(t, name, token, csr)
 	if err != nil {
 		t.Fatalf("once the console names the key: %v", err)
@@ -195,24 +221,34 @@ func TestAPoolHostJoinsOnceItsSourceVouches(t *testing.T) {
 	}
 }
 
-// A HOST WHOSE CONSOLE NAMES ANOTHER KEY IS REFUSED AND ITS ORDER HELD, with nothing
-// recorded and the token unspent; the host the console names is then refused too, until
-// a person acts.
-func TestAPoolHostTheConsoleContradictsHoldsItsOrder(t *testing.T) {
+// A HOST WHOSE CONSOLE NAMES ANOTHER KEY IS TOLD TO WAIT AND ITS ORDER IS HELD, with
+// nothing recorded and the token unspent; the host the console names is told to wait
+// too, its source unasked, until a person acts. Once a person releases the hold, that
+// host's next ask is judged again and joins.
+func TestAPoolHostTheConsoleContradictsWaitsForAPerson(t *testing.T) {
 	t.Parallel()
 	w := newPoolJoinWire(t)
 	token := w.order(t, "pb")
 	name := alloc.PoolNodeName("pb")
-	csr, _, err := wirecert.NewNodeCSR(name)
+	imposter, _, err := wirecert.NewNodeCSR(name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.src.write("host-pb", hostsource.ConsoleLine("pb", "SHA256:theHostsOwnKey"))
-	if _, err := w.ask(t, name, token, csr); err == nil || !strings.Contains(err.Error(), "403") {
-		t.Fatalf("a contradicted ask: %v, want refused", err)
+	host, _, err := wirecert.NewNodeCSR(name)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok, _ := w.alloc.LookupEnrollment(t.Context(), name); ok {
-		t.Fatal("a contradicted ask was recorded")
+	hostFP, err := wirecert.FingerprintOfCSR(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.src.write("host-pb", nodeapi.PoolConsoleLine("pb", hostFP))
+	if _, err := w.ask(t, name, token, imposter); !errors.Is(err, nodeclient.ErrNotApproved) {
+		t.Fatalf("a contradicted ask: %v, want told to wait", err)
+	}
+	_, ok, err := w.alloc.LookupEnrollment(t.Context(), name)
+	if err != nil || ok {
+		t.Fatalf("a contradicted ask was recorded (%v, %v)", ok, err)
 	}
 	o, err := w.alloc.ReadPoolOrder(t.Context(), "pb")
 	if err != nil || o.JoinHold == "" || o.NodeName != "" {
@@ -221,5 +257,23 @@ func TestAPoolHostTheConsoleContradictsHoldsItsOrder(t *testing.T) {
 	tokens, err := w.alloc.JoinTokens(t.Context())
 	if err != nil || len(tokens) != 1 || tokens[0].Uses != 1 {
 		t.Fatalf("the token after a contradiction: %+v, %v", tokens, err)
+	}
+
+	w.advance(pool.DefaultJudgeEvery)
+	asked := w.src.asks()
+	if _, err := w.ask(t, name, token, host); !errors.Is(err, nodeclient.ErrNotApproved) {
+		t.Fatalf("the console's own key while the order is held: %v, want told to wait", err)
+	}
+	if w.src.asks() != asked {
+		t.Fatal("a held order's source was asked")
+	}
+
+	if err := w.alloc.ReleasePoolJoin(t.Context(), "pb"); err != nil {
+		t.Fatal(err)
+	}
+	w.advance(pool.DefaultJudgeEvery)
+	cert, err := w.ask(t, name, token, host)
+	if err != nil || len(cert) == 0 {
+		t.Fatalf("the console's own key once the hold was released: %v", err)
 	}
 }

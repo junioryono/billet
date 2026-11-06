@@ -992,7 +992,7 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 	// A POOL ORDER'S TOKEN IS ASKED OF ITS SOURCE FIRST (ADR-030), which may admit the
 	// host on its own word, refuse it, or leave it to the request below.
 	if h.poolJoins != nil && strings.TrimSpace(req.JoinToken) != "" {
-		order, err := h.poolJoins.PoolJoinOrder(r.Context(), req.JoinToken)
+		order, live, err := h.poolJoins.PoolJoinOrder(r.Context(), req.JoinToken)
 		if err != nil {
 			h.log.Error("could not read which pool order a join token is for", "node", req.Node, "error", err)
 			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, "billet could not read this request; try again")
@@ -1000,7 +1000,7 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if order != "" && h.poolEnroll(w, r, &req, fingerprint, order) {
+		if order != "" && h.poolEnroll(w, r, &req, fingerprint, order, live) {
 			return
 		}
 	}

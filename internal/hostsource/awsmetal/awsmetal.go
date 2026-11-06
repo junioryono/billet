@@ -74,12 +74,17 @@ type Config struct {
 	Shapes           []Shape
 	// Account answers which AWS account the credentials are in.
 	Account func(context.Context) (string, error)
-	// Identity verifies a host's identity document; nil, and Witness never vouches.
+	// Identity verifies a host's identity document, without which Witness never vouches;
+	// New refuses a source without it.
 	Identity *awsidentity.Verifier
 }
 
 // New builds a source over a provider's pool-host surface.
 func New(h *ec2.Hosts, cfg Config) (*Source, error) {
+	if cfg.Identity == nil {
+		return nil, errors.New("awsmetal: a source needs AWS's certificates to verify a host's identity document")
+	}
+
 	return newSource(h, cfg)
 }
 

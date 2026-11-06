@@ -348,3 +348,126 @@ func TestALapsedJoinIsHeld(t *testing.T) {
 		t.Fatalf("a second pass held %d, %v", held, err)
 	}
 }
+
+// A HOLD IS ONLY ON AN ORDER A NODE MAY STILL JOIN FROM: holding a joined or closed
+// order changes nothing, holding none is an error, and a hold needs its reason.
+func TestAHoldIsOnlyOnAnOpenOrder(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	tok := placedOrder(t, a, "joined")
+	if _, err := a.AdmitPoolEnrollment(ctx, admission("joined", "SHA256:j", tok, "0j")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.HoldPoolJoin(ctx, "joined", "too late"); err != nil {
+		t.Fatalf("holding a joined order: %v", err)
+	}
+	if o := readOrder(t, a, "joined"); o.JoinHold != "" {
+		t.Fatalf("a joined order was held: %+v", o)
+	}
+	if err := a.HoldPoolJoin(ctx, "missing", "why"); !errors.Is(err, ErrPoolOrderClosed) {
+		t.Fatalf("holding no order answered %v", err)
+	}
+	if err := a.HoldPoolJoin(ctx, "joined", ""); err == nil {
+		t.Fatal("a hold with no reason was accepted")
+	}
+}
+
+// A PERSON RELEASES A HELD JOIN, and the host's next request is admitted on its
+// source's word again; an order with no hold, a closed order or none at all has
+// nothing to release. A person's approval of a held order clears its hold.
+func TestAHeldJoinIsReleasedOnAPersonsWord(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	tok := placedOrder(t, a, "pa")
+	if err := a.ReleasePoolJoin(ctx, "pa"); !errors.Is(err, ErrPoolJoinNotHeld) {
+		t.Fatalf("releasing an order with no hold answered %v", err)
+	}
+	if err := a.HoldPoolJoin(ctx, "pa", "a key nobody can account for"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", tok, "0a")); !errors.Is(err, ErrPoolJoinHeld) {
+		t.Fatalf("admitting a held order answered %v", err)
+	}
+	if err := a.ReleasePoolJoin(ctx, "pa"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := a.AdmitPoolEnrollment(ctx, admission("pa", "SHA256:k", tok, "0a")); err != nil {
+		t.Fatalf("admitting once the hold was released: %v", err)
+	}
+	if err := a.ReleasePoolJoin(ctx, "pa"); !errors.Is(err, ErrPoolOrderClosed) && !errors.Is(err, ErrPoolJoinNotHeld) {
+		t.Fatalf("releasing a joined order answered %v", err)
+	}
+	if err := a.ReleasePoolJoin(ctx, "missing"); !errors.Is(err, ErrPoolOrderClosed) {
+		t.Fatalf("releasing no order answered %v", err)
+	}
+
+	tokB := placedOrder(t, a, "pb")
+	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pb"), "SHA256:b", "csr", tokB); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.HoldPoolJoin(ctx, "pb", "held"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.DecideEnrollment(ctx, PoolNodeName("pb"), "SHA256:b", EnrollApproved, "cert", "0b"); err != nil {
+		t.Fatal(err)
+	}
+	if o := readOrder(t, a, "pb"); o.JoinHold != "" || o.NodeName == "" {
+		t.Fatalf("a person's approval left %+v", o)
+	}
+}
+
+// A POOL'S NAMES ARE ITS TOKENS' ALONE: an operator's token under a `pool-` name is
+// refused and not spent, so it cannot claim the name of a host the pool ordered.
+func TestAnOperatorsTokenCannotClaimAPoolName(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	tok, err := a.NewJoinToken(ctx, time.Hour, 1, "an operator's")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pa"), "SHA256:k", "csr", tok); !errors.Is(err, ErrBadJoinToken) {
+		t.Fatalf("an operator's token under a pool name answered %v", err)
+	}
+	if _, err := a.RequestEnrollmentWithToken(ctx, "epyc-1", "SHA256:k", "csr", tok); err != nil {
+		t.Fatalf("the unspent token under an ordinary name: %v", err)
+	}
+	if !IsPoolNodeName(PoolNodeName("x")) || IsPoolNodeName("epyc-1") {
+		t.Fatal("IsPoolNodeName disagrees with PoolNodeName")
+	}
+}
+
+// A TOKEN'S ORDER IS READ WHETHER IT IS SPENT OR NOT, WITH WHETHER IT IS LIVE: an
+// unknown token and an operator's name no order.
+func TestATokensOrderIsReadWithWhetherItIsLive(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	tok := placedOrder(t, a, "pa")
+	if order, live, err := a.PoolJoinOrder(ctx, tok); err != nil || order != "pa" || !live {
+		t.Fatalf("a live token: %q %v %v", order, live, err)
+	}
+	if _, err := a.RequestEnrollmentWithToken(ctx, PoolNodeName("pa"), "SHA256:k", "csr", tok); err != nil {
+		t.Fatal(err)
+	}
+	if order, live, err := a.PoolJoinOrder(ctx, tok); err != nil || order != "pa" || live {
+		t.Fatalf("a spent token: %q %v %v", order, live, err)
+	}
+	if order, live, err := a.PoolJoinOrder(ctx, "never-minted"); err != nil || order != "" || live {
+		t.Fatalf("an unknown token: %q %v %v", order, live, err)
+	}
+	if _, err := a.NewPoolJoinToken(ctx, "pa", 0); err == nil {
+		t.Fatal("a token with no lifetime was minted")
+	}
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		return a.linkPoolNodeTx(ctx, state.WriteQueries(tx), "pa", PoolNodeName("pa"), "SHA256:k", "", false)
+	}); err == nil {
+		t.Fatal("an order was linked without its certificate's serial")
+	}
+}

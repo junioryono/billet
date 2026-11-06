@@ -137,17 +137,30 @@ func (q *Queries) LiveJoinTokenExists(ctx context.Context, arg LiveJoinTokenExis
 }
 
 const readJoinTokenOrder = `-- name: ReadJoinTokenOrder :one
-SELECT pool_order FROM join_tokens WHERE token_sha256 = $1
+SELECT pool_order,
+       CAST(CASE WHEN uses_remaining > 0 AND expires_at > $1 THEN 1 ELSE 0 END AS BIGINT) AS live
+  FROM join_tokens WHERE token_sha256 = $2
 `
 
-// The pool order a token was minted for, spent or not: a host polls with the token
-// it booted with long after the admission spent it, and its poll is still the
-// order's. Empty for an operator's token; sql.ErrNoRows for no such token.
-func (q *Queries) ReadJoinTokenOrder(ctx context.Context, tokenSha256 string) (string, error) {
-	row := q.db.QueryRowContext(ctx, readJoinTokenOrder, tokenSha256)
-	var pool_order string
-	err := row.Scan(&pool_order)
-	return pool_order, err
+type ReadJoinTokenOrderParams struct {
+	Now         string
+	TokenSha256 string
+}
+
+type ReadJoinTokenOrderRow struct {
+	PoolOrder string
+	Live      int64
+}
+
+// The pool order a token was minted for, spent or not, and whether it could still be
+// spent: a host polls with the token it booted with long after the admission spent
+// it, and its poll is still the order's. Empty for an operator's token;
+// sql.ErrNoRows for no such token.
+func (q *Queries) ReadJoinTokenOrder(ctx context.Context, arg ReadJoinTokenOrderParams) (ReadJoinTokenOrderRow, error) {
+	row := q.db.QueryRowContext(ctx, readJoinTokenOrder, arg.Now, arg.TokenSha256)
+	var i ReadJoinTokenOrderRow
+	err := row.Scan(&i.PoolOrder, &i.Live)
+	return i, err
 }
 
 const retirePoolJoinTokens = `-- name: RetirePoolJoinTokens :exec

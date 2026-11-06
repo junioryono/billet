@@ -477,17 +477,9 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 	// binds to this once it has built the scheduler.
 	resizes := &resizeGate{alloc: cp.allocator}
 
-	wireOpts := []wireOption{withResizer(resizes.resize)}
-
-	// A POOL'S HOSTS JOIN ON THEIR SOURCE'S WORD (ADR-030), through the sources the pool
-	// orders from.
-	if cp.cfg.Server.Pool != nil {
-		joins, err := NewPoolJoins(cp.cfg, cp.allocator, cp.deployment)
-		if err != nil {
-			return nil, err
-		}
-
-		wireOpts = append(wireOpts, withPoolJoins(joins))
+	wireOpts, err := poolWireOptions(cp.cfg, cp.allocator, cp.deployment, withResizer(resizes.resize))
+	if err != nil {
+		return nil, err
 	}
 
 	wire, err := ServeNodeWire(ctx, cp.cfg, cp.host.ServerAccess, nodes, cp.allocator,

@@ -93,6 +93,25 @@ func NewPoolJoins(cfg *config.Config, ledger *alloc.Allocator, deployment string
 	return poolJoins{Allocator: ledger, Joins: pool.NewJoins(ledger, sources, nil)}, nil
 }
 
+// poolWireOptions is the wire's options with a pool's joins added when the config names
+// a pool (ADR-030), so its hosts join on their source's word through the sources the
+// pool orders from.
+func poolWireOptions(cfg *config.Config, ledger *alloc.Allocator, deployment string, opts ...wireOption) ([]wireOption, error) {
+	if cfg.Server.Pool == nil {
+		return opts, nil
+	}
+	joins, err := NewPoolJoins(cfg, ledger, deployment)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(opts, withPoolJoins(joins)), nil
+}
+
+// seesHostAddress says whether an enrollment's peer is the host itself: a router in
+// front of the listeners is every enrollment's peer.
+func seesHostAddress(cfg *config.Config) bool { return cfg.Server.TLSRouter == nil }
+
 // schedulePool is the controller's pool loop, and false when the config names no pool
 // or the run is dry, which orders nothing as it accepts no job.
 func schedulePool(cfg *config.Config, ledger *alloc.Allocator, deployment string, dryRun bool) (func(context.Context), bool, error) {

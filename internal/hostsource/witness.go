@@ -1,10 +1,6 @@
 package hostsource
 
-import (
-	"context"
-	"regexp"
-	"strings"
-)
+import "context"
 
 // Verdict is what a source says of a pool host's enrollment (ADR-030). The zero value
 // is could-not-tell, which admits nothing and holds nothing.
@@ -62,37 +58,4 @@ type Testimony struct {
 // and its hosts wait for a person to compare a fingerprint.
 type Witness interface {
 	Witness(ctx context.Context, claim Claim) Testimony
-}
-
-// consolePrefix begins the line a pool host writes to its console.
-const consolePrefix = "billet-pool-join "
-
-// ConsoleLine is the line a pool host writes to its system console before it asks to
-// join, naming its order and its key's fingerprint, so a source that reads the
-// console of the exact host it placed can say which key is that host's. It is the one
-// spelling: the host writes it and the plane reads it through ConsoleFingerprints.
-func ConsoleLine(order, fingerprint string) string {
-	return consolePrefix + "order=" + order + " fingerprint=" + fingerprint
-}
-
-var consoleLine = regexp.MustCompile(`billet-pool-join order=([a-z0-9][a-z0-9-]*) fingerprint=([A-Za-z0-9:+/=_-]+)`)
-
-// ConsoleFingerprints is every distinct fingerprint a console names for order, in the
-// order first written. A console carries a boot's whole output, terminal escapes and
-// carriage returns included, and is read as text: a line is matched wherever it sits.
-func ConsoleFingerprints(console, order string) []string {
-	var out []string
-	seen := map[string]bool{}
-	for _, m := range consoleLine.FindAllStringSubmatch(console, -1) {
-		if m[1] != order {
-			continue
-		}
-		fp := strings.TrimRight(m[2], "\r")
-		if !seen[fp] {
-			seen[fp] = true
-			out = append(out, fp)
-		}
-	}
-
-	return out
 }

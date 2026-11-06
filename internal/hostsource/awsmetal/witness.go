@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
-	"github.com/junioryono/billet/internal/awsidentity"
 	"github.com/junioryono/billet/internal/hostsource"
+	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/provider/ec2"
 )
 
 var _ hostsource.Witness = (*Source)(nil)
@@ -23,12 +25,16 @@ var _ hostsource.Witness = (*Source)(nil)
 //     its launch and its private address;
 //   - the enrollment came from that private address, when the listener can see it.
 //
-// IT CONTRADICTS only on a positive answer for something else: the console names only
-// other keys, the address or a verified document names another instance, or the
-// instance is ending. ANYTHING IT CANNOT READ IS COULD-NOT-TELL: a failed Describe, a
-// console that has not shown the line yet, two keys on the console, or a document no
-// certificate here verifies (AWS rotates them), and an empty address cannot vouch
-// unless the document does.
+// IT CONTRADICTS only on a positive answer about the host itself: the console names
+// only other keys, a verified document names another instance, account or address, or
+// the instance is ending. ANYTHING ELSE IS COULD-NOT-TELL: a failed read, a console that
+// has not shown the line yet, two keys on it, a document no certificate here verifies
+// (AWS rotates them), and an address or a launch time that does not match, which a NAT
+// or a proxy in front of the listener, or a launch EC2 recorded differently, would
+// explain without anything being wrong with the host.
+//
+// A REASON NEVER QUOTES AN AWS ANSWER: an EC2 or STS error's prose can name the caller's
+// account and role, so a failure is said by its code.
 func (s *Source) Witness(ctx context.Context, claim hostsource.Claim) hostsource.Testimony {
 	unknown := func(format string, a ...any) hostsource.Testimony {
 		return hostsource.Testimony{Verdict: hostsource.VerdictUnknown, Reason: fmt.Sprintf(format, a...)}
@@ -43,7 +49,7 @@ func (s *Source) Witness(ctx context.Context, claim hostsource.Claim) hostsource
 	rec, err := s.hosts.Describe(ctx, claim.HostID)
 	switch {
 	case err != nil:
-		return unknown("EC2 could not describe %s: %v", claim.HostID, err)
+		return unknown("EC2 could not describe %s (%s)", claim.HostID, s.failure(err))
 	case rec.State == "shutting-down" || rec.State == "terminated":
 		return contradicts("instance %s is %s", claim.HostID, rec.State)
 	case rec.State != "running":
@@ -51,7 +57,7 @@ func (s *Source) Witness(ctx context.Context, claim hostsource.Claim) hostsource
 	case rec.PrivateIP == "":
 		return unknown("EC2 described %s with no private address", claim.HostID)
 	case claim.Address != "" && claim.Address != rec.PrivateIP:
-		return contradicts("the enrollment came from %s and instance %s is at %s", claim.Address, claim.HostID, rec.PrivateIP)
+		return unknown("the enrollment came from %s and instance %s is at %s", claim.Address, claim.HostID, rec.PrivateIP)
 	}
 
 	// THE DOCUMENT, read only once the instance is known: a verified document naming
@@ -60,12 +66,12 @@ func (s *Source) Witness(ctx context.Context, claim hostsource.Claim) hostsource
 		return unknown("the enrollment carries no identity document this source can check")
 	}
 	doc, err := s.identity.Verify(s.region, claim.Document, claim.Signature)
-	if errors.Is(err, awsidentity.ErrUnverified) || err != nil {
-		return unknown("the identity document: %v", err)
+	if err != nil {
+		return unknown("the identity document does not verify under this region's certificate")
 	}
 	account, err := s.account(ctx)
 	if err != nil || account == "" {
-		return unknown("which account the credentials are in: %v", err)
+		return unknown("which account the credentials are in could not be read")
 	}
 	switch {
 	case doc.InstanceID != claim.HostID:
@@ -78,16 +84,16 @@ func (s *Source) Witness(ctx context.Context, claim hostsource.Claim) hostsource
 	case rec.LaunchTime.IsZero():
 		return unknown("EC2 described %s with no launch time", claim.HostID)
 	case !doc.PendingTime.Equal(rec.LaunchTime):
-		return contradicts("the identity document was signed for a launch at %s and %s launched at %s",
-			doc.PendingTime.Format("2006-01-02T15:04:05Z"), claim.HostID, rec.LaunchTime.Format("2006-01-02T15:04:05Z"))
+		return unknown("the identity document was signed for a launch at %s and EC2 says %s launched at %s",
+			doc.PendingTime.Format(time.RFC3339), claim.HostID, rec.LaunchTime.Format(time.RFC3339))
 	}
 
 	// THE CONSOLE LAST, because it is the one read EC2 throttles.
 	console, err := s.hosts.Console(ctx, claim.HostID)
 	if err != nil {
-		return unknown("EC2 could not read the console of %s: %v", claim.HostID, err)
+		return unknown("EC2 could not read the console of %s (%s)", claim.HostID, s.failure(err))
 	}
-	keys := hostsource.ConsoleFingerprints(console, claim.Order)
+	keys := nodeapi.PoolConsoleFingerprints(console, claim.Order)
 	switch {
 	case len(keys) == 0:
 		return unknown("the console of %s does not name a key for order %s yet", claim.HostID, claim.Order)
@@ -106,4 +112,21 @@ func (s *Source) Witness(ctx context.Context, claim hostsource.Claim) hostsource
 
 	return hostsource.Testimony{Verdict: hostsource.VerdictVouches,
 		Reason: "the console, the identity document, the address and EC2 agree"}
+}
+
+// failure names what went wrong with an EC2 call in billet's words or EC2's code.
+func (s *Source) failure(err error) string {
+	code, coded := s.code(err)
+	switch {
+	case errors.Is(err, ec2.ErrHostNotFound):
+		return "EC2 has no such instance yet"
+	case errors.Is(err, ec2.ErrNotAPoolHost):
+		return "it is not this deployment's pool host"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "the call ran out of time"
+	case coded:
+		return "EC2 answered " + code
+	}
+
+	return "the call failed"
 }

@@ -389,6 +389,16 @@ linters:
           allow:
             - $gostd
 
+        # THE IDENTITY DOCUMENT'S VERIFIER IS A LEAF. It is what lets a pool host in
+        # without a person (ADR-030), so it reads nothing but the bytes it is handed
+        # and the certificates it embeds: the standard library only.
+        awsidentity:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/awsidentity/**"
+          allow:
+            - $gostd
+
         # THE ENDING RECORD IS A LEAF. The node writes it and every command that
         # stops or starts a node judges it, so whatever it imported the node and
         # those commands would import. The standard library and the two file

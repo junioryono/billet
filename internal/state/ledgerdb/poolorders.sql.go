@@ -37,7 +37,7 @@ func (q *Queries) HoldLapsedPoolJoins(ctx context.Context, arg HoldLapsedPoolJoi
 
 const holdPoolOrderJoin = `-- name: HoldPoolOrderJoin :execrows
 UPDATE pool_orders SET join_hold = $1, updated_at = $2
- WHERE order_id = $3 AND join_hold = ''
+ WHERE order_id = $3 AND join_hold = '' AND state = 'placed' AND node_name = ''
 `
 
 type HoldPoolOrderJoinParams struct {
@@ -46,7 +46,8 @@ type HoldPoolOrderJoinParams struct {
 	OrderID   string
 }
 
-// Hold an order's join for a person, with the first reason kept.
+// Hold an order's join for a person, with the first reason kept, and only while a node
+// may still join from it.
 func (q *Queries) HoldPoolOrderJoin(ctx context.Context, arg HoldPoolOrderJoinParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, holdPoolOrderJoin, arg.JoinHold, arg.UpdatedAt, arg.OrderID)
 	if err != nil {
@@ -91,8 +92,8 @@ func (q *Queries) InsertPoolOrder(ctx context.Context, arg InsertPoolOrderParams
 const linkPoolOrderNode = `-- name: LinkPoolOrderNode :execrows
 UPDATE pool_orders
    SET node_name = $1, node_fingerprint = $2, node_cert_serial = $3,
-       updated_at = $4
- WHERE order_id = $5 AND state = 'placed' AND node_name = ''
+       join_hold = '', updated_at = $4
+ WHERE order_id = $5 AND state = 'placed' AND node_name = '' AND join_hold = $6
 `
 
 type LinkPoolOrderNodeParams struct {
@@ -101,10 +102,13 @@ type LinkPoolOrderNodeParams struct {
 	NodeCertSerial  string
 	UpdatedAt       string
 	OrderID         string
+	JoinHold        string
 }
 
 // The node that joined from a placed order, the key it was admitted with and the
-// certificate it was handed. Once: an order's node is never replaced.
+// certificate it was handed. Once: an order's node is never replaced. The hold is the
+// one the caller read, so a hold committed since moves nothing, and a link clears it:
+// a person's approval of a held order is what the hold waited for.
 func (q *Queries) LinkPoolOrderNode(ctx context.Context, arg LinkPoolOrderNodeParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, linkPoolOrderNode,
 		arg.NodeName,
@@ -112,6 +116,7 @@ func (q *Queries) LinkPoolOrderNode(ctx context.Context, arg LinkPoolOrderNodePa
 		arg.NodeCertSerial,
 		arg.UpdatedAt,
 		arg.OrderID,
+		arg.JoinHold,
 	)
 	if err != nil {
 		return 0, err
@@ -269,4 +274,23 @@ func (q *Queries) ReadPoolOrder(ctx context.Context, orderID string) (PoolOrder,
 		&i.JoinHold,
 	)
 	return i, err
+}
+
+const releasePoolOrderJoin = `-- name: ReleasePoolOrderJoin :execrows
+UPDATE pool_orders SET join_hold = '', updated_at = $1
+ WHERE order_id = $2 AND join_hold != '' AND state = 'placed' AND node_name = ''
+`
+
+type ReleasePoolOrderJoinParams struct {
+	UpdatedAt string
+	OrderID   string
+}
+
+// A person releases an order's held join, so its host's next request is judged again.
+func (q *Queries) ReleasePoolOrderJoin(ctx context.Context, arg ReleasePoolOrderJoinParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, releasePoolOrderJoin, arg.UpdatedAt, arg.OrderID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }

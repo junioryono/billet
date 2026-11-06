@@ -275,3 +275,47 @@ func TestAPoolWithAnEmptyCredentialVariableIsRefused(t *testing.T) {
 		t.Fatalf("an empty secret variable answered %v", err)
 	}
 }
+
+// A POOL'S JOINS REACH THE NODE WIRE WHEN THE CONFIG NAMES A POOL, and nothing is added
+// when it names none.
+func TestAPoolsJoinsReachTheWire(t *testing.T) {
+	t.Parallel()
+	base := withResizer(nil)
+	cfg := poolBootConfig()
+	cfg.Server.Pool = nil
+	opts, err := poolWireOptions(cfg, nil, "0123456789abcdef0123456789abcdef", base)
+	if err != nil || len(opts) != 1 {
+		t.Fatalf("no pool: %d options, %v", len(opts), err)
+	}
+
+	cfg = poolBootConfig()
+	cfg.Server.Pool.AWSMetal = &config.PoolAWSMetal{
+		Region: "us-west-2", SubnetID: "subnet-0abc", AvailabilityZone: "us-west-2a",
+		SecurityGroupIDs: []string{"sg-0abc"}, Images: map[config.Arch]string{config.ArchX64: "ami-0abc"},
+		Shapes: []config.PoolShape{{Type: "c7i.metal-24xl", Arch: config.ArchX64}},
+	}
+	opts, err = poolWireOptions(cfg, nil, "0123456789abcdef0123456789abcdef", base)
+	if err != nil || len(opts) != 2 {
+		t.Fatalf("a pool: %d options, %v", len(opts), err)
+	}
+	var s wireSettings
+	for _, o := range opts {
+		o(&s)
+	}
+	if s.poolJoins == nil {
+		t.Fatal("a pool's wire options carry no joins")
+	}
+}
+
+// AN ENROLLMENT'S PEER IS THE HOST ONLY WITHOUT A ROUTER IN FRONT OF THE LISTENERS.
+func TestTheHostsAddressIsSeenOnlyWithoutARouter(t *testing.T) {
+	t.Parallel()
+	cfg := poolBootConfig()
+	if !seesHostAddress(cfg) {
+		t.Fatal("a listener dialled directly does not see the host's address")
+	}
+	cfg.Server.TLSRouter = &config.TLSRouterConfig{}
+	if seesHostAddress(cfg) {
+		t.Fatal("a listener behind a router sees the host's address")
+	}
+}

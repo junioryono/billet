@@ -41,10 +41,13 @@ SELECT EXISTS(SELECT 1 FROM join_tokens
                  AND expires_at > @now);
 
 -- name: ReadJoinTokenOrder :one
--- The pool order a token was minted for, spent or not: a host polls with the token
--- it booted with long after the admission spent it, and its poll is still the
--- order's. Empty for an operator's token; sql.ErrNoRows for no such token.
-SELECT pool_order FROM join_tokens WHERE token_sha256 = @token_sha256;
+-- The pool order a token was minted for, spent or not, and whether it could still be
+-- spent: a host polls with the token it booted with long after the admission spent
+-- it, and its poll is still the order's. Empty for an operator's token;
+-- sql.ErrNoRows for no such token.
+SELECT pool_order,
+       CAST(CASE WHEN uses_remaining > 0 AND expires_at > @now THEN 1 ELSE 0 END AS BIGINT) AS live
+  FROM join_tokens WHERE token_sha256 = @token_sha256;
 
 -- name: SpendPoolJoinToken :execresult
 -- Consume one use of a token, only while it is live AND minted for this order, in
