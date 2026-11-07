@@ -1823,8 +1823,10 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 		}
 
 		var r evictionRound
+		var held time.Time
 
 		taken, release := c.withCacheLockReleased(ctx, time.Now(), func(now time.Time) error {
+			held = c.now()
 			r = c.evictGenerations(ctx, olderThan, now, remaining)
 
 			return nil
@@ -1832,7 +1834,13 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 		for _, err := range r.failures {
 			keep(err)
 		}
-		remaining -= r.held
+		// FROM THE MOMENT THE LOCK WAS HELD TO THE RETURN OF ITS RELEASE, which still
+		// holds it while it removes the heartbeat and the lock. Release is not
+		// reserved for: what a writer waits, cacheLockWaitLimit, is more than twice
+		// the budget.
+		if !held.IsZero() {
+			remaining -= c.now().Sub(held)
+		}
 
 		// A LOCK WHOSE RELEASE FAILED MAY STILL BE HELD, and every writer waits on it,
 		// so no further round runs; the lock's stale age recovers it.
@@ -1858,8 +1866,6 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 // evictionRound is what one round of eviction did under the cache lock.
 type evictionRound struct {
 	removed int
-	// held is how long the round held the lock, charged to the pass's budget.
-	held time.Duration
 	// stop is why the round ended before its last generation, nil when it did not.
 	stop error
 	// failures are the generations the round could not remove or judge.
@@ -1915,7 +1921,7 @@ func (c *Client) evictGenerations(
 
 	removed := 0
 	done := func(stop error) evictionRound {
-		return evictionRound{removed: removed, held: c.now().Sub(started), stop: stop, failures: failures}
+		return evictionRound{removed: removed, stop: stop, failures: failures}
 	}
 
 	metadata, err := c.cacheIndexMetadata(ctx)

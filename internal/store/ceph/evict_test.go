@@ -799,47 +799,59 @@ func TestCloningAGenerationWhoseSnapshotIsGoneIsAMiss(t *testing.T) {
 }
 
 // THE LOCK BUDGET IS THE PASS'S: rounds that each stay inside it still stop once
-// together they have held the lock that long, because a writer whose retry is in
-// flight at every gap waits through all of them.
+// together they have held the lock that long, release included, because a writer
+// whose retry is in flight at every gap waits through all of them.
 func TestTheEvictionPassHoldsTheLockForItsBudgetInAll(t *testing.T) {
 	t.Parallel()
 
-	f := newCacheFake()
-	c := cacheClient(t, f)
-	first := cutOffLineage(t, f, c, "acme/api/go")
-	second := cutOffLineage(t, f, c, "acme/web/go")
+	// THE FIRST ROUND REMOVES BOTH LINEAGES' LEAVES and, with its release, spends
+	// all but a quarter of the budget, which leaves the second round room for one of
+	// the two generations it could otherwise remove.
+	for name, cost := range map[string]struct{ removal, release time.Duration }{
+		"removals":              {removal: evictionLockBudget * 3 / 8},
+		"removals and releases": {removal: evictionLockBudget / 4, release: evictionLockBudget / 4},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	// EACH REMOVAL COSTS A THIRD OF THE BUDGET: the first round removes both
-	// lineages' leaves, two thirds, and leaves the second round a third, room for
-	// one of the two generations it could otherwise remove.
-	clock := time.Now()
-	c.clock = func() time.Time { return clock }
-	c.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
-		out, err := f.run(ctx, bin, args)
-		if err == nil && slices.Contains(args, "rm") && !slices.Contains(args, "lock") &&
-			!slices.Contains(args, "trash") {
-			clock = clock.Add(evictionLockBudget / 3)
-		}
+			f := newCacheFake()
+			c := cacheClient(t, f)
+			first := cutOffLineage(t, f, c, "acme/api/go")
+			second := cutOffLineage(t, f, c, "acme/web/go")
 
-		return out, err
-	}
+			clock := time.Now()
+			c.clock = func() time.Time { return clock }
+			c.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
+				out, err := f.run(ctx, bin, args)
+				switch {
+				case err != nil || !slices.Contains(args, "rm") || slices.Contains(args, "trash"):
+				case slices.Contains(args, "lock"):
+					clock = clock.Add(cost.release)
+				default:
+					clock = clock.Add(cost.removal)
+				}
 
-	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil &&
-		!strings.Contains(err.Error(), "wait for the next eviction pass") {
-		t.Fatalf("Evict = %v, want no failure but the budget's stop", err)
-	}
+				return out, err
+			}
 
-	if f.images[first[3].Handle] || f.images[second[3].Handle] {
-		t.Fatal("the first round kept a lineage's leaf, inside the budget, so the test proves nothing")
-	}
-	if kept := btoi(f.images[first[2].Handle]) + btoi(f.images[second[2].Handle]); kept != 1 {
-		t.Errorf("the second round kept %d of the two generations it could reach, want 1: the "+
-			"rounds together hold the lock for the pass's budget, not each its own", kept)
-	}
-	for _, generation := range []storecontract.Candidate{first[0], first[1], second[0], second[1]} {
-		if !f.images[generation.Handle] {
-			t.Errorf("eviction removed %s after the pass's budget was spent", generation.Handle)
-		}
+			if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil &&
+				!strings.Contains(err.Error(), "wait for the next eviction pass") {
+				t.Fatalf("Evict = %v, want no failure but the budget's stop", err)
+			}
+
+			if f.images[first[3].Handle] || f.images[second[3].Handle] {
+				t.Fatal("the first round kept a lineage's leaf, inside the budget, so the test proves nothing")
+			}
+			if kept := btoi(f.images[first[2].Handle]) + btoi(f.images[second[2].Handle]); kept != 1 {
+				t.Errorf("the second round kept %d of the two generations it could reach, want 1: the "+
+					"rounds together hold the lock for the pass's budget, not each its own", kept)
+			}
+			for _, generation := range []storecontract.Candidate{first[0], first[1], second[0], second[1]} {
+				if !f.images[generation.Handle] {
+					t.Errorf("eviction removed %s after the pass's budget was spent", generation.Handle)
+				}
+			}
+		})
 	}
 }
 
