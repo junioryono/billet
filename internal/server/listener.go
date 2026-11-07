@@ -319,8 +319,8 @@ type Listener struct {
 	waitingFor  int
 	demandKnown bool
 	demandAt    time.Time
-	// answeredAt is when GitHub last answered this tier's poll, with a message or with
-	// none. Guarded by mu; reported, never scheduled on.
+	// answeredAt is when GitHub last answered this tier's poll with nothing new
+	// (dateEmptyAnswer). Guarded by mu; reported, never scheduled on.
 	answeredAt time.Time
 	// demandReleases is the tier's release generation read with the runner
 	// count waitingFor was made from (alloc.ActiveRunnersAt).

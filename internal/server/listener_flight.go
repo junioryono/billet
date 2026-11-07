@@ -386,6 +386,8 @@ func (l *Listener) joinLaunches(ctx context.Context) {
 type exchanged struct {
 	msg *Message
 	err error
+	// at is when the poll returned, taken where it returned.
+	at time.Time
 	// beside is a failure of the reconciliation an ended launch woke while the poll
 	// was out, for the loop to treat as it treats its own reconciliation's. The
 	// answer in hand is not handled then, and GitHub delivers it again.
@@ -408,8 +410,10 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 
 	if !l.backgroundLaunches {
 		msg, err := l.timedPoll(ctx, l.session, l.lastMessageID, advertised)
+		answer := exchanged{msg: msg, err: err, at: l.clock()}
+		l.dateEmptyAnswer(answer)
 
-		return exchanged{msg: msg, err: err}
+		return answer
 	}
 
 	var (
@@ -424,6 +428,7 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 		defer close(answered)
 
 		answer.msg, answer.err = l.timedPoll(ctx, session, lastMessageID, advertised)
+		answer.at = l.clock()
 	})
 
 	var beside error
@@ -433,6 +438,7 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 		case <-answered:
 			polling.Wait()
 			answer.beside = beside
+			l.dateEmptyAnswer(answer)
 
 			return answer
 		case <-l.loopWake:
@@ -449,24 +455,31 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 
 // timedPoll polls GitHub and reports how long an answered poll took. One that failed is
 // left out: its time is the client's retries, and it says nothing of GitHub's long poll.
-//
-// AND IT DATES THE ANSWER HERE, where the poll returned, with a message or with none: the
-// statistics in hand are as current as that answer, which a pool reads before it shrinks
-// (AnsweredAt), and with background launches the loop may consume the answer long after,
-// inside a reconciliation, where a date taken then would date an old count as current.
 func (l *Listener) timedPoll(ctx context.Context, session Session, lastMessageID int64, advertised int,
 ) (*Message, error) {
 	began := time.Now()
 
 	msg, err := session.GetMessage(ctx, lastMessageID, advertised)
 	if err == nil || errors.Is(err, ErrNoMessage) {
-		answered := l.clock()
-
 		l.timings.pollTook(l.tier, time.Since(began))
-		l.mu.Lock()
-		l.answeredAt = answered
-		l.mu.Unlock()
 	}
 
 	return msg, err
+}
+
+// dateEmptyAnswer records when GitHub last answered this tier's poll with nothing new
+// (AnsweredAt, which a pool reads before it shrinks): the statistics in hand are then as
+// current as that answer. ONLY AN EMPTY ANSWER, because a message carries work the count
+// in hand has not seen yet, and a reconciliation of the old statistics may publish
+// before the loop adopts the new. DATED WHERE THE POLL RETURNED, and recorded here, on
+// the loop's goroutine as it receives the answer, never by the poll aside, so no
+// reconciliation runs between the record and the answer's adoption.
+func (l *Listener) dateEmptyAnswer(answer exchanged) {
+	if !errors.Is(answer.err, ErrNoMessage) {
+		return
+	}
+
+	l.mu.Lock()
+	l.answeredAt = answer.at
+	l.mu.Unlock()
 }

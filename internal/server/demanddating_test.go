@@ -297,21 +297,29 @@ func TestAnAnsweredPollDatesTheReport(t *testing.T) {
 	}
 }
 
-// AN ANSWER IS DATED WHERE THE POLL RETURNED, in both of the loop's ways of polling, by
-// the poll itself: with background launches the loop may consume the answer long after,
-// inside a reconciliation, and an answer dated then would date an old count as current.
-// A poll GitHub did not answer dates nothing.
-func TestAnAnswerIsDatedWhenItsPollReturned(t *testing.T) {
+// ONLY AN EMPTY ANSWER IS DATED, WHERE ITS POLL RETURNED, in both of the loop's ways of
+// polling: with background launches the loop may consume the answer long after, inside a
+// reconciliation, and an answer dated then would date an old count as current. A
+// message carries work the count in hand has not seen, so it dates nothing, and nor does
+// a poll GitHub did not answer.
+func TestOnlyAnEmptyAnswerIsDatedWhenItsPollReturned(t *testing.T) {
 	t.Parallel()
+
+	reset := errors.New("the connection reset")
+	work := &Message{MessageID: 1, Statistics: &Statistics{TotalAssignedJobs: 1}}
 
 	for name, c := range map[string]struct {
 		background bool
+		msg        *Message
 		answer     error
+		dated      bool
 	}{
-		"inline":             {answer: ErrNoMessage},
-		"background":         {background: true, answer: ErrNoMessage},
-		"inline, failed":     {answer: errors.New("the connection reset")},
-		"background, failed": {background: true, answer: errors.New("the connection reset")},
+		"inline, empty":         {answer: ErrNoMessage, dated: true},
+		"background, empty":     {background: true, answer: ErrNoMessage, dated: true},
+		"inline, a message":     {msg: work},
+		"background, a message": {background: true, msg: work},
+		"inline, failed":        {answer: reset},
+		"background, failed":    {background: true, answer: reset},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -329,7 +337,7 @@ func TestAnAnswerIsDatedWhenItsPollReturned(t *testing.T) {
 				now = returned
 				mu.Unlock()
 
-				return nil, c.answer
+				return c.msg, c.answer
 			}}
 
 			opts := []Option{WithLogger(slog.New(slog.DiscardHandler)), WithRunner(&fakeRunner{})}
@@ -355,14 +363,14 @@ func TestAnAnswerIsDatedWhenItsPollReturned(t *testing.T) {
 			dated := l.answeredAt
 			l.mu.Unlock()
 
-			if !errors.Is(answer.err, c.answer) {
-				t.Fatalf("the poll answered %v, want %v", answer.err, c.answer)
+			if !errors.Is(answer.err, c.answer) || answer.msg != c.msg {
+				t.Fatalf("the poll answered %v, %v; want %v, %v", answer.msg, answer.err, c.msg, c.answer)
 			}
-			if errors.Is(c.answer, ErrNoMessage) && !dated.Equal(returned) {
-				t.Fatalf("an answered poll was dated %v, want its return at %v", dated, returned)
+			if c.dated && !dated.Equal(returned) {
+				t.Fatalf("an empty answer was dated %v, want its poll's return at %v", dated, returned)
 			}
-			if !errors.Is(c.answer, ErrNoMessage) && !dated.IsZero() {
-				t.Fatalf("a poll GitHub did not answer was dated %v", dated)
+			if !c.dated && !dated.IsZero() {
+				t.Fatalf("an answer that was not empty was dated %v", dated)
 			}
 		})
 	}
