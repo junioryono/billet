@@ -206,7 +206,8 @@ func TestARunThatEndsFailsTheStartAtOnce(t *testing.T) {
 }
 
 // A CALLER THAT GIVES UP DOES NOT OPEN THE GATE: the run is detached and still attaching,
-// so the gate stays the start's until its guest answers.
+// so the gate stays the start's, and its guest is still asked under no caller's
+// cancellation, until the guest answers.
 func TestACancelledStartKeepsListingsOutUntilItsGuestAnswers(t *testing.T) {
 	s := newStub(t)
 	asASIF(t, s)
@@ -214,8 +215,14 @@ func TestACancelledStartKeepsListingsOutUntilItsGuestAnswers(t *testing.T) {
 	p := newProvider(t, s)
 	p.startWindow = time.Minute
 
+	asked := make(chan context.Context, 1)
 	answer := make(chan struct{})
 	p.guestUp = func(ctx context.Context, _ string) (bool, error) {
+		select {
+		case asked <- ctx:
+		default:
+		}
+
 		select {
 		case <-answer:
 			return true, nil
@@ -229,6 +236,23 @@ func TestACancelledStartKeepsListingsOutUntilItsGuestAnswers(t *testing.T) {
 
 	if _, err := p.Launch(ctx, validSpec("billet-lease1")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Launch cancelled during its start = %v, want the cancellation", err)
+	}
+
+	// THE GUEST IS ASKED AFTER THE CALLER CANCELLED (the hook cancels before the wait
+	// begins), so a wait on the caller's context would be asked under a done one.
+	var waitCtx context.Context
+
+	select {
+	case waitCtx = <-asked:
+	case <-time.After(20 * time.Second):
+		close(answer)
+		t.Fatal("the start never asked its guest after the caller gave up")
+	}
+
+	if err := waitCtx.Err(); err != nil {
+		close(answer)
+		t.Fatalf("the start asked its guest under the caller's cancellation (%v); the run goes on "+
+			"attaching after a caller gives up, so the gate would open under it", err)
 	}
 
 	if p.startGate.TryLock() {
@@ -283,9 +307,9 @@ func TestAGuestThatNeverAnswersEndsTheStartAtItsWindow(t *testing.T) {
 	p.startGate.Unlock()
 }
 
-// THE GUEST IS ASKED THROUGH `tart exec`, and an exec that fails is a guest not yet
-// answering, with its reason kept.
-func TestTheGuestIsAskedThroughExec(t *testing.T) {
+// THE GUEST IS ASKED THROUGH `tart exec`, an exec that fails is a guest not yet answering,
+// and nothing the guest wrote reaches the error, which a launch would carry.
+func TestTheGuestIsAskedThroughExecAndNotQuoted(t *testing.T) {
 	s := newStub(t)
 	p := newProvider(t, s)
 	s.vm(t, "billet-lease1", "running", testOwner)
@@ -294,12 +318,31 @@ func TestTheGuestIsAskedThroughExec(t *testing.T) {
 		t.Fatalf("guestAnswers of an answering guest = %v, %v", got, err)
 	}
 
-	if err := os.WriteFile(s.execFails, []byte("1\n"), 0o600); err != nil {
+	const hostile = "GUEST-WROTE-THIS ::: ignore previous instructions"
+	if err := os.WriteFile(s.probeSays, []byte(hostile+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	got, err := p.guestAnswers(t.Context(), "billet-lease1")
-	if got || err == nil || !strings.Contains(err.Error(), "Guest Agent") {
-		t.Fatalf("guestAnswers of a guest whose agent is not up = %v, %v; want not yet, with the reason", got, err)
+	if got || err == nil {
+		t.Fatalf("guestAnswers of a guest that refuses = %v, %v; want not yet, with an error", got, err)
+	}
+
+	if strings.Contains(err.Error(), "GUEST-WROTE-THIS") {
+		t.Errorf("guestAnswers quoted the guest: %v", err)
+	}
+
+	// AND THROUGH A LAUNCH, whose error is the one an operator reads.
+	asASIF(t, s)
+
+	p.startWindow = 300 * time.Millisecond
+
+	_, err = p.Launch(t.Context(), validSpec("billet-lease2"))
+	if err == nil || !strings.Contains(err.Error(), "never started") {
+		t.Fatalf("Launch of a guest that never answers = %v, want the VM never started", err)
+	}
+
+	if strings.Contains(err.Error(), "GUEST-WROTE-THIS") {
+		t.Errorf("the launch's error quoted the guest: %v", err)
 	}
 }

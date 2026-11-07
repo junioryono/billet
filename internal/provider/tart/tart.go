@@ -91,11 +91,10 @@ const ownerMarker = "billet-owner"
 // runLogDir holds what each detached `tart run` writes, one file a VM, under billet's
 // own directory in tart's store.
 //
-// NEVER INSIDE THE VM'S BUNDLE. It was, and a macOS guest on an ASIF disk then failed
-// to start under billet most of the time with Virtualization's "Internal Virtualization
-// error" while every hand launch booted it (tart 2.41.1, macOS 27.2, 2026-11-07): the
-// full billet start failed 3 of 4, and with only the log moved out of the bundle it
-// booted 3 of 3. A raw-disk guest was never affected.
+// NOT INSIDE THE VM'S BUNDLE, where nothing but tart's own files belong. It was moved
+// out (#776) on a probe that blamed it for ASIF macOS guests failing to start (3 of 4
+// with it, 3 of 3 without); the failures went on, and the cause was billet's `tart list`
+// during the disk's attach (see bootVM). The log's place was never the cause.
 const runLogDir = "run-logs"
 
 // stagingSuffix marks a clone that has not yet been renamed to its lease name.
@@ -1173,19 +1172,24 @@ func (p *Provider) bootVM(ctx context.Context, name string, held []*os.File, net
 		return err
 	}
 
-	if p.afterRunStart != nil {
-		p.afterRunStart(name)
-	}
-
 	done := make(chan error, 1)
 
 	// NOT THE CALLER'S CANCELLATION: the run goes on attaching after a caller gives up.
 	attaching := context.WithoutCancel(ctx)
 
+	// THE GOROUTINE OWNS THE GATE FROM HERE, and releases it BEFORE it publishes the
+	// answer (defers run last first), so a caller that has the answer finds it released.
 	go func() {
+		var err error
+
+		defer func() { done <- err }()
 		defer p.startGate.RUnlock()
 
-		done <- p.awaitGuest(attaching, name, exited)
+		if p.afterRunStart != nil {
+			p.afterRunStart(name)
+		}
+
+		err = p.awaitGuest(attaching, name, exited)
 	}()
 
 	select {
@@ -1293,9 +1297,10 @@ func (p *Provider) lookForGuest(ctx context.Context, name string, deadline time.
 }
 
 // guestAnswers asks the guest to run nothing, through `tart exec`, which sizes no disk.
-// An exec that fails is a guest not yet answering, and its error says why.
+// An exec that fails is a guest not yet answering, and its error quotes nothing the guest
+// wrote (guestAnswer).
 func (p *Provider) guestAnswers(ctx context.Context, name string) (bool, error) {
-	if _, err := p.run(ctx, "exec", name, "/bin/sh", "-c", ":"); err != nil {
+	if _, err := p.guestAnswer(ctx, name, ":"); err != nil {
 		return false, err
 	}
 
