@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -180,7 +181,8 @@ type matrixWorkflowJob struct {
 // both architectures' tiers and keeps one Git mirror and one registry cache, so with a
 // package or a repository in common the second architecture's cold job read warm (run
 // 42386061079, 2026-11-07). The npm job's script is executed for each architecture
-// against a fake npm, and the git job's checkout names its repository by architecture.
+// against a fake npm, and the git job's checkout names its repository by architecture,
+// each one the node would mirror.
 func TestEachArchitectureFetchesItsOwnSharedCacheContent(t *testing.T) {
 	t.Parallel()
 	bin := t.TempDir()
@@ -232,9 +234,21 @@ func TestEachArchitectureFetchesItsOwnSharedCacheContent(t *testing.T) {
 		return ""
 	}
 	cold, warm := repo("matrix-cold.yml"), repo("matrix-warm.yml")
-	if cold != warm || !strings.Contains(cold, "runner.arch == 'ARM64'") || !strings.Contains(cold, "github.repository") {
-		t.Errorf("the git jobs check out %q (cold) and %q (warm); want one repository per architecture, "+
-			"the same in both", cold, warm)
+	if cold != warm {
+		t.Errorf("the cold git job checks out %q and the warm one %q; want the same", cold, warm)
+	}
+	// The node mirrors only repositories of the session's scope owner (mirrorsOwner),
+	// and the matrix's scope is the matrix repository, so each architecture's choice
+	// must be a repository of github.repository_owner, and not the same one.
+	choice := regexp.MustCompile(`^\$\{\{ runner\.arch == 'ARM64' && ` +
+		`format\('\{0\}/([a-z0-9-]+)', github\.repository_owner\) \|\| github\.repository \}\}$`)
+	m := choice.FindStringSubmatch(cold)
+	if m == nil {
+		t.Fatalf("the git job checks out %q; want arm64 to fetch a repository of the matrix repository's "+
+			"owner and x64 the matrix repository", cold)
+	}
+	if m[1] == "acceptance-matrix" {
+		t.Errorf("arm64 checks out %s, the matrix repository x64 checks out", m[1])
 	}
 }
 

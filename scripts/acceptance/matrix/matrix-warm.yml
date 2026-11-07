@@ -91,10 +91,12 @@ jobs:
     steps:
       # A REPOSITORY OF ITS OWN PER ARCHITECTURE: one node serves both architectures'
       # tiers and keeps one Git mirror, so a second architecture's cold job would find the
-      # first's repository already mirrored. arm64 fetches GitHub's public sample.
+      # first's repository already mirrored. arm64 fetches the public fixture beside the
+      # matrix repository, under the same owner, because the node mirrors only the
+      # scope's owner's repositories and a job's token reads only its own private one.
       - uses: actions/checkout@v6
         with:
-          repository: ${{ runner.arch == 'ARM64' && 'octocat/Hello-World' || github.repository }}
+          repository: ${{ runner.arch == 'ARM64' && format('{0}/acceptance-matrix-fixture', github.repository_owner) || github.repository }}
   go:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 30

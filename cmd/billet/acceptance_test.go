@@ -1187,15 +1187,17 @@ func TestOnlyJobsThisRunWaitedForCountTowardsIt(t *testing.T) {
 	}
 
 	after := append(append([]acceptanceJob(nil), before...),
-		acceptanceJob{LeaseID: "new-1", Billet: "succeeded", RunID: 2},
+		acceptanceJob{LeaseID: "new-1", Billet: "succeeded", RunID: 2, StartedAt: "2026-11-07T10:00:00Z"},
 		// STILL RUNNING, so it does not count either: a job billet has not
 		// concluded is one whose compute may still be there.
-		acceptanceJob{LeaseID: "new-2", RunID: 2},
+		acceptanceJob{LeaseID: "new-2", RunID: 2, StartedAt: "2026-11-07T10:00:00Z"},
 		// A RUNNER GITHUB NEVER GAVE A JOB, ended: nothing of GitHub's on it, so it is
 		// no job of the run's (run 42386061079, 2026-11-07).
 		acceptanceJob{LeaseID: "new-3", Billet: "done"},
-		// AND ONE GITHUB GAVE A JOB BY ANY OF ITS THREE MARKS counts.
-		acceptanceJob{LeaseID: "new-4", Billet: "done", GitHubRunID: 3},
+		// A RUN BOUGHT IT AND NOTHING STARTED: a failed launch, or a runner another took
+		// the job from, while the job itself runs and counts elsewhere.
+		acceptanceJob{LeaseID: "new-4", Billet: "failed", RunID: 2, GitHubRunID: 3},
+		// AND ONE GITHUB ANSWERED FOR counts, started or not.
 		acceptanceJob{LeaseID: "new-5", Billet: "done", GitHub: "failed"},
 	)
 
@@ -1204,8 +1206,8 @@ func TestOnlyJobsThisRunWaitedForCountTowardsIt(t *testing.T) {
 	for i := range got {
 		ids = append(ids, got[i].LeaseID)
 	}
-	if strings.Join(ids, ",") != "new-1,new-4,new-5" {
-		t.Errorf("the wait counted %v; only the new, finished jobs GitHub gave should count", ids)
+	if strings.Join(ids, ",") != "new-1,new-5" {
+		t.Errorf("the wait counted %v; only the new, finished jobs GitHub started or answered for should count", ids)
 	}
 }
 
