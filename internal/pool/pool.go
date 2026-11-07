@@ -18,7 +18,11 @@
 // tokens all lapsed with nothing joined is held for a person, as is one whose join the
 // source contradicted. A held order still holds its host and is no longer on its way.
 //
-// SHRINKING IS NOT HERE. A host leaves only by drain, on proof it holds nothing.
+// THE POOL SHRINKS ONLY BY DRAIN. With server.pool.idle_after set, a step asks for the
+// release of one joined host per architecture that has held nothing for that long, when
+// the architecture is above its floor, has no demand and nothing on its way; the release
+// then takes the host out of placement and seals it only on proof it holds nothing, as a
+// person's would. A timer proposes; only the proof releases (ADR-030).
 package pool
 
 import (
@@ -63,6 +67,8 @@ type Ledger interface {
 	PoolOrderReleased(ctx context.Context, id string) error
 	PoolOrderGone(ctx context.Context, id string) error
 	CapacityReports(ctx context.Context) (map[string]alloc.TierCapacity, error)
+	PoolIdleHosts(ctx context.Context) ([]alloc.PoolIdleHost, error)
+	ReleaseIdlePoolHost(ctx context.Context, order string, idleBefore time.Time, reason string) error
 }
 
 // Choice is one place a host may be ordered from.
@@ -84,7 +90,10 @@ type Config struct {
 	Archs          map[config.Arch]Policy
 	Sources        map[string]hostsource.Source
 	RefusalBackoff time.Duration
-	TokenLife      time.Duration
+	// IdleAfter is how long a joined host must have held nothing before the pool asks
+	// for its release; zero, the pool never shrinks itself.
+	IdleAfter time.Duration
+	TokenLife time.Duration
 	// DemandFreshness is the oldest a capacity report may be and still count.
 	DemandFreshness time.Duration
 	// Boot renders an ordered host's first boot from its order and join token.
@@ -217,6 +226,54 @@ func (p *Pool) Step(ctx context.Context) error {
 		}
 		if err := p.order(ctx, arch, a, orders); err != nil {
 			errs = append(errs, err)
+		}
+	}
+	// SHRINKING READS DEMAND, so a reading it could not take shrinks nothing.
+	if p.cfg.IdleAfter > 0 && err == nil {
+		if serr := p.shrink(ctx, orders, demand); serr != nil {
+			errs = append(errs, serr)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// shrink asks for the release of the joined host idle longest on each architecture
+// above its floor with no demand, nothing unknown and nothing on its way, when it has
+// held nothing for IdleAfter. One host per architecture per step: each release counts
+// as leaving from the next step on, and the floor is read again then.
+func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, demand map[config.Arch]bool) error {
+	idle, err := p.ledger.PoolIdleHosts(ctx)
+	if err != nil {
+		return fmt.Errorf("pool: read the idle hosts: %w", err)
+	}
+	cutoff := p.now().Add(-p.cfg.IdleAfter)
+	var errs []error
+	for arch, a := range p.cfg.Archs {
+		c := count(orders, arch)
+		if c.unknown > 0 || c.onItsWay > 0 || demand[arch] || c.active-c.leaving <= a.Floor {
+			continue
+		}
+		var pick *alloc.PoolIdleHost
+		for i := range idle {
+			h := &idle[i]
+			if h.Arch == arch && !h.Since.After(cutoff) && (pick == nil || h.Since.Before(pick.Since)) {
+				pick = h
+			}
+		}
+		if pick == nil {
+			continue
+		}
+		reason := fmt.Sprintf("idle since %s, past server.pool.idle_after %s",
+			pick.Since.UTC().Format(time.RFC3339), p.cfg.IdleAfter)
+		switch err := p.ledger.ReleaseIdlePoolHost(ctx, pick.Order, cutoff, reason); {
+		case errors.Is(err, alloc.ErrPoolHostNotIdle):
+			p.log.Info("a pool host the pool would release took work first; it stays", "order", pick.Order)
+		case err != nil:
+			errs = append(errs, err)
+		default:
+			p.log.Info("releasing an idle pool host, by drain", "order", pick.Order, "arch", arch,
+				"idle_since", pick.Since)
 		}
 	}
 

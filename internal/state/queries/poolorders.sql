@@ -194,3 +194,32 @@ UPDATE pool_orders SET state = 'gone', reason = @reason, updated_at = @updated_a
 SELECT CAST((SELECT COUNT(*) FROM node_enrollments e
               WHERE (e.pool_order = @order_id OR e.name = @node_name) AND e.state = 'approved')
           + (SELECT COUNT(*) FROM issued_certs c WHERE c.node = @node_name) AS BIGINT);
+
+-- name: ListPoolIdleHosts :many
+-- The joined pool hosts that hold nothing, with when each last held something: the end of
+-- its newest job and its node's admission, the later of which the scaler reads as the
+-- start of its idleness (ADR-030). A host whose release was asked for, held for a person,
+-- or not placed is none of them. COALESCE(node, target_node), as everywhere: an escrow
+-- aimed at a host has committed its room.
+SELECT p.order_id, p.node_name, p.arch,
+       CAST(COALESCE((SELECT MAX(h.finished_at) FROM job_history h WHERE h.node = p.node_name), '') AS TEXT) AS last_finished,
+       CAST(COALESCE((SELECT MAX(e.decided_at) FROM node_enrollments e
+                       WHERE e.name = p.node_name AND e.state = 'approved'), '') AS TEXT) AS joined
+  FROM pool_orders p
+ WHERE p.state = 'placed' AND p.release_requested_at = '' AND p.node_name != '' AND p.join_hold = ''
+   AND NOT EXISTS (SELECT 1 FROM leases l
+                    WHERE COALESCE(l.node, l.target_node) = p.node_name AND l.phase NOT IN ('done','failed'))
+ ORDER BY p.order_id;
+
+-- name: ReadPoolIdleHost :one
+-- One order's row of ListPoolIdleHosts, read again in the transaction that asks for its
+-- release, so a host that took work since is not proposed.
+SELECT p.order_id, p.node_name, p.arch,
+       CAST(COALESCE((SELECT MAX(h.finished_at) FROM job_history h WHERE h.node = p.node_name), '') AS TEXT) AS last_finished,
+       CAST(COALESCE((SELECT MAX(e.decided_at) FROM node_enrollments e
+                       WHERE e.name = p.node_name AND e.state = 'approved'), '') AS TEXT) AS joined
+  FROM pool_orders p
+ WHERE p.order_id = @order_id AND p.state = 'placed' AND p.release_requested_at = '' AND p.node_name != ''
+   AND p.join_hold = ''
+   AND NOT EXISTS (SELECT 1 FROM leases l
+                    WHERE COALESCE(l.node, l.target_node) = p.node_name AND l.phase NOT IN ('done','failed'));

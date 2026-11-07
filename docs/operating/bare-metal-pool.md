@@ -33,7 +33,8 @@ A control plane with `server.pool` in its config orders Firecracker hosts from r
   - **phoenixNAP never says gone of a server it took back.** So on phoenixNAP, wherever the source is no longer configured or now orders somewhere else, and for a sealed host taken back by hand, a person closes the sealed or released order with `billet pool close --reason TEXT <order>`, after checking the source's console. The order's reason records that a person closed it.
   - **A node of a sealed, released or gone order is refused at registration**, for good, so a node already on its way in when its host was sealed or closed cannot rejoin the fleet; a host only draining still registers, and stays out of placement.
   - **A `pool-` name is the pool's.** `billet ca issue` and `billet join` refuse one without its order, and a node registering under a sealed order's name is not placeable.
-- **Not yet:** the pool does not shrink itself; a person releases a host. The pool's IAM, including the console read the join needs on AWS, is owed.
+- **Built: shrinking, when `idle_after` is set.** At each step the pool asks for the release of the host idle longest on each architecture, once it has held nothing for `idle_after`, the architecture is above its floor, a fresh reading shows no demand there and no order is on its way or unknown. Idle is measured from the end of the host's newest job, or from its admission if it never ran one. The request is the one `billet pool release` makes, read again in its own transaction, so a host that took a job in the meantime stays; the release then drains and seals it only on proof, as above. Unset, the pool never shrinks itself.
+- **Not yet:** the pool's IAM, including the console read the join needs on AWS, is owed, and a shrink timed to a source's billing hour.
 
 ## An order's life
 

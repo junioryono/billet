@@ -1,0 +1,112 @@
+package alloc
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
+)
+
+// ErrPoolHostNotIdle is a pool host the scaler proposed for release that, read again in
+// the release's own transaction, holds something, has a release asked for already, or
+// was not idle long enough. Nothing was written.
+var ErrPoolHostNotIdle = errors.New("alloc: the pool host is not idle")
+
+// PoolIdleHost is a joined pool host that holds nothing, with when it last held
+// something: the end of its newest job, or its node's admission if it never ran one.
+type PoolIdleHost struct {
+	Order string
+	Node  string
+	Arch  config.Arch
+	Since time.Time
+}
+
+// PoolIdleHosts lists the joined pool hosts that hold nothing. A host whose idleness
+// cannot be read (no admission recorded, a time this binary cannot parse) is left out:
+// could-not-tell is never idle.
+func (a *Allocator) PoolIdleHosts(ctx context.Context) ([]PoolIdleHost, error) {
+	var out []PoolIdleHost
+
+	err := a.db.View(ctx, func(q querier) error {
+		rows, err := state.ReadQueries(q).ListPoolIdleHosts(ctx)
+		if err != nil {
+			return fmt.Errorf("alloc: list the idle pool hosts: %w", err)
+		}
+
+		out = out[:0]
+
+		for _, r := range rows {
+			since, ok := idleSince(r.LastFinished, r.Joined)
+			if !ok {
+				continue
+			}
+
+			out = append(out, PoolIdleHost{Order: r.OrderID, Node: r.NodeName, Arch: config.Arch(r.Arch), Since: since})
+		}
+
+		return nil
+	})
+
+	return out, err
+}
+
+// ReleaseIdlePoolHost asks for the release of a joined pool host on the pool's word, in
+// one transaction that reads it again: it must still hold nothing, have no release asked
+// for, and have held nothing since idleBefore. Otherwise it answers ErrPoolHostNotIdle
+// and writes nothing. The release then proves itself as any other does (ADR-030): a
+// timer proposes a drain; only the proof releases.
+func (a *Allocator) ReleaseIdlePoolHost(ctx context.Context, order string, idleBefore time.Time, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("alloc: releasing idle pool order %s needs a reason", order)
+	}
+
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+
+		row, err := q.ReadPoolIdleHost(ctx, order)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: pool order %s holds something, is not placed and joined, or its release "+
+				"was asked for", ErrPoolHostNotIdle, order)
+		case err != nil:
+			return fmt.Errorf("alloc: read whether pool order %s is idle: %w", order, err)
+		}
+
+		since, ok := idleSince(row.LastFinished, row.Joined)
+		if !ok || since.After(idleBefore) {
+			return fmt.Errorf("%w: pool order %s has not been idle since %s", ErrPoolHostNotIdle, order,
+				idleBefore.UTC().Format(time.RFC3339))
+		}
+
+		return requestJoinedReleaseTx(ctx, q, order, row.NodeName, reason, a.now().UTC())
+	})
+}
+
+// idleSince is the later of a host's newest job's end and its node's admission, and
+// whether either could be read. A value this binary cannot parse makes the answer
+// unknown rather than older: an unreadable time is never read as idle.
+func idleSince(lastFinished, joined string) (time.Time, bool) {
+	var since time.Time
+
+	for _, s := range []string{lastFinished, joined} {
+		if s == "" {
+			continue
+		}
+
+		t, err := time.Parse(timestampFormat, s)
+		if err != nil {
+			return time.Time{}, false
+		}
+
+		if t.After(since) {
+			since = t
+		}
+	}
+
+	return since, !since.IsZero()
+}

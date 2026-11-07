@@ -344,6 +344,60 @@ func (q *Queries) ListPoolClearanceTargets(ctx context.Context) ([]ListPoolClear
 	return items, nil
 }
 
+const listPoolIdleHosts = `-- name: ListPoolIdleHosts :many
+SELECT p.order_id, p.node_name, p.arch,
+       CAST(COALESCE((SELECT MAX(h.finished_at) FROM job_history h WHERE h.node = p.node_name), '') AS TEXT) AS last_finished,
+       CAST(COALESCE((SELECT MAX(e.decided_at) FROM node_enrollments e
+                       WHERE e.name = p.node_name AND e.state = 'approved'), '') AS TEXT) AS joined
+  FROM pool_orders p
+ WHERE p.state = 'placed' AND p.release_requested_at = '' AND p.node_name != '' AND p.join_hold = ''
+   AND NOT EXISTS (SELECT 1 FROM leases l
+                    WHERE COALESCE(l.node, l.target_node) = p.node_name AND l.phase NOT IN ('done','failed'))
+ ORDER BY p.order_id
+`
+
+type ListPoolIdleHostsRow struct {
+	OrderID      string
+	NodeName     string
+	Arch         string
+	LastFinished string
+	Joined       string
+}
+
+// The joined pool hosts that hold nothing, with when each last held something: the end of
+// its newest job and its node's admission, the later of which the scaler reads as the
+// start of its idleness (ADR-030). A host whose release was asked for, held for a person,
+// or not placed is none of them. COALESCE(node, target_node), as everywhere: an escrow
+// aimed at a host has committed its room.
+func (q *Queries) ListPoolIdleHosts(ctx context.Context) ([]ListPoolIdleHostsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPoolIdleHosts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPoolIdleHostsRow
+	for rows.Next() {
+		var i ListPoolIdleHostsRow
+		if err := rows.Scan(
+			&i.OrderID,
+			&i.NodeName,
+			&i.Arch,
+			&i.LastFinished,
+			&i.Joined,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPoolOrders = `-- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
        node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted,
@@ -531,6 +585,41 @@ func (q *Queries) MarkUncertainPoolOrderFound(ctx context.Context, arg MarkUncer
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const readPoolIdleHost = `-- name: ReadPoolIdleHost :one
+SELECT p.order_id, p.node_name, p.arch,
+       CAST(COALESCE((SELECT MAX(h.finished_at) FROM job_history h WHERE h.node = p.node_name), '') AS TEXT) AS last_finished,
+       CAST(COALESCE((SELECT MAX(e.decided_at) FROM node_enrollments e
+                       WHERE e.name = p.node_name AND e.state = 'approved'), '') AS TEXT) AS joined
+  FROM pool_orders p
+ WHERE p.order_id = $1 AND p.state = 'placed' AND p.release_requested_at = '' AND p.node_name != ''
+   AND p.join_hold = ''
+   AND NOT EXISTS (SELECT 1 FROM leases l
+                    WHERE COALESCE(l.node, l.target_node) = p.node_name AND l.phase NOT IN ('done','failed'))
+`
+
+type ReadPoolIdleHostRow struct {
+	OrderID      string
+	NodeName     string
+	Arch         string
+	LastFinished string
+	Joined       string
+}
+
+// One order's row of ListPoolIdleHosts, read again in the transaction that asks for its
+// release, so a host that took work since is not proposed.
+func (q *Queries) ReadPoolIdleHost(ctx context.Context, orderID string) (ReadPoolIdleHostRow, error) {
+	row := q.db.QueryRowContext(ctx, readPoolIdleHost, orderID)
+	var i ReadPoolIdleHostRow
+	err := row.Scan(
+		&i.OrderID,
+		&i.NodeName,
+		&i.Arch,
+		&i.LastFinished,
+		&i.Joined,
+	)
+	return i, err
 }
 
 const readPoolOrder = `-- name: ReadPoolOrder :one

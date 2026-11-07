@@ -39,6 +39,53 @@ type fakeLedger struct {
 	sealCalls    int
 	// contradicted is every sealed order whose proof the ledger no longer holds.
 	contradicted map[string]bool
+	// idleSince is when each order's joined host last held something; an order absent
+	// holds something now. idleReleases records each ReleaseIdlePoolHost asked, and
+	// tookWork makes one answer that its host is not idle.
+	idleSince    map[string]time.Time
+	idleReleases []idleRelease
+	tookWork     map[string]bool
+}
+
+type idleRelease struct {
+	order  string
+	cutoff time.Time
+	reason string
+}
+
+func (l *fakeLedger) PoolIdleHosts(context.Context) ([]alloc.PoolIdleHost, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []alloc.PoolIdleHost
+	for i := range l.orders {
+		o := &l.orders[i]
+		since, ok := l.idleSince[o.ID]
+		if ok && o.State == alloc.PoolPlaced && o.NodeName != "" && o.ReleaseRequested.IsZero() && o.JoinHold == "" {
+			out = append(out, alloc.PoolIdleHost{Order: o.ID, Node: o.NodeName, Arch: o.Arch, Since: since})
+		}
+	}
+
+	return out, nil
+}
+
+func (l *fakeLedger) ReleaseIdlePoolHost(_ context.Context, order string, cutoff time.Time, reason string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.idleReleases = append(l.idleReleases, idleRelease{order: order, cutoff: cutoff, reason: reason})
+	if l.tookWork[order] {
+		return fmt.Errorf("%w: it took a job", alloc.ErrPoolHostNotIdle)
+	}
+	for i := range l.orders {
+		o := &l.orders[i]
+		since, ok := l.idleSince[order]
+		if o.ID == order && ok && !since.After(cutoff) && o.State == alloc.PoolPlaced && o.ReleaseRequested.IsZero() {
+			o.ReleaseRequested, o.ReleaseReason = l.now(), reason
+
+			return nil
+		}
+	}
+
+	return fmt.Errorf("%w: order %s", alloc.ErrPoolHostNotIdle, order)
 }
 
 // contradict records that order's node said, after its seal, that it is back.
