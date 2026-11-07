@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -282,14 +283,17 @@ func TestARestartDestroysAHeldVMAtItsBoundBeforeItsSessionOpens(t *testing.T) {
 
 		go func() { done <- l.Run(ctx) }()
 
+		// A CLEANUP TICK INSIDE THE HOLD, a third of the lease's life after Run began and half a
+		// minute before the bound: the pass that runs then finds the hold standing.
+		time.Sleep(l.heartbeatInterval() + time.Second)
 		synctest.Wait()
 
 		if len(p.destroyed) != 0 {
 			t.Fatalf("destroyed %v inside the hold, while the session waits", p.destroyed)
 		}
 
-		// PAST THE BOUND, with the session still refused, and long enough for the cleanup clock.
-		time.Sleep(time.Minute + 30*time.Second)
+		// PAST THE BOUND, with the session still refused, and through the next tick.
+		time.Sleep(time.Minute)
 		synctest.Wait()
 
 		if opens.Load() != 1 {
@@ -310,31 +314,67 @@ func TestARestartDestroysAHeldVMAtItsBoundBeforeItsSessionOpens(t *testing.T) {
 	})
 }
 
-// A LISTENER STOPPED WHILE ITS FIRST SESSION IS REFUSED RETURNS, closes nothing it never opened, and
-// leaves its cleanup loop joined (#783).
-func TestAListenerStoppedBeforeItsSessionOpensReturns(t *testing.T) {
+// A LISTENER STOPPED WHILE ITS FIRST SESSION IS REFUSED JOINS THE CLEANUP IT STARTED, and returns
+// only once a destroy that cleanup is inside has come back, closing no session it never opened
+// (#783). A Run that returned first would leave that destroy to release a lease into a ledger its
+// caller had every right to close.
+func TestAListenerStoppedBeforeItsSessionOpensJoinsItsCleanup(t *testing.T) {
 	t.Parallel()
 
 	synctest.Test(t, func(t *testing.T) {
-		p := newRunnerlessPool(t, job11)
+		p, held, failed := heldPool(t, "Failed")
+		p.complete(t, failed)
 
-		l := NewListener(p.a, p.l.tier, nil, WithRunner(p.l.runner), WithRunnerRegistry(p.registry),
+		// THE HOLD ENDED, so the restored completion's destroy is owed on the first tick.
+		if ended, err := p.a.EndLeaseHold(t.Context(), held.LeaseID, alloc.HoldEndedByOperator); err != nil || !ended {
+			t.Fatalf("end the hold: %t, %v", ended, err)
+		}
+
+		entered, unblock := make(chan struct{}), make(chan struct{})
+
+		var once sync.Once
+
+		runner := &fakeRunner{onDestroy: func(requestID int64) error {
+			once.Do(func() { close(entered) })
+			<-unblock
+			p.destroyed = append(p.destroyed, requestID)
+
+			return nil
+		}}
+
+		l := NewListener(p.a, p.l.tier, nil, WithRunner(runner), WithRunnerRegistry(p.registry),
 			WithSessionReopen(func(ctx context.Context) (Session, error) {
 				<-ctx.Done()
 
 				return nil, ctx.Err()
 			}))
+		l.holdOnFailure, l.completionStore = testHold, p.l.completionStore
+		l.writeJobResult = func(context.Context, string, string, int64) error { return nil }
 
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan error, 1)
 
 		go func() { done <- l.Run(ctx) }()
 
-		synctest.Wait()
+		// THE CLEANUP LOOP'S DESTROY HAS BEGUN, with no session open.
+		<-entered
 		cancel()
+		synctest.Wait()
+
+		select {
+		case err := <-done:
+			t.Fatalf("Run returned %v while a destroy its cleanup started was still running", err)
+		default:
+		}
+
+		close(unblock)
 
 		if err := <-done; !errors.Is(err, context.Canceled) {
 			t.Errorf("Run = %v, want the cancellation", err)
+		}
+
+		if !slices.Contains(p.destroyed, 11) {
+			t.Errorf("destroyed %v; want the owed VM gone", p.destroyed)
 		}
 	})
 }
