@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
 )
 
 func holdAllocator(t *testing.T, now *time.Time) *Allocator {
@@ -35,6 +36,40 @@ func TestAHoldsBoundIsWrittenOnce(t *testing.T) {
 	again, err := a.OpenLeaseHold(t.Context(), "l1", "t", now.Add(24*time.Hour))
 	if err != nil || !again.Until.Equal(first) || !again.HeldAt.Equal(hold.HeldAt) {
 		t.Errorf("a second opening answered %+v, %v; want the bound it opened with", again, err)
+	}
+}
+
+// A SEALED DEPLOYMENT OPENS NO NEW HOLD, and keeps one it had (#783). The seal is read in the
+// transaction that would write the hold, so a seal committed before it is never missed, and a hold
+// opened before the seal is answered as it stands.
+func TestASealedDeploymentOpensNoNewHoldAndKeepsItsOld(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	a := holdAllocator(t, &now)
+
+	before, err := a.OpenLeaseHold(t.Context(), "l1", "t", now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("open before the seal: %v", err)
+	}
+
+	if _, err := a.db.Seal(t.Context(), state.SealRequest{
+		Provenance: state.ProvenanceOperator, Reason: "draining", Actor: "ops",
+	}); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	if hold, err := a.OpenLeaseHold(t.Context(), "l2", "t", now.Add(time.Hour)); !errors.Is(err, ErrAdmissionSealed) {
+		t.Errorf("a new hold on a sealed deployment: %+v, %v; want ErrAdmissionSealed", hold, err)
+	}
+
+	if _, err := a.LeaseHoldOf(t.Context(), "l2"); !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("a refused hold was written: %v", err)
+	}
+
+	after, err := a.OpenLeaseHold(t.Context(), "l1", "t", now.Add(24*time.Hour))
+	if err != nil || !after.Holding() || !after.Until.Equal(before.Until) {
+		t.Errorf("the hold from before the seal: %+v, %v; want it as it stood", after, err)
 	}
 }
 

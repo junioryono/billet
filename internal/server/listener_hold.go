@@ -53,12 +53,15 @@ func (l *Listener) holdCompletion(ctx context.Context, job dispatch.Job, lease *
 	)
 
 	// NOR A NEW ONE WHILE A DRAIN IS WAITING: someone wants this tier empty, and an hour of a job that
-	// failed after the seal is not what they are waiting for. THE SEAL IS READ FROM THE LEDGER HERE,
-	// not only from the poll loop's flag: a restarted listener runs its cleanup before its session
-	// opens and so before any poll has read admission (#783), and a seal another process wrote
-	// reaches the flag only a poll later.
-	if l.holdOnFailure > 0 && !l.isDraining() && !l.isQuiesced() && l.admitsNewHold(ctx) {
+	// failed after the seal is not what they are waiting for. THE POLL LOOP'S FLAGS ARE ONLY THE FAST
+	// ANSWER: a restarted listener runs its cleanup before its session opens and so before any poll
+	// has read admission (#783), and a seal another process wrote reaches them only a poll later, so
+	// OpenLeaseHold reads the seal in the transaction that would write the hold.
+	if l.holdOnFailure > 0 && !l.isDraining() && !l.isQuiesced() {
 		hold, err = l.alloc.OpenLeaseHold(ctx, lease.ID, l.tier, time.Now().Add(l.holdOnFailure))
+		if errors.Is(err, alloc.ErrAdmissionSealed) {
+			return false
+		}
 	} else {
 		hold, err = l.alloc.LeaseHoldOf(ctx, lease.ID)
 		if errors.Is(err, alloc.ErrLeaseNotFound) {
@@ -80,20 +83,6 @@ func (l *Listener) holdCompletion(ctx context.Context, job dispatch.Job, lease *
 	l.parkHeld(ctx, job, lease, hold)
 
 	return true
-}
-
-// admitsNewHold says the deployment is admitting work, as the ledger says now. A ledger that cannot
-// answer opens no hold, as everywhere else a hold is decided.
-func (l *Listener) admitsNewHold(ctx context.Context) bool {
-	admission, err := l.alloc.Admission(ctx)
-	if err != nil {
-		l.log.Warn("could not read whether this deployment is admitting work, so a failed job's VM is "+
-			"not held", "tier", l.tier, "error", err)
-
-		return false
-	}
-
-	return !admission.Sealed()
 }
 
 // holdStands says a hold is still holding, and ends one that has reached its bound. THE BOUND IS
