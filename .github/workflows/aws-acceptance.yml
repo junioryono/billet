@@ -156,9 +156,9 @@ jobs:
             --query Parameter.Value --output text >/srv/billet-accept/app.pem)
           chown -R ubuntu: '$RUN_DIR' /srv/billet-accept/app.pem
           runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' prepare '$RUN_DIR' /srv/billet-accept/base.yaml '$ACCOUNT' '$KMS_KEY_ARN'
-          for f in tiers deployment iam.json; do aws s3 cp --only-show-errors \"$RUN_DIR/\$f\" \"s3://$BUCKET/runs/$RUN/\$f\"; done"
+          for f in tiers deployment iam.json teardown.json; do aws s3 cp --only-show-errors \"$RUN_DIR/\$f\" \"s3://$BUCKET/runs/$RUN/\$f\"; done"
           mkdir -p out
-          for f in tiers deployment iam.json; do
+          for f in tiers deployment iam.json teardown.json; do
             aws s3 cp --only-show-errors "s3://$BUCKET/runs/$RUN/$f" "out/$f"
           done
       - name: Grant the node its policy, scoped to this run's deployment
@@ -190,6 +190,7 @@ jobs:
               exit 1
             fi
             labels="$labels $label"
+            echo "label_$arch=$label" >>"$GITHUB_OUTPUT"
           done
           echo "labels=$labels" >>"$GITHUB_OUTPUT"
           : >out/runs
@@ -238,6 +239,38 @@ jobs:
           set -euo pipefail
           read -r -a labels <<<"$LABELS"
           scripts/acceptance/matrix-dispatch.sh warm "$REPO" "$RUN" out/runs "${labels[@]}"
+      # THE TWO-WRITER RUNS LAST, ONE ARCHITECTURE AT A TIME, each with a token and a
+      # deadline of its own: each writer a holds a runner while it waits for its writer b,
+      # so they run with nothing else on the deployment, and two architectures' at once
+      # could hold every slot.
+      - id: writers-x64-token
+        if: ${{ steps.labels.outputs.label_x64 != '' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Dispatch the x64 two-writer runs, alone on the deployment, and wait for them
+        if: ${{ steps.labels.outputs.label_x64 != '' }}
+        env:
+          GH_TOKEN: ${{ steps.writers-x64-token.outputs.token }}
+          LABEL: ${{ steps.labels.outputs.label_x64 }}
+        run: scripts/acceptance/matrix-dispatch.sh writers "$REPO" "$RUN" out/runs "$LABEL"
+      - id: writers-arm64-token
+        if: ${{ steps.labels.outputs.label_arm64 != '' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Dispatch the arm64 two-writer runs, alone on the deployment, and wait for them
+        if: ${{ steps.labels.outputs.label_arm64 != '' }}
+        env:
+          GH_TOKEN: ${{ steps.writers-arm64-token.outputs.token }}
+          LABEL: ${{ steps.labels.outputs.label_arm64 }}
+        run: scripts/acceptance/matrix-dispatch.sh writers "$REPO" "$RUN" out/runs "$LABEL"
       # A FAILED OR CANCELLED DISPATCH STOPS THE HOST'S RUN rather than leave it waiting
       # out --wait for jobs nobody sent; the wait below then joins it, and the judge
       # refuses a run with no recorded exit. Asked whether or not the run's command id
@@ -247,7 +280,7 @@ jobs:
         if: ${{ failure() || cancelled() }}
         run: |
           scripts/acceptance/ssm-run.sh run "$HOST" 120 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' stop '$RUN_DIR'"
-      - name: Wait for the host's run, which tears down what it made
+      - name: Wait for the host's run, which writes the evidence and stops its services
         if: ${{ always() && steps.host-run.outputs.id != '' }}
         run: scripts/acceptance/ssm-run.sh wait "$HOST" "${{ steps.host-run.outputs.id }}" 10800
       - name: Judge the cells
@@ -303,26 +336,25 @@ jobs:
             status=1
           }
           down=0
-          # DECOMMISSION DELETES WHAT THE NODE'S OWN POLICY NEVER MAY: a sticky disk's
-          # state objects, which billet's rendered policy keeps from the credential that
-          # evicts (site-acceptance.md, 2026-11-06). So the teardown alone is granted
-          # their delete, under this cache's prefix, and only for its length. A policy
-          # with no cache objects has no state objects to delete.
-          if [ -s out/iam.json ]; then
-            if ! jq '{Version: "2012-10-17", Statement: [{Sid: "MatrixDecommissionState",
-                Effect: "Allow", Action: "s3:DeleteObject",
-                Resource: [.Statement[] | select(.Sid == "BilletCacheObjects") | .Resource[]
-                  | sub("/\\*$"; "/owners/*/state/*")]}]}' out/iam.json >out/down.json; then
-              echo "could not read the node's policy; a cache's state objects may be left" >&2
+          # DECOMMISSION DELETES WHAT THE NODE'S OWN POLICY NEVER MAY: this deployment's
+          # cache state objects, which billet's rendered policy keeps from the credential
+          # that evicts (site-acceptance.md, 2026-11-06). The teardown alone is granted
+          # their delete, as `billet acceptance matrix teardown-policy` renders it for this
+          # deployment's own state prefix, and only once no run lives on the host, so no
+          # live node ever holds it; `down` is the run's one teardown (`run` is sent
+          # --no-teardown).
+          if [ -s out/teardown.json ]; then
+            if ! scripts/acceptance/ssm-run.sh run "$HOST" 2400 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' stopped '$RUN_DIR'"; then
+              echo "the host's run is still live, so the teardown's delete is not granted beside it" >&2
               status=1
-            elif [ "$(jq '.Statement[0].Resource | length' out/down.json)" != 0 ]; then
-              if aws iam put-role-policy --role-name "$HOST_ROLE" \
-                --policy-name "billet-matrix-$RUN-down" --policy-document file://out/down.json; then
-                sleep 20
-              else
-                echo "could not grant the teardown its delete; a cache's state objects may be left" >&2
-                status=1
-              fi
+            elif aws iam put-role-policy --role-name "$HOST_ROLE" \
+              --policy-name "billet-matrix-$RUN-down" --policy-document file://out/teardown.json; then
+              # IAM is eventually consistent; a delete refused for it fails `down`, which
+              # holds the host for a person rather than leave anything unsaid.
+              sleep 20
+            else
+              echo "could not grant the teardown its delete; this deployment's cache state may be left" >&2
+              status=1
             fi
           fi
           # THE KEY GOES ONLY WITH THE DEPLOYMENT: a run still tearing down needs it to

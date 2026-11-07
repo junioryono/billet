@@ -26,6 +26,8 @@ type fakeBlocks struct {
 	deletedSnap    []string
 	snapshots      map[string]snapshotInfo
 	available      []volumeInfo
+	// attached are owned volumes in use, which no purge takes and a sweep counts.
+	attached []string
 	// notOwned ids refuse deletion the way the real API does for a resource
 	// carrying another store's ownership tags.
 	notOwned map[string]bool
@@ -59,8 +61,31 @@ func (f *fakeBlocks) DeleteVolume(_ context.Context, id string) error {
 		return fmt.Errorf("ebs-s3: refusing to delete volume %s: %w", id, errNotOwned)
 	}
 	f.deletedVolume = append(f.deletedVolume, id)
+	f.available = slices.DeleteFunc(f.available, func(v volumeInfo) bool { return v.ID == id })
 
 	return nil
+}
+
+// Owned counts what carries both ownership tags, which a notOwned resource does not.
+func (f *fakeBlocks) Owned(context.Context) (int, int, error) {
+	snapshots, volumes := 0, 0
+	for id := range f.snapshots {
+		if !f.notOwned[id] {
+			snapshots++
+		}
+	}
+	for _, volume := range f.available {
+		if !f.notOwned[volume.ID] {
+			volumes++
+		}
+	}
+	for _, id := range f.attached {
+		if !f.notOwned[id] {
+			volumes++
+		}
+	}
+
+	return snapshots, volumes, nil
 }
 
 func (f *fakeBlocks) CreateSnapshot(
@@ -901,12 +926,17 @@ func TestResidueCountsWhatAPurgeLeft(t *testing.T) {
 		t.Fatalf("PublishCAS: %v", err)
 	}
 	blocks.available = []volumeInfo{{ID: "vol-orphan", Created: now}}
+	owned := len(blocks.snapshots)
+	// ANOTHER DEPLOYMENT'S snapshot under this cache owner, which Purge skips and a
+	// sweep must not count, or no teardown could ever pass it.
+	blocks.snapshots["snap-foreign"] = snapshotInfo{ID: "snap-foreign", Created: now}
+	blocks.notOwned = map[string]bool{"snap-foreign": true}
 
 	before, err := s.Residue(t.Context())
 	if err != nil {
 		t.Fatalf("Residue: %v", err)
 	}
-	want := Residue{Snapshots: len(blocks.snapshots), Volumes: 1, StateObjects: len(objects.objects)}
+	want := Residue{Snapshots: owned, Volumes: 1, StateObjects: len(objects.objects)}
 	if before != want || before.Snapshots < 1 || before.StateObjects < 1 {
 		t.Fatalf("residue before the purge = %+v, want %+v with a snapshot and a state object", before, want)
 	}
@@ -915,13 +945,12 @@ func TestResidueCountsWhatAPurgeLeft(t *testing.T) {
 	if _, err := s.Purge(t.Context()); !errors.Is(err, errFakeDelete) {
 		t.Fatalf("the refused state delete was not surfaced: %v", err)
 	}
-	blocks.available = nil
 
 	after, err := s.Residue(t.Context())
 	if err != nil {
 		t.Fatalf("Residue: %v", err)
 	}
-	if after.Empty() || after.StateObjects != want.StateObjects || after.Snapshots != 0 {
+	if after != (Residue{StateObjects: want.StateObjects}) {
 		t.Fatalf("residue after a refused purge = %+v, want only the %d state object(s)", after,
 			want.StateObjects)
 	}
@@ -932,6 +961,12 @@ func TestResidueCountsWhatAPurgeLeft(t *testing.T) {
 	}
 	if after, err := s.Residue(t.Context()); err != nil || !after.Empty() {
 		t.Fatalf("residue after a whole purge = %+v, %v; want none", after, err)
+	}
+
+	// AN ATTACHED VOLUME is this deployment's though no purge takes it.
+	blocks.attached = []string{"vol-in-use"}
+	if after, err := s.Residue(t.Context()); err != nil || after != (Residue{Volumes: 1}) {
+		t.Fatalf("residue with an attached volume = %+v, %v; want that volume", after, err)
 	}
 }
 

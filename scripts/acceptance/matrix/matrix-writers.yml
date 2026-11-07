@@ -12,19 +12,19 @@ name: matrix-writers
 # runner once a had published would clone a's generation, not the seed, and under cas its
 # commit would then not be stale (run 42358345989, 2026-11-07, where it found a's marker).
 # AND THE TWO PAIRS RUN ONE AFTER THE OTHER (seed-lww needs reader-cas, with explicit
-# conditions so a cas failure does not skip the lww cell), and one architecture's run
-# after another's (the concurrency group, which queues the second of two; the matrix
-# covers at most two), so at most two writers hold runners at once across the
-# deployment: otherwise two a writers could take the only two slots and wait for b
-# writers that never get one. The deployment must give two jobs at once.
+# conditions so a cas failure does not skip the lww cell), and the dispatcher sends this
+# workflow last, one architecture at a time, once every other run has finished, so at most
+# two writers hold runners at once on the deployment: otherwise two a writers could take
+# the only two slots and wait for b writers that never get one. The deployment must give
+# two jobs at once.
 #
 # EVERY WAIT IS A DEADLINE ON THE CLOCK, each GitHub call within it bounded, and each
 # job's timeout holds its waits and its sticky disk's post step (fsck and a commit the
 # action bounds at 13 minutes, about 15 in all): a 15 for b's clone, b 30 for a's whole
 # job, the reader 6 for both logs. A run longer than the dispatcher's phase deadline fails
-# that phase; it never passes. The reader needs both jobs, so both commits have settled when it clones, and
-# it finds one writer's generation whole, never one writer's marker over the other's
-# payload. AND IT READS EACH WRITER'S OWN LOG, where the sticky disk's post step says what
+# that phase; it never passes. The reader needs both jobs, so both commits have settled
+# when it clones, and it finds one writer's generation whole, never one writer's marker
+# over the other's payload. AND IT READS EACH WRITER'S OWN LOG, where the sticky disk's post step says what
 # became of its write: writer a must have published, and writer b must have been
 # superseded under cas and have published under last-write-wins, so a reader that finds
 # the expected writer for any other reason (a's publication failed, b never reached its
@@ -47,9 +47,6 @@ on:
       tag:
         description: what makes this run's keys its own
         required: true
-concurrency:
-  group: matrix-writers-${{ inputs.tag }}
-  cancel-in-progress: false
 permissions:
   contents: read
   # Writer b reads its own run's jobs, to wait for writer a's, and the reader reads the

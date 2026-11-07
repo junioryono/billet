@@ -15,9 +15,12 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/awspolicy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lease"
+	"github.com/junioryono/billet/internal/store/ebss3"
 )
 
 // The acceptance matrix (#554): every backend, architecture, cache and case billet
@@ -449,9 +452,58 @@ func cmdAcceptanceMatrix(env cli.Env, args []string) error {
 		return cmdMatrixJobs(env, args[1:])
 	case "judge":
 		return cmdMatrixJudge(env, args[1:])
+	case "teardown-policy":
+		return cmdMatrixTeardownPolicy(env, args[1:])
 	}
 
-	return fmt.Errorf("billet acceptance matrix %s: unknown subcommand; it is cells, tiers, jobs or judge", args[0])
+	return fmt.Errorf("billet acceptance matrix %s: unknown subcommand; it is cells, tiers, jobs, judge or "+
+		"teardown-policy", args[0])
+}
+
+// cmdMatrixTeardownPolicy prints the IAM policy a run's teardown needs beside the node's
+// own: s3:DeleteObject on this deployment's cache state objects, which `billet
+// decommission` deletes and billet's rendered node policy never lets a node delete
+// (2026-11-07). It names this deployment's own state prefix, the store's own
+// derivation, so the grant reaches no other deployment's state under the same bucket
+// prefix. A workspace whose config has no ebs-s3 cache prints nothing.
+func cmdMatrixTeardownPolicy(env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet acceptance matrix teardown-policy", env.Stdout)
+	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
+	if err := cli.Parse(fs, args); err != nil {
+		return err
+	}
+	ws, err := requireAcceptanceWorkspace(*workspace)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return err
+	}
+	policy, ok, err := matrixTeardownPolicy(cfg, ws.DeploymentID)
+	if err != nil || !ok {
+		return err
+	}
+
+	return writeJSON(env.Stdout, policy)
+}
+
+func matrixTeardownPolicy(cfg *config.Config, deployment string) (awspolicy.Policy, bool, error) {
+	if cfg.Node == nil || cfg.Node.EBSS3 == nil {
+		return awspolicy.Policy{}, false, nil
+	}
+	if deployment == "" {
+		return awspolicy.Policy{}, false, errors.New("the workspace records no deployment id, so its " +
+			"cache's state prefix is unknown")
+	}
+	store := *cfg.Node.EBSS3
+	prefix := ebss3.StatePrefix(store, app.CacheNamespace(deployment, cfg.Node.Site))
+
+	return awspolicy.Policy{Version: "2012-10-17", Statement: []awspolicy.Statement{{
+		Sid: "BilletMatrixDecommissionState", Effect: "Allow", Action: []string{"s3:DeleteObject"},
+		Resource: []string{fmt.Sprintf("arn:%s:s3:::%s/%s*", awspolicy.PartitionForRegion(store.Region),
+			store.Bucket, prefix)},
+	}}}, true, nil
 }
 
 // matrixJobsPerArch is how many jobs one dispatch of every matrix workflow runs on one

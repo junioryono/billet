@@ -4,6 +4,7 @@
 #   matrix-host.sh run <run-dir> <jobs>
 #   matrix-host.sh stop <run-dir>
 #   matrix-host.sh judge <run-dir> <archs> <runs-file> <owner/repo>
+#   matrix-host.sh stopped <run-dir>
 #   matrix-host.sh down <run-dir>
 #
 # The acceptance matrix's half that runs on the acceptance host, beside the node its
@@ -12,17 +13,20 @@
 #
 # prepare stands an isolated deployment up from <base-config> (`billet acceptance up`),
 # writes <run-dir>/tiers (one "<backend> <arch> <label>" line per tier the matrix
-# dispatches to), <run-dir>/deployment (its id) and <run-dir>/iam.json (the node's policy
-# scoped to that id, which the caller puts on this host's role before `run`).
+# dispatches to), <run-dir>/deployment (its id), <run-dir>/iam.json (the node's policy
+# scoped to that id, which the caller puts on this host's role before `run`) and
+# <run-dir>/teardown.json (the delete of that deployment's cache state objects, which
+# decommission needs and the node's policy never grants, and which the caller puts on the
+# role only for `down`; empty when the config has no ebs-s3 cache).
 # <guest-role-arn> is the role inside the base config's node.ec2.instance_profile, for the
 # policy's iam:PassRole; omit it when the guests carry no instance profile.
 #
-# run runs the deployment until <jobs> jobs have finished (`billet acceptance run`, which
-# writes the evidence and tears down what it made), under matrix-supervise.py beside this
-# script: it holds <run-dir>/run.lock for as long as the run lives, writes the run's exit
+# run runs the deployment until <jobs> jobs have finished (`billet acceptance run
+# --no-teardown`, which writes the evidence and stops the services, and leaves the destroy
+# to `down`, the one teardown, which runs with the teardown's grant), under
+# matrix-supervise.py beside this script: it holds <run-dir>/run.lock for as long as the run lives, writes the run's exit
 # to <run-dir>/run.exit, and, when <run-dir>/stop-requested appears, sends the run ONE
-# SIGTERM, as an operator's Ctrl-C would, so the run writes its evidence and tears down
-# what it made. A stop requested before it starts means it never starts.
+# SIGTERM, as an operator's Ctrl-C would, so the run writes its evidence and stops. A stop requested before it starts means it never starts.
 #
 # stop requests that, and returns; it signals nothing itself.
 #
@@ -31,6 +35,10 @@
 # with the judge's status. It judges nothing for a run with no recorded exit, which may
 # still be writing.
 #
+# stopped requests a stop and waits as down does, and takes nothing down: it exits 0 only
+# once no run lives in <run-dir>, which is when the caller may put the teardown's grant
+# on the role, so no live node ever holds it.
+#
 # down requests a stop, waits up to MATRIX_DOWN_WAIT seconds (default 1800) for the run's
 # lock to be free (a reboot frees it; nothing else does while the run lives), then destroys whatever the run left (`billet acceptance down`, idempotent)
 # and removes the workspace; a run still live after that is said, and nothing is taken
@@ -38,7 +46,7 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,7p' "$0" >&2
+	sed -n '2,8p' "$0" >&2
 	exit 2
 }
 
@@ -77,12 +85,16 @@ prepare)
 		echo "matrix: the node's policy could not be rendered" >&2
 		exit 1
 	fi
+	if ! "$billet" acceptance matrix teardown-policy --workspace "$ws" >"$run_dir/teardown.json"; then
+		echo "matrix: the teardown's policy could not be rendered" >&2
+		exit 1
+	fi
 	echo "matrix: deployment $(cat "$run_dir/deployment") is up; its tiers:"
 	cat "$run_dir/tiers"
 	;;
 run)
 	[ "$#" -eq 3 ] || usage
-	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 150m
+	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 150m --no-teardown
 	;;
 stop)
 	[ "$#" -eq 2 ] || usage
@@ -113,6 +125,17 @@ judge)
 	judged=$?
 	cat "$run_dir/out/matrix.txt"
 	exit "$judged"
+	;;
+stopped)
+	[ "$#" -eq 2 ] || usage
+	if [ -d "$run_dir" ]; then
+		: >"$run_dir/stop-requested" || exit 1
+		if ! python3 -I "$supervise" await "$run_dir" "${MATRIX_DOWN_WAIT:-1800}"; then
+			echo "matrix: the run is still live; its workspace is $ws" >&2
+			exit 1
+		fi
+	fi
+	echo "matrix: no run lives in $run_dir"
 	;;
 down)
 	[ "$#" -eq 2 ] || usage

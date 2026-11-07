@@ -11,9 +11,50 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lease"
+	"github.com/junioryono/billet/internal/store/ebss3"
 
 	"gopkg.in/yaml.v3"
 )
+
+// THE TEARDOWN'S DELETE REACHES THIS DEPLOYMENT'S STATE OBJECTS AND NO OTHER'S. Runs
+// share the bucket's prefix and are told apart by their owner digest, so a grant on
+// owners/*/state/* would let one run's teardown delete another's (2026-11-07).
+func TestTheTeardownPolicyNamesOnlyThisDeploymentsState(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{Node: &config.NodeConfig{Site: "us-west-2a", EBSS3: &config.EBSS3Config{
+		Region: "us-west-2", AvailabilityZone: "us-west-2a", Bucket: "cache-bucket", Prefix: "billet-cache",
+	}}}
+	policy, ok, err := matrixTeardownPolicy(cfg, "d1")
+	if err != nil || !ok || len(policy.Statement) != 1 || len(policy.Statement[0].Resource) != 1 {
+		t.Fatalf("teardown policy = %+v, %v, %v", policy, ok, err)
+	}
+	statement := policy.Statement[0]
+	if statement.Effect != "Allow" || !slices.Equal(statement.Action, []string{"s3:DeleteObject"}) {
+		t.Fatalf("the teardown grants %s %v, want only s3:DeleteObject", statement.Effect, statement.Action)
+	}
+	resource := statement.Resource[0]
+	granted := func(key string) bool {
+		return strings.HasPrefix("arn:aws:s3:::cache-bucket/"+key, strings.TrimSuffix(resource, "*"))
+	}
+	mine := ebss3.StatePrefix(*cfg.Node.EBSS3, "d1/us-west-2a")
+	if !strings.HasSuffix(resource, "*") || !granted(mine+"k.json") {
+		t.Fatalf("%s does not reach this deployment's state object %s", resource, mine+"k.json")
+	}
+	if other := ebss3.StatePrefix(*cfg.Node.EBSS3, "d2/us-west-2a"); granted(other + "k.json") {
+		t.Fatalf("%s reaches another deployment's state object %s", resource, other+"k.json")
+	}
+	if archive := strings.TrimSuffix(mine, "state/") + "archives/x"; granted(archive) {
+		t.Fatalf("%s reaches this deployment's archive %s", resource, archive)
+	}
+
+	if _, ok, err := matrixTeardownPolicy(&config.Config{Node: &config.NodeConfig{}}, "d1"); ok || err != nil {
+		t.Fatalf("a config with no ebs-s3 cache rendered a teardown policy: %v, %v", ok, err)
+	}
+	if _, _, err := matrixTeardownPolicy(cfg, ""); err == nil {
+		t.Fatal("a workspace with no deployment id rendered a policy for an unknown prefix")
+	}
+}
 
 // A CELL WANTS THE LEDGER'S WORD FOR SUCCESS, which is the scale-set message's, never
 // the REST API's: the first real run (42358345989, 2026-11-07) failed every cell whose
