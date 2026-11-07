@@ -30,6 +30,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **On a Mac the node is a launch agent and a root daemon cannot do the job.**
 - **What launchd loaded is not what its plist says.**
+- **An installed agent is billet's own when its property list is the shipped one, not its bytes (#787).**
 
 ### The local commands and the seal: [references/local-commands.md](references/local-commands.md)
 
