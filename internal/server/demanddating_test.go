@@ -375,3 +375,63 @@ func TestOnlyAnEmptyAnswerIsDatedWhenItsPollReturned(t *testing.T) {
 		})
 	}
 }
+
+// AN ANSWER TAKEN LATE KEEPS ITS POLL'S DATE, and nothing dates it before the loop takes
+// it: the clock moves past the demand freshness between the poll's return and the loop
+// taking the answer, as a long reconciliation would make it, and the date recorded is
+// still the poll's return.
+func TestAnAnswerTakenLateKeepsItsPollsDate(t *testing.T) {
+	t.Parallel()
+
+	a, label, _, _ := workTier(t)
+	returned := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+
+	var (
+		mu  sync.Mutex
+		now = returned.Add(-time.Hour)
+	)
+
+	session := &fakeSession{stats: &Statistics{}, onGet: func() (*Message, error) {
+		mu.Lock()
+		now = returned
+		mu.Unlock()
+
+		return nil, ErrNoMessage
+	}}
+
+	l := NewListener(a, label, session, WithLogger(slog.New(slog.DiscardHandler)), WithRunner(&fakeRunner{}),
+		WithBackgroundLaunches())
+	l.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return now
+	}
+
+	var beforeTaken time.Time
+
+	l.beforeAnswerTaken = func() {
+		l.mu.Lock()
+		beforeTaken = l.answeredAt
+		l.mu.Unlock()
+
+		mu.Lock()
+		now = returned.Add(time.Hour)
+		mu.Unlock()
+	}
+
+	if answer := l.exchange(t.Context(), 1, false); !errors.Is(answer.err, ErrNoMessage) {
+		t.Fatalf("the poll answered %v", answer.err)
+	}
+
+	l.mu.Lock()
+	dated := l.answeredAt
+	l.mu.Unlock()
+
+	if !beforeTaken.IsZero() {
+		t.Errorf("the answer was dated %v before the loop took it", beforeTaken)
+	}
+	if !dated.Equal(returned) {
+		t.Errorf("an answer taken an hour after its poll returned was dated %v, want %v", dated, returned)
+	}
+}

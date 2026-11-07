@@ -438,6 +438,9 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 		case <-answered:
 			polling.Wait()
 			answer.beside = beside
+			if l.beforeAnswerTaken != nil {
+				l.beforeAnswerTaken()
+			}
 			l.dateEmptyAnswer(answer)
 
 			return answer
