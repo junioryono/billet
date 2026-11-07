@@ -338,13 +338,12 @@ type Provider struct {
 	// asked again under the lock.
 	beforeRunLogLock func()
 	// startGate keeps this provider's own `tart list` out of the window between an ASIF
-	// VM's `tart run` and Virtualization.framework holding its disk: each such start holds
-	// it shared, and a listing exclusively. See bootVM.
+	// VM's `tart run` and its guest's first answer: each such start holds it shared, and a
+	// listing exclusively. See bootVM.
 	startGate sync.RWMutex
-	// diskAttached answers whether a Virtualization.framework process holds the VM's
-	// disk open. Nil is the real answer, through lsof and processPath; a test whose
-	// stub runs no VM stands in for it.
-	diskAttached func(ctx context.Context, name string) (bool, error)
+	// guestUp asks whether a starting VM's guest answers. Nil is the real question,
+	// `tart exec`; a test stands in for it to watch the gate or hold the answer back.
+	guestUp func(ctx context.Context, name string) (bool, error)
 	// afterRunStart runs just after a start spawns `tart run`, and nothing sets it outside
 	// tests, which ask there whether the gate is already the start's.
 	afterRunStart func(name string)
@@ -1119,27 +1118,31 @@ func (p *Provider) startDetachedHolding(name string, held []*os.File, netFlags .
 	return err
 }
 
-// bootVM starts the VM's `tart run`, and for an ASIF disk returns once
-// Virtualization.framework holds that disk open, or says why it never did.
+// bootVM starts the VM's `tart run`, and for an ASIF disk returns once its guest first
+// answers, or says why it never did.
 //
 // NO `tart list` RUNS WHILE AN ASIF DISK IS BEING ATTACHED, from this provider. `tart
 // list` and `tart get` size every VM they show, and an ASIF disk is sized by running
 // `diskutil image info` on it (tart 2.41.1: List.swift, VMDirectory.diskSizeBytes,
 // Diskutil.imageInfo), while `tart run` takes the lock that makes `tart list` say running
-// before it asks the framework to start the VM and attach that disk (Run.swift). A
-// `diskutil` read landing on the attach failed the start with "Internal Virtualization
-// error" every time it was tried on purpose (a fleet Mac, macOS 27.2, 2026-11-07: a loop
-// of `diskutil image info` every 0.3 s from the start of a hand-run `tart run` failed it
-// 2 of 2, none booted 2 of 2), and billet's own polling of `tart list` from the first
-// instant failed most launches of an ASIF macOS guest. A raw disk is only stat'ed, so its
-// start takes none of this and needs no process to be visible.
+// before it asks the framework to start the VM and attach that disk (Run.swift). Measured
+// on a fleet Mac (macOS 27.2, golden-gate 27.2 at 6 vCPU and 24 GiB, 2026-11-07), with
+// `diskutil image info` looped every 0.3 s for 60 s beside a fresh `tart run`: from the
+// start, it failed the start 2 of 2 with "Internal Virtualization error"; from the moment
+// the framework's process first held the disk (0.2 to 0.4 s in), 1 of 3; from 5, 15 or
+// 30 s after that, from `tart ip` answering (5.6 to 6.5 s) and from the guest's first
+// `tart exec` answer (13.3 to 15.5 s), none of 3 each, as with no polling at all. So the
+// disk being held is not the end of the window, and the guest answering is past it with
+// room: that is what the start waits for. A raw disk is only stat'ed, so its start takes
+// none of this.
 //
 // THE GATE IS THE START'S, NOT THE CALLER'S. The start holds startGate shared from before
-// `tart run` until the disk is attached, the run ends, or the start window does, in a
+// `tart run` until its guest answers, the run ends, or the start window does, in a
 // goroutine of its own, because the run is detached: a caller that gives up has not
-// stopped it attaching. Every listing this provider makes takes the gate exclusively.
-// Another process running `tart list` meanwhile (another deployment, an operator, `billet
-// check`) is outside what this can hold.
+// stopped it attaching. Every listing this provider makes takes the gate exclusively, so
+// a node's listings wait out each ASIF boot. Another process running `tart list`
+// meanwhile (another deployment, an operator, `billet check`) is outside what this can
+// hold.
 func (p *Provider) bootVM(ctx context.Context, name string, held []*os.File, netFlags ...string) error {
 	asif, err := p.diskIsASIF(name)
 	if err != nil {
@@ -1176,17 +1179,20 @@ func (p *Provider) bootVM(ctx context.Context, name string, held []*os.File, net
 
 	done := make(chan error, 1)
 
+	// NOT THE CALLER'S CANCELLATION: the run goes on attaching after a caller gives up.
+	attaching := context.WithoutCancel(ctx)
+
 	go func() {
 		defer p.startGate.RUnlock()
 
-		done <- p.awaitAttach(name, exited)
+		done <- p.awaitGuest(attaching, name, exited)
 	}()
 
 	select {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		return fmt.Errorf("waiting for %s to attach its disk: %w", name, ctx.Err())
+		return fmt.Errorf("waiting for %s's guest to answer: %w", name, ctx.Err())
 	}
 }
 
@@ -1209,10 +1215,11 @@ func (p *Provider) enterStart(ctx context.Context) error {
 	return nil
 }
 
-// awaitAttach waits, on the start window's clock and no caller's, until the VM's disk is
-// attached or its run has ended. Each look is bounded, so a stuck lsof cannot outlast the
-// window, and a run that ends is noticed between looks.
-func (p *Provider) awaitAttach(name string, exited <-chan struct{}) error {
+// awaitGuest waits, on the start window's clock and with no caller's cancellation, until the VM's guest
+// answers or its run has ended. Each look is bounded, so an exec that blocks (a guest
+// agent not yet listening holds one for 30 s) cannot outlast the window, and a run that
+// ends is noticed between looks.
+func (p *Provider) awaitGuest(ctx context.Context, name string, exited <-chan struct{}) error {
 	deadline := time.Now().Add(p.startWindow)
 
 	retry := time.NewTimer(p.proveRetry)
@@ -1221,8 +1228,8 @@ func (p *Provider) awaitAttach(name string, exited <-chan struct{}) error {
 	var lastErr error
 
 	for {
-		attached, err := p.lookForAttach(name, deadline)
-		if err == nil && attached {
+		answered, err := p.lookForGuest(ctx, name, deadline)
+		if answered {
 			return nil
 		}
 
@@ -1232,10 +1239,16 @@ func (p *Provider) awaitAttach(name string, exited <-chan struct{}) error {
 
 		select {
 		case <-exited:
-			// ASKED ONCE MORE, because the run may have attached and ended between the
-			// question and this answer; a `tart run` that has ended is a VM that has.
-			if attached, err := p.lookForAttach(name, time.Now().Add(attachLook)); err == nil && attached {
+			// ASKED ONCE MORE, because the guest may have answered and the run ended
+			// between the question and this answer; a `tart run` that has ended is a VM
+			// that has.
+			answered, err := p.lookForGuest(ctx, name, deadline)
+			if answered {
 				return nil
+			}
+
+			if err != nil {
+				return fmt.Errorf("the VM never started: %s (its guest did not answer: %w)", p.runLogTail(name), err)
 			}
 
 			return fmt.Errorf("the VM never started: %s", p.runLogTail(name))
@@ -1244,8 +1257,8 @@ func (p *Provider) awaitAttach(name string, exited <-chan struct{}) error {
 
 		if time.Now().After(deadline) {
 			if lastErr != nil {
-				return fmt.Errorf("the VM never started: %s (and whether its disk was attached could "+
-					"not be read: %w)", p.runLogTail(name), lastErr)
+				return fmt.Errorf("the VM never started: %s (its guest did not answer: %w)",
+					p.runLogTail(name), lastErr)
 			}
 
 			return fmt.Errorf("the VM never started: %s", p.runLogTail(name))
@@ -1260,19 +1273,33 @@ func (p *Provider) awaitAttach(name string, exited <-chan struct{}) error {
 	}
 }
 
-// attachLook bounds one look at whether a disk is attached.
-const attachLook = 10 * time.Second
+// guestLook bounds one asking of the guest.
+const guestLook = 10 * time.Second
 
-// lookForAttach is one bounded look, ending at the earlier of attachLook and deadline.
-func (p *Provider) lookForAttach(name string, deadline time.Time) (bool, error) {
-	if bound := time.Now().Add(attachLook); bound.Before(deadline) {
+// lookForGuest asks the guest once, ending at the earlier of guestLook and deadline.
+func (p *Provider) lookForGuest(ctx context.Context, name string, deadline time.Time) (bool, error) {
+	if bound := time.Now().Add(guestLook); bound.Before(deadline) {
 		deadline = bound
 	}
 
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	return p.vmHoldsDisk(ctx, name)
+	if p.guestUp != nil {
+		return p.guestUp(ctx, name)
+	}
+
+	return p.guestAnswers(ctx, name)
+}
+
+// guestAnswers asks the guest to run nothing, through `tart exec`, which sizes no disk.
+// An exec that fails is a guest not yet answering, and its error says why.
+func (p *Provider) guestAnswers(ctx context.Context, name string) (bool, error) {
+	if _, err := p.run(ctx, "exec", name, "/bin/sh", "-c", ":"); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // diskIsASIF reads the VM's disk format from its config.json as tart does: `asif` is
@@ -1295,40 +1322,8 @@ func (p *Provider) diskIsASIF(name string) (bool, error) {
 	return cfg.DiskFormat == "asif", nil
 }
 
-// vmHoldsDisk answers whether a Virtualization.framework process holds the VM's disk
-// open, which lsof reads without opening the disk.
-func (p *Provider) vmHoldsDisk(ctx context.Context, name string) (bool, error) {
-	if p.diskAttached != nil {
-		return p.diskAttached(ctx, name)
-	}
-
-	disk := filepath.Join(p.vmDir(name), "disk.img")
-
-	pids, err := p.openers(ctx, disk)
-	if err != nil {
-		return false, err
-	}
-
-	for _, pid := range pids {
-		path, err := p.processPath(pid)
-		if errors.Is(err, syscall.ESRCH) {
-			continue
-		}
-
-		if err != nil {
-			return false, fmt.Errorf("could not tell what process %d holding %s is: %w", pid, disk, err)
-		}
-
-		if path == vmService {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-// withoutStarts runs fn while no ASIF disk this provider started is being attached,
-// waiting for one at most the start window, and refusing past it. See bootVM.
+// withoutStarts runs fn while no ASIF VM this provider started is still before its guest's
+// first answer, waiting for one at most the start window, and refusing past it. See bootVM.
 func (p *Provider) withoutStarts(ctx context.Context, fn func() error) error {
 	deadline := time.Now().Add(p.startWindow)
 
@@ -1337,15 +1332,15 @@ func (p *Provider) withoutStarts(ctx context.Context, fn func() error) error {
 
 	for !p.startGate.TryLock() {
 		if time.Now().After(deadline) {
-			return fmt.Errorf("tart: a VM this node started was still attaching its disk after %s, "+
-				"and listing VMs then sizes that disk under the attach", p.startWindow)
+			return fmt.Errorf("tart: an ASIF VM this node started had no answering guest after %s, "+
+				"and listing VMs before then sizes its disk under the attach", p.startWindow)
 		}
 
 		retry.Reset(startGatePoll)
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("tart: waiting for a VM's start to attach its disk before listing: %w", ctx.Err())
+			return fmt.Errorf("tart: waiting for an ASIF VM's guest to answer before listing: %w", ctx.Err())
 		case <-retry.C:
 		}
 	}

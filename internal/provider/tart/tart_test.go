@@ -840,28 +840,8 @@ func newProvider(t *testing.T, s *stub) *Provider {
 	// The WINDOW stays at its default, because an uncontended acquisition never
 	// waits; only the tests that deliberately hold the lock shorten it.
 	p.storeLockRetry = time.Millisecond
-	// THE STUB RUNS NO VM, so nothing holds a disk for lsof to find: a VM its `run` marked
-	// running is one whose disk is attached. The real answer has tests of its own.
-	p.diskAttached = stubDiskAttached(p)
 
 	return p
-}
-
-// stubDiskAttached answers for the stub's VMs: attached once its `run` has marked one
-// running.
-func stubDiskAttached(p *Provider) func(context.Context, string) (bool, error) {
-	return func(_ context.Context, name string) (bool, error) {
-		raw, err := os.ReadFile(filepath.Join(p.vmDir(name), ".state"))
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-
-		if err != nil {
-			return false, err
-		}
-
-		return strings.TrimSpace(string(raw)) == "running", nil
-	}
 }
 
 func validSpec(name string) provider.Spec {
