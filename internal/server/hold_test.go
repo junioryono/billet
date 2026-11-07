@@ -257,11 +257,33 @@ func TestARestartDestroysAHeldVMAtItsBoundBeforeItsSessionOpens(t *testing.T) {
 		p, _, failed := heldPool(t, "Failed")
 		p.complete(t, failed)
 
-		store, runner := p.l.completionStore, p.l.runner
+		store := p.l.completionStore
 
 		time.Sleep(testHold - time.Minute)
 
 		var opens atomic.Int64
+
+		// UNDER A MUTEX, since Run's cleanup goroutine writes what this goroutine reads between passes.
+		var (
+			mu        sync.Mutex
+			destroyed []int64
+		)
+
+		gone := func() []int64 {
+			mu.Lock()
+			defer mu.Unlock()
+
+			return slices.Clone(destroyed)
+		}
+
+		runner := &fakeRunner{onDestroy: func(requestID int64) error {
+			mu.Lock()
+			defer mu.Unlock()
+
+			destroyed = append(destroyed, requestID)
+
+			return nil
+		}}
 
 		release := make(chan struct{})
 		l := NewListener(p.a, p.l.tier, nil, WithRunner(runner), WithRunnerRegistry(p.registry),
@@ -290,8 +312,8 @@ func TestARestartDestroysAHeldVMAtItsBoundBeforeItsSessionOpens(t *testing.T) {
 		time.Sleep(l.heartbeatInterval() + time.Second)
 		synctest.Wait()
 
-		if len(p.destroyed) != 0 {
-			t.Fatalf("destroyed %v inside the hold, while the session waits", p.destroyed)
+		if got := gone(); len(got) != 0 {
+			t.Fatalf("destroyed %v inside the hold, while the session waits", got)
 		}
 
 		// PAST THE BOUND, with the session still refused, and through the next tick.
@@ -302,9 +324,9 @@ func TestARestartDestroysAHeldVMAtItsBoundBeforeItsSessionOpens(t *testing.T) {
 			t.Fatalf("the session was asked for %d times, want one open still waiting", opens.Load())
 		}
 
-		if !slices.Contains(p.destroyed, 11) {
+		if got := gone(); !slices.Contains(got, 11) {
 			t.Errorf("destroyed %v past the bound while the session was refused; the held VM waited for GitHub",
-				p.destroyed)
+				got)
 		}
 
 		close(release)
