@@ -7,8 +7,8 @@ import (
 )
 
 // ledgerAt75 is a ledger migrated to 75 and no further, so the next open applies
-// migration 76 and every one after it. 77 goes first, since rewindNewest takes back
-// only the newest.
+// migration 76 and every one after it. rewindNewest takes back the newest, which is
+// alerts' 78, and then 77 and 76 are undone.
 func ledgerAt75(t *testing.T) string {
 	t.Helper()
 
@@ -18,6 +18,8 @@ func ledgerAt75(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+
+	rewindNewest(t, db)
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{

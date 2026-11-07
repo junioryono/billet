@@ -229,6 +229,34 @@ server:
   #
   # flight_recorder: false
 
+  # Tell a webhook or a Slack channel about a job: one that failed or was
+  # cancelled, ran or waited past a duration, or was disrupted by billet itself.
+  # A destination's address is a credential, so this names where to read it (an
+  # environment variable, or a file only its owner can read) and never the
+  # address. `branch` and `step` are read from GitHub and need the App to hold
+  # `actions: read`. A rule counts per job of a workflow of a repository:
+  # in_a_row hits before it fires (default 1), then quiet for cooldown (default
+  # 1h). Mute one without a restart: `billet alerts mute <rule> --for 2h`. See
+  # docs/operating/alerts.md.
+  #
+  # alerts:
+  #   destinations:
+  #     - name: oncall
+  #       kind: slack
+  #       url_env: BILLET_ALERT_ONCALL
+  #     - name: pager
+  #       kind: webhook
+  #       url_file: /etc/billet/pager-url
+  #   rules:
+  #     - name: deploys
+  #       match: {repository: "acme/*", workflow: deploy.yml, branch: main}
+  #       on: {failed: true, disrupted: true}
+  #       notify: [oncall, pager]
+  #     - name: slow-builds
+  #       on: {running_longer_than: 2h, waited_longer_than: 15m}
+  #       cooldown: 4h
+  #       notify: [oncall]
+
   # Hard ceiling on what the allocator will hand out across every tier combined.
   # Capacity is escrowed before each scale-set listener advertises to GitHub, so
   # this is what stops concurrent tiers from collectively overcommitting the box.

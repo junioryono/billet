@@ -91,7 +91,7 @@ is_replay_input() {
 	internal/provider/* | internal/store/*) return 0 ;;
 	# The EC2 provider embeds this script's text for the image's guest caches.
 	scripts/build-guest-image.sh) return 0 ;;
-	internal/alloc/* | internal/app/* | internal/awscreds/* | internal/awsjson/* | \
+	internal/alerts/* | internal/alloc/* | internal/app/* | internal/awscreds/* | internal/awsjson/* | \
 		internal/awsquota/* | internal/awss3/* | internal/awssig/* | internal/awsssm/* | internal/awssts/* | internal/config/* | \
 		internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
 		internal/endpoint/* | internal/fakeactions/* | internal/flightrecorder/* | internal/github/* | internal/guestassets/* | \

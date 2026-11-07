@@ -132,6 +132,46 @@ func TestARunsJobsNameTheirCommit(t *testing.T) {
 	}
 }
 
+// EVERY JOB OF A RUN IS READ WITH ITS STEPS AND ITS STATUS IN ONE LIST, keyed by its
+// runner: a runner two jobs share, and a record too incomplete to read, are left out
+// rather than given either's, which the caller reads as could-not-tell.
+func TestARunsJobsAreReadWithTheirStepsByRunner(t *testing.T) {
+	t.Parallel()
+
+	c, requests := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		fmt.Fprint(w, `{"total_count":5,"jobs":[
+			{"id":1,"name":"deploy","runner_name":"billet-a","status":"completed","run_attempt":1,
+			 "steps":[{"number":1,"name":"Run migrations","status":"completed","conclusion":"failure"}]},
+			{"id":2,"name":"build","runner_name":"billet-b","status":"in_progress",
+			 "steps":[{"number":1,"name":"Compile","status":"in_progress","conclusion":null}]},
+			{"id":3,"name":"x","runner_name":"billet-twice","status":"completed","steps":[]},
+			{"id":4,"name":"x","runner_name":"billet-twice","status":"completed","steps":[]},
+			{"id":5,"runner_name":"billet-broken","status":"completed"}]}`)
+	})
+
+	jobs, err := c.RunnerJobs(t.Context(), "acme", "api", 31)
+	if err != nil {
+		t.Fatalf("RunnerJobs: %v", err)
+	}
+
+	a := jobs["billet-a"]
+	if a.Status != "completed" || len(a.Steps) != 1 || a.Steps[0].Name != "Run migrations" ||
+		a.Steps[0].Conclusion != "failure" {
+		t.Errorf("billet-a = %+v", a)
+	}
+	if b := jobs["billet-b"]; b.Status != "in_progress" || len(b.Steps) != 1 || b.Steps[0].Conclusion != "" {
+		t.Errorf("billet-b = %+v", b)
+	}
+	for _, absent := range []string{"billet-twice", "billet-broken"} {
+		if got, ok := jobs[absent]; ok {
+			t.Errorf("%s = %+v, want left out", absent, got)
+		}
+	}
+	if requests.Load() != 2 {
+		t.Errorf("requests = %d, want a token and one page", requests.Load())
+	}
+}
+
 // EACH RUNNER'S ATTEMPT IS ITS JOB'S run_attempt, read from the same list as its
 // queue time: a re-run lists every attempt's jobs under one run id, on runners of
 // their own, and a record that does not say, or says zero, gives no attempt rather

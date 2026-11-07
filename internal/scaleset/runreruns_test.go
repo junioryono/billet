@@ -122,3 +122,58 @@ func TestAnAttemptReachesTheServerJudged(t *testing.T) {
 		t.Errorf("a client with no App = %v, want ErrRunEvidenceUnavailable", err)
 	}
 }
+
+// stepsPolicy is a policy client whose run's job list answers from fields, and says
+// which run it was asked about.
+type stepsPolicy struct {
+	billetgithub.RunnerGroupPolicyClient
+
+	jobs  map[string]billetgithub.WorkflowJob
+	err   error
+	asked *int64
+}
+
+func (s stepsPolicy) RunnerJobs(_ context.Context, _, _ string, runID int64,
+) (map[string]billetgithub.WorkflowJob, error) {
+	*s.asked = runID
+
+	return s.jobs, s.err
+}
+
+// AN ALERT RULE NAMING A STEP READS EVERY JOB OF THE RUN ONCE, each step's name and
+// conclusion and whether GitHub has concluded the job, and GitHub's refusal keeps its
+// chain.
+func TestARunsJobStepsAreReadOnceByRunner(t *testing.T) {
+	t.Parallel()
+
+	var asked int64
+	c := &Client{policy: stepsPolicy{asked: &asked, jobs: map[string]billetgithub.WorkflowJob{
+		"billet-abc": {Status: "completed", Steps: []billetgithub.JobStep{
+			{Number: 1, Name: "Set up job", Status: "completed", Conclusion: "success"},
+			{Number: 2, Name: "Run migrations", Status: "completed", Conclusion: "failure"},
+		}},
+		"billet-def": {Status: "in_progress", Steps: []billetgithub.JobStep{{Number: 1, Name: "Compile"}}},
+	}}}
+
+	jobs, err := c.RunJobSteps(t.Context(), "acme", "api", 31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asked != 31 {
+		t.Errorf("asked about run %d", asked)
+	}
+	abc := jobs["billet-abc"]
+	if !abc.Completed || len(abc.Steps) != 2 || abc.Steps[1].Name != "Run migrations" ||
+		abc.Steps[1].Conclusion != "failure" {
+		t.Errorf("billet-abc = %+v", abc)
+	}
+	if def := jobs["billet-def"]; def.Completed || len(def.Steps) != 1 {
+		t.Errorf("an unfinished job = %+v, want it said so", def)
+	}
+
+	refused := &billetgithub.APIError{Status: 403}
+	c = &Client{policy: stepsPolicy{asked: &asked, err: refused}}
+	if _, err := c.RunJobSteps(t.Context(), "acme", "api", 31); !errors.Is(err, refused) {
+		t.Errorf("a refused read = %v, want GitHub's answer in its chain", err)
+	}
+}
