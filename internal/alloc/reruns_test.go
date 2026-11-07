@@ -85,7 +85,7 @@ func TestOnlyAJobOfACauseThatRanAndWentRedIsACandidate(t *testing.T) {
 		{lease: "node-forgotten", disruption: string(DisruptionNodeForgotten)},
 		{lease: "held-past-limit", disruption: string(DisruptionHeldPastLimit)},
 		{lease: "another-word", disruption: "something-newer"},
-		{lease: "succeeded", result: resultSucceeded},
+		{lease: "succeeded", result: ResultSucceeded},
 		{lease: "already-decided", decision: string(RerunUnproven)},
 		{lease: "too-old", resultAt: time.Now().Add(-72 * time.Hour)},
 	} {

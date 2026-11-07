@@ -14,6 +14,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lease"
@@ -81,7 +82,9 @@ type matrixRun struct {
 	Workflow string `json:"workflow"`
 	// Job is the job's name as GitHub reports it.
 	Job string `json:"job"`
-	// GitHub is the result GitHub must report for the job.
+	// GitHub is the result GitHub must report for the job, in the ledger's words, which
+	// are the scale-set message's (alloc.ResultSucceeded), never the REST API's
+	// "success": the first real run failed every cell that passed on that word.
 	GitHub string `json:"github"`
 	// Observe names the node's observation the cell reads (matrixObservation), and
 	// Want the token it must hold.
@@ -145,14 +148,14 @@ func matrixCellFor(cache, kase string) matrixCell {
 			workflow = "matrix-images-" + kase + ".yml"
 		}
 
-		return matrixCell{Run: &matrixRun{Workflow: workflow, Job: cache, GitHub: "success",
+		return matrixCell{Run: &matrixRun{Workflow: workflow, Job: cache, GitHub: alloc.ResultSucceeded,
 			Observe: observe, Want: want}}
 	case "two-writers-cas", "two-writers-lww":
 		mode := strings.TrimPrefix(kase, "two-writers-")
 		switch {
 		case cache == "sticky-disks":
 			return matrixCell{Run: &matrixRun{Workflow: "matrix-writers.yml", Job: "reader-" + mode,
-				GitHub: "success", Observe: observe, Want: string(lease.BuildCacheWarm)}}
+				GitHub: alloc.ResultSucceeded, Observe: observe, Want: string(lease.BuildCacheWarm)}}
 		case cache == "docker-builder":
 			return matrixCell{Unsupported: true, Why: "the builder's state is a sticky disk published " +
 				"last-write-wins; two writers are the sticky-disks cells"}
@@ -171,7 +174,7 @@ func matrixCellFor(cache, kase string) matrixCell {
 		switch cache {
 		case "sticky-disks":
 			return matrixCell{Run: &matrixRun{Workflow: "matrix-writer-fails.yml", Job: "reader",
-				GitHub: "success", Observe: observe, Want: string(lease.BuildCacheWarm)}}
+				GitHub: alloc.ResultSucceeded, Observe: observe, Want: string(lease.BuildCacheWarm)}}
 		case "docker-builder":
 			return matrixCell{Unsupported: true, Why: "the builder's state is a sticky disk; a failed " +
 				"writer is the sticky-disks cell"}

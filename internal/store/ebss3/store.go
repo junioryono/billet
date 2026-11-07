@@ -1048,6 +1048,66 @@ func (s Store) Purge(ctx context.Context) (PurgeReport, error) {
 	return report, nil
 }
 
+// Residue counts what this store's namespace still holds, read without removing
+// anything.
+type Residue struct {
+	Snapshots    int
+	Volumes      int
+	StateObjects int
+	// CacheObjects counts archives, content-addressed entries, their records and
+	// unfinished uploads.
+	CacheObjects int
+}
+
+// Empty reports whether nothing was found.
+func (r Residue) Empty() bool { return r == Residue{} }
+
+// Residue reads what Purge would take, through the listings Purge walks, so a
+// teardown's sweep is answered by the code that removes: a state object a purge could
+// not delete is found here, where a sweep of instances alone said nothing remained
+// (measured 2026-11-07). A listing that fails is an error, never an empty residue.
+func (s Store) Residue(ctx context.Context) (Residue, error) {
+	var residue Residue
+
+	keys, err := s.objects.List(ctx, s.statePrefix())
+	if err != nil {
+		return residue, err
+	}
+	residue.StateObjects = len(keys)
+
+	snapshots, err := s.blocks.ListSnapshots(ctx)
+	if err != nil {
+		return residue, err
+	}
+	residue.Snapshots = len(snapshots)
+
+	volumes, err := s.blocks.ListAvailableVolumes(ctx)
+	if err != nil {
+		return residue, err
+	}
+	residue.Volumes = len(volumes)
+
+	if s.bulk == nil {
+		return residue, nil
+	}
+	objects, err := s.bulk.ListObjects(ctx, s.ownerPrefix())
+	if err != nil {
+		return residue, err
+	}
+	for _, object := range objects {
+		if !strings.HasPrefix(object.Key, s.statePrefix()) {
+			residue.CacheObjects++
+		}
+	}
+	uploads, err := s.bulk.ListMultipart(ctx, s.ownerPrefix())
+	if err != nil {
+		return residue, err
+	}
+	residue.CacheObjects += len(uploads)
+
+	return residue, nil
+}
+
 // purgeDelete deletes one owned resource, skipping (rather than aborting on) a
 // foreign one. It reports whether the resource was deleted; false means it was
 // skipped as not-owned. Any non-ownership error aborts.

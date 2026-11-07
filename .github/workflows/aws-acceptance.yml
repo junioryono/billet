@@ -303,6 +303,28 @@ jobs:
             status=1
           }
           down=0
+          # DECOMMISSION DELETES WHAT THE NODE'S OWN POLICY NEVER MAY: a sticky disk's
+          # state objects, which billet's rendered policy keeps from the credential that
+          # evicts (site-acceptance.md, 2026-11-06). So the teardown alone is granted
+          # their delete, under this cache's prefix, and only for its length. A policy
+          # with no cache objects has no state objects to delete.
+          if [ -s out/iam.json ]; then
+            if ! jq '{Version: "2012-10-17", Statement: [{Sid: "MatrixDecommissionState",
+                Effect: "Allow", Action: "s3:DeleteObject",
+                Resource: [.Statement[] | select(.Sid == "BilletCacheObjects") | .Resource[]
+                  | sub("/\\*$"; "/owners/*/state/*")]}]}' out/iam.json >out/down.json; then
+              echo "could not read the node's policy; a cache's state objects may be left" >&2
+              status=1
+            elif [ "$(jq '.Statement[0].Resource | length' out/down.json)" != 0 ]; then
+              if aws iam put-role-policy --role-name "$HOST_ROLE" \
+                --policy-name "billet-matrix-$RUN-down" --policy-document file://out/down.json; then
+                sleep 20
+              else
+                echo "could not grant the teardown its delete; a cache's state objects may be left" >&2
+                status=1
+              fi
+            fi
+          fi
           # THE KEY GOES ONLY WITH THE DEPLOYMENT: a run still tearing down needs it to
           # delete its scale sets.
           if ! scripts/acceptance/ssm-run.sh run "$HOST" 2400 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' down '$RUN_DIR' || exit \$?
@@ -323,7 +345,7 @@ jobs:
           fi
           if [ "$down" -ne 0 ]; then
             echo "left for a person to finish the teardown in $RUN_DIR on $HOST, which is left running:" >&2
-            echo "  the policy billet-matrix-$RUN on $HOST_ROLE, /srv/billet-accept/app.pem on the host," >&2
+            echo "  the policies billet-matrix-$RUN and billet-matrix-$RUN-down on $HOST_ROLE, /srv/billet-accept/app.pem on the host," >&2
             echo "  and the parameter /billet-acceptance/runs/$RUN/app-key" >&2
             # AND THE HOST IS HELD, so no later run starts beside this one.
             if ! aws ssm put-parameter --name /billet-acceptance/held --type String --value "$RUN" --overwrite >/dev/null; then
@@ -333,6 +355,8 @@ jobs:
           fi
           gone "the run's node policy" NoSuchEntity \
             aws iam delete-role-policy --role-name "$HOST_ROLE" --policy-name "billet-matrix-$RUN"
+          gone "the teardown's delete" NoSuchEntity \
+            aws iam delete-role-policy --role-name "$HOST_ROLE" --policy-name "billet-matrix-$RUN-down"
           gone "the App key's parameter" ParameterNotFound \
             aws ssm delete-parameter --name "/billet-acceptance/runs/$RUN/app-key"
           if ! aws ec2 stop-instances --instance-ids "$HOST" >/dev/null; then

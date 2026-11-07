@@ -128,7 +128,7 @@ func (a *Allocator) RunRerunCandidates(ctx context.Context, repository string, r
 	err := a.db.View(ctx, func(q querier) error {
 		rows, err := state.ReadQueries(q).ListRerunCandidatesOfRun(ctx, ledgerdb.ListRerunCandidatesOfRunParams{
 			RunID: runID, Repo: repository, CauseOne: string(RerunCauses[0]), CauseTwo: string(RerunCauses[1]),
-			Succeeded: resultSucceeded, BeforeResult: after.resultAt, BeforeLease: after.leaseID,
+			Succeeded: ResultSucceeded, BeforeResult: after.resultAt, BeforeLease: after.leaseID,
 			MaxRows: int64(limit),
 		})
 		if err != nil {
@@ -189,7 +189,7 @@ func (a *Allocator) RerunCandidates(ctx context.Context, since time.Time, after 
 	err := a.db.View(ctx, func(q querier) error {
 		rows, err := state.ReadQueries(q).ListRerunCandidates(ctx, ledgerdb.ListRerunCandidatesParams{
 			CauseOne: string(RerunCauses[0]), CauseTwo: string(RerunCauses[1]),
-			Succeeded: resultSucceeded, Since: ts(since.UTC()),
+			Succeeded: ResultSucceeded, Since: ts(since.UTC()),
 			BeforeResult: after.resultAt, BeforeLease: after.leaseID, MaxRows: int64(limit),
 		})
 		if err != nil {

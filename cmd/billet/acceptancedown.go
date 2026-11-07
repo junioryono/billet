@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/ops/fleetops"
+	"github.com/junioryono/billet/internal/store/ebss3"
 
 	"github.com/junioryono/billet/internal/cli"
 )
@@ -276,6 +277,15 @@ func sweepAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, c
 	// implementation that could disagree about what belongs to this deployment.
 	err := runBilletSubcommand(ctx, env, fleetops.Decommission, "decommission", "--config", ws.ConfigPath)
 
+	return sweepVerdict(ctx, env, ws, computeProved, err, fleetops.CacheResidue)
+}
+
+// sweepVerdict judges the dry run's answer, asking cacheResidue what the cache still
+// holds once no instance does.
+func sweepVerdict(
+	ctx context.Context, env cli.Env, ws acceptanceWorkspace, computeProved bool, err error,
+	cacheResidue func(context.Context, string) (ebss3.Residue, error),
+) error {
 	switch {
 	case isNoCloudBackend(err) && computeProved:
 		// THE BARRIER ALREADY ASKED, AND IT ASKS EVERY BACKEND. `decommission`
@@ -311,6 +321,19 @@ func sweepAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, c
 			errAcceptanceUnswept, ws.DeploymentID)
 
 	case err == nil:
+		// THE CACHE TOO, counted by the listings the purge walks: a run whose purge was
+		// refused part-way left state objects while every instance was gone, and a
+		// sweep of instances alone said nothing remained (2026-11-07).
+		residue, err := cacheResidue(ctx, ws.ConfigPath)
+		if err != nil {
+			return fmt.Errorf("the sweep could not read the cache, so nothing here establishes whether "+
+				"this run left anything behind: %w", err)
+		}
+		if !residue.Empty() {
+			return fmt.Errorf("%w: the ebs-s3 cache still holds %d snapshot(s), %d volume(s), %d state "+
+				"object(s) and %d cache object(s) of %s", errAcceptanceResidue, residue.Snapshots,
+				residue.Volumes, residue.StateObjects, residue.CacheObjects, ws.DeploymentID)
+		}
 		fmt.Fprintf(env.Stdout, "sweep: nothing carrying %s remains\n", ws.DeploymentID)
 
 		return nil

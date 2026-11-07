@@ -883,6 +883,58 @@ func TestCloudPurgeSurfacesAStateDeleteError(t *testing.T) {
 	}
 }
 
+// RESIDUE COUNTS WHAT PURGE TAKES, and what a purge refused part-way leaves: the
+// state objects an S3 delete was refused on, after every block was gone, which a
+// sweep of instances alone reported as nothing remaining (2026-11-07).
+func TestResidueCountsWhatAPurgeLeft(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	s, blocks, objects := testStore(&now)
+
+	candidate := snapshotCandidate(t, s)
+	lease, fence, err := s.AcquireWriter(t.Context(), candidate.Key, "job-1", time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireWriter: %v", err)
+	}
+	if err := s.PublishCAS(t.Context(), candidate.Key, "", candidate, lease, fence); err != nil {
+		t.Fatalf("PublishCAS: %v", err)
+	}
+	blocks.available = []volumeInfo{{ID: "vol-orphan", Created: now}}
+
+	before, err := s.Residue(t.Context())
+	if err != nil {
+		t.Fatalf("Residue: %v", err)
+	}
+	want := Residue{Snapshots: len(blocks.snapshots), Volumes: 1, StateObjects: len(objects.objects)}
+	if before != want || before.Snapshots < 1 || before.StateObjects < 1 {
+		t.Fatalf("residue before the purge = %+v, want %+v with a snapshot and a state object", before, want)
+	}
+
+	objects.deleteErr = errFakeDelete
+	if _, err := s.Purge(t.Context()); !errors.Is(err, errFakeDelete) {
+		t.Fatalf("the refused state delete was not surfaced: %v", err)
+	}
+	blocks.available = nil
+
+	after, err := s.Residue(t.Context())
+	if err != nil {
+		t.Fatalf("Residue: %v", err)
+	}
+	if after.Empty() || after.StateObjects != want.StateObjects || after.Snapshots != 0 {
+		t.Fatalf("residue after a refused purge = %+v, want only the %d state object(s)", after,
+			want.StateObjects)
+	}
+
+	objects.deleteErr = nil
+	if _, err := s.Purge(t.Context()); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if after, err := s.Residue(t.Context()); err != nil || !after.Empty() {
+		t.Fatalf("residue after a whole purge = %+v, %v; want none", after, err)
+	}
+}
+
 // THE ACCESS PROBE'S CONTRACT: a clean miss under the owner's own state
 // prefix is a healthy bucket, and any refusal or transport failure surfaces —
 // a 403 must not read as "empty cache".

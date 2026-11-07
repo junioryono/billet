@@ -285,6 +285,9 @@ func TestBuilderCleanupPublishesABuildWithNoCacheMount(t *testing.T) {
 		"no cache mount":                    {"null\n", "null\n", true, 0},
 		"an oversized mount pruned to none": {oversized, "null\n", true, 1},
 		"an empty answer":                   {"", "", false, 0},
+		"none, then an empty answer":        {"null\n", "", false, 0},
+		"none, then not a list":             {"null\n", "{}\n", false, 0},
+		"none, then an oversized mount":     {"null\n", oversized, false, 0},
 		"not a list":                        {"{\"id\":\"mount-1\"}\n", "{\"id\":\"mount-1\"}\n", false, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
