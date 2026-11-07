@@ -32,6 +32,7 @@ replay-policies
 target-weights
 egress-allowlist
 bare-metal-hosts
+job-statistics
 ```
 
 | Record | Covers |
@@ -63,3 +64,4 @@ bare-metal-hosts
 | [Admission orders on replay](replay-policies.md) | `fair` against `fill` replayed through billet's real scheduler: on a whole-host shape beside smaller ones, `fill` starving the 32 vCPU jobs (p99 1h46m against 28m) and `fair` making every smaller shape wait behind them (8 vCPU p99 5h12m against 19m), and on the reference deployment's own week of 19,757 jobs, `fill` making the 16 vCPU jobs wait (p99 3h59m against 11m) and `fair` the 8 vCPU ones (p99 2h30m against 56m). |
 | [The egress allowlist](egress-allowlist.md) | a tier's allowlist in a real Firecracker guest: an allowed name connects, any other name, a hard-coded address, an outside resolver and IPv6 are refused and recorded by the host; and the kernel's behaviour behind each rule, including the frame a bridge's hooks never see |
 | [Bare-metal hosts](bare-metal-hosts.md) | what rented bare metal measured on 2026-11-05: four AWS metal types from the launch call to a running script in 21 to 47 s, which of them fit a 4 GiB per vCPU pool with local NVMe, their NVMe throughput and single-thread speed alone and under full load; and phoenixNAP's catalogue, stock per location, a new account's one-server quota and the order its API refused (#553) |
+| [Reading the ledger back](job-statistics.md) | `billet jobs stats`, `billet jobs rightsize` and `billet migrate workflows` against the reference deployment's week and GitHub's record of it: 78 of billet's own jobs agreeing with GitHub, what a re-run of failed jobs records under each attempt, why a recommendation reads the job's own window and its VM's memory rather than the usage summary, two jobs recomputed by hand, and GitHub's hosted labels on 2026-11-03 |

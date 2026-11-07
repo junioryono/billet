@@ -1,0 +1,15 @@
+name: expression
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        type: string
+jobs:
+  by-input:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - run: echo input
+  by-choice:
+    runs-on: ${{ github.event_name == 'push' && 'ubuntu-latest' || 'macos-latest' }}
+    steps:
+      - run: echo choice
