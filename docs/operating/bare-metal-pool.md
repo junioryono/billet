@@ -9,7 +9,11 @@ A control plane with `server.pool` in its config orders Firecracker hosts from r
 - **When the source cannot tell**, or on phoenixNAP, which has no channel to its hosts, the request waits in `billet nodes pending` with its order beside it, for you to compare the fingerprint with the host's console and approve it with `billet nodes approve`, as any node's.
 - **When the source contradicts the host** (another key on its console, a document naming another instance), or another key already holds the host's name, its order is held: nothing is admitted from it and its token is not spent, and the host is told to wait, so it keeps asking. `billet pool` lists every held order with why. An order whose tokens all lapsed with nothing joined is held the same way. A held order still counts against the maximum and no longer counts as on its way. Its requests are recorded in `billet nodes pending` with the order beside them, without spending its token. Look at the host's console: deny a request whose key the console does not name, approve the one it does (`billet nodes approve`) if you are sure it is the host, release the hold with `billet pool unhold <order>` so its next ask is judged again, or release the host.
 - **An address or a launch time that does not match** is not a contradiction: a NAT or a proxy in front of the enrollment listener explains the first, and the request waits for a person instead of holding the order. A listener behind `server.tls_router` is not asked to see a host's address at all.
-- **Not yet:** a host is never released by the pool: releasing needs a proof that it holds nothing (ADR-030), and the pool's IAM, including the console read the join needs on AWS, is owed. Until then an operator drains and releases a pool host by hand.
+- **Built: release on a person's word.** `billet pool release --reason TEXT <order>` releases a placed host, only on proof it holds nothing (ADR-030):
+  - **A host a node joined from** leaves placement at once, and stays out across its node's restarts. Once the ledger shows it holds no lease, nothing in quarantine or custody, and its node has reported an empty inventory since it left placement, the pool's next step seals the order, revokes the node's certificates, and asks the source to take the host back.
+  - **A host nothing joined from** is sealed at once, on the ledger's word that nothing was ever admitted for it, and its tokens are retired.
+  - Either way, the order is closed only on the source's own answer that the host is gone. `billet pool` shows a host still draining, and why it was released.
+- **Not yet:** the pool does not shrink itself; a person releases a host. The pool's IAM, including the console read the join needs on AWS, is owed.
 
 ## An order's life
 
@@ -18,6 +22,9 @@ Every order is a row in the ledger, written before its source is asked, so `bill
 - **ordering**: the row is committed and the source has been, or is being, asked.
 - **placed**: the source named the host.
 - **refused**: the source refused, or the order failed before anything reached the source; the reason is on the order.
+- **sealed**: a release is proved and the node's certificates are revoked: nothing joins from the order or is placed on its host again, and the source is asked to take the host back.
+- **released**: the source took the host back. It still counts against the maximum until the source says it is gone.
+- **gone**: the source said, in its own answer for that host, that it is gone. Not-found and elapsed time are never that answer.
 - **uncertain**: the answer was lost, the source lists no host for the order, and a resend could place a second one. On AWS, whose launches carry the order as an idempotency token, the pool sends a lost order again for ten minutes from its first attempt before it calls it uncertain; phoenixNAP takes no such token, so a lost answer there is uncertain at once. A resend the source refuses makes the order uncertain too: the refusal says nothing about the first attempt, which may have placed a host.
 
 An order records where its source orders (an AWS account, region, subnet and zone; a phoenixNAP account). If the config or the credentials change so the source orders somewhere else, or the source is no longer configured or no longer declares the order's shape, an order still being ordered is not read back or sent again; it becomes uncertain, because reading it back anywhere else could miss the host it placed. Look where it was placed, then close it.

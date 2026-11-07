@@ -33,6 +33,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
+	"github.com/junioryono/billet/internal/releaseproof"
 )
 
 // DefaultTokenLife is how long an ordered host's join token lives: past any measured
@@ -57,6 +58,10 @@ type Ledger interface {
 	PoolOrderRefused(ctx context.Context, id, reason string) error
 	NewPoolJoinToken(ctx context.Context, order string, ttl time.Duration) (string, error)
 	HoldLapsedPoolJoins(ctx context.Context) (int, error)
+	SealPoolRelease(ctx context.Context, order string) (releaseproof.Proof, error)
+	PoolReleaseProof(ctx context.Context, order string) (releaseproof.Proof, error)
+	PoolOrderReleased(ctx context.Context, id string) error
+	PoolOrderGone(ctx context.Context, id string) error
 	CapacityReports(ctx context.Context) (map[string]alloc.TierCapacity, error)
 }
 
@@ -170,11 +175,17 @@ func (p *Pool) Step(ctx context.Context) error {
 	}
 	for i := range orders {
 		var err error
-		switch o := orders[i]; o.State {
-		case alloc.PoolOrdering:
+		switch o := orders[i]; {
+		case o.State == alloc.PoolOrdering:
 			err = p.resume(ctx, o)
-		case alloc.PoolUncertain:
+		case o.State == alloc.PoolUncertain:
 			err = p.findUncertain(ctx, o)
+		case o.State == alloc.PoolPlaced && !o.ReleaseRequested.IsZero():
+			err = p.seal(ctx, o)
+		case o.State == alloc.PoolSealed:
+			err = p.release(ctx, o)
+		case o.State == alloc.PoolReleased:
+			err = p.gone(ctx, o)
 		}
 		if err != nil {
 			errs = append(errs, err)
@@ -195,10 +206,13 @@ func (p *Pool) Step(ctx context.Context) error {
 			continue
 		}
 		want := a.Floor
+		// A HOST LEAVING IS BILLED UNTIL IT IS GONE, so it counts against the maximum,
+		// and serves nothing, so it does not count towards the floor or demand.
+		serving := c.active - c.leaving
 		if demand[arch] && c.onItsWay == 0 {
-			want = c.active + 1
+			want = serving + 1
 		}
-		if c.active >= a.Max || c.active >= want {
+		if c.active >= a.Max || serving >= want {
 			continue
 		}
 		if err := p.order(ctx, arch, a, orders); err != nil {
@@ -210,9 +224,10 @@ func (p *Pool) Step(ctx context.Context) error {
 }
 
 // counts are an architecture's orders that hold or may hold a host (active), those
-// whose outcome is not known (unknown), and those placed, not yet joined and not held
-// for a person (onItsWay).
-type counts struct{ active, unknown, onItsWay int }
+// whose outcome is not known (unknown), those placed, not yet joined and not held for a
+// person (onItsWay), and those whose host is being released (leaving), which are active
+// until the source says they are gone.
+type counts struct{ active, unknown, onItsWay, leaving int }
 
 func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 	var c counts
@@ -227,11 +242,17 @@ func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 			c.unknown++
 		case alloc.PoolPlaced:
 			c.active++
-			// A HELD ORDER IS NOT ON ITS WAY: its host joins only once a person acts, and
-			// counting it would stop growth for demand until then.
-			if o.NodeName == "" && o.JoinHold == "" {
+			switch {
+			case !o.ReleaseRequested.IsZero():
+				c.leaving++
+			case o.NodeName == "" && o.JoinHold == "":
+				// A HELD ORDER IS NOT ON ITS WAY: its host joins only once a person acts,
+				// and counting it would stop growth for demand until then.
 				c.onItsWay++
 			}
+		case alloc.PoolSealed, alloc.PoolReleased:
+			c.active++
+			c.leaving++
 		}
 	}
 
@@ -459,6 +480,78 @@ func (p *Pool) findUncertain(ctx context.Context, o alloc.PoolOrder) error {
 		"order", o.ID, "host", host.ID)
 
 	return p.ledger.UncertainPoolOrderFound(ctx, o.ID, host.ID)
+}
+
+// seal seals a joined host whose release was asked for once the ledger proves it holds
+// nothing, then asks its source to take it back. A host still draining waits for the
+// next step; that is not an error.
+func (p *Pool) seal(ctx context.Context, o alloc.PoolOrder) error {
+	proof, err := p.ledger.SealPoolRelease(ctx, o.ID)
+	if errors.Is(err, alloc.ErrPoolReleaseWaits) {
+		p.log.Info("a pool host's release waits for it to drain", "order", o.ID, "why", err)
+
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("pool: seal the release of order %s: %w", o.ID, err)
+	}
+	p.log.Info("a pool host is sealed for release: its certificates are revoked", "order", o.ID, "host", o.HostID)
+
+	return p.releaseWith(ctx, o, proof)
+}
+
+// release asks the source to take back a sealed order's host, on the proof its seal
+// recorded, which a release asked again after a failure or a restart is.
+func (p *Pool) release(ctx context.Context, o alloc.PoolOrder) error {
+	proof, err := p.ledger.PoolReleaseProof(ctx, o.ID)
+	if err != nil {
+		return fmt.Errorf("pool: the release proof of order %s: %w", o.ID, err)
+	}
+
+	return p.releaseWith(ctx, o, proof)
+}
+
+// releaseWith releases a sealed host only where its order was placed: a source whose
+// scope has changed since is not where the host is, and a person releases it by hand.
+func (p *Pool) releaseWith(ctx context.Context, o alloc.PoolOrder, proof releaseproof.Proof) error {
+	src := p.cfg.Sources[o.Source]
+	if src == nil {
+		return fmt.Errorf("pool: order %s is sealed, and its source %s is no longer configured to release it", o.ID,
+			o.Source)
+	}
+	scope, err := src.Scope(ctx)
+	if err != nil {
+		return fmt.Errorf("pool: where sealed order %s's source orders now: %w", o.ID, err)
+	}
+	if scope != o.Scope {
+		return fmt.Errorf("pool: order %s is sealed in %s and its source now orders in %s, so it is released by hand",
+			o.ID, o.Scope, scope)
+	}
+	if err := src.Release(ctx, proof); err != nil {
+		return fmt.Errorf("pool: release order %s's host %s: %w", o.ID, o.HostID, err)
+	}
+	p.log.Info("a pool host was released", "order", o.ID, "host", o.HostID)
+
+	return p.ledger.PoolOrderReleased(ctx, o.ID)
+}
+
+// gone asks the source whether a released host is gone. Only its own terminal answer
+// closes the order; not-found or a failed read waits.
+func (p *Pool) gone(ctx context.Context, o alloc.PoolOrder) error {
+	src := p.cfg.Sources[o.Source]
+	if src == nil {
+		return nil
+	}
+	presence, err := src.Gone(ctx, o.HostID)
+	if err != nil {
+		return fmt.Errorf("pool: whether order %s's host %s is gone: %w", o.ID, o.HostID, err)
+	}
+	if presence != hostsource.PresenceGone {
+		return nil
+	}
+	p.log.Info("a released pool host is gone", "order", o.ID, "host", o.HostID)
+
+	return p.ledger.PoolOrderGone(ctx, o.ID)
 }
 
 func newOrderID() (string, error) {

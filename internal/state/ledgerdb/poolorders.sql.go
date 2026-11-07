@@ -9,6 +9,26 @@ import (
 	"context"
 )
 
+const countPoolOrderAdmissions = `-- name: CountPoolOrderAdmissions :one
+SELECT CAST((SELECT COUNT(*) FROM node_enrollments e
+              WHERE (e.pool_order = $1 OR e.name = $2) AND e.state = 'approved')
+          + (SELECT COUNT(*) FROM issued_certs c WHERE c.node = $2) AS BIGINT)
+`
+
+type CountPoolOrderAdmissionsParams struct {
+	OrderID  string
+	NodeName string
+}
+
+// Everything that would show a node joined from an order: an enrollment approved under
+// it, a request approved under its name, and a certificate ever issued for its name.
+func (q *Queries) CountPoolOrderAdmissions(ctx context.Context, arg CountPoolOrderAdmissionsParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countPoolOrderAdmissions, arg.OrderID, arg.NodeName)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const holdLapsedPoolJoin = `-- name: HoldLapsedPoolJoin :execrows
 UPDATE pool_orders SET join_hold = $1, updated_at = $2
  WHERE order_id = $3 AND state = 'placed' AND node_name = '' AND join_hold = ''
@@ -165,7 +185,7 @@ func (q *Queries) LinkPoolOrderNode(ctx context.Context, arg LinkPoolOrderNodePa
 
 const listPoolOrders = `-- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
 FROM pool_orders
 ORDER BY first_attempt_at, order_id
 `
@@ -195,6 +215,8 @@ func (q *Queries) ListPoolOrders(ctx context.Context) ([]PoolOrder, error) {
 			&i.NodeFingerprint,
 			&i.NodeCertSerial,
 			&i.JoinHold,
+			&i.ReleaseRequestedAt,
+			&i.ReleaseReason,
 		); err != nil {
 			return nil, err
 		}
@@ -222,6 +244,25 @@ type MarkPoolOrderAbandonedParams struct {
 
 func (q *Queries) MarkPoolOrderAbandoned(ctx context.Context, arg MarkPoolOrderAbandonedParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, markPoolOrderAbandoned, arg.Reason, arg.UpdatedAt, arg.OrderID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const markPoolOrderGone = `-- name: MarkPoolOrderGone :execrows
+UPDATE pool_orders SET state = 'gone', updated_at = $1
+ WHERE order_id = $2 AND state = 'released'
+`
+
+type MarkPoolOrderGoneParams struct {
+	UpdatedAt string
+	OrderID   string
+}
+
+// The source said, in its own terminal answer, that the released host is gone.
+func (q *Queries) MarkPoolOrderGone(ctx context.Context, arg MarkPoolOrderGoneParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markPoolOrderGone, arg.UpdatedAt, arg.OrderID)
 	if err != nil {
 		return 0, err
 	}
@@ -260,6 +301,25 @@ type MarkPoolOrderRefusedParams struct {
 
 func (q *Queries) MarkPoolOrderRefused(ctx context.Context, arg MarkPoolOrderRefusedParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, markPoolOrderRefused, arg.Reason, arg.UpdatedAt, arg.OrderID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const markPoolOrderReleased = `-- name: MarkPoolOrderReleased :execrows
+UPDATE pool_orders SET state = 'released', updated_at = $1
+ WHERE order_id = $2 AND state = 'sealed'
+`
+
+type MarkPoolOrderReleasedParams struct {
+	UpdatedAt string
+	OrderID   string
+}
+
+// The source took the sealed host back.
+func (q *Queries) MarkPoolOrderReleased(ctx context.Context, arg MarkPoolOrderReleasedParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markPoolOrderReleased, arg.UpdatedAt, arg.OrderID)
 	if err != nil {
 		return 0, err
 	}
@@ -306,7 +366,7 @@ func (q *Queries) MarkUncertainPoolOrderFound(ctx context.Context, arg MarkUncer
 
 const readPoolOrder = `-- name: ReadPoolOrder :one
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
 FROM pool_orders
 WHERE order_id = $1
 `
@@ -330,6 +390,8 @@ func (q *Queries) ReadPoolOrder(ctx context.Context, orderID string) (PoolOrder,
 		&i.NodeFingerprint,
 		&i.NodeCertSerial,
 		&i.JoinHold,
+		&i.ReleaseRequestedAt,
+		&i.ReleaseReason,
 	)
 	return i, err
 }
@@ -347,6 +409,60 @@ type ReleasePoolOrderJoinParams struct {
 // A person releases an order's held join, so its host's next request is judged again.
 func (q *Queries) ReleasePoolOrderJoin(ctx context.Context, arg ReleasePoolOrderJoinParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, releasePoolOrderJoin, arg.UpdatedAt, arg.OrderID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const requestPoolOrderRelease = `-- name: RequestPoolOrderRelease :execrows
+UPDATE pool_orders SET release_requested_at = $1, release_reason = $2, updated_at = $1
+ WHERE order_id = $3 AND state = 'placed' AND release_requested_at = ''
+`
+
+type RequestPoolOrderReleaseParams struct {
+	Now     string
+	Reason  string
+	OrderID string
+}
+
+// A person asks for a joined host's release: the moment placement stops, which an
+// inventory reported after it is measured against. Once, and only of a placed order.
+func (q *Queries) RequestPoolOrderRelease(ctx context.Context, arg RequestPoolOrderReleaseParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, requestPoolOrderRelease, arg.Now, arg.Reason, arg.OrderID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const sealPoolOrder = `-- name: SealPoolOrder :execrows
+UPDATE pool_orders
+   SET state = 'sealed', release_requested_at = $1, release_reason = $2, updated_at = $3
+ WHERE order_id = $4 AND state = 'placed' AND node_name = $5
+   AND (node_name = '' OR release_requested_at != '')
+`
+
+type SealPoolOrderParams struct {
+	RequestedAt string
+	Reason      string
+	Now         string
+	OrderID     string
+	NodeName    string
+}
+
+// The release's seal, written in the transaction that read its proof: nothing joins
+// from the order or is placed on its host again. A joined order is sealed only once a
+// release was asked for; one nothing joined from is sealed by the asking. The node is
+// the one the proof was read for, so a link committed since seals nothing.
+func (q *Queries) SealPoolOrder(ctx context.Context, arg SealPoolOrderParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, sealPoolOrder,
+		arg.RequestedAt,
+		arg.Reason,
+		arg.Now,
+		arg.OrderID,
+		arg.NodeName,
+	)
 	if err != nil {
 		return 0, err
 	}

@@ -20,10 +20,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"slices"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/releaseproof"
 )
 
 // ErrNoStock means the source said it has no host of that shape where it was asked.
@@ -45,7 +45,7 @@ var ErrRefused = errors.New("hostsource: the source refused the request")
 var ErrNotSent = errors.New("hostsource: the order was not sent")
 
 // ErrNoProof is a release refused because its proof is missing or names another host.
-var ErrNoProof = errors.New("hostsource: a host is released only on proof it holds nothing or never joined")
+var ErrNoProof = releaseproof.ErrNoProof
 
 // Request is one host the pool asks a source for.
 type Request struct {
@@ -187,90 +187,22 @@ type Source interface {
 	Terms(shape string) (Terms, error)
 }
 
-// ReleaseProof is what Release requires. Its zero value proves nothing, and the only
-// ways to build one that does are NewDrainedProof and NewUnjoinedProof, from positive
-// answers the pool read in the transaction that sealed the host.
-type ReleaseProof struct {
-	host     string
-	at       time.Time
-	verified bool
-}
+// ReleaseProof is what Release requires: the proof the ledger built in the transaction
+// that sealed the host (internal/releaseproof, which the allocator can import and a
+// source cannot be imported by). Its zero value proves nothing.
+type ReleaseProof = releaseproof.Proof
 
-// Holdings is what the ledger says a host holds, read in the transaction that sealed it
-// against placement. A count the pool could not read is negative.
-type Holdings struct {
-	Host string
-	// Sealed is when the host was sealed against placement, zero if it is not.
-	Sealed     time.Time
-	Leases     int
-	Quarantine int
-	Custody    int
-	// Inventory is how many instances the node's last inventory reported.
-	Inventory int
-}
+// Holdings and Unjoined are what a proof is built from.
+type (
+	Holdings = releaseproof.Holdings
+	Unjoined = releaseproof.Unjoined
+)
 
-// NewDrainedProof builds the proof a drained host is released on (ADR-030): sealed
-// against placement, and holding no lease, no quarantine and no custody, with its
-// node's last inventory empty. A count that could not be read refuses like a holding.
-func NewDrainedProof(h Holdings) (ReleaseProof, error) {
-	counts := []int{h.Leases, h.Quarantine, h.Custody, h.Inventory}
-	switch {
-	case h.Host == "":
-		return ReleaseProof{}, fmt.Errorf("%w: no host named", ErrNoProof)
-	case h.Sealed.IsZero():
-		return ReleaseProof{}, fmt.Errorf("%w: %s is not sealed against placement", ErrNoProof, h.Host)
-	case slices.ContainsFunc(counts, func(n int) bool { return n < 0 }):
-		return ReleaseProof{}, fmt.Errorf("%w: what %s holds could not be read", ErrNoProof, h.Host)
-	case slices.ContainsFunc(counts, func(n int) bool { return n > 0 }):
-		return ReleaseProof{}, fmt.Errorf("%w: %s holds %d leases, %d quarantined, %d in custody and %d instances",
-			ErrNoProof, h.Host, h.Leases, h.Quarantine, h.Custody, h.Inventory)
-	}
-
-	return ReleaseProof{host: h.Host, at: h.Sealed, verified: true}, nil
-}
-
-// Unjoined is what the ledger says of a host whose node never enrolled, read in the
-// transaction that sealed its order against enrollment and revoked its token.
-type Unjoined struct {
-	Host string
-	// OrderSealed is when the order was sealed against enrollment, zero if it is not.
-	OrderSealed time.Time
-	// Admitted is how many enrollments were ever admitted for the order; negative if
-	// it could not be read.
-	Admitted int
-}
-
-// NewUnjoinedProof builds the proof a host that never joined is released on: it never
-// held anything a job could use, so it has no drain to prove (ADR-030).
-func NewUnjoinedProof(u Unjoined) (ReleaseProof, error) {
-	switch {
-	case u.Host == "":
-		return ReleaseProof{}, fmt.Errorf("%w: no host named", ErrNoProof)
-	case u.OrderSealed.IsZero():
-		return ReleaseProof{}, fmt.Errorf("%w: %s's order is not sealed against enrollment", ErrNoProof, u.Host)
-	case u.Admitted < 0:
-		return ReleaseProof{}, fmt.Errorf("%w: whether %s ever joined could not be read", ErrNoProof, u.Host)
-	case u.Admitted > 0:
-		return ReleaseProof{}, fmt.Errorf("%w: %s joined, so it is released by drain", ErrNoProof, u.Host)
-	}
-
-	return ReleaseProof{host: u.Host, at: u.OrderSealed, verified: true}, nil
-}
-
-// Host is the host the proof is for.
-func (p ReleaseProof) Host() string { return p.host }
-
-// For reports whether the proof releases id; a source calls it first in Release.
-func (p ReleaseProof) For(id string) error {
-	if !p.verified || p.host == "" {
-		return ErrNoProof
-	}
-	if p.host != id {
-		return fmt.Errorf("%w: the proof is for %q, not %q", ErrNoProof, p.host, id)
-	}
-
-	return nil
-}
+// NewDrainedProof and NewUnjoinedProof are releaseproof's constructors.
+var (
+	NewDrainedProof  = releaseproof.NewDrained
+	NewUnjoinedProof = releaseproof.NewUnjoined
+)
 
 // Secret is a first-boot payload or a credential: it reaches the source's API and
 // nothing else, and every way of printing it prints that it is redacted.

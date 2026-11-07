@@ -13,6 +13,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
+	"github.com/junioryono/billet/internal/releaseproof"
 )
 
 // fakeLedger keeps orders the way migration 75 does: one-way moves from one state, and
@@ -32,6 +33,63 @@ type fakeLedger struct {
 	holdErr         error
 	holdCalls       int
 	listsBeforeHold int
+	// releaseWaits makes a seal answer that its host still holds something; sealCalls
+	// counts the seals asked for.
+	releaseWaits bool
+	sealCalls    int
+}
+
+// releaseMove moves an order between two release states, keeping its host.
+func (l *fakeLedger) releaseMove(id, from, to string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := range l.orders {
+		if l.orders[i].ID == id && l.orders[i].State == from {
+			l.orders[i].State, l.orders[i].Updated = to, l.now()
+
+			return nil
+		}
+	}
+
+	return alloc.ErrPoolOrderMoved
+}
+
+// SealPoolRelease seals a placed order whose release was asked for, as the allocator
+// does once the ledger proves its host holds nothing, unless releaseWaits says it does.
+func (l *fakeLedger) SealPoolRelease(_ context.Context, order string) (releaseproof.Proof, error) {
+	l.mu.Lock()
+	l.sealCalls++
+	waits := l.releaseWaits
+	l.mu.Unlock()
+	if waits {
+		return releaseproof.Proof{}, fmt.Errorf("%w: %w", alloc.ErrPoolReleaseWaits, releaseproof.ErrNoProof)
+	}
+	if o := l.states()[order]; o != alloc.PoolPlaced {
+		return releaseproof.Proof{}, alloc.ErrPoolOrderMoved
+	}
+	if err := l.releaseMove(order, alloc.PoolPlaced, alloc.PoolSealed); err != nil {
+		return releaseproof.Proof{}, err
+	}
+	o := l.snapshot()[order]
+
+	return releaseproof.Sealed(o.HostID, o.Updated)
+}
+
+func (l *fakeLedger) PoolReleaseProof(_ context.Context, order string) (releaseproof.Proof, error) {
+	o := l.snapshot()[order]
+	if o.State != alloc.PoolSealed {
+		return releaseproof.Proof{}, alloc.ErrPoolOrderMoved
+	}
+
+	return releaseproof.Sealed(o.HostID, o.Updated)
+}
+
+func (l *fakeLedger) PoolOrderReleased(_ context.Context, id string) error {
+	return l.releaseMove(id, alloc.PoolSealed, alloc.PoolReleased)
+}
+
+func (l *fakeLedger) PoolOrderGone(_ context.Context, id string) error {
+	return l.releaseMove(id, alloc.PoolReleased, alloc.PoolGone)
 }
 
 func (l *fakeLedger) RecordPoolOrder(_ context.Context, o alloc.PoolOrder) error {
@@ -182,6 +240,13 @@ type fakeSource struct {
 	answer     func(req hostsource.Request) (hostsource.Host, error)
 	find       func(order string) (hostsource.Host, bool, error)
 	idempotent time.Duration
+	// released is every host the source was asked to take back, releaseErr its answer;
+	// goneAsked every host asked about, and presence and goneErr the answer.
+	released   []string
+	releaseErr error
+	goneAsked  []string
+	presence   hostsource.Presence
+	goneErr    error
 }
 
 func (s *fakeSource) Name() string { return "fake" }
@@ -223,10 +288,28 @@ func (s *fakeSource) Find(_ context.Context, order string) (hostsource.Host, boo
 func (s *fakeSource) Describe(context.Context, string) (hostsource.Host, error) {
 	return hostsource.Host{}, nil
 }
-func (s *fakeSource) Gone(context.Context, string) (hostsource.Presence, error) {
-	return hostsource.PresenceUnknown, nil
+func (s *fakeSource) Gone(_ context.Context, id string) (hostsource.Presence, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.goneAsked = append(s.goneAsked, id)
+
+	return s.presence, s.goneErr
 }
-func (s *fakeSource) Release(context.Context, hostsource.ReleaseProof) error { return nil }
+
+// Release takes a host back only on a proof for it, as a source does.
+func (s *fakeSource) Release(_ context.Context, proof hostsource.ReleaseProof) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.releaseErr != nil {
+		return s.releaseErr
+	}
+	if proof.Host() == "" {
+		return hostsource.ErrNoProof
+	}
+	s.released = append(s.released, proof.Host())
+
+	return nil
+}
 
 func (s *fakeSource) Terms(shape string) (hostsource.Terms, error) {
 	for _, known := range s.shapes {
@@ -498,7 +581,7 @@ func TestARefusedChoiceIsPassedOverForTheBackoff(t *testing.T) {
 				t.Fatalf("orders = %v; second asked %d times", got, len(r.second.requests()))
 			}
 			r.ledger.mu.Lock()
-			r.ledger.orders[1].State = alloc.PoolReleased // the floor is short again
+			r.ledger.orders[1].State = alloc.PoolGone // the floor is short again
 			r.ledger.mu.Unlock()
 			r.now = r.now.Add(11 * time.Minute)
 			r.first.answer = nil
@@ -941,5 +1024,112 @@ func TestAStepHoldsLapsedJoinsFirstAndAFailedHoldKeepsTheFloor(t *testing.T) {
 	}
 	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolPlaced {
 		t.Fatalf("the floor after a failed hold: %v", got)
+	}
+}
+
+// joined seeds a placed order a node joined from, under host, whose release a person
+// asked for when draining is true.
+func (r *rig) joined(id, host string, draining bool) {
+	r.ledger.mu.Lock()
+	defer r.ledger.mu.Unlock()
+	o := alloc.PoolOrder{ID: id, Source: "first", Scope: "first:us-west-2", Shape: "z1d.metal", Arch: config.ArchX64,
+		State: alloc.PoolPlaced, HostID: host, NodeName: alloc.PoolNodeName(id), FirstAttempt: r.now, Updated: r.now}
+	if draining {
+		o.ReleaseRequested, o.ReleaseReason = r.now, "the pool shrinks"
+	}
+	r.ledger.orders = append(r.ledger.orders, o)
+}
+
+// A RELEASE MOVES ONE WAY, ONE STEP AT A TIME: a host whose release was asked for is
+// sealed once the ledger proves it holds nothing, and its source is asked to take it
+// back on that proof; only the source's own terminal answer closes the order, and a
+// host whose answer is not yet gone is asked again at the next step.
+func TestAReleaseIsSealedReleasedAndGoneInTurn(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 0, Max: 2})
+	r.joined("o-9", "i-9", true)
+	r.first.presence = hostsource.PresenceUnknown
+	step(t, r)
+	if got := r.ledger.states()["o-9"]; got != alloc.PoolReleased || len(r.first.released) != 1 || r.first.released[0] != "i-9" {
+		t.Fatalf("after one step: %s, released %v", got, r.first.released)
+	}
+	step(t, r)
+	if got := r.ledger.states()["o-9"]; got != alloc.PoolReleased || len(r.first.goneAsked) != 1 {
+		t.Fatalf("a host not yet gone: %s, asked %v", got, r.first.goneAsked)
+	}
+	r.first.mu.Lock()
+	r.first.presence = hostsource.PresenceGone
+	r.first.mu.Unlock()
+	step(t, r)
+	if got := r.ledger.states()["o-9"]; got != alloc.PoolGone || len(r.first.released) != 1 {
+		t.Fatalf("a host its source says is gone: %s, released %v", got, r.first.released)
+	}
+}
+
+// A HOST STILL DRAINING WAITS, and that is no error: nothing is sealed and its source is
+// not asked; a host not asked to be released is never sealed at all.
+func TestAHostStillDrainingWaits(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 0, Max: 2})
+	r.joined("o-9", "i-9", true)
+	r.joined("o-8", "i-8", false)
+	r.ledger.releaseWaits = true
+	step(t, r)
+	if got := r.ledger.states(); got["o-9"] != alloc.PoolPlaced || got["o-8"] != alloc.PoolPlaced ||
+		len(r.first.released) != 0 || r.ledger.sealCalls != 1 {
+		t.Fatalf("a draining host: %v, released %v, sealed %d times", got, r.first.released, r.ledger.sealCalls)
+	}
+}
+
+// A RELEASE THE SOURCE REFUSED STAYS SEALED and is asked again on the seal's proof; a
+// source that now orders somewhere else, or is gone from the config, releases nothing
+// and says so.
+func TestAFailedReleaseIsAskedAgainOnlyWhereTheHostIs(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 0, Max: 2})
+	r.joined("o-9", "i-9", true)
+	r.first.releaseErr = errors.New("throttled")
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "release order o-9") {
+		t.Fatalf("a refused release answered %v", err)
+	}
+	if got := r.ledger.states()["o-9"]; got != alloc.PoolSealed {
+		t.Fatalf("a refused release left %s, want sealed", got)
+	}
+	r.first.mu.Lock()
+	r.first.releaseErr, r.first.scope = nil, "first:eu-west-1"
+	r.first.mu.Unlock()
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "released by hand") {
+		t.Fatalf("a source ordering elsewhere answered %v", err)
+	}
+	if len(r.first.released) != 0 {
+		t.Fatalf("released %v somewhere else", r.first.released)
+	}
+	r.first.mu.Lock()
+	r.first.scope = "first:us-west-2"
+	r.first.mu.Unlock()
+	step(t, r)
+	if got := r.ledger.states()["o-9"]; got != alloc.PoolReleased || len(r.first.released) != 1 {
+		t.Fatalf("asked again where the host is: %s, released %v", got, r.first.released)
+	}
+}
+
+// A HOST LEAVING IS BILLED UNTIL IT IS GONE AND SERVES NOTHING: it counts against the
+// maximum, and not towards the floor, so the floor is kept while it leaves.
+func TestAHostLeavingCountsAgainstTheMaximumNotTheFloor(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 1, Max: 2})
+	r.joined("o-9", "i-9", true)
+	r.ledger.releaseWaits = true
+	step(t, r)
+	if got := r.ledger.states(); len(got) != 2 {
+		t.Fatalf("the floor while a host leaves: %v, want one more ordered", got)
+	}
+
+	r = newRig(t, Policy{Floor: 1, Max: 1})
+	r.joined("o-9", "i-9", true)
+	r.ledger.releaseWaits = true
+	step(t, r)
+	if got := r.ledger.states(); len(got) != 1 {
+		t.Fatalf("the maximum while a host leaves: %v, want nothing ordered", got)
 	}
 }

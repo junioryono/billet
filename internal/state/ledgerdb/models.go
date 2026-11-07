@@ -163,21 +163,23 @@ type NodeEnrollment struct {
 }
 
 type PoolOrder struct {
-	OrderID         string
-	Source          string
-	Scope           string
-	Shape           string
-	Location        string
-	Arch            string
-	State           string
-	HostID          string
-	NodeName        string
-	Reason          string
-	FirstAttemptAt  string
-	UpdatedAt       string
-	NodeFingerprint string
-	NodeCertSerial  string
-	JoinHold        string
+	OrderID            string
+	Source             string
+	Scope              string
+	Shape              string
+	Location           string
+	Arch               string
+	State              string
+	HostID             string
+	NodeName           string
+	Reason             string
+	FirstAttemptAt     string
+	UpdatedAt          string
+	NodeFingerprint    string
+	NodeCertSerial     string
+	JoinHold           string
+	ReleaseRequestedAt string
+	ReleaseReason      string
 }
 
 type PoolRunner struct {

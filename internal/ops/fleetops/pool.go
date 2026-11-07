@@ -14,17 +14,21 @@ import (
 
 const poolUsage = "usage: billet pool [--config PATH]\n" +
 	"       billet pool abandon [--config PATH] --reason TEXT <order>\n" +
-	"       billet pool unhold [--config PATH] <order>"
+	"       billet pool unhold [--config PATH] <order>\n" +
+	"       billet pool release [--config PATH] --reason TEXT <order>"
 
 // Pool is `billet pool`: what the pool of rented bare metal ordered and what became of
-// each order (ADR-030), closing an uncertain order, and releasing a held join, each on
-// a person's word.
+// each order (ADR-030), closing an uncertain order, releasing a held join, and
+// releasing a host, each on a person's word.
 func Pool(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) > 0 && args[0] == "abandon" {
 		return poolAbandon(ctx, env, args[1:])
 	}
 	if len(args) > 0 && args[0] == "unhold" {
 		return poolUnhold(ctx, env, args[1:])
+	}
+	if len(args) > 0 && args[0] == "release" {
+		return poolRelease(ctx, env, args[1:])
 	}
 	fs := cli.NewFlagSet("billet pool", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
@@ -61,12 +65,28 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 		if o.State == alloc.PoolUncertain {
 			uncertain++
 		}
+		st := o.State
+		if o.State == alloc.PoolPlaced && !o.ReleaseRequested.IsZero() {
+			st = "draining"
+		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.ID, o.Arch, o.Source, o.Scope, o.Shape,
-			dash(o.Location), o.State, dash(o.HostID), dash(o.NodeName),
+			dash(o.Location), st, dash(o.HostID), dash(o.NodeName),
 			o.FirstAttempt.UTC().Format(time.RFC3339), dash(oneLine(o.Reason)))
 	}
 	if err := w.Flush(); err != nil {
 		return err
+	}
+	draining := false
+	for i := range orders {
+		if o := &orders[i]; o.State == alloc.PoolPlaced && !o.ReleaseRequested.IsZero() {
+			if !draining {
+				fmt.Fprintf(env.Stdout, "\nDraining for release (ADR-030): out of placement, and sealed, revoked and released "+
+					"once the ledger shows the host holds nothing.\n")
+				draining = true
+			}
+			fmt.Fprintf(env.Stdout, "  %s since %s: %s\n", o.ID, o.ReleaseRequested.UTC().Format(time.RFC3339),
+				oneLine(o.ReleaseReason))
+		}
 	}
 	if uncertain > 0 {
 		fmt.Fprintf(env.Stdout, "\n%d uncertain: the source's answer was lost and a resend could place a second host. "+
@@ -142,6 +162,43 @@ func poolUnhold(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 	fmt.Fprintf(env.Stdout, "Released the held join of %s; its host is judged again on its next ask.\n", order)
+
+	return nil
+}
+
+// poolRelease asks for a placed host's release on a person's word (ADR-030). A host a
+// node joined from leaves placement now and is released once the ledger shows it holds
+// nothing; one nothing joined from is sealed now, on the proof that nothing was ever
+// admitted for it. The pool's next step asks the source in either case.
+func poolRelease(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet pool release", env.Stdout)
+	cfgPath := cli.AddConfigFlag(fs)
+	reason := fs.String("reason", "", "why the host is released, recorded on the order")
+	order, err := cli.ParseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+	if order == "" || strings.TrimSpace(*reason) == "" {
+		return errors.New(poolUsage)
+	}
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
+	sealed, err := a.RequestPoolRelease(ctx, order, oneLine(*reason))
+	if err != nil {
+		return err
+	}
+	if sealed {
+		fmt.Fprintf(env.Stdout, "Sealed %s: nothing ever joined from it, and nothing will. The pool's next step asks "+
+			"its source to take the host back.\n", order)
+
+		return nil
+	}
+	fmt.Fprintf(env.Stdout, "Released %s from placement. Once the ledger shows its host holds nothing, the pool seals "+
+		"it, revokes its node's certificates and asks its source to take it back; `billet pool` shows where it is.\n",
+		order)
 
 	return nil
 }

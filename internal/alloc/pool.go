@@ -52,6 +52,10 @@ type PoolOrder struct {
 	NodeCertSerial  string
 	// JoinHold is why a person must look before the order admits a node.
 	JoinHold string
+	// ReleaseRequested is when a person asked for the host's release, zero until one
+	// did; the moment its host left placement. ReleaseReason is what they gave.
+	ReleaseRequested time.Time
+	ReleaseReason    string
 }
 
 // RecordPoolOrder commits an order before its source is asked, so an order whose
@@ -106,11 +110,20 @@ func poolOrderFrom(r *ledgerdb.PoolOrder) (PoolOrder, error) {
 		return PoolOrder{}, fmt.Errorf("alloc: pool order %s: updated %q: %w", r.OrderID, r.UpdatedAt, err)
 	}
 
+	var requested time.Time
+	if r.ReleaseRequestedAt != "" {
+		if requested, err = time.Parse(timestampFormat, r.ReleaseRequestedAt); err != nil {
+			return PoolOrder{}, fmt.Errorf("alloc: pool order %s: release asked for at %q: %w", r.OrderID,
+				r.ReleaseRequestedAt, err)
+		}
+	}
+
 	return PoolOrder{
 		ID: r.OrderID, Source: r.Source, Scope: r.Scope, Shape: r.Shape, Location: r.Location,
 		Arch: config.Arch(r.Arch), State: r.State, HostID: r.HostID, NodeName: r.NodeName,
 		Reason: r.Reason, FirstAttempt: first, Updated: updated,
 		NodeFingerprint: r.NodeFingerprint, NodeCertSerial: r.NodeCertSerial, JoinHold: r.JoinHold,
+		ReleaseRequested: requested, ReleaseReason: r.ReleaseReason,
 	}, nil
 }
 

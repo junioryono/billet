@@ -64,6 +64,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **An order records its source's scope and is read back only there; a resend the source refuses is uncertain, not refused.**
 - **A pool host joins on its source's word only when every check vouches for its key; a contradiction holds its order, and could-not-tell waits for a person (ADR-030).**
 - **Only a whole console line names a key, and nothing a pool host's join prints can be one.**
+- **A pool host is released only on proof, sealed in the transaction that reads it, with its node's certificates revoked first (ADR-030).**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

@@ -7,13 +7,13 @@ VALUES (@order_id, @source, @scope, @shape, @location, @arch, 'ordering', @first
 
 -- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
 FROM pool_orders
 ORDER BY first_attempt_at, order_id;
 
 -- name: ReadPoolOrder :one
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
 FROM pool_orders
 WHERE order_id = @order_id;
 
@@ -80,3 +80,36 @@ UPDATE pool_orders SET join_hold = @join_hold, updated_at = @updated_at
                     WHERE t.pool_order = pool_orders.order_id AND t.uses_remaining > 0 AND t.expires_at > @now)
    AND NOT EXISTS (SELECT 1 FROM node_enrollments e
                     WHERE e.pool_order = pool_orders.order_id AND e.state = 'pending');
+
+-- name: RequestPoolOrderRelease :execrows
+-- A person asks for a joined host's release: the moment placement stops, which an
+-- inventory reported after it is measured against. Once, and only of a placed order.
+UPDATE pool_orders SET release_requested_at = @now, release_reason = @reason, updated_at = @now
+ WHERE order_id = @order_id AND state = 'placed' AND release_requested_at = '';
+
+-- name: SealPoolOrder :execrows
+-- The release's seal, written in the transaction that read its proof: nothing joins
+-- from the order or is placed on its host again. A joined order is sealed only once a
+-- release was asked for; one nothing joined from is sealed by the asking. The node is
+-- the one the proof was read for, so a link committed since seals nothing.
+UPDATE pool_orders
+   SET state = 'sealed', release_requested_at = @requested_at, release_reason = @reason, updated_at = @now
+ WHERE order_id = @order_id AND state = 'placed' AND node_name = @node_name
+   AND (node_name = '' OR release_requested_at != '');
+
+-- name: MarkPoolOrderReleased :execrows
+-- The source took the sealed host back.
+UPDATE pool_orders SET state = 'released', updated_at = @updated_at
+ WHERE order_id = @order_id AND state = 'sealed';
+
+-- name: MarkPoolOrderGone :execrows
+-- The source said, in its own terminal answer, that the released host is gone.
+UPDATE pool_orders SET state = 'gone', updated_at = @updated_at
+ WHERE order_id = @order_id AND state = 'released';
+
+-- name: CountPoolOrderAdmissions :one
+-- Everything that would show a node joined from an order: an enrollment approved under
+-- it, a request approved under its name, and a certificate ever issued for its name.
+SELECT CAST((SELECT COUNT(*) FROM node_enrollments e
+              WHERE (e.pool_order = @order_id OR e.name = @node_name) AND e.state = 'approved')
+          + (SELECT COUNT(*) FROM issued_certs c WHERE c.node = @node_name) AS BIGINT);

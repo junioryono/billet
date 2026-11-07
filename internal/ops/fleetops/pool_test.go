@@ -141,3 +141,52 @@ func heldAt(t *testing.T, a *alloc.Allocator, order string) time.Time {
 
 	return o.Updated
 }
+
+// `billet pool release` SEALS A HOST NOTHING JOINED FROM AT ONCE, AND SAYS SO; it
+// refuses without a reason, and a second release of the same order is refused. The
+// listing then shows the order sealed.
+func TestThePoolCommandReleasesAHost(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeCAConfig(t, stateDir)
+	ctx := t.Context()
+	a, closeDB, err := ControlPlaneAllocator(ctx, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := a.RecordPoolOrder(ctx, alloc.PoolOrder{
+		ID: "p-idle", Source: "aws-metal", Scope: "aws:us-west-2:subnet-0abc:us-west-2a", Shape: "z1d.metal",
+		Location: "us-west-2a", Arch: config.ArchX64,
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := a.PoolOrderPlaced(ctx, "p-idle", "i-idle"); err != nil {
+		t.Fatalf("placed: %v", err)
+	}
+	closeDB()
+
+	env, out := poolEnv()
+	if err := Pool(ctx, env, []string{"release", "--config", cfg, "p-idle"}); err == nil ||
+		!strings.Contains(err.Error(), "usage:") {
+		t.Fatalf("a release without a reason answered %v", err)
+	}
+	if err := Pool(ctx, env, []string{"release", "--config", cfg, "--reason", "it never\nbooted", "p-idle"}); err != nil ||
+		!strings.Contains(out.String(), "Sealed p-idle") {
+		t.Fatalf("release: %v\n%s", err, out)
+	}
+	if err := Pool(ctx, env, []string{"release", "--config", cfg, "--reason", "again", "p-idle"}); err == nil {
+		t.Fatal("a second release was taken")
+	}
+	env, out = poolEnv()
+	if err := Pool(ctx, env, []string{"--config", cfg}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	rows := map[string][]string{}
+	for _, line := range strings.Split(out.String(), "\n") {
+		if f := strings.Fields(line); len(f) > 0 {
+			rows[f[0]] = f
+		}
+	}
+	if r := rows["p-idle"]; len(r) < 7 || r[6] != "sealed" {
+		t.Fatalf("the p-idle row = %q\n%s", r, out)
+	}
+}
