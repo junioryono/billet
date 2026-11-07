@@ -13,13 +13,18 @@ import (
 )
 
 const poolUsage = "usage: billet pool [--config PATH]\n" +
-	"       billet pool abandon [--config PATH] --reason TEXT <order>"
+	"       billet pool abandon [--config PATH] --reason TEXT <order>\n" +
+	"       billet pool unhold [--config PATH] <order>"
 
 // Pool is `billet pool`: what the pool of rented bare metal ordered and what became of
-// each order (ADR-030), and closing an uncertain order on a person's word.
+// each order (ADR-030), closing an uncertain order, and releasing a held join, each on
+// a person's word.
 func Pool(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) > 0 && args[0] == "abandon" {
 		return poolAbandon(ctx, env, args[1:])
+	}
+	if len(args) > 0 && args[0] == "unhold" {
+		return poolUnhold(ctx, env, args[1:])
 	}
 	fs := cli.NewFlagSet("billet pool", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
@@ -70,6 +75,20 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 			uncertain)
 	}
 
+	// A HELD JOIN IS A HOST BILLED AND NOT SERVING, which only a person moves.
+	held := false
+	for i := range orders {
+		if o := &orders[i]; o.JoinHold != "" {
+			if !held {
+				fmt.Fprintf(env.Stdout, "\nJoins held for a person (ADR-030): the order admits no node on its source's word. "+
+					"Look at the host: approve a request it recorded (`billet nodes pending`, `billet nodes approve`), release "+
+					"the hold so its next ask is judged again (`billet pool unhold <order>`), or release the host.\n")
+				held = true
+			}
+			fmt.Fprintf(env.Stdout, "  held %s: %s\n", o.ID, oneLine(o.JoinHold))
+		}
+	}
+
 	return nil
 }
 
@@ -98,6 +117,31 @@ func poolAbandon(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 	fmt.Fprintf(env.Stdout, "Abandoned %s.\n", order)
+
+	return nil
+}
+
+// poolUnhold releases an order's held join on a person's word: its host, which keeps
+// asking while it is held, is judged again on its next ask.
+func poolUnhold(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet pool unhold", env.Stdout)
+	cfgPath := cli.AddConfigFlag(fs)
+	order, err := cli.ParseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+	if order == "" {
+		return errors.New(poolUsage)
+	}
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
+	if err := a.ReleasePoolJoin(ctx, order); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "Released the held join of %s; its host is judged again on its next ask.\n", order)
 
 	return nil
 }

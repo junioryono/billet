@@ -39,7 +39,8 @@ const poolBlock = `  pool:
 
 func poolConfig(block string) string {
 	return "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n  private_key_path: /tmp/key.pem\nserver:\n" +
-		"  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n" + block
+		"  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n  listen: 10.77.0.10:7717\n" +
+		"  bootstrap_listen: 10.77.0.10:7718\n" + block
 }
 
 func TestAPoolBlockLoads(t *testing.T) {
@@ -119,5 +120,61 @@ func TestAPoolWithNoSourceOrNoArchitectureIsRefused(t *testing.T) {
 	_, err := loadServer(t, poolConfig(block))
 	if err == nil || !strings.Contains(err.Error(), "names no source") || !strings.Contains(err.Error(), "architectures is empty") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// AN ORDERED HOST JOINS ONLY THROUGH AN ENROLLMENT LISTENER, so a pool on a control plane
+// that enrolls nothing over the network, or whose listener names no host to dial and
+// no bootstrap_addr says one, is refused; otherwise the address it dials is the one
+// given, else the listener's own.
+func TestAPoolNeedsAnEnrollmentListenerItsHostsCanDial(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct{ from, to, want string }{
+		"no enrollment listener": {"  bootstrap_listen: 10.77.0.10:7718\n", "", "needs server.bootstrap_listen"},
+		"a wildcard listener":    {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: 0.0.0.0:7718", "bootstrap_addr is required"},
+		"a loopback listener":    {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: 127.0.0.1:7718", "bootstrap_addr is required"},
+		"an ipv6 loopback":       {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: '[::1]:7718'", "bootstrap_addr is required"},
+		"localhost":              {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: localhost:7718", "bootstrap_addr is required"},
+		"a loopback override":    {"    boot_prelude:", "    bootstrap_addr: 127.0.0.1:7718\n    boot_prelude:", "no wildcard and no loopback"},
+		"a wildcard override":    {"    boot_prelude:", "    bootstrap_addr: '[::]:7718'\n    boot_prelude:", "no wildcard and no loopback"},
+		"a zoned override":       {"    boot_prelude:", "    bootstrap_addr: '[::1%lo]:7718'\n    boot_prelude:", "no wildcard and no loopback"},
+		"a zoned listener":       {"bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: '[fe80::1%eth0]:7718'", "bootstrap_addr is required"},
+		"a loopback join server": {"join_server: 10.77.0.10:7717", "join_server: localhost:7717", "join_server"},
+	} {
+		raw := poolConfig(poolBlock)
+		if !strings.Contains(raw, c.from) {
+			t.Fatalf("%s: the fixture has no %q", name, c.from)
+		}
+		if _, err := loadServer(t, strings.Replace(raw, c.from, c.to, 1)); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: got %v, want it to say %q", name, err, c.want)
+		}
+	}
+
+	cfg, err := loadServer(t, poolConfig(poolBlock))
+	if err != nil || cfg.Server.PoolEnrollAddr() != "10.77.0.10:7718" {
+		t.Fatalf("the listener's own address: %v, %v", cfg, err)
+	}
+	given := strings.Replace(poolConfig(poolBlock), "bootstrap_listen: 10.77.0.10:7718", "bootstrap_listen: 0.0.0.0:7718", 1)
+	given = strings.Replace(given, "    boot_prelude:", "    bootstrap_addr: billet.internal:7718\n    boot_prelude:", 1)
+	cfg, err = loadServer(t, given)
+	if err != nil || cfg.Server.PoolEnrollAddr() != "billet.internal:7718" {
+		t.Fatalf("the address given: %v", err)
+	}
+}
+
+// AN ENROLLMENT ADDRESS INHERITED FROM THE ROUTER IS HELD TO THE SAME RULE: a rented host
+// dials it, and loopback there is the host itself.
+func TestAPoolRefusesAnInheritedEnrollmentAddressItsHostsCannotDial(t *testing.T) {
+	t.Parallel()
+	for _, addr := range []string{"localhost:443", "billet.localhost:443", "127.0.0.1:443", "[::1%lo]:443", "billet.example:443"} {
+		s := &ServerConfig{BootstrapListen: "127.0.0.1:7718", TLSRouter: &TLSRouterConfig{EnrollAddr: addr},
+			Pool: &PoolConfig{}}
+		want := ""
+		if addr == "billet.example:443" {
+			want = addr
+		}
+		if got := s.PoolEnrollAddr(); got != want {
+			t.Errorf("router enroll_addr %s: the pool's hosts dial %q, want %q", addr, got, want)
+		}
 	}
 }

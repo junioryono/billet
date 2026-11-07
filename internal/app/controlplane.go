@@ -513,8 +513,13 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 	// binds to this once it has built the scheduler.
 	resizes := &resizeGate{alloc: cp.allocator}
 
+	wireOpts, err := poolWireOptions(cp.cfg, cp.allocator, cp.deployment, append(wireOpts, withResizer(resizes.resize))...)
+	if err != nil {
+		return nil, err
+	}
+
 	wire, err := ServeNodeWire(ctx, cp.cfg, cp.host.ServerAccess, nodes, cp.allocator,
-		cp.planeJIT, cp.allocator, cp.allocator, cp.db, append(wireOpts, withResizer(resizes.resize))...)
+		cp.planeJIT, cp.allocator, cp.allocator, cp.db, wireOpts...)
 	if err != nil {
 		return nil, err
 	}

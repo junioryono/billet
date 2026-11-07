@@ -73,7 +73,7 @@ func TestADeniedEnrollmentFreesTheNameForAnotherKey(t *testing.T) {
 	}
 
 	// The key is gone with the process that made it, so the operator denies it.
-	if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:lost", EnrollDenied, ""); err != nil {
+	if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:lost", EnrollDenied, "", ""); err != nil {
 		t.Fatalf("deny: %v", err)
 	}
 
@@ -108,7 +108,7 @@ func TestReclaimingADeniedNameClearsTheDecision(t *testing.T) {
 		t.Fatalf("RequestEnrollment: %v", err)
 	}
 
-	if err := a.DecideEnrollment(t.Context(), "epyc-1", "aa:bb", EnrollDenied, ""); err != nil {
+	if err := a.DecideEnrollment(t.Context(), "epyc-1", "aa:bb", EnrollDenied, "", ""); err != nil {
 		t.Fatalf("DecideEnrollment: %v", err)
 	}
 
@@ -147,7 +147,7 @@ func TestAClaimedNameStillRefusesASecondKey(t *testing.T) {
 		t.Fatalf("a pending name accepted a second key: %v", err)
 	}
 
-	if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:first", EnrollApproved, "cert"); err != nil {
+	if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:first", EnrollApproved, "cert", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 

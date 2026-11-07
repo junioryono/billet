@@ -1,5 +1,7 @@
 {
   "node": "EnrollRequest.node",
   "csr_pem": "EnrollRequest.csr_pem",
-  "join_token": "EnrollRequest.join_token"
+  "join_token": "EnrollRequest.join_token",
+  "identity_document": "EnrollRequest.identity_document",
+  "identity_signature": "EnrollRequest.identity_signature"
 }

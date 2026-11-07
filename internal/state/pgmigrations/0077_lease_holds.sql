@@ -1,6 +1,6 @@
--- migration 76: lease_holds, for PostgreSQL
+-- migration 77: lease_holds, for PostgreSQL
 --
--- The twin of migrations/0076_lease_holds.sql, which says why. Everything between the
+-- The twin of migrations/0077_lease_holds.sql, which says why. Everything between the
 -- markers below is PUBLISHED BYTES; the prose is not. Reformat one tab and every ledger
 -- that applied this migration refuses to open.
 

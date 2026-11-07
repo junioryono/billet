@@ -96,10 +96,10 @@ is_replay_input() {
 		internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
 		internal/endpoint/* | internal/fakeactions/* | internal/flightrecorder/* | internal/github/* | internal/guestassets/* | \
 		internal/guestattach/* | internal/guestreport/* | internal/joblog/* | internal/peercred/* | internal/relay/* | \
-		internal/egress/* | internal/hostauthority/* | internal/hostsource/* | internal/imageaccept/* | internal/jobtrace/* | internal/lifeops/* | \
+		internal/awsidentity/* | internal/egress/* | internal/hostauthority/* | internal/hostsource/* | internal/imageaccept/* | internal/jobtrace/* | internal/lifeops/* | \
 		internal/importcheck/* | internal/lease/* | internal/macoslimit/* | internal/metrics/* | internal/notices/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeending/* | internal/nodeplane/* | \
-		internal/pool/* | internal/power/* | internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
+		internal/pool/* | internal/joinconsole/* | internal/power/* | internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
 		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \
 		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
 		internal/tokenbroker/* | internal/usage/* | internal/version/* | internal/wallmeter/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;

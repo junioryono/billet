@@ -110,10 +110,6 @@ Command.tier.cache.npm tag omitempty
 Command.tier.cache.npm bool
 Command.tier.arch tag omitempty
 Command.tier.arch string
-Command.tier.attach tag omitempty
-Command.tier.attach bool
-Command.tier.hold_on_failure tag omitempty
-Command.tier.hold_on_failure string
 Command.tier.egress tag omitempty
 Command.tier.egress pointer
 Command.tier.egress.allow slice
@@ -154,8 +150,3 @@ Command.log_read.ranges slice
 Command.log_read.ranges[].first int64
 Command.log_read.ranges[].last int64
 Command.log_read.max_bytes int
-Command.attach tag omitempty
-Command.attach pointer
-Command.attach.lease string
-Command.attach.stream string
-Command.attach.token string

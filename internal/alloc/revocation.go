@@ -113,6 +113,9 @@ const (
 	CertEnrolled = "enrolled"
 	CertIssued   = "issued"
 	CertRenewed  = "renewed"
+	// CertPool is a certificate signed for a pool host its source vouched for
+	// (ADR-030), with no person comparing its fingerprint.
+	CertPool = "pool"
 )
 
 // RecordIssuedCert writes down a credential at the moment it is handed out.

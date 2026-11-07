@@ -149,6 +149,8 @@ type ReadOps interface {
 	ReadRetirement(ctx context.Context, deployment string) (ledgerdb.ControllerRetirement, error)
 	ReadEnrollment(ctx context.Context, name string) (ledgerdb.NodeEnrollment, error)
 	ReadEnrollmentFingerprint(ctx context.Context, name string) (string, error)
+	ReadJoinTokenOrder(ctx context.Context, arg ledgerdb.ReadJoinTokenOrderParams) (ledgerdb.ReadJoinTokenOrderRow, error)
+	ReadPoolOrder(ctx context.Context, orderID string) (ledgerdb.PoolOrder, error)
 	ReadJobConclusion(ctx context.Context, leaseID string) (sql.NullString, error)
 	ReadJobFailureReason(ctx context.Context, leaseID string) (string, error)
 	ReadJobNode(ctx context.Context, leaseID string) (sql.NullString, error)
@@ -292,8 +294,18 @@ type WriteOps interface {
 	InsertPoolOrder(ctx context.Context, arg ledgerdb.InsertPoolOrderParams) error
 	MarkPoolOrderPlaced(ctx context.Context, arg ledgerdb.MarkPoolOrderPlacedParams) (int64, error)
 	MarkPoolOrderUncertain(ctx context.Context, arg ledgerdb.MarkPoolOrderUncertainParams) (int64, error)
+	MarkUncertainPoolOrderFound(ctx context.Context, arg ledgerdb.MarkUncertainPoolOrderFoundParams) (int64, error)
 	MarkPoolOrderRefused(ctx context.Context, arg ledgerdb.MarkPoolOrderRefusedParams) (int64, error)
 	MarkPoolOrderAbandoned(ctx context.Context, arg ledgerdb.MarkPoolOrderAbandonedParams) (int64, error)
+	LinkPoolOrderNode(ctx context.Context, arg ledgerdb.LinkPoolOrderNodeParams) (int64, error)
+	HoldPoolOrderJoin(ctx context.Context, arg ledgerdb.HoldPoolOrderJoinParams) (int64, error)
+	HoldLapsedPoolJoins(ctx context.Context, arg ledgerdb.HoldLapsedPoolJoinsParams) (int64, error)
+	HoldLapsedPoolJoin(ctx context.Context, arg ledgerdb.HoldLapsedPoolJoinParams) (int64, error)
+	ReleasePoolOrderJoin(ctx context.Context, arg ledgerdb.ReleasePoolOrderJoinParams) (int64, error)
+	SpendPoolJoinToken(ctx context.Context, arg ledgerdb.SpendPoolJoinTokenParams) (sql.Result, error)
+	RetirePoolJoinTokens(ctx context.Context, poolOrder string) error
+	InsertAdmittedEnrollment(ctx context.Context, arg ledgerdb.InsertAdmittedEnrollmentParams) error
+	AdmitPendingEnrollment(ctx context.Context, arg ledgerdb.AdmitPendingEnrollmentParams) (int64, error)
 	RefreshLeaseHolder(ctx context.Context, arg ledgerdb.RefreshLeaseHolderParams) error
 	RecordBarrierRun(ctx context.Context, arg ledgerdb.RecordBarrierRunParams) error
 	RecordHistoryCacheObservation(ctx context.Context, arg ledgerdb.RecordHistoryCacheObservationParams) error

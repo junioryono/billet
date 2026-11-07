@@ -99,6 +99,58 @@ func TestPoolOrderMovesAreOneWay(t *testing.T) {
 	}
 }
 
+// AN UNCERTAIN ORDER ITS SOURCE NOW LISTS IS PLACED under the host it lists, and only an
+// uncertain one: an order anywhere else is not moved, and a host it does not name places
+// nothing.
+func TestAnUncertainOrderItsSourceListsIsPlaced(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	for _, id := range []string{"uncertain", "ordering", "placed", "refused", "abandoned"} {
+		if err := a.RecordPoolOrder(ctx, poolOrder(id)); err != nil {
+			t.Fatalf("record %s: %v", id, err)
+		}
+	}
+	for _, err := range []error{
+		a.PoolOrderUncertain(ctx, "uncertain", "lost"), a.PoolOrderPlaced(ctx, "placed", "i-1"),
+		a.PoolOrderRefused(ctx, "refused", "no stock"), a.PoolOrderUncertain(ctx, "abandoned", "lost"),
+	} {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.PoolOrderAbandoned(ctx, "abandoned", "none there"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"ordering", "placed", "refused", "abandoned", "nobody"} {
+		if err := a.UncertainPoolOrderFound(ctx, id, "i-9"); !errors.Is(err, ErrPoolOrderMoved) {
+			t.Errorf("found %s: %v, want ErrPoolOrderMoved", id, err)
+		}
+	}
+	if err := a.UncertainPoolOrderFound(ctx, "uncertain", ""); err == nil || errors.Is(err, ErrPoolOrderMoved) {
+		t.Fatalf("found with no host: %v", err)
+	}
+	now = now.Add(time.Minute)
+	if err := a.UncertainPoolOrderFound(ctx, "uncertain", "i-9"); err != nil {
+		t.Fatalf("found: %v", err)
+	}
+	orders, err := a.PoolOrders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range orders {
+		want := map[string]string{"uncertain": PoolPlaced, "ordering": PoolOrdering, "placed": PoolPlaced,
+			"refused": PoolRefused, "abandoned": PoolAbandoned}[o.ID]
+		if o.State != want {
+			t.Errorf("%s is %s, want %s", o.ID, o.State, want)
+		}
+		if o.ID == "uncertain" && (o.HostID != "i-9" || o.Reason != "" || !o.Updated.Equal(now)) {
+			t.Errorf("the found order: %+v", o)
+		}
+	}
+}
+
 func TestAPoolOrderMissingWhatItNeedsIsRefused(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)

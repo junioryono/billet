@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
@@ -89,4 +90,54 @@ func TestThePoolCommandListsOrdersAndClosesOnlyAnUncertainOne(t *testing.T) {
 		strings.Contains(out.String(), "uncertain:") {
 		t.Fatalf("after abandoning: %v\n%s", err, out)
 	}
+}
+
+// A HELD JOIN IS LISTED WITH ITS REASON AND WHAT A PERSON DOES ABOUT IT, on one line
+// whatever the reason held; an order held for no one is not listed as held.
+func TestThePoolCommandSaysWhichJoinsAreHeld(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeCAConfig(t, stateDir)
+	ctx := t.Context()
+	a, closeDB, err := ControlPlaneAllocator(ctx, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for _, id := range []string{"p-held", "p-fine"} {
+		if err := a.RecordPoolOrder(ctx, alloc.PoolOrder{
+			ID: id, Source: "aws-metal", Scope: "aws:us-west-2:subnet-0abc:us-west-2a", Shape: "z1d.metal",
+			Location: "us-west-2a", Arch: config.ArchX64,
+		}); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+		if err := a.PoolOrderPlaced(ctx, id, "i-"+id); err != nil {
+			t.Fatalf("placed: %v", err)
+		}
+	}
+	if err := a.HoldPoolJoin(ctx, "p-held", "the console names\nanother key", heldAt(t, a, "p-held")); err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	closeDB()
+
+	env, out := poolEnv()
+	if err := Pool(ctx, env, []string{"--config", cfg}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, want := range []string{"held p-held: the console names another key", "billet nodes approve"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the listing has no %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out.String(), "held p-fine") {
+		t.Errorf("an order held for no one is listed as held:\n%s", out)
+	}
+}
+
+func heldAt(t *testing.T, a *alloc.Allocator, order string) time.Time {
+	t.Helper()
+	o, err := a.ReadPoolOrder(t.Context(), order)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return o.Updated
 }

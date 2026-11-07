@@ -1,3 +1,7 @@
 EnrollRequest.node string
 EnrollRequest.csr_pem string
 EnrollRequest.join_token string
+EnrollRequest.identity_document tag omitempty
+EnrollRequest.identity_document string
+EnrollRequest.identity_signature tag omitempty
+EnrollRequest.identity_signature string

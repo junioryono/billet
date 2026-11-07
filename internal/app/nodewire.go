@@ -85,6 +85,11 @@ type NodeWireRequest struct {
 	// Resizer answers the resize route in place of Leases' own Resize; nil
 	// leaves it to Leases (nodeplane.WithResizer).
 	Resizer nodeplane.Resizer
+	// PoolJoins admits a pool's hosts on their source's word, and SeesHostAddress
+	// says an enrollment's peer is the host itself (nodeplane.WithPoolJoins); nil
+	// without a pool.
+	PoolJoins       nodeplane.PoolJoins
+	SeesHostAddress bool
 	// Logs takes chunks of jobs' logs; nil is a control plane that keeps no index.
 	Logs nodeplane.LogIndexer
 }
@@ -124,6 +129,12 @@ func BuildNodeWire(req NodeWireRequest) (NodeWire, error) {
 
 	if req.Resizer != nil {
 		opts = append(opts, nodeplane.WithResizer(req.Resizer))
+	}
+
+	// THE ENROLLMENT LISTENER'S ALONE, the one route a pool host asks to join on.
+	var enrollOpts []nodeplane.HandlerOption
+	if req.PoolJoins != nil {
+		enrollOpts = append(enrollOpts, nodeplane.WithPoolJoins(req.PoolJoins, req.SeesHostAddress))
 	}
 
 	wire := NodeWire{}
@@ -180,8 +191,10 @@ func BuildNodeWire(req NodeWireRequest) (NodeWire, error) {
 		// retire` landing between two reads admits a node against an authority
 		// the control plane has stopped presenting.
 		wire.Bootstrap = nodeplane.BootstrapHandler(req.Log, req.Plane, authority.Issuing,
-			nodeplane.WithTrustBundle(authority.Trust),
-			nodeplane.WithEnrollment(req.Enrollments))
+			append([]nodeplane.HandlerOption{
+				nodeplane.WithTrustBundle(authority.Trust),
+				nodeplane.WithEnrollment(req.Enrollments),
+			}, enrollOpts...)...)
 
 		wire.Serving = bundle
 		wire.Rotating = authority.Rotating
