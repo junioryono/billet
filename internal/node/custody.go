@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -1083,6 +1084,41 @@ func (r *Runner) custodySnapshot() []*custody {
 	}
 
 	return out
+}
+
+// CustodyLeases is every lease this process holds compute for: custody, a launch a
+// supersession let finish, and what that launch left running.
+func (r *Runner) CustodyLeases() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	leases := make([]string, 0, len(r.custody)+len(r.launching)+len(r.runningLease))
+	for id := range r.custody {
+		leases = append(leases, id)
+	}
+
+	for id := range r.launching {
+		leases = append(leases, id)
+	}
+
+	for _, lease := range r.runningLease {
+		leases = append(leases, lease.ID)
+	}
+
+	slices.Sort(leases)
+
+	return slices.Compact(leases)
+}
+
+// HoldsInCustodyForTest reports whether a lease is in custody here, which a running
+// job is not until this process knows it was superseded.
+func (r *Runner) HoldsInCustodyForTest(leaseID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	_, held := r.custody[leaseID]
+
+	return held
 }
 
 // Superseded moves everything this node is running into custody.

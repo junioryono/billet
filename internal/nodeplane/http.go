@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -412,6 +413,9 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 	mux.HandleFunc("POST /v1/nodes/{node}/logs", h.forNode(h.logChunk))
 	mux.HandleFunc("POST /v1/nodes/{node}/streams/{stream}", h.forNode(h.stream))
+	// forNode, BECAUSE THE PROCESS THAT ASKS HAS LOST THE NAME: it is a superseded
+	// process saying what it already holds, and this route gives it no name and no work.
+	mux.HandleFunc("POST /v1/nodes/{node}/custody", h.forNode(h.claimCustody))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
 
 	return mux
@@ -628,7 +632,12 @@ func (h *handler) guardLease(next http.HandlerFunc, admitEnded bool) http.Handle
 			// already treats as done. Anything the ledger still holds open keeps the
 			// refusal, because only the process given the work may touch a lease
 			// that is still charged.
-			if errors.Is(err, ErrSuperseded) && h.leaseIsOver(r, lease) {
+			//
+			// AND WITH NO PROCESS REGISTERED AT ALL, as a replaced controller stands when
+			// the process that superseded this one has gone: "register again" is not
+			// something a superseded process may do, so that answer would hold it for
+			// as long as nothing registers, over a lease that is already over.
+			if (errors.Is(err, ErrSuperseded) || errors.Is(err, ErrUnregistered)) && h.leaseIsOver(r, lease) {
 				if admitEnded && h.endedOnThisNode(r, lease, node) {
 					next(w, r)
 
@@ -1595,6 +1604,88 @@ func (h *handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// custodyClaimRecheck bounds reading back what one claim added.
+const custodyClaimRecheck = 5 * time.Second
+
+// claimCustody is a superseded process saying what it holds (Plane.ClaimCustody).
+// THE LEDGER DECIDES WHAT MAY BE CLAIMED, read before the plane's mutex is taken: a
+// lease it holds no row for is over and needs no owner, and one it places on another
+// node is not this node's to claim, as ledgerAgrees has it for a lease's own routes.
+// The request a lease was launched under comes from the ledger too, never the claim,
+// so a destroy reaches the process that holds it. A store that could not answer
+// fails the claim, which is asked again: could-not-tell grants nothing, and neither
+// does a lease the ledger places nowhere.
+func (h *handler) claimCustody(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.ClaimCustodyRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if len(req.LeaseIDs) > nodeapi.MaxCustodyClaim {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+			fmt.Sprintf("a claim names %d leases, more than the %d one may", len(req.LeaseIDs), nodeapi.MaxCustodyClaim))
+
+		return
+	}
+
+	node := r.PathValue("node")
+
+	incarnation := r.Header.Get(nodeapi.HeaderIncarnation)
+	if incarnation == "" {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, "a custody claim names no process")
+
+		return
+	}
+
+	claims := make([]CustodyClaim, 0, len(req.LeaseIDs))
+
+	for _, id := range req.LeaseIDs {
+		lease, err := h.store.Lease(r.Context(), id)
+		if errors.Is(err, alloc.ErrLeaseNotFound) {
+			continue
+		}
+
+		if err != nil {
+			writeStoreErr(w, err)
+
+			return
+		}
+
+		if lease == nil {
+			continue
+		}
+
+		placed := lease.Node
+		if placed == "" {
+			placed = lease.TargetNode
+		}
+
+		if placed == node {
+			claims = append(claims, CustodyClaim{LeaseID: id, RequestID: lease.RequestID})
+		}
+	}
+
+	held, added := h.plane.ClaimCustody(node, incarnation, claims)
+
+	// A LEASE THAT ENDED WHILE THIS CLAIM WAS IN HAND has been forgotten already, and
+	// nothing else would ever name the record just written. Asked after the write, so a
+	// release is either seen here or forgets the record itself. A store that could not
+	// answer keeps it: could-not-tell is not an end, and the process may still hold it.
+	// NOT ON THE REQUEST'S CONTEXT, which the process's last release may be cancelling:
+	// it stops following as its wait ends, and that is when this race is won.
+	lookup, stopLookup := context.WithTimeout(context.WithoutCancel(r.Context()), custodyClaimRecheck)
+	defer stopLookup()
+
+	for _, id := range added {
+		if _, err := h.store.Lease(lookup, id); errors.Is(err, alloc.ErrLeaseNotFound) {
+			h.plane.ForgetLease(node, id)
+			held = slices.DeleteFunc(held, func(heldID string) bool { return heldID == id })
+		}
+	}
+
+	writeJSON(w, http.StatusOK, nodeapi.ClaimCustodyResponse{Version: nodeapi.Version, Held: held})
 }
 
 func (h *handler) markFailure(w http.ResponseWriter, r *http.Request) {

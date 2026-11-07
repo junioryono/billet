@@ -1,0 +1,3 @@
+DescribeRequest.name string
+DescribeRequest.group tag omitempty
+DescribeRequest.group string

@@ -44,6 +44,8 @@ type controller struct {
 	// supersede, when it returns true for a request, answers that another
 	// process has registered as this node.
 	supersede func(path string, n int) bool
+	// respond, when it returns true for a request, has answered it.
+	respond func(w http.ResponseWriter, r *http.Request) bool
 }
 
 func newController(t *testing.T) *controller {
@@ -65,8 +67,12 @@ func newController(t *testing.T) *controller {
 		c.mu.Lock()
 		c.requests[r.URL.Path]++
 		n := c.requests[r.URL.Path]
-		drop, unavailable, supersede := c.drop, c.unavailable, c.supersede
+		drop, unavailable, supersede, respond := c.drop, c.unavailable, c.supersede, c.respond
 		c.mu.Unlock()
+
+		if respond != nil && respond(w, r) {
+			return
+		}
 
 		if supersede != nil && supersede(r.URL.Path, n) {
 			w.Header().Set("Content-Type", "application/json")
@@ -598,8 +604,14 @@ func TestARecoverySupersededBeforeADrainStopsAsking(t *testing.T) {
 
 	const launched = "/v1/nodes/n1/launched"
 
+	// THE ORDINARY LOOP'S RECOVERY FAILS UNTIL THE STOP, whose own recovery is the one
+	// superseded: one superseded before the stop drains from the ordinary loop. The
+	// refusal holds throughout, so no answer falls between the two.
+	var stopped atomic.Bool
+
 	a.mu.Lock()
-	a.supersede = func(path string, _ int) bool { return path == launched }
+	a.unavailable = func(path string, _ int) bool { return path == launched }
+	a.supersede = func(path string, _ int) bool { return path == launched && stopped.Load() }
 	a.mu.Unlock()
 
 	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Base: a.srv.URL})
@@ -611,6 +623,7 @@ func TestARecoverySupersededBeforeADrainStopsAsking(t *testing.T) {
 
 	waitFor(t, func() bool { return a.sent(launched) >= 2 })
 	cancel()
+	stopped.Store(true)
 
 	select {
 	case err := <-done:
@@ -651,8 +664,14 @@ func TestAStopSupersededBeforeItsDrainNeverRegistersAgain(t *testing.T) {
 
 	const launched = "/v1/nodes/n1/launched"
 
+	// THE ORDINARY LOOP'S RECOVERY FAILS UNTIL THE STOP, whose own recovery is the one
+	// superseded: one superseded before the stop drains from the ordinary loop. The
+	// refusal holds throughout, so no answer falls between the two.
+	var stopped atomic.Bool
+
 	a.mu.Lock()
-	a.supersede = func(path string, _ int) bool { return path == launched }
+	a.unavailable = func(path string, _ int) bool { return path == launched }
+	a.supersede = func(path string, _ int) bool { return path == launched && stopped.Load() }
 	a.mu.Unlock()
 
 	c, err := nodeclient.New(nodeclient.Options{Node: "n1", Targets: []nodeclient.Target{
@@ -672,6 +691,7 @@ func TestAStopSupersededBeforeItsDrainNeverRegistersAgain(t *testing.T) {
 
 	polls := a.sent("/v1/nodes/n1/poll")
 	cancel()
+	stopped.Store(true)
 
 	// THE DRAIN'S WORKER RETURNS WHILE WHAT RUNS HERE IS STILL HELD, which it
 	// does only when it serves nothing: one that served would return only when

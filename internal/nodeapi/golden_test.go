@@ -65,6 +65,8 @@ var wireTypes = map[string]any{
 	"MarkFailureRequest":        MarkFailureRequest{},
 	"Range":                     Range{},
 	"ReconcileRequest":          ReconcileRequest{},
+	"ClaimCustodyRequest":       ClaimCustodyRequest{},
+	"ClaimCustodyResponse":      ClaimCustodyResponse{},
 	"ReconcileResponse":         ReconcileResponse{},
 	"RecoverRunnerRequest":      RecoverRunnerRequest{},
 	"RecoverRunnerResponse":     RecoverRunnerResponse{},

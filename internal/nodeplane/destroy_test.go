@@ -136,7 +136,7 @@ func TestBoundCompletionUsesTheHolderAfterItAdoptsTheLease(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register holder: %v", err)
 	}
-	p.AdoptOwnership("holder", "holder-2", []string{"l1"})
+	p.AdoptOwnershipWithInventory("holder", "holder-2", []string{"l1"}, true)
 
 	done := make(chan error, 1)
 	go func() {
@@ -166,7 +166,7 @@ func TestBoundCompletionIsNotTakenByAReplacementIncarnation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register holder: %v", err)
 	}
-	p.AdoptOwnership("holder", "holder-1", []string{"l1"})
+	p.AdoptOwnershipWithInventory("holder", "holder-1", []string{"l1"}, true)
 	done := make(chan error, 1)
 	go func() {
 		done <- p.NewRunner().DestroyCompletedBound(

@@ -50,6 +50,9 @@ func SetDrainServingDoneForTest(f func()) func() {
 	return func() { drainServingDone = saved }
 }
 
+// SetWireForTest stands in for the version a registration negotiated.
+func SetWireForTest(c *Client, version int) { c.wire.Store(int64(version)) }
+
 // BackoffForTest is the pause the loop takes after a failed registration.
 func BackoffForTest(opts LoopOptions, c *Client) time.Duration { return backoffFor(opts, c) }
 

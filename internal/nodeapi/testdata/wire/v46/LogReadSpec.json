@@ -1,0 +1,10 @@
+{
+  "lease": "LogReadSpec.lease",
+  "ranges": [
+    {
+      "first": 835302481,
+      "last": 1658642351
+    }
+  ],
+  "max_bytes": 735060724
+}

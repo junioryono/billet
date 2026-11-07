@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 45
+	Version = 46
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -604,6 +604,20 @@ const (
 	// and starts a guest with no terminal, which an attach then says, and which costs the job
 	// nothing.
 	VersionJobAttach = 45
+
+	// VersionCustodyClaim is the version from which a superseded process may claim
+	// the leases it holds in custody on the controller that serves now
+	// (ClaimCustodyRequest), because a controller's ownership record does not
+	// survive it: a promoted or restarted controller would otherwise refuse the
+	// process its own leases, and the process, which must not register, has no
+	// other way to say what it holds.
+	//
+	// REPORTED, NOT REFUSED. An older plane answers the route with a bare 404, and
+	// what the pairing loses is the failover of a superseded process's custody,
+	// which then waits as it always did. A node asks whatever it negotiated, since
+	// that was with another controller and the answer settles it with this one. An
+	// older node never asks, and the plane needs no gate.
+	VersionCustodyClaim = 46
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

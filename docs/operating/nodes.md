@@ -81,7 +81,7 @@ Registration is dynamic and never asks whether a host was declared anywhere. It 
 | adding or changing a tier | yes; tiers are read at startup and each becomes one scale set |
 | changing the `nodes:` policy block | yes; it is snapshotted into the allocator at startup |
 
-A node's identity is its **name**, so two hosts configured with the same one are one host to the control plane; a per-process incarnation routes new commands to the newest registration and lets a superseded process keep maintaining the work it already holds, but after a restart the plane cannot say which of two machines sharing a name physically holds a container. Give each host its own name.
+A node's identity is its **name**, so two hosts configured with the same one are one host to the control plane; a per-process incarnation routes new commands to the newest registration and lets a superseded process keep maintaining the work it already holds, on the controller it knew and on whichever replaces it, without taking the name back; but after a restart the plane cannot say which of two machines sharing a name physically holds a container. Give each host its own name.
 
 ## Certificates renew themselves
 
