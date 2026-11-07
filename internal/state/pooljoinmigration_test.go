@@ -9,8 +9,16 @@ import (
 // ledgerAt75 is a ledger migrated to 75 and no further, so the next open applies
 // migration 76 and every one after it. rewindNewest takes back the newest, which is
 // the pool release's 79, and then 78, 77 and 76 are undone.
+//
+// IT REFUSES A NEWER BINARY, as rewindNewest does: a migration 80 would be the one
+// rewindNewest took back, and 79 would stay behind on a ledger this test still calls 75.
 func ledgerAt75(t *testing.T) string {
 	t.Helper()
+
+	if latest := LatestSchemaVersion(); latest != 79 {
+		t.Fatalf("this binary's newest migration is %d; ledgerAt75 undoes 79 through 76 and must be "+
+			"taught each migration after 75 before it can stand for a ledger at 75", latest)
+	}
 
 	dir := t.TempDir()
 
