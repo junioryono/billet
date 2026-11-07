@@ -133,6 +133,8 @@ type Plane struct {
 	imagesAccept []string
 	// logIndexID names the index of job logs this control plane holds, empty for none.
 	logIndexID string
+	// streams are the connections nodes dial back on command.
+	streams streamBook
 	// macOSLimit is the macOS guests the deployment places on a named node, which a
 	// registration's answer carries; nil answers none, as a plane in a test does.
 	macOSLimit func(node string) int

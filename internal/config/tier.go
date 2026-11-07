@@ -187,6 +187,9 @@ type Tier struct {
 	// Logs keeps this tier's jobs' step logs on the node that ran them and indexes them
 	// so `billet logs search` finds them. Absent means none is kept. See logs.go.
 	Logs *TierLogs `yaml:"logs,omitempty"`
+	// Debug lets an operator into this tier's jobs' VMs, and keeps a failed job's for a
+	// while. Absent means neither. See debug.go.
+	Debug *TierDebug `yaml:"debug,omitempty"`
 	// Network is what the tier asks of its guests' network; see TierEgress.
 	Network *TierNetwork `yaml:"network,omitempty"`
 
@@ -435,6 +438,7 @@ func (t Tier) ProviderErrors(where string) []error {
 	var errs []error
 
 	errs = append(errs, t.validateLogs(where)...)
+	errs = append(errs, t.validateDebug(where)...)
 
 	// BOTH SPELLINGS IS AN ERROR, not a merge. Guessing which one an operator
 	// meant is not a kindness when the answer decides where untrusted code runs.

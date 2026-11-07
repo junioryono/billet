@@ -36,6 +36,7 @@ adr-028-host-enforced-egress
 adr-029-rerunning-disrupted-jobs
 adr-030-rented-bare-metal-pool
 adr-031-job-logs
+adr-032-job-attach
 ```
 
 | Record | Decides |
@@ -71,3 +72,4 @@ adr-031-job-logs
 | [ADR-029](adr-029-rerunning-disrupted-jobs.md) | why billet re-runs a job it ended only for a tier that sets `retry.disrupted` and only on GitHub's own record of a lost runner, which causes count, why the request is exact or there is none, how a request whose answer was lost is settled by reading the run, and why the runner App then holds `actions: write` |
 | [ADR-030](adr-030-rented-bare-metal-pool.md) | how billet rents bare metal for Firecracker from a dedicated-server provider and from AWS behind one host-source contract; the pool's shape, where its caches live so it can shrink to its floor, why it grows ahead of demand and shrinks only by drain on proof, why a pool host is never spot, how an ordered host joins without a person only where its source vouches for its key, what a returned host keeps, and why a guest's traffic is policed on the host |
 | [ADR-031](adr-031-job-logs.md) | why a job's log is kept on its node and indexed on the control plane, in a file a day of its own, and read back through the node wire |
+| [ADR-032](adr-032-job-attach.md) | why a terminal reaches a job's VM over a stream the node dials back, and why a hold on a failed job's VM delays a destroy and never authorises one |

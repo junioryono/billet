@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -115,6 +116,8 @@ func listenOperator(ctx context.Context, cfg *config.Config) (*peerListener, err
 // operatorLedger is what the socket reads of the ledger.
 type operatorLedger interface {
 	Job(ctx context.Context, leaseID string) (alloc.JobRecord, error)
+	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
+	EndLeaseHold(ctx context.Context, leaseID, by string) (bool, error)
 }
 
 // operatorServer is what the socket serves.
@@ -122,6 +125,12 @@ type operatorServer struct {
 	jobs  operatorLedger
 	plane *nodeplane.Plane
 	log   *slog.Logger
+
+	// mu guards sessions, the terminals open to each lease.
+	mu       sync.Mutex
+	sessions map[string]int
+	// exited are the leases one of whose sessions' shells has ended.
+	exited map[string]bool
 }
 
 // serveOperator serves the socket until ctx ends. A failure to listen is said and ends
@@ -137,6 +146,24 @@ func serveOperator(ctx context.Context, cfg *config.Config, server *operatorServ
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+operatorLogPath, server.readLog)
+
+	mux.HandleFunc("POST "+operatorAttachExitPath, server.shellExited)
+
+	// A SESSION OUTLIVES ITS REQUEST'S CONTEXT ONCE UPGRADED, and closing the server does not
+	// reach a taken connection, so each is joined here and ended by ctx. The count this function
+	// holds while serving keeps a handler's Add from racing the Wait.
+	var attaching sync.WaitGroup
+	defer attaching.Wait()
+
+	attaching.Add(1)
+	defer attaching.Done()
+
+	mux.HandleFunc("POST "+operatorAttachPath, func(w http.ResponseWriter, r *http.Request) {
+		attaching.Add(1)
+		defer attaching.Done()
+
+		server.attach(ctx, cfg, w, r)
+	})
 
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 

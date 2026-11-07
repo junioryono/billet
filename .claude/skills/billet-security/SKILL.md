@@ -15,6 +15,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 ### Privilege, trust and destruction: [references/privilege-and-trust.md](references/privilege-and-trust.md)
 
+- **A terminal in a job's VM is offered only on a trusted tier, and whatever passes through it is the guest's.**
 - **The server is unprivileged; the node is a root custodian.**
 - **Trust belongs to a pool, not to the assignment that scaled it up.**
 - **Untrusted work needs a real boundary and a network of its own, and each backend answers differently.**

@@ -151,6 +151,15 @@ type GuestReportStore interface {
 // keeps guest reports; this fails the build if it ever stops.
 var _ GuestReportStore = (*alloc.Allocator)(nil)
 
+// LeaseHoldStore answers whether a failed job's VM is being held. ASKED OF THE LEASE STORE as
+// GuestReportStore is; a store that keeps none holds nothing.
+type LeaseHoldStore interface {
+	LeaseHoldOf(ctx context.Context, leaseID string) (alloc.LeaseHold, error)
+}
+
+// The allocator keeps them; this fails the build if it ever stops.
+var _ LeaseHoldStore = (*alloc.Allocator)(nil)
+
 // EgressReportStore keeps what the host saw of a lease's network, fenced on the
 // epoch, the first report kept. Asked of the lease store for GuestReportStore's
 // reason.
@@ -402,6 +411,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/recover", h.forOwnLease(h.recoverRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 	mux.HandleFunc("POST /v1/nodes/{node}/logs", h.forNode(h.logChunk))
+	mux.HandleFunc("POST /v1/nodes/{node}/streams/{stream}", h.forNode(h.stream))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
 
 	return mux
@@ -2608,6 +2618,24 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		case alloc.PoolRunnerIdle:
 			req.RunnerName = binding.RunnerName
 		case alloc.PoolRunnerRetiring:
+			// A HELD VM'S RUNNER IS RETIRING AND ITS VM IS WANTED. A completion journals the runner
+			// first, and a retired answer would have the node destroy what a hold is keeping, when
+			// its lease was quarantined by a control plane away for a lease's life. BUSY AND NOT
+			// TRACKED: the node keeps the VM, renews it and asks again on every tend, so it hears
+			// retired once the hold ends, whether or not a listener is left to destroy it. Tracked is
+			// never asked again, and a tier removed meanwhile would keep the VM for ever. Could-not-tell
+			// is refused, since the node asks again and a retired answer cannot be taken back.
+			if holds, ok := h.store.(LeaseHoldStore); ok {
+				hold, err := holds.LeaseHoldOf(r.Context(), leaseID)
+				if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+					writeStoreErr(w, err)
+					return
+				}
+				if err == nil && hold.Holding() && time.Now().Before(hold.Until) {
+					writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryBusy})
+					return
+				}
+			}
 			if !resolve() {
 				return
 			}

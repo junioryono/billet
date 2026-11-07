@@ -614,6 +614,8 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 
 	l.mu.Unlock()
 
+	l.restoreHolds(ctx, completions)
+
 	// THE RESULT IS RE-RECORDED FROM THE DURABLE ROW, OUTSIDE THE MUTEX.
 	//
 	// PutPendingCompletion commits before RecordJobResult, so a process that died
@@ -731,6 +733,14 @@ func (l *Listener) complete(ctx context.Context, job dispatch.Job) {
 	// capacity stays charged until a node happens to report an inventory, or
 	// forever if that node never comes back.
 	before, beforeOutcome, _ := l.completionRelease(job.RequestID)
+
+	// A FAILED JOB'S VM CAN BE KEPT A WHILE, on a tier that says so. The cleanup clock comes
+	// back to it, and when the hold ends this goes on as it would have.
+	if l.holdCompletion(ctx, job, before) {
+		return
+	}
+
+	l.notHeld(job.RequestID)
 
 	if err := l.destroyCompleted(ctx, job, before, beforeOutcome); err != nil {
 		// THE RUNNER IS HOLDING IT, SO THIS LISTENER LETS GO.

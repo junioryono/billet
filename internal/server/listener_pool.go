@@ -527,6 +527,10 @@ func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, dispatch.J
 // The retiring row is the crash-recovery journal: any failed phase is retried on
 // the next scale-set message before another idle member is selected.
 func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner) {
+	if l.retirementHeld(ctx, member) {
+		return
+	}
+
 	lease, err := l.alloc.Lease(ctx, member.LeaseID)
 	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
 		l.log.Error("could not read a retiring pool member's lease", "tier", l.tier,
