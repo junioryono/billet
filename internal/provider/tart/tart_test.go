@@ -1928,10 +1928,16 @@ func TestADestroyOfAnAbsentVMTakesItsLeftoverRunLog(t *testing.T) {
 // AN ABSENT VM'S LOG IS REMOVED ONLY UNDER THE STORE LOCK, AND ONLY WHILE IT IS STILL
 // ABSENT, because another billet sharing the store publishes a VM under that lock and
 // then opens its log: removing it on this process's own word would take a live run's.
-func TestAnAbsentVMsLogWaitsForTheStoreAndSparesAVMThatAppeared(t *testing.T) {
+//
+// AND IT NEVER WAITS FOR THE LOCK: the teardown is already proved, so a held lock leaves
+// the log rather than holding the node's command slot for the lock's window.
+func TestAnAbsentVMsLogNeedsTheFreeStoreAndSparesAVMThatAppeared(t *testing.T) {
 	s := newStub(t)
 	p := newProvider(t, s)
-	p.storeLockWindow = 50 * time.Millisecond
+
+	// A WINDOW NO TEST WAITS OUT, so a cleanup that waited for the lock fails the bound
+	// below instead of passing slowly.
+	p.storeLockWindow = time.Minute
 
 	seed := func(name string) string {
 		t.Helper()
@@ -1956,25 +1962,34 @@ func TestAnAbsentVMsLogWaitsForTheStoreAndSparesAVMThatAppeared(t *testing.T) {
 		t.Fatalf("could not stage a competing holder: %v", err)
 	}
 
+	start := time.Now()
 	got, err := p.Destroy(t.Context(), "billet-gone")
+	took := time.Since(start)
+
 	unlock()
 
 	if err != nil || got != provider.TeardownStopped {
 		t.Fatalf("Destroy of an absent VM = %v, %v; want stopped, since the VM is gone", got, err)
 	}
 
+	if took > 20*time.Second {
+		t.Errorf("Destroy of an absent VM took %s behind a held store lock; its log's cleanup "+
+			"must try the lock once, not wait for it", took)
+	}
+
 	if _, err := os.Stat(held); err != nil {
 		t.Errorf("the log was removed although another billet held the store: %v", err)
 	}
 
-	// UNDER THE LOCK THE VM IS THERE AGAIN, so its log is a live run's.
-	s.vm(t, "billet-back", "running", testOwner)
+	// ANOTHER BILLET PUBLISHES THE NAME just before this one takes the lock, which only
+	// an absence asked under the lock sees.
 	back := seed("billet-back")
+	p.beforeRunLogLock = func() { s.vm(t, "billet-back", "running", testOwner) }
 
 	p.removeAbsentVMRunLog(t.Context(), "billet-back")
 
 	if _, err := os.Stat(back); err != nil {
-		t.Errorf("the log of a VM present under the store lock was removed: %v", err)
+		t.Errorf("the log of a VM published before the lock was taken was removed: %v", err)
 	}
 }
 

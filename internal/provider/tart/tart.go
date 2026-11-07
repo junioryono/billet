@@ -332,6 +332,10 @@ type Provider struct {
 	// beforeCleanup runs just before a verification's cleanup, and nothing sets it outside
 	// tests, which have no other way to say that a refused verification never got there.
 	beforeCleanup func()
+	// beforeRunLogLock runs just before an absent VM's run log takes the store lock, and
+	// nothing sets it outside tests, which publish a VM there to prove the absence is
+	// asked again under the lock.
+	beforeRunLogLock func()
 	// installer installs the records. Its zero value is the real one, and a test fails a
 	// step of it.
 	installer durablefile.Installer
@@ -1620,12 +1624,28 @@ func (p *Provider) removeRunLog(name string) {
 //
 // THE STORE LOCK, NOT THE NAME'S MUTEX: that mutex is this process's, and another billet
 // sharing the store publishes a VM under the store lock, then opens its log. So the
-// absence is asked again under the lock, and a VM that appeared keeps its log. A lock
-// that cannot be taken leaves the log; the VM is gone either way.
+// absence is asked again under the lock, and a VM that appeared keeps its log.
+//
+// ONE ATTEMPT AT THE LOCK, NEVER A WAIT: the teardown it follows is already proved, and
+// waiting out another billet's slow delete would hold the node's command slot and the
+// capacity it releases for the length of the lock's window. A held lock leaves the log.
 func (p *Provider) removeAbsentVMRunLog(ctx context.Context, name string) {
-	unlock, err := p.lockStore(ctx, "remove the run log of "+name)
+	if _, err := os.Lstat(p.runLogPath(name)); errors.Is(err, os.ErrNotExist) {
+		return
+	}
+
+	if p.beforeRunLogLock != nil {
+		p.beforeRunLogLock()
+	}
+
+	// A CANCELLED CONTEXT IS ONE ATTEMPT: lockStore tries the flock before it looks at
+	// any deadline.
+	once, cancel := context.WithCancel(ctx)
+	cancel()
+
+	unlock, err := p.lockStore(once, "remove the run log of "+name)
 	if err != nil {
-		p.log.Warn("left a deleted VM's run log, since the store lock could not be taken",
+		p.log.Warn("left a deleted VM's run log, since the store lock was not free",
 			"vm", name, "error", err)
 
 		return
