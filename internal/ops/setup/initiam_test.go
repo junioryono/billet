@@ -157,7 +157,8 @@ node:
 
 	got := parsePolicy(t, out)
 	want := []string{
-		"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeDenyForeignSnapshot",
+		"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeLaunchOwned",
+		"BilletRuntimeLaunchNetwork", "BilletRuntimeDenyForeignSnapshot",
 		"BilletRuntimeTag", "BilletRuntimeTerminate",
 	}
 	if len(got) != len(want) {

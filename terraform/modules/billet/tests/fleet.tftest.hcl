@@ -68,7 +68,37 @@ run "sentinels_fully_substituted" {
     error_message = "the BilletCacheList statement must scope s3:prefix to exactly the real cache_prefix on the bare bucket ARN"
   }
 
-  # THE LAUNCH BOUNDARY, structurally. ec2:RunInstances is granted on "*" and it
+  # THE LAUNCH TAG, structurally (#779): the instance and its volumes are launched
+  # only under billet's owner tag, so the role cannot make compute no billet role
+  # can list or terminate. The unconditioned NotResource grant beside it must
+  # exclude both, or it hands them back without the condition.
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.node.policy).Statement :
+      try(
+        s.Sid == "BilletRuntimeLaunchOwned" &&
+        s.Effect == "Allow" &&
+        tolist(s.Resource) == tolist(["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"]) &&
+        s.Condition.Null["aws:RequestTag/sh.billet.owner"] == "false" &&
+        tolist(s.Condition["ForAnyValue:StringEquals"]["aws:TagKeys"]) == tolist(["sh.billet.owner"]),
+        false
+      )
+      ]) && anytrue([
+      for s in jsondecode(aws_iam_role_policy.node.policy).Statement :
+      try(
+        s.Sid == "BilletRuntimeLaunch" &&
+        s.Effect == "Allow" &&
+        tolist(s.Action) == tolist(["ec2:RunInstances"]) &&
+        tolist(s.NotResource) == tolist(["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"]) &&
+        !can(s.Resource) && !can(s.Condition),
+        false
+      )
+    ])
+    error_message = "the node policy must launch an instance and its volumes only under billet's owner tag, in the real partition"
+  }
+
+  # THE LAUNCH BOUNDARY, structurally. ec2:RunInstances is granted unconditioned on
+  # every resource type but the instance and its volumes, and it
   # authorises every snapshot a block-device mapping names, so without this Deny
   # the node role can launch an instance with the control plane's ledger snapshot
   # attached and read the deployment identity and the CA key off it. Asserted as a

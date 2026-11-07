@@ -33,9 +33,10 @@
 // owner (by value) in the request; deletes, attach/detach and terminate require it
 // on the resource; CreateSnapshot additionally requires the SOURCE volume to carry
 // it, so a foreign volume cannot be copied into a billet-tagged snapshot.
-// RunInstances and the describes cannot be scoped this way (RunInstances makes
-// several resource types at once; describes are not resource-scopable) and stay on
-// "*".
+// RunInstances is split by the resource types it authorizes (launchStatements): its
+// instance and volumes need the owner in the request, its subnets and security
+// groups are the node's own when the caller names them, and the rest stays
+// unconditioned. The describes are not resource-scopable and stay on "*".
 //
 // THE TAG BOUNDARY IS DESTRUCTIVE INTEGRITY; CONFIDENTIALITY NEEDS THE KEY. Tag
 // conditions stop one deployment terminating, deleting or wedging another's
@@ -76,15 +77,14 @@
 // A LAUNCH MAY NOT ATTACH A SNAPSHOT BILLET DOES NOT OWN — this deployment's, in
 // per-deployment mode; any billet-owned one in account-wide mode, which is the
 // same weaker boundary every other condition here falls back to without an id.
-// That is the one boundary RunInstances-on-"*" cannot draw by being scoped:
-// RunInstances authorizes every snapshot a block-device mapping names, so an
-// unconditioned grant lets a node role launch an instance with ANY snapshot in the
+// RunInstances authorizes every snapshot a block-device mapping names, and the
+// snapshot is among the resource types the launch grant leaves unconditioned, so
+// without a bound the grant lets a node role launch an instance with ANY snapshot in the
 // account attached and read it — in a shared account that is the control plane's
 // own ledger snapshots, a volume holding the deployment identity and the node-wire
 // CA key. The other two routes to a foreign snapshot are already closed by tag
 // conditions (BilletCacheCloneSource on CreateVolume, BilletCacheAttach); this one
-// is closed by an explicit DENY, because the Allow it bounds cannot be narrowed
-// without denying the launch itself.
+// is closed by an explicit DENY, the shape measured against EC2 itself below.
 //
 // MEASURED WITH iam:SimulateCustomPolicy, 2026-09-04, both modes and both
 // directions each. Per-deployment (StringNotEquals on the owner value): a snapshot
@@ -176,6 +176,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/junioryono/billet/internal/archivestore"
@@ -191,16 +192,18 @@ type Policy struct {
 }
 
 // Statement is one rule. Every statement here is an Allow but one — the snapshot
-// boundary the package comment describes, which has to be a Deny because the
-// Allow it bounds cannot be narrowed without denying billet's own launches.
+// boundary the package comment describes, which is a Deny because the launch
+// grant's resource types other than the four it scopes stay unconditioned.
 // Condition is omitted when empty so an unconditioned statement does not render an
-// empty object.
+// empty object. Exactly one of Resource and NotResource is set, and NotResource
+// only on the launch grant.
 type Statement struct {
-	Sid       string         `json:"Sid"`
-	Effect    string         `json:"Effect"`
-	Action    []string       `json:"Action"`
-	Resource  []string       `json:"Resource"`
-	Condition map[string]any `json:"Condition,omitempty"`
+	Sid         string         `json:"Sid"`
+	Effect      string         `json:"Effect"`
+	Action      []string       `json:"Action"`
+	Resource    []string       `json:"Resource,omitempty"`
+	NotResource []string       `json:"NotResource,omitempty"`
+	Condition   map[string]any `json:"Condition,omitempty"`
 }
 
 // Cache describes the cache storage a node's policy must permit.
@@ -349,6 +352,18 @@ type CodeBuildSweep struct {
 	Account string
 }
 
+// Network names the subnets and security groups an ec2 node launches into. When
+// set, the launch grant reaches exactly these and no other subnet or group in the
+// account.
+type Network struct {
+	// SubnetIDs are the subnets launches go to: node.ec2.subnet_id, and a
+	// builder's own when it has one. Bare ids, `subnet-` then hex.
+	SubnetIDs []string
+	// SecurityGroupIDs are every group a launch may attach: the trusted and the
+	// untrusted groups, and a builder's own. Bare ids, `sg-` then hex.
+	SecurityGroupIDs []string
+}
+
 // Inputs is the deployment a policy is built for. The zero value yields the
 // runtime-only policy a compute-only node needs.
 type Inputs struct {
@@ -370,6 +385,12 @@ type Inputs struct {
 	// Region scopes the KMS kms:ViaService condition to this region's EC2 service.
 	// Required when Cache.KMSKeyARN is set.
 	Region string
+	// Network, when non-nil, scopes the launch grant to these subnets and security
+	// groups. Nil leaves both unscoped, which is what the terraform module's
+	// committed rendering carries, because it names no ids (an operator who wants
+	// the scoped document passes `billet init iam` output as iam_policy_json).
+	// `billet init iam` always sets it from the node's config.
+	Network *Network
 	// Cache, when non-nil, adds the sticky-disk cache statements.
 	Cache *Cache
 	// CodeBuild, when non-nil, adds the statements a codebuild NODE needs.
@@ -458,6 +479,16 @@ func (in Inputs) Build() (Policy, error) {
 		partition = "aws"
 	}
 
+	// THE PARTITION LANDS IN EVERY ARN, and in the launch grant's NotResource it
+	// decides what is excluded: one carrying a `:` or a `*` would exclude an ARN no
+	// resource has, and the unconditioned grant would then reach the instance and
+	// the network the other two statements scope. Letters and hyphens are every
+	// partition AWS has and the terraform module's sentinel.
+	if !partitionPattern.MatchString(partition) {
+		return Policy{}, fmt.Errorf("awspolicy: %q is not a partition (letters and hyphens, "+
+			"such as aws, aws-cn or aws-us-gov)", partition)
+	}
+
 	suffix := in.DNSSuffix
 	if suffix == "" {
 		suffix = dnsSuffix(partition)
@@ -476,6 +507,17 @@ func (in Inputs) Build() (Policy, error) {
 		}
 	}
 
+	if in.Network != nil {
+		if in.NoCompute {
+			return Policy{}, errors.New("awspolicy: a launch network is only meaningful for a " +
+				"principal that launches; this one is NoCompute")
+		}
+
+		if err := in.Network.check(); err != nil {
+			return Policy{}, err
+		}
+	}
+
 	p := Policy{Version: policyVersion}
 
 	ownerResource := ownerTagCondition("aws:ResourceTag/"+ec2.OwnerTagKey, in.Owner)
@@ -487,19 +529,17 @@ func (in Inputs) Build() (Policy, error) {
 				Sid: "BilletRuntimeRead", Effect: "Allow",
 				Action: ec2.RuntimeDescribeIAMActions(), Resource: []string{"*"},
 			},
-			// RunInstances stays on "*" — it creates several resource types at once, and
-			// the instances it makes are tagged, which the teardown below relies on.
-			Statement{
-				Sid: "BilletRuntimeLaunch", Effect: "Allow",
-				Action: ec2.RuntimeLaunchIAMActions(), Resource: []string{"*"},
-			},
+		)
+		p.Statement = append(p.Statement, launchStatements(partition, in)...)
+		p.Statement = append(p.Statement,
 			// AND THE ONE THING THAT LAUNCH MAY NOT ATTACH: a snapshot this deployment
 			// does not own. RunInstances authorizes every snapshot a block-device
-			// mapping names, so the Allow above is also a read of any snapshot in the
-			// account — the ledger's among them. It cannot be narrowed (it creates
-			// several resource types at once), so the boundary is a Deny beside it. See
-			// the package comment for the simulation and for why billet's own launches,
-			// which name no snapshot, are unaffected.
+			// mapping names, so the launch grant's unconditioned half is also a read of
+			// any snapshot in the account — the ledger's among them. The boundary stays
+			// a Deny beside it rather than a scoped Allow, because that is what was
+			// measured against EC2 itself, including that the AMI's own backing snapshot
+			// is not evaluated. See the package comment for the simulation and for why
+			// billet's own launches, which name no snapshot, are unaffected.
 			Statement{
 				Sid: "BilletRuntimeDenyForeignSnapshot", Effect: "Deny",
 				Action:    ec2.RuntimeLaunchIAMActions(),
@@ -1464,6 +1504,138 @@ func withCacheOwnerPresent(owner map[string]any) map[string]any {
 	}
 
 	return out
+}
+
+var (
+	partitionPattern       = regexp.MustCompile(`^[A-Za-z]+(-[A-Za-z]+)*$`)
+	subnetIDPattern        = regexp.MustCompile(`^subnet-[0-9a-z]+$`)
+	securityGroupIDPattern = regexp.MustCompile(`^sg-[0-9a-z]+$`)
+)
+
+// check refuses a network that would grant nothing or more than it names. An id
+// lands in an IAM Resource ARN, so one carrying a `*`, a `?` or a separator would
+// widen the grant to every subnet or group it matches. The id's own shape is
+// EC2's to judge, so letters and digits are all this asks.
+func (n Network) check() error {
+	if len(n.SubnetIDs) == 0 || len(n.SecurityGroupIDs) == 0 {
+		return errors.New("awspolicy: a launch network needs at least one subnet and one " +
+			"security group; with neither named every launch would be refused")
+	}
+
+	for _, id := range n.SubnetIDs {
+		if !subnetIDPattern.MatchString(id) {
+			return fmt.Errorf("awspolicy: %q is not a subnet id (subnet- then lowercase "+
+				"letters and digits)", id)
+		}
+	}
+
+	for _, id := range n.SecurityGroupIDs {
+		if !securityGroupIDPattern.MatchString(id) {
+			return fmt.Errorf("awspolicy: %q is not a security group id (sg- then lowercase "+
+				"letters and digits)", id)
+		}
+	}
+
+	return nil
+}
+
+// launchStatements is the RunInstances grant, split by the resource types a launch
+// authorizes, because one grant on "*" let a holder of the role launch into any
+// subnet with any security group, and launch an instance carrying no owner tag,
+// which no billet role can terminate or even list (#779).
+//
+// The instance and its volumes are allowed only when the request tags them with
+// this deployment's owner, so a launch that tags nothing is refused rather than
+// left as compute billet cannot see. The subnets and security groups are, when the
+// caller names them, exactly those. Everything else a launch authorizes (the image,
+// the network interface, a key pair, a placement group, a spot request) is granted
+// by NotResource, so a resource type EC2 adds later is not refused; the snapshot
+// among them stays bounded by the Deny beside this grant.
+//
+// MEASURED WITH iam:SimulateCustomPolicy, 2026-11-07, per resource, for a value-mode
+// document naming one subnet and two groups: billet's own launch shape is allowed
+// with either group; a launch requesting no owner tag, another deployment's, or
+// a builder's under a runtime-only policy is denied on instance/* and volume/*
+// alone; another subnet, or another group, is denied on that resource alone.
+//
+// AND ASKED OF EC2 ITSELF the same day, `billet check --authorize` under a real
+// node role holding this rendering, which dry-runs billet's own launch request for
+// a trusted and an untrusted tier on an arm64 AMI. Before: both authorized in the
+// node's subnet AND in another subnet of the same VPC, which is the exposure. After,
+// with launchTagCondition's exact tag key too: both authorized in the node's subnet,
+// and both UnauthorizedOperation in the other.
+func launchStatements(partition string, in Inputs) []Statement {
+	arn := func(kind string) string { return "arn:" + partition + ":ec2:*:*:" + kind }
+
+	scoped := []string{arn("instance/*"), arn("volume/*")}
+	if in.Network != nil {
+		scoped = append(scoped, arn("subnet/*"), arn("security-group/*"))
+	}
+
+	out := []Statement{
+		{
+			Sid: "BilletRuntimeLaunch", Effect: "Allow",
+			Action: ec2.RuntimeLaunchIAMActions(), NotResource: scoped,
+		},
+		{
+			Sid: "BilletRuntimeLaunchOwned", Effect: "Allow",
+			Action:    ec2.RuntimeLaunchIAMActions(),
+			Resource:  []string{arn("instance/*"), arn("volume/*")},
+			Condition: launchTagCondition(in.Owner, in.Builder),
+		},
+	}
+
+	if in.Network != nil {
+		network := make([]string, 0, len(in.Network.SubnetIDs)+len(in.Network.SecurityGroupIDs))
+		for _, id := range in.Network.SubnetIDs {
+			network = append(network, arn("subnet/"+id))
+		}
+
+		for _, id := range in.Network.SecurityGroupIDs {
+			network = append(network, arn("security-group/"+id))
+		}
+
+		out = append(out, Statement{
+			Sid: "BilletRuntimeLaunchNetwork", Effect: "Allow",
+			Action: ec2.RuntimeLaunchIAMActions(), Resource: network,
+		})
+	}
+
+	return out
+}
+
+// launchTagCondition is what a launch's instance and volumes must be tagged with:
+// this deployment's owner value, or one of its builders' when a builder shares the
+// policy, or in account-wide mode an owner tag of any value. The same values
+// createTagCondition admits, asked of every launch rather than only of one that
+// sends tags.
+//
+// AND THE KEY IN EXACTLY BILLET'S SPELLING. IAM matches the tag key inside a
+// condition key name case-insensitively, so `aws:RequestTag/sh.billet.owner` alone
+// is satisfied by a tag `sh.billet.Owner`, which EC2 keeps as a different key and
+// billet's owner-filtered inventory never finds. aws:TagKeys compares values, and
+// StringEquals on a value is case-sensitive. Simulated 2026-11-07: billet's own
+// keys are allowed; `sh.billet.Owner` in their place, or no owner key, is denied on
+// instance/* and volume/*.
+func launchTagCondition(owner string, builder bool) map[string]any {
+	key := "aws:RequestTag/" + ec2.OwnerTagKey
+
+	var cond map[string]any
+
+	switch {
+	case owner == "":
+		cond = nullPresent(key)
+	case builder:
+		cond = map[string]any{"StringLike": map[string]any{
+			key: []string{owner, ec2.BuilderOwnerPattern(owner)},
+		}}
+	default:
+		cond = map[string]any{"StringEquals": map[string]any{key: owner}}
+	}
+
+	cond["ForAnyValue:StringEquals"] = map[string]any{"aws:TagKeys": []string{ec2.OwnerTagKey}}
+
+	return cond
 }
 
 // createTagCondition is the condition on CreateTags: always restricted to
