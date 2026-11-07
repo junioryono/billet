@@ -1815,6 +1815,216 @@ func TestAVMThatNeverStartsReportsWhy(t *testing.T) {
 	}
 }
 
+// THE RUN LOG IS NEVER WRITTEN INTO THE VM'S BUNDLE. Written there, a macOS guest on an
+// ASIF disk failed to start under billet most of the time (tart 2.41.1, macOS 27.2,
+// 2026-11-07), so where it lives is the fix, and so is that it starts empty for a name
+// used before and goes when its VM does.
+func TestTheRunLogLivesOutsideTheBundleStartsEmptyAndGoesWithItsVM(t *testing.T) {
+	s := newStub(t)
+	p := newProvider(t, s)
+
+	const name = "billet-lease1"
+
+	logPath := p.runLogPath(name)
+	if rel, err := filepath.Rel(p.vmDir(name), logPath); err != nil || !strings.HasPrefix(rel, "..") {
+		t.Fatalf("the run log %s is inside the VM's bundle %s", logPath, p.vmDir(name))
+	}
+
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	if err := os.WriteFile(logPath, []byte("an earlier run's reason\n"), 0o600); err != nil {
+		t.Fatalf("seed an earlier run's log: %v", err)
+	}
+
+	if _, err := p.Launch(t.Context(), validSpec(name)); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("the started VM has no run log at %s: %v", logPath, err)
+	}
+
+	if strings.Contains(string(got), "an earlier run's reason") {
+		t.Errorf("the run log kept an earlier run's output: %q", got)
+	}
+
+	entries, err := os.ReadDir(p.vmDir(name))
+	if err != nil {
+		t.Fatalf("read the bundle: %v", err)
+	}
+
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".log") {
+			t.Errorf("the VM's bundle holds %s; nothing billet writes during a run belongs there", e.Name())
+		}
+	}
+
+	if _, err := p.Destroy(t.Context(), name); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the run log outlived its VM: %v", err)
+	}
+}
+
+// A START ON A HOST THAT NEVER HAD A RUN LOG MAKES THE DIRECTORY, privately, since the
+// logs are tart's words about guests and sit in a store others may share.
+func TestAFirstStartMakesThePrivateRunLogDirectory(t *testing.T) {
+	s := newStub(t)
+	p := newProvider(t, s)
+
+	dir := filepath.Dir(p.runLogPath("billet-lease1"))
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the run log directory exists before any start (%v), so this proves nothing", err)
+	}
+
+	if _, err := p.Launch(t.Context(), validSpec("billet-lease1")); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("the first start made no run log directory: %v", err)
+	}
+
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("run log directory mode %o, want 700", perm)
+	}
+
+	if _, err := os.Stat(p.runLogPath("billet-lease1")); err != nil {
+		t.Errorf("no run log after the first start: %v", err)
+	}
+}
+
+// A DESTROY THAT FINDS THE VM ALREADY GONE TAKES ITS LOG, which a delete interrupted
+// between the VM and the log, or an operator's own delete, left behind.
+func TestADestroyOfAnAbsentVMTakesItsLeftoverRunLog(t *testing.T) {
+	s := newStub(t)
+	p := newProvider(t, s)
+
+	logPath := p.runLogPath("billet-gone")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	if err := os.WriteFile(logPath, []byte("a run whose VM is gone\n"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	got, err := p.Destroy(t.Context(), "billet-gone")
+	if err != nil || got != provider.TeardownStopped {
+		t.Fatalf("Destroy of an absent VM = %v, %v; want stopped", got, err)
+	}
+
+	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the leftover run log survived the destroy: %v", err)
+	}
+}
+
+// AN ABSENT VM'S LOG IS REMOVED ONLY UNDER THE STORE LOCK, AND ONLY WHILE IT IS STILL
+// ABSENT, because another billet sharing the store publishes a VM under that lock and
+// then opens its log: removing it on this process's own word would take a live run's.
+//
+// AND IT NEVER WAITS FOR THE LOCK: the teardown is already proved, so a held lock leaves
+// the log rather than holding the node's command slot for the lock's window.
+func TestAnAbsentVMsLogNeedsTheFreeStoreAndSparesAVMThatAppeared(t *testing.T) {
+	s := newStub(t)
+	p := newProvider(t, s)
+
+	// A WINDOW NO TEST WAITS OUT, so a cleanup that waited for the lock fails the bound
+	// below instead of passing slowly.
+	p.storeLockWindow = time.Minute
+
+	seed := func(name string) string {
+		t.Helper()
+
+		path := p.runLogPath(name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+
+		if err := os.WriteFile(path, []byte("a run\n"), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		return path
+	}
+
+	held := seed("billet-gone")
+	other := newLockProvider(t, s.home)
+
+	unlock, err := other.lockStore(t.Context(), "stand in for another billet")
+	if err != nil {
+		t.Fatalf("could not stage a competing holder: %v", err)
+	}
+
+	start := time.Now()
+	got, err := p.Destroy(t.Context(), "billet-gone")
+	took := time.Since(start)
+
+	unlock()
+
+	if err != nil || got != provider.TeardownStopped {
+		t.Fatalf("Destroy of an absent VM = %v, %v; want stopped, since the VM is gone", got, err)
+	}
+
+	if took > 20*time.Second {
+		t.Errorf("Destroy of an absent VM took %s behind a held store lock; its log's cleanup "+
+			"must try the lock once, not wait for it", took)
+	}
+
+	if _, err := os.Stat(held); err != nil {
+		t.Errorf("the log was removed although another billet held the store: %v", err)
+	}
+
+	// ANOTHER BILLET PUBLISHES THE NAME just before this one takes the lock, which only
+	// an absence asked under the lock sees.
+	back := seed("billet-back")
+	p.beforeRunLogLock = func() { s.vm(t, "billet-back", "running", testOwner) }
+
+	p.removeAbsentVMRunLog(t.Context(), "billet-back")
+
+	if _, err := os.Stat(back); err != nil {
+		t.Errorf("the log of a VM published before the lock was taken was removed: %v", err)
+	}
+}
+
+// A probe or a base removed by name goes with its run log too, since a probe's name is
+// its image's and every verification of that image runs one.
+func TestADeletedProbeTakesItsRunLog(t *testing.T) {
+	s := newStub(t)
+	p := newProvider(t, s)
+
+	const name = "billetprobe-test"
+
+	s.vm(t, name, "stopped", testOwner)
+
+	logPath := p.runLogPath(name)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	if err := os.WriteFile(logPath, []byte("a probe's run\n"), 0o600); err != nil {
+		t.Fatalf("seed the probe's log: %v", err)
+	}
+
+	if err := p.deleteOwnedVM(t.Context(), name); err != nil {
+		t.Fatalf("deleteOwnedVM: %v", err)
+	}
+
+	if s.dirExists(name) {
+		t.Fatal("the probe survived its delete, so this says nothing about its log")
+	}
+
+	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the probe's run log outlived it: %v", err)
+	}
+}
+
 // A pid proves a NUMBER is in use, not that it is still this runner. Guest
 // kernels reuse pids, so without a birth token a recycled number reports a
 // healthy runner where there is none — and billet would adopt a VM whose runner

@@ -168,7 +168,12 @@ func removeGuest(t *testing.T, p *Provider, name string) {
 	if _, err := p.run(ctx, "delete", name); err != nil && !isMissingVM(err) {
 		t.Logf("cleanup could not delete %s: %v; remove it with `tart delete %s`",
 			name, err, name)
+
+		return
 	}
+
+	// THE STORE IS THE OPERATOR'S, so the run log the start wrote under it goes too.
+	p.removeRunLog(name)
 }
 
 // guestSays runs a command in the guest and returns its stdout.
