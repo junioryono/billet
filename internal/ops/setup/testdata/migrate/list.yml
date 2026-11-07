@@ -1,0 +1,12 @@
+name: list
+on: [push]
+jobs:
+  flow:
+    runs-on: [ubuntu-latest]
+    steps:
+      - run: echo flow
+  block:
+    runs-on:
+      - ubuntu-24.04
+    steps:
+      - run: echo block

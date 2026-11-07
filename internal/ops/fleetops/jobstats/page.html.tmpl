@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="{{.Policy}}">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>billet job statistics</title>
+<style>{{.Style}}</style>
+</head>
+<body>
+<header>
+<p class="kicker">billet job statistics</p>
+<h1>{{.Heading}}</h1>
+{{- if .Partial}}
+<p class="partial">{{.Partial}}</p>
+{{- end}}
+<p class="note">{{.Covers}}</p>
+</header>
+{{- if not .Groups}}
+<p class="why">No job started in either window.</p>
+{{- end}}
+{{- range .Groups}}
+<section>
+<h2>{{.Heading}}</h2>
+<div class="scroll">
+<table>
+<thead><tr><th scope="col"></th><th scope="col">This window</th><th scope="col">Previous window</th></tr></thead>
+<tbody>
+{{- range .Rows}}
+<tr{{if .Unmeasured}} class="unmeasured"{{end}}><th scope="row">{{.Label}}</th><td>{{.Current}}</td><td>{{.Previous}}</td></tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+</section>
+{{- end}}
+</body>
+</html>

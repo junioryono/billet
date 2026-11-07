@@ -22,7 +22,8 @@ import (
 func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet jobs show <lease> | billet jobs show --run <run id> | billet jobs wait | " +
-			"billet jobs runtimes | billet jobs export | billet jobs attach <lease> | billet jobs release <lease>")
+			"billet jobs runtimes | billet jobs export | billet jobs stats | billet jobs rightsize | " +
+			"billet jobs attach <lease> | billet jobs release <lease>")
 	}
 	switch args[0] {
 	case "show":
@@ -37,9 +38,13 @@ func Jobs(ctx context.Context, env cli.Env, args []string) error {
 		return cmdJobsRuntimes(ctx, env, args[1:])
 	case "export":
 		return cmdJobsExport(ctx, env, args[1:])
+	case "stats":
+		return cmdJobsStats(ctx, env, args[1:])
+	case "rightsize":
+		return cmdJobsRightsize(ctx, env, args[1:])
 	}
 
-	return fmt.Errorf("unknown jobs command %q; try show, wait, runtimes, export, attach or release", args[0])
+	return fmt.Errorf("unknown jobs command %q; try show, wait, runtimes, export, stats, rightsize, attach or release", args[0])
 }
 
 // cmdJobsShow prints one job's history and what the host measured it do, or
@@ -292,6 +297,9 @@ type jobJSON struct {
 	// may differ from RunID, the run the lease was assigned; zero is not
 	// recorded.
 	GitHubRunID int64 `json:"github_run_id"`
+	// RunAttempt is which attempt of that run the job was, from GitHub's REST
+	// record; zero is not recorded, never a first attempt.
+	RunAttempt int64 `json:"run_attempt"`
 	// RequestID is GitHub's runner request id, zero for a pooled lease, whose
 	// negative id is billet's own scheduler identity and nothing GitHub shows.
 	RequestID   int64  `json:"request_id"`
@@ -423,7 +431,8 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 		GitHubQueuedAt: rec.GitHubQueuedAt, GitHubScaleSetAssignedAt: rec.GitHubScaleSetAssignedAt,
 		GitHubRunnerAssignedAt: rec.GitHubRunnerAssignedAt, BoughtAt: rec.BoughtAt,
 		DetailRetiredAt: rec.DetailRetiredAt,
-		GitHubRunID:     rec.GitHubRunID, LaunchedAt: rec.LaunchedAt, RegisteredAt: rec.RegisteredAt,
+		GitHubRunID:     rec.GitHubRunID, RunAttempt: rec.Job.RunAttempt,
+		LaunchedAt: rec.LaunchedAt, RegisteredAt: rec.RegisteredAt,
 		CustodyAt: rec.CustodyAt, TeardownAt: rec.TeardownAt, QuarantinedAt: rec.QuarantinedAt,
 		RunnerID: rec.RunnerID, LaunchIncarnation: rec.LaunchIncarnation,
 		HolderIncarnation: rec.HolderIncarnation, FailureReason: rec.FailureReason,
@@ -488,8 +497,12 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, names m
 	if rec.RequestID > 0 {
 		request = fmt.Sprintf(", request %d", rec.RequestID)
 	}
-	line("job", "%s (github job %s, run %s%s)", quoted(rec.Job.Name),
-		quoted(rec.Job.JobID), runOf(rec), request)
+	attempt := "attempt not recorded"
+	if rec.Job.RunAttempt > 0 {
+		attempt = fmt.Sprintf("attempt %d", rec.Job.RunAttempt)
+	}
+	line("job", "%s (github job %s, run %s, %s%s)", quoted(rec.Job.Name),
+		quoted(rec.Job.JobID), runOf(rec), attempt, request)
 	line("repository", "%s", quoted(rec.Repo))
 	line("workflow", "%s", quoted(rec.Job.WorkflowRef))
 	line("commit", "%s on branch %s", quoted(rec.Job.HeadSHA), quoted(rec.Job.HeadBranch))
