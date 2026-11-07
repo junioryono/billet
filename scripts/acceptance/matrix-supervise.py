@@ -31,7 +31,7 @@ and to its stderr while that still reads, and it echoes the log's tail at the en
 await waits up to <seconds> for the lock to be free, which is the proof no run is
 live in <run-dir>: 0 once it is, 1 if a run still holds it.
 
-keep-logs moves the run's services' logs out of the workspace the teardown removes, into
+keep-logs links the run's services' logs out of the workspace the teardown removes, into
 <run-dir>/logs, which it creates 0700; it exits 1 having said what it did not keep.
 
 MATRIX_POLL (seconds, default 2) is how often each looks.
@@ -169,9 +169,12 @@ def keep_logs(run_dir):
     following a symlink and every step names an entry relative to one of them, so nothing
     swapped in between a check and the move can send a log into out/, which the workflow
     uploads. The logs directory must be one this call created, 0700 and the caller's, or
-    nothing is kept. A log is LINKED and then unlinked, never renamed or copied: a link
-    refuses an entry that is already there and a move across filesystems, so a log of
-    any size is kept at once or not at all, and the teardown that follows never waits.
+    nothing is kept. A log is LINKED, never renamed or copied: a link refuses an entry
+    that is already there and a move across filesystems, so a log of any size is kept at
+    once or not at all, and the teardown that follows never waits.
+
+    It keeps the logs from the run's own reader, not from the run's own user: a process
+    that may rename entries in <run-dir> may write out/ itself.
     """
     try:
         run_fd = os.open(run_dir, DIRECTORY)
@@ -224,14 +227,21 @@ def keep_from(run_dir, run_fd, ws_fd):
             try:
                 os.link(name, name, src_dir_fd=ws_fd, dst_dir_fd=logs_fd,
                         follow_symlinks=False)
+                kept = os.stat(name, dir_fd=logs_fd, follow_symlinks=False)
             except OSError as err:
                 say(name + " is not kept: " + err.strerror)
                 status = 1
                 continue
-            try:
-                os.unlink(name, dir_fd=ws_fd)
-            except OSError:
-                pass
+            # WHAT WAS LINKED IS WHAT WAS CHECKED, or it is dropped: an entry replaced
+            # between the two is linked as whatever it became. The workspace's own name
+            # is left to the teardown, which removes the workspace whole.
+            if (kept.st_dev, kept.st_ino) != (found.st_dev, found.st_ino):
+                say(name + " is not kept: it changed while it was being kept")
+                try:
+                    os.unlink(name, dir_fd=logs_fd)
+                except OSError:
+                    pass
+                status = 1
         return status
     finally:
         os.close(logs_fd)
