@@ -364,6 +364,60 @@ func TestOnlyADrainingOrdersIdleNodeIsAsked(t *testing.T) {
 	}
 }
 
+// A BARRIER ANSWER LISTING COMPUTE CONTRADICTS A RELEASE, whatever became of the barrier
+// and though the inventory it carried was never recorded: after the seal the proof is
+// refused, and the contradiction is the same one a clearance answer records.
+func TestABarrierAnswerListingComputeContradictsARelease(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := drainingPoolNode(t, a)
+	answerClearance(t, a, node, true)
+	now = now.Add(computeAbsenceGrace)
+	answerClearance(t, a, node, true)
+	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	if err := a.RecordBarrierObservation(ctx, BarrierObservation{
+		Node: node, BarrierID: "no-barrier-in-force", Fence: fenceOf(t, a, node), Running: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.PoolReleaseProof(ctx, "pa"); !errors.Is(err, ErrPoolReleaseContradicted) {
+		t.Fatalf("the proof after a barrier answer listing compute answered %v", err)
+	}
+}
+
+// A CLEARANCE ANSWER LISTING COMPUTE ENDS THE NODE'S BARRIER RUN TOO, so a decommission
+// after it is not proved by a run taken before the compute listed, and the contradiction
+// stands.
+func TestAClearanceListingComputeLeavesNoOlderRunToDecommissionOn(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := drainingPoolNode(t, a)
+	barrier := requestBarrier(t, a)
+	observeNode(t, a, barrier, node, true)
+	now = now.Add(computeAbsenceGrace)
+	observeNode(t, a, barrier, node, true)
+
+	if err := a.RecordPoolClearance(ctx, PoolClearanceObservation{
+		Order: "pa", Node: node, Fence: fenceOf(t, a, node), Running: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.NodeGone(ctx, node, fenceOf(t, a, node).Epoch); err != nil {
+		t.Fatal(err)
+	}
+	if proven, err := a.Decommission(ctx, DecommissionRequest{Node: node, Actor: "ops"}); err == nil || proven {
+		t.Fatalf("a decommission proved by a run older than the compute listed: proved %v, %v", proven, err)
+	}
+	waitsUnsealed(t, a, "0a", "compute listed after a barrier run")
+}
+
 // COMPUTE A NODE LISTED IS A CONTRADICTION WHATEVER THE ORDER BECAME SINCE IT WAS ASKED:
 // an answer of its current registration listing compute, recorded after the seal, refuses
 // the release proof, though the inventory the same answer carried was never recorded;

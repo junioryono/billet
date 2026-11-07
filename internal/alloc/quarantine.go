@@ -816,23 +816,53 @@ func recordInventoryTx(
 	}
 
 	if running > 0 {
-		pool, err := q.ContradictPoolRelease(ctx, node)
-		if err != nil {
-			return fmt.Errorf("alloc: contradict the release of pool node %s: %w", node, err)
-		}
+		return computeListedTx(ctx, q, node)
+	}
 
-		// AND A POOL NODE'S IDLE RUN GOES WITH IT, so the next decommission that clears the
-		// contradiction is proved by answers taken after it, never by a run that predates
-		// the compute this reported (ADR-030). Only a pool node's: any other host's run is
-		// the drain's to judge, and an empty barrier answer there clears a stale positive.
-		if pool > 0 {
-			if err := q.DeleteBarrierRun(ctx, node); err != nil {
-				return fmt.Errorf("alloc: discard pool node %s's idle run: %w", node, err)
-			}
+	return nil
+}
+
+// computeListedTx records that a node's current registration listed compute, for a pool
+// release (ADR-030): its release is contradicted, its clearance run with it, and its
+// barrier run too, so the next decommission that clears the contradiction is proved by
+// answers taken after it, never by a run that predates the compute listed. The caller
+// has proved the answer is of the node's current registration.
+//
+// THE ONE PLACE A LISTING CONTRADICTS A RELEASE, reached from every path an answer takes:
+// the inventory recorded (recordInventoryTx), and a barrier or clearance answer that
+// listed compute, whose inventory may not have been recorded at all if the
+// reconciliation beside it failed. Only a pool node's barrier run goes: any other host's
+// is the drain's to judge, and an empty barrier answer there clears a stale positive.
+func computeListedTx(ctx context.Context, q state.WriteOps, node string) error {
+	pool, err := q.ContradictPoolRelease(ctx, node)
+	if err != nil {
+		return fmt.Errorf("alloc: contradict the release of pool node %s: %w", node, err)
+	}
+
+	if pool > 0 {
+		if err := q.DeleteBarrierRun(ctx, node); err != nil {
+			return fmt.Errorf("alloc: discard pool node %s's idle run: %w", node, err)
 		}
 	}
 
 	return nil
+}
+
+// computeListedNowTx is computeListedTx for an answer taken against epoch, which says
+// nothing of the host unless that is still its registration.
+func computeListedNowTx(ctx context.Context, q state.WriteOps, node string, epoch int64) error {
+	fence, err := q.ReadNodeFence(ctx, node)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("alloc: read the fence of node %s: %w", node, err)
+	case fence.Epoch != epoch:
+		return nil
+	}
+
+	return computeListedTx(ctx, q, node)
 }
 
 // NodeInventory is one host's last word about what it was running.

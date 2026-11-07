@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -289,7 +290,10 @@ func (p *Plane) askNode(ctx context.Context, n *node, barrierID string) {
 		return
 	}
 
-	obs := alloc.BarrierObservation{Node: n.name, BarrierID: barrierID, Fence: fence, Empty: listed == listedNothing}
+	obs := alloc.BarrierObservation{
+		Node: n.name, BarrierID: barrierID, Fence: fence,
+		Empty: listed == listedNothing, Running: listed == listedCompute,
+	}
 	if err := p.barriers.RecordBarrierObservation(ctx, obs); err != nil && ctx.Err() == nil {
 		p.log.Warn("could not record what a host said it is running",
 			"node", n.name, "error", err)
@@ -338,6 +342,15 @@ func (p *Plane) schedulePoolAsks(ctx context.Context) {
 
 		return
 	}
+
+	// THE LONGEST UNASKED FIRST, never asked before all: orders whose nodes keep failing
+	// slowly would otherwise take every slot round after round while another waited.
+	p.poolMu.Lock()
+	asked := maps.Clone(p.poolAskedAt)
+	p.poolMu.Unlock()
+	slices.SortStableFunc(targets, func(x, y alloc.PoolClearanceTarget) int {
+		return asked[x.Order].Compare(asked[y.Order])
+	})
 
 	waiting := make(map[string]bool, len(targets))
 

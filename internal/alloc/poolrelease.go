@@ -368,22 +368,7 @@ func (a *Allocator) RecordPoolClearance(ctx context.Context, obs PoolClearanceOb
 			// since the question, sealed included: the inventory the same answer carried may
 			// not have been recorded (a reconciliation that failed), and this is then the only
 			// record of it. Only an answer of the node's current registration says so.
-			fence, err := q.ReadNodeFence(ctx, obs.Node)
-
-			switch {
-			case errors.Is(err, sql.ErrNoRows):
-				return nil
-			case err != nil:
-				return fmt.Errorf("alloc: read the fence of node %s: %w", obs.Node, err)
-			case fence.Epoch != obs.Fence.Epoch:
-				return nil
-			}
-
-			if _, err := q.ContradictPoolRelease(ctx, obs.Node); err != nil {
-				return fmt.Errorf("alloc: contradict the release of pool node %s: %w", obs.Node, err)
-			}
-
-			return nil
+			return computeListedNowTx(ctx, q, obs.Node, obs.Fence.Epoch)
 		case row.State != PoolPlaced || row.ReleaseRequestedAt == "":
 			return nil
 		}

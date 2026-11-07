@@ -589,8 +589,8 @@ func TestAHostThatReportsComputeEndsItsRun(t *testing.T) {
 		t.Fatalf("want one observation, got %d", len(observed))
 	}
 
-	if observed[0].Empty {
-		t.Fatal("a host that listed a lease was recorded as empty")
+	if observed[0].Empty || !observed[0].Running {
+		t.Fatalf("a host that listed a lease was recorded as %+v", observed[0])
 	}
 
 	// AND ITS LIST SETTLES REAL CAPACITY. A barrier inventory is a real

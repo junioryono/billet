@@ -2,6 +2,7 @@ package nodeplane
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -26,6 +27,29 @@ func answerPoolAsk(t *testing.T, p *Plane, node, wantID string, instances []stri
 		ID: cmd.ID, OK: true, BarrierID: cmd.BarrierID, Instances: instances,
 	}); err != nil {
 		t.Fatalf("Result: %v", err)
+	}
+}
+
+// untilPoolAskDone waits until order's ask is no longer out: its answer is recorded
+// before the ask lets go of its claim, so receiving the answer does not say it has.
+func untilPoolAskDone(t *testing.T, p *Plane, order string) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		p.poolMu.Lock()
+		out := p.poolInFlight[order]
+		p.poolMu.Unlock()
+
+		if !out {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the ask of %s never finished", order)
+		}
+
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -123,6 +147,7 @@ func TestASlowPoolNodeHoldsUpOnlyItsOwnRelease(t *testing.T) {
 
 	p.schedulePoolAsks(ctx)
 	quick(1)
+	untilPoolAskDone(t, p, "quick")
 
 	agePoolAsk(p, "slow")
 	agePoolAsk(p, "quick")
@@ -165,13 +190,13 @@ func TestAPoolNodeBelowTheBarrierProtocolIsNotAsked(t *testing.T) {
 	}
 }
 
-// THE POOL'S CLEARANCES RUN ON A LOOP OF THEIR OWN: with a deployment barrier waiting on
-// a node that never answers, a release's node is still asked.
+// THE POOL'S CLEARANCES RUN ON A LOOP OF THEIR OWN: with the deployment's barrier waiting
+// on a node that has taken its question and never answers, a release's node is asked,
+// and asked again a round later, while that question is still out.
 func TestAPoolReleaseIsAskedWhileTheDeploymentsBarrierWaits(t *testing.T) {
 	t.Parallel()
 
 	store := newBarrierStore()
-	store.poolRecorded = make(chan alloc.PoolClearanceObservation, 4)
 	p, reg := barrierPlane(t, store)
 	register(t, p, "fast", config.ProviderDocker)
 	store.setFence("fast", alloc.NodeFence{
@@ -193,34 +218,81 @@ func TestAPoolReleaseIsAskedWhileTheDeploymentsBarrierWaits(t *testing.T) {
 		<-looped
 	}()
 
-	// THE DEPLOYMENT'S BARRIER ASKS barrierHostName, which nobody plays, so its pass waits;
-	// the fast node is asked twice, once for the barrier and once for its release, and only
-	// the release's ask is answered here.
-	deadline := time.After(10 * time.Second)
+	// THE BARRIER'S QUESTION TO barrierHostName IS TAKEN AND NEVER ANSWERED, so its pass
+	// is waiting from here on.
+	if cmd, took, err := p.Poll(ctx, barrierHostName, ""); err != nil || !took || cmd.BarrierID != barrierFixtureID {
+		t.Fatalf("the deployment's barrier did not ask %s: %+v, %v, %v", barrierHostName, cmd, took, err)
+	}
 
-	for {
+	asked := 0
+
+	for asked < 2 {
 		cmd, took, err := p.Poll(ctx, "fast", "")
 		if err != nil || !took {
 			t.Fatalf("the fast node was not asked: took %v, %v", took, err)
 		}
-		if cmd.BarrierID == "pool-release-quick" {
-			if err := p.Result("fast", "", nodeapi.CommandResult{ID: cmd.ID, OK: true, BarrierID: cmd.BarrierID}); err != nil {
-				t.Fatalf("Result: %v", err)
-			}
-
-			break
-		}
 		if err := p.Result("fast", "", nodeapi.CommandResult{ID: cmd.ID, OK: true, BarrierID: cmd.BarrierID}); err != nil {
 			t.Fatalf("Result: %v", err)
 		}
+		if cmd.BarrierID != "pool-release-quick" {
+			continue
+		}
+
+		asked++
+		untilPoolAskDone(t, p, "quick")
+		agePoolAsk(p, "quick")
 	}
 
-	select {
-	case obs := <-store.poolRecorded:
-		if obs.Order != "quick" {
-			t.Fatalf("recorded %+v", obs)
-		}
-	case <-deadline:
-		t.Fatal("the release was not asked while the deployment's barrier waited")
+	if got := p.QueuedForTest(barrierHostName); got != 0 {
+		t.Fatalf("the barrier's question to %s was answered or re-sent: %d queued", barrierHostName, got)
+	}
+}
+
+// THE LONGEST UNASKED IS ASKED FIRST: with every slot's worth of orders due again, an
+// order never asked takes a slot ahead of them, so orders whose nodes keep failing
+// slowly cannot starve another release.
+func TestANeverAskedReleaseIsAskedAheadOfDueOnes(t *testing.T) {
+	t.Parallel()
+
+	store := newBarrierStore()
+	store.hasBarrier = false
+	p, reg := barrierPlane(t, store)
+
+	var targets []alloc.PoolClearanceTarget
+
+	for i := range barrierFanOut + 1 {
+		name := fmt.Sprintf("n%d", i)
+		register(t, p, name, config.ProviderDocker)
+		store.setFence(name, alloc.NodeFence{
+			Epoch: reg.current(), Dispatch: 1, WireVersion: nodeapi.VersionComputeBarrier, Live: true,
+		})
+		targets = append(targets, alloc.PoolClearanceTarget{Order: fmt.Sprintf("o%d", i), Node: name})
+	}
+	store.poolTargets = targets
+
+	p.poolMu.Lock()
+	p.poolAskedAt, p.poolInFlight = map[string]time.Time{}, map[string]bool{}
+	for _, target := range targets[:barrierFanOut] {
+		p.poolAskedAt[target.Order] = time.Now().Add(-2 * barrierRound)
+	}
+	p.poolMu.Unlock()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer func() {
+		cancel()
+		p.poolAsks.Wait()
+	}()
+
+	p.schedulePoolAsks(ctx)
+
+	// THE CLAIM, which the schedule takes before it returns; the ask itself is dispatched
+	// by its own goroutine after.
+	last := targets[barrierFanOut].Order
+	p.poolMu.Lock()
+	claimed, out := p.poolInFlight[last], len(p.poolInFlight)
+	p.poolMu.Unlock()
+
+	if !claimed || out != barrierFanOut {
+		t.Fatalf("the order never asked was not asked first: %s claimed %v, %d asks out", last, claimed, out)
 	}
 }
