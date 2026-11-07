@@ -2,8 +2,51 @@ package state
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
 )
+
+// rewoundBeforePoolJoin is a SQLite ledger migrated and then taken back to version 75,
+// so migration 76 runs over the rows a test seeds: rewindNewest takes back the
+// newest, which is no longer 76, and 76's own statements are undone after it.
+func rewoundBeforePoolJoin(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	rewindNewest(t, db)
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`ALTER TABLE pool_orders DROP COLUMN join_hold`,
+			`ALTER TABLE pool_orders DROP COLUMN node_cert_serial`,
+			`ALTER TABLE pool_orders DROP COLUMN node_fingerprint`,
+			`ALTER TABLE node_enrollments DROP COLUMN pool_order`,
+			`DROP INDEX join_tokens_pool_order_idx`,
+			`ALTER TABLE join_tokens DROP COLUMN pool_order`,
+			`DELETE FROM schema_migrations WHERE version = 76`,
+		} {
+			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("rewind to version 75: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the rewound ledger: %v", err)
+	}
+
+	return dir
+}
 
 // MIGRATION 76 BINDS WHAT MIGRATION 75 LEFT TO ITS ORDER: a token a pool minted with the
 // note `pool order <order>`, and a request named `pool-<order>`, are that order's when
@@ -14,7 +57,7 @@ import (
 func TestMigration76BindsAnOrdersEarlierTokensAndRequests(t *testing.T) {
 	t.Parallel()
 
-	dir := rewoundLedger(t)
+	dir := rewoundBeforePoolJoin(t)
 
 	pools, err := newSQLiteBackend(dir).dataSources()
 	if err != nil {

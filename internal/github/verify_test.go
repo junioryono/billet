@@ -7,10 +7,12 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -173,10 +175,17 @@ func TestVerifyAppClassifiesTransportFailureAsUnverifiable(t *testing.T) {
 	t.Parallel()
 
 	srv, _ := verifyFake(t, http.StatusOK, `{}`)
-	base := srv.URL
-	srv.Close() // the address now refuses connections
 
-	_, err := verifyAppAt(t.Context(), http.DefaultClient, base, 7, testAppKey(), OrganizationTarget("acme"), 42, ActionsNone)
+	// THE DIAL REFUSES, rather than a closed server's port: a parallel test's server
+	// can be handed the same port and answer it (2026-11-07, a 404 read as "not
+	// installed").
+	refusing := &http.Client{Transport: &http.Transport{
+		DialContext: func(_ context.Context, network, _ string) (net.Conn, error) {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: syscall.ECONNREFUSED}
+		},
+	}}
+
+	_, err := verifyAppAt(t.Context(), refusing, srv.URL, 7, testAppKey(), OrganizationTarget("acme"), 42, ActionsNone)
 	if !errors.Is(err, ErrAppUnverifiable) {
 		t.Fatalf("a connection refusal was not classified as unverifiable: %v", err)
 	}
