@@ -2541,7 +2541,20 @@ func TestCleanupFailureDoesNotRemainClassifiedAsAColdMiss(t *testing.T) {
 	}
 	f.metadata[c.cacheIndex()] = map[string]string{pointerKey(key): string(encoded)}
 	f.metadata[source] = map[string]string{cacheMetaPrefix + "lineage": "0"}
+	f.images[source] = true
+	f.snapshots[source+"@g1"] = true
 	f.failRemove = true
+	// THE GENERATION GOES AFTER THE LOCK SAW IT, so the clone, not the check under
+	// the lock, finds it missing, and its cleanup runs.
+	c.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "clone") {
+			f.calls = append(f.calls, slices.Clone(args))
+
+			return nil, errors.New("rbd: error opening image cache-g-1-missing: (2) No such file or directory")
+		}
+
+		return f.run(ctx, bin, args)
+	}
 
 	_, err = c.Clone(t.Context(), key, "")
 	if err == nil {

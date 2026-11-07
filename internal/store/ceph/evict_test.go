@@ -604,7 +604,7 @@ func TestOnePassUnwindsALineageACompactionCutOff(t *testing.T) {
 
 	f := newCacheFake()
 	c := cacheClient(t, f)
-	generations := cutOffLineage(t, f, c)
+	generations := cutOffLineage(t, f, c, "acme/api/go")
 	current := generations[len(generations)-1]
 
 	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
@@ -635,7 +635,7 @@ func TestAFailedLockReleaseEndsTheEvictionPass(t *testing.T) {
 
 	f := newCacheFake()
 	c := cacheClient(t, f)
-	generations := cutOffLineage(t, f, c)
+	generations := cutOffLineage(t, f, c, "acme/api/go")
 
 	f.lockRemoveErrOn = f.lockRemoves + 1
 	f.lockRemoveErr = errors.New("injected lock release failure")
@@ -666,7 +666,7 @@ func TestEvictionLeavesTheCacheLockFreeBetweenRounds(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newCacheFake()
 		c := cacheClient(t, f)
-		cutOffLineage(t, f, c)
+		cutOffLineage(t, f, c, "acme/api/go")
 
 		var released time.Time
 		var gaps []time.Duration
@@ -705,11 +705,11 @@ func TestEvictionLeavesTheCacheLockFreeBetweenRounds(t *testing.T) {
 // four before it are a lineage nothing current reads, each used two hours ago:
 // past supersededGrace and far inside the retention. It returns the generations
 // oldest first.
-func cutOffLineage(t *testing.T, f *cacheFake, c *Client) []storecontract.Candidate {
+func cutOffLineage(t *testing.T, f *cacheFake, c *Client, key string) []storecontract.Candidate {
 	t.Helper()
 
 	now := time.Now().UTC()
-	key := "acme/api/go"
+	trashed := len(f.trash)
 	var previous string
 	var generations []storecontract.Candidate
 
@@ -746,8 +746,8 @@ func cutOffLineage(t *testing.T, f *cacheFake, c *Client) []storecontract.Candid
 	if parent := f.parents[current.Handle]; parent != "" {
 		t.Fatalf("the current generation was not compacted: it still has parent %q", parent)
 	}
-	if len(f.trash) != len(generations) {
-		t.Fatalf("the trash holds %d retired writers, want %d", len(f.trash), len(generations))
+	if len(f.trash)-trashed != len(generations) {
+		t.Fatalf("the lineage retired %d writers to the trash, want %d", len(f.trash)-trashed, len(generations))
 	}
 
 	for _, candidate := range generations[:len(generations)-1] {
@@ -757,27 +757,122 @@ func cutOffLineage(t *testing.T, f *cacheFake, c *Client) []storecontract.Candid
 	return generations
 }
 
-// A GENERATION WHOSE RECORD OUTLIVED ITS IMAGE IS A MISS. Eviction removes the
-// image and then the record, and a record removal that fails leaves one naming
-// nothing; a clone of it answers ErrMiss, and records nothing that names it.
-func TestCloningAGenerationWhoseImageIsGoneIsAMiss(t *testing.T) {
+// A GENERATION WHOSE RECORD OUTLIVED WHAT IT NAMES IS A MISS. Eviction purges a
+// generation's snapshot before its `rbd rm`, which a child refuses, and removes the
+// image before the record, whose removal can fail; a clone of either answers
+// ErrMiss under the lock, and records nothing that names it.
+func TestCloningAGenerationWhoseSnapshotIsGoneIsAMiss(t *testing.T) {
+	t.Parallel()
+
+	for name, imagePresent := range map[string]bool{"snapshot purged": true, "image removed": false} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newCacheFake()
+			c := cacheClient(t, f)
+			key := "acme/api/go"
+			handle := expiredGeneration(time.Now(), 'a')
+			setIndexRecord(t, f, c, generationKey(key, "gen-a"), cachePointer{
+				Key: key, Generation: "gen-a", Handle: handle, UsedAt: time.Now(), RetentionHours: 7 * 24,
+			})
+			if imagePresent {
+				f.addVolume(handle)
+				f.metadata[handle] = map[string]string{cacheMetaPrefix + "lineage": "1"}
+			} else {
+				f.missingImages = map[string]bool{handle: true}
+			}
+			before := maps.Clone(f.metadata[c.cacheIndex()])
+
+			if _, err := c.Clone(t.Context(), key, "gen-a"); !errors.Is(err, storecontract.ErrMiss) {
+				t.Fatalf("Clone = %v, want ErrMiss", err)
+			}
+
+			if !maps.Equal(f.metadata[c.cacheIndex()], before) {
+				t.Errorf("a clone of a generation that is gone changed the index: %v",
+					f.metadata[c.cacheIndex()])
+			}
+			if f.ranWith("clone") {
+				t.Error("a clone was attempted outside the lock of a generation the lock could see was gone")
+			}
+		})
+	}
+}
+
+// THE LOCK BUDGET IS THE PASS'S: rounds that each stay inside it still stop once
+// together they have held the lock that long, because a writer whose retry is in
+// flight at every gap waits through all of them.
+func TestTheEvictionPassHoldsTheLockForItsBudgetInAll(t *testing.T) {
 	t.Parallel()
 
 	f := newCacheFake()
 	c := cacheClient(t, f)
-	key := "acme/api/go"
-	handle := expiredGeneration(time.Now(), 'a')
-	setIndexRecord(t, f, c, generationKey(key, "gen-a"), cachePointer{
-		Key: key, Generation: "gen-a", Handle: handle, UsedAt: time.Now(), RetentionHours: 7 * 24,
-	})
-	f.missingImages = map[string]bool{handle: true}
-	before := maps.Clone(f.metadata[c.cacheIndex()])
+	first := cutOffLineage(t, f, c, "acme/api/go")
+	second := cutOffLineage(t, f, c, "acme/web/go")
 
-	if _, err := c.Clone(t.Context(), key, "gen-a"); !errors.Is(err, storecontract.ErrMiss) {
-		t.Fatalf("Clone = %v, want ErrMiss", err)
+	// EACH REMOVAL COSTS A THIRD OF THE BUDGET: the first round removes both
+	// lineages' leaves, two thirds, and leaves the second round a third, room for
+	// one of the two generations it could otherwise remove.
+	clock := time.Now()
+	c.clock = func() time.Time { return clock }
+	c.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		out, err := f.run(ctx, bin, args)
+		if err == nil && slices.Contains(args, "rm") && !slices.Contains(args, "lock") &&
+			!slices.Contains(args, "trash") {
+			clock = clock.Add(evictionLockBudget / 3)
+		}
+
+		return out, err
 	}
 
-	if !maps.Equal(f.metadata[c.cacheIndex()], before) {
-		t.Errorf("a clone of a generation that is gone changed the index: %v", f.metadata[c.cacheIndex()])
+	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil &&
+		!strings.Contains(err.Error(), "wait for the next eviction pass") {
+		t.Fatalf("Evict = %v, want no failure but the budget's stop", err)
+	}
+
+	if f.images[first[3].Handle] || f.images[second[3].Handle] {
+		t.Fatal("the first round kept a lineage's leaf, inside the budget, so the test proves nothing")
+	}
+	if kept := btoi(f.images[first[2].Handle]) + btoi(f.images[second[2].Handle]); kept != 1 {
+		t.Errorf("the second round kept %d of the two generations it could reach, want 1: the "+
+			"rounds together hold the lock for the pass's budget, not each its own", kept)
+	}
+	for _, generation := range []storecontract.Candidate{first[0], first[1], second[0], second[1]} {
+		if !f.images[generation.Handle] {
+			t.Errorf("eviction removed %s after the pass's budget was spent", generation.Handle)
+		}
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+
+	return 0
+}
+
+// A FAILED RELEASE IS REPORTED HOWEVER MANY GENERATIONS FAILED: why a pass stopped
+// is never one of the failures the cap counts away.
+func TestAFailedReleaseIsReportedPastTheFailureCap(t *testing.T) {
+	t.Parallel()
+
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	f := newCacheFake()
+	c := evictingClient(t, f, f.run)
+	for i := range evictionFailuresReported + 2 {
+		f.addVolume(expiredGeneration(old.Add(time.Duration(i)*time.Second), 'a'))
+	}
+	f.failRemove = true
+	f.lockRemoveErrOn = f.lockRemoves + 1
+	f.lockRemoveErr = errors.New("injected lock release failure")
+
+	err := c.Evict(t.Context(), 7*24*time.Hour)
+
+	if err == nil || !strings.Contains(err.Error(), "injected lock release failure") ||
+		!strings.Contains(err.Error(), "may still be held") {
+		t.Errorf("Evict = %v, want the failed release reported by name", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "more eviction failure(s)") {
+		t.Errorf("Evict = %v, want the cap reached, so it proves nothing otherwise", err)
 	}
 }
