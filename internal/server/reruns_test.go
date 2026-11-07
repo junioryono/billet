@@ -560,6 +560,49 @@ func TestARunWithAResultStillSettlingWaits(t *testing.T) {
 	}
 }
 
+// A PACED LOOP READS A SETTLING RUN AGAIN AFTER ITS PACE, never after the minutes the
+// defaults wait: a run found unfinished is read again once the longer of the settle and
+// the tick has passed. A loop that kept the default would wait two minutes for a result
+// a millisecond old, past any wait a paced test gives it.
+func TestAPacedLoopReadsASettlingRunAgainAfterItsPace(t *testing.T) {
+	t.Parallel()
+
+	for name, pace := range map[string]struct{ every, settle time.Duration }{
+		"the tick longer":   {every: 100 * time.Millisecond, settle: time.Millisecond},
+		"the settle longer": {every: 10 * time.Millisecond, settle: time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRerunStack(t)
+			WithRerunPacing(pace.every, pace.settle)(r.s)
+
+			again := max(pace.every, pace.settle)
+
+			r.job("lost", 31, 0)
+			r.lists(1, listed("lost", 77, true))
+
+			r.pass()
+			if r.reads() != 0 || r.github.asked() != 0 {
+				t.Fatalf("reads %d, requests %d on a result still settling", r.reads(), r.github.asked())
+			}
+
+			r.after(again - time.Millisecond).pass()
+			if r.reads() != 0 {
+				t.Errorf("read %d times inside its pace", r.reads())
+			}
+
+			r.after(2 * time.Millisecond).pass()
+			if r.reads() != 1 || r.github.asked() != 1 {
+				t.Errorf("reads %d, requests %d, want it decided once its pace had passed", r.reads(), r.github.asked())
+			}
+			if got := r.decision("lost"); got != alloc.RerunRequested {
+				t.Errorf("decision = %q", got)
+			}
+		})
+	}
+}
+
 // A SIBLING BILLET HAS NOT HEARD FROM HOLDS THE RUN: its completion may be on its way,
 // and it may be one more job billet proves. Another deployment's runner does not.
 func TestASiblingNotYetHeardFromHoldsTheRun(t *testing.T) {
