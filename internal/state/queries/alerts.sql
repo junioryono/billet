@@ -1,5 +1,5 @@
 -- Alerts (#537): which jobs `server.alerts` looks at, what it has decided, and what
--- it owes a destination. Migration 75 holds why each table is shaped as it is.
+-- it owes a destination. Migration 76 holds why each table is shaped as it is.
 
 -- name: ListRunningJobsForAlerts :many
 -- The jobs with no result yet that started since a moment, oldest first and bounded,

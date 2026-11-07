@@ -60,6 +60,8 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: fleetops.CA},
 		{Name: "leases", Summary: "show capacity held for compute nobody has accounted for",
 			Run: fleetops.Leases},
+		{Name: "pool", Summary: "show the rented bare-metal hosts the pool ordered, and close an uncertain order",
+			Run: fleetops.Pool},
 		{Name: "jobs", Summary: "show which GitHub job a lease, or every lease of a run, ran, how it lived and what it did to the host",
 			Run: fleetops.Jobs},
 		{Name: "tests", Summary: "rank the tests jobs reported: the slowest, the most often failing and the flaky",

@@ -22,6 +22,14 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `token_broker.url` | with a broker | where this deployment takes its installation tokens from, https only, naming only a scheme and a host. With it, no target names a `private_key_path` and this host holds no App key ([ADR-025](decisions/adr-025-installation-tokens-from-a-broker.md)) |
 | `token_broker.client_key_path` | with a broker | the key this host proves its deployment with, absolute and outside `identity_dir`; `billet broker client-key` creates it |
 | `token_broker.ca_file` | no | the PEM bundle the broker's certificate is verified against; absent, the system's roots |
+| `pool` | no | a pool of rented bare metal the controller orders Firecracker hosts from, ahead of demand ([ADR-030](decisions/adr-030-rented-bare-metal-pool.md), [the pool](../operating/bare-metal-pool.md)) |
+| `pool.join_server` | with a pool | the node-wire `host:port` an ordered host dials to join, as that host reaches it |
+| `pool.bootstrap_addr` | no | the enrollment listener an ordered host dials, when the deployment serves one apart from the node wire |
+| `pool.boot_prelude` | with a pool | an absolute path to the script an ordered host runs on its first boot before `billet join`: it installs billet and what a Firecracker node needs. The prelude, the join and its token must fit EC2's 16384 bytes of user data |
+| `pool.interval`, `pool.refusal_backoff` | no | how often the pool looks at its orders and the demand (default `30s`), and how long a choice a source refused is passed over (default `10m`); Go durations |
+| `pool.architectures.<arch>` | with a pool | per architecture: `floor` (hosts kept whatever the demand), `max` (at least 1, not below the floor) and `order`, the choices hosts come from, first first: each a `source` (`aws-metal` or `phoenixnap`), a `shape` that source declares for this architecture, and a `location` (the subnet's zone for `aws-metal`, which it may leave out; required for `phoenixnap`, whose stock is per location) |
+| `pool.aws_metal` | for `aws-metal` | `region`, `subnet_id`, `availability_zone`, `security_group_ids`, `instance_profile` (the role a host runs under, for the site's store), `images` (the AMI per architecture) and `shapes` (each a `type` and its `arch`) |
+| `pool.phoenixnap` | for `phoenixnap` | `client_id_env` and `client_secret_env`, the environment variables the API client's id and secret are read from (never the values), and `shapes` (each a `type` and its `arch`) |
 | `identity.backend` | no | `file` (default) or `aws-ssm` |
 | `identity.aws_ssm` | for `aws-ssm` | `region`, `prefix` (isolates one deployment in an account), `kms_key_id` |
 | `max_vcpu`, `max_memory` | yes, positive | the deployment ceiling across every tier |

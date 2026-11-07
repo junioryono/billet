@@ -1137,6 +1137,8 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 			`DROP TABLE alert_streaks`,
 			`DROP TABLE alert_marks`,
 			`DROP TABLE alert_rules`,
+			`DROP INDEX pool_orders_state_idx`,
+			`DROP TABLE pool_orders`,
 			`DROP INDEX job_history_rerun_decided_idx`,
 			`ALTER TABLE job_history DROP COLUMN rerun_decision`,
 			`ALTER TABLE job_history DROP COLUMN rerun_decided_at`,

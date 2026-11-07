@@ -170,6 +170,7 @@ type ReadOps interface {
 	ReadJob(ctx context.Context, leaseID string) (ledgerdb.ReadJobRow, error)
 	ReadJobWait(ctx context.Context, leaseID string) (ledgerdb.ReadJobWaitRow, error)
 	ListJobWaits(ctx context.Context, arg ledgerdb.ListJobWaitsParams) ([]ledgerdb.ListJobWaitsRow, error)
+	ListPoolOrders(ctx context.Context) ([]ledgerdb.PoolOrder, error)
 	ListJobRuntimes(ctx context.Context, arg ledgerdb.ListJobRuntimesParams) ([]ledgerdb.ListJobRuntimesRow, error)
 	ListJobsForExport(ctx context.Context,
 		arg ledgerdb.ListJobsForExportParams) ([]ledgerdb.ListJobsForExportRow, error)
@@ -297,6 +298,11 @@ type WriteOps interface {
 	ReclaimLease(ctx context.Context, arg ledgerdb.ReclaimLeaseParams) error
 	RecordCredentialSweep(ctx context.Context, arg ledgerdb.RecordCredentialSweepParams) error
 	RecordListenerCapacity(ctx context.Context, arg ledgerdb.RecordListenerCapacityParams) error
+	InsertPoolOrder(ctx context.Context, arg ledgerdb.InsertPoolOrderParams) error
+	MarkPoolOrderPlaced(ctx context.Context, arg ledgerdb.MarkPoolOrderPlacedParams) (int64, error)
+	MarkPoolOrderUncertain(ctx context.Context, arg ledgerdb.MarkPoolOrderUncertainParams) (int64, error)
+	MarkPoolOrderRefused(ctx context.Context, arg ledgerdb.MarkPoolOrderRefusedParams) (int64, error)
+	MarkPoolOrderAbandoned(ctx context.Context, arg ledgerdb.MarkPoolOrderAbandonedParams) (int64, error)
 	RefreshLeaseHolder(ctx context.Context, arg ledgerdb.RefreshLeaseHolderParams) error
 	RecordBarrierRun(ctx context.Context, arg ledgerdb.RecordBarrierRunParams) error
 	RecordHistoryCacheObservation(ctx context.Context, arg ledgerdb.RecordHistoryCacheObservationParams) error

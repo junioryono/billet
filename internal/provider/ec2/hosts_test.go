@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -109,6 +111,101 @@ func TestALaunchRefusalKeepsTheCodeAndDropsTheMessage(t *testing.T) {
 	}
 }
 
+// A POOL LAUNCH IS SENT ONCE, even on an answer the client would retry anywhere else: a
+// second attempt could carry back a refusal from an order whose first attempt launched a
+// host, and the pool, which reads the order back under its client token, is what tries
+// again. Every other call keeps its retries.
+func TestAPoolLaunchIsSentOnce(t *testing.T) {
+	t.Parallel()
+	for name, reply := range map[string]struct {
+		status int
+		body   string
+	}{
+		"a server error": {http.StatusInternalServerError, `<Response><Errors><Error><Code>InternalError</Code></Error></Errors></Response>`},
+		"a throttle":     {http.StatusServiceUnavailable, `<Response><Errors><Error><Code>RequestLimitExceeded</Code></Error></Errors></Response>`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newFakeEC2(t)
+			f.respond = func(action string, _ url.Values) (int, string) {
+				if action == "RunInstances" || action == "DescribeInstances" {
+					return reply.status, reply.body
+				}
+
+				return http.StatusOK, defaultReply(action)
+			}
+			p := newTestProvider(t, f, nil)
+			rewound := &rewindRecorder{next: p.api.http.Transport}
+			if rewound.next == nil {
+				rewound.next = http.DefaultTransport
+			}
+			p.api.http = &http.Client{Transport: rewound, CheckRedirect: p.api.http.CheckRedirect, Timeout: p.api.http.Timeout}
+			h := p.Hosts()
+			if _, err := h.Launch(t.Context(), hostLaunch()); err == nil {
+				t.Fatal("a failed launch succeeded")
+			}
+			if n := f.countOf("RunInstances"); n != 1 {
+				t.Fatalf("RunInstances was sent %d times, want once", n)
+			}
+			if n := len(rewound.of("RunInstances")); n != 1 || rewound.of("RunInstances")[0] {
+				t.Fatalf("RunInstances went to the transport as %v (rewindable?), want once and not rewindable",
+					rewound.of("RunInstances"))
+			}
+			if _, _, err := h.Find(t.Context(), "o-1"); err == nil {
+				t.Fatal("a failed read back succeeded")
+			}
+			if n := f.countOf("DescribeInstances"); n != maxAttempts {
+				t.Fatalf("DescribeInstances was sent %d times, want its %d retries kept", n, maxAttempts)
+			}
+			if n := len(rewound.of("DescribeInstances")); n != maxAttempts {
+				t.Fatalf("the recorder saw %d reads, want %d: it is not wrapping the client Find uses", n, maxAttempts)
+			}
+			for _, r := range rewound.of("DescribeInstances") {
+				if !r {
+					t.Fatal("a retried read went out with a body that cannot be rewound")
+				}
+			}
+		})
+	}
+}
+
+// rewindRecorder records, per action, whether each request handed to the transport
+// could be rewound (GetBody set), which is what lets Go's HTTP/2 client resend it.
+type rewindRecorder struct {
+	next http.RoundTripper
+	mu   sync.Mutex
+	seen map[string][]bool
+}
+
+func (r *rewindRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	rewindable := req.GetBody != nil
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	_ = req.Body.Close()
+	form, err := url.ParseQuery(string(raw))
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	if r.seen == nil {
+		r.seen = map[string][]bool{}
+	}
+	r.seen[form.Get("Action")] = append(r.seen[form.Get("Action")], rewindable)
+	r.mu.Unlock()
+	req.Body = io.NopCloser(bytes.NewReader(raw))
+
+	return r.next.RoundTrip(req)
+}
+
+func (r *rewindRecorder) of(action string) []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]bool(nil), r.seen[action]...)
+}
+
 func TestAnOrderThatCannotBeATokenOrAFilterIsRefused(t *testing.T) {
 	t.Parallel()
 	f := newFakeEC2(t)
@@ -116,7 +213,7 @@ func TestAnOrderThatCannotBeATokenOrAFilterIsRefused(t *testing.T) {
 	for _, order := range []string{"", "o-*", "O-1", "o 1", strings.Repeat("a", 49)} {
 		l := hostLaunch()
 		l.Order = order
-		if _, err := h.Launch(t.Context(), l); err == nil {
+		if _, err := h.Launch(t.Context(), l); !errors.Is(err, ErrLaunchNotSent) {
 			t.Errorf("order %q was launched", order)
 		}
 		if _, _, err := h.Find(t.Context(), order); err == nil {
@@ -358,6 +455,39 @@ func TestALaunchRefusalNamesOnlyKnownCodes(t *testing.T) {
 	}
 }
 
+// A POOL LAUNCH ANSWERED WITH A REDIRECT IS REFUSED AS ONE, sent once and not followed:
+// its body cannot be rewound, so net/http hands the 307 back without asking the
+// redirect policy, and it must not read as an unrecognised refusal.
+func TestAPoolLaunchAnsweredWithARedirectIsARedirect(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		f := newFakeEC2(t)
+		f.redirectTo = "https://elsewhere.example/token-9QX"
+		f.respond = func(action string, _ url.Values) (int, string) {
+			if action == "RunInstances" {
+				return status, ``
+			}
+
+			return http.StatusOK, defaultReply(action)
+		}
+		p := newTestProvider(t, f, nil)
+		_, err := p.Hosts().Launch(t.Context(), hostLaunch())
+		if !errors.Is(err, errRedirected) || strings.Contains(err.Error(), "token-9QX") {
+			t.Errorf("a %d answered %v, want a refused redirect that quotes nothing", status, err)
+		}
+		if n := f.countOf("RunInstances"); n != 1 {
+			t.Errorf("a %d: RunInstances was sent %d times, want once", status, n)
+		}
+		// AND THE CLIENT'S OWN ERROR, which the launch scrubs before it is seen: another
+		// caller of callOnce renders it as it is.
+		raw := p.api.callOnce(t.Context(), url.Values{"Action": {"RunInstances"}}, nil)
+		if !errors.Is(raw, errRedirected) || strings.Contains(raw.Error(), "token-9QX") ||
+			strings.Contains(raw.Error(), "elsewhere") {
+			t.Errorf("a %d: the client answered %v, want a refused redirect that quotes nothing", status, raw)
+		}
+	}
+}
+
 // WHAT ANSWERED IS NOT QUOTED ON ANY CALL: an unparsable Location fails before any
 // redirect policy runs and net/http renders it, and an XML error repeats the answer.
 func TestNoCallQuotesWhatAnswered(t *testing.T) {
@@ -481,5 +611,32 @@ func TestARefusalNamesTheOrderAskedFor(t *testing.T) {
 	_, _, err := newTestProvider(t, f, nil).Hosts().Find(t.Context(), "o-1")
 	if err == nil || !strings.Contains(err.Error(), "o-1") {
 		t.Fatalf("find = %v", err)
+	}
+}
+
+// A LAUNCH THE PROVIDER REFUSES BEFORE RUNINSTANCES SENT NOTHING, whichever local check
+// refused it, and says so.
+func TestEveryLocalRefusalOfALaunchIsNotSent(t *testing.T) {
+	t.Parallel()
+	f := newFakeEC2(t)
+	h := newTestProvider(t, f, nil).Hosts()
+	for name, mutate := range map[string]func(*HostLaunch){
+		"no instance type":  func(l *HostLaunch) { l.InstanceType = "" },
+		"no image":          func(l *HostLaunch) { l.Image = "" },
+		"user data too big": func(l *HostLaunch) { l.UserData = make([]byte, maxUserData+1) },
+	} {
+		l := hostLaunch()
+		mutate(&l)
+		if _, err := h.Launch(t.Context(), l); !errors.Is(err, ErrLaunchNotSent) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	l := hostLaunch()
+	l.UserData = make([]byte, maxUserData)
+	if _, err := h.Launch(t.Context(), l); err != nil {
+		t.Fatalf("user data of exactly the limit: %v", err)
+	}
+	if n := f.countOf("RunInstances"); n != 1 {
+		t.Fatalf("%d launches reached EC2, want only the one within the limit", n)
 	}
 }

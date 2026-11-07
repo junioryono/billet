@@ -49,6 +49,7 @@
    operating/alerts
    operating/measurement-validation
    operating/nodes
+   operating/bare-metal-pool
    operating/guest-images
    operating/build-caches
    operating/actions-cache

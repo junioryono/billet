@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -36,6 +37,7 @@ type hosts interface {
 	Find(ctx context.Context, order string) (ec2.HostRecord, bool, error)
 	Describe(ctx context.Context, id string) (ec2.HostRecord, error)
 	Terminate(ctx context.Context, id string) error
+	Scope() string
 }
 
 // Shape is one metal type a pool may order, with what it is.
@@ -50,17 +52,25 @@ type Source struct {
 	hosts    hosts
 	location string
 	shapes   map[string]Shape
+	// account answers which AWS account the credentials are in now. It is asked at
+	// every Scope, never kept: credentials that rotate into another account without a
+	// restart would otherwise read an order placed in the first as absent in the second.
+	account func(context.Context) (string, error)
 	// code reads EC2's error code out of an error chain; ec2.Code outside a test.
 	code func(error) (string, bool)
 }
 
 // New builds a source over a provider's pool-host surface. location is the subnet's
-// availability zone, the one place this source orders in.
-func New(h *ec2.Hosts, location string, shapes []Shape) (*Source, error) {
-	return newSource(h, location, shapes)
+// availability zone, the one place this source orders in, and account answers which
+// AWS account the credentials are in.
+func New(h *ec2.Hosts, location string, shapes []Shape, account func(context.Context) (string, error)) (*Source, error) {
+	return newSource(h, location, shapes, account)
 }
 
-func newSource(h hosts, location string, shapes []Shape) (*Source, error) {
+func newSource(h hosts, location string, shapes []Shape, account func(context.Context) (string, error)) (*Source, error) {
+	if account == nil {
+		return nil, errors.New("awsmetal: a source needs to know its account, because a shared subnet has several")
+	}
 	if location == "" {
 		return nil, errors.New("awsmetal: a source needs the availability zone its subnet is in")
 	}
@@ -78,13 +88,29 @@ func newSource(h hosts, location string, shapes []Shape) (*Source, error) {
 		return nil, errors.New("awsmetal: a source needs at least one shape")
 	}
 
-	return &Source{hosts: h, location: location, shapes: byType, code: ec2.Code}, nil
+	return &Source{hosts: h, location: location, shapes: byType, code: ec2.Code, account: account}, nil
 }
 
 var _ hostsource.Source = (*Source)(nil)
 
 // Name is the source's kind.
 func (s *Source) Name() string { return Name }
+
+// Scope is the account the credentials are in, the provider's region and subnet, and
+// this source's zone. THE ACCOUNT IS PART OF IT because a shared subnet admits several
+// accounts, each blind to the others' instances: credentials that changed account
+// would read an order back as absent and launch it again.
+func (s *Source) Scope(ctx context.Context) (string, error) {
+	id, err := s.account(ctx)
+	if err != nil {
+		return "", fmt.Errorf("awsmetal: which account the credentials are in: %w", err)
+	}
+	if id == "" {
+		return "", errors.New("awsmetal: the credentials named no account")
+	}
+
+	return "aws:" + id + ":" + strings.TrimPrefix(s.hosts.Scope(), "aws:") + ":" + s.location, nil
+}
 
 // Terms are on-demand EC2's: billed by the second, and a launch measured reaching its
 // first script within a minute. The lead time to a registered node is not measured.
@@ -101,11 +127,12 @@ func (s *Source) Order(ctx context.Context, req hostsource.Request) (hostsource.
 	shape, ok := s.shapes[req.Shape]
 	switch {
 	case !ok:
-		return hostsource.Host{}, fmt.Errorf("awsmetal: %s is not a declared shape", req.Shape)
+		return hostsource.Host{}, fmt.Errorf("%w: awsmetal: %s is not a declared shape", hostsource.ErrNotSent, req.Shape)
 	case req.Arch != "" && req.Arch != shape.Arch:
-		return hostsource.Host{}, fmt.Errorf("awsmetal: %s is %s, not %s", req.Shape, shape.Arch, req.Arch)
+		return hostsource.Host{}, fmt.Errorf("%w: awsmetal: %s is %s, not %s", hostsource.ErrNotSent, req.Shape, shape.Arch, req.Arch)
 	case req.Location != "" && req.Location != s.location:
-		return hostsource.Host{}, fmt.Errorf("awsmetal: this source orders in %s, not %s", s.location, req.Location)
+		return hostsource.Host{}, fmt.Errorf("%w: awsmetal: this source orders in %s, not %s",
+			hostsource.ErrNotSent, s.location, req.Location)
 	}
 	rec, err := s.hosts.Launch(ctx, ec2.HostLaunch{
 		Order:        req.Order,
@@ -196,6 +223,9 @@ func stateOf(state string) hostsource.State {
 
 // refusal turns EC2's synchronous refusals into the contract's answers.
 func (s *Source) refusal(err error) error {
+	if errors.Is(err, ec2.ErrLaunchNotSent) {
+		return fmt.Errorf("%w: %w", hostsource.ErrNotSent, err)
+	}
 	code, ok := s.code(err)
 	if !ok {
 		return err

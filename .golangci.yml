@@ -283,6 +283,8 @@ linters:
               desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
             - pkg: "github.com/junioryono/billet/internal/rollout"
               desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
+            - pkg: "github.com/junioryono/billet/internal/pool"
+              desc: "A host source answers the pool and nothing above it."
             - pkg: "github.com/junioryono/billet/cmd"
               desc: "Host sources must not import cmd/."
 
@@ -829,6 +831,8 @@ linters:
               desc: "The ledger is a lower layer than a guest's network policy, which runs nft and opens sockets; a call inside a transaction holds the writer slot for it."
             - pkg: "github.com/junioryono/billet/internal/hostsource"
               desc: "A host source calls a provider's API (ADR-030): the release proof is built inside the transaction, and the source is called after it commits."
+            - pkg: "github.com/junioryono/billet/internal/pool"
+              desc: "The pool asks host sources over the network; a ledger writer calls it never, and it calls the ledger through alloc."
             - pkg: "github.com/junioryono/billet/internal/store"
               desc: "The ledger is a lower layer than site storage; an rbd call inside a transaction holds the single writer slot."
             - pkg: "github.com/junioryono/billet/internal/tokenbroker"
