@@ -160,20 +160,9 @@ down)
 		echo "matrix: no workspace at $ws; nothing to take down"
 		exit 0
 	fi
-	# MOVED, NOT COPIED: the workspace is under the run directory, so a rename keeps a log
-	# of any size at once and in no more space, and the teardown never waits on it. Never
-	# through a symlink at either end, so a log cannot be sent into out/.
-	for log in server.log node.log; do
-		src="$ws/$log" dst="$run_dir/logs/$log"
-		[ -e "$src" ] || [ -L "$src" ] || continue
-		if [ -L "$src" ] || [ ! -f "$src" ] || [ -L "$run_dir/logs" ] || [ -L "$dst" ] || [ -e "$dst" ]; then
-			echo "matrix: $src is not kept: it is not a plain file, or $dst is taken; the teardown removes it" >&2
-			continue
-		fi
-		if ! { { [ -d "$run_dir/logs" ] || mkdir -m 700 "$run_dir/logs"; } && mv "$src" "$dst"; }; then
-			echo "matrix: could not keep $src; the teardown removes it" >&2
-		fi
-	done
+	# WHATEVER IT KEEPS, the teardown runs and answers: a log not kept is said, and costs
+	# only the log.
+	python3 -I "$supervise" keep-logs "$run_dir"
 	"$billet" acceptance down --workspace "$ws"
 	;;
 *)

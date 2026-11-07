@@ -653,19 +653,50 @@ func TestTheMatrixHostDownKeepsTheServicesLogsOnTheHost(t *testing.T) {
 	}
 	noSentinelIn(dir)
 
-	// A logs directory that is a symlink into out/ keeps nothing, and the teardown still
-	// runs and gives down its status.
+	// A LOGS DIRECTORY THIS TEARDOWN DID NOT CREATE keeps nothing, whether a symlink into
+	// out/ or a directory anyone may read, and the teardown still runs and gives down its
+	// status.
+	for name, plant := range map[string]func(dir string) error{
+		"a symlink into out/": func(dir string) error {
+			return os.Symlink(filepath.Join(dir, "out"), filepath.Join(dir, "logs"))
+		},
+		"a directory anyone may read": func(dir string) error {
+			return os.Mkdir(filepath.Join(dir, "logs"), 0o755)
+		},
+	} {
+		dir = stage()
+		if err := plant(dir); err != nil {
+			t.Fatal(err)
+		}
+		if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "no logs kept") {
+			t.Fatalf("down with logs as %s: exit %d\n%s", name, code, out)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "ws")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("logs as %s stopped the teardown: %v", name, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "logs", "node.log")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("logs as %s took the node's log: %v", name, err)
+		}
+		noSentinelIn(dir)
+	}
+
+	// A LOG THAT IS NOT A PLAIN FILE is not kept, and the other one still is.
 	dir = stage()
-	if err := os.Symlink(filepath.Join(dir, "out"), filepath.Join(dir, "logs")); err != nil {
+	if err := os.Remove(filepath.Join(dir, "ws", "server.log")); err != nil {
 		t.Fatal(err)
 	}
-	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "is not kept") {
-		t.Fatalf("down through a symlinked logs directory: exit %d\n%s", code, out)
+	if err := os.Symlink(filepath.Join(dir, "out", "run.log"), filepath.Join(dir, "ws", "server.log")); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "ws")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("a log that could not be kept stopped the teardown: %v", err)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "server.log is not kept") {
+		t.Fatalf("down with a symlinked server log: exit %d\n%s", code, out)
 	}
-	noSentinelIn(dir)
+	if kept, err := os.ReadFile(filepath.Join(dir, "logs", "node.log")); err != nil || string(kept) != "NODE-SENTINEL\n" {
+		t.Errorf("the node's log was not kept beside a server log that was not: %q, %v", kept, err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "logs", "server.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a symlinked server log was kept: %v", err)
+	}
 }
 
 // fakeSSM answers send-command with a command id and get-command-invocation from

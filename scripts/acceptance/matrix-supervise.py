@@ -4,6 +4,7 @@
 Usage:
   matrix-supervise.py run <run-dir> <command>...
   matrix-supervise.py await <run-dir> <seconds>
+  matrix-supervise.py keep-logs <run-dir>
 
 run holds an exclusive lock on <run-dir>/run.lock for as long as the command lives,
 and hands it down to the command (BILLET_ACCEPTANCE_LOCK_FD names the descriptor, which
@@ -30,12 +31,16 @@ and to its stderr while that still reads, and it echoes the log's tail at the en
 await waits up to <seconds> for the lock to be free, which is the proof no run is
 live in <run-dir>: 0 once it is, 1 if a run still holds it.
 
+keep-logs moves the run's services' logs out of the workspace the teardown removes, into
+<run-dir>/logs, which it creates 0700; it exits 1 having said what it did not keep.
+
 MATRIX_POLL (seconds, default 2) is how often each looks.
 """
 
 import fcntl
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -153,12 +158,93 @@ def await_free(run_dir, seconds, poll):
         time.sleep(poll)
 
 
+KEPT_LOGS = ("server.log", "node.log")
+DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def keep_logs(run_dir):
+    """Moves the services' logs from <run-dir>/ws into <run-dir>/logs, which it creates.
+
+    THROUGH DESCRIPTORS, NEVER A PATH RESOLVED TWICE: the directories are opened without
+    following a symlink and every step names an entry relative to one of them, so nothing
+    swapped in between a check and the move can send a log into out/, which the workflow
+    uploads. The logs directory must be one this call created, 0700 and the caller's, or
+    nothing is kept. A log is LINKED and then unlinked, never renamed or copied: a link
+    refuses an entry that is already there and a move across filesystems, so a log of
+    any size is kept at once or not at all, and the teardown that follows never waits.
+    """
+    try:
+        run_fd = os.open(run_dir, DIRECTORY)
+    except OSError as err:
+        say("no logs kept: " + run_dir + ": " + err.strerror)
+        return 1
+    try:
+        try:
+            ws_fd = os.open("ws", DIRECTORY, dir_fd=run_fd)
+        except FileNotFoundError:
+            return 0
+        except OSError as err:
+            say("no logs kept: " + run_dir + "/ws: " + err.strerror)
+            return 1
+        try:
+            return keep_from(run_dir, run_fd, ws_fd)
+        finally:
+            os.close(ws_fd)
+    finally:
+        os.close(run_fd)
+
+
+def keep_from(run_dir, run_fd, ws_fd):
+    try:
+        os.mkdir("logs", 0o700, dir_fd=run_fd)
+        logs_fd = os.open("logs", DIRECTORY, dir_fd=run_fd)
+    except OSError as err:
+        say("no logs kept: " + run_dir + "/logs: " + err.strerror
+            + "; only a directory this teardown creates holds them")
+        return 1
+    try:
+        held = os.fstat(logs_fd)
+        if held.st_uid != os.geteuid() or stat.S_IMODE(held.st_mode) & 0o077:
+            say("no logs kept: " + run_dir + "/logs is not this user's alone")
+            return 1
+        status = 0
+        for name in KEPT_LOGS:
+            try:
+                found = os.stat(name, dir_fd=ws_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                say(name + " is not kept: " + err.strerror)
+                status = 1
+                continue
+            if not stat.S_ISREG(found.st_mode):
+                say(name + " is not kept: it is not a plain file")
+                status = 1
+                continue
+            try:
+                os.link(name, name, src_dir_fd=ws_fd, dst_dir_fd=logs_fd,
+                        follow_symlinks=False)
+            except OSError as err:
+                say(name + " is not kept: " + err.strerror)
+                status = 1
+                continue
+            try:
+                os.unlink(name, dir_fd=ws_fd)
+            except OSError:
+                pass
+        return status
+    finally:
+        os.close(logs_fd)
+
+
 def main(args):
     poll = float(os.environ.get("MATRIX_POLL", "2"))
     if len(args) >= 3 and args[0] == "run":
         return run(args[1], args[2:], poll)
     if len(args) == 3 and args[0] == "await":
         return await_free(args[1], float(args[2]), poll)
+    if len(args) == 2 and args[0] == "keep-logs":
+        return keep_logs(args[1])
     print(__doc__.split("\n\n")[1], file=sys.stderr)
     return 2
 
