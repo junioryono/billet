@@ -1586,7 +1586,7 @@ func launchStatements(partition string, in Inputs) []Statement {
 	}
 
 	if in.Network != nil {
-		var network []string
+		network := make([]string, 0, len(in.Network.SubnetIDs)+len(in.Network.SecurityGroupIDs))
 		for _, id := range in.Network.SubnetIDs {
 			network = append(network, arn("subnet/"+id))
 		}
