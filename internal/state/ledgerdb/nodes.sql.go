@@ -865,7 +865,7 @@ func (q *Queries) ReadNodeRegistration(ctx context.Context, name string) (ReadNo
 }
 
 const readNodeReleaseFacts = `-- name: ReadNodeReleaseFacts :one
-SELECT n.epoch, n.decommission_proven, i.node_epoch, i.running
+SELECT n.epoch, n.dispatch_generation, n.decommission_proven, i.node_epoch, i.running
   FROM nodes n
   LEFT JOIN node_inventory i ON i.node = n.name
  WHERE n.name = $1
@@ -873,12 +873,14 @@ SELECT n.epoch, n.decommission_proven, i.node_epoch, i.running
 
 type ReadNodeReleaseFactsRow struct {
 	Epoch              int64
+	DispatchGeneration int64
 	DecommissionProven int64
 	NodeEpoch          sql.NullInt64
 	Running            sql.NullInt64
 }
 
-// What a pool host's release proof reads of its node: its current epoch, whether a person
+// What a pool host's release proof reads of its node: its current epoch and launch-dispatch
+// generation, which a clearance run must have been taken under, whether a person
 // decommissioned it on the compute barrier's proof, and its last inventory, which is null
 // when it never reported one; an inventory of the current epoch reporting compute
 // outweighs the decommission.
@@ -887,6 +889,7 @@ func (q *Queries) ReadNodeReleaseFacts(ctx context.Context, name string) (ReadNo
 	var i ReadNodeReleaseFactsRow
 	err := row.Scan(
 		&i.Epoch,
+		&i.DispatchGeneration,
 		&i.DecommissionProven,
 		&i.NodeEpoch,
 		&i.Running,

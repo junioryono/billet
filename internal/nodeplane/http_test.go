@@ -1569,6 +1569,14 @@ func (b *recordingBarriers) ResolveQuarantineFor(
 	return 0, nil
 }
 
+func (b *recordingBarriers) PoolClearanceTargets(context.Context) ([]alloc.PoolClearanceTarget, error) {
+	return nil, nil
+}
+
+func (b *recordingBarriers) RecordPoolClearance(context.Context, alloc.PoolClearanceObservation) error {
+	return nil
+}
+
 // A REGISTRATION OVER THE WIRE DISCARDS WHAT THE HOST HAD PROVED, BEFORE IT
 // COMMITS ITS EPOCH.
 //

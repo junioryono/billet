@@ -112,6 +112,9 @@ type Plane struct {
 	barriers BarrierStore
 	// barrierPace replaces the loop's own waits between rounds when set.
 	barrierPace time.Duration
+	// poolAskedAt is when the barrier loop last asked the nodes pool releases wait on;
+	// only that loop reads or writes it.
+	poolAskedAt time.Time
 
 	// deployment is the identity this control plane belongs to. A node carrying a
 	// different one is refused: it would label its compute with an identity this

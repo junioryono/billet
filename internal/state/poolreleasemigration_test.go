@@ -13,7 +13,7 @@ import (
 func TestMigration79HoldsALinkedOrderForAFreshProof(t *testing.T) {
 	t.Parallel()
 
-	dir := rewoundLedger(t)
+	dir := ledgerAt78(t)
 
 	pools, err := newSQLiteBackend(dir).dataSources()
 	if err != nil {

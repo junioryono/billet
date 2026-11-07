@@ -89,12 +89,16 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 		if o := &orders[i]; !o.ReleaseRequested.IsZero() {
 			if !releases {
 				fmt.Fprintf(env.Stdout, "\nReleased by a person (ADR-030). A draining host is out of placement, and is "+
-					"sealed, revoked and released once nothing holds it and its node is decommissioned on proof "+
-					"(docs/operating/bare-metal-pool.md).\n")
+					"sealed, revoked and released once nothing holds it and its node has answered empty twice across "+
+					"five minutes, or was decommissioned on proof (docs/operating/bare-metal-pool.md).\n")
 				releases = true
 			}
 			st := o.State
 			switch {
+			case o.State == alloc.PoolPlaced && !o.ClearanceSince.IsZero():
+				// HOW FAR THE NODE'S OWN PROOF HAS GOT, as answers; the proof is the ledger's.
+				st = fmt.Sprintf("draining, its node empty from %s to %s",
+					o.ClearanceSince.UTC().Format(time.RFC3339), o.ClearanceObserved.UTC().Format(time.RFC3339))
 			case o.State == alloc.PoolPlaced:
 				st = "draining"
 			case o.State == alloc.PoolSealed && o.ReleaseContradicted:
@@ -226,10 +230,11 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 
 		return nil
 	}
-	fmt.Fprintf(env.Stdout, "Released %s from placement. Once nothing holds its host and its node is decommissioned "+
-		"on proof (`billet nodes decommission %s`), the pool seals it, revokes its node's certificates and asks its "+
-		"source to take it back, or `billet pool release %s` (no reason) seals it; `billet pool` shows where it is.\n",
-		order, alloc.PoolNodeName(order), order)
+	fmt.Fprintf(env.Stdout, "Released %s from placement. The control plane asks its node what it runs; once nothing "+
+		"holds the host and the node has answered empty twice across five minutes, the pool seals it, revokes its "+
+		"node's certificates and asks its source to take it back, or `billet pool release %s` (no reason) seals it. "+
+		"A node that cannot answer is decommissioned on proof instead (`billet nodes decommission %s`); `billet pool` "+
+		"shows where it is.\n", order, order, alloc.PoolNodeName(order))
 
 	return nil
 }
@@ -241,7 +246,8 @@ func sealPoolRelease(ctx context.Context, env cli.Env, a *alloc.Allocator, order
 	if _, err := a.SealPoolRelease(ctx, order); err != nil {
 		if errors.Is(err, alloc.ErrPoolReleaseWaits) {
 			return fmt.Errorf("billet pool release: %s is out of placement and cannot be sealed yet: %w. Until "+
-				"nothing holds it and `billet nodes decommission %s` has said it was proved, it is not; "+
+				"nothing holds it and its node has answered empty twice across five minutes, or "+
+				"`billet nodes decommission %s` has said it was proved, it is not; "+
 				"docs/operating/bare-metal-pool.md has the procedure", order, err, alloc.PoolNodeName(order))
 		}
 

@@ -197,6 +197,10 @@ type PoolOrder struct {
 	ReleaseRequestedAt  string
 	ReleaseReason       string
 	ReleaseContradicted int64
+	ClearEpoch          int64
+	ClearDispatch       int64
+	ClearSince          string
+	ClearObservedAt     string
 }
 
 type PoolRunner struct {

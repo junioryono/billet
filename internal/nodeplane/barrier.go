@@ -69,6 +69,12 @@ type BarrierStore interface {
 	// inventory is a real inventory, and feeding it through the one path that
 	// already fences one frees quarantined capacity while the drain waits.
 	ResolveQuarantineFor(ctx context.Context, node string, running []string, epoch int64) (int, error)
+	// PoolClearanceTargets lists the nodes pool releases wait on (ADR-030): each out of
+	// placement, its release asked for, and nothing in the ledger holding it.
+	PoolClearanceTargets(ctx context.Context) ([]alloc.PoolClearanceTarget, error)
+	// RecordPoolClearance stores one fenced answer to a release's clearance, or ends
+	// its run.
+	RecordPoolClearance(ctx context.Context, obs alloc.PoolClearanceObservation) error
 }
 
 // WithBarrierStore lets this plane answer a compute barrier.
@@ -121,7 +127,24 @@ func (p *Plane) BarrierLoop(ctx context.Context) {
 }
 
 // barrierPass runs one round and reports how long to wait before the next.
+//
+// TWO QUESTIONS, EACH ON ITS OWN PACE: the deployment's barrier, when a drain waits on
+// one, and the nodes pool releases wait on, which need no seal, so a host leaving the pool
+// is proved idle while the rest of the deployment keeps working (ADR-030).
 func (p *Plane) barrierPass(ctx context.Context) time.Duration {
+	wait := p.deploymentBarrierPass(ctx)
+
+	if p.poolAskedAt.IsZero() || time.Since(p.poolAskedAt) >= barrierRound {
+		p.poolAskedAt = time.Now()
+		p.askPoolClearances(ctx)
+	}
+
+	return wait
+}
+
+// deploymentBarrierPass runs one round of the deployment's barrier, if a drain waits on
+// one, and reports how long to wait before the next.
+func (p *Plane) deploymentBarrierPass(ctx context.Context) time.Duration {
 	barrier, found, err := p.barriers.ComputeBarrierInForce(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -257,26 +280,93 @@ func (p *Plane) barrierTargets() []*node {
 // Over-invalidating is possible and harmless: a launch that lands between the
 // capture and the queueing costs this round.
 func (p *Plane) askNode(ctx context.Context, n *node, barrierID string) {
+	fence, empty, asked := p.inventoryOf(ctx, n, barrierID)
+	if !asked {
+		return
+	}
+
+	obs := alloc.BarrierObservation{Node: n.name, BarrierID: barrierID, Fence: fence, Empty: empty}
+	if err := p.barriers.RecordBarrierObservation(ctx, obs); err != nil && ctx.Err() == nil {
+		p.log.Warn("could not record what a host said it is running",
+			"node", n.name, "error", err)
+	}
+}
+
+// askPoolClearances asks each node a pool release waits on what it runs, and records
+// each answer against the fence read before the question, as askNode does for the
+// deployment's barrier. A node not connected is not asked, and says nothing.
+func (p *Plane) askPoolClearances(ctx context.Context) {
+	targets, err := p.barriers.PoolClearanceTargets(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			p.log.Warn("could not read which pool releases wait on their nodes", "error", err)
+		}
+
+		return
+	}
+
+	for _, target := range targets {
+		n := p.poolClearanceNode(target.Node)
+		if n == nil {
+			continue
+		}
+
+		fence, empty, asked := p.inventoryOf(ctx, n, poolClearanceID(target.Order))
+		if !asked {
+			continue
+		}
+
+		obs := alloc.PoolClearanceObservation{Order: target.Order, Node: target.Node, Fence: fence, Empty: empty}
+		if err := p.barriers.RecordPoolClearance(ctx, obs); err != nil && ctx.Err() == nil {
+			p.log.Warn("could not record what a pool host leaving said it is running",
+				"order", target.Order, "node", target.Node, "error", err)
+		}
+	}
+}
+
+// poolClearanceID is what a release's inventory asks under, which the node echoes.
+func poolClearanceID(order string) string { return "pool-release-" + order }
+
+// poolClearanceNode is the connected node of that name whose wire can answer an
+// inventory, or nil.
+func (p *Plane) poolClearanceNode(name string) *node {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.expireStaleLocked()
+
+	n, ok := p.nodes[name]
+	if !ok || (n.wireVersion > 0 && n.wireVersion < nodeapi.VersionComputeBarrier) {
+		return nil
+	}
+
+	return n
+}
+
+// inventoryOf asks one host what it is running under askID, and reports the fence read
+// before the question, whether the answer was an empty inventory, and whether there is
+// anything to record: a host the ledger has no fence for has none.
+func (p *Plane) inventoryOf(ctx context.Context, n *node, barrierID string) (alloc.NodeFence, bool, bool) {
 	fence, found, err := p.barriers.NodeFenceOf(ctx, n.name)
 	if err != nil {
 		if ctx.Err() == nil {
 			p.log.Warn("could not read a host's barrier fence", "node", n.name, "error", err)
 		}
 
-		return
+		return alloc.NodeFence{}, false, false
 	}
 
 	if !found {
 		// In the plane's map and not in the ledger. Nothing can be proved about a
 		// host the clearance query will never walk, so there is nothing to record.
-		return
+		return alloc.NodeFence{}, false, false
 	}
 
 	id, err := commandID()
 	if err != nil {
 		p.log.Warn("could not mint an inventory command id", "node", n.name, "error", err)
 
-		return
+		return alloc.NodeFence{}, false, false
 	}
 
 	pend := &pending{
@@ -293,13 +383,13 @@ func (p *Plane) askNode(ctx context.Context, n *node, barrierID string) {
 
 	res, err := p.dispatch(ctx, n, pend)
 
-	obs := alloc.BarrierObservation{Node: n.name, BarrierID: barrierID, Fence: fence}
+	empty := false
 
 	switch {
 	case err != nil:
 		// A host that could not be asked has not said it is empty. The run ends.
 		if ctx.Err() != nil {
-			return
+			return alloc.NodeFence{}, false, false
 		}
 
 		p.log.Info("a host did not answer what it is running; its idle run starts again",
@@ -314,7 +404,7 @@ func (p *Plane) askNode(ctx context.Context, n *node, barrierID string) {
 		p.log.Warn("a host answered an inventory for a different barrier",
 			"node", n.name, "asked", barrierID, "answered", res.BarrierID)
 	default:
-		obs.Empty = len(res.Instances) == 0
+		empty = len(res.Instances) == 0
 
 		// A REAL INVENTORY, SO IT SETTLES REAL CAPACITY. The quarantine resolver
 		// is the one path that already fences an inventory against the node epoch,
@@ -332,10 +422,7 @@ func (p *Plane) askNode(ctx context.Context, n *node, barrierID string) {
 		}
 	}
 
-	if err := p.barriers.RecordBarrierObservation(ctx, obs); err != nil && ctx.Err() == nil {
-		p.log.Warn("could not record what a host said it is running",
-			"node", n.name, "error", err)
-	}
+	return fence, empty, true
 }
 
 // BarrierTargetsForTest names the hosts a barrier round would ask, sorted.

@@ -7,13 +7,15 @@ VALUES (@order_id, @source, @scope, @shape, @location, @arch, 'ordering', @first
 
 -- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted,
+       clear_epoch, clear_dispatch, clear_since, clear_observed_at
 FROM pool_orders
 ORDER BY first_attempt_at, order_id;
 
 -- name: ReadPoolOrder :one
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted,
+       clear_epoch, clear_dispatch, clear_since, clear_observed_at
 FROM pool_orders
 WHERE order_id = @order_id;
 
@@ -106,8 +108,39 @@ UPDATE pool_orders
 -- because what its node said before cannot be read back. Every pool order the node is
 -- the node of counts, contradicted already or not, so a caller can tell a pool node from
 -- any other.
-UPDATE pool_orders SET release_contradicted = 1
+--
+-- AND IT ENDS THE ORDER'S CLEARANCE RUN, in this one statement, so no caller can record a
+-- contradiction and leave the run standing: a run that reaches proved therefore began
+-- after the last contradiction, and is proof for the order whatever release_contradicted
+-- says (migration 80).
+UPDATE pool_orders SET release_contradicted = 1, clear_since = '', clear_observed_at = ''
  WHERE node_name = @node AND node_name != '' AND state IN ('placed', 'sealed');
+
+-- name: ListPoolClearanceTargets :many
+-- The orders whose node the control plane asks what it runs, for a release that proves
+-- itself without the deployment's seal (migration 80): placed, a release asked for, a node
+-- linked, and nothing in the ledger holding that node. A sealed order is never asked: its
+-- node's certificates are revoked, a failed ask would end the run its proof is read from.
+SELECT p.order_id, p.node_name FROM pool_orders p
+ WHERE p.state = 'placed' AND p.release_requested_at != '' AND p.node_name != ''
+   AND NOT EXISTS (SELECT 1 FROM leases l
+                    WHERE COALESCE(l.node, l.target_node) = p.node_name AND l.phase NOT IN ('done','failed'))
+ ORDER BY p.order_id;
+
+-- name: RecordPoolClearanceRun :execrows
+-- One empty answer to the order's clearance, taken against the fence it names: the run's
+-- first answer is kept only while the fence it was taken under still holds, so a run is
+-- continuous across one epoch and one launch-dispatch generation or it starts again.
+UPDATE pool_orders
+   SET clear_since = CASE WHEN clear_epoch = @epoch AND clear_dispatch = @dispatch AND clear_since != ''
+                          THEN clear_since ELSE @now END,
+       clear_epoch = @epoch, clear_dispatch = @dispatch, clear_observed_at = @now
+ WHERE order_id = @order_id AND state = 'placed' AND release_requested_at != '' AND node_name = @node;
+
+-- name: EndPoolClearanceRun :exec
+-- An answer that was not empty, or not an answer, or not taken where the run could stand:
+-- the run is over.
+UPDATE pool_orders SET clear_since = '', clear_observed_at = '' WHERE order_id = @order_id;
 
 -- name: ClearPoolReleaseContradiction :exec
 -- A fresh decommission on the compute barrier's proof, in its own transaction: what the

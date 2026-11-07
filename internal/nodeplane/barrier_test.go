@@ -3,6 +3,7 @@ package nodeplane
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -224,6 +225,12 @@ type barrierStore struct {
 	invalidated    []string
 	invalidatedAll int
 	invalidateErr  error
+	// poolTargets are the nodes pool releases wait on, and poolObserved what was recorded
+	// against them.
+	poolTargets  []alloc.PoolClearanceTarget
+	poolObserved []alloc.PoolClearanceObservation
+	// poolRounds counts the rounds that asked which releases wait on their nodes.
+	poolRounds int
 }
 
 func newBarrierStore() *barrierStore {
@@ -343,6 +350,38 @@ func (s *barrierStore) ResolveQuarantineFor(
 	s.reconciled = append(s.reconciled, running)
 
 	return 0, nil
+}
+
+func (s *barrierStore) PoolClearanceTargets(context.Context) ([]alloc.PoolClearanceTarget, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.poolRounds++
+
+	return slices.Clone(s.poolTargets), nil
+}
+
+func (s *barrierStore) poolRoundCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.poolRounds
+}
+
+func (s *barrierStore) RecordPoolClearance(_ context.Context, obs alloc.PoolClearanceObservation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.poolObserved = append(s.poolObserved, obs)
+
+	return nil
+}
+
+func (s *barrierStore) poolObservations() []alloc.PoolClearanceObservation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.poolObserved)
 }
 
 func (s *barrierStore) observations() []alloc.BarrierObservation {

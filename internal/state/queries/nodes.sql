@@ -399,11 +399,12 @@ SELECT EXISTS(SELECT 1 FROM pool_orders p
 UPDATE nodes SET drained = 1 WHERE name = @name;
 
 -- name: ReadNodeReleaseFacts :one
--- What a pool host's release proof reads of its node: its current epoch, whether a person
+-- What a pool host's release proof reads of its node: its current epoch and launch-dispatch
+-- generation, which a clearance run must have been taken under, whether a person
 -- decommissioned it on the compute barrier's proof, and its last inventory, which is null
 -- when it never reported one; an inventory of the current epoch reporting compute
 -- outweighs the decommission.
-SELECT n.epoch, n.decommission_proven, i.node_epoch, i.running
+SELECT n.epoch, n.dispatch_generation, n.decommission_proven, i.node_epoch, i.running
   FROM nodes n
   LEFT JOIN node_inventory i ON i.node = n.name
  WHERE n.name = @name;

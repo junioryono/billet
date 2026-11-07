@@ -12,13 +12,13 @@ import (
 )
 
 // newestMigration is the version rewindNewest takes back off a ledger.
-const newestMigration = 79
+const newestMigration = 80
 
 // rewindNewest takes the newest migration back off a migrated ledger, so the
 // next migration has exactly one version to apply.
 //
 // IT KNOWS THAT MIGRATION'S STATEMENTS, the way the version tests beside it do:
-// the columns migration 79 added, and its record. It refuses
+// the columns migration 80 added, and its record. It refuses
 // to run once a newer one exists, so the ledger it leaves is always the schema
 // just before this binary's newest and, when a move is reported, its endpoints
 // are {newest-1, newest}; rewinding 61 under a 62 would leave a ledger at 62 with
@@ -30,6 +30,39 @@ func rewindNewest(t *testing.T, db *DB) {
 		t.Fatalf("this binary's newest migration is %d; rewindNewest takes back %d and must be "+
 			"taught the newest one's statements", latest, newestMigration)
 	}
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`ALTER TABLE pool_orders DROP COLUMN clear_observed_at`,
+			`ALTER TABLE pool_orders DROP COLUMN clear_since`,
+			`ALTER TABLE pool_orders DROP COLUMN clear_dispatch`,
+			`ALTER TABLE pool_orders DROP COLUMN clear_epoch`,
+			`DELETE FROM schema_migrations WHERE version = 80`,
+		} {
+			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("rewind to version %d: %v", newestMigration-1, err)
+	}
+}
+
+// ledgerAt78 is a SQLite ledger migrated and then taken back to version 78, so the next
+// open applies migration 79 and the newest after it.
+func ledgerAt78(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	rewindNewest(t, db)
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
@@ -45,8 +78,14 @@ func rewindNewest(t *testing.T, db *DB) {
 
 		return nil
 	}); err != nil {
-		t.Fatalf("rewind to version %d: %v", newestMigration-1, err)
+		t.Fatalf("rewind to version 78: %v", err)
 	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the rewound ledger: %v", err)
+	}
+
+	return dir
 }
 
 // rewoundLedger is a SQLite ledger in a fresh directory, migrated and then one

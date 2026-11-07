@@ -187,7 +187,7 @@ func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releasep
 			return fmt.Errorf("alloc: pool order %s: release asked for at %q: %w", order, row.ReleaseRequestedAt, err)
 		}
 
-		holdings, err := releaseHoldingsTx(ctx, q, row.NodeName, row.HostID, requested, row.ReleaseContradicted == 1)
+		holdings, err := releaseHoldingsTx(ctx, q, &row, requested)
 		if err != nil {
 			return err
 		}
@@ -231,8 +231,10 @@ func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releasep
 // (release_contradicted) is could-not-tell; one that never registered held nothing
 // whatever it said arriving, because nothing places on a node the ledger has no row for.
 func releaseHoldingsTx(
-	ctx context.Context, q state.ReadOps, node, host string, sealed time.Time, contradicted bool,
+	ctx context.Context, q state.ReadOps, row *ledgerdb.PoolOrder, sealed time.Time,
 ) (releaseproof.Holdings, error) {
+	node, host := row.NodeName, row.HostID
+
 	counts, err := q.CountNodeHoldings(ctx, node)
 	if err != nil {
 		return releaseproof.Holdings{}, fmt.Errorf("alloc: count what %s holds: %w", node, err)
@@ -251,13 +253,147 @@ func releaseHoldingsTx(
 		holdings.Inventory = 0
 	case err != nil:
 		return releaseproof.Holdings{}, fmt.Errorf("alloc: read %s's release facts: %w", node, err)
-	case contradicted:
+	case poolClearanceProved(row, &facts):
+		// PROVED BY THE NODE ITSELF, while out of placement and holding nothing: a run
+		// that reached proved began after every contradiction, which ends it, so the
+		// contradiction flag does not outweigh it (ContradictPoolRelease).
+		holdings.Inventory = 0
+	case row.ReleaseContradicted == 1:
 		holdings.Inventory = -1
 	default:
 		holdings.Inventory = releaseInventory(&facts)
 	}
 
 	return holdings, nil
+}
+
+// poolClearanceProved reports whether an order's clearance run proves its node runs
+// nothing: two empty answers spanning the absence grace, the run taken under the node's
+// current epoch and launch-dispatch generation. The span is between the two answers and
+// never to the current time, as a compute barrier's run (barrierRun.proved).
+func poolClearanceProved(row *ledgerdb.PoolOrder, facts *ledgerdb.ReadNodeReleaseFactsRow) bool {
+	if row.ClearSince == "" || row.ClearObservedAt == "" ||
+		row.ClearEpoch != facts.Epoch || row.ClearDispatch != facts.DispatchGeneration {
+		return false
+	}
+
+	since, err := time.Parse(timestampFormat, row.ClearSince)
+	if err != nil {
+		return false
+	}
+
+	observed, err := time.Parse(timestampFormat, row.ClearObservedAt)
+	if err != nil {
+		return false
+	}
+
+	return !observed.Before(since.Add(computeAbsenceGrace))
+}
+
+// PoolClearanceTarget is a node the control plane asks what it runs, for the release of
+// the order it joined from.
+type PoolClearanceTarget struct {
+	Order string
+	Node  string
+}
+
+// PoolClearanceTargets lists the nodes a release waits on the clearance of: each order
+// placed, its release asked for and its node linked, while nothing in the ledger holds
+// the node.
+func (a *Allocator) PoolClearanceTargets(ctx context.Context) ([]PoolClearanceTarget, error) {
+	var out []PoolClearanceTarget
+
+	err := a.db.View(ctx, func(q querier) error {
+		rows, err := state.ReadQueries(q).ListPoolClearanceTargets(ctx)
+		if err != nil {
+			return fmt.Errorf("alloc: list the pool releases waiting on their nodes: %w", err)
+		}
+
+		out = make([]PoolClearanceTarget, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, PoolClearanceTarget{Order: r.OrderID, Node: r.NodeName})
+		}
+
+		return nil
+	})
+
+	return out, err
+}
+
+// PoolClearanceObservation is one node's fenced answer to its release's clearance.
+type PoolClearanceObservation struct {
+	Order string
+	Node  string
+	// Fence is what the caller read BEFORE it asked.
+	Fence NodeFence
+	// Empty says the node read its provider and found no billet compute. An answer
+	// that is not empty, or that is not an answer, is not.
+	Empty bool
+}
+
+// RecordPoolClearance stores one answer to an order's clearance, or ends its run
+// (ADR-030): a pool host draining alone proves itself idle without the deployment's
+// seal.
+//
+// THE WHOLE CONTENT IS ITS REFUSALS, in one transaction with the write, as a compute
+// barrier's: the order must still be placed with its release asked for and this node
+// linked, which keeps the node out of placement; nothing in the ledger may hold the node,
+// which is the per-node stand-in for the barrier's quiet ledger; and the node's epoch and
+// launch-dispatch generation must be the ones read before it was asked, so a launch
+// dispatched since, or a registration since, refuses the answer. Any refusal of a
+// non-empty or failed answer ends the run, and an empty one extends it.
+func (a *Allocator) RecordPoolClearance(ctx context.Context, obs PoolClearanceObservation) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+
+		row, err := q.ReadPoolOrder(ctx, obs.Order)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil
+		case err != nil:
+			return fmt.Errorf("alloc: read pool order %s: %w", obs.Order, err)
+		case row.State != PoolPlaced || row.ReleaseRequestedAt == "" || row.NodeName != obs.Node:
+			return nil
+		}
+
+		end := func() error {
+			if err := q.EndPoolClearanceRun(ctx, obs.Order); err != nil {
+				return fmt.Errorf("alloc: end pool order %s's clearance run: %w", obs.Order, err)
+			}
+
+			return nil
+		}
+
+		counts, err := q.CountNodeHoldings(ctx, obs.Node)
+		if err != nil {
+			return fmt.Errorf("alloc: count what %s holds: %w", obs.Node, err)
+		}
+
+		if counts.Outstanding > 0 {
+			return end()
+		}
+
+		fence, err := q.ReadNodeFence(ctx, obs.Node)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return end()
+		case err != nil:
+			return fmt.Errorf("alloc: read the fence of node %s: %w", obs.Node, err)
+		case fence.Epoch != obs.Fence.Epoch || fence.DispatchGeneration != obs.Fence.Dispatch || !obs.Empty:
+			return end()
+		}
+
+		if _, err := q.RecordPoolClearanceRun(ctx, ledgerdb.RecordPoolClearanceRunParams{
+			Epoch: fence.Epoch, Dispatch: fence.DispatchGeneration, Now: ts(a.now().UTC()),
+			OrderID: obs.Order, Node: obs.Node,
+		}); err != nil {
+			return fmt.Errorf("alloc: record pool order %s's clearance: %w", obs.Order, err)
+		}
+
+		return nil
+	})
 }
 
 // releaseInventory is what a registered node is proved to run for its release: nothing
@@ -329,7 +465,7 @@ func (a *Allocator) PoolReleaseProof(ctx context.Context, order string) (release
 		}
 
 		if row.NodeName != "" {
-			holdings, err := releaseHoldingsTx(ctx, q, row.NodeName, row.HostID, sealed, row.ReleaseContradicted == 1)
+			holdings, err := releaseHoldingsTx(ctx, q, &row, sealed)
 			if err != nil {
 				return err
 			}
