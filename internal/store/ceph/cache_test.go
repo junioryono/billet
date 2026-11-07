@@ -71,6 +71,9 @@ type cacheFake struct {
 	// removeLocked records, per metadata key, whether the cache index lock was
 	// held at the instant `image-meta remove` ran for it.
 	removeLocked map[string]bool
+	// trashRemovedLocked lists the `trash rm` calls that ran while the cache index
+	// lock was held.
+	trashRemovedLocked []string
 	// halfRemoved holds images an interrupted `rbd rm` left behind: `rbd ls`
 	// still lists them, nothing can open them, and `rbd rm` finishes them.
 	halfRemoved map[string]bool
@@ -199,6 +202,9 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 
 		return json.Marshal(entries)
 	case "rm":
+		if f.lockCookie != "" {
+			f.trashRemovedLocked = append(f.trashRemovedLocked, args[1])
+		}
 		if err, ok := f.trashFailures[args[1]]; ok {
 			return nil, err
 		}

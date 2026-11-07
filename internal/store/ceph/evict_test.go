@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	storecontract "github.com/junioryono/billet/internal/store"
@@ -41,23 +43,14 @@ func (f *cacheFake) callIndex(fragments ...string) int {
 	})
 }
 
-// trashDeletedUnderLock reports the first `trash rm` the fake ran while the cache
-// lock was held, or "".
+// trashDeletedUnderLock reports the first `trash rm` the fake ran while it held
+// the cache lock, or "".
 func trashDeletedUnderLock(f *cacheFake) string {
-	locked := false
-
-	for _, call := range f.calls {
-		switch {
-		case slices.Contains(call, "lock") && slices.Contains(call, "add"):
-			locked = true
-		case slices.Contains(call, "lock") && slices.Contains(call, "rm"):
-			locked = false
-		case locked && slices.Contains(call, "trash") && slices.Contains(call, "rm"):
-			return strings.Join(call, " ")
-		}
+	if len(f.trashRemovedLocked) == 0 {
+		return ""
 	}
 
-	return ""
+	return "trash rm " + f.trashRemovedLocked[0]
 }
 
 // AN EXPIRED WRITABLE VOLUME GOES TO THE TRASH, AFTER THE LOCK, AND A GENERATION
@@ -309,6 +302,76 @@ func TestEvictionHoldsTheCacheLockForABoundedTime(t *testing.T) {
 	}
 }
 
+// A ROUND WHOSE LAST GENERATION SPENDS THE BUDGET ENDS THE PASS, as one cut short
+// does: it held the lock as long, and another round would hold it again.
+func TestARoundThatSpendsItsBudgetOnItsLastGenerationEndsThePass(t *testing.T) {
+	t.Parallel()
+
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	generations := []string{expiredGeneration(old, '1'), expiredGeneration(old, '2')}
+
+	f := newCacheFake()
+	clock := time.Now()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "rm") && !slices.Contains(args, "lock") && !slices.Contains(args, "trash") {
+			clock = clock.Add(evictionLockBudget / 2)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	c.clock = func() time.Time { return clock }
+	for _, generation := range generations {
+		f.addVolume(generation)
+	}
+
+	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	if f.images[generations[0]] || f.images[generations[1]] {
+		t.Fatal("the round kept a generation inside its budget, so it proves nothing here")
+	}
+	if f.lockAdds != 1 {
+		t.Errorf("eviction took the cache lock %d times, want one round", f.lockAdds)
+	}
+}
+
+// AN EARLIER ROUND'S FAILURE IS REPORTED, though a later round succeeds: the later
+// round has not retried what the earlier could not finish.
+func TestAnEvictionRoundsFailureOutlivesALaterCleanRound(t *testing.T) {
+	t.Parallel()
+
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	generation := expiredGeneration(old, 'a')
+
+	f := newCacheFake()
+	f.trash["id-stuck"] = strings.TrimPrefix(orphanVolume(old, 'b'), "billet-cache/")
+	failed := false
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if !failed && slices.Contains(args, "trash") && slices.Contains(args, "billet-cache/id-stuck") {
+			failed = true
+			f.calls = append(f.calls, slices.Clone(args))
+
+			return nil, errors.New("injected purge failure")
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	f.addVolume(generation)
+	f.freshVolume(time.Now())
+
+	err := c.Evict(t.Context(), 7*24*time.Hour)
+
+	if f.images[generation] || !failed {
+		t.Fatal("want the first purge to fail and its round to remove the generation, so a second runs")
+	}
+	if err == nil || !strings.Contains(err.Error(), "injected purge failure") {
+		t.Errorf("Evict = %v, want the first round's purge failure reported", err)
+	}
+}
+
 // A PASS CUT SHORT RESUMES WHERE IT STOPPED. Generations that fail slowly at the
 // front of the order would otherwise spend every pass's budget, and the
 // removable one behind them would never be reached.
@@ -467,10 +530,12 @@ func TestASupersededGenerationLeavesAfterItsGraceNotItsRetention(t *testing.T) {
 	unrecorded := expiredGeneration(twoHours, 'f')
 	keyless := expiredGeneration(twoHours, '0')
 	pointerless := expiredGeneration(twoHours, '1')
+	aliased := expiredGeneration(twoHours, '2')
 
 	used := map[string]time.Time{
 		current: now, superseded: twoHours, recent: now.Add(-supersededGrace / 2), held: twoHours,
 		otherCurrent: twoHours, unrecorded: twoHours, keyless: twoHours, pointerless: twoHours,
+		aliased: twoHours,
 	}
 	for handle, at := range used {
 		f.addVolume(handle)
@@ -490,6 +555,10 @@ func TestASupersededGenerationLeavesAfterItsGraceNotItsRetention(t *testing.T) {
 	setIndexRecord(t, f, c, generationKey(key, "gen-"+keyless), record("", keyless, twoHours))
 	setIndexRecord(t, f, c, generationKey("acme/api/gone", "gen-"+pointerless),
 		record("acme/api/gone", pointerless, twoHours))
+	// TWO RECORDS NAME ONE GENERATION: one says superseded, the other cannot.
+	setIndexRecord(t, f, c, generationKey(key, "gen-"+aliased), record(key, aliased, twoHours))
+	setIndexRecord(t, f, c, generationKey("acme/api/gone", "gen-"+aliased),
+		record("acme/api/gone", aliased, twoHours))
 
 	active, err := json.Marshal(cacheActive{Key: key, Handle: held, Generation: "gen-" + held,
 		Expires: now.Add(time.Hour)})
@@ -517,6 +586,7 @@ func TestASupersededGenerationLeavesAfterItsGraceNotItsRetention(t *testing.T) {
 		unrecorded:   "a generation no record names",
 		keyless:      "a generation whose record names no key",
 		pointerless:  "a generation whose key has no pointer",
+		aliased:      "a generation one of whose records cannot say it is superseded",
 	} {
 		if !f.images[handle] || f.ranWith("rm", handle) {
 			t.Errorf("eviction removed %s (%s)", why, handle)
@@ -534,6 +604,110 @@ func TestOnePassUnwindsALineageACompactionCutOff(t *testing.T) {
 
 	f := newCacheFake()
 	c := cacheClient(t, f)
+	generations := cutOffLineage(t, f, c)
+	current := generations[len(generations)-1]
+
+	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	if !f.images[current.Handle] {
+		t.Fatal("eviction removed the key's current generation")
+	}
+	for _, candidate := range generations[:len(generations)-1] {
+		if f.images[candidate.Handle] {
+			t.Errorf("one pass kept superseded ancestor %s behind a compacted current generation",
+				candidate.Handle)
+		}
+	}
+	if len(f.trash) != 0 {
+		t.Errorf("one pass left retired writers behind a compacted current generation: %v", f.trash)
+	}
+	if call := trashDeletedUnderLock(f); call != "" {
+		t.Errorf("eviction ran %q under the cache lock", call)
+	}
+}
+
+// A LOCK WHOSE RELEASE FAILED MAY STILL BE HELD, and every writer waits on it, so
+// the pass runs no further round and says why.
+func TestAFailedLockReleaseEndsTheEvictionPass(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	generations := cutOffLineage(t, f, c)
+
+	f.lockRemoveErrOn = f.lockRemoves + 1
+	f.lockRemoveErr = errors.New("injected lock release failure")
+	adds := f.lockAdds
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := c.Evict(ctx, 7*24*time.Hour); err == nil ||
+		!strings.Contains(err.Error(), "injected lock release failure") {
+		t.Errorf("Evict = %v, want the failed release reported", err)
+	}
+
+	if f.lockAdds != adds+1 {
+		t.Errorf("eviction asked for the cache lock %d time(s) after a release failed, want once",
+			f.lockAdds-adds)
+	}
+	if f.images[generations[3].Handle] || !f.images[generations[2].Handle] {
+		t.Error("want the one round before the failed release to have run, and no other")
+	}
+}
+
+// THE LOCK IS LEFT FREE BETWEEN ROUNDS for longer than a waiting writer's retry,
+// because nothing queues a writer and a purge with nothing to delete is quick.
+func TestEvictionLeavesTheCacheLockFreeBetweenRounds(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		f := newCacheFake()
+		c := cacheClient(t, f)
+		cutOffLineage(t, f, c)
+
+		var released time.Time
+		var gaps []time.Duration
+		c.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			out, err := f.run(ctx, bin, args)
+			if slices.Contains(args, "lock") && err == nil {
+				switch {
+				case slices.Contains(args, "rm"):
+					released = time.Now()
+				case slices.Contains(args, "add") && !released.IsZero():
+					gaps = append(gaps, time.Since(released))
+				}
+			}
+
+			return out, err
+		}
+
+		if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
+			t.Fatalf("Evict: %v", err)
+		}
+
+		if len(gaps) < 2 {
+			t.Fatalf("eviction took the lock again %d time(s), want a round per link of the lineage",
+				len(gaps))
+		}
+		for i, gap := range gaps {
+			if gap < evictionRoundGap(c.cacheLockRetry) {
+				t.Errorf("round %d took the lock %s after the last released it, want at least %s",
+					i+2, gap, evictionRoundGap(c.cacheLockRetry))
+			}
+		}
+	})
+}
+
+// cutOffLineage publishes five generations of one key, the fifth compacted, so the
+// four before it are a lineage nothing current reads, each used two hours ago:
+// past supersededGrace and far inside the retention. It returns the generations
+// oldest first.
+func cutOffLineage(t *testing.T, f *cacheFake, c *Client) []storecontract.Candidate {
+	t.Helper()
+
 	now := time.Now().UTC()
 	key := "acme/api/go"
 	var previous string
@@ -576,28 +750,34 @@ func TestOnePassUnwindsALineageACompactionCutOff(t *testing.T) {
 		t.Fatalf("the trash holds %d retired writers, want %d", len(f.trash), len(generations))
 	}
 
-	// TWO HOURS: past the grace and far inside the retention.
 	for _, candidate := range generations[:len(generations)-1] {
 		f.metadata[candidate.Handle][cacheMetaPrefix+"used_at"] = now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
 	}
 
-	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
-		t.Fatalf("Evict: %v", err)
+	return generations
+}
+
+// A GENERATION WHOSE RECORD OUTLIVED ITS IMAGE IS A MISS. Eviction removes the
+// image and then the record, and a record removal that fails leaves one naming
+// nothing; a clone of it answers ErrMiss, and records nothing that names it.
+func TestCloningAGenerationWhoseImageIsGoneIsAMiss(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	key := "acme/api/go"
+	handle := expiredGeneration(time.Now(), 'a')
+	setIndexRecord(t, f, c, generationKey(key, "gen-a"), cachePointer{
+		Key: key, Generation: "gen-a", Handle: handle, UsedAt: time.Now(), RetentionHours: 7 * 24,
+	})
+	f.missingImages = map[string]bool{handle: true}
+	before := maps.Clone(f.metadata[c.cacheIndex()])
+
+	if _, err := c.Clone(t.Context(), key, "gen-a"); !errors.Is(err, storecontract.ErrMiss) {
+		t.Fatalf("Clone = %v, want ErrMiss", err)
 	}
 
-	if !f.images[current.Handle] {
-		t.Fatal("eviction removed the key's current generation")
-	}
-	for _, candidate := range generations[:len(generations)-1] {
-		if f.images[candidate.Handle] {
-			t.Errorf("one pass kept superseded ancestor %s behind a compacted current generation",
-				candidate.Handle)
-		}
-	}
-	if len(f.trash) != 0 {
-		t.Errorf("one pass left retired writers behind a compacted current generation: %v", f.trash)
-	}
-	if call := trashDeletedUnderLock(f); call != "" {
-		t.Errorf("eviction ran %q under the cache lock", call)
+	if !maps.Equal(f.metadata[c.cacheIndex()], before) {
+		t.Errorf("a clone of a generation that is gone changed the index: %v", f.metadata[c.cacheIndex()])
 	}
 }
