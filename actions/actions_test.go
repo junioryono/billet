@@ -477,6 +477,129 @@ func TestTheBuilderConfiguresEachUpstreamToItsOwnMirror(t *testing.T) {
 	}
 }
 
+// BUILDKIT TRUSTS THE MIRRORS' AUTHORITY FOR THE MIRRORS ALONE, from a file it can
+// read in its own container; and an authority the job cannot read leaves it no
+// worse than one with no authority, which goes to the registry.
+func TestTheBuilderTrustsAMirrorsAuthorityForTheMirrorsAlone(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq is not installed on this build host")
+	}
+	authority := filepath.Join(t.TempDir(), "mirrors-ca.pem")
+	if err := forkSafeWriteFile(authority, []byte("PEM\n"), 0o644); err != nil {
+		t.Fatalf("write the authority: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name, file string
+		trusted    bool
+	}{
+		{name: "an authority", file: authority, trusted: true},
+		{name: "no authority"},
+		{name: "an authority that is not there", file: authority + ".absent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			temporary := t.TempDir()
+			if err := os.Mkdir(filepath.Join(temporary, "billet-buildkit-state"), 0o755); err != nil {
+				t.Fatalf("create state directory: %v", err)
+			}
+			tools := t.TempDir()
+			argv := filepath.Join(temporary, "docker-argv")
+			fake := "#!/bin/sh\nprintf '%s\\n' \"$@\" >>" + argv + "\nexit 0\n"
+			if err := forkSafeWriteFile(filepath.Join(tools, "docker"), []byte(fake), 0o755); err != nil {
+				t.Fatalf("write fake docker: %v", err)
+			}
+			cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("setup-docker-builder", "start.sh"))
+			cmd.Env = append(os.Environ(),
+				"PATH="+tools+":"+os.Getenv("PATH"),
+				"RUNNER_TEMP="+temporary,
+				"GITHUB_OUTPUT="+filepath.Join(temporary, "outputs"),
+				"GITHUB_RUN_ID=1",
+				"GITHUB_RUN_ATTEMPT=1",
+				"GITHUB_JOB=build",
+				"BILLET_BUILDKIT_IMAGE=moby/buildkit:test",
+				"BILLET_BUILDKIT_RESET=false",
+				"BILLET_REGISTRY_MIRRORS_CA_FILE="+tc.file,
+				`BILLET_REGISTRY_MIRRORS_JSON={"docker.io":"https://172.31.0.1:7740","ghcr.io":"https://172.31.0.1:7741","quay.io":"https://172.31.0.1:7742"}`,
+			)
+			if combined, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("start mirrored builder: %v\n%s", err, combined)
+			}
+			config, err := os.ReadFile(filepath.Join(temporary, "billet-buildkitd.toml"))
+			if err != nil {
+				t.Fatalf("read BuildKit config: %v", err)
+			}
+			calls, err := os.ReadFile(argv)
+			if err != nil {
+				t.Fatalf("read docker's arguments: %v", err)
+			}
+			const inContainer = "/etc/buildkit/billet-registry-mirrors-ca.pem"
+			for _, mirror := range []string{"172.31.0.1:7740", "172.31.0.1:7741", "172.31.0.1:7742"} {
+				want := `[registry."` + mirror + `"]` + "\n" + `  ca = ["` + inContainer + `"]`
+				if got := strings.Contains(string(config), want); got != tc.trusted {
+					t.Errorf("trusts %s = %v, want %v:\n%s", mirror, got, tc.trusted, config)
+				}
+			}
+			if got := strings.Contains(string(calls), authority+":"+inContainer+":ro"); got != tc.trusted {
+				t.Errorf("mounts the authority = %v, want %v:\n%s", got, tc.trusted, calls)
+			}
+			// THE UPSTREAMS STILL NAME THEIR MIRRORS whichever way this goes: an
+			// untrusted one is passed over for the registry, measured.
+			if !strings.Contains(string(config), `mirrors = ["172.31.0.1:7740"]`) {
+				t.Errorf("docker.io lost its mirror:\n%s", config)
+			}
+		})
+	}
+}
+
+// A MIRROR NAMED LIKE AN UPSTREAM SHARES ITS TABLE, and TOML refuses a table declared
+// twice, which would stop the builder rather than send it to the registry.
+func TestABuilderConfigDeclaresEachRegistryOnce(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq is not installed on this build host")
+	}
+	temporary := t.TempDir()
+	if err := os.Mkdir(filepath.Join(temporary, "billet-buildkit-state"), 0o755); err != nil {
+		t.Fatalf("create state directory: %v", err)
+	}
+	authority := filepath.Join(temporary, "mirrors-ca.pem")
+	if err := forkSafeWriteFile(authority, []byte("PEM\n"), 0o644); err != nil {
+		t.Fatalf("write the authority: %v", err)
+	}
+	tools := t.TempDir()
+	if err := forkSafeWriteFile(filepath.Join(tools, "docker"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake docker: %v", err)
+	}
+	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("setup-docker-builder", "start.sh"))
+	cmd.Env = append(os.Environ(),
+		"PATH="+tools+":"+os.Getenv("PATH"),
+		"RUNNER_TEMP="+temporary,
+		"GITHUB_OUTPUT="+filepath.Join(temporary, "outputs"),
+		"GITHUB_RUN_ID=1",
+		"GITHUB_RUN_ATTEMPT=1",
+		"GITHUB_JOB=build",
+		"BILLET_BUILDKIT_IMAGE=moby/buildkit:test",
+		"BILLET_BUILDKIT_RESET=false",
+		"BILLET_REGISTRY_MIRRORS_CA_FILE="+authority,
+		`BILLET_REGISTRY_MIRRORS_JSON={"docker.io":"https://ghcr.io","ghcr.io":"https://172.31.0.1:7741","quay.io":"https://172.31.0.1:7742"}`,
+	)
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("start mirrored builder: %v\n%s", err, combined)
+	}
+	config, err := os.ReadFile(filepath.Join(temporary, "billet-buildkitd.toml"))
+	if err != nil {
+		t.Fatalf("read BuildKit config: %v", err)
+	}
+	if got := strings.Count(string(config), `[registry."ghcr.io"]`); got != 1 {
+		t.Errorf("ghcr.io is declared %d times:\n%s", got, config)
+	}
+}
+
 func TestTheTierMountLimitAndFailSafeDiscardAreWiredBetweenActions(t *testing.T) {
 	t.Parallel()
 

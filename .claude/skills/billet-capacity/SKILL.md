@@ -66,6 +66,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A pool host joins on its source's word only when every check vouches for its key; a contradiction holds its order, and could-not-tell waits for a person (ADR-030).**
 - **Only a whole console line names a key, and nothing a pool host's join prints can be one.**
 - **A pool host is released only on proof, sealed in the transaction that reads it, with its node's certificates revoked first (ADR-030).**
+- **The pool shrinks only by drain: idle_after proposes a release, read again in its own transaction, and only the proof releases.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

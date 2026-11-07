@@ -258,6 +258,12 @@ type NodeConfig struct {
 	// RegistryMirrors are three site-local Distribution pull-through caches. One
 	// instance per upstream is required because proxy mode has one remote URL.
 	RegistryMirrors *RegistryMirrors `yaml:"registry_mirrors,omitempty"`
+	// RegistryMirrorsCA is the path of the PEM authority a mirror's certificate
+	// chains to, for mirrors no public authority signs. The guest trusts it for
+	// those mirrors alone, never in its system store. Empty means
+	// DefaultRegistryMirrorsCA when that file exists, and otherwise that the
+	// mirrors' certificates are publicly trusted.
+	RegistryMirrorsCA string `yaml:"registry_mirrors_ca,omitempty"`
 
 	// MaxCustody bounds how long billet holds capacity for compute it cannot account
 	// for — a container adopted from a crashed run, or one an ambiguous launch may
@@ -297,6 +303,10 @@ type NodeCacheConfig struct {
 	TLSCert string `yaml:"tls_cert,omitempty"`
 	TLSKey  string `yaml:"tls_key,omitempty"`
 }
+
+// DefaultRegistryMirrorsCA is where the host role installs the authority of the
+// mirrors it runs, which a node reads when node.registry_mirrors_ca names no other.
+const DefaultRegistryMirrorsCA = "/etc/billet-registry/ca.pem"
 
 // RegistryMirrors names the independent public-registry caches visible at a site.
 type RegistryMirrors struct {
@@ -898,6 +908,16 @@ func (c *Config) validateNode() []error {
 			errs = append(errs, fmt.Errorf("node.registry_mirrors is set but this node's provider is %s, and only the managed Firecracker guest consumes it", c.Node.Provider))
 		} else {
 			errs = append(errs, CheckRegistryMirrors(*c.Node.RegistryMirrors)...)
+		}
+	}
+	if c.Node.RegistryMirrorsCA != "" {
+		if c.Node.RegistryMirrors == nil {
+			errs = append(errs, errors.New("node.registry_mirrors_ca is set with no node.registry_mirrors "+
+				"for it to be the authority of"))
+		}
+		if !filepath.IsAbs(c.Node.RegistryMirrorsCA) {
+			errs = append(errs, fmt.Errorf("node.registry_mirrors_ca must be an absolute path, not %q",
+				c.Node.RegistryMirrorsCA))
 		}
 	}
 

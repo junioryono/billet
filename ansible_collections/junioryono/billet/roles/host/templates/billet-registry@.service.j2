@@ -1,0 +1,35 @@
+[Unit]
+Description=billet pull-through registry mirror %i
+After=network-online.target systemd-networkd.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User={{ billet_registry_mirror_user }}
+Group={{ billet_registry_mirror_user }}
+ExecStart={{ billet_registry_mirror_binary }} serve {{ billet_registry_mirror_dir }}/%i.yml
+Environment=OTEL_TRACES_EXPORTER=none
+StateDirectory=billet-registry/%i
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

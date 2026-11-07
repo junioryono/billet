@@ -490,7 +490,10 @@ func waitForAcceptanceJobs(ctx context.Context, env cli.Env, ws acceptanceWorksp
 	ticker := time.NewTicker(acceptancePoll)
 	defer ticker.Stop()
 
-	reported := 0
+	// BY LEASE, NOT BY POSITION: the history is read again at every poll and its order
+	// can move, so printing from the count already printed listed some jobs twice and
+	// others never (run 42386061079, 2026-11-07).
+	reported := map[string]bool{}
 
 	for {
 		jobs, err := readAcceptanceJobs(ctx, ws)
@@ -499,20 +502,25 @@ func waitForAcceptanceJobs(ctx context.Context, env cli.Env, ws acceptanceWorksp
 		}
 
 		terminal := newTerminalJobs(jobs, baseline)
-		if len(terminal) > reported {
-			for i := range terminal[reported:] {
-				j := &terminal[reported+i]
-				fmt.Fprintf(env.Stdout, "  %s  tier=%s run=%d github=%q billet=%q\n",
-					j.LeaseID, j.Tier, j.RunID, j.GitHub, j.Billet)
+		for i := range terminal {
+			j := &terminal[i]
+			if reported[j.LeaseID] {
+				continue
 			}
 
-			reported = len(terminal)
+			reported[j.LeaseID] = true
+			fmt.Fprintf(env.Stdout, "  %s  tier=%s run=%d github=%q billet=%q\n",
+				j.LeaseID, j.Tier, j.RunID, j.GitHub, j.Billet)
 		}
 
 		if len(terminal) >= opts.jobs {
 			fmt.Fprintf(env.Stdout, "\n%d job(s) finished.\n", len(terminal))
 
 			return nil
+		}
+
+		if err := historyMayHideJobs(len(jobs), len(terminal), opts.jobs); err != nil {
+			return err
 		}
 
 		if time.Now().After(deadline) {
@@ -526,4 +534,22 @@ func waitForAcceptanceJobs(ctx context.Context, env cli.Env, ws acceptanceWorksp
 			return fmt.Errorf("stopped waiting: %w", ctx.Err())
 		}
 	}
+}
+
+// historyMayHideJobs answers whether a read of read history rows, counting counted of
+// want, could have missed jobs the wait is waiting for.
+//
+// A FULL READ CANNOT TELL. The read is bounded and oldest first, and a lease that
+// counts for nothing (a runner GitHub gave no job, a launch that failed, a job of an
+// earlier run) still takes one of its rows, so a deployment that finished every job
+// it was asked for can hold the last of them past the bound: the wait would run out
+// its whole --wait against them, and a timeout is not what happened.
+func historyMayHideJobs(read, counted, want int) error {
+	if counted >= want || read < acceptanceJobLimit {
+		return nil
+	}
+
+	return fmt.Errorf("the ledger's job history holds at least the %d rows this run reads, %d of "+
+		"them NEW jobs that count of the %d waited for, so it cannot tell whether the rest have "+
+		"finished; read the history with `billet jobs`", acceptanceJobLimit, counted, want)
 }

@@ -60,10 +60,27 @@ func TestAPoolBlockLoads(t *testing.T) {
 	if a, ok := p.ShapeArch(PoolSourcePhoenixNAP, "s2.c2.small"); !ok || a != ArchX64 {
 		t.Fatalf("shape arch = %v, %t", a, ok)
 	}
-	withTimes := strings.Replace(poolBlock, "    boot_prelude:", "    interval: 1m\n    refusal_backoff: 1h\n    boot_prelude:", 1)
+	// NO IDLE_AFTER, NO SHRINK: a person releases a host, as before the key existed.
+	if d, ok := p.PoolIdleAfter(); ok {
+		t.Fatalf("a pool with no idle_after shrinks itself after %v", d)
+	}
+	withTimes := strings.Replace(poolBlock, "    boot_prelude:",
+		"    interval: 1m\n    refusal_backoff: 1h\n    idle_after: 20m\n    boot_prelude:", 1)
 	cfg, err = loadServer(t, poolConfig(withTimes))
 	if err != nil || cfg.Server.Pool.PoolInterval() != time.Minute || cfg.Server.Pool.PoolRefusalBackoff() != time.Hour {
 		t.Fatalf("set durations: %v", err)
+	}
+	if d, ok := cfg.Server.Pool.PoolIdleAfter(); !ok || d != 20*time.Minute {
+		t.Fatalf("idle_after = %v, %t; want 20m", d, ok)
+	}
+	// THE SHORTEST IT MAY BE IS ACCEPTED, exactly.
+	atMin := strings.Replace(poolBlock, "    boot_prelude:", "    idle_after: 5m\n    boot_prelude:", 1)
+	cfg, err = loadServer(t, poolConfig(atMin))
+	if err != nil {
+		t.Fatalf("idle_after: 5m was refused: %v", err)
+	}
+	if d, ok := cfg.Server.Pool.PoolIdleAfter(); !ok || d != MinPoolIdleAfter {
+		t.Fatalf("idle_after 5m = %v, %t", d, ok)
 	}
 }
 
@@ -76,6 +93,8 @@ func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
 		"a wildcard join":         {"join_server: 10.77.0.10:7717", "join_server: 0.0.0.0:7717", "join_server"},
 		"a relative prelude":      {"boot_prelude: /etc/billet/pool-prelude.sh", "boot_prelude: prelude.sh", "boot_prelude"},
 		"a bad interval":          {"    boot_prelude:", "    interval: soon\n    boot_prelude:", "interval"},
+		"a short idle_after":      {"    boot_prelude:", "    idle_after: 4m59s\n    boot_prelude:", "idle_after \"4m59s\" must be a Go duration of at least 5m0s"},
+		"a bad idle_after":        {"    boot_prelude:", "    idle_after: later\n    boot_prelude:", "idle_after \"later\" must be a Go duration of at least 5m0s"},
 		"a negative floor":        {"floor: 1", "floor: -1", "must not be negative"},
 		"max below the floor":     {"floor: 1\n        max: 3", "floor: 4\n        max: 3", "below its floor"},
 		"no max":                  {"max: 2", "max: 0", "at least 1"},

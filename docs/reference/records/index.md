@@ -34,6 +34,7 @@ target-weights
 egress-allowlist
 bare-metal-hosts
 job-statistics
+docker-builder
 ```
 
 | Record | Covers |
@@ -67,3 +68,4 @@ job-statistics
 | [The egress allowlist](egress-allowlist.md) | a tier's allowlist in a real Firecracker guest: an allowed name connects, any other name, a hard-coded address, an outside resolver and IPv6 are refused and recorded by the host; and the kernel's behaviour behind each rule, including the frame a bridge's hooks never see, on kernels 7.0 and 6.8 |
 | [Bare-metal hosts](bare-metal-hosts.md) | what rented bare metal measured on 2026-11-05: four AWS metal types from the launch call to a running script in 21 to 47 s, which of them fit a 4 GiB per vCPU pool with local NVMe, their NVMe throughput and single-thread speed alone and under full load; and phoenixNAP's catalogue, stock per location, a new account's one-server quota and the order its API refused (#553) |
 | [Reading the ledger back](job-statistics.md) | `billet jobs stats`, `billet jobs rightsize` and `billet migrate workflows` against the reference deployment's week and GitHub's record of it: 78 of billet's own jobs agreeing with GitHub, what a re-run of failed jobs records under each attempt, why a recommendation reads the job's own window and its VM's memory rather than the usage summary, two jobs recomputed by hand, and GitHub's hosted labels on 2026-11-03 |
+| [What a Docker build's cache saves](docker-builder.md) | the persistent builder against a registry cache, `type=gha` and none, for four projects and four kinds of change on 2026-11-05; two Dockerfiles on one key; attach time against the state's size; and what the Docker image store saves a job using a 6 GB image (#542) |

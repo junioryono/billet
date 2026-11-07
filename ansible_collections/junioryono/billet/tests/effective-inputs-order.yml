@@ -30,9 +30,15 @@
       - "'hostvars[item].billet_config' in billet_gate_node_hosts_source"
       - "'billet_effective_config' not in billet_gate_node_hosts_source"
       - "'billet_retirement_collect_vars.billet_config.node' in billet_gate_collect_host_source"
+      # The node's own document, with the mirrors the role gave it named as the
+      # ordinary converge names them (role_registry_mirrors), and nothing else.
       - >-
-        "template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config}"
+        "template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config\n"
         in billet_gate_collect_host_source
+      - >-
+        "| junioryono.billet.role_registry_mirrors(" in
+        (billet_gate_collect_host_source.split("template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config\n")[1]
+         .split('}) }}')[0].split() | join(' '))
       - "'billet_effective_config' not in billet_gate_collect_source"
       - "'billet_effective_config' not in billet_gate_collect_host_source"
       - >-
@@ -88,9 +94,9 @@
         billet_gate_ordinary_imports ==
         ['effective-config.yml', 'service-account.yml', 'upgrade-inspect.yml', 'ledger-mount-name.yml',
          'upgrade-recover.yml', 'upgrade-fresh-converge.yml', 'validate-interpreted-inputs.yml', 'network-disable.yml',
-         'retirement-node-preflight.yml', 'needrestart.yml', 'account.yml',
+         'retirement-node-preflight.yml', 'needrestart.yml', 'registry-mirrors-fetch.yml', 'account.yml',
          'service-account.yml', 'ledger-mount.yml', 'cache-tls.yml', 'firecracker.yml', 'network.yml',
-         'cephadm-logrotate.yml', 'ceph.yml', 'alerts.yml', 'images-refresh.yml', 'backup.yml', 'services.yml', 'uplink.yml']
+         'registry-mirrors.yml', 'cephadm-logrotate.yml', 'ceph.yml', 'alerts.yml', 'images-refresh.yml', 'backup.yml', 'services.yml', 'uplink.yml']
       - billet_gate_main_source[-1].block[-2]['ansible.builtin.meta'] == 'flush_handlers'
     fail_msg: >-
       The ordinary imports are now {{ billet_gate_ordinary_imports }}.
@@ -114,6 +120,7 @@
         - (billet_effective_config.node.cache | default({})).tls_cert is defined
     - {name: Configure Firecracker, condition: billet_firecracker_enabled}
     - {name: Configure guest networking, condition: billet_firecracker_enabled}
+    - {name: Configure or remove the registry mirrors, condition: 'not billet_retirement_node_ordinary | bool'}
     - {name: "Leave cephadm's log to ceph-common's rotation", condition: ['billet_ceph_enabled', 'not billet_retirement_node_ordinary | bool']}
     - {name: Configure Ceph, condition: billet_ceph_enabled}
     - {name: Remove disabled Ceph kernel module policy, condition: 'not billet_ceph_enabled'}

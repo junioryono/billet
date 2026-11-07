@@ -63,6 +63,12 @@ type ListenerCapacity struct {
 	// the field, never none, because a drain reads it to say whether assigned
 	// work is still waiting (#140).
 	Unstarted *int `json:"unstarted,omitempty"`
+	// AnsweredAt is when GitHub last answered the tier's poll with nothing new, which
+	// dates the statistics Unstarted was counted from as current: a listener
+	// republishes its last count at every publication, so the observation's own date
+	// says nothing about a poll that has stalled. Empty when none has been answered, or
+	// from a control plane older than the field, which a pool reads as not current.
+	AnsweredAt string `json:"answered_at,omitempty"`
 	// UnstartedAt is when GitHub last vouched for the statistics Unstarted was
 	// counted from (an empty exchange sent with the advertisement withdrawn),
 	// which is not when the observation was written: a listener republishes its

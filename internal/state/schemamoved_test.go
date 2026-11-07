@@ -6,19 +6,30 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
 
 // newestMigration is the version rewindNewest takes back off a ledger.
-const newestMigration = 80
+const newestMigration = 81
+
+// undoPoolClearance is what migration 80 added, taken back with its record.
+var undoPoolClearance = []string{
+	`ALTER TABLE pool_orders DROP COLUMN clear_generation`,
+	`ALTER TABLE pool_orders DROP COLUMN clear_observed_at`,
+	`ALTER TABLE pool_orders DROP COLUMN clear_since`,
+	`ALTER TABLE pool_orders DROP COLUMN clear_dispatch`,
+	`ALTER TABLE pool_orders DROP COLUMN clear_epoch`,
+	`DELETE FROM schema_migrations WHERE version = 80`,
+}
 
 // rewindNewest takes the newest migration back off a migrated ledger, so the
 // next migration has exactly one version to apply.
 //
 // IT KNOWS THAT MIGRATION'S STATEMENTS, the way the version tests beside it do:
-// the columns migration 80 added, and its record. It refuses
+// the index migration 81 added, and its record. It refuses
 // to run once a newer one exists, so the ledger it leaves is always the schema
 // just before this binary's newest and, when a move is reported, its endpoints
 // are {newest-1, newest}; rewinding 61 under a 62 would leave a ledger at 62 with
@@ -33,12 +44,8 @@ func rewindNewest(t *testing.T, db *DB) {
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
-			`ALTER TABLE pool_orders DROP COLUMN clear_generation`,
-			`ALTER TABLE pool_orders DROP COLUMN clear_observed_at`,
-			`ALTER TABLE pool_orders DROP COLUMN clear_since`,
-			`ALTER TABLE pool_orders DROP COLUMN clear_dispatch`,
-			`ALTER TABLE pool_orders DROP COLUMN clear_epoch`,
-			`DELETE FROM schema_migrations WHERE version = 80`,
+			`DROP INDEX job_history_node_finished_idx`,
+			`DELETE FROM schema_migrations WHERE version = 81`,
 		} {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
@@ -52,7 +59,7 @@ func rewindNewest(t *testing.T, db *DB) {
 }
 
 // ledgerAt78 is a SQLite ledger migrated and then taken back to version 78, so the next
-// open applies migration 79 and the newest after it.
+// open applies migration 79 and every one after it.
 func ledgerAt78(t *testing.T) string {
 	t.Helper()
 
@@ -66,12 +73,12 @@ func ledgerAt78(t *testing.T) string {
 	rewindNewest(t, db)
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		for _, stmt := range []string{
+		for _, stmt := range append(slices.Clone(undoPoolClearance),
 			`ALTER TABLE pool_orders DROP COLUMN release_contradicted`,
 			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
 			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,
 			`DELETE FROM schema_migrations WHERE version = 79`,
-		} {
+		) {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
 			}

@@ -1,16 +1,20 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/state"
 )
 
 const testHold = time.Hour
@@ -241,6 +245,249 @@ func TestAHoldSurvivesARestart(t *testing.T) {
 			})
 		})
 	}
+}
+
+// A RESTARTED LISTENER DESTROYS A HELD VM AT ITS BOUND WHILE ITS SESSION IS STILL REFUSED (#783).
+// GitHub keeps a stopped control plane's session for about 90 s, and the completions a restart
+// restores need none of it: their cleanup runs before the session opens, through Run itself.
+func TestARestartDestroysAHeldVMAtItsBoundBeforeItsSessionOpens(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p, _, failed := heldPool(t, "Failed")
+		p.complete(t, failed)
+
+		store := p.l.completionStore
+
+		time.Sleep(testHold - time.Minute)
+
+		var opens atomic.Int64
+
+		// UNDER A MUTEX, since Run's cleanup goroutine writes what this goroutine reads between passes.
+		var (
+			mu        sync.Mutex
+			destroyed []int64
+		)
+
+		gone := func() []int64 {
+			mu.Lock()
+			defer mu.Unlock()
+
+			return slices.Clone(destroyed)
+		}
+
+		runner := &fakeRunner{onDestroy: func(requestID int64) error {
+			mu.Lock()
+			defer mu.Unlock()
+
+			destroyed = append(destroyed, requestID)
+
+			return nil
+		}}
+
+		release := make(chan struct{})
+		l := NewListener(p.a, p.l.tier, nil, WithRunner(runner), WithRunnerRegistry(p.registry),
+			WithSessionReopen(func(ctx context.Context) (Session, error) {
+				opens.Add(1)
+
+				// REFUSED UNTIL THE TEST SAYS, as GitHub refuses the successor of a session
+				// a stopped control plane left.
+				select {
+				case <-release:
+					return p.session, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}))
+		l.holdOnFailure, l.completionStore = testHold, store
+		l.writeJobResult = func(context.Context, string, string, int64) error { return nil }
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- l.Run(ctx) }()
+
+		// A CLEANUP TICK INSIDE THE HOLD, a third of the lease's life after Run began and half a
+		// minute before the bound: the pass that runs then finds the hold standing.
+		time.Sleep(l.heartbeatInterval() + time.Second)
+		synctest.Wait()
+
+		if got := gone(); len(got) != 0 {
+			t.Fatalf("destroyed %v inside the hold, while the session waits", got)
+		}
+
+		// PAST THE BOUND, with the session still refused, and through the next tick.
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		if opens.Load() != 1 {
+			t.Fatalf("the session was asked for %d times, want one open still waiting", opens.Load())
+		}
+
+		if got := gone(); !slices.Contains(got, 11) {
+			t.Errorf("destroyed %v past the bound while the session was refused; the held VM waited for GitHub",
+				got)
+		}
+
+		close(release)
+		cancel()
+
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run = %v", err)
+		}
+	})
+}
+
+// A LISTENER STOPPED WHILE ITS FIRST SESSION IS REFUSED JOINS THE CLEANUP IT STARTED, and returns
+// only once a destroy that cleanup is inside has come back, closing no session it never opened
+// (#783). A Run that returned first would leave that destroy to release a lease into a ledger its
+// caller had every right to close.
+func TestAListenerStoppedBeforeItsSessionOpensJoinsItsCleanup(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p, held, failed := heldPool(t, "Failed")
+		p.complete(t, failed)
+
+		// THE HOLD ENDED, so the restored completion's destroy is owed on the first tick.
+		if ended, err := p.a.EndLeaseHold(t.Context(), held.LeaseID, alloc.HoldEndedByOperator); err != nil || !ended {
+			t.Fatalf("end the hold: %t, %v", ended, err)
+		}
+
+		entered, unblock := make(chan struct{}), make(chan struct{})
+
+		var once sync.Once
+
+		runner := &fakeRunner{onDestroy: func(requestID int64) error {
+			once.Do(func() { close(entered) })
+			<-unblock
+			p.destroyed = append(p.destroyed, requestID)
+
+			return nil
+		}}
+
+		l := NewListener(p.a, p.l.tier, nil, WithRunner(runner), WithRunnerRegistry(p.registry),
+			WithSessionReopen(func(ctx context.Context) (Session, error) {
+				<-ctx.Done()
+
+				return nil, ctx.Err()
+			}))
+		l.holdOnFailure, l.completionStore = testHold, p.l.completionStore
+		l.writeJobResult = func(context.Context, string, string, int64) error { return nil }
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- l.Run(ctx) }()
+
+		// THE CLEANUP LOOP'S DESTROY HAS BEGUN, with no session open.
+		<-entered
+		cancel()
+		synctest.Wait()
+
+		select {
+		case err := <-done:
+			t.Fatalf("Run returned %v while a destroy its cleanup started was still running", err)
+		default:
+		}
+
+		close(unblock)
+
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Errorf("Run = %v, want the cancellation", err)
+		}
+
+		if !slices.Contains(p.destroyed, 11) {
+			t.Errorf("destroyed %v; want the owed VM gone", p.destroyed)
+		}
+	})
+}
+
+// A SEALED DEPLOYMENT GETS NO NEW HOLD BEFORE A RESTARTED LISTENER'S SESSION OPENS (#783). The poll
+// loop reads admission only once the session is open, so the hold reads the ledger itself: a failed
+// job whose predecessor recorded its completion and held nothing is destroyed, not held for an hour
+// in front of the drain that sealed it.
+func TestASealedDeploymentGetsNoNewHoldBeforeTheSessionOpens(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		db := openState(t)
+
+		a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, runnerlessTiers())
+		if err != nil {
+			t.Fatalf("alloc.New: %v", err)
+		}
+
+		registerDefaultHosts(t, a)
+
+		p := newRunnerlessPoolOver(t, a, job11)
+		p.l.completionStore = db
+
+		runner := p.launchedFor11(t)
+
+		started := job11
+		started.RunnerID, started.RunnerName = 77, runner.RunnerName
+
+		if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
+			Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+			t.Fatalf("start job 11: %v", err)
+		}
+
+		// THE PREDECESSOR RECORDED THE COMPLETION AND HELD NOTHING: its tier held nothing then, and
+		// its destroy did not go through.
+		p.l.runner = &fakeRunner{onDestroy: func(int64) error { return errors.New("the node is busy") }}
+
+		failed := started
+		failed.Result = "Failed"
+		p.complete(t, failed)
+
+		if _, err := a.LeaseHoldOf(t.Context(), runner.LeaseID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+			t.Fatalf("a hold before the restart: %v", err)
+		}
+
+		if _, err := db.Seal(t.Context(), state.SealRequest{
+			Provenance: state.ProvenanceOperator, Reason: "draining", Actor: "ops",
+		}); err != nil {
+			t.Fatalf("Seal: %v", err)
+		}
+
+		l := NewListener(a, p.l.tier, nil,
+			WithRunner(&fakeRunner{onDestroy: func(requestID int64) error {
+				p.destroyed = append(p.destroyed, requestID)
+
+				return nil
+			}}),
+			WithRunnerRegistry(p.registry),
+			WithSessionReopen(func(ctx context.Context) (Session, error) {
+				<-ctx.Done()
+
+				return nil, ctx.Err()
+			}))
+		l.holdOnFailure, l.completionStore = testHold, db
+		l.writeJobResult = func(context.Context, string, string, int64) error { return nil }
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- l.Run(ctx) }()
+
+		time.Sleep(l.heartbeatInterval() + time.Second)
+		synctest.Wait()
+
+		if hold, err := a.LeaseHoldOf(t.Context(), runner.LeaseID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+			t.Errorf("a hold was opened on a sealed deployment: %+v, %v", hold, err)
+		}
+
+		if !slices.Contains(p.destroyed, 11) {
+			t.Errorf("destroyed %v; want the failed job's VM gone, as nothing may hold it", p.destroyed)
+		}
+
+		cancel()
+
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Errorf("Run = %v, want the cancellation", err)
+		}
+	})
 }
 
 // AN ENDED HOLD ENDS IT: whatever ended it, the next pass destroys, and what ended it stands.

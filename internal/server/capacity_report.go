@@ -43,6 +43,9 @@ func (l *Listener) publishCapacity(ctx context.Context, sent *int, exchange stri
 		Sent: l.capacitySent, Confirmed: l.capacityConfirmed, Exchange: l.capacityExchange,
 		Waiting: l.waitingFor,
 	}
+	if !l.answeredAt.IsZero() {
+		report.AnsweredAt = l.answeredAt.UTC().Format(time.RFC3339Nano)
+	}
 
 	// GITHUB'S DEMAND AS COUNTED, whatever the order made of it: a drain reads
 	// this to say whether assigned work is still waiting (#140).
