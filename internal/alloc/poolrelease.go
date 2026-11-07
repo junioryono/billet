@@ -415,6 +415,20 @@ func (a *Allocator) ForceClosePoolOrder(ctx context.Context, id, reason string) 
 			return fmt.Errorf("alloc: take %s out of placement: %w", row.NodeName, err)
 		}
 
+		// AND OUT OF THE FLEET, UNPROVEN, as `billet nodes decommission --force` records it:
+		// a node nobody can hear from again would otherwise hold every later drain open.
+		// A node that never registered has no row, and this moves nothing.
+		if err := q.DecommissionNode(ctx, ledgerdb.DecommissionNodeParams{
+			DecommissionedAt: ts(now), DecommissionProven: 0, DecommissionActor: "billet pool close --force",
+			Name: row.NodeName,
+		}); err != nil {
+			return fmt.Errorf("alloc: exclude %s from the fleet: %w", row.NodeName, err)
+		}
+
+		if err := q.DeleteBarrierRun(ctx, row.NodeName); err != nil {
+			return fmt.Errorf("alloc: clear the barrier run of node %s: %w", row.NodeName, err)
+		}
+
 		n, err := q.ForceClosePoolOrder(ctx, ledgerdb.ForceClosePoolOrderParams{
 			Reason: "closed by a person without proof: " + reason, UpdatedAt: ts(now), OrderID: id,
 			NodeName: row.NodeName,

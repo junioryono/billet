@@ -98,7 +98,7 @@ func TestAHostACertificateWasIssuedForIsReleasedAsJoined(t *testing.T) {
 	if left := usesLeft(t, a, "pa"); len(left) != 1 || left[0] != 0 {
 		t.Fatalf("its tokens were not retired: %v", left)
 	}
-	waitsUnsealed(t, a, "a decommission taken before the order knew its node")
+	waitsUnsealed(t, a, "0f", "a decommission taken before the order knew its node")
 
 	registerPoolNode(t, a, node)
 	if placeableHosts(t, a) != 0 {
@@ -156,6 +156,9 @@ func TestADrainingHostIsClosedByForceOnlyWhenNothingHoldsIt(t *testing.T) {
 	if revoked, err := a.CertRevoked(ctx, "0a"); err != nil || !revoked {
 		t.Fatalf("the forced host's certificate was not revoked: %v, %v", revoked, err)
 	}
+	if unproven := clearance(t, a).Unproven(); !slices.Equal(unproven, []string{node}) {
+		t.Fatalf("the force-closed node is not excluded from the fleet as unproven: %v", unproven)
+	}
 	registerPoolNode(t, a, node)
 	if placeableHosts(t, a) != 0 {
 		t.Fatal("a registration put a force-closed host back into placement")
@@ -191,7 +194,7 @@ func TestARunBeforeTheLinkProvesNoDecommission(t *testing.T) {
 	if proven, err := a.Decommission(ctx, DecommissionRequest{Node: node, Actor: "ops"}); err == nil || proven {
 		t.Fatalf("a decommission proved by a run taken before the link: proved %v, %v", proven, err)
 	}
-	waitsUnsealed(t, a, "a run taken before the link")
+	waitsUnsealed(t, a, "0f", "a run taken before the link")
 }
 
 // AN IDLE RUN THAT PREDATES A CONTRADICTION PROVES NO DECOMMISSION AFTER IT: an inventory
@@ -224,7 +227,7 @@ func TestARunBeforeAContradictionProvesNoDecommission(t *testing.T) {
 	if proven, err := a.Decommission(ctx, DecommissionRequest{Node: node, Actor: "ops"}); err == nil || proven {
 		t.Fatalf("a decommission proved by a run older than the compute reported since: proved %v, %v", proven, err)
 	}
-	waitsUnsealed(t, a, "a run older than the contradiction")
+	waitsUnsealed(t, a, "0a", "a run older than the contradiction")
 }
 
 // registerPoolNode registers a pool host's node as a placeable x64 Firecracker host that
@@ -271,10 +274,17 @@ func decommissionOnProof(t *testing.T, a *Allocator, now *time.Time, barrier Com
 }
 
 // waitsUnsealed asserts that sealing order pa is refused and writes nothing: the order
-// stays placed and its node's certificate, serial 0a, stays unrevoked.
-func waitsUnsealed(t *testing.T, a *Allocator, why string) {
+// stays placed and its node's certificate, serial, which the ledger records as issued,
+// stays unrevoked.
+func waitsUnsealed(t *testing.T, a *Allocator, serial, why string) {
 	t.Helper()
-	const id, serial = "pa", "0a"
+	const id = "pa"
+	var issued int
+	if err := a.db.View(t.Context(), func(q querier) error {
+		return q.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM issued_certs WHERE serial = $1`, serial).Scan(&issued)
+	}); err != nil || issued != 1 {
+		t.Fatalf("%s: certificate %s is recorded %d times: %v", why, serial, issued, err)
+	}
 	if _, err := a.SealPoolRelease(t.Context(), id); !errors.Is(err, ErrPoolReleaseWaits) {
 		t.Fatalf("%s: sealing answered %v", why, err)
 	}
@@ -319,7 +329,7 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	if placeableHosts(t, a) != 0 {
 		t.Fatal("a registration put a host whose release was asked for back into placement")
 	}
-	waitsUnsealed(t, a, "a lease on the host")
+	waitsUnsealed(t, a, "0a", "a lease on the host")
 
 	for _, l := range leases {
 		if err := a.Release(ctx, l.ID, l.Epoch, PhaseDone); err != nil {
@@ -330,7 +340,7 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	if _, err := a.Reconcile(ctx, node, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitsUnsealed(t, a, "an empty inventory and nothing else")
+	waitsUnsealed(t, a, "0a", "an empty inventory and nothing else")
 
 	decommissionOnProof(t, a, &now, requestBarrier(t, a), node)
 	proof, err := a.SealPoolRelease(ctx, "pa")
@@ -419,18 +429,18 @@ func TestAContradictedDecommissionStaysContradicted(t *testing.T) {
 			decommissionOnProof(t, a, &now, barrier, node)
 
 			contradict(t, a, node)
-			waitsUnsealed(t, a, "a decommission contradicted since")
+			waitsUnsealed(t, a, "0a", "a decommission contradicted since")
 			if !decommissionProven(t, a, node) {
 				t.Fatal("the release's contradiction rewrote the decommission other readers read")
 			}
 			if _, err := a.Reconcile(ctx, node, nil); err != nil {
 				t.Fatal(err)
 			}
-			waitsUnsealed(t, a, "an empty inventory after the contradiction")
+			waitsUnsealed(t, a, "0a", "an empty inventory after the contradiction")
 			if err := a.ForgetEveryNode(ctx); err != nil {
 				t.Fatal(err)
 			}
-			waitsUnsealed(t, a, "a control-plane start after the contradiction")
+			waitsUnsealed(t, a, "0a", "a control-plane start after the contradiction")
 
 			registerPoolNode(t, a, node)
 			decommissionOnProof(t, a, &now, barrier, node)
@@ -535,7 +545,7 @@ func TestAnythingHoldingAHostKeepsItsReleaseUnsealed(t *testing.T) {
 				}
 			}
 			setLease(hold.phase, hold.onNode)
-			waitsUnsealed(t, a, name)
+			waitsUnsealed(t, a, "0a", name)
 
 			setLease(PhaseDone, hold.onNode)
 			if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
