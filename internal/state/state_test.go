@@ -1181,6 +1181,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 			`ALTER TABLE job_history DROP COLUMN github_scale_set_assigned_at`,
 			`ALTER TABLE job_history DROP COLUMN github_runner_assigned_at`,
 			`ALTER TABLE job_history DROP COLUMN bought_at`,
+			`DROP TABLE lease_holds`,
 			`DROP TABLE job_egress`,
 			`DROP TABLE job_test_results`,
 			`ALTER TABLE job_history DROP COLUMN head_sha`,
@@ -1302,6 +1303,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	requireIndex(t, upgraded, "job_guest_reports_recorded_at")
 	requireIndex(t, upgraded, "job_egress_recorded_at")
 	requireIndex(t, upgraded, "job_test_results_recorded_at")
+	requireIndex(t, upgraded, "lease_holds_holding")
 	requireIndex(t, upgraded, "job_history_started_idx")
 	requireIndex(t, upgraded, "job_history_rerun_decided_idx")
 	requireIndex(t, upgraded, "job_history_running_idx")

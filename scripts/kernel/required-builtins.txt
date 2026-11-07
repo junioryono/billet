@@ -88,6 +88,8 @@ VIRTIO
 VIRTIO_MMIO
 VIRTIO_BLK
 VIRTIO_NET
+VIRTIO_VSOCKETS
+VSOCKETS
 VIRTIO_PCI_LEGACY
 
 # apparmor: ubuntu's userspace expects it and docker's default profile needs it.

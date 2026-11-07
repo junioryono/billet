@@ -1336,6 +1336,15 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	// re-registration never runs beside a launch begun under the last one. The
 	// wait comes before the cancel: the other order would cancel what it waits for.
 	launches := newLaunchSet(opts.LaunchConcurrency)
+	// A SESSION ENDS WITH THIS serve, not only with ctx: a node superseded or unregistered returns
+	// from here with ctx still live, and an idle terminal must not hold up what its caller does
+	// next. Cancelled before the join, once the reads that start sessions have finished.
+	var sessions sync.WaitGroup
+	defer sessions.Wait()
+
+	sessionCtx, endSessions := context.WithCancel(ctx)
+	defer endSessions()
+
 	reads := newLaunchSet(logReadsAtOnce)
 	defer reads.wait()
 
@@ -1477,6 +1486,26 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			if !reads.tryStart(run) {
 				err := reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd, nodeapi.CommandResult{
 					ID: cmd.ID, Error: "this node is reading as many logs as it may; ask again",
+				})
+				if err != nil {
+					return err
+				}
+			}
+
+			continue
+		}
+
+		// AN ATTACH THE SAME: reaching a guest should not wait out a destroy, nor one wait
+		// for it, and its session runs on beside everything once it is joined.
+		if cmd.Kind == nodeapi.CommandAttach {
+			attach := func() error {
+				return reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd,
+					attachGuest(sessionCtx, c, compute, cmd, &sessions))
+			}
+
+			if !reads.tryStart(attach) {
+				err := reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd, nodeapi.CommandResult{
+					ID: cmd.ID, Error: "this node is opening as many terminals as it may; ask again",
 				})
 				if err != nil {
 					return err

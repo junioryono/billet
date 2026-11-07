@@ -1105,6 +1105,26 @@ else
         would reach the node only on SIGTERM, after GitHub recorded the job"
 fi
 
+# THE JOB-STARTED HOOK the agent names wherever it started the terminal server, and the unit it
+# starts. The hook runs inside the job and writes to its log, so it is this tree's, byte for byte.
+JOB_STARTED_HOOK_SOURCE="${JOB_STARTED_HOOK_SOURCE:-$(cd "$(dirname "$0")/.." && pwd)/internal/guestassets/job-started-hook.sh}"
+JOB_STARTED_HOOK="$MNT/usr/local/lib/billet/job-started-hook.sh"
+if [ -f "$JOB_STARTED_HOOK" ] && [ -x "$JOB_STARTED_HOOK" ] &&
+	cmp -s "$JOB_STARTED_HOOK_SOURCE" "$JOB_STARTED_HOOK"; then
+	pass "the job-started hook says how to attach to a job"
+else
+	fail "no executable /usr/local/lib/billet/job-started-hook.sh identical to
+        internal/guestassets/job-started-hook.sh; a job's log would not say how to reach its VM"
+fi
+GUEST_ATTACH_UNIT="$MNT/etc/systemd/system/billet-guest-attach.service"
+if [ -f "$GUEST_ATTACH_UNIT" ] &&
+	grep -Fxq 'ExecStart=/opt/billet/bin/billet guest attach-serve' "$GUEST_ATTACH_UNIT"; then
+	pass "the terminal server is a unit of its own, which outlives the runner"
+else
+	fail "no billet-guest-attach.service running billet guest attach-serve; a job on a tier with
+        debug.attach could not be attached to, and a held VM would serve nothing"
+fi
+
 DOCKER_CACHE="$MNT/usr/local/bin/billet-docker-cache"
 if [ -x "$DOCKER_CACHE" ] && grep -Fq '[ "$status" = 100 ]' "$DOCKER_CACHE" &&
 	grep -Fq '/v1/docker-store' "$DOCKER_CACHE" &&

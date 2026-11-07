@@ -1,4 +1,4 @@
--- migration 77: job_alerts
+-- migration 78: job_alerts
 --
 -- WHAT `server.alerts` HAS DECIDED AND WHAT IT STILL OWES (#537). The ledger holds it
 -- rather than the process, so a restart neither repeats a notice nor forgets one, and

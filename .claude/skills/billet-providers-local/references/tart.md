@@ -2,7 +2,7 @@
 
 Part of the `billet-providers-local` skill. Each rule is stated in full, with the measurement or incident behind it.
 
-**`tart run` is the VM, and nothing believes its exit status.** It starts detached in its own session so a billet restart does not kill guests; state is read back through `tart list`. A VM that refuses to start used to surface as a delivery timeout, so `Launch` waits for the VM to be running and quotes the host's own reason from the run log.
+**`tart run` is the VM, and nothing believes its exit status.** It starts detached in its own session so a billet restart does not kill guests; state is read back through `tart list`. A VM that refuses to start used to surface as a delivery timeout, so `Launch` waits for the VM to be running and quotes the host's own reason from the run log. The run log lives under billet's own directory, `<TART_HOME>/.billet/run-logs/<name>.log`, truncated at each start and removed with its VM, and never inside the VM's bundle: written there, a macOS guest on an ASIF disk failed to start under billet most of the time with "Internal Virtualization error" while every hand launch booted it (measured-facts, 2026-11-07).
 
 **Tart has no labels, so ownership is a marker file and the order is the invariant.** Clone under a `.staging` name, write and fsync the marker, then `tart rename` to the lease name; a lease-named VM always has provable ownership, `List` refuses to guess about one that does not, and two deployments on one Mac cannot destroy each other's guests. `checkSpec` reserves the `.staging` suffix so nothing can be launched under it.
 

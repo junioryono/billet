@@ -6,10 +6,10 @@ import (
 	"testing"
 )
 
-// rewoundBeforePoolJoin is a SQLite ledger migrated and then taken back to version 75,
-// so migration 76 runs over the rows a test seeds: rewindNewest takes back the
-// newest, which is no longer 76, and 76's own statements are undone after it.
-func rewoundBeforePoolJoin(t *testing.T) string {
+// ledgerAt75 is a ledger migrated to 75 and no further, so the next open applies
+// migration 76 and every one after it. rewindNewest takes back the newest, which is
+// alerts' 78, and then 77 and 76 are undone.
+func ledgerAt75(t *testing.T) string {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -23,6 +23,8 @@ func rewoundBeforePoolJoin(t *testing.T) string {
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			`DROP TABLE lease_holds`,
+			`DELETE FROM schema_migrations WHERE version = 77`,
 			`ALTER TABLE pool_orders DROP COLUMN join_hold`,
 			`ALTER TABLE pool_orders DROP COLUMN node_cert_serial`,
 			`ALTER TABLE pool_orders DROP COLUMN node_fingerprint`,
@@ -57,7 +59,7 @@ func rewoundBeforePoolJoin(t *testing.T) string {
 func TestMigration76BindsAnOrdersEarlierTokensAndRequests(t *testing.T) {
 	t.Parallel()
 
-	dir := rewoundBeforePoolJoin(t)
+	dir := ledgerAt75(t)
 
 	pools, err := newSQLiteBackend(dir).dataSources()
 	if err != nil {

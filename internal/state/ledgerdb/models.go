@@ -151,6 +151,15 @@ type JobUsage struct {
 	TapReceivedBytes       sql.NullInt64
 }
 
+type LeaseHold struct {
+	LeaseID string
+	Tier    string
+	HeldAt  string
+	UntilAt string
+	EndedAt string
+	EndedBy string
+}
+
 type ListenerCapacity struct {
 	Tier       string
 	ObservedAt string

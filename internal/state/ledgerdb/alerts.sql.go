@@ -516,7 +516,7 @@ type ListRunningJobsForAlertsRow struct {
 }
 
 // Alerts (#537): which jobs `server.alerts` looks at, what it has decided, and what
-// it owes a destination. Migration 77 holds why each table is shaped as it is.
+// it owes a destination. Migration 78 holds why each table is shaped as it is.
 // The jobs with no result yet that started since a moment, oldest first and bounded,
 // with what a rule is judged against. The run is the one that started, as
 // ListJobsAwaitingQueueTime reads it. finished_at says the lease is archived though
