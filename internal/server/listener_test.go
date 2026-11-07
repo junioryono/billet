@@ -2284,6 +2284,14 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 	t.Helper()
 
 	a := newBareAllocator(t, limits, tiers, opts...)
+	registerDefaultHosts(t, a)
+
+	return a
+}
+
+// registerDefaultHosts gives an allocator newAllocator's hosts.
+func registerDefaultHosts(t *testing.T, a *alloc.Allocator) {
+	t.Helper()
 
 	// A HOST, BECAUSE CAPACITY IS PER MACHINE NOW. A deployment with no
 	// registered node can place nothing, so every tier advertises zero — correct,
@@ -2305,8 +2313,6 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 			t.Fatalf("registering the default host: %v", err)
 		}
 	}
-
-	return a
 }
 
 // newBareAllocator is an allocator with NO hosts, for a test that declares its

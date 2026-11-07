@@ -48,6 +48,12 @@ func leaseHoldOf(row ledgerdb.LeaseHold) LeaseHold {
 // OpenLeaseHold opens a lease's hold until until and answers the row, whatever it was: a
 // hold already open keeps the bound it opened with, so nothing can extend one, and one that
 // ended stays ended.
+//
+// A NEW HOLD IS REFUSED ON A SEALED DEPLOYMENT, with ErrAdmissionSealed, and the seal is read in
+// the transaction that would write the hold, so a seal committed a moment before cannot be
+// missed: someone wants the deployment empty, and a failed job's VM kept for an hour is not what
+// their drain is waiting for. A ledger that cannot say is sealed for this. A hold that already
+// exists is answered as it is.
 func (a *Allocator) OpenLeaseHold(ctx context.Context, leaseID, tier string, until time.Time) (LeaseHold, error) {
 	// READ FIRST: the cleanup clock asks on every pass, and only the first needs the writer.
 	out, err := a.LeaseHoldOf(ctx, leaseID)
@@ -56,13 +62,30 @@ func (a *Allocator) OpenLeaseHold(ctx context.Context, leaseID, tier string, unt
 	}
 
 	err = a.db.Tx(ctx, func(tx *sql.Tx) error {
+		// AGAIN UNDER THE WRITER, since the read above was outside it: a hold another pass
+		// opened meanwhile is the answer, sealed deployment or not.
+		row, err := state.ReadQueries(tx).ReadLeaseHold(ctx, leaseID)
+		if err == nil {
+			out = leaseHoldOf(row)
+
+			return nil
+		}
+
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("alloc: read the hold of lease %s: %w", leaseID, err)
+		}
+
+		if err := refuseIfSealed(ctx, tx); err != nil {
+			return err
+		}
+
 		if err := state.WriteQueries(tx).OpenLeaseHold(ctx, ledgerdb.OpenLeaseHoldParams{
 			LeaseID: leaseID, Tier: tier, HeldAt: ts(a.now()), UntilAt: ts(until),
 		}); err != nil {
 			return fmt.Errorf("alloc: open the hold of lease %s: %w", leaseID, err)
 		}
 
-		row, err := state.ReadQueries(tx).ReadLeaseHold(ctx, leaseID)
+		row, err = state.ReadQueries(tx).ReadLeaseHold(ctx, leaseID)
 		if err != nil {
 			return fmt.Errorf("alloc: read the hold of lease %s: %w", leaseID, err)
 		}
