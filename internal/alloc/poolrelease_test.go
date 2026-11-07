@@ -12,20 +12,6 @@ import (
 	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
-// joinedOrder places an order, admits a node from it with certificate serial, and
-// registers that node as a placeable x64 Firecracker host.
-func joinedOrder(t *testing.T, a *Allocator, id, serial string) string {
-	t.Helper()
-	tok := placedOrder(t, a, id)
-	if _, err := a.AdmitPoolEnrollment(t.Context(), admission(t, a, id, "SHA256:"+id, tok, serial)); err != nil {
-		t.Fatalf("admit %s: %v", id, err)
-	}
-	node := PoolNodeName(id)
-	registerArchNode(t, a, node, config.ArchX64)
-
-	return node
-}
-
 func placeableHosts(t *testing.T, a *Allocator) int {
 	t.Helper()
 	_, _, hosts, err := a.PlaceableContribution(t.Context())
@@ -102,47 +88,74 @@ func TestAHostACertificateWasIssuedForIsNotUnjoined(t *testing.T) {
 	}
 }
 
-// decommissionedOnProof marks a node as `billet nodes decommission` does on the compute
-// barrier's proof that it runs nothing.
-func decommissionedOnProof(t *testing.T, a *Allocator, node string) {
+// registerPoolNode registers a pool host's node as a placeable x64 Firecracker host that
+// answers the compute barrier.
+func registerPoolNode(t *testing.T, a *Allocator, node string) {
 	t.Helper()
-	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(t.Context(),
-			`UPDATE nodes SET decommission_proven = 1, live = 0, drained = 1 WHERE name = $1`, node)
+	if _, err := a.RegisterNode(t.Context(), NodeRegistration{Name: node, Provider: config.ProviderFirecracker,
+		VCPU: 8, Memory: 32 * config.GiB, Architectures: []config.Arch{config.ArchX64},
+		WireMin: 12, WireMax: BarrierWireVersion, WireVersion: BarrierWireVersion}); err != nil {
+		t.Fatalf("register %s: %v", node, err)
+	}
+}
 
-		return err
-	}); err != nil {
-		t.Fatal(err)
+// joinedPoolNode places an order, admits a node from it with certificate serial, and
+// registers that node.
+func joinedPoolNode(t *testing.T, a *Allocator, id, serial string) string {
+	t.Helper()
+	tok := placedOrder(t, a, id)
+	if _, err := a.AdmitPoolEnrollment(t.Context(), admission(t, a, id, "SHA256:"+id, tok, serial)); err != nil {
+		t.Fatalf("admit %s: %v", id, err)
+	}
+	node := PoolNodeName(id)
+	registerPoolNode(t, a, node)
+
+	return node
+}
+
+// decommissionOnProof takes a host the whole way `billet nodes decommission` asks for:
+// two empty answers to the compute barrier spanning its grace, the node stopped, and the
+// decommission, which must record itself as proved.
+func decommissionOnProof(t *testing.T, a *Allocator, now *time.Time, barrier ComputeBarrier, node string) {
+	t.Helper()
+	observeNode(t, a, barrier, node, true)
+	*now = now.Add(computeAbsenceGrace)
+	observeNode(t, a, barrier, node, true)
+	if err := a.NodeGone(t.Context(), node, fenceOf(t, a, node).Epoch); err != nil {
+		t.Fatalf("stop %s: %v", node, err)
+	}
+	proven, err := a.Decommission(t.Context(), DecommissionRequest{Node: node, Actor: "ops"})
+	if err != nil || !proven {
+		t.Fatalf("decommission %s on the barrier's proof: proved %v, %v", node, proven, err)
+	}
+}
+
+// waitsUnsealed asserts that sealing order pa is refused and writes nothing: the order
+// stays placed and its node's certificate, serial 0a, stays unrevoked.
+func waitsUnsealed(t *testing.T, a *Allocator, why string) {
+	t.Helper()
+	const id, serial = "pa", "0a"
+	if _, err := a.SealPoolRelease(t.Context(), id); !errors.Is(err, ErrPoolReleaseWaits) {
+		t.Fatalf("%s: sealing answered %v", why, err)
+	}
+	if o := readOrder(t, a, id); o.State != PoolPlaced {
+		t.Fatalf("%s: a refused seal wrote %s", why, o.State)
+	}
+	if revoked, err := a.CertRevoked(t.Context(), serial); err != nil || revoked {
+		t.Fatalf("%s: a refused seal revoked the certificate: %v, %v", why, revoked, err)
 	}
 }
 
 // A JOINED HOST LEAVES PLACEMENT WHEN ITS RELEASE IS ASKED FOR, AND IS SEALED ONLY ON
-// PROOF IT RUNS NOTHING: no lease, and a decommission on the compute barrier's proof
-// that no inventory of its current registration since contradicts. An inventory alone,
-// however empty, is never that proof. The seal revokes its certificate first, and a
-// registration after it does not put the host back into placement.
+// PROOF IT RUNS NOTHING: no lease, and a decommission on the compute barrier's proof. An
+// inventory alone, however empty, is never that proof. The seal revokes its certificate
+// first, and a registration after it does not put the host back into placement.
 func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
 	a := poolAllocator(t, &now)
 	ctx := t.Context()
-	node := joinedOrder(t, a, "pa", "0a")
-	register := func() {
-		t.Helper()
-		if _, err := a.RegisterNode(ctx, NodeRegistration{Name: node, Provider: config.ProviderFirecracker, VCPU: 8,
-			Memory: 32 * config.GiB, Architectures: []config.Arch{config.ArchX64}}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	waits := func(why string) {
-		t.Helper()
-		if _, err := a.SealPoolRelease(ctx, "pa"); !errors.Is(err, ErrPoolReleaseWaits) {
-			t.Fatalf("%s: sealing answered %v", why, err)
-		}
-		if o := readOrder(t, a, "pa"); o.State != PoolPlaced {
-			t.Fatalf("%s: a refused seal wrote %s", why, o.State)
-		}
-	}
+	node := joinedPoolNode(t, a, "pa", "0a")
 
 	leases, err := a.Escrow(ctx, "intel", 1)
 	if err != nil || len(leases) != 1 {
@@ -162,10 +175,11 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	if more, err := a.Escrow(ctx, "intel", 1); err != nil || len(more) != 0 {
 		t.Fatalf("placed %d more leases on a host being released: %v", len(more), err)
 	}
-	register()
+	registerPoolNode(t, a, node)
 	if placeableHosts(t, a) != 0 {
 		t.Fatal("a registration put a host whose release was asked for back into placement")
 	}
+	waitsUnsealed(t, a, "a lease on the host")
 
 	for _, l := range leases {
 		if err := a.Release(ctx, l.ID, l.Epoch, PhaseDone); err != nil {
@@ -176,17 +190,9 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	if _, err := a.Reconcile(ctx, node, nil); err != nil {
 		t.Fatal(err)
 	}
-	waits("an empty inventory and nothing else")
+	waitsUnsealed(t, a, "an empty inventory and nothing else")
 
-	decommissionedOnProof(t, a, node)
-	if _, err := a.Reconcile(ctx, node, []string{"some-instance"}); err != nil {
-		t.Fatal(err)
-	}
-	waits("a decommission an inventory since contradicts")
-	if _, err := a.Reconcile(ctx, node, nil); err != nil {
-		t.Fatal(err)
-	}
-
+	decommissionOnProof(t, a, &now, requestBarrier(t, a), node)
 	proof, err := a.SealPoolRelease(ctx, "pa")
 	if err != nil || proof.For("i-pa") != nil {
 		t.Fatalf("sealing a host proved to run nothing: %v", err)
@@ -197,7 +203,7 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	if revoked, err := a.CertRevoked(ctx, "0a"); err != nil || !revoked {
 		t.Fatalf("the host's certificate was not revoked: %v, %v", revoked, err)
 	}
-	register()
+	registerPoolNode(t, a, node)
 	if placeableHosts(t, a) != 0 {
 		t.Fatal("a registration put a sealed host back into placement")
 	}
@@ -216,6 +222,97 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	}
 	if o := readOrder(t, a, "pa"); o.State != PoolGone || o.Reason != "its source said the host is gone" {
 		t.Fatalf("the order: %+v, want gone on its source's word", o)
+	}
+}
+
+// A DECOMMISSION AN INVENTORY CONTRADICTS STAYS CONTRADICTED: neither a later empty report
+// nor a control-plane start, which forgets every inventory, makes it proof again; only a
+// fresh decommission on the barrier's proof does.
+func TestADecommissionAnInventoryContradictedStaysContradicted(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := joinedPoolNode(t, a, "pa", "0a")
+	if _, err := a.RequestPoolRelease(ctx, "pa", "the pool shrinks"); err != nil {
+		t.Fatal(err)
+	}
+	barrier := requestBarrier(t, a)
+	decommissionOnProof(t, a, &now, barrier, node)
+
+	if _, err := a.Reconcile(ctx, node, []string{"some-instance"}); err != nil {
+		t.Fatal(err)
+	}
+	waitsUnsealed(t, a, "a decommission an inventory since contradicts")
+	if _, err := a.Reconcile(ctx, node, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitsUnsealed(t, a, "an empty inventory after the contradiction")
+	if err := a.ForgetEveryNode(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitsUnsealed(t, a, "a control-plane start after the contradiction")
+
+	registerPoolNode(t, a, node)
+	decommissionOnProof(t, a, &now, barrier, node)
+	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+		t.Fatalf("sealing on a fresh decommission: %v", err)
+	}
+}
+
+// ANYTHING STILL HOLDING A HOST KEEPS ITS RELEASE UNSEALED, whatever else is proved: an
+// escrow aimed at it, a quarantined lease, a lease in custody.
+func TestAnythingHoldingAHostKeepsItsReleaseUnsealed(t *testing.T) {
+	t.Parallel()
+	for name, hold := range map[string]struct {
+		phase  Phase
+		onNode bool
+	}{
+		"an escrow aimed at it": {PhaseCapacity, false},
+		"a quarantined lease":   {PhaseQuarantine, true},
+		"a lease in custody":    {PhaseCustody, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+			a := poolAllocator(t, &now)
+			ctx := t.Context()
+			node := joinedPoolNode(t, a, "pa", "0a")
+			leases, err := a.Escrow(ctx, "intel", 1)
+			if err != nil || len(leases) != 1 {
+				t.Fatalf("a lease on the host: %v, %v", leases, err)
+			}
+			if _, err := a.RequestPoolRelease(ctx, "pa", "the pool shrinks"); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.Release(ctx, leases[0].ID, leases[0].Epoch, PhaseDone); err != nil {
+				t.Fatal(err)
+			}
+			decommissionOnProof(t, a, &now, requestBarrier(t, a), node)
+
+			// BY HAND, because nothing billet does puts a lease on a host decommissioned on
+			// proof; this isolates the seal's own count from the decommission's.
+			setLease := func(phase Phase, onNode bool) {
+				t.Helper()
+				held := sql.NullString{String: node, Valid: onNode}
+				if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+					_, err := tx.ExecContext(ctx,
+						`UPDATE leases SET phase = $1, node = $2, target_node = $3 WHERE id = $4`,
+						string(phase), held, node, leases[0].ID)
+
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			setLease(hold.phase, hold.onNode)
+			waitsUnsealed(t, a, name)
+
+			setLease(PhaseDone, hold.onNode)
+			if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+				t.Fatalf("sealing once %s ended: %v", name, err)
+			}
+		})
 	}
 }
 

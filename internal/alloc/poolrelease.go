@@ -17,6 +17,11 @@ import (
 // nothing was written, and the pool asks again at its next step.
 var ErrPoolReleaseWaits = errors.New("alloc: the pool host's release waits for its proof")
 
+// ErrPoolReleaseAsked is a release asked for again of a joined host already out of
+// placement. It wraps ErrPoolOrderMoved; the caller may try the seal itself
+// (SealPoolRelease), which is how a person seals a release with no pool configured.
+var ErrPoolReleaseAsked = errors.New("alloc: the pool host's release was asked for already")
+
 // RequestPoolRelease asks for a placed host's release on a person's word (ADR-030), and
 // answers whether the order was sealed by the asking.
 //
@@ -51,7 +56,7 @@ func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string
 			return fmt.Errorf("%w: pool order %s is %s; only a placed host is released", ErrPoolOrderMoved,
 				order, row.State)
 		case row.ReleaseRequestedAt != "":
-			return fmt.Errorf("%w: pool order %s's release was asked for already", ErrPoolOrderMoved, order)
+			return fmt.Errorf("%w: %w: pool order %s", ErrPoolOrderMoved, ErrPoolReleaseAsked, order)
 		}
 
 		if row.NodeName != "" {

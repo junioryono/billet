@@ -815,6 +815,14 @@ func recordInventoryTx(
 		return fmt.Errorf("alloc: record what node %s reports running: %w", node, err)
 	}
 
+	if running > 0 {
+		if err := q.ContradictNodeDecommission(ctx, ledgerdb.ContradictNodeDecommissionParams{
+			Name: node, Epoch: epoch,
+		}); err != nil {
+			return fmt.Errorf("alloc: withdraw the proof of node %s's decommission: %w", node, err)
+		}
+	}
+
 	return nil
 }
 

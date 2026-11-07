@@ -372,6 +372,7 @@ type WriteOps interface {
 	UpsertComputeBarrier(ctx context.Context, arg ledgerdb.UpsertComputeBarrierParams) error
 	UpsertIssuedEnrollment(ctx context.Context, arg ledgerdb.UpsertIssuedEnrollmentParams) error
 	UpsertNodeInventory(ctx context.Context, arg ledgerdb.UpsertNodeInventoryParams) error
+	ContradictNodeDecommission(ctx context.Context, arg ledgerdb.ContradictNodeDecommissionParams) error
 	UpsertNodeRegistration(ctx context.Context, arg ledgerdb.UpsertNodeRegistrationParams) (int64, error)
 	UpsertPendingCompletion(ctx context.Context, arg ledgerdb.UpsertPendingCompletionParams) error
 	UpsertScaleSet(ctx context.Context, arg ledgerdb.UpsertScaleSetParams) error

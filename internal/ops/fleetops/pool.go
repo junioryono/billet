@@ -85,7 +85,7 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 		if o := &orders[i]; o.State == alloc.PoolPlaced && !o.ReleaseRequested.IsZero() {
 			if !draining {
 				fmt.Fprintf(env.Stdout, "\nDraining for release (ADR-030): out of placement, and sealed, revoked and released "+
-					"once the ledger shows the host holds nothing.\n")
+					"once nothing holds the host and its node is decommissioned on proof (docs/operating/bare-metal-pool.md).\n")
 				draining = true
 			}
 			fmt.Fprintf(env.Stdout, "  %s since %s: %s\n", o.ID, o.ReleaseRequested.UTC().Format(time.RFC3339),
@@ -191,6 +191,9 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 	}
 	defer closeDB()
 	sealed, err := a.RequestPoolRelease(ctx, order, oneLine(*reason))
+	if errors.Is(err, alloc.ErrPoolReleaseAsked) {
+		return sealPoolRelease(ctx, env, a, order)
+	}
 	if err != nil {
 		return err
 	}
@@ -200,9 +203,30 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 
 		return nil
 	}
-	fmt.Fprintf(env.Stdout, "Released %s from placement. Once the ledger shows its host holds nothing, the pool seals "+
-		"it, revokes its node's certificates and asks its source to take it back; `billet pool` shows where it is.\n",
-		order)
+	fmt.Fprintf(env.Stdout, "Released %s from placement. Once nothing holds its host and its node is decommissioned "+
+		"on proof (`billet nodes decommission %s`), the pool seals it, revokes its node's certificates and asks its "+
+		"source to take it back, or `billet pool release %s` again seals it; `billet pool` shows where it is.\n",
+		order, alloc.PoolNodeName(order), order)
+
+	return nil
+}
+
+// sealPoolRelease seals a release asked for already, on the ledger's proof that its host
+// runs nothing: the same transaction the pool's step seals with, so a deployment with no
+// pool configured, or one whose pool is not running, can still finish a release.
+func sealPoolRelease(ctx context.Context, env cli.Env, a *alloc.Allocator, order string) error {
+	if _, err := a.SealPoolRelease(ctx, order); err != nil {
+		if errors.Is(err, alloc.ErrPoolReleaseWaits) {
+			return fmt.Errorf("billet pool release: %s is out of placement and cannot be sealed yet: %w. Until "+
+				"nothing holds it and `billet nodes decommission %s` has said it was proved, it is not; "+
+				"docs/operating/bare-metal-pool.md has the procedure", order, err, alloc.PoolNodeName(order))
+		}
+
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "Sealed %s: its host was proved to run nothing and its node's certificates are revoked. "+
+		"The pool's next step asks its source to take the host back; with no pool running, take it back in the "+
+		"source's console and `billet pool close` it.\n", order)
 
 	return nil
 }

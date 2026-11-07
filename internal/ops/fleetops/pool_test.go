@@ -222,3 +222,83 @@ func TestThePoolCommandReleasesAHost(t *testing.T) {
 		t.Fatalf("the listing after a closure: %v\n%s", err, out)
 	}
 }
+
+// A SECOND `billet pool release` OF A HOST ALREADY OUT OF PLACEMENT TRIES THE SEAL ITSELF,
+// so a deployment whose pool is not running can still finish a release: a host admitted
+// but never registered is sealed, and one whose node registered and was never
+// decommissioned on proof is refused with the procedure that proves it.
+func TestASecondReleaseSealsWhatTheLedgerProves(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeCAConfig(t, stateDir)
+	ctx := t.Context()
+	a, closeDB, err := ControlPlaneAllocator(ctx, cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for i, id := range []string{"p-quiet", "p-live"} {
+		if err := a.RecordPoolOrder(ctx, alloc.PoolOrder{
+			ID: id, Source: "aws-metal", Scope: "aws:us-west-2:subnet-0abc:us-west-2a", Shape: "z1d.metal",
+			Location: "us-west-2a", Arch: config.ArchX64,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.PoolOrderPlaced(ctx, id, "i-"+id); err != nil {
+			t.Fatal(err)
+		}
+		tok, err := a.NewPoolJoinToken(ctx, id, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o, err := a.ReadPoolOrder(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.AdmitPoolEnrollment(ctx, alloc.PoolAdmission{
+			Order: id, Fingerprint: "SHA256:" + id, CSRPEM: "csr", Token: tok, CertPEM: "cert",
+			Serial: string(rune('a' + i)), NotAfter: "2027-11-06T00:00:00Z", Seen: o.Updated,
+		}); err != nil {
+			t.Fatalf("admit %s: %v", id, err)
+		}
+	}
+	if _, err := a.RegisterNode(ctx, alloc.NodeRegistration{Name: alloc.PoolNodeName("p-live"),
+		Provider: config.ProviderFirecracker, VCPU: 8, Memory: 32 * config.GiB,
+		Architectures: []config.Arch{config.ArchX64}}); err != nil {
+		t.Fatal(err)
+	}
+	closeDB()
+
+	for _, id := range []string{"p-quiet", "p-live"} {
+		env, out := poolEnv()
+		if err := Pool(ctx, env, []string{"release", "--config", cfg, "--reason", "the pool shrinks", id}); err != nil ||
+			!strings.Contains(out.String(), "Released "+id+" from placement") {
+			t.Fatalf("the first release of %s: %v\n%s", id, err, out)
+		}
+	}
+	env, out := poolEnv()
+	if err := Pool(ctx, env, []string{"release", "--config", cfg, "--reason", "again", "p-quiet"}); err != nil ||
+		!strings.Contains(out.String(), "Sealed p-quiet: its host was proved to run nothing") {
+		t.Fatalf("the second release of a host whose node never registered: %v\n%s", err, out)
+	}
+	err = Pool(ctx, env, []string{"release", "--config", cfg, "--reason", "again", "p-live"})
+	if err == nil || !strings.Contains(err.Error(), "cannot be sealed yet") ||
+		!strings.Contains(err.Error(), "billet nodes decommission pool-p-live") {
+		t.Fatalf("the second release of a registered host never decommissioned answered %v", err)
+	}
+
+	env, out = poolEnv()
+	if err := Pool(ctx, env, []string{"--config", cfg}); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	rows := map[string][]string{}
+	for _, line := range strings.Split(out.String(), "\n") {
+		if f := strings.Fields(line); len(f) > 0 && rows[f[0]] == nil {
+			rows[f[0]] = f
+		}
+	}
+	if r := rows["p-quiet"]; len(r) < 7 || r[6] != "sealed" {
+		t.Fatalf("the p-quiet row = %q\n%s", r, out)
+	}
+	if r := rows["p-live"]; len(r) < 7 || r[6] != "draining" {
+		t.Fatalf("the p-live row = %q\n%s", r, out)
+	}
+}
