@@ -71,6 +71,7 @@ import (
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/usage"
 )
 
@@ -336,14 +337,17 @@ type Provider struct {
 	// nothing sets it outside tests, which publish a VM there to prove the absence is
 	// asked again under the lock.
 	beforeRunLogLock func()
-	// startGate keeps this provider's own `tart list` out of the window between a VM's
-	// `tart run` and Virtualization.framework holding its disk: each start holds it
-	// shared, and a listing exclusively. See bootVM.
+	// startGate keeps this provider's own `tart list` out of the window between an ASIF
+	// VM's `tart run` and Virtualization.framework holding its disk: each such start holds
+	// it shared, and a listing exclusively. See bootVM.
 	startGate sync.RWMutex
 	// diskAttached answers whether a Virtualization.framework process holds the VM's
 	// disk open. Nil is the real answer, through lsof and processPath; a test whose
 	// stub runs no VM stands in for it.
 	diskAttached func(ctx context.Context, name string) (bool, error)
+	// afterRunStart runs just after a start spawns `tart run`, and nothing sets it outside
+	// tests, which ask there whether the gate is already the start's.
+	afterRunStart func(name string)
 	// installer installs the records. Its zero value is the real one, and a test fails a
 	// step of it.
 	installer durablefile.Installer
@@ -1115,31 +1119,100 @@ func (p *Provider) startDetachedHolding(name string, held []*os.File, netFlags .
 	return err
 }
 
-// bootVM starts the VM's `tart run` and returns once Virtualization.framework holds its
-// disk open, or says why it never did.
+// bootVM starts the VM's `tart run`, and for an ASIF disk returns once
+// Virtualization.framework holds that disk open, or says why it never did.
 //
-// NO `tart list` RUNS IN THIS WINDOW, from this provider. `tart list` and `tart get` size
-// every VM they show, and an ASIF disk is sized by running `diskutil image info` on it
-// (tart 2.41.1: List.swift, VMDirectory.diskSizeBytes, Diskutil.imageInfo), while `tart
-// run` takes the lock that makes `tart list` say running before it asks the framework to
-// start the VM and attach that disk (Run.swift). A `diskutil` read landing on the attach
-// failed the start with "Internal Virtualization error" every time it was tried on
-// purpose (a fleet Mac, macOS 27.2, 2026-11-07: a loop of `diskutil image info` every
-// 0.3 s from the start of a hand-run `tart run` failed it 2 of 2, none booted 2 of 2), and
-// billet's own polling of `tart list` from the first instant failed most launches of an
-// ASIF macOS guest. So the start holds startGate shared until the disk is attached, and
-// every listing this provider makes takes it exclusively. A raw disk is only stat'ed, but
-// the same order costs it nothing. Another process running `tart list` meanwhile (another
-// deployment, an operator, `billet check`) is outside what this can hold.
+// NO `tart list` RUNS WHILE AN ASIF DISK IS BEING ATTACHED, from this provider. `tart
+// list` and `tart get` size every VM they show, and an ASIF disk is sized by running
+// `diskutil image info` on it (tart 2.41.1: List.swift, VMDirectory.diskSizeBytes,
+// Diskutil.imageInfo), while `tart run` takes the lock that makes `tart list` say running
+// before it asks the framework to start the VM and attach that disk (Run.swift). A
+// `diskutil` read landing on the attach failed the start with "Internal Virtualization
+// error" every time it was tried on purpose (a fleet Mac, macOS 27.2, 2026-11-07: a loop
+// of `diskutil image info` every 0.3 s from the start of a hand-run `tart run` failed it
+// 2 of 2, none booted 2 of 2), and billet's own polling of `tart list` from the first
+// instant failed most launches of an ASIF macOS guest. A raw disk is only stat'ed, so its
+// start takes none of this and needs no process to be visible.
+//
+// THE GATE IS THE START'S, NOT THE CALLER'S. The start holds startGate shared from before
+// `tart run` until the disk is attached, the run ends, or the start window does, in a
+// goroutine of its own, because the run is detached: a caller that gives up has not
+// stopped it attaching. Every listing this provider makes takes the gate exclusively.
+// Another process running `tart list` meanwhile (another deployment, an operator, `billet
+// check`) is outside what this can hold.
 func (p *Provider) bootVM(ctx context.Context, name string, held []*os.File, netFlags ...string) error {
-	p.startGate.RLock()
-	defer p.startGate.RUnlock()
-
-	exited, err := p.startRun(name, held, netFlags...)
+	asif, err := p.diskIsASIF(name)
 	if err != nil {
 		return err
 	}
 
+	if !asif {
+		_, err := p.startRun(name, held, netFlags...)
+
+		return err
+	}
+
+	if err := p.enterStart(ctx); err != nil {
+		return err
+	}
+
+	// NOTHING IS STARTED FOR A CALLER THAT HAS GONE while the gate was awaited.
+	if err := ctx.Err(); err != nil {
+		p.startGate.RUnlock()
+
+		return fmt.Errorf("start %s: %w", name, err)
+	}
+
+	exited, err := p.startRun(name, held, netFlags...)
+	if err != nil {
+		p.startGate.RUnlock()
+
+		return err
+	}
+
+	if p.afterRunStart != nil {
+		p.afterRunStart(name)
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		defer p.startGate.RUnlock()
+
+		done <- p.awaitAttach(name, exited)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for %s to attach its disk: %w", name, ctx.Err())
+	}
+}
+
+// enterStart takes the start gate shared, waiting for a listing in progress as long as
+// the caller does.
+func (p *Provider) enterStart(ctx context.Context) error {
+	retry := time.NewTimer(startGatePoll)
+	defer retry.Stop()
+
+	for !p.startGate.TryRLock() {
+		retry.Reset(startGatePoll)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for a listing to finish before a start: %w", ctx.Err())
+		case <-retry.C:
+		}
+	}
+
+	return nil
+}
+
+// awaitAttach waits, on the start window's clock and no caller's, until the VM's disk is
+// attached or its run has ended. Each look is bounded, so a stuck lsof cannot outlast the
+// window, and a run that ends is noticed between looks.
+func (p *Provider) awaitAttach(name string, exited <-chan struct{}) error {
 	deadline := time.Now().Add(p.startWindow)
 
 	retry := time.NewTimer(p.proveRetry)
@@ -1148,7 +1221,7 @@ func (p *Provider) bootVM(ctx context.Context, name string, held []*os.File, net
 	var lastErr error
 
 	for {
-		attached, err := p.vmHoldsDisk(ctx, name)
+		attached, err := p.lookForAttach(name, deadline)
 		if err == nil && attached {
 			return nil
 		}
@@ -1161,7 +1234,7 @@ func (p *Provider) bootVM(ctx context.Context, name string, held []*os.File, net
 		case <-exited:
 			// ASKED ONCE MORE, because the run may have attached and ended between the
 			// question and this answer; a `tart run` that has ended is a VM that has.
-			if attached, err := p.vmHoldsDisk(ctx, name); err == nil && attached {
+			if attached, err := p.lookForAttach(name, time.Now().Add(attachLook)); err == nil && attached {
 				return nil
 			}
 
@@ -1181,12 +1254,45 @@ func (p *Provider) bootVM(ctx context.Context, name string, held []*os.File, net
 		retry.Reset(p.proveRetry)
 
 		select {
-		case <-ctx.Done():
-			return fmt.Errorf("waiting for %s to attach its disk: %w", name, ctx.Err())
 		case <-exited:
 		case <-retry.C:
 		}
 	}
+}
+
+// attachLook bounds one look at whether a disk is attached.
+const attachLook = 10 * time.Second
+
+// lookForAttach is one bounded look, ending at the earlier of attachLook and deadline.
+func (p *Provider) lookForAttach(name string, deadline time.Time) (bool, error) {
+	if bound := time.Now().Add(attachLook); bound.Before(deadline) {
+		deadline = bound
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	return p.vmHoldsDisk(ctx, name)
+}
+
+// diskIsASIF reads the VM's disk format from its config.json as tart does: `asif` is
+// ASIF, and an absent or other value is raw.
+func (p *Provider) diskIsASIF(name string) (bool, error) {
+	raw, err := regularfile.ReadFile(filepath.Join(p.vmDir(name), "config.json"), maxVMConfig,
+		regularfile.Options{NoFollow: true})
+	if err != nil {
+		return false, fmt.Errorf("read %s's configuration for its disk format: %w", name, err)
+	}
+
+	var cfg struct {
+		DiskFormat string `json:"diskFormat"`
+	}
+
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return false, fmt.Errorf("read %s's configuration for its disk format: %w", name, err)
+	}
+
+	return cfg.DiskFormat == "asif", nil
 }
 
 // vmHoldsDisk answers whether a Virtualization.framework process holds the VM's disk
@@ -1221,10 +1327,13 @@ func (p *Provider) vmHoldsDisk(ctx context.Context, name string) (bool, error) {
 	return false, nil
 }
 
-// withoutStarts runs fn while no VM this provider started is between its `tart run` and
-// its disk being attached, waiting for one at most the start window. See bootVM.
+// withoutStarts runs fn while no ASIF disk this provider started is being attached,
+// waiting for one at most the start window, and refusing past it. See bootVM.
 func (p *Provider) withoutStarts(ctx context.Context, fn func() error) error {
 	deadline := time.Now().Add(p.startWindow)
+
+	retry := time.NewTimer(startGatePoll)
+	defer retry.Stop()
 
 	for !p.startGate.TryLock() {
 		if time.Now().After(deadline) {
@@ -1232,10 +1341,12 @@ func (p *Provider) withoutStarts(ctx context.Context, fn func() error) error {
 				"and listing VMs then sizes that disk under the attach", p.startWindow)
 		}
 
+		retry.Reset(startGatePoll)
+
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("tart: waiting for a VM's start to attach its disk before listing: %w", ctx.Err())
-		case <-time.After(startGatePoll):
+		case <-retry.C:
 		}
 	}
 
@@ -1244,7 +1355,7 @@ func (p *Provider) withoutStarts(ctx context.Context, fn func() error) error {
 	return fn()
 }
 
-// startGatePoll is how often a listing asks again whether a start has attached its disk.
+// startGatePoll is how often a listing, or a start, asks again for the gate.
 const startGatePoll = 50 * time.Millisecond
 
 // startRun starts `tart run` detached, and returns a channel closed when it exits.
