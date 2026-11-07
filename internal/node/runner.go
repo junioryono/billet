@@ -605,6 +605,8 @@ func (r *Runner) Launch(
 		GuestCaches:   guestCaches,
 		// ONLY WITH A SESSION TO REPORT TO, whose bearer is the agent's.
 		GuestMonitor:            cacheToken != "" && r.cache.GuestMonitoring(),
+		GuestAttach:             tier.Attach,
+		GuestHold:               tier.HoldOnFailure,
 		ActionsProxy:            actionsProxy,
 		NpmProxy:                npmProxy,
 		ActionsCAPEM:            actionsCAPEM,

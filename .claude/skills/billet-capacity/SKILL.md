@@ -40,6 +40,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 ### Custody, quarantine, drains and sessions: [references/custody-and-drains.md](references/custody-and-drains.md)
 
+- **A hold delays a destroy a completion already asked for, and never authorises one; a pool member's retirement asks about it too.**
 - **Compute billet cannot account for is a named state, never resold.**
 - **`Recover` runs at every registration, not only at start, so what it finds includes this process's own jobs (#227).**
 - **A drain waits for compute, not for entries.**

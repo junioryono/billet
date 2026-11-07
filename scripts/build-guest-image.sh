@@ -1304,6 +1304,10 @@ IMAGEINFO
 	# monitor: it asks the monitor for its final batch before the job is recorded.
 	install -D -m 0755 "$SCRIPT_DIR/../internal/guestassets/job-completed-hook.sh" \
 		"$rootfs/usr/local/lib/billet/job-completed-hook.sh"
+	# THE JOB-STARTED HOOK, named only where the agent started the terminal server: it says in
+	# the job's log how to open a terminal in this VM.
+	install -D -m 0755 "$SCRIPT_DIR/../internal/guestassets/job-started-hook.sh" \
+		"$rootfs/usr/local/lib/billet/job-started-hook.sh"
 	# THE DOCKER SHIM SITS AHEAD OF THE REAL CLIENT on the job's PATH and points a
 	# build's BuildKit cache client at the adapter, which is what lets a workflow
 	# that changed only `runs-on` export `type=gha` from a container-driver
@@ -1585,6 +1589,25 @@ BILLET_MONITOR_ENV
 	fi
 fi
 # BILLET_GUEST_MONITOR_START_END
+
+# THE TERMINAL SERVER, where the node's metadata asks for it, which only a tier with debug.attach
+# does. A UNIT OF ITS OWN AND NOT A CHILD OF THIS AGENT: a unit's children die with it, and the
+# server has to outlive the runner, since a failed job's VM is held after this agent exits.
+# --no-block, because nothing here waits on it and a server that does not start is a job nobody
+# can attach to, which the attempt says; the job goes on.
+# BILLET_GUEST_ATTACH_START_BEGIN
+guest_attach_started=""
+guest_attach_hold=""
+if [ -x "$GUEST_BILLET" ] && guest_attach=$(fetch guest-attach 2>/dev/null) && [ "$guest_attach" = 1 ]; then
+	if systemctl start --no-block billet-guest-attach.service 2>/dev/null; then
+		guest_attach_started=1
+		guest_attach_hold=$(fetch guest-attach-hold 2>/dev/null) || guest_attach_hold=""
+		log "started the terminal server"
+	else
+		log "the terminal server did not start, so this job cannot be attached to"
+	fi
+fi
+# BILLET_GUEST_ATTACH_START_END
 
 # BILLET_SHARED_PREPARE_BEGIN: from here to its end, and BILLET_SHARED_START,
 # BILLET_CACHE_RELAY and BILLET_SHARED_ENV below, are also what the EC2 image runs at
@@ -2412,6 +2435,23 @@ if [ -n "$guest_monitor_pid" ] && [ -x "$GUEST_MONITOR_HOOK" ]; then
 	runner_env+=("ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$GUEST_MONITOR_HOOK")
 fi
 # BILLET_GUEST_MONITOR_HOOK_END
+# THE JOB-STARTED HOOK SAYS HOW TO ATTACH, only where the server was started, and STANDS IN FRONT
+# of a hook already named above rather than replacing it: the runner runs one, and the Actions
+# cache's is what makes the job's trust bundle. The one behind it is the answer for the job.
+# BILLET_GUEST_ATTACH_HOOK_BEGIN
+GUEST_ATTACH_HOOK="${GUEST_ATTACH_HOOK:-/usr/local/lib/billet/job-started-hook.sh}"
+if [ -n "$guest_attach_started" ] && [ -x "$GUEST_ATTACH_HOOK" ]; then
+	for guest_attach_index in "${!runner_env[@]}"; do
+		if [[ ${runner_env[$guest_attach_index]} == ACTIONS_RUNNER_HOOK_JOB_STARTED=* ]]; then
+			runner_env[guest_attach_index]="BILLET_JOB_STARTED_NEXT=${runner_env[$guest_attach_index]#ACTIONS_RUNNER_HOOK_JOB_STARTED=}"
+		fi
+	done
+	runner_env+=("ACTIONS_RUNNER_HOOK_JOB_STARTED=$GUEST_ATTACH_HOOK")
+	if [ -n "$guest_attach_hold" ]; then
+		runner_env+=("BILLET_ATTACH_HOLD=$guest_attach_hold")
+	fi
+fi
+# BILLET_GUEST_ATTACH_HOOK_END
 
 # THE ENVIRONMENT CROSSES ON DESCRIPTOR 3, NEVER IN AN ARGUMENT LIST (#352). It
 # carries the registration and the cache bearer, and setpriv's and env's argv are
@@ -2505,6 +2545,20 @@ service_status=$(/usr/local/bin/billet-docker-cache service-status "$job_status"
 	service_status=$job_status
 exit "$service_status"
 AGENT
+
+	# NOT ENABLED: the agent starts it, on a guest whose tier says so, and every other guest has
+	# nothing listening on its vsock.
+	install -m 0644 /dev/stdin "$rootfs/etc/systemd/system/billet-guest-attach.service" <<'UNIT'
+[Unit]
+Description=billet: serve a terminal in this job's VM over vsock
+
+[Service]
+Type=exec
+ExecStart=/opt/billet/bin/billet guest attach-serve
+Restart=no
+StandardOutput=journal
+StandardError=journal
+UNIT
 
 	install -m 0644 /dev/stdin "$rootfs/etc/systemd/system/billet-agent.service" <<'UNIT'
 [Unit]

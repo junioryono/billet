@@ -165,6 +165,7 @@ type ReadOps interface {
 	ReadJob(ctx context.Context, leaseID string) (ledgerdb.ReadJobRow, error)
 	ReadJobWait(ctx context.Context, leaseID string) (ledgerdb.ReadJobWaitRow, error)
 	ListJobWaits(ctx context.Context, arg ledgerdb.ListJobWaitsParams) ([]ledgerdb.ListJobWaitsRow, error)
+	ListJobFacts(ctx context.Context, arg ledgerdb.ListJobFactsParams) ([]ledgerdb.ListJobFactsRow, error)
 	ListPoolOrders(ctx context.Context) ([]ledgerdb.PoolOrder, error)
 	ListJobRuntimes(ctx context.Context, arg ledgerdb.ListJobRuntimesParams) ([]ledgerdb.ListJobRuntimesRow, error)
 	ListJobsForExport(ctx context.Context,
@@ -183,6 +184,8 @@ type ReadOps interface {
 	ReadJobDestinations(ctx context.Context, leaseID string) ([]ledgerdb.ReadJobDestinationsRow, error)
 	ReadJobGuestReport(ctx context.Context, leaseID string) (ledgerdb.JobGuestReport, error)
 	ReadJobTestResults(ctx context.Context, leaseID string) (ledgerdb.JobTestResult, error)
+	ReadLeaseHold(ctx context.Context, leaseID string) (ledgerdb.LeaseHold, error)
+	ListHoldingLeaseHolds(ctx context.Context) ([]ledgerdb.LeaseHold, error)
 	ListJobTestResults(ctx context.Context, arg ledgerdb.ListJobTestResultsParams) ([]ledgerdb.ListJobTestResultsRow, error)
 	ListJobTestResultsPastRetention(ctx context.Context, arg ledgerdb.ListJobTestResultsPastRetentionParams) ([]string, error)
 	ListJobTestResultsPastBound(ctx context.Context, arg ledgerdb.ListJobTestResultsPastBoundParams) ([]string, error)
@@ -340,6 +343,10 @@ type WriteOps interface {
 	RecordJobTestResults(ctx context.Context, arg ledgerdb.RecordJobTestResultsParams) (int64, error)
 	DeleteJobTestResults(ctx context.Context, packed string) (int64, error)
 	RecordJobEgress(ctx context.Context, arg ledgerdb.RecordJobEgressParams) (int64, error)
+	OpenLeaseHold(ctx context.Context, arg ledgerdb.OpenLeaseHoldParams) error
+	EndLeaseHold(ctx context.Context, arg ledgerdb.EndLeaseHoldParams) (int64, error)
+	EndHoldingLeaseHolds(ctx context.Context, arg ledgerdb.EndHoldingLeaseHoldsParams) (int64, error)
+	DeleteEndedLeaseHolds(ctx context.Context, before string) (int64, error)
 	MarkJobDetailRetired(ctx context.Context, arg ledgerdb.MarkJobDetailRetiredParams) (int64, error)
 	DeleteRetiredJobSeries(ctx context.Context, stamp string) (int64, error)
 	DeleteRetiredJobDestinations(ctx context.Context, stamp string) (int64, error)

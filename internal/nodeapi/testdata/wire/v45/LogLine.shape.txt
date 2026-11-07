@@ -1,0 +1,4 @@
+LogLine.line int64
+LogLine.at_ms tag omitempty
+LogLine.at_ms int64
+LogLine.text string

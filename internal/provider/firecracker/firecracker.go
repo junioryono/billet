@@ -1109,6 +1109,19 @@ func (p *Provider) configure(
 		}})
 	}
 
+	// A DEVICE ONLY WHERE THE TIER MAY BE ATTACHED TO, so every other guest has one thing fewer in
+	// its VMM. Nothing listens on it until the guest serves a terminal, and nothing outside the
+	// jail reaches it but this node.
+	if spec.GuestAttach {
+		steps = append(steps, struct {
+			path string
+			body any
+		}{"/vsock", map[string]any{
+			"guest_cid": guestVsockCID,
+			"uds_path":  "/" + guestVsockSocket,
+		}})
+	}
+
 	for _, step := range steps {
 		if err := api.put(ctx, step.path, step.body); err != nil {
 			return fmt.Errorf("firecracker: configure %s for %s: %w", step.path, spec.Name, err)
@@ -1181,6 +1194,13 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 	// no such key and starts no monitor.
 	if spec.GuestMonitor {
 		billet["guest-monitor"] = "1"
+	}
+	// AND THE SAME FOR THE TERMINAL: an image older than this reads no such key.
+	if spec.GuestAttach {
+		billet["guest-attach"] = "1"
+		if spec.GuestHold != "" {
+			billet["guest-attach-hold"] = spec.GuestHold
+		}
 	}
 	if spec.ActionsProxy != "" {
 		billet["actions-proxy"] = spec.ActionsProxy

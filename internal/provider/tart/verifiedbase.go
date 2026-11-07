@@ -611,6 +611,8 @@ func (p *Provider) deleteOwnedVM(ctx context.Context, name string) error {
 		return fmt.Errorf("delete %s: %w", name, err)
 	}
 
+	p.removeRunLog(name)
+
 	return nil
 }
 

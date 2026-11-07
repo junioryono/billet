@@ -39,6 +39,7 @@ var wireTypes = map[string]any{
 	"CAResponse":                CAResponse{},
 	"CacheAuthority":            CacheAuthority{},
 	"CacheAuthorityResponse":    CacheAuthorityResponse{},
+	"AttachSpec":                AttachSpec{},
 	"CacheObservationRequest":   CacheObservationRequest{},
 	"LogChunkRequest":           LogChunkRequest{},
 	"LogLine":                   LogLine{},
@@ -1254,7 +1255,7 @@ func TestEveryTopLevelBodyHasADirection(t *testing.T) {
 	t.Parallel()
 
 	nested := []string{"Range", "TierSpec", "UpgradeSpec", "CacheAuthority", "Job", "LogLine", "LogLineRange",
-		"LogReadResult", "LogReadSpec"}
+		"LogReadResult", "LogReadSpec", "AttachSpec"}
 
 	for _, name := range nested {
 		if directionOf(name) != insideOther {

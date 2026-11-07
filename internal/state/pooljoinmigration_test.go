@@ -6,6 +6,52 @@ import (
 	"testing"
 )
 
+// ledgerAt75 is a ledger migrated to 75 and no further, so the next open applies
+// migration 76 and every one after it. 78 and 77 go first, newest first, since
+// rewindNewest takes back only the newest.
+func ledgerAt75(t *testing.T) string {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`ALTER TABLE pool_orders DROP COLUMN release_contradicted`,
+			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
+			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,
+			`DELETE FROM schema_migrations WHERE version = 78`,
+			`DROP TABLE lease_holds`,
+			`DELETE FROM schema_migrations WHERE version = 77`,
+			`ALTER TABLE pool_orders DROP COLUMN join_hold`,
+			`ALTER TABLE pool_orders DROP COLUMN node_cert_serial`,
+			`ALTER TABLE pool_orders DROP COLUMN node_fingerprint`,
+			`ALTER TABLE node_enrollments DROP COLUMN pool_order`,
+			`DROP INDEX join_tokens_pool_order_idx`,
+			`ALTER TABLE join_tokens DROP COLUMN pool_order`,
+			`DELETE FROM schema_migrations WHERE version = 76`,
+		} {
+			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("rewind to version 75: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the rewound ledger: %v", err)
+	}
+
+	return dir
+}
+
 // MIGRATION 76 BINDS WHAT MIGRATION 75 LEFT TO ITS ORDER: a token a pool minted with the
 // note `pool order <order>`, and a request named `pool-<order>`, are that order's when
 // the order is recorded, and nothing else is: an operator's token, a note or a name
@@ -15,7 +61,7 @@ import (
 func TestMigration76BindsAnOrdersEarlierTokensAndRequests(t *testing.T) {
 	t.Parallel()
 
-	dir := ledgerBefore76(t)
+	dir := ledgerAt75(t)
 
 	pools, err := newSQLiteBackend(dir).dataSources()
 	if err != nil {
@@ -91,45 +137,4 @@ func TestMigration76BindsAnOrdersEarlierTokensAndRequests(t *testing.T) {
 			t.Errorf("token %s has %s uses, want %s", token, got, want)
 		}
 	}
-}
-
-// ledgerBefore76 is a SQLite ledger migrated and then taken back past migration 76, so
-// opening it applies 76 and every migration after it: the newest, then what 76 added.
-func ledgerBefore76(t *testing.T) string {
-	t.Helper()
-
-	dir := t.TempDir()
-
-	db, err := Open(t.Context(), dir)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-
-	rewindNewest(t, db)
-
-	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		for _, stmt := range []string{
-			`ALTER TABLE pool_orders DROP COLUMN join_hold`,
-			`ALTER TABLE pool_orders DROP COLUMN node_cert_serial`,
-			`ALTER TABLE pool_orders DROP COLUMN node_fingerprint`,
-			`ALTER TABLE node_enrollments DROP COLUMN pool_order`,
-			`DROP INDEX join_tokens_pool_order_idx`,
-			`ALTER TABLE join_tokens DROP COLUMN pool_order`,
-			`DELETE FROM schema_migrations WHERE version = 76`,
-		} {
-			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
-				return fmt.Errorf("%s: %w", stmt, err)
-			}
-		}
-
-		return nil
-	}); err != nil {
-		t.Fatalf("rewind past migration 76: %v", err)
-	}
-
-	if err := db.Close(); err != nil {
-		t.Fatalf("close the rewound ledger: %v", err)
-	}
-
-	return dir
 }

@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
 	"sort"
@@ -17,6 +19,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/guestattach"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
@@ -3346,5 +3349,81 @@ func TestALaunchCarriesItsTiersArchitecture(t *testing.T) {
 
 	if len(p.launched) != 1 || p.launched[0].Arch != config.ArchARM64 {
 		t.Fatalf("launched %+v, want one launch of arm64", p.launched)
+	}
+}
+
+// dialingProvider is a provider that reaches a guest's ports.
+type dialingProvider struct {
+	*fakeProvider
+
+	err      error
+	instance string
+	port     int
+}
+
+func (p *dialingProvider) DialGuest(_ context.Context, instance string, port int) (io.ReadWriteCloser, error) {
+	p.instance, p.port = instance, port
+	if p.err != nil {
+		return nil, p.err
+	}
+
+	near, far := net.Pipe()
+	_ = far.Close()
+
+	return near, nil
+}
+
+// A TERMINAL IS OPENED THROUGH THE PROVIDER, ON THE LEASE'S OWN INSTANCE AND THE SERVER'S PORT, and
+// what comes back says which of three things happened: nothing listening, no way to reach one on
+// this backend, or a failure that says nothing of the guest.
+func TestATerminalIsOpenedThroughTheProvider(t *testing.T) {
+	a, host := newAllocatorWithHost(t)
+
+	dialer := &dialingProvider{fakeProvider: &fakeProvider{kind: config.ProviderFirecracker}}
+	r := New(a, host, &fakeJIT{setID: 7}, dialer, nil)
+
+	stream, err := r.OpenGuestTerminal(t.Context(), "lease-1")
+	if err != nil {
+		t.Fatalf("OpenGuestTerminal: %v", err)
+	}
+	_ = stream.Close()
+
+	if dialer.instance != provider.InstanceName("lease-1") || dialer.port != guestattach.Port {
+		t.Errorf("dialled %s port %d", dialer.instance, dialer.port)
+	}
+
+	dialer.err = fmt.Errorf("firecracker: x: %w", provider.ErrNoGuestListener)
+	if _, err := r.OpenGuestTerminal(t.Context(), "lease-1"); err == nil ||
+		!strings.Contains(err.Error(), "nothing in this job's VM is serving a terminal") {
+		t.Errorf("nothing listening: %v", err)
+	}
+
+	dialer.err = errors.New("the socket is gone")
+	if _, err := r.OpenGuestTerminal(t.Context(), "lease-1"); err == nil ||
+		strings.Contains(err.Error(), "serving a terminal") {
+		t.Errorf("a failure reaching it: %v", err)
+	}
+
+	other := New(a, host, &fakeJIT{setID: 7}, &fakeProvider{kind: config.ProviderDocker}, nil)
+	if _, err := other.OpenGuestTerminal(t.Context(), "lease-1"); err == nil {
+		t.Error("a backend that cannot reach a guest opened a terminal")
+	}
+}
+
+// ONLY A TIER THAT MAY BE ATTACHED TO ASKS THE GUEST TO SERVE ONE, and the hold reaches it to say.
+func TestATiersAttachWordReachesTheProvider(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	tier := dockerSpec()
+	tier.Attach, tier.HoldOnFailure = true, "5m0s"
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), tier, Job{RequestID: 11, RunID: 101}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if !p.launched[0].GuestAttach || p.launched[0].GuestHold != "5m0s" {
+		t.Errorf("the tier's word became %t, %q", p.launched[0].GuestAttach, p.launched[0].GuestHold)
 	}
 }

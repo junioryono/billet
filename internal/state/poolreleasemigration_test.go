@@ -5,12 +5,12 @@ import (
 	"testing"
 )
 
-// MIGRATION 77 STARTS A LINKED ORDER CONTRADICTED: a billet before it recorded nothing
+// MIGRATION 78 STARTS A LINKED ORDER CONTRADICTED: a billet before it recorded nothing
 // durable when a decommissioned node came back or reported compute, so an order a release
 // could still seal is held for a decommission proved after the upgrade, and its node's
 // idle run goes with it. An order no node was linked to, one already gone, and any other
 // host's run are left as they were.
-func TestMigration77HoldsALinkedOrderForAFreshProof(t *testing.T) {
+func TestMigration78HoldsALinkedOrderForAFreshProof(t *testing.T) {
 	t.Parallel()
 
 	dir := rewoundLedger(t)

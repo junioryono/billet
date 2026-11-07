@@ -1,0 +1,17 @@
+name: mixed
+on: [push]
+jobs:
+  self-hosted:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - run: echo self
+  hosted-beside:
+    runs-on:
+      - ubuntu-latest
+      - gpu
+    steps:
+      - run: echo gpu
+  named-pool:
+    runs-on: our-own-runners
+    steps:
+      - run: echo pool

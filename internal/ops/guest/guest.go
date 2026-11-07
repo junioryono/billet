@@ -11,12 +11,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os/signal"
 	"strings"
 	"syscall"
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/guestagent"
+	"github.com/junioryono/billet/internal/guestattach"
 	"github.com/junioryono/billet/internal/version"
 )
 
@@ -33,6 +35,10 @@ const (
 	defaultDiag      = "/home/runner/runner/_diag"
 	defaultJUnitRoot = "/home/runner/work"
 	defaultSocket    = "/run/billet/guest-monitor.sock"
+	// A session is the job's own account, in the job's own directory.
+	defaultAttachUser  = "runner"
+	defaultAttachShell = "/bin/bash"
+	defaultAttachDir   = "/home/runner/runner/_work"
 	// defaultNice is low enough that a job's own threads win the CPU, and high
 	// enough that the final flush still finishes inside its 3 s on a guest
 	// whose every CPU is busy.
@@ -47,10 +53,29 @@ func Run(ctx context.Context, env cli.Env, args []string) error {
 			return monitor(ctx, env, args[1:])
 		case "flush":
 			return flush(ctx, env, args[1:])
+		case "attach-serve":
+			return attachServe(ctx, env, args[1:])
 		}
 	}
 
-	return errors.New("usage: billet guest <monitor|flush> [flags] (run inside a job's VM)")
+	return errors.New("usage: billet guest <monitor|flush|attach-serve> [flags] (run inside a job's VM)")
+}
+
+// attachServe is `billet guest attach-serve`, the terminal server the image's unit starts on a tier
+// that may be attached to. It never reaches the job: it is a unit of its own, so it outlives the
+// runner, which is what makes a held VM worth attaching to.
+func attachServe(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet guest attach-serve", env.Stdout)
+	user := fs.String("user", defaultAttachUser, "the account a session's shell runs as")
+	shell := fs.String("shell", defaultAttachShell, "the shell a session runs")
+	dir := fs.String("dir", defaultAttachDir, "where a session's shell starts")
+
+	if err := cli.Parse(fs, args); err != nil {
+		return err
+	}
+
+	return guestattach.Serve(ctx, guestattach.Config{User: *user, Shell: *shell, Dir: *dir},
+		slog.New(slog.NewTextHandler(env.Stderr, nil)))
 }
 
 // monitor is `billet guest monitor`.

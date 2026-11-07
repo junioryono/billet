@@ -44,6 +44,9 @@ type pendingCleanup struct {
 	wait time.Duration
 	// Zero means immediately, which is what a freshly recorded failure wants.
 	at time.Time
+	// held says this completion's destroy is waiting for a hold, which a shutdown leaves alone as
+	// it leaves a running job: the next process finds the completion and the hold both durable.
+	held bool
 	// GitHub re-offers an unacquired job indefinitely, so the message is worth
 	// exactly once per obligation.
 	declined bool

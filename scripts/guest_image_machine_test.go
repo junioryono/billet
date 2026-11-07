@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -241,6 +242,8 @@ func TestABuildOfNoMachineIsRefused(t *testing.T) {
 func TestTheGuestBilletIsBuiltForTheMachine(t *testing.T) {
 	t.Parallel()
 
+	onTheLinuxBuilder(t)
+
 	here, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -313,6 +316,8 @@ func TestEachPinNamesEachMachinesFile(t *testing.T) {
 // package. Only what would fetch or unpack is stood in for.
 func TestTheBaseFilesystemAndItsSourceAreChosenByTheMachine(t *testing.T) {
 	t.Parallel()
+
+	onTheLinuxBuilder(t)
 
 	here, err := os.Getwd()
 	if err != nil {
@@ -877,6 +882,8 @@ func machineImage(t *testing.T, machine uint16) string {
 func TestTheGateRefusesAnImageOfAnotherMachine(t *testing.T) {
 	t.Parallel()
 
+	onTheLinuxBuilder(t)
+
 	const x86, arm = 62, 183
 
 	for name, tc := range map[string]struct {
@@ -1218,5 +1225,18 @@ func TestEachMachineBuildsTheKernelItsVMMLoads(t *testing.T) {
 
 	if _, err := os.Stat(calls); err == nil {
 		t.Error("a machine with no kernel reached apt-get before it was refused")
+	}
+}
+
+// onTheLinuxBuilder skips a test of a build or gate function off Linux. Those functions
+// run on the Linux image builder with GNU coreutils, and two of their tools answer
+// differently elsewhere: BSD install refuses a here-document through /dev/stdin
+// ("Inappropriate file type or format"), and a short file's header reads otherwise. CI
+// runs these on Linux.
+func onTheLinuxBuilder(t *testing.T) {
+	t.Helper()
+
+	if runtime.GOOS != "linux" {
+		t.Skip("this function runs on the Linux image builder, whose GNU coreutils this host lacks")
 	}
 }
