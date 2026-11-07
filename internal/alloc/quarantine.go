@@ -816,10 +816,8 @@ func recordInventoryTx(
 	}
 
 	if running > 0 {
-		if err := q.ContradictNodeDecommission(ctx, ledgerdb.ContradictNodeDecommissionParams{
-			Name: node, Epoch: epoch,
-		}); err != nil {
-			return fmt.Errorf("alloc: withdraw the proof of node %s's decommission: %w", node, err)
+		if err := q.ContradictPoolRelease(ctx, node); err != nil {
+			return fmt.Errorf("alloc: contradict the release of pool node %s: %w", node, err)
 		}
 	}
 

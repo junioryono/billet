@@ -486,34 +486,27 @@ func (p *Pool) findUncertain(ctx context.Context, o alloc.PoolOrder) error {
 // nothing, then asks its source to take it back. A host still draining waits for the
 // next step; that is not an error.
 func (p *Pool) seal(ctx context.Context, o alloc.PoolOrder) error {
-	proof, err := p.ledger.SealPoolRelease(ctx, o.ID)
-	if errors.Is(err, alloc.ErrPoolReleaseWaits) {
+	if _, err := p.ledger.SealPoolRelease(ctx, o.ID); errors.Is(err, alloc.ErrPoolReleaseWaits) {
 		p.log.Info("a pool host's release waits for it to drain", "order", o.ID, "why", err)
 
 		return nil
-	}
-	if err != nil {
+	} else if err != nil {
 		return fmt.Errorf("pool: seal the release of order %s: %w", o.ID, err)
 	}
 	p.log.Info("a pool host is sealed for release: its certificates are revoked", "order", o.ID, "host", o.HostID)
 
-	return p.releaseWith(ctx, o, proof)
+	return p.release(ctx, o)
 }
 
-// release asks the source to take back a sealed order's host, on the proof its seal
-// recorded, which a release asked again after a failure or a restart is.
+// release asks the source to take back a sealed order's host only where its order was
+// placed: a source whose scope has changed since is not where the host is, and a person
+// releases it by hand.
+//
+// THE PROOF IS READ LAST, after the source's scope, which is a round trip of its own
+// (STS, on AWS): a contradiction committed while that was answered refuses the release,
+// where a proof read before it would have been sent regardless. The seal's own proof is
+// not carried here for the same reason.
 func (p *Pool) release(ctx context.Context, o alloc.PoolOrder) error {
-	proof, err := p.ledger.PoolReleaseProof(ctx, o.ID)
-	if err != nil {
-		return fmt.Errorf("pool: the release proof of order %s: %w", o.ID, err)
-	}
-
-	return p.releaseWith(ctx, o, proof)
-}
-
-// releaseWith releases a sealed host only where its order was placed: a source whose
-// scope has changed since is not where the host is, and a person releases it by hand.
-func (p *Pool) releaseWith(ctx context.Context, o alloc.PoolOrder, proof releaseproof.Proof) error {
 	src := p.cfg.Sources[o.Source]
 	if src == nil {
 		return fmt.Errorf("pool: order %s is sealed, and its source %s is no longer configured to release it", o.ID,
@@ -526,6 +519,10 @@ func (p *Pool) releaseWith(ctx context.Context, o alloc.PoolOrder, proof release
 	if scope != o.Scope {
 		return fmt.Errorf("pool: order %s is sealed in %s and its source now orders in %s, so it is released by hand",
 			o.ID, o.Scope, scope)
+	}
+	proof, err := p.ledger.PoolReleaseProof(ctx, o.ID)
+	if err != nil {
+		return fmt.Errorf("pool: the release proof of order %s: %w", o.ID, err)
 	}
 	if err := src.Release(ctx, proof); err != nil {
 		return fmt.Errorf("pool: release order %s's host %s: %w", o.ID, o.HostID, err)

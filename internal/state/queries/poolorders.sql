@@ -7,13 +7,13 @@ VALUES (@order_id, @source, @scope, @shape, @location, @arch, 'ordering', @first
 
 -- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted
 FROM pool_orders
 ORDER BY first_attempt_at, order_id;
 
 -- name: ReadPoolOrder :one
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted
 FROM pool_orders
 WHERE order_id = @order_id;
 
@@ -96,6 +96,21 @@ UPDATE pool_orders
    SET state = 'sealed', release_requested_at = @requested_at, release_reason = @reason, updated_at = @now
  WHERE order_id = @order_id AND state = 'placed' AND node_name = @node_name
    AND (node_name = '' OR release_requested_at != '');
+
+-- name: ContradictPoolRelease :exec
+-- The order's node said it is back or runs something (ADR-030): it arrived to register,
+-- or an inventory of its current registration reported compute. Its release is proved
+-- by no decommission recorded before this; the decommission itself is left as the
+-- person recorded it, for the readers that are not the release's.
+UPDATE pool_orders SET release_contradicted = 1
+ WHERE node_name = @node AND node_name != '' AND state IN ('placed', 'sealed') AND release_contradicted = 0;
+
+-- name: ClearPoolReleaseContradiction :exec
+-- A fresh decommission on the compute barrier's proof, in its own transaction: what the
+-- node said before it no longer outweighs a proof taken since. A sealed order stays
+-- contradicted, because its node's certificates are revoked and nothing proves it again.
+UPDATE pool_orders SET release_contradicted = 0
+ WHERE node_name = @node AND node_name != '' AND state = 'placed' AND release_contradicted = 1;
 
 -- name: MarkPoolOrderReleased :execrows
 -- The source took the sealed host back.

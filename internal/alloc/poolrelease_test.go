@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/releaseproof"
 	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
@@ -67,24 +66,48 @@ func TestANeverJoinedHostIsSealedByTheAsking(t *testing.T) {
 }
 
 // A HOST ANYTHING WAS EVER ADMITTED FOR IS NOT RELEASED AS ONE THAT NEVER JOINED: a
-// certificate issued under the order's name is a node that could have held work, so the
-// asking seals nothing.
-func TestAHostACertificateWasIssuedForIsNotUnjoined(t *testing.T) {
+// certificate issued under the order's name before that name was reserved is a node that
+// could have held work, so the asking seals nothing. It links the order to the name and
+// releases it as a joined host: out of placement now, sealed on a proved decommission,
+// and that certificate revoked by the seal.
+func TestAHostACertificateWasIssuedForIsReleasedAsJoined(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
 	a := poolAllocator(t, &now)
 	ctx := t.Context()
 	placedOrder(t, a, "pa")
-	if err := a.RecordIssuedCert(ctx, IssuedCert{Serial: "0f", Node: PoolNodeName("pa"), Source: CertIssued,
+	node := PoolNodeName("pa")
+	if err := a.RecordIssuedCert(ctx, IssuedCert{Serial: "0f", Node: node, Source: CertIssued,
 		NotAfter: "2027-11-07T00:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.RequestPoolRelease(ctx, "pa", "never joined?"); !errors.Is(err, ErrPoolReleaseWaits) ||
-		!errors.Is(err, releaseproof.ErrNoProof) {
-		t.Fatalf("a host a certificate was issued for answered %v", err)
+	registerPoolNode(t, a, node)
+	if placeableHosts(t, a) != 1 {
+		t.Fatal("the node under the order's name is not placeable")
 	}
-	if o := readOrder(t, a, "pa"); o.State != PoolPlaced || !o.ReleaseRequested.IsZero() {
-		t.Fatalf("a refused release wrote %+v", o)
+
+	if sealed, err := a.RequestPoolRelease(ctx, "pa", "joined by hand"); err != nil || sealed {
+		t.Fatalf("a host a certificate was issued for: sealed %v, %v", sealed, err)
+	}
+	if o := readOrder(t, a, "pa"); o.State != PoolPlaced || o.NodeName != node || o.ReleaseRequested.IsZero() {
+		t.Fatalf("the order after its release was asked for: %+v", o)
+	}
+	if placeableHosts(t, a) != 0 {
+		t.Fatal("the node under the order's name is still placeable")
+	}
+	if left := usesLeft(t, a, "pa"); len(left) != 1 || left[0] != 0 {
+		t.Fatalf("its tokens were not retired: %v", left)
+	}
+	if _, err := a.SealPoolRelease(ctx, "pa"); !errors.Is(err, ErrPoolReleaseWaits) {
+		t.Fatalf("sealing before a proved decommission answered %v", err)
+	}
+
+	decommissionOnProof(t, a, &now, requestBarrier(t, a), node)
+	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+		t.Fatalf("sealing on a proved decommission: %v", err)
+	}
+	if revoked, err := a.CertRevoked(ctx, "0f"); err != nil || !revoked {
+		t.Fatalf("the certificate issued under its name was not revoked: %v, %v", revoked, err)
 	}
 }
 
@@ -225,10 +248,10 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	}
 }
 
-// contradictions are what withdraws a decommission's proof of a pool host: an inventory of
-// its node's current registration reporting compute, and the node arriving to register,
-// which the registration handler reports before it decides anything, so a refused
-// registration contradicts it too, as does a loopback arrival that names no host.
+// contradictions are what contradicts a pool host's release after its decommission on
+// proof: an inventory of its node's current registration reporting compute, and the node
+// arriving to register, which the registration handler reports before it decides
+// anything, so a refused registration contradicts it too.
 var contradictions = map[string]func(t *testing.T, a *Allocator, node string){
 	"an inventory reporting compute": func(t *testing.T, a *Allocator, node string) {
 		t.Helper()
@@ -242,18 +265,28 @@ var contradictions = map[string]func(t *testing.T, a *Allocator, node string){
 			t.Fatal(err)
 		}
 	},
-	"an arrival that names no host": func(t *testing.T, a *Allocator, _ string) {
-		t.Helper()
-		if err := a.InvalidateEveryBarrierRun(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-	},
 }
 
-// A CONTRADICTED DECOMMISSION STAYS CONTRADICTED: neither a later empty report nor a
-// control-plane start, which forgets every inventory, makes it proof again; only a fresh
-// decommission on the barrier's proof does. The arrival is contradicted with no barrier
-// run left to discard, as Decommission leaves it.
+// decommissionProven reads whether the ledger records node's decommission as proved, the
+// fact the drain's clearance and a CodeBuild fleet's claim read.
+func decommissionProven(t *testing.T, a *Allocator, node string) bool {
+	t.Helper()
+	var proven int64
+	if err := a.db.View(t.Context(), func(q querier) error {
+		return q.QueryRowContext(t.Context(),
+			`SELECT decommission_proven FROM nodes WHERE name = $1`, node).Scan(&proven)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	return proven == 1
+}
+
+// A CONTRADICTED DECOMMISSION STAYS CONTRADICTED FOR THE RELEASE: neither a later empty
+// report nor a control-plane start, which forgets every inventory, makes it proof again;
+// only a fresh decommission on the barrier's proof does. The arrival is contradicted with
+// no barrier run left to discard, as Decommission leaves it. The decommission itself is
+// left as the person recorded it, for the readers that are not the release's.
 func TestAContradictedDecommissionStaysContradicted(t *testing.T) {
 	t.Parallel()
 	for name, contradict := range contradictions {
@@ -271,6 +304,9 @@ func TestAContradictedDecommissionStaysContradicted(t *testing.T) {
 
 			contradict(t, a, node)
 			waitsUnsealed(t, a, "a decommission contradicted since")
+			if !decommissionProven(t, a, node) {
+				t.Fatal("the release's contradiction rewrote the decommission other readers read")
+			}
 			if _, err := a.Reconcile(ctx, node, nil); err != nil {
 				t.Fatal(err)
 			}
@@ -407,6 +443,11 @@ func TestAnAdmittedHostThatNeverRegisteredIsSealed(t *testing.T) {
 	}
 	if sealed, err := a.RequestPoolRelease(ctx, "pa", "it never came up"); err != nil || sealed {
 		t.Fatalf("releasing an admitted host: %v, %v", sealed, err)
+	}
+	// AN ARRIVAL WHOSE REGISTRATION WAS REFUSED leaves no node row, so nothing was ever
+	// placed on it, and it does not hold the release.
+	if err := a.InvalidateBarrierRun(ctx, PoolNodeName("pa")); err != nil {
+		t.Fatal(err)
 	}
 	proof, err := a.SealPoolRelease(ctx, "pa")
 	if err != nil || proof.For("i-pa") != nil {

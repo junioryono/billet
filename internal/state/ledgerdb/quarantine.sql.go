@@ -10,28 +10,6 @@ import (
 	"database/sql"
 )
 
-const contradictNodeDecommission = `-- name: ContradictNodeDecommission :exec
-UPDATE nodes SET decommission_proven = 0
- WHERE name = $1 AND epoch = $2 AND decommission_proven = 1
-`
-
-type ContradictNodeDecommissionParams struct {
-	Name  string
-	Epoch int64
-}
-
-// Withdraw the proof of a decommission from a host whose current registration has
-// reported compute since (ADR-030).
-//
-// DURABLE, BECAUSE THE INVENTORY IS NOT. A later empty report overwrites the row and a
-// control-plane start deletes it, and either would leave the decommission standing as
-// proof that a host it contradicted runs nothing. decommissioned_at stays: the person's
-// word is still recorded, only no longer as proved, as `--force` records it.
-func (q *Queries) ContradictNodeDecommission(ctx context.Context, arg ContradictNodeDecommissionParams) error {
-	_, err := q.db.ExecContext(ctx, contradictNodeDecommission, arg.Name, arg.Epoch)
-	return err
-}
-
 const correctProvisionalHistory = `-- name: CorrectProvisionalHistory :exec
 UPDATE job_history SET conclusion = $1, failure_reason = '' WHERE lease_id = $2
 `

@@ -9,6 +9,19 @@ import (
 	"context"
 )
 
+const clearPoolReleaseContradiction = `-- name: ClearPoolReleaseContradiction :exec
+UPDATE pool_orders SET release_contradicted = 0
+ WHERE node_name = $1 AND node_name != '' AND state = 'placed' AND release_contradicted = 1
+`
+
+// A fresh decommission on the compute barrier's proof, in its own transaction: what the
+// node said before it no longer outweighs a proof taken since. A sealed order stays
+// contradicted, because its node's certificates are revoked and nothing proves it again.
+func (q *Queries) ClearPoolReleaseContradiction(ctx context.Context, node string) error {
+	_, err := q.db.ExecContext(ctx, clearPoolReleaseContradiction, node)
+	return err
+}
+
 const closePoolOrder = `-- name: ClosePoolOrder :execrows
 UPDATE pool_orders SET state = 'gone', reason = $1, updated_at = $2
  WHERE order_id = $3 AND state IN ('sealed', 'released')
@@ -28,6 +41,20 @@ func (q *Queries) ClosePoolOrder(ctx context.Context, arg ClosePoolOrderParams) 
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const contradictPoolRelease = `-- name: ContradictPoolRelease :exec
+UPDATE pool_orders SET release_contradicted = 1
+ WHERE node_name = $1 AND node_name != '' AND state IN ('placed', 'sealed') AND release_contradicted = 0
+`
+
+// The order's node said it is back or runs something (ADR-030): it arrived to register,
+// or an inventory of its current registration reported compute. Its release is proved
+// by no decommission recorded before this; the decommission itself is left as the
+// person recorded it, for the readers that are not the release's.
+func (q *Queries) ContradictPoolRelease(ctx context.Context, node string) error {
+	_, err := q.db.ExecContext(ctx, contradictPoolRelease, node)
+	return err
 }
 
 const countPoolOrderAdmissions = `-- name: CountPoolOrderAdmissions :one
@@ -206,7 +233,7 @@ func (q *Queries) LinkPoolOrderNode(ctx context.Context, arg LinkPoolOrderNodePa
 
 const listPoolOrders = `-- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted
 FROM pool_orders
 ORDER BY first_attempt_at, order_id
 `
@@ -238,6 +265,7 @@ func (q *Queries) ListPoolOrders(ctx context.Context) ([]PoolOrder, error) {
 			&i.JoinHold,
 			&i.ReleaseRequestedAt,
 			&i.ReleaseReason,
+			&i.ReleaseContradicted,
 		); err != nil {
 			return nil, err
 		}
@@ -388,7 +416,7 @@ func (q *Queries) MarkUncertainPoolOrderFound(ctx context.Context, arg MarkUncer
 
 const readPoolOrder = `-- name: ReadPoolOrder :one
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted
 FROM pool_orders
 WHERE order_id = $1
 `
@@ -414,6 +442,7 @@ func (q *Queries) ReadPoolOrder(ctx context.Context, orderID string) (PoolOrder,
 		&i.JoinHold,
 		&i.ReleaseRequestedAt,
 		&i.ReleaseReason,
+		&i.ReleaseContradicted,
 	)
 	return i, err
 }

@@ -61,7 +61,7 @@ var errReadOnlyHandle = errors.New(
 // mutation in the wrong one is caught by
 // TestReadOpsHoldsExactlyTheQueriesThatOnlyRead rather than by review.
 type ReadOps interface {
-	AnyArrivalProof(ctx context.Context) (bool, error)
+	AnyBarrierRunExists(ctx context.Context) (bool, error)
 	ArrivalHasProof(ctx context.Context, node string) (bool, error)
 	CertRevocation(ctx context.Context, serial string) (int64, error)
 	CountActiveRunnerLeases(ctx context.Context, tier string) (int64, error)
@@ -254,8 +254,6 @@ type WriteOps interface {
 	DecommissionNode(ctx context.Context, arg ledgerdb.DecommissionNodeParams) error
 	DeleteAcknowledgedCompletion(ctx context.Context, arg ledgerdb.DeleteAcknowledgedCompletionParams) error
 	DeleteBarrierRun(ctx context.Context, node string) error
-	WithdrawDecommissionProof(ctx context.Context, name string) error
-	WithdrawEveryDecommissionProof(ctx context.Context) error
 	DeleteCacheBlock(ctx context.Context, arg ledgerdb.DeleteCacheBlockParams) error
 	DeleteComputeBarrier(ctx context.Context) error
 	DeleteEveryBarrierRun(ctx context.Context) error
@@ -374,7 +372,8 @@ type WriteOps interface {
 	UpsertComputeBarrier(ctx context.Context, arg ledgerdb.UpsertComputeBarrierParams) error
 	UpsertIssuedEnrollment(ctx context.Context, arg ledgerdb.UpsertIssuedEnrollmentParams) error
 	UpsertNodeInventory(ctx context.Context, arg ledgerdb.UpsertNodeInventoryParams) error
-	ContradictNodeDecommission(ctx context.Context, arg ledgerdb.ContradictNodeDecommissionParams) error
+	ContradictPoolRelease(ctx context.Context, node string) error
+	ClearPoolReleaseContradiction(ctx context.Context, node string) error
 	UpsertNodeRegistration(ctx context.Context, arg ledgerdb.UpsertNodeRegistrationParams) (int64, error)
 	UpsertPendingCompletion(ctx context.Context, arg ledgerdb.UpsertPendingCompletionParams) error
 	UpsertScaleSet(ctx context.Context, arg ledgerdb.UpsertScaleSetParams) error

@@ -17,3 +17,7 @@ ALTER TABLE pool_orders ADD COLUMN release_requested_at text NOT NULL DEFAULT ''
 -- +billet:statement
 ALTER TABLE pool_orders ADD COLUMN release_reason text NOT NULL DEFAULT '';
 -- +billet:end
+
+-- +billet:statement
+ALTER TABLE pool_orders ADD COLUMN release_contradicted bigint NOT NULL DEFAULT 0 CHECK (release_contradicted IN (0, 1));
+-- +billet:end

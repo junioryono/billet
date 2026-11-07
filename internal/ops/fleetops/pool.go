@@ -94,8 +94,12 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 				releases = true
 			}
 			st := o.State
-			if o.State == alloc.PoolPlaced {
+			switch {
+			case o.State == alloc.PoolPlaced:
 				st = "draining"
+			case o.State == alloc.PoolSealed && o.ReleaseContradicted:
+				// ITS NODE SAID IT IS BACK AFTER THE SEAL, so its source is never asked.
+				st = "sealed, contradicted since: take it back by hand and `billet pool close` it"
 			}
 			fmt.Fprintf(env.Stdout, "  %s (%s) since %s: %s\n", o.ID, st, o.ReleaseRequested.UTC().Format(time.RFC3339),
 				oneLine(o.ReleaseReason))

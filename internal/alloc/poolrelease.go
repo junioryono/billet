@@ -39,6 +39,12 @@ var ErrPoolReleaseAsked = errors.New("alloc: the pool host's release was asked f
 // transaction, on the proof that nothing was ever admitted for it: its tokens retired
 // and nothing joining from it again. Whether a node joined is read here, so an approval
 // that linked one first makes this the joined case.
+//
+// A HOST SOMETHING WAS ADMITTED FOR WITHOUT A LINK (a certificate `billet ca issue` handed
+// out under its name before that name was reserved, or a request approved under it
+// outside the pool) is linked to its derived name here and released as a joined host,
+// so its node's certificates are revoked at the seal like any other's and a release of
+// it is never stranded.
 func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string) (bool, error) {
 	if reason == "" {
 		return false, fmt.Errorf("alloc: releasing pool order %s needs the reason a person gave", order)
@@ -65,44 +71,44 @@ func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string
 			return fmt.Errorf("%w: %w: pool order %s", ErrPoolOrderMoved, ErrPoolReleaseAsked, order)
 		}
 
-		if row.NodeName != "" {
-			if n, err := q.RequestPoolOrderRelease(ctx, ledgerdb.RequestPoolOrderReleaseParams{
-				Now: ts(now), Reason: reason, OrderID: order,
+		if row.NodeName == "" {
+			admitted, err := q.CountPoolOrderAdmissions(ctx, ledgerdb.CountPoolOrderAdmissionsParams{
+				OrderID: order, NodeName: PoolNodeName(order),
+			})
+			if err != nil {
+				return fmt.Errorf("alloc: read whether a node joined from pool order %s: %w", order, err)
+			}
+
+			if admitted == 0 {
+				return sealUnjoinedTx(ctx, q, &row, reason, now, &sealed)
+			}
+
+			if n, err := q.LinkPoolOrderNode(ctx, ledgerdb.LinkPoolOrderNodeParams{
+				NodeName: PoolNodeName(order), UpdatedAt: ts(now), OrderID: order, JoinHold: row.JoinHold,
 			}); err != nil {
-				return fmt.Errorf("alloc: ask for the release of pool order %s: %w", order, err)
+				return fmt.Errorf("alloc: link pool order %s to the node admitted under its name: %w", order, err)
 			} else if n != 1 {
 				return fmt.Errorf("%w: pool order %s moved while its release was asked for", ErrPoolOrderMoved, order)
 			}
 
-			if err := q.MarkNodeDrainedForRelease(ctx, row.NodeName); err != nil {
-				return fmt.Errorf("alloc: take %s out of placement: %w", row.NodeName, err)
+			if err := q.RetirePoolJoinTokens(ctx, order); err != nil {
+				return fmt.Errorf("alloc: retire the join tokens of pool order %s: %w", order, err)
 			}
 
-			return nil
+			row.NodeName = PoolNodeName(order)
 		}
 
-		admitted, err := q.CountPoolOrderAdmissions(ctx, ledgerdb.CountPoolOrderAdmissionsParams{
-			OrderID: order, NodeName: PoolNodeName(order),
-		})
-		if err != nil {
-			return fmt.Errorf("alloc: read whether a node joined from pool order %s: %w", order, err)
-		}
-
-		if _, err := releaseproof.NewUnjoined(releaseproof.Unjoined{
-			Host: row.HostID, OrderSealed: now, Admitted: int(admitted),
+		if n, err := q.RequestPoolOrderRelease(ctx, ledgerdb.RequestPoolOrderReleaseParams{
+			Now: ts(now), Reason: reason, OrderID: order,
 		}); err != nil {
-			return fmt.Errorf("%w: %w", ErrPoolReleaseWaits, err)
+			return fmt.Errorf("alloc: ask for the release of pool order %s: %w", order, err)
+		} else if n != 1 {
+			return fmt.Errorf("%w: pool order %s moved while its release was asked for", ErrPoolOrderMoved, order)
 		}
 
-		if err := q.RetirePoolJoinTokens(ctx, order); err != nil {
-			return fmt.Errorf("alloc: retire the join tokens of pool order %s: %w", order, err)
+		if err := q.MarkNodeDrainedForRelease(ctx, row.NodeName); err != nil {
+			return fmt.Errorf("alloc: take %s out of placement: %w", row.NodeName, err)
 		}
-
-		if err := sealPoolOrderTx(ctx, q, order, "", ts(now), reason, ts(now)); err != nil {
-			return err
-		}
-
-		sealed = true
 
 		return nil
 	})
@@ -111,6 +117,30 @@ func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string
 	}
 
 	return sealed, nil
+}
+
+// sealUnjoinedTx seals an order nothing was ever admitted for, on that proof, with its
+// tokens retired so nothing joins from it again.
+func sealUnjoinedTx(
+	ctx context.Context, q state.WriteOps, row *ledgerdb.PoolOrder, reason string, now time.Time, sealed *bool,
+) error {
+	if _, err := releaseproof.NewUnjoined(releaseproof.Unjoined{
+		Host: row.HostID, OrderSealed: now, Admitted: 0,
+	}); err != nil {
+		return fmt.Errorf("%w: %w", ErrPoolReleaseWaits, err)
+	}
+
+	if err := q.RetirePoolJoinTokens(ctx, row.OrderID); err != nil {
+		return fmt.Errorf("alloc: retire the join tokens of pool order %s: %w", row.OrderID, err)
+	}
+
+	if err := sealPoolOrderTx(ctx, q, row.OrderID, "", ts(now), reason, ts(now)); err != nil {
+		return err
+	}
+
+	*sealed = true
+
+	return nil
 }
 
 // SealPoolRelease seals a joined host whose release was asked for, once the ledger
@@ -146,7 +176,7 @@ func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releasep
 			return fmt.Errorf("alloc: pool order %s: release asked for at %q: %w", order, row.ReleaseRequestedAt, err)
 		}
 
-		holdings, err := releaseHoldingsTx(ctx, q, row.NodeName, row.HostID, requested)
+		holdings, err := releaseHoldingsTx(ctx, q, row.NodeName, row.HostID, requested, row.ReleaseContradicted == 1)
 		if err != nil {
 			return err
 		}
@@ -185,9 +215,12 @@ func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releasep
 }
 
 // releaseHoldingsTx reads what still holds a joined pool host for its release: its
-// leases, quarantine and custody, and what it is proved to run.
+// leases, quarantine and custody, and what it is proved to run. A registered node that
+// has contradicted the order's release since its last proved decommission
+// (release_contradicted) is could-not-tell; one that never registered held nothing
+// whatever it said arriving, because nothing places on a node the ledger has no row for.
 func releaseHoldingsTx(
-	ctx context.Context, q state.ReadOps, node, host string, sealed time.Time,
+	ctx context.Context, q state.ReadOps, node, host string, sealed time.Time, contradicted bool,
 ) (releaseproof.Holdings, error) {
 	counts, err := q.CountNodeHoldings(ctx, node)
 	if err != nil {
@@ -207,6 +240,8 @@ func releaseHoldingsTx(
 		holdings.Inventory = 0
 	case err != nil:
 		return releaseproof.Holdings{}, fmt.Errorf("alloc: read %s's release facts: %w", node, err)
+	case contradicted:
+		holdings.Inventory = -1
 	default:
 		holdings.Inventory = releaseInventory(&facts)
 	}
@@ -283,7 +318,7 @@ func (a *Allocator) PoolReleaseProof(ctx context.Context, order string) (release
 		}
 
 		if row.NodeName != "" {
-			holdings, err := releaseHoldingsTx(ctx, q, row.NodeName, row.HostID, sealed)
+			holdings, err := releaseHoldingsTx(ctx, q, row.NodeName, row.HostID, sealed, row.ReleaseContradicted == 1)
 			if err != nil {
 				return err
 			}

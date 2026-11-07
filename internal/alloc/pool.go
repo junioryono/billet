@@ -56,6 +56,10 @@ type PoolOrder struct {
 	// did; the moment its host left placement. ReleaseReason is what they gave.
 	ReleaseRequested time.Time
 	ReleaseReason    string
+	// ReleaseContradicted is whether the order's node has said, since its last
+	// decommission on proof, that it is back or runs something; its release waits for a
+	// fresh one, or a sealed one for a person.
+	ReleaseContradicted bool
 }
 
 // RecordPoolOrder commits an order before its source is asked, so an order whose
@@ -124,6 +128,7 @@ func poolOrderFrom(r *ledgerdb.PoolOrder) (PoolOrder, error) {
 		Reason: r.Reason, FirstAttempt: first, Updated: updated,
 		NodeFingerprint: r.NodeFingerprint, NodeCertSerial: r.NodeCertSerial, JoinHold: r.JoinHold,
 		ReleaseRequested: requested, ReleaseReason: r.ReleaseReason,
+		ReleaseContradicted: r.ReleaseContradicted == 1,
 	}, nil
 }
 

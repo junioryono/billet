@@ -151,17 +151,6 @@ ON CONFLICT(node) DO UPDATE SET
      received_at = excluded.received_at,
      running = excluded.running;
 
--- name: ContradictNodeDecommission :exec
--- Withdraw the proof of a decommission from a host whose current registration has
--- reported compute since (ADR-030).
---
--- DURABLE, BECAUSE THE INVENTORY IS NOT. A later empty report overwrites the row and a
--- control-plane start deletes it, and either would leave the decommission standing as
--- proof that a host it contradicted runs nothing. decommissioned_at stays: the person's
--- word is still recorded, only no longer as proved, as `--force` records it.
-UPDATE nodes SET decommission_proven = 0
- WHERE name = @name AND epoch = @epoch AND decommission_proven = 1;
-
 -- name: ListNodeInventories :many
 -- What every known host last said it was running.
 --

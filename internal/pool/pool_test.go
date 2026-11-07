@@ -37,6 +37,18 @@ type fakeLedger struct {
 	// counts the seals asked for.
 	releaseWaits bool
 	sealCalls    int
+	// contradicted is every sealed order whose proof the ledger no longer holds.
+	contradicted map[string]bool
+}
+
+// contradict records that order's node said, after its seal, that it is back.
+func (l *fakeLedger) contradict(order string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.contradicted == nil {
+		l.contradicted = map[string]bool{}
+	}
+	l.contradicted[order] = true
 }
 
 // releaseMove moves an order between two release states, keeping its host.
@@ -79,6 +91,12 @@ func (l *fakeLedger) PoolReleaseProof(_ context.Context, order string) (releasep
 	o := l.snapshot()[order]
 	if o.State != alloc.PoolSealed {
 		return releaseproof.Proof{}, alloc.ErrPoolOrderMoved
+	}
+	l.mu.Lock()
+	contradicted := l.contradicted[order]
+	l.mu.Unlock()
+	if contradicted {
+		return releaseproof.Proof{}, alloc.ErrPoolReleaseContradicted
 	}
 
 	return releaseproof.Sealed(o.HostID, o.Updated)
@@ -247,11 +265,20 @@ type fakeSource struct {
 	goneAsked  []string
 	presence   hostsource.Presence
 	goneErr    error
+	// onScope runs inside every Scope call, before it answers: what commits while the
+	// source's scope is being read.
+	onScope func()
 }
 
 func (s *fakeSource) Name() string { return "fake" }
 
 func (s *fakeSource) Scope(context.Context) (string, error) {
+	s.mu.Lock()
+	onScope := s.onScope
+	s.mu.Unlock()
+	if onScope != nil {
+		onScope()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1063,6 +1090,28 @@ func TestAReleaseIsSealedReleasedAndGoneInTurn(t *testing.T) {
 	step(t, r)
 	if got := r.ledger.states()["o-9"]; got != alloc.PoolGone || len(r.first.released) != 1 {
 		t.Fatalf("a host its source says is gone: %s, released %v", got, r.first.released)
+	}
+}
+
+// A CONTRADICTION COMMITTED WHILE THE SOURCE'S SCOPE IS READ RELEASES NOTHING: the proof
+// is read after the scope, so the host its node says is back is not sent to its source,
+// on the first ask after the seal or on any later one.
+func TestAContradictionDuringTheScopeLookupReleasesNothing(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 0, Max: 2})
+	r.joined("o-9", "i-9", true)
+	r.first.onScope = func() {
+		if r.ledger.states()["o-9"] == alloc.PoolSealed {
+			r.ledger.contradict("o-9")
+		}
+	}
+	for range 2 {
+		if err := r.pool.Step(t.Context()); !errors.Is(err, alloc.ErrPoolReleaseContradicted) {
+			t.Fatalf("a contradiction during the scope lookup answered %v", err)
+		}
+		if got := r.ledger.states()["o-9"]; got != alloc.PoolSealed || len(r.first.released) != 0 {
+			t.Fatalf("a contradicted seal: %s, released %v", got, r.first.released)
+		}
 	}
 }
 

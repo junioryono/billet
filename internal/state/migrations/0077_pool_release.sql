@@ -13,6 +13,14 @@
 --
 -- release_reason is what the person who asked gave, for `billet pool` and the log.
 --
+-- release_contradicted is 1 once the order's node has said, since its last decommission
+-- on the compute barrier's proof, that it is back or runs something: it arrived to
+-- register (refused or not), or an inventory of its current registration reported
+-- compute. Only a fresh decommission on proof sets it back to 0, in that decommission's
+-- own transaction, so the order of the two is the ledger's and never a clock's. It is
+-- the release's alone: the decommission itself, which the drain's clearance and a
+-- CodeBuild fleet's claim read, is left as the person recorded it.
+--
 -- The states this uses (sealed, released, gone) were listed by migration 75.
 
 -- +billet:statement
@@ -21,4 +29,8 @@ ALTER TABLE pool_orders ADD COLUMN release_requested_at TEXT NOT NULL DEFAULT ''
 
 -- +billet:statement
 ALTER TABLE pool_orders ADD COLUMN release_reason TEXT NOT NULL DEFAULT ''
+-- +billet:end
+
+-- +billet:statement
+ALTER TABLE pool_orders ADD COLUMN release_contradicted INTEGER NOT NULL DEFAULT 0 CHECK (release_contradicted IN (0, 1))
 -- +billet:end

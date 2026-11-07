@@ -9,15 +9,13 @@ import (
 	"context"
 )
 
-const anyArrivalProof = `-- name: AnyArrivalProof :one
-SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes
-              UNION ALL
-              SELECT 1 FROM nodes WHERE decommission_proven = 1)
+const anyBarrierRunExists = `-- name: AnyBarrierRunExists :one
+SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes)
 `
 
-// Whether the fleet has anything an unattributed arrival discards, for the same reason.
-func (q *Queries) AnyArrivalProof(ctx context.Context) (bool, error) {
-	row := q.db.QueryRowContext(ctx, anyArrivalProof)
+// Whether the fleet has any run at all, for the same reason.
+func (q *Queries) AnyBarrierRunExists(ctx context.Context) (bool, error) {
+	row := q.db.QueryRowContext(ctx, anyBarrierRunExists)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -26,11 +24,13 @@ func (q *Queries) AnyArrivalProof(ctx context.Context) (bool, error) {
 const arrivalHasProof = `-- name: ArrivalHasProof :one
 SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = $1
               UNION ALL
-              SELECT 1 FROM nodes WHERE name = $1 AND decommission_proven = 1)
+              SELECT 1 FROM pool_orders
+               WHERE node_name = $1 AND node_name != '' AND state IN ('placed', 'sealed')
+                 AND release_contradicted = 0)
 `
 
-// Whether one host has anything an arrival discards: a continuous-empty run, or a
-// decommission recorded as proved.
+// Whether one host has anything an arrival discards: a continuous-empty run, or a pool
+// order whose release its decommission still proves (ADR-030).
 //
 // READ BEFORE THE WRITE, and that is not a micro-optimisation: the invalidation
 // runs on EVERY registration, ahead of the revocation check, so a credential an
@@ -448,28 +448,5 @@ func (q *Queries) UpsertComputeBarrier(ctx context.Context, arg UpsertComputeBar
 		arg.RequestedAt,
 		arg.RequestedBy,
 	)
-	return err
-}
-
-const withdrawDecommissionProof = `-- name: WithdrawDecommissionProof :exec
-UPDATE nodes SET decommission_proven = 0 WHERE name = $1 AND decommission_proven = 1
-`
-
-// A host arriving to register contradicts a decommission's proof that it is gone
-// (ADR-030), whether or not the registration is then refused: a refused one never
-// reaches the upsert that clears the decommission, and the proof must not outlive the
-// machine's own word. decommissioned_at stays, as `--force` records it.
-func (q *Queries) WithdrawDecommissionProof(ctx context.Context, name string) error {
-	_, err := q.db.ExecContext(ctx, withdrawDecommissionProof, name)
-	return err
-}
-
-const withdrawEveryDecommissionProof = `-- name: WithdrawEveryDecommissionProof :exec
-UPDATE nodes SET decommission_proven = 0 WHERE decommission_proven = 1
-`
-
-// The same for an arrival that names no host.
-func (q *Queries) WithdrawEveryDecommissionProof(ctx context.Context) error {
-	_, err := q.db.ExecContext(ctx, withdrawEveryDecommissionProof)
 	return err
 }

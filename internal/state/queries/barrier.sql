@@ -83,8 +83,8 @@ DELETE FROM compute_barrier_nodes;
 DELETE FROM compute_barrier_nodes WHERE node = @node;
 
 -- name: ArrivalHasProof :one
--- Whether one host has anything an arrival discards: a continuous-empty run, or a
--- decommission recorded as proved.
+-- Whether one host has anything an arrival discards: a continuous-empty run, or a pool
+-- order whose release its decommission still proves (ADR-030).
 --
 -- READ BEFORE THE WRITE, and that is not a micro-optimisation: the invalidation
 -- runs on EVERY registration, ahead of the revocation check, so a credential an
@@ -93,24 +93,13 @@ DELETE FROM compute_barrier_nodes WHERE node = @node;
 -- slot over and over and starve every scheduling decision in the process.
 SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = @node
               UNION ALL
-              SELECT 1 FROM nodes WHERE name = @node AND decommission_proven = 1);
+              SELECT 1 FROM pool_orders
+               WHERE node_name = @node AND node_name != '' AND state IN ('placed', 'sealed')
+                 AND release_contradicted = 0);
 
--- name: AnyArrivalProof :one
--- Whether the fleet has anything an unattributed arrival discards, for the same reason.
-SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes
-              UNION ALL
-              SELECT 1 FROM nodes WHERE decommission_proven = 1);
-
--- name: WithdrawDecommissionProof :exec
--- A host arriving to register contradicts a decommission's proof that it is gone
--- (ADR-030), whether or not the registration is then refused: a refused one never
--- reaches the upsert that clears the decommission, and the proof must not outlive the
--- machine's own word. decommissioned_at stays, as `--force` records it.
-UPDATE nodes SET decommission_proven = 0 WHERE name = @name AND decommission_proven = 1;
-
--- name: WithdrawEveryDecommissionProof :exec
--- The same for an arrival that names no host.
-UPDATE nodes SET decommission_proven = 0 WHERE decommission_proven = 1;
+-- name: AnyBarrierRunExists :one
+-- Whether the fleet has any run at all, for the same reason.
+SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes);
 
 -- name: RecordBarrierRun :exec
 -- Extend one host's continuous-empty run, or start a new one.
