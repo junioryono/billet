@@ -78,11 +78,13 @@ The renders are bound to one root by a **generation fingerprint**. The plan rend
 
 ### `billet init iam`
 
-Print the IAM policy this config's node role needs, derived from the config: cache adds EBS and S3, spot adds the queue, an instance profile adds `PassRole`. Every ec2 policy also denies `ec2:RunInstances` for a snapshot the deployment does not own, because that grant otherwise reads any snapshot in the account through a block-device mapping.
+Print the IAM policy this config's node role needs, derived from the config: cache adds EBS and S3, spot adds the queue, an instance profile adds `PassRole`. Every ec2 policy also denies `ec2:RunInstances` for a snapshot the deployment does not own, because that grant otherwise reads any snapshot in the account through a block-device mapping. The launch grant allows an instance and its volumes only when the launch tags them with this deployment's owner, and only into the config's `subnet_id` and its trusted and untrusted security groups, so the role cannot launch elsewhere in the account or launch compute billet cannot see.
 
 | Flag | Meaning |
 |---|---|
 | `--builder` | also grant what `billet ami build` needs |
+| `--builder-subnet <id>`, `--builder-security-group <id>` | with `--builder`, also let launches use the subnet and the group `billet ami build` is told to launch with, when they are not the config's |
+
 | `--payload-bucket <bucket>` | with `--builder`, also grant put, get and delete on the objects `billet ami build --payload-bucket` stages there (`billet-payload-*`) and nothing else |
 | `--build-role` | print the CodeBuild build service role's policy instead of the node's |
 | `--controller-sweep` | print the control plane's grant for sweeping staged registrations under this node's parameter path |

@@ -20,9 +20,26 @@
       "Action": [
         "ec2:RunInstances"
       ],
-      "Resource": [
-        "*"
+      "NotResource": [
+        "arn:TFPARTITION:ec2:*:*:instance/*",
+        "arn:TFPARTITION:ec2:*:*:volume/*"
       ]
+    },
+    {
+      "Sid": "BilletRuntimeLaunchOwned",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*:*:instance/*",
+        "arn:TFPARTITION:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/sh.billet.owner": "false"
+        }
+      }
     },
     {
       "Sid": "BilletRuntimeDenyForeignSnapshot",

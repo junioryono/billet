@@ -20,9 +20,26 @@
       "Action": [
         "ec2:RunInstances"
       ],
-      "Resource": [
-        "*"
+      "NotResource": [
+        "arn:aws:ec2:*:*:instance/*",
+        "arn:aws:ec2:*:*:volume/*"
       ]
+    },
+    {
+      "Sid": "BilletRuntimeLaunchOwned",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:instance/*",
+        "arn:aws:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/sh.billet.owner": "false"
+        }
+      }
     },
     {
       "Sid": "BilletRuntimeDenyForeignSnapshot",
