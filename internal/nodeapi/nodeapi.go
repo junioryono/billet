@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 39
+	Version = 46
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -520,6 +520,91 @@ const (
 	// without them.
 	VersionJobTests = 38
 
+	// VersionWindowsGuests is the version from which a node reads a lease's guest OS
+	// to choose its boot script, so a Windows lease reaches only a node that will
+	// boot it (ADR-026). The lease has carried the guest OS since long before this,
+	// and no wire struct changes: the step is in what a node does with it.
+	//
+	// REFUSED WHERE IT IS SENT. A node below it sends a Linux boot script to a Windows
+	// AMI, which boots, looks healthy, registers nothing and holds its lease, so
+	// placement passes over one (alloc.WindowsGuestsWireVersion, which a test holds
+	// equal) and a Windows lease is refused to one at dispatch and again at delivery,
+	// as an architecture is. The job waits for a node that can run it, and `billet
+	// status` says so. A Linux lease is as it always was.
+	VersionWindowsGuests = 39
+
+	// VersionEgress is the version from which a launch can carry a tier's allowlist
+	// (TierSpec's egress) and a node can report what the host saw of a job's network
+	// (POST /v1/nodes/{node}/leases/{lease}/egress, a lease.JobEgress) (ADR-028).
+	//
+	// THE TWO DIRECTIONS GO DIFFERENT WAYS, because they mean different things.
+	// REFUSED WHERE A LAUNCH IS SENT: an older node ignores TierSpec's egress and
+	// would run the job open, so a listed tier is refused to a node below this at
+	// dispatch and again at delivery, as a cache block and an architecture are.
+	// REPORTED, AND CHECKED WHERE IT IS EMITTED, for the report: it is an
+	// observation nothing decides from, and an older plane answers the route with a
+	// bare 404, so a node negotiated below this drops it as success and says so
+	// once. A pairing that negotiated below this and sends one anyway is refused.
+	// MinVersion does not move.
+	VersionEgress = 40
+
+	// VersionTartVerified is the version from which a node reads a Tart tier's
+	// `<image>@verified` and a registration's answer carries the node's macOS limit
+	// (RegisterResponse's macos_vm_limit), which a verification beside the node counts
+	// its probe against (ADR-021).
+	//
+	// IGNORED BY AN OLDER NODE, which decodes an answer leniently, and a node below it
+	// records that its control plane does not say. CHECKED WHERE A LAUNCH IS SENT: an
+	// older node hands `@verified` to `tart fqn` as a name, so placement passes over a
+	// Tart host below this for a tier naming it (alloc.TartVerifiedWireVersion, which a
+	// test holds equal), and such a tier is refused to one at dispatch and again at
+	// delivery.
+	VersionTartVerified = 41
+
+	// VersionEC2GuestCaches is the version from which an EC2 node carries the caches
+	// it serves to a guest into that guest's boot script (ADR-024).
+	//
+	// REPORTED BY DOING LESS, WHERE THE LAUNCH IS SENT: an older EC2 node refuses a
+	// launch that names a guest cache, which would fail every job on a tier that
+	// merely has them by default. So the plane sends it the tier's cache block with
+	// them off, and its job runs as it did before them. Delivery holds a launch that
+	// names them to a node at this version or above.
+	VersionEC2GuestCaches = 42
+
+	// VersionJobLogs is the version from which a node can send a job's step logs to be
+	// indexed (POST /v1/nodes/{node}/logs, LogChunkRequest), a registration's answer names
+	// the index (RegisterResponse's log_index_id), and the plane can ask a node for lines
+	// it holds (CommandReadLog).
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT: below it a node
+	// ships nothing, and the plane sends no CommandReadLog, which an older node answers as
+	// an unknown command after a wait, and no log_index_id. CHECKED WHERE IT IS READ: a
+	// chunk from a pairing below it is refused, and an id below it is no index. Its text
+	// stays on the node either way, so what an older pairing loses is finding it.
+	VersionJobLogs = 43
+
+	// VersionPoolJoin is the version from which an enrollment may carry what a pool
+	// host's platform signed about it (EnrollRequest's identity_document and
+	// identity_signature), which its order's source checks before it vouches (ADR-030).
+	//
+	// ENROLLMENT NEGOTIATES NO VERSION, so the gate is who sends them: only a pool
+	// host, `billet join --pool-order`, which a pool's own boot runs, so its control
+	// plane runs a pool and is at this version. An older plane's strict decoder refuses
+	// a request carrying them; an ordinary node never sends them.
+	VersionPoolJoin = 44
+
+	// VersionJobAttach is the version from which the plane can ask a node for a stream to a
+	// lease's guest (CommandAttach), which the node dials back on
+	// POST /v1/nodes/{node}/streams/{stream}, so a terminal reaches a VM with no port open on
+	// the node, and a launch's tier can say it may be attached to (TierSpec's attach).
+	//
+	// A FEATURE AN OLDER PEER CANNOT OFFER, reported rather than refused. CHECKED WHERE IT IS
+	// SENT: the pending command's minWire, so an older node is not asked and an attach says
+	// so. NEITHER REFUSED NOR REPORTED for the tier's word: an older node decodes it leniently
+	// and starts a guest with no terminal, which an attach then says, and which costs the job
+	// nothing.
+	VersionJobAttach = 45
+
 	// VersionCacheBreaker is the version from which a cache observation may say
 	// `bypassed`, what a job got when its node's breaker had stopped asking the site's
 	// store (#531), and from which a node may report what the breaker is doing
@@ -530,7 +615,7 @@ const (
 	// one over this, and has no such route: below it the node says `unavailable`,
 	// which is true as far as it goes, and sends no report. CHECKED WHERE THE WORD IS
 	// READ too, so a pairing below it that sends one anyway is kept as `unavailable`.
-	VersionCacheBreaker = 39
+	VersionCacheBreaker = 46
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -658,6 +743,16 @@ const (
 	// dispatched, and its answer is recorded against a fence captured before it
 	// was sent — which is what turns bounded staleness into an ordering.
 	CommandInventory CommandKind = "inventory"
+
+	// CommandReadLog asks a node for lines of a job's log it holds (VersionJobLogs), taken in
+	// its turn from the queue like any command, and answered busy when the node has its limit
+	// of reads running. Run
+	// beside the node's loop, like a launch, so a search never waits behind a destroy.
+	CommandReadLog CommandKind = "read_log"
+
+	// CommandAttach asks a node to reach a lease's guest and dial a stream back to the plane
+	// (VersionJobAttach). Run beside the node's loop, like a log read.
+	CommandAttach CommandKind = "attach"
 )
 
 // RegisterRequest is a node introducing itself.
@@ -798,6 +893,10 @@ type RegisterResponse struct {
 	// which is why they are not what Version is checked against.
 	MinVersion int `json:"min_version,omitempty"`
 	MaxVersion int `json:"max_version,omitempty"`
+	// LogIndexID names the index of job logs this control plane holds, from
+	// VersionJobLogs and empty where it holds none. A node ships what it holds to an id it
+	// has not shipped to.
+	LogIndexID string `json:"log_index_id,omitempty"`
 	// Deployment is which installation answered.
 	//
 	// SO THE NODE CAN CHECK TOO. TLS already binds this — the node verifies the
@@ -815,6 +914,9 @@ type RegisterResponse struct {
 	// ImagesAccept is what the control plane's images.accept names, sorted, from
 	// VersionImageAcceptance. Absent at that version means it accepts none.
 	ImagesAccept []string `json:"images_accept,omitempty"`
+	// MacOSVMLimit is how many macOS guests the control plane places on this node, from
+	// VersionTartVerified. A pointer so zero, which runs none, is told from silence.
+	MacOSVMLimit *int `json:"macos_vm_limit,omitempty"`
 }
 
 // HeaderIncarnation carries the node process's identity on every request.
@@ -874,6 +976,64 @@ type Command struct {
 	// Upgrade is the release an upgrade command names, and the rollout that asked
 	// for it.
 	Upgrade *UpgradeSpec `json:"upgrade,omitempty"`
+
+	// LogRead is what CommandReadLog asks for.
+	LogRead *LogReadSpec `json:"log_read,omitempty"`
+
+	// Attach is what CommandAttach asks for.
+	Attach *AttachSpec `json:"attach,omitempty"`
+}
+
+// AttachSpec names a lease's guest, and the stream to carry it on: a name and a single-use token,
+// which prove to the plane that a command asked for this stream.
+type AttachSpec struct {
+	Lease  string `json:"lease"`
+	Stream string `json:"stream"`
+	Token  string `json:"token"`
+}
+
+// HeaderStreamToken carries a stream's single-use token, and StreamProtocol is what a stream's
+// connection upgrades to.
+const (
+	HeaderStreamToken = "Billet-Stream-Token"
+	StreamProtocol    = "billet-stream"
+)
+
+// The most a CommandReadLog answer carries. JSON can spell a byte of text in six, and a
+// line costs about 50 bytes of its own, so an answer at both bounds fits the 1 MiB body.
+const (
+	MaxLogReadBytes = 128 << 10
+	MaxLogReadLines = 2 << 10
+)
+
+// LogLineRange is an inclusive range of a job's line numbers.
+type LogLineRange struct {
+	First int64 `json:"first"`
+	Last  int64 `json:"last"`
+}
+
+// LogReadSpec names lines of one lease's log.
+type LogReadSpec struct {
+	Lease    string         `json:"lease"`
+	Ranges   []LogLineRange `json:"ranges"`
+	MaxBytes int            `json:"max_bytes"`
+}
+
+// LogLine is one line of a job's log. WHAT THE JOB WROTE, on the guest's clock.
+type LogLine struct {
+	Line     int64  `json:"line"`
+	AtMillis int64  `json:"at_ms,omitempty"`
+	Text     string `json:"text"`
+}
+
+// LogReadResult is a node's answer. Held false is a node that holds nothing of the lease,
+// which is never no such lines; Cut says a bound stopped the read; Unreadable counts the
+// chunks that could not be read back.
+type LogReadResult struct {
+	Held       bool      `json:"held"`
+	Cut        bool      `json:"cut,omitempty"`
+	Unreadable int       `json:"unreadable,omitempty"`
+	Lines      []LogLine `json:"lines,omitempty"`
 }
 
 // UpgradeSpec is one instruction to replace a node's own billet.
@@ -949,6 +1109,14 @@ type TierSpec struct {
 	// it, so the plane sends a tier naming one only to a node that speaks it, and
 	// checks again at delivery.
 	Arch config.Arch `json:"arch,omitempty"`
+	// Attach says the tier's guests serve a terminal, and HoldOnFailure is how long a failed
+	// job's VM is kept, as the job's log says it, empty for none. From VersionJobAttach; an
+	// older node ignores both and starts a guest with no terminal.
+	Attach        bool   `json:"attach,omitempty"`
+	HoldOnFailure string `json:"hold_on_failure,omitempty"`
+	// Egress is the tier's allowlist, nil for an open tier (VersionEgress). A node
+	// that cannot apply it refuses the launch.
+	Egress *config.TierEgress `json:"egress,omitempty"`
 }
 
 // TierSpecOf renders the parts of a tier that travel to the selected provider's
@@ -968,6 +1136,15 @@ func TierSpecOf(t config.Tier, provider config.ProviderKind) *TierSpec {
 		CacheScope:  t.CacheScope,
 		Cache:       new(t.EffectiveCache()),
 		Arch:        t.Arch,
+		Attach:      t.Attachable(),
+		HoldOnFailure: func() string {
+			if d := t.HoldDuration(); d > 0 {
+				return d.String()
+			}
+
+			return ""
+		}(),
+		Egress: t.EgressOf(),
 		BuildKitCacheMountLimit: func() config.ByteSize {
 			if t.BuildKitCacheMountLimit > 0 {
 				return t.BuildKitCacheMountLimit
@@ -994,6 +1171,13 @@ type EnrollRequest struct {
 	// can reach the port, who could then fill the pending list or take a name
 	// before the machine that should have it.
 	JoinToken string `json:"join_token"`
+	// IdentityDocument and IdentitySignature are what the host's platform signed about
+	// it (an EC2 instance identity document and its base64 signature), which a pool
+	// host sends so its order's source can vouch for it (ADR-030). Sent only by a pool
+	// host, whose control plane runs the pool and so decodes them; an older plane's
+	// strict decoder refuses a request carrying them (VersionPoolJoin).
+	IdentityDocument  string `json:"identity_document,omitempty"`
+	IdentitySignature string `json:"identity_signature,omitempty"`
 }
 
 // EnrollResponse is the decision, or that there is not one yet.
@@ -1144,4 +1328,7 @@ type CommandResult struct {
 	// InventoryKnown exists to prevent, not to be copied.
 	BarrierID string   `json:"barrier_id,omitempty"`
 	Instances []string `json:"instances,omitempty"`
+
+	// Log is CommandReadLog's answer.
+	Log *LogReadResult `json:"log,omitempty"`
 }

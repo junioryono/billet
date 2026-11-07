@@ -138,6 +138,14 @@ func TestARealSecondProcessIsRefusedAndTheLockDiesWithIt(t *testing.T) {
 	if _, err := LockDeployment(id, LockOptions{Dir: dir}); !errors.Is(err, ErrDeploymentLocked) {
 		t.Fatalf("a second PROCESS took an identity another process holds: %v", err)
 	}
+	// AND THE PROBE SEES ANOTHER PROCESS'S HOLD, which `billet acceptance stopped` reads.
+	path, err := DeploymentLockPath(dir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held, err := LockHeld(path); err != nil || !held {
+		t.Fatalf("LockHeld beside another process's lock: held %v, %v", held, err)
+	}
 
 	// And the other half: when that process dies, the kernel drops the lock.
 	//
@@ -168,6 +176,10 @@ func TestARealSecondProcessIsRefusedAndTheLockDiesWithIt(t *testing.T) {
 	if status, ok := exit.Sys().(syscall.WaitStatus); ok && !status.Signaled() {
 		t.Fatalf("the helper exited on its own (%v) rather than being killed, so nothing here "+
 			"shows the kernel releasing a HELD lock", exit)
+	}
+
+	if held, err := LockHeld(path); err != nil || held {
+		t.Fatalf("LockHeld after the holder was killed: held %v, %v", held, err)
 	}
 
 	// SIGKILL, so nothing in the helper ran on the way out — no defer, no

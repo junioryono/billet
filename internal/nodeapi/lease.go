@@ -113,6 +113,13 @@ type GuestReportRequest struct {
 	Report lease.GuestReport `json:"report"`
 }
 
+// EgressReportRequest carries what the host saw of a lease's network, once, as its
+// compute goes (VersionEgress).
+type EgressReportRequest struct {
+	Epoch  int64           `json:"epoch"`
+	Report lease.JobEgress `json:"report"`
+}
+
 // ReleaseRequest ends a lease with a terminal outcome.
 type ReleaseRequest struct {
 	Epoch   int64  `json:"epoch"`
@@ -249,4 +256,13 @@ func ParsePhase(s string) (lease.Phase, bool) {
 	default:
 		return "", false
 	}
+}
+
+// LogChunkRequest sends one chunk of a job's log to be indexed (VersionJobLogs). Data is
+// the chunk as the guest sent it and the node stored it, joblog's codec, and FirstLine
+// where the node numbered its lines from.
+type LogChunkRequest struct {
+	Lease     string `json:"lease"`
+	FirstLine int64  `json:"first_line"`
+	Data      []byte `json:"data"`
 }

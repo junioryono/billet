@@ -13,10 +13,19 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/imageaccept"
+	"github.com/junioryono/billet/internal/macoslimit"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/wirecert"
 )
+
+// logReadsAtOnce bounds the log reads a node serves beside its loop.
+const logReadsAtOnce = 4
+
+// LogReader is a Compute that keeps its jobs' logs.
+type LogReader interface {
+	ReadJobLog(ctx context.Context, spec nodeapi.LogReadSpec) (nodeapi.LogReadResult, error)
+}
 
 // Compute is the part of internal/node.Runner the loop drives.
 //
@@ -200,8 +209,8 @@ type LoopOptions struct {
 	RegistrationRecordPath string
 	// ImageAcceptanceDir is node.state_dir, where the node records what its
 	// deployment accepts for its guest images, or that its control plane does not
-	// say, after every accepted registration (internal/imageaccept); empty
-	// records nothing.
+	// say, after every accepted registration (internal/imageaccept), and its macOS
+	// limit (internal/macoslimit); empty records neither.
 	ImageAcceptanceDir string
 	// Registered is told of every accepted registration, for what the node reports
 	// once per registration because the ledger keeps it only under the one in force.
@@ -597,6 +606,20 @@ func recordRegistration(c *Client, log *slog.Logger, opts LoopOptions) {
 		if err := imageaccept.Remove(opts.ImageAcceptanceDir); err != nil {
 			log.Error("could not remove the earlier record of which image components the "+
 				"deployment accepts, which the image commands may still read", "error", err)
+		}
+	}
+
+	// THE NODE'S MACOS LIMIT, from the same registration. A record that could not be
+	// replaced is removed, so a verification refuses rather than count its probe against
+	// a limit this node no longer holds.
+	limit, said := c.MacOSLimit()
+	if err := macoslimit.Write(opts.ImageAcceptanceDir, opts.Deployment, said, limit, opts.now()); err != nil {
+		log.Error("could not record this node's macOS limit; a macOS verification refuses until "+
+			"the node records it at its next registration", "error", err)
+
+		if err := macoslimit.Remove(opts.ImageAcceptanceDir); err != nil {
+			log.Error("could not remove the earlier record of this node's macOS limit, which a "+
+				"verification may still read", "error", err)
 		}
 	}
 }
@@ -1321,6 +1344,18 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	// re-registration never runs beside a launch begun under the last one. The
 	// wait comes before the cancel: the other order would cancel what it waits for.
 	launches := newLaunchSet(opts.LaunchConcurrency)
+	// A SESSION ENDS WITH THIS serve, not only with ctx: a node superseded or unregistered returns
+	// from here with ctx still live, and an idle terminal must not hold up what its caller does
+	// next. Cancelled before the join, once the reads that start sessions have finished.
+	var sessions sync.WaitGroup
+	defer sessions.Wait()
+
+	sessionCtx, endSessions := context.WithCancel(ctx)
+	defer endSessions()
+
+	reads := newLaunchSet(logReadsAtOnce)
+	defer reads.wait()
+
 	defer func() {
 		launches.wait()
 		stopSaying()
@@ -1449,6 +1484,43 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		run := func() error {
 			return reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd,
 				executePolled(ctx, launchCtx, &executing, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
+		}
+
+		// A LOG READ RUNS BESIDE THE LOOP ALWAYS: it touches no compute and takes no
+		// lease, and a search should not wait out a destroy or an upgrade. NOR THE LOOP
+		// FOR A READ: with every slot taken it is answered busy at once, since a destroy
+		// behind it matters more, and a reader can ask again.
+		if cmd.Kind == nodeapi.CommandReadLog {
+			if !reads.tryStart(run) {
+				err := reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd, nodeapi.CommandResult{
+					ID: cmd.ID, Error: "this node is reading as many logs as it may; ask again",
+				})
+				if err != nil {
+					return err
+				}
+			}
+
+			continue
+		}
+
+		// AN ATTACH THE SAME: reaching a guest should not wait out a destroy, nor one wait
+		// for it, and its session runs on beside everything once it is joined.
+		if cmd.Kind == nodeapi.CommandAttach {
+			attach := func() error {
+				return reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd,
+					attachGuest(sessionCtx, c, compute, cmd, &sessions))
+			}
+
+			if !reads.tryStart(attach) {
+				err := reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd, nodeapi.CommandResult{
+					ID: cmd.ID, Error: "this node is opening as many terminals as it may; ask again",
+				})
+				if err != nil {
+					return err
+				}
+			}
+
+			continue
 		}
 
 		// A LAUNCH RUNS BESIDE THE LOOP when the provider allows it, and the poll
@@ -1798,6 +1870,28 @@ func execute(
 		}
 
 		res.OK = true
+
+		return res
+
+	case nodeapi.CommandReadLog:
+		// A NODE THAT KEEPS NO LOGS ANSWERS THAT IT HOLDS NOTHING: an error would read as
+		// could-not-tell, and asking again would change nothing.
+		res.OK = true
+		res.Log = &nodeapi.LogReadResult{}
+
+		reader, ok := compute.(LogReader)
+		if !ok || cmd.LogRead == nil {
+			return res
+		}
+
+		log, err := reader.ReadJobLog(ctx, *cmd.LogRead)
+		if err != nil {
+			res.OK, res.Log, res.Error = false, nil, err.Error()
+
+			return res
+		}
+
+		res.Log = &log
 
 		return res
 

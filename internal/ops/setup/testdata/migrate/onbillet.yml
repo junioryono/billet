@@ -1,0 +1,11 @@
+name: already
+on: [push]
+jobs:
+  moved:
+    runs-on: billet-2vcpu-ubuntu-2404
+    steps:
+      - run: echo moved
+  loud:
+    runs-on: BILLET-2VCPU-UBUNTU-2404
+    steps:
+      - run: echo loud

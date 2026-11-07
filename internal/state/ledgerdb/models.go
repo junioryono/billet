@@ -18,6 +18,13 @@ type Admission struct {
 	ChangedAt  string
 }
 
+type AlertRule struct {
+	Name        string
+	FirstSeenAt string
+	MutedUntil  string
+	MutedBy     string
+}
+
 type CacheBlock struct {
 	Kind       string
 	ScopeType  string
@@ -67,6 +74,14 @@ type IssuedCert struct {
 	Source   string
 	NotAfter string
 	IssuedAt string
+}
+
+type JobEgress struct {
+	LeaseID    string
+	Node       string
+	RecordedAt string
+	Listed     int64
+	Report     string
 }
 
 type JobGuestReport struct {
@@ -136,6 +151,15 @@ type JobUsage struct {
 	TapReceivedBytes       sql.NullInt64
 }
 
+type LeaseHold struct {
+	LeaseID string
+	Tier    string
+	HeldAt  string
+	UntilAt string
+	EndedAt string
+	EndedBy string
+}
+
 type ListenerCapacity struct {
 	Tier       string
 	ObservedAt string
@@ -151,6 +175,33 @@ type NodeEnrollment struct {
 	RequestedAt string
 	DecidedAt   string
 	Source      string
+	PoolOrder   string
+}
+
+type PoolOrder struct {
+	OrderID             string
+	Source              string
+	Scope               string
+	Shape               string
+	Location            string
+	Arch                string
+	State               string
+	HostID              string
+	NodeName            string
+	Reason              string
+	FirstAttemptAt      string
+	UpdatedAt           string
+	NodeFingerprint     string
+	NodeCertSerial      string
+	JoinHold            string
+	ReleaseRequestedAt  string
+	ReleaseReason       string
+	ReleaseContradicted int64
+	ClearEpoch          int64
+	ClearDispatch       int64
+	ClearSince          string
+	ClearObservedAt     string
+	ClearGeneration     int64
 }
 
 type PoolRunner struct {
@@ -170,6 +221,11 @@ type PoolRunner struct {
 	JobWorkflowRef     string
 	JobEvent           string
 	GithubTarget       string
+}
+
+type RerunTier struct {
+	Tier       string
+	AskedSince string
 }
 
 type RevokedCert struct {

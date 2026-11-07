@@ -914,6 +914,72 @@ func TestS3ListParsesEveryStateObject(t *testing.T) {
 	}
 }
 
+// OWNED IS EVERY STATE, HELD TO BOTH TAGS: a pending snapshot and an attached volume
+// are this deployment's though no purge takes them, and the filters are the predicate
+// a delete checks, so another deployment's resource under this cache owner is not.
+func TestOwnedCountsEveryStateUnderBothOwnershipTags(t *testing.T) {
+	t.Parallel()
+
+	var api *ebsAPI
+	pages := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Error(err)
+		}
+		action := values.Get("Action")
+		filters := map[string]string{
+			values.Get("Filter.1.Name"): values.Get("Filter.1.Value.1"),
+			values.Get("Filter.2.Name"): values.Get("Filter.2.Value.1"),
+		}
+		if filters["tag:"+cacheOwnerTag] != api.owner || filters["tag:"+ownerTag] != api.deploymentOwner ||
+			api.deploymentOwner == "" {
+			t.Errorf("%s filters = %v, want both ownership tags", action, filters)
+		}
+		if values.Get("Filter.3.Name") != "" {
+			t.Errorf("%s filters on more than ownership: %v", action, values)
+		}
+		page := pages[action]
+		pages[action]++
+		switch {
+		case action == "DescribeSnapshots" && page == 0:
+			writeAWSResponse(t, w, `<DescribeSnapshotsResponse><snapshotSet><item><snapshotId>snap-1</snapshotId>`+
+				`<status>pending</status></item></snapshotSet><nextToken>p2</nextToken></DescribeSnapshotsResponse>`)
+		case action == "DescribeSnapshots":
+			if values.Get("NextToken") != "p2" {
+				t.Errorf("second snapshot page asked with %q", values.Get("NextToken"))
+			}
+			writeAWSResponse(t, w, `<DescribeSnapshotsResponse><snapshotSet><item><snapshotId>snap-2</snapshotId>`+
+				`<status>completed</status></item></snapshotSet></DescribeSnapshotsResponse>`)
+		case action == "DescribeVolumes":
+			writeAWSResponse(t, w, `<DescribeVolumesResponse><volumeSet>`+
+				`<item><volumeId>vol-1</volumeId><status>in-use</status></item>`+
+				`<item><volumeId>vol-2</volumeId><status>available</status></item>`+
+				`<item><volumeId>vol-3</volumeId><status>deleting</status></item>`+
+				`</volumeSet></DescribeVolumesResponse>`)
+		default:
+			t.Errorf("unexpected action %q", action)
+		}
+	}))
+	defer server.Close()
+
+	api = newEBSAPI(config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a"},
+		"deployment/site", staticCredentials{}, server.Client(), server.URL, time.Now,
+		func(context.Context, time.Duration) error { return nil })
+	snapshots, volumes, err := api.Owned(t.Context())
+	if err != nil {
+		t.Fatalf("Owned: %v", err)
+	}
+	if snapshots != 2 || volumes != 2 {
+		t.Fatalf("Owned = %d snapshots, %d volumes; want 2 (pending and completed) and 2 (in-use and "+
+			"available, not deleting)", snapshots, volumes)
+	}
+}
+
 func TestEveryAWSPaginationCycleIsRefused(t *testing.T) {
 	t.Parallel()
 

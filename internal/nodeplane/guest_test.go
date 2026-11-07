@@ -2,6 +2,7 @@ package nodeplane_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -407,5 +408,131 @@ func TestTestResultsAreHeldToTheirBoundAtTheWire(t *testing.T) {
 	defer store.mu.Unlock()
 	if len(store.guests) != 1 {
 		t.Errorf("the ledger was asked to record %d reports, want the one that fits", len(store.guests))
+	}
+}
+
+// fakeIndexer is the control plane's log index.
+type fakeIndexer struct {
+	err error
+	got []string
+}
+
+func (f *fakeIndexer) IndexLogChunk(_ context.Context, node, lease string, first int64, _ []byte) error {
+	f.got = append(f.got, fmt.Sprintf("%s %s %d", node, lease, first))
+
+	return f.err
+}
+
+// A CHUNK REACHES THE INDEX WITH THE NODE THE WIRE SAYS SENT IT, never one the body names; a pairing
+// below the wire is refused; and the index's own refusal is one the node reads as final, where
+// any other failure is one it tries again.
+func TestALogChunkCrossesTheWire(t *testing.T) {
+	t.Parallel()
+
+	body, err := json.Marshal(nodeapi.LogChunkRequest{Lease: "l1", FirstLine: 7, Data: []byte{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		version int
+		err     error
+		status  int
+		code    string
+		indexed bool
+	}{
+		// LITERAL VERSIONS, for the reason above.
+		{"the last wire without it", 42, nil, http.StatusBadRequest, nodeapi.CodeRefused, false},
+		{"the wire with it", 43, nil, http.StatusNoContent, "", true},
+		{"a refusal", 43, fmt.Errorf("%w: no", nodeplane.ErrRefused), http.StatusBadRequest, nodeapi.CodeRefused, true},
+		{"a failure", 43, errors.New("busy"), http.StatusServiceUnavailable, "", true},
+	} {
+		index := &fakeIndexer{err: tc.err}
+		log := slog.New(slog.DiscardHandler)
+		p := nodeplane.New(log, deployment, time.Minute)
+		srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil, nodeplane.WithLogIndex(index)))
+		t.Cleanup(srv.Close)
+
+		incarnation := fmt.Sprintf("wire-%d", tc.version)
+		registerAt(t, srv.URL, tc.version, incarnation)
+
+		status, refusal := postAs(t, srv.URL, "/v1/nodes/n1/logs", incarnation, body)
+		if status != tc.status || refusal.Code != tc.code {
+			t.Errorf("%s: answered %d %+v, want %d %q", tc.name, status, refusal, tc.status, tc.code)
+		}
+		if indexed := len(index.got) == 1; indexed != tc.indexed {
+			t.Errorf("%s: the index was asked %v, want asked %t", tc.name, index.got, tc.indexed)
+		}
+		if tc.indexed && index.got[0] != "n1 l1 7" {
+			t.Errorf("%s: the index was asked %v", tc.name, index.got)
+		}
+	}
+}
+
+// A CONTROL PLANE WITH NO INDEX SAYS IT COULD NOT TAKE A CHUNK, and the node tries again: its next
+// registration says whether there is an index to ship to at all.
+func TestAPlaneWithNoIndexCouldNotTakeAChunk(t *testing.T) {
+	t.Parallel()
+
+	_, base := serve(t, &fakeStore{})
+	registerAt(t, base, nodeapi.Version, "current")
+
+	body, err := json.Marshal(nodeapi.LogChunkRequest{Lease: "l1", Data: []byte{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// NOT A REFUSAL, which a node takes as for good and marks past: an index can come back under the
+	// id the node still holds.
+	status, refusal := postAs(t, base, "/v1/nodes/n1/logs", "current", body)
+	if status != http.StatusServiceUnavailable || refusal.Code == nodeapi.CodeRefused {
+		t.Errorf("answered %d %+v, want could-not-tell", status, refusal)
+	}
+}
+
+// THE INDEX'S NAME GOES ONLY TO A NODE THAT CAN READ IT, and asking a node the plane has not heard
+// of is could-not-tell, by the sentinel, never a log with no lines.
+func TestAnIndexIsNamedAtItsWireAndAnUnknownNodeIsNoAnswer(t *testing.T) {
+	t.Parallel()
+
+	p, base := serve(t, &fakeStore{}, nodeplane.WithLogIndexID("index-a"))
+
+	for _, tc := range []struct {
+		version int
+		want    string
+	}{{42, ""}, {43, "index-a"}} {
+		body, err := json.Marshal(nodeapi.RegisterRequest{MinVersion: tc.version, Version: tc.version, Incarnation: "i",
+			Node: "n1", Provider: config.ProviderDocker, GuestOS: []config.GuestOS{config.GuestLinux},
+			Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, base+"/v1/register", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set(nodeapi.HeaderIncarnation, "i")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		var got nodeapi.RegisterResponse
+
+		err = json.NewDecoder(resp.Body).Decode(&got)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.LogIndexID != tc.want {
+			t.Errorf("at wire %d the answer names %q, want %q", tc.version, got.LogIndexID, tc.want)
+		}
+	}
+
+	if _, err := p.ReadJobLog(t.Context(), "nobody", nodeapi.LogReadSpec{Lease: "l1"}); !errors.Is(err, nodeplane.ErrNoNode) {
+		t.Errorf("a node not registered: %v", err)
 	}
 }

@@ -40,9 +40,11 @@ var (
 	conformanceBuildVersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$`)
 	conformanceCommitPattern       = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 	conformanceRunnerPattern       = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
-	conformanceContractPattern     = regexp.MustCompile(`^[1-9]\d*$`)
-	conformanceWorkflowRefPattern  = regexp.MustCompile(`^refs/(?:heads|tags)/[a-zA-Z0-9][a-zA-Z0-9._/-]{0,200}$`)
-	conformanceInputPattern        = regexp.MustCompile(`(?i)\binputs\b`)
+	// A Firecracker guest's contract, or an EC2 image's as ec2:<AMIContract>: the two
+	// images carry their contract in different places, and a candidate is one or the other.
+	conformanceContractPattern    = regexp.MustCompile(`^(ec2:)?[1-9]\d*$`)
+	conformanceWorkflowRefPattern = regexp.MustCompile(`^refs/(?:heads|tags)/[a-zA-Z0-9][a-zA-Z0-9._/-]{0,200}$`)
+	conformanceInputPattern       = regexp.MustCompile(`(?i)\binputs\b`)
 )
 
 type cacheConformanceInstallOptions struct {
@@ -73,7 +75,7 @@ func cmdCacheConformance(ctx context.Context, env cli.Env, args []string) error 
 	expectedRunner := fs.String("expected-runner-version", runnerrelease.Pinned(),
 		"exact actions/runner version required in the candidate image")
 	expectedGuestContract := fs.String("expected-guest-contract", firecracker.GuestContract,
-		"exact Billet guest contract required in the candidate image")
+		"exact Billet guest contract required in the candidate image, or ec2:<AMIContract> for an EC2 image")
 	workflowRef := fs.String("workflow-ref", defaultConformanceWorkflowRef,
 		"consumer branch or tag selected by the trusted runner group")
 	output := fs.String("output", defaultConformanceOutput,
@@ -264,7 +266,7 @@ func validateCacheConformanceOptions(options cacheConformanceInstallOptions) (st
 		return "", errors.New("--expected-runner-version must be a numeric MAJOR.MINOR.PATCH version")
 	}
 	if !conformanceContractPattern.MatchString(options.expectedGuestContract) {
-		return "", errors.New("--expected-guest-contract must be a positive integer")
+		return "", errors.New("--expected-guest-contract must be a positive integer, or ec2: and one")
 	}
 	if !validCacheConformanceWorkflowRef(options.workflowRef) {
 		return "", errors.New("--workflow-ref must be a full refs/heads/<branch> or refs/tags/<tag> ref")

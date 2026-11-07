@@ -61,6 +61,9 @@ const (
 // constant before it changes it.
 var casFillDefault = casFullFraction
 
+// errCASObjectLarge is an object past the bound it was stored under.
+var errCASObjectLarge = errors.New("the object is larger than it may be")
+
 // errCASBackoff is a transfer refused because its kind's attach failed within
 // casAttachBackoff; the failure itself was logged when it happened.
 var errCASBackoff = errors.New("the cache could not be attached recently, so it is not tried again yet")
@@ -95,6 +98,17 @@ type hostVolume struct {
 	// place of. Its volume replaces that generation and no other: anything
 	// published since, another fresh start's included, is merged into.
 	Supersedes string `json:"supersedes,omitempty"`
+	// Objects says this volume is a directory on the node's own disk over a store
+	// that keeps entries as objects (casblobs.go). Volume then names only the key.
+	Objects bool `json:"objects,omitempty"`
+	// index and reads are what the store held and what this session read of it.
+	index blobIndex
+	reads blobUses
+	// written bounds what one job adds to a store with no volume to fill, and allowance
+	// is held while a stored object is installed and counted. Nothing is waited for
+	// under it, so it comes after every other lock here.
+	written   atomic.Int64
+	allowance sync.Mutex
 
 	// io is held for reading by every transfer and for writing by whatever
 	// unmounts the volume, so no transfer runs on a volume being taken away.
@@ -156,6 +170,14 @@ func (s *CacheService) casVolume(
 
 	ceiling := volumeCeiling(setting)
 	key := s.cacheKeyFor(session, kind, "", "")
+	if s.blobStore() != nil {
+		hv, err := s.attachBlobVolume(session, kind, key)
+		if err != nil {
+			backOff()
+		}
+
+		return hv, err
+	}
 	volume, cold, err := s.acquireVolume(ctx, session, cacheWorkLimit,
 		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
 			return s.cloneOrCreate(acquireCtx, session.instance, key, ceiling, ceiling)
@@ -409,6 +431,9 @@ type casHandle struct {
 	root    string
 	limit   int64
 	release func()
+	// ctx is the transfer's: reapi.Volume's Open takes none, and on a store of
+	// objects an Open can be a request.
+	ctx context.Context //nolint:containedctx // A handle lives for one call.
 }
 
 var _ reapi.Volume = (*casHandle)(nil)
@@ -512,7 +537,7 @@ func (s *CacheService) openCASHandle(
 
 	return &casHandle{
 		s: s, session: session, hv: hv, root: s.casMountPath(session, kind),
-		limit: volumeCeiling(sessionSetting(session, kind)),
+		limit: volumeCeiling(sessionSetting(session, kind)), ctx: ctx,
 		release: func() {
 			hv.io.RUnlock()
 			admitted()
@@ -541,6 +566,11 @@ func (h *casHandle) Open(table reapi.Table, digest string) (*os.File, error) {
 	done := h.s.breaker.watch(storeCall{op: "a content-addressed read", who: h.session.instance}, casReadLimit)
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
+		if h.hv.Objects {
+			done(nil)
+
+			return h.openBlob(table, digest)
+		}
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) {
 			err = nil
 		}
@@ -579,7 +609,93 @@ func (h *casHandle) Put(ctx context.Context, table reapi.Table, digest string, b
 	if table == reapi.TableCAS {
 		limit = h.limit
 	}
-	return h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root)
+	if !h.hv.Objects {
+		return h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root)
+	}
+
+	return h.putWithinAllowance(ctx, table, digest, path, limit, body)
+}
+
+// putWithinAllowance stores what a job wrote on a store of objects, whose directory is
+// on the node's own disk with nothing else to bound it, so the tier's size is the whole
+// of what the job may add. An object is read to one side, bounded by what is left when it
+// starts, then installed and counted together, so writes side by side cannot install past
+// the size, and a writer of one digest cannot take out what another was told it stored.
+func (h *casHandle) putWithinAllowance(
+	ctx context.Context, table reapi.Table, digest, path string, limit int64, body io.Reader,
+) error {
+	left := h.limit - h.hv.written.Load() + regularSize(path)
+	if left <= 0 {
+		return reapi.ErrFull
+	}
+	token, err := randomCacheToken()
+	if err != nil {
+		return err
+	}
+	// A DOTTED NAME IS NOTHING A READ, A LISTING OR AN UPLOAD WILL TAKE FOR AN ENTRY.
+	held := filepath.Join(filepath.Dir(path), ".held-"+token)
+	defer os.Remove(held)
+	err = h.s.storeCASObject(ctx, body, held, string(table), digest, min(limit, left), h.root)
+	if errors.Is(err, errCASObjectLarge) && left < limit {
+		return reapi.ErrFull
+	}
+	if err != nil {
+		return err
+	}
+	size := regularSize(held)
+
+	h.hv.allowance.Lock()
+	defer h.hv.allowance.Unlock()
+	replacing := regularSize(path)
+	if h.hv.written.Load()+size-replacing > h.limit {
+		return reapi.ErrFull
+	}
+	if err := os.Rename(held, path); err != nil {
+		return fmt.Errorf("install the stored object: %w", err)
+	}
+	h.hv.written.Add(size - replacing)
+
+	return nil
+}
+
+// regularSize is how large a file is, or nothing if it is not there to count.
+func regularSize(path string) int64 {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0
+	}
+
+	return info.Size()
+}
+
+// Size is how large a stored object is, which on a store of objects is known without
+// the request an Open can be. Reading it counts as a use, as an Open does: a build that
+// asks and finds it there goes on to depend on it.
+func (h *casHandle) Size(table reapi.Table, digest string) (int64, error) {
+	path, err := h.path(table, digest)
+	if err != nil {
+		return 0, err
+	}
+	if h.hv.Objects {
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return h.blobSize(table, digest)
+		}
+		h.hv.hit.Store(true)
+
+		return info.Size(), nil
+	}
+	file, err := h.Open(table, digest)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("read a stored object's size: %w", err)
+	}
+
+	return info.Size(), nil
 }
 
 func (h *casHandle) Close() { h.release() }
@@ -635,7 +751,7 @@ func (s *CacheService) storeCASObject(
 	case closeErr != nil:
 		return fmt.Errorf("stage the object: %w", closeErr)
 	case written > limit:
-		return fmt.Errorf("the object is larger than %d bytes", limit)
+		return fmt.Errorf("%w: %d bytes", errCASObjectLarge, limit)
 	case table == "cas" && hex.EncodeToString(hash.Sum(nil)) != digest:
 		return reapi.ErrMismatch
 	}
@@ -683,6 +799,9 @@ func stopWith(ctx context.Context, r io.Reader) io.Reader {
 func (s *CacheService) releaseCASVolume(
 	ctx context.Context, session *cacheSession, hv *hostVolume,
 ) (bool, error) {
+	if hv.Objects {
+		return s.releaseBlobVolume(ctx, session, hv)
+	}
 	// A TRANSFER STILL RUNNING HOLDS io, and the cache loop serves every
 	// session, so it waits a little and comes back rather than wait out a
 	// transfer's whole deadline.
@@ -691,10 +810,15 @@ func (s *CacheService) releaseCASVolume(
 	}
 	defer hv.io.Unlock()
 
+	// UNMOUNTED WHATEVER THE RECORD SAYS. Mounted false is what the node believes,
+	// not what the kernel holds: a mount whose command was killed can have finished
+	// mounting, and the discard after it then cannot unmap a device still mounted
+	// here, so it retried every half minute for hours (2026-11-06). Unmount asks the
+	// kernel, and leaves alone what is not mounted.
+	if err := s.actionIO.Unmount(ctx, s.casMountPath(session, hv.Kind)); err != nil {
+		return false, fmt.Errorf("unmount the %s cache: %w", hv.Kind, err)
+	}
 	if hv.Mounted {
-		if err := s.actionIO.Unmount(ctx, s.casMountPath(session, hv.Kind)); err != nil {
-			return false, fmt.Errorf("unmount the %s cache: %w", hv.Kind, err)
-		}
 		hv.Mounted = false
 		if err := s.persistSession(session); err != nil {
 			return false, err
@@ -762,6 +886,15 @@ func (s *CacheService) releaseCASVolume(
 	// publications were lost to the one before them (#689).
 	if errors.Is(err, errWriterHeld) {
 		journal.Phase = ""
+
+		return false, s.persistSession(session)
+	}
+	// NOR IS A DEVICE THAT COULD NOT BE PROVED A REASON TO LOSE WHAT THE VOLUME
+	// HOLDS: nothing was done to it, and the store's next answer may be better.
+	if errors.Is(err, storecontract.ErrDeviceUnknown) {
+		journal.Phase = ""
+		s.log.Warn("could not yet publish a content-addressed cache a job wrote; will retry",
+			"instance", session.instance, "kind", hv.Kind, "error", err)
 
 		return false, s.persistSession(session)
 	}
@@ -882,6 +1015,12 @@ func (s *CacheService) mergeCASVolume(
 		return candidate.Generation, true, nil
 	}
 
+	// BEFORE THE CLONE, so a device that cannot be proved yet leaves nothing behind
+	// for the retry to replace.
+	device, err := s.provenDevice(ctx, hv.Volume)
+	if err != nil {
+		return "", false, release(err)
+	}
 	// A CLONE HANDED OVER IS THE STORE DOING WHAT A JOB NEEDS, as a job's own is.
 	latest, err := s.handOver(session.instance, "a clone to merge into", func() (storecontract.Volume, error) {
 		return s.store.Clone(ctx, key, current)
@@ -895,7 +1034,7 @@ func (s *CacheService) mergeCASVolume(
 	}
 	source := s.casMountPath(session, hv.Kind) + ".source"
 	target := s.casMountPath(session, hv.Kind) + ".merge"
-	if err := s.actionIO.MountReadOnly(ctx, hv.Volume.Device, source); err != nil {
+	if err := s.actionIO.MountReadOnly(ctx, device, source); err != nil {
 		return "", false, release(err)
 	}
 	if err := s.actionIO.MountWritable(ctx, latest.Device, target); err != nil {
@@ -937,7 +1076,9 @@ func (s *CacheService) mergeCASVolume(
 	}
 	candidate, err := snapshot(latest)
 	if err != nil {
-		return "", false, release(fmt.Errorf("snapshot: %w", err))
+		// %v: THE CLONE IS RECORDED AND MERGED INTO, so this ends the publication
+		// whatever the reason, and is not asked again from the top.
+		return "", false, release(fmt.Errorf("snapshot: %v", err)) //nolint:errorlint // see above
 	}
 	if err := publish(current, candidate); err != nil {
 		return "", false, err

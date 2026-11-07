@@ -240,7 +240,7 @@ func TestPollingAfterADecisionDoesNotSpendTheToken(t *testing.T) {
 				t.Fatalf("first request: %v", err)
 			}
 
-			if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:same", decision, "cert"); err != nil {
+			if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:same", decision, "cert", ""); err != nil {
 				t.Fatalf("decide: %v", err)
 			}
 

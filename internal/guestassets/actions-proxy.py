@@ -36,16 +36,20 @@ including a websocket. The adapter cannot: it OWNS a TLS session, and an
 ssl.SSLSocket is not safe for a concurrent read and write, so it does one
 request and one answer in order -- which is all the paths it admits ever need.
 
-`--mode node-relay` puts the node's plain-HTTP cache endpoint one hop away
-(#374). The guest's Git, Bazel and Go caches, and the credential helpers that
-answer for them, name this listener instead of the node's address, and it splices
-each connection to the node unchanged. What it adds is patience: while the node is
-restarting (a node handing over leaves its guests running and its successor
-listens again a few seconds to minutes later), a connection is held and the node
-redialled for up to NODE_RELAY_WAIT instead of being refused, because a refused
-connection fails a `git fetch` and nothing in Git falls back. It understands no
-HTTP and terminates no TLS; an https endpoint never comes through it, since its
-certificate names the node's address.
+`--mode node-relay` puts the node's cache endpoint one hop away (#374). The guest's
+Git, Bazel and Go caches, and the credential helpers that answer for them, name this
+listener instead of the node's address, and it splices each connection to the node
+unchanged. What it adds is patience: while the node is restarting (a node handing
+over leaves its guests running and its successor listens again a few seconds to
+minutes later), a connection is held and the node redialled for up to NODE_RELAY_WAIT
+instead of being refused, because a refused connection fails a `git fetch` and nothing
+in Git falls back. It understands no HTTP.
+
+An https endpoint (an EC2 guest's, whose bearer crosses a VPC) is reached over TLS
+this relay does itself, checked against the system's roots, where the image bakes the
+listener's issuer. Everything else in the guest keeps speaking what it speaks on a
+Firecracker guest's bridge, CONNECT tunnels included, which is what keeps a client's
+own TLS out of a second TLS session Python's sockets cannot nest (ADR-024).
 
 BOTH MODES ARE ONE FILE because they are one mechanism: the CONNECT tunnel, the
 header reader, the fail-open dial and the timeouts are shared, and a second copy
@@ -115,6 +119,18 @@ NODE_RELAY_RETRY = 1
 # every descriptor inside select()'s range. A connection past it is closed at
 # once, which is what the node's own listener would have done.
 NODE_RELAY_LIMIT = 64
+# How long the results passthrough goes on beginning attempts at a tunnel the node
+# does not answer before failing open; the last attempt may run CONNECT_TIMEOUT past
+# it. It cannot see a request inside the TLS it relays, so a blob URL billet signed
+# reaches GitHub if it fails open, and GitHub's "404 page not found" ends the
+# toolkit's upload where a wait would have saved it (#694). A node's ordinary restart
+# is shorter; a node gone for good costs each connection this much, and the rest of
+# what shares the origin then still works.
+RESULTS_NODE_WAIT = 30
+# How many connections wait for the node at once. Each holds a thread and two
+# descriptors while it does, and this listener carries the runner's logs and step
+# updates, so one past the bound fails open at once rather than risk them.
+NODE_WAITERS = threading.BoundedSemaphore(64)
 # How long the adapter waits for an answer that has not started arriving. It
 # begins once the request body is written -- every read and write before that is
 # bounded per operation by RELAY_TIMEOUT -- and every byte received resets it, so
@@ -181,6 +197,10 @@ WOULD_BLOCK = (BlockingIOError,) if ssl is None else (
     BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError)
 
 
+class NodeRefused(ConnectionError):
+    """The node answered and will not tunnel this session: nothing to wait out."""
+
+
 def read_headers(connection):
     data = bytearray()
     while b"\r\n\r\n" not in data:
@@ -219,19 +239,52 @@ def node_tunnel(upstream, authority=RESULTS_AUTHORITY):
         response, remainder = read_headers(connection)
         status = response.split(b"\r\n", 1)[0].split()
         if len(status) < 2 or status[1] != b"200":
-            raise ConnectionError("the Billet node refused the cache tunnel")
+            raise NodeRefused("the Billet node refused the cache tunnel")
         return connection, remainder
     except Exception:
         connection.close()
         raise
 
 
+def patient_tunnel(client, upstream, authority, wait, retry=None, now=time.monotonic,
+                   sleep=time.sleep):
+    """node_tunnel, asked again while the node does not answer, until wait is spent.
+
+    A refusal is an answer and is not asked again, and a client that has gone is
+    not waited for. The client is mid-TLS with whichever peer this reaches, so it
+    is told nothing until one exists.
+    """
+    retry = NODE_RELAY_RETRY if retry is None else retry
+    deadline = now() + wait
+    try:
+        return node_tunnel(upstream, authority)
+    except NodeRefused:
+        raise
+    except OSError:  # ConnectionError and a timeout among them
+        if now() + retry >= deadline or not NODE_WAITERS.acquire(blocking=False):
+            raise
+    try:
+        while True:
+            if client_gone(client):
+                raise ConnectionError("the client went away while the node was away")
+            sleep(retry)
+            try:
+                return node_tunnel(upstream, authority)
+            except NodeRefused:
+                raise
+            except OSError:
+                if now() + retry >= deadline:
+                    raise
+    finally:
+        NODE_WAITERS.release()
+
+
 def direct_tunnel(addresses):
     """Connect straight to the real results origin, bypassing the node.
 
-    This is the fail-open path. If the node cannot take the tunnel -- it is
-    restarting, unreachable, or refuses the session -- the client's TLS still
-    reaches GitHub directly, so its cache call degrades to an ordinary miss while
+    This is the fail-open path. If the node cannot take the tunnel -- it has been
+    away for all of RESULTS_NODE_WAIT, or refuses the session -- the client's TLS
+    still reaches GitHub directly, so its cache call degrades to an ordinary miss while
     the artifact, log-archive, step-update and live-log traffic that shares this
     origin keeps working. The client trusts GitHub's real certificate through the
     distribution roots in its bundle, exactly as it trusts the node's leaf through
@@ -247,13 +300,36 @@ def direct_tunnel(addresses):
     raise last or ConnectionError("no results-origin fallback address")
 
 
+def read_ready(source):
+    """One read of a socket select called readable, or None if it holds nothing yet.
+
+    A TLS SOCKET CAN BE READABLE WITH NOTHING FOR THE APPLICATION: a session ticket or
+    a key update is a record OpenSSL consumes and then waits past, and a blocking read
+    there leaves the other direction unserviced. A client sending a large body then
+    stalls against a node waiting for the rest of it, until the idle bound.
+    """
+    if ssl is None or not isinstance(source, ssl.SSLSocket):
+        return source.recv(64 * 1024)
+    source.settimeout(0)
+    try:
+        return source.recv(64 * 1024)
+    except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+        return None
+    finally:
+        source.settimeout(RELAY_TIMEOUT)
+
+
 def relay(client, node, node_buffer):
     if node_buffer:
         client.sendall(node_buffer)
     peers = {client: node, node: client}
     half_closed = False
     while peers:
-        readable, _, _ = select.select(list(peers), [], [], DRAIN_IDLE)
+        # A TLS SOCKET MAY HOLD DECRYPTED BYTES THE DESCRIPTOR NO LONGER SHOWS, and
+        # select would sit on them until the idle bound.
+        readable = [peer for peer in peers if getattr(peer, "pending", int)() > 0]
+        if not readable:
+            readable, _, _ = select.select(list(peers), [], [], DRAIN_IDLE)
         if not readable:
             # No data for the idle interval. Before a half-close this is an
             # ordinarily quiet connection the node's own timeout will end; after
@@ -266,14 +342,20 @@ def relay(client, node, node_buffer):
             target = peers.get(source)
             if target is None:
                 continue
-            data = source.recv(64 * 1024)
+            data = read_ready(source)
+            if data is None:
+                continue
             if data:
                 target.sendall(data)
                 continue
-            try:
-                target.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+            # NOT ON A TLS SOCKET, whose shutdown ends the session in both directions
+            # and leaves the next read returning the raw records. The idle bound ends
+            # that side once it has drained.
+            if ssl is None or not isinstance(target, ssl.SSLSocket):
+                try:
+                    target.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
             peers.pop(source, None)
             half_closed = True
 
@@ -617,8 +699,12 @@ def handle_adapter(client, upstream, fallback, ca_file, origin):
             refuse(client, 403, "this endpoint serves Billet's Actions cache only")
 
             return
+        # A BLOB URL IS BILLET'S OWN, and GitHub answers one it never signed with a
+        # 404 the toolkit treats as final (#694). This adapter can see the path, so
+        # it says the node is unreachable instead, which the client retries.
+        blob = head.split(None, 2)[1].startswith(ADAPTER_PATHS[1].encode())
         try:
-            peer = adapter_peer(upstream, fallback, ca_file)
+            peer = adapter_peer(upstream, [] if blob else fallback, ca_file)
         except (ConnectionError, OSError, UnicodeError, ValueError):
             refuse(client, 502, "Billet's Actions cache is unreachable")
 
@@ -763,7 +849,7 @@ def guest_process(client, proc="/proc", now=time.monotonic):
     return False, "uid %d, holder not found" % uid
 
 
-def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY, admit=None):
+def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY, admit=None, node_wait=0):
     peer = None
     try:
         # WAIT FOR THE CLIENT'S FIRST BYTE before spending a tunnel. A bare connect
@@ -793,7 +879,7 @@ def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY, admit=None):
         # available outcome, degrading the cache call to its ordinary miss.
         if trusted:
             try:
-                peer, buffered = node_tunnel(upstream, authority)
+                peer, buffered = patient_tunnel(client, upstream, authority, node_wait)
             except (ConnectionError, OSError, UnicodeError, ValueError):
                 if not fallback:
                     raise
@@ -816,30 +902,61 @@ def handle(client, upstream, fallback, authority=RESULTS_AUTHORITY, admit=None):
 
 
 def node_endpoint(upstream):
-    """The node's host and port from its plain-HTTP cache endpoint."""
+    """The node's host and port from its cache endpoint, and whether it speaks TLS."""
     parsed = urllib.parse.urlsplit(upstream)
-    if parsed.scheme != "http" or not parsed.hostname or parsed.port is None:
-        raise ValueError("the node relay needs an http endpoint with an explicit port")
-    return parsed.hostname, parsed.port
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.port is None:
+        raise ValueError("the node relay needs an http or https endpoint with an explicit port")
+    return parsed.hostname, parsed.port, parsed.scheme == "https"
+
+
+def node_tls_context():
+    """What the relay checks an https node with: the system's roots, by name."""
+    if ssl is None:
+        raise ValueError("this interpreter has no ssl module; the relay cannot reach an https node")
+    return ssl.create_default_context()
+
+
+def handshake_final(error):
+    """Whether a failed connection says something waiting will not change.
+
+    A node restarting drops or stalls a handshake. One whose certificate cannot be
+    verified, or that does not speak TLS, is the node it will go on being, and waiting
+    only spends the client's patience on an answer already known.
+    """
+    if ssl is None or not isinstance(error, ssl.SSLError):
+        return False
+    return not isinstance(error, (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLSyscallError))
 
 
 def dial_node(address, wait=None, retry=None, now=time.monotonic, sleep=time.sleep,
-              abandoned=lambda: False):
+              abandoned=lambda: False, tls=None):
     """Connect to the node, redialling while it is away, until the wait is spent.
 
     A refused or unanswered dial is the node restarting as often as it is the node
     gone, and the first is the case worth waiting for: the client is told nothing
     until either a connection exists or the wait ends, and then it sees the same
     failure it would have seen at once.
+
+    THE HANDSHAKE IS PART OF THE DIAL. A restarted node binds its port before it serves,
+    so a dial succeeds at once, and on a plain bridge the client's request simply waits
+    in the listener's queue. A ClientHello waiting there would otherwise end the
+    connection after one handshake's timeout, and a fetch in flight with it.
     """
     wait = NODE_RELAY_WAIT if wait is None else wait
     retry = NODE_RELAY_RETRY if retry is None else retry
     deadline = now() + wait
     while True:
+        connection = None
         try:
-            return socket.create_connection(address, CONNECT_TIMEOUT)
-        except OSError:
-            if now() + retry >= deadline or abandoned():
+            connection = socket.create_connection(address, CONNECT_TIMEOUT)
+            if tls is None:
+                return connection
+            connection.settimeout(CONNECT_TIMEOUT)
+            return tls.wrap_socket(connection, server_hostname=address[0])
+        except OSError as error:
+            if connection is not None:
+                connection.close()
+            if handshake_final(error) or now() + retry >= deadline or abandoned():
                 raise
             sleep(retry)
 
@@ -866,7 +983,7 @@ def client_gone(client):
         return True
 
 
-def handle_node_relay(client, address, slots=None):
+def handle_node_relay(client, address, slots=None, tls=None):
     peer = None
     try:
         # The client's first byte first, as the passthrough does, so a bare
@@ -874,7 +991,7 @@ def handle_node_relay(client, address, slots=None):
         ready, _, _ = select.select([client], [], [], CONNECT_TIMEOUT)
         if not ready or not client.recv(1, socket.MSG_PEEK):
             return
-        peer = dial_node(address, abandoned=lambda: client_gone(client))
+        peer = dial_node(address, abandoned=lambda: client_gone(client), tls=tls)
         client.settimeout(RELAY_TIMEOUT)
         peer.settimeout(RELAY_TIMEOUT)
         relay(client, peer, b"")
@@ -988,12 +1105,16 @@ def main():
     fallback = [addr for addr in args.fallback_addr.split(",") if addr]
 
     node_address = None
+    node_tls = None
     if args.mode == "node-relay":
         # Parsed once, so an endpoint the relay cannot serve fails the SERVICE and
         # the agent keeps the node's own address, rather than a listener that
         # starts and then drops every connection.
         try:
-            node_address = node_endpoint(args.upstream)
+            host, port, encrypted = node_endpoint(args.upstream)
+            node_address = (host, port)
+            if encrypted:
+                node_tls = node_tls_context()
         except ValueError as error:
             raise SystemExit(str(error)) from error
 
@@ -1055,10 +1176,11 @@ def main():
             if not slots.acquire(blocking=False):
                 client.close()
                 continue
-            worker, arguments = handle_node_relay, (client, node_address, slots)
+            worker, arguments = handle_node_relay, (client, node_address, slots, node_tls)
         else:
             worker, arguments = handle, (client, args.upstream, fallback, authority,
-                                         guest_process if args.guest_processes_only else None)
+                                         guest_process if args.guest_processes_only else None,
+                                         RESULTS_NODE_WAIT if args.origin == RESULTS_HOST else 0)
         # A THREAD THAT CANNOT START CLOSES ITS CONNECTION, never the process: every
         # other connection this listener carries is still worth finishing.
         try:

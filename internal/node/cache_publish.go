@@ -133,11 +133,17 @@ func (s *CacheService) publishDeferred(
 		}
 		candidate, err := s.store.Snapshot(ctx, attachment.Volume)
 		s.countedPublication(session.instance, "a cache snapshot", err)
+		if errors.Is(err, storecontract.ErrVolumeGone) {
+			// NOTHING IS LEFT TO RETRY: an earlier attempt's failure took the clone,
+			// and that failure is what was logged. Asking again until the window
+			// ended held the session open for it, and for nothing else.
+			return abandon("the volume is gone after an earlier failed snapshot")
+		}
 		if err != nil {
 			// RETRIED ON THE NEXT PASS. A failed Snapshot leaves the pointer
-			// unchanged, which is all the contract promises; if it also consumed
-			// the clone, the retry fails the same way and the window's end
-			// abandons it, and the discard that follows is idempotent.
+			// unchanged, which is all the contract promises. If it also took the
+			// clone, the retry says so with ErrVolumeGone, and the discard that
+			// follows is idempotent.
 			journal.Phase = ""
 			journal.Attempts++
 
@@ -308,11 +314,20 @@ func (s *CacheService) cloneWithin(
 	}
 	// A CLONE THAT CANNOT BE DISCARDED IS KEPT AND USED, oversized, rather than
 	// dropped: nothing has recorded it yet, so returning without it would lose
-	// the only handle anything has on it.
+	// the only handle anything has on it. A discard unmaps first and may fail after
+	// that, though, so its device is proved again before anything is given it: the
+	// number may already be another job's disk. One that cannot be is not used, and
+	// the store's eviction collects it once its lease runs out unrenewed.
 	if err := s.store.Discard(ctx, volume); err != nil {
+		device, proveErr := s.provenDevice(ctx, volume)
+		if proveErr != nil {
+			return storecontract.Volume{}, false, errors.Join(
+				fmt.Errorf("discard a cache generation larger than its tier allows: %w", err), proveErr)
+		}
 		s.log.Warn("could not discard a cache generation larger than its tier allows; using it",
 			"key", key, "generation", volume.Generation, "size", size, "ceiling", ceiling,
 			"error", err)
+		volume.Device = device
 
 		return volume, false, nil
 	}

@@ -8,6 +8,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/metrics"
+	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -29,6 +30,9 @@ var _ state.Observer = (*metrics.LedgerObserver)(nil)
 // And the queue waits through alloc.QueueWaitObserver, the same way.
 var _ alloc.QueueWaitObserver = (*metrics.QueueWaitObserver)(nil)
 
+// And the listeners' times through server.ListenerObserver, the same way.
+var _ server.ListenerObserver = (*metrics.ListenerObserver)(nil)
+
 // ledgerScrapeTimeout bounds one scrape's reads of the ledger.
 const ledgerScrapeTimeout = 5 * time.Second
 
@@ -43,7 +47,13 @@ const (
 	familyTierWaitingFor = "billet_tier_waiting_seconds"
 	familyTierReportAge  = "billet_tier_report_age_seconds"
 	familyNodes          = "billet_nodes"
+	familyJobReruns      = "billet_job_reruns"
+	familyAlertNotices   = "billet_alert_notices"
 )
+
+// jobRerunWindow is how far back billet_job_reruns counts. A gauge rather than a
+// counter, read from the ledger, so a restart does not lose or repeat one.
+const jobRerunWindow = 24 * time.Hour
 
 var ledgerFamilies = []metrics.Family{
 	{Name: familyTierLeases, Labels: []string{"tier", "state"},
@@ -65,6 +75,13 @@ var ledgerFamilies = []metrics.Family{
 		Help: "How old the tier listener's last published report is; a stopped listener's report only ages."},
 	{Name: familyNodes, Labels: []string{"state"},
 		Help: "Registered hosts by state: live, offline, or decommissioned."},
+	{Name: familyJobReruns, Labels: []string{"tier", "decision"},
+		Help: "Jobs billet disrupted in the last day, by tier and what was decided about re-running them; " +
+			"failed is a re-run GitHub never accepted, and unconfirmed one it could not be read to confirm. " +
+			"Absent where nothing was decided."},
+	{Name: familyAlertNotices, Labels: []string{"destination", "state"},
+		Help: "Alert notices the ledger holds, by destination and state: pending, delivered, or failed, one " +
+			"given up on. Settled notices are kept eight days. Absent where a destination was never owed one."},
 }
 
 // LedgerMetrics is the control plane's ledger as metrics: each tier's capacity
@@ -72,7 +89,30 @@ var ledgerFamilies = []metrics.Family{
 // pool, never the writer slot scheduling uses; and how the writes themselves
 // went, told by the ledger as they happen.
 func (cp *ControlPlane) LedgerMetrics() MetricsSource {
-	return ledgerSource(cp.allocator, cp.db, cp.cfg.Tiers)
+	return withListenerTimings(ledgerSource(cp.allocator, cp.db, cp.cfg.Tiers), cp.listenerTimings)
+}
+
+// withListenerTimings has a source also serve how long the listeners' loops take, told
+// by the listeners as it happens.
+func withListenerTimings(source MetricsSource, timings *server.ListenerTimings) MetricsSource {
+	attach := source.attach
+
+	source.attach = func(reg *metrics.Registry) error {
+		if err := attach(reg); err != nil {
+			return err
+		}
+
+		o, err := reg.ListenerObserver()
+		if err != nil {
+			return err
+		}
+
+		timings.Observe(o)
+
+		return nil
+	}
+
+	return source
 }
 
 func ledgerSource(a *alloc.Allocator, db *state.DB, tiers []config.Tier) MetricsSource {
@@ -165,6 +205,24 @@ func ledgerSnapshot(a *alloc.Allocator, tiers []config.Tier, now func() time.Tim
 			if since, ok := parseLedgerTime(report.Listener.WaitingSince); ok && report.Listener.Waiting > 0 {
 				add(familyTierWaitingFor, age(since), label)
 			}
+		}
+
+		decisions, err := a.RerunDecisions(ctx, at.Add(-jobRerunWindow))
+		if err != nil {
+			return nil, fmt.Errorf("re-run decisions: %w", err)
+		}
+
+		for _, d := range decisions {
+			add(familyJobReruns, float64(d.Jobs), d.Tier, string(d.Decision))
+		}
+
+		notices, err := a.AlertNoticeCounts(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("alert notices: %w", err)
+		}
+
+		for _, n := range notices {
+			add(familyAlertNotices, float64(n.Notices), n.Destination, n.State)
 		}
 
 		nodes, err := a.RegisteredNodes(ctx)

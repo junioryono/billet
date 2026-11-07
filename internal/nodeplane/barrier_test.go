@@ -3,6 +3,7 @@ package nodeplane
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -224,6 +225,12 @@ type barrierStore struct {
 	invalidated    []string
 	invalidatedAll int
 	invalidateErr  error
+	// poolTargets are the nodes pool releases wait on, and poolObserved what was recorded
+	// against them.
+	poolTargets  []alloc.PoolClearanceTarget
+	poolObserved []alloc.PoolClearanceObservation
+	// poolRecorded, when a test sets it, receives each answer recorded (buffer it).
+	poolRecorded chan alloc.PoolClearanceObservation
 }
 
 func newBarrierStore() *barrierStore {
@@ -343,6 +350,33 @@ func (s *barrierStore) ResolveQuarantineFor(
 	s.reconciled = append(s.reconciled, running)
 
 	return 0, nil
+}
+
+func (s *barrierStore) PoolClearanceTargets(context.Context) ([]alloc.PoolClearanceTarget, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.poolTargets), nil
+}
+
+func (s *barrierStore) RecordPoolClearance(_ context.Context, obs alloc.PoolClearanceObservation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.poolObserved = append(s.poolObserved, obs)
+
+	if s.poolRecorded != nil {
+		s.poolRecorded <- obs
+	}
+
+	return nil
+}
+
+func (s *barrierStore) poolObservations() []alloc.PoolClearanceObservation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.poolObserved)
 }
 
 func (s *barrierStore) observations() []alloc.BarrierObservation {
@@ -555,8 +589,8 @@ func TestAHostThatReportsComputeEndsItsRun(t *testing.T) {
 		t.Fatalf("want one observation, got %d", len(observed))
 	}
 
-	if observed[0].Empty {
-		t.Fatal("a host that listed a lease was recorded as empty")
+	if observed[0].Empty || !observed[0].Running {
+		t.Fatalf("a host that listed a lease was recorded as %+v", observed[0])
 	}
 
 	// AND ITS LIST SETTLES REAL CAPACITY. A barrier inventory is a real

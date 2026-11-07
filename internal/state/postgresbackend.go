@@ -49,6 +49,10 @@ type postgresBackend struct {
 	// so a recycled connection is a released lock. See claimController for what
 	// that does and does not guarantee.
 	claim *sql.DB
+
+	// claimAttempt is the session a process waiting for the claim keeps asking on, until
+	// it holds the claim or closes. See claimController.
+	claimAttempt *sql.DB
 }
 
 var _ backend = (*postgresBackend)(nil)
@@ -605,20 +609,29 @@ func (b *postgresBackend) claimController(ctx context.Context, db *DB) error {
 		return nil
 	}
 
-	pools, err := b.dataSources()
-	if err != nil {
-		return err
-	}
+	// ONE SESSION ACROSS ATTEMPTS, KEPT WHEN REFUSED. A standby asks every two seconds for
+	// as long as it waits: a connection per attempt starts a server backend each time,
+	// and registers a pgx configuration that stays registered for the life of the
+	// process. The refusal is the ordinary answer here, not a failure of this session.
+	conn := b.claimAttempt
+	if conn == nil {
+		source, err := registerConn(b.dsn, map[string]string{"lock_timeout": "50"})
+		if err != nil {
+			return err
+		}
 
-	conn, err := sql.Open(b.driverName(), pools.writer)
-	if err != nil {
-		return fmt.Errorf("state: open a connection for the controller claim: %w", err)
-	}
+		conn, err = sql.Open(b.driverName(), source)
+		if err != nil {
+			return fmt.Errorf("state: open a connection for the controller claim: %w", err)
+		}
 
-	conn.SetMaxOpenConns(1)
-	conn.SetMaxIdleConns(1)
-	conn.SetConnMaxLifetime(0)
-	conn.SetConnMaxIdleTime(0)
+		conn.SetMaxOpenConns(1)
+		conn.SetMaxIdleConns(1)
+		conn.SetConnMaxLifetime(0)
+		conn.SetConnMaxIdleTime(0)
+
+		b.claimAttempt = conn
+	}
 
 	var taken bool
 
@@ -626,16 +639,17 @@ func (b *postgresBackend) claimController(ctx context.Context, db *DB) error {
 	if err := conn.QueryRowContext(ctx,
 		`SELECT pg_try_advisory_lock($1, $2)`, advisoryClassController, b.lockKey,
 	).Scan(&taken); err != nil {
+		b.claimAttempt = nil
+
 		return errors.Join(
 			fmt.Errorf("state: take the controller claim: %w", err), conn.Close())
 	}
 
 	if !taken {
-		return errors.Join(
-			fmt.Errorf("%w%s", ErrControllerHeld, describeHolder(ctx, db)), conn.Close())
+		return fmt.Errorf("%w%s", ErrControllerHeld, describeHolder(ctx, db))
 	}
 
-	b.claim = conn
+	b.claim, b.claimAttempt = conn, nil
 
 	return nil
 }
@@ -646,14 +660,19 @@ func (b *postgresBackend) claimController(ctx context.Context, db *DB) error {
 // and is not the guarantee: the lock belongs to the session, so the only thing
 // that has to be true is that the session ends.
 func (b *postgresBackend) releaseController() error {
-	if b.claim == nil {
-		return nil
+	var attemptErr, claimErr error
+
+	if b.claimAttempt != nil {
+		attemptErr = b.claimAttempt.Close()
+		b.claimAttempt = nil
 	}
 
-	conn := b.claim
-	b.claim = nil
+	if b.claim != nil {
+		claimErr = b.claim.Close()
+		b.claim = nil
+	}
 
-	return conn.Close()
+	return errors.Join(attemptErr, claimErr)
 }
 
 // OpenPostgres opens a deployment whose ledger lives in PostgreSQL.

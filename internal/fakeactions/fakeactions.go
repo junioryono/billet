@@ -63,6 +63,9 @@ type Request struct {
 	Path   string
 	Query  string
 	Body   string
+	// Authorization is the credential the request carried, so a test can see whose
+	// token reached GitHub.
+	Authorization string
 }
 
 // New starts a fake service. The handler serves the scale-set API; the
@@ -167,6 +170,8 @@ func (f *Server) record(t *testing.T, r *http.Request) {
 		Path:   r.URL.Path,
 		Query:  r.URL.RawQuery,
 		Body:   string(body),
+
+		Authorization: r.Header.Get("Authorization"),
 	})
 }
 
@@ -338,7 +343,9 @@ func JitConfigJSON(runnerID int, name, encoded string) map[string]any {
 // other message does. A zero field leaves JobJSON's value in place.
 type JobFields struct {
 	Owner, Repository, WorkflowRef, JobID string
-	RunID                                 int64
+	// Name is the job's display name, which JobJSON otherwise fixes.
+	Name  string
+	RunID int64
 	// RunnerID and RunnerName identify the pool member, and Result is GitHub's
 	// conclusion. All three are read only from started and completed messages.
 	RunnerID   int64
@@ -347,6 +354,8 @@ type JobFields struct {
 	// QueuedAt, ScaleSetAssignedAt and RunnerAssignedAt are GitHub's times for
 	// the job. Zero leaves JobJSON's queue time and sends no other.
 	QueuedAt, ScaleSetAssignedAt, RunnerAssignedAt time.Time
+	// FinishedAt is GitHub's time for the job's end, which a completion carries.
+	FinishedAt time.Time
 }
 
 // Apply sets the fields on a job message JobJSON built, and returns it.
@@ -367,6 +376,10 @@ func (f JobFields) Apply(job map[string]any) map[string]any {
 		job["jobId"] = f.JobID
 	}
 
+	if f.Name != "" {
+		job["jobDisplayName"] = f.Name
+	}
+
 	if f.RunID != 0 {
 		job["workflowRunId"] = f.RunID
 	}
@@ -385,7 +398,7 @@ func (f JobFields) Apply(job map[string]any) map[string]any {
 
 	for key, at := range map[string]time.Time{
 		"queueTime": f.QueuedAt, "scaleSetAssignTime": f.ScaleSetAssignedAt,
-		"runnerAssignTime": f.RunnerAssignedAt,
+		"runnerAssignTime": f.RunnerAssignedAt, "finishTime": f.FinishedAt,
 	} {
 		if !at.IsZero() {
 			job[key] = at.Format(time.RFC3339Nano)

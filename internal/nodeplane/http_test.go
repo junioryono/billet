@@ -247,6 +247,9 @@ type fakeStore struct {
 	releaseErr    error
 	leaseErr      error
 	deregisterErr error
+	holdErr       error
+
+	hold *alloc.LeaseHold
 
 	lease       *alloc.Lease
 	launched    map[string]bool
@@ -485,6 +488,20 @@ func (f *fakeStore) PoolRunnerByName(_ context.Context, name string) (alloc.Pool
 		return alloc.PoolRunner{}, alloc.ErrLeaseNotFound
 	}
 	return runner, nil
+}
+
+func (f *fakeStore) LeaseHoldOf(_ context.Context, leaseID string) (alloc.LeaseHold, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.holdErr != nil {
+		return alloc.LeaseHold{}, f.holdErr
+	}
+	if f.hold == nil || f.hold.LeaseID != leaseID {
+		return alloc.LeaseHold{}, alloc.ErrLeaseNotFound
+	}
+
+	return *f.hold, nil
 }
 
 func (f *fakeStore) PoolRunnerByLease(_ context.Context, leaseID string) (alloc.PoolRunner, error) {
@@ -853,6 +870,28 @@ func TestJITPersistsGitHubsReturnedIdentityBeforeGivingItToTheNode(t *testing.T)
 		t.Fatal("runner recovery was allowed outside quarantine")
 	}
 	store.lease.Phase = alloc.PhaseQuarantine
+
+	// A HELD VM IS KEPT: its runner is retiring, and a retired answer would have the node destroy what
+	// the hold is keeping. Past its bound or ended it goes as any retiring runner's, and a hold that
+	// could not be read is could-not-tell, since a retired answer cannot be taken back.
+	store.mu.Lock()
+	store.hold = &alloc.LeaseHold{LeaseID: "l1", Until: time.Now().Add(time.Hour)}
+	store.mu.Unlock()
+	recovery, err = c.RecoverRunner(t.Context(), "l1", "billet-2vcpu", 7, "billet-l1")
+	if err != nil || recovery != billetnode.RunnerRecoveryBusy {
+		t.Fatalf("recovery of a held runner = %q, err %v; want busy, which the node asks about again", recovery, err)
+	}
+	store.mu.Lock()
+	store.holdErr = errors.New("the ledger did not answer")
+	store.mu.Unlock()
+	if recovery, err := c.RecoverRunner(t.Context(), "l1", "billet-2vcpu", 7, "billet-l1"); err == nil {
+		t.Fatalf("recovery with a hold that could not be read = %q; want it refused", recovery)
+	}
+	store.mu.Lock()
+	store.holdErr = nil
+	store.hold = &alloc.LeaseHold{LeaseID: "l1", Until: time.Now().Add(-time.Second)}
+	store.mu.Unlock()
+
 	recovery, err = c.RecoverRunner(t.Context(), "l1", "billet-2vcpu", 7, "billet-l1")
 	if err != nil || recovery != billetnode.RunnerRecoveryRetired || len(jit.recovered) != 1 ||
 		!slices.Equal(jit.removed, []string{"github-returned-name", "github-returned-name", "github-returned-name"}) {
@@ -1545,6 +1584,14 @@ func (b *recordingBarriers) ResolveQuarantineFor(
 	context.Context, string, []string, int64,
 ) (int, error) {
 	return 0, nil
+}
+
+func (b *recordingBarriers) PoolClearanceTargets(context.Context) ([]alloc.PoolClearanceTarget, error) {
+	return nil, nil
+}
+
+func (b *recordingBarriers) RecordPoolClearance(context.Context, alloc.PoolClearanceObservation) error {
+	return nil
 }
 
 // A REGISTRATION OVER THE WIRE DISCARDS WHAT THE HOST HAD PROVED, BEFORE IT
@@ -2305,8 +2352,8 @@ func TestOnlyLoopbackIsSafeWithoutTLS(t *testing.T) {
 		"garbage":     false,
 		"1.2.3.4.5:1": false,
 	} {
-		if got := nodeplane.LoopbackOnly(addr); got != want {
-			t.Errorf("LoopbackOnly(%q) = %v, want %v", addr, got, want)
+		if got := config.LoopbackAddr(addr); got != want {
+			t.Errorf("LoopbackAddr(%q) = %v, want %v", addr, got, want)
 		}
 	}
 }

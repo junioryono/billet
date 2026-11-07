@@ -45,23 +45,9 @@ func Decommission(ctx context.Context, env cli.Env, args []string) error {
 			"resources; this config has no ec2 node, so there is nothing for it to remove")
 	}
 
-	// The REAL deployment id, resolved certificate-first then the state directory
-	// (peeked, never minted). It scopes every List and delete to what THIS
-	// deployment owns — decommission must never reach into another deployment's
-	// resources, and an unresolved identity would do exactly that if defaulted.
-	bundle, err := app.NodeBundle(cfg)
+	owner, err := decommissionOwner(cfg)
 	if err != nil {
-		return fmt.Errorf("node identity: %w", err)
-	}
-
-	owner, err := app.AuthorizeOwner(cfg, bundle)
-	if err != nil {
-		return fmt.Errorf("node.ec2: %w", err)
-	}
-	if owner == "" {
-		return errors.New("decommission cannot resolve this deployment's identity (no certificate " +
-			"and no id in the state directory), so it cannot tell which resources are yours; enroll " +
-			"the node or run it once, then retry")
+		return err
 	}
 
 	creds := awscreds.Default()
@@ -82,6 +68,59 @@ func Decommission(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	return nil
+}
+
+// decommissionOwner is the REAL deployment id, resolved certificate-first then the
+// state directory (peeked, never minted). It scopes every List and delete to what THIS
+// deployment owns — decommission must never reach into another deployment's
+// resources, and an unresolved identity would do exactly that if defaulted.
+func decommissionOwner(cfg *config.Config) (string, error) {
+	bundle, err := app.NodeBundle(cfg)
+	if err != nil {
+		return "", fmt.Errorf("node identity: %w", err)
+	}
+
+	owner, err := app.AuthorizeOwner(cfg, bundle)
+	if err != nil {
+		return "", fmt.Errorf("node.ec2: %w", err)
+	}
+	if owner == "" {
+		return "", errors.New("decommission cannot resolve this deployment's identity (no certificate " +
+			"and no id in the state directory), so it cannot tell which resources are yours; enroll " +
+			"the node or run it once, then retry")
+	}
+
+	return owner, nil
+}
+
+// CacheResidue reads what the deployment's ebs-s3 cache still holds, through the
+// listings decommission's purge walks, for a teardown's sweep: what the purge left is
+// residue, and a config with no ebs-s3 cache holds none. It deletes nothing.
+func CacheResidue(ctx context.Context, cfgPath string) (ebss3.Residue, error) {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return ebss3.Residue{}, err
+	}
+	if cfg.Node == nil || cfg.Node.EBSS3 == nil {
+		return ebss3.Residue{}, nil
+	}
+
+	owner, err := decommissionOwner(cfg)
+	if err != nil {
+		return ebss3.Residue{}, err
+	}
+
+	store, err := ebss3.New(*cfg.Node.EBSS3, app.CacheNamespace(owner, cfg.Node.Site), awscreds.Default())
+	if err != nil {
+		return ebss3.Residue{}, fmt.Errorf("node.ebs_s3: %w", err)
+	}
+
+	residue, err := store.Residue(ctx)
+	if err != nil {
+		return ebss3.Residue{}, fmt.Errorf("node.ebs_s3: %w", err)
+	}
+
+	return residue, nil
 }
 
 // decommissionInstances lists the deployment's instances and, with --yes and
@@ -157,6 +196,9 @@ func decommissionCache(
 
 	fmt.Fprintf(env.Stdout, "cache    purged %d snapshot(s), %d volume(s), %d state object(s)",
 		report.Snapshots, report.Volumes, report.StateObjects)
+	if report.CacheObjects > 0 {
+		fmt.Fprintf(env.Stdout, ", %d cache object(s)", report.CacheObjects)
+	}
 	if report.SkippedForeign > 0 {
 		fmt.Fprintf(env.Stdout, "; skipped %d resource(s) owned by another deployment", report.SkippedForeign)
 	}

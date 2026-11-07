@@ -815,7 +815,115 @@ func recordInventoryTx(
 		return fmt.Errorf("alloc: record what node %s reports running: %w", node, err)
 	}
 
+	if running > 0 {
+		return computeListedTx(ctx, q, node)
+	}
+
 	return nil
+}
+
+// computeListedTx records that a node's current registration listed compute, for a pool
+// release (ADR-030): its release is contradicted, its clearance run with it, and its
+// barrier run too, so the next decommission that clears the contradiction is proved by
+// answers taken after it, never by a run that predates the compute listed. The caller
+// has proved the answer is of the node's current registration.
+//
+// THE ONE PLACE A LISTING CONTRADICTS A RELEASE, reached from every path an answer takes:
+// the inventory recorded (recordInventoryTx), and a barrier or clearance answer that
+// listed compute, whose inventory may not have been recorded at all if the
+// reconciliation beside it failed. Only a pool node's barrier run goes: any other host's
+// is the drain's to judge, and an empty barrier answer there clears a stale positive.
+func computeListedTx(ctx context.Context, q state.WriteOps, node string) error {
+	pool, err := q.ContradictPoolRelease(ctx, node)
+	if err != nil {
+		return fmt.Errorf("alloc: contradict the release of pool node %s: %w", node, err)
+	}
+
+	// A SEAL'S OWN RETIREMENT OF THE NODE IS UNDONE, whatever its order became since (a
+	// released host is not yet a gone one), so a drain expects the node again rather
+	// than counting as proved idle one that has since listed compute; a person's
+	// decommission is theirs, and stays.
+	undone, err := q.UndoPoolRetirement(ctx, ledgerdb.UndoPoolRetirementParams{
+		Name: node, Actor: poolReleaseActor,
+	})
+	if err != nil {
+		return fmt.Errorf("alloc: return pool node %s to the fleet: %w", node, err)
+	}
+
+	if pool > 0 || undone > 0 {
+		if err := q.DeleteBarrierRun(ctx, node); err != nil {
+			return fmt.Errorf("alloc: discard pool node %s's idle run: %w", node, err)
+		}
+	}
+
+	return nil
+}
+
+// settleClosedNodeTx takes a closed order's node out of the fleet when nothing has
+// already proved it gone: an order closed is a host taken back, and a node left a member
+// would hold every later drain open on a machine that cannot answer. A person's word is
+// recorded unproven (proven 0), as `billet nodes decommission --force` records it, and a
+// source's own answer that the host is gone as proved. A node already decommissioned on
+// proof keeps that record, and a node that never registered has none.
+func settleClosedNodeTx(
+	ctx context.Context, q state.WriteOps, node string, proven bool, actor string, now time.Time,
+) error {
+	if node == "" {
+		return nil
+	}
+
+	facts, err := q.ReadNodeReleaseFacts(ctx, node)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("alloc: read %s's release facts: %w", node, err)
+	case facts.DecommissionProven == 1:
+		// A PROOF THAT STILL STANDS IS KEPT, and the seal's own becomes the closing's, so
+		// compute listed after the order closed can no longer undo it.
+		if err := q.HandOverPoolRetirement(ctx, ledgerdb.HandOverPoolRetirementParams{
+			ClosingActor: actor, Name: node, SealActor: poolReleaseActor,
+		}); err != nil {
+			return fmt.Errorf("alloc: hand %s's retirement to its closing: %w", node, err)
+		}
+
+		return nil
+	}
+
+	recorded := int64(0)
+	if proven {
+		recorded = 1
+	}
+
+	if err := q.DecommissionNode(ctx, ledgerdb.DecommissionNodeParams{
+		DecommissionedAt: ts(now), DecommissionProven: recorded, DecommissionActor: actor, Name: node,
+	}); err != nil {
+		return fmt.Errorf("alloc: take %s out of the fleet: %w", node, err)
+	}
+
+	if err := q.DeleteBarrierRun(ctx, node); err != nil {
+		return fmt.Errorf("alloc: clear the barrier run of node %s: %w", node, err)
+	}
+
+	return nil
+}
+
+// computeListedNowTx is computeListedTx for an answer taken against epoch, which says
+// nothing of the host unless that is still its registration.
+func computeListedNowTx(ctx context.Context, q state.WriteOps, node string, epoch int64) error {
+	fence, err := q.ReadNodeFence(ctx, node)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("alloc: read the fence of node %s: %w", node, err)
+	case fence.Epoch != epoch:
+		return nil
+	}
+
+	return computeListedTx(ctx, q, node)
 }
 
 // NodeInventory is one host's last word about what it was running.

@@ -22,6 +22,23 @@ func GitHubTargetOf(t config.GitHubTarget) github.Target {
 	return github.OrganizationTarget(t.Org)
 }
 
+// ActionsAccessOf is how much of the `actions` permission a target's App must
+// hold under this config, the one answer `billet check` and a startup failure's
+// diagnosis both ask. Re-running a job needs write, which includes the read a
+// cache publication and an alert rule naming a branch or a step need. A rule is
+// not scoped to a target, so one that reads GitHub's records asks it of every
+// target.
+func ActionsAccessOf(cfg *config.Config, name string) github.ActionsAccess {
+	switch {
+	case cfg.TargetNeedsActionsWrite(name):
+		return github.ActionsWrite
+	case cfg.TargetNeedsRunEvidence(name), cfg.AlertsNeedRunRecords():
+		return github.ActionsRead
+	default:
+		return github.ActionsNone
+	}
+}
+
 // describeGitHubTarget names a target the way an operator reads it: its scope and
 // its GitHub path.
 func DescribeGitHubTarget(t config.GitHubTarget) string {
@@ -85,6 +102,27 @@ var ScaleSetGitHubURL = ""
 // slightly-different construction is how one of them ends up talking to a
 // different owner than the other.
 func NewScaleSetClientFor(ctx context.Context, cfg *config.Config, target config.GitHubTarget) (*scaleset.Client, error) {
+	if cfg.Server.TokenBroker != nil {
+		broker, err := NewBrokerClient(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("target %s: %w", target.Name, err)
+		}
+
+		client, err := scaleset.New(scaleset.Config{
+			Target:         GitHubTargetOf(target),
+			GitHubURL:      ScaleSetGitHubURL,
+			APIURL:         GitHubAPIBase,
+			InstallationID: target.InstallationID,
+			Tokens:         TargetTokens(broker, target),
+			AppID:          target.AppID,
+		}, slog.Default())
+		if err != nil {
+			return nil, fmt.Errorf("target %s: %w", target.Name, err)
+		}
+
+		return client, nil
+	}
+
 	key, err := ResolveAppKey(ctx, cfg, target)
 	if err != nil {
 		return nil, err
@@ -139,8 +177,15 @@ func NewScaleSetClients(ctx context.Context, cfg *config.Config) ([]Target, erro
 // appKeyFilePaths is every target's key path, for the lifecycle commands that
 // inspect, contain and preserve the files a deployment is made of. Empty under
 // the store backend, where no target names a file.
+//
+// A broker's client key is among them: this host's service reads it, and a lifecycle
+// command has to hand it over and leave it standing as it does an App key.
 func KeyFilePaths(cfg *config.Config) []string {
 	var paths []string
+
+	if cfg.Server != nil && cfg.Server.TokenBroker != nil {
+		paths = append(paths, cfg.Server.TokenBroker.ClientKeyPath)
+	}
 
 	for _, target := range cfg.GitHubTargets() {
 		if target.PrivateKeyPath != "" {

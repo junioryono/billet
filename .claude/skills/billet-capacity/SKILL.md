@@ -18,9 +18,12 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Capacity is bought when a runner starts, and it is a vector.**
 - **Nothing is reserved for an idle tier, and there is no rotation (#140).**
 - **A target's share is a narrower deployment ceiling (#192).**
+- **A target's weight ranks who buys next while targets contend, and decides nothing else (#530).**
+- **`hold` holds one host for a shape that fits nowhere, and a waiter holds back only what could keep it waiting (#527).**
 - **Status separates ownership from phase.**
 - **A commitment made to a remote service cannot be revoked by a local timer.**
 - **A pool member GitHub cannot route work to is retired on GitHub's per-registration word, never on the aggregate.**
+- **A runtime prediction may choose a host and decides nothing else (#524).**
 - **A tier naming an architecture is placed only on nodes that reported it, and a node that reported none serves only tiers naming none (ADR-022).**
 - **The loop that decides never waits for a machine to start (#708).**
 
@@ -32,11 +35,12 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A heartbeat pass's budget starts after it holds the mutex.**
 - **Exactly one party renews a lease, and every defect here was a moment when that count was zero.**
 - **An inventory that shrinks is capacity that gets resold.**
-- **billet attributes a lost job; it never re-runs one.**
+- **billet attributes a lost job, and re-runs one only for a tier that asks and only on GitHub's proof of a lost runner.**
 - **A reserved fleet's claim is released by a proof.**
 
 ### Custody, quarantine, drains and sessions: [references/custody-and-drains.md](references/custody-and-drains.md)
 
+- **A hold delays a destroy a completion already asked for, and never authorises one; a pool member's retirement asks about it too.**
 - **Compute billet cannot account for is a named state, never resold.**
 - **`Recover` runs at every registration, not only at start, so what it finds includes this process's own jobs (#227).**
 - **A drain waits for compute, not for entries.**
@@ -52,6 +56,16 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A clean exit withdraws; silence still means nothing.**
 - **A restart waits for its own message session, and so does a failover.**
 - **A tier whose session fails keeps everything it holds while it reopens (#207).**
+
+### The pool of rented bare metal: [references/pool.md](references/pool.md)
+
+- **A pool order is committed before its source is asked, and read back before anything else is done about it (ADR-030).**
+- **A lost answer is sent again only inside the source's deduplication window; past it, the order is uncertain and a person decides.**
+- **Nothing is ordered on an architecture while an order there is unknown, and demand grows the pool one host at a time while any placed host has not joined.**
+- **An order records its source's scope and is read back only there; a resend the source refuses is uncertain, not refused.**
+- **A pool host joins on its source's word only when every check vouches for its key; a contradiction holds its order, and could-not-tell waits for a person (ADR-030).**
+- **Only a whole console line names a key, and nothing a pool host's join prints can be one.**
+- **A pool host is released only on proof, sealed in the transaction that reads it, with its node's certificates revoked first (ADR-030).**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

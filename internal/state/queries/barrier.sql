@@ -82,15 +82,22 @@ DELETE FROM compute_barrier_nodes;
 -- Discard one host's continuous-empty run.
 DELETE FROM compute_barrier_nodes WHERE node = @node;
 
--- name: BarrierRunExists :one
--- Whether one host has a run at all.
+-- name: ArrivalHasProof :one
+-- Whether one host has anything an arrival discards: a continuous-empty run, or a pool
+-- order still waiting on it whose release its decommission still proves, or one with a
+-- clearance run, which the arrival ends whether or not the release was contradicted
+-- before (ADR-030). A sealed order is not an arrival's (ContradictWaitingPoolRelease).
 --
 -- READ BEFORE THE WRITE, and that is not a micro-optimisation: the invalidation
 -- runs on EVERY registration, ahead of the revocation check, so a credential an
 -- operator has taken back can call it as fast as it can open connections. An
 -- unconditional write transaction would let it reserve SQLite's single writer
 -- slot over and over and starve every scheduling decision in the process.
-SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = @node);
+SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = @node
+              UNION ALL
+              SELECT 1 FROM pool_orders
+               WHERE node_name = @node AND node_name != '' AND state = 'placed'
+                 AND (release_contradicted = 0 OR clear_since != ''));
 
 -- name: AnyBarrierRunExists :one
 -- Whether the fleet has any run at all, for the same reason.

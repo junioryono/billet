@@ -371,10 +371,10 @@ func TestAllocatorReappliesInterceptionProviderSafety(t *testing.T) {
 	db := openTestLedger(t)
 
 	unsafe := tier("remote-cache", 2, 4*config.GiB)
-	unsafe.Provider = config.ProviderEC2
+	unsafe.Provider = config.ProviderCodeBuild
 	unsafe.Intercept = true
 	_, err := New(db, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB}, []config.Tier{unsafe})
-	if err == nil || !strings.Contains(err.Error(), "only the firecracker provider") {
+	if err == nil || !strings.Contains(err.Error(), "requires the firecracker or ec2 provider") {
 		t.Fatalf("New accepted unsafe interception outside config.Load: %v", err)
 	}
 }

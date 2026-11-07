@@ -12,8 +12,8 @@ import (
 
 const insertJoinToken = `-- name: InsertJoinToken :exec
 
-INSERT INTO join_tokens (token_sha256, note, uses_remaining, created_at, expires_at)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO join_tokens (token_sha256, note, uses_remaining, created_at, expires_at, pool_order)
+VALUES ($1, $2, $3, $4, $5, $6)
 `
 
 type InsertJoinTokenParams struct {
@@ -22,13 +22,15 @@ type InsertJoinTokenParams struct {
 	UsesRemaining int64
 	CreatedAt     string
 	ExpiresAt     string
+	PoolOrder     string
 }
 
 // Join tokens: the short-lived credential that lets a machine ASK to enroll.
 //
 // The token is never stored. What the table holds is its sha256, which is why
 // every statement here takes a hash rather than a secret.
-// Mint one join token.
+// Mint one join token. pool_order is the order a pool minted it for, and empty for
+// one an operator minted (migration 76).
 func (q *Queries) InsertJoinToken(ctx context.Context, arg InsertJoinTokenParams) error {
 	_, err := q.db.ExecContext(ctx, insertJoinToken,
 		arg.TokenSha256,
@@ -36,6 +38,7 @@ func (q *Queries) InsertJoinToken(ctx context.Context, arg InsertJoinTokenParams
 		arg.UsesRemaining,
 		arg.CreatedAt,
 		arg.ExpiresAt,
+		arg.PoolOrder,
 	)
 	return err
 }
@@ -133,6 +136,45 @@ func (q *Queries) LiveJoinTokenExists(ctx context.Context, arg LiveJoinTokenExis
 	return exists, err
 }
 
+const readJoinTokenOrder = `-- name: ReadJoinTokenOrder :one
+SELECT pool_order,
+       CAST(CASE WHEN uses_remaining > 0 AND expires_at > $1 THEN 1 ELSE 0 END AS BIGINT) AS live
+  FROM join_tokens WHERE token_sha256 = $2
+`
+
+type ReadJoinTokenOrderParams struct {
+	Now         string
+	TokenSha256 string
+}
+
+type ReadJoinTokenOrderRow struct {
+	PoolOrder string
+	Live      int64
+}
+
+// The pool order a token was minted for, spent or not, and whether it could still be
+// spent: a host polls with the token it booted with long after the admission spent
+// it, and its poll is still the order's. Empty for an operator's token;
+// sql.ErrNoRows for no such token.
+func (q *Queries) ReadJoinTokenOrder(ctx context.Context, arg ReadJoinTokenOrderParams) (ReadJoinTokenOrderRow, error) {
+	row := q.db.QueryRowContext(ctx, readJoinTokenOrder, arg.Now, arg.TokenSha256)
+	var i ReadJoinTokenOrderRow
+	err := row.Scan(&i.PoolOrder, &i.Live)
+	return i, err
+}
+
+const retirePoolJoinTokens = `-- name: RetirePoolJoinTokens :exec
+UPDATE join_tokens SET uses_remaining = 0
+ WHERE pool_order = $1 AND uses_remaining > 0
+`
+
+// Spend every use left on an order's tokens, once a node has joined from it: each
+// send minted one, and only the one that booted the host was ever needed.
+func (q *Queries) RetirePoolJoinTokens(ctx context.Context, poolOrder string) error {
+	_, err := q.db.ExecContext(ctx, retirePoolJoinTokens, poolOrder)
+	return err
+}
+
 const spendJoinToken = `-- name: SpendJoinToken :execresult
 UPDATE join_tokens SET uses_remaining = uses_remaining - 1
  WHERE token_sha256 = $1 AND uses_remaining > 0 AND expires_at > $2
@@ -152,4 +194,22 @@ type SpendJoinTokenParams struct {
 // returns nothing to distinguish "spent" from "there was nothing to spend".
 func (q *Queries) SpendJoinToken(ctx context.Context, arg SpendJoinTokenParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, spendJoinToken, arg.TokenSha256, arg.Now)
+}
+
+const spendPoolJoinToken = `-- name: SpendPoolJoinToken :execresult
+UPDATE join_tokens SET uses_remaining = uses_remaining - 1
+ WHERE token_sha256 = $1 AND pool_order = $2
+   AND uses_remaining > 0 AND expires_at > $3
+`
+
+type SpendPoolJoinTokenParams struct {
+	TokenSha256 string
+	PoolOrder   string
+	Now         string
+}
+
+// Consume one use of a token, only while it is live AND minted for this order, in
+// one statement, so a token of one order never admits another's host.
+func (q *Queries) SpendPoolJoinToken(ctx context.Context, arg SpendPoolJoinTokenParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, spendPoolJoinToken, arg.TokenSha256, arg.PoolOrder, arg.Now)
 }

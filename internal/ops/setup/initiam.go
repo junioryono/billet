@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/junioryono/billet/internal/awspolicy"
@@ -44,6 +45,12 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 		"the S3 bucket `billet ami build --payload-bucket` stages the shared installers in, "+
 			"needed once they outgrow EC2's user-data limit; grants put, get and delete on the "+
 			"object names billet writes there and nothing else (requires --builder)")
+	builderSubnet := fs.String("builder-subnet", "",
+		"the subnet `billet ami build --subnet` launches into, when it is not node.ec2's "+
+			"(requires --builder); the launch grant names it beside node.ec2.subnet_id")
+	builderGroup := fs.String("builder-security-group", "",
+		"the security group `billet ami build --security-group` attaches, when it is not one "+
+			"of node.ec2's (requires --builder); the launch grant names it beside them")
 	roleARN := fs.String("role-arn", "",
 		"the IAM role ARN the instance_profile contains, for iam:PassRole scoping")
 	kmsKeyARN := fs.String("kms-key-arn", "",
@@ -125,6 +132,11 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	in.Network, err = launchNetwork(cfg.Node.EC2, *builder, *builderSubnet, *builderGroup)
+	if err != nil {
+		return err
+	}
+
 	in.Owner = owner
 
 	policy, err := in.Build()
@@ -188,6 +200,34 @@ func resolveDeploymentOwner(cfg *config.Config, flag string, accountWide bool) (
 		"mint it (or `billet ca issue`/enroll a node), then re-run; or pass --deployment <id>. To " +
 		"scope the policy by tag presence instead — only safe if this is the single billet " +
 		"deployment in the account — pass --account-wide")
+}
+
+// launchNetwork is every subnet and security group the node's launches use: the
+// config's subnet, its trusted and untrusted groups, and a builder's own when it
+// names one. The launch grant reaches these and nothing else in the account (#779),
+// so a builder launching somewhere the config does not name says so here or is
+// refused at RunInstances.
+func launchNetwork(
+	ec2cfg *config.EC2Config, builder bool, builderSubnet, builderGroup string,
+) (*awspolicy.Network, error) {
+	if !builder && (builderSubnet != "" || builderGroup != "") {
+		return nil, errors.New("--builder-subnet and --builder-security-group are only " +
+			"meaningful with --builder: they name where `billet ami build` launches")
+	}
+
+	n := &awspolicy.Network{SubnetIDs: []string{ec2cfg.SubnetID}}
+	if builderSubnet != "" && builderSubnet != ec2cfg.SubnetID {
+		n.SubnetIDs = append(n.SubnetIDs, builderSubnet)
+	}
+
+	for _, g := range append(append(append([]string{}, ec2cfg.SecurityGroupIDs...),
+		ec2cfg.UntrustedSecurityGroupIDs...), builderGroup) {
+		if g != "" && !slices.Contains(n.SecurityGroupIDs, g) {
+			n.SecurityGroupIDs = append(n.SecurityGroupIDs, g)
+		}
+	}
+
+	return n, nil
 }
 
 // iamInputsFromConfig reads the deployment's shape out of the loaded config,

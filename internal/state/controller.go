@@ -95,11 +95,12 @@ func (e *SchemaMoved) Error() string {
 
 // controllerPollInterval paces a standby's attempts to take the claim.
 //
-// SHORT, BECAUSE THE ONLY THING IT COSTS IS ONE pg_try_advisory_lock AGAINST A
-// LEDGER NOBODY IS WRITING TO, and what it buys is how long a deployment has no
-// controller after the incumbent's session ends. It is not a lease and it is not
-// a timeout: nothing here decides that a controller is dead — PostgreSQL does,
-// by ending the session — so this number cannot make billet wrong, only slow.
+// SHORT, BECAUSE THE ONLY THING IT COSTS IS ONE pg_try_advisory_lock, ON THE ONE
+// SESSION A STANDBY KEEPS FOR IT, AGAINST A LEDGER NOBODY IS WRITING TO, and what it
+// buys is how long a deployment has no controller after the incumbent's session
+// ends. It is not a lease and it is not a timeout: nothing here decides that a
+// controller is dead — PostgreSQL does, by ending the session — so this number
+// cannot make billet wrong, only slow.
 const controllerPollInterval = 2 * time.Second
 
 // ControllerClaim is proof that this process may make scheduling decisions for

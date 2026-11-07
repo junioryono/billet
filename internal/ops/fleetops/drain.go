@@ -120,6 +120,8 @@ func Drain(ctx context.Context, env cli.Env, args []string) error {
 	withoutProof := fs.Bool("without-compute-proof", false,
 		"stop once the LEDGER is quiet, without asking each host what it is actually "+
 			"running (faster, and it cannot see compute whose lease has already gone)")
+	cutHolds := fs.Bool("cut-holds", false,
+		"end every hold on a failed job's VM now, rather than waiting for each to reach its bound")
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -164,6 +166,21 @@ func Drain(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	if *cutHolds || !*wait {
+		a, err := app.NewAllocator(cfg, db)
+		if err != nil {
+			return fmt.Errorf("capacity allocator: %w", err)
+		}
+
+		if *cutHolds {
+			if err := settleHolds(ctx, env, a); err != nil {
+				return err
+			}
+		} else {
+			sayHolds(ctx, env, a)
+		}
+	}
+
 	if !*wait {
 		fmt.Fprintf(env.Stdout, "\nJobs already running are unaffected and will finish. Watch what is left\n")
 		fmt.Fprintf(env.Stdout, "with `billet status`, or re-run this with --wait. Reopen with `billet resume`.\n")
@@ -174,6 +191,7 @@ func Drain(ctx context.Context, env cli.Env, args []string) error {
 	return WaitForQuiet(ctx, env, db, cfg, sealed.Generation, WaitOptions{
 		Timeout:      *timeout,
 		WithoutProof: *withoutProof,
+		CutHolds:     *cutHolds,
 	})
 }
 
@@ -185,6 +203,9 @@ type WaitOptions struct {
 	// that is off, or too old to answer, never will — and an operator has to be
 	// able to proceed knowing that is what they did.
 	WithoutProof bool
+	// CutHolds ends every hold on a failed job's VM as the wait goes on: a listener can open one
+	// before it has heard of the seal, and this wait would otherwise sit out its bound.
+	CutHolds bool
 }
 
 // takeTheSeal records the operator's decision and returns the admission the
@@ -367,6 +388,9 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 	fmt.Fprintf(env.Stdout, "\nWaiting for what is already running to finish. Ctrl-C stops waiting; it does\n")
 	fmt.Fprintf(env.Stdout, "not stop the drain, and nothing running is harmed either way.\n\n")
 
+	// EVERY WAIT, not only `billet drain`'s: a held VM is compute to all of them.
+	sayHolds(ctx, env, allocator)
+
 	// waitBegan bounds the seal from above: this command sealed, or found the
 	// deployment sealed, before it began to wait.
 	waitBegan := time.Now()
@@ -383,6 +407,13 @@ func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 	var quietSince time.Time
 
 	for {
+		if opts.CutHolds {
+			if _, err := allocator.EndHoldingLeaseHolds(ctx, alloc.HoldEndedByDrain); err != nil &&
+				!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				fmt.Fprintf(env.Stdout, "Could not end the holds still open: %v\n", err)
+			}
+		}
+
 		q, err := allocator.Quiescence(ctx)
 		if err != nil {
 			// A CANCELLED WAIT IS NOT A LEDGER FAILURE, and the test is on the

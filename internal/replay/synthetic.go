@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"time"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 // Params shape a synthetic trace. Zero values take the defaults below.
@@ -193,4 +196,300 @@ func LongTail(seed uint64, p Params) Trace {
 	t.Normalize()
 
 	return t
+}
+
+// Burst is one push queuing every job at once: all of them within ten seconds
+// of the start, across the tiers, most a few minutes long.
+func Burst(seed uint64, p Params) Trace {
+	g := newGenerator(seed, p)
+
+	var t Trace
+
+	for i := range g.p.Jobs {
+		at := g.p.Start.Add(time.Duration(g.r.Float64() * float64(10*time.Second)))
+		t.Arrivals = append(t.Arrivals, g.arrival(at, g.pick(g.p.Tiers), g.pick(g.p.Repositories),
+			int64(20000+i/10), g.lognormal(5*time.Minute, 0.5)))
+	}
+
+	t.Normalize()
+
+	return t
+}
+
+// IdleBacklog is a backlog larger than the fleet arriving within half a minute
+// at an idle fleet, the shape of a fleet coming back after an outage: the
+// queue is drained by what the hosts can hold, and the tail is how long the
+// last of it waits.
+func IdleBacklog(seed uint64, p Params) Trace {
+	g := newGenerator(seed, p)
+
+	var t Trace
+
+	for i := range g.p.Jobs {
+		at := g.p.Start.Add(time.Duration(g.r.Float64() * float64(30*time.Second)))
+		t.Arrivals = append(t.Arrivals, g.arrival(at, g.pick(g.p.Tiers), g.pick(g.p.Repositories),
+			int64(30000+i), g.lognormal(10*time.Minute, 0.4)))
+	}
+
+	t.Normalize()
+
+	return t
+}
+
+// QuietParams shape QuietBesideSaturated.
+type QuietParams struct {
+	Params
+	// Fleet is what the busy tier saturates; its tiers' first is the busy one
+	// and its last the quiet one.
+	Fleet Fleet
+	// Saturation is the share of the fleet's vCPU room the busy tier offers;
+	// zero means 1.5, a backlog that only grows.
+	Saturation float64
+}
+
+// quietMedian and busyMedian are the runtimes QuietBesideSaturated draws
+// around.
+const (
+	busyMedian  = 4 * time.Minute
+	quietMedian = 6 * time.Minute
+	quietSigma  = 0.3
+	busySigma   = 0.4
+)
+
+// QuietBesideSaturated is one tier, the fleet's first, offered more work than
+// the whole fleet holds (Saturation of its vCPU room), beside a quiet tier,
+// the fleet's last, whose few jobs arrive at random across the same span on
+// the same hosts: the shape that shows whether the quiet tier's jobs wait
+// behind the busy one's backlog. A tenth of the jobs are the quiet tier's.
+func QuietBesideSaturated(seed uint64, p QuietParams) Trace {
+	if p.Saturation <= 0 {
+		p.Saturation = 1.5
+	}
+
+	busy, quiet := p.Fleet.Tiers[0], p.Fleet.Tiers[len(p.Fleet.Tiers)-1]
+	p.Tiers = []string{busy.Label, quiet.Label}
+	g := newGenerator(seed, p.Params)
+
+	room := 0
+	for _, h := range p.Fleet.Hosts {
+		room += h.VCPU
+	}
+
+	room = min(room, p.Fleet.MaxVCPU)
+
+	quietJobs := max(g.p.Jobs/10, 1)
+	busyJobs := g.p.Jobs - quietJobs
+
+	// The busy tier's mean gap makes its offered vCPU-time Saturation of the
+	// room: a job's vCPU times its mean runtime, over the room's share.
+	meanBusy := float64(busyMedian) * math.Exp(busySigma*busySigma/2)
+	gap := float64(busy.VCPU) * meanBusy / (p.Saturation * float64(room))
+
+	var t Trace
+
+	at := g.p.Start
+	for i := range busyJobs {
+		at = at.Add(time.Duration(g.r.ExpFloat64() * gap))
+		t.Arrivals = append(t.Arrivals, g.arrival(at, busy.Label, g.pick(g.p.Repositories), int64(40000+i),
+			g.lognormal(busyMedian, busySigma)))
+	}
+
+	span := at.Sub(g.p.Start)
+
+	for i := range quietJobs {
+		quietAt := g.p.Start.Add(time.Duration(g.r.Float64() * float64(span)))
+		t.Arrivals = append(t.Arrivals, g.arrival(quietAt, quiet.Label, g.pick(g.p.Repositories), int64(45000+i),
+			g.lognormal(quietMedian, quietSigma)))
+	}
+
+	t.Normalize()
+
+	return t
+}
+
+// WideParams shape WideShapeMix.
+type WideParams struct {
+	Params
+	// Fleet is what the load is offered to; its tiers are the mix, and the
+	// widest of them is the whole-host shape.
+	Fleet Fleet
+	// OfferedLoad is the share of the fleet's vCPU room the arrivals offer on
+	// average; zero means 0.85.
+	OfferedLoad float64
+	// WideShare is the share of the jobs that are of the widest tier; zero
+	// means 0.05.
+	WideShare float64
+}
+
+// WideMedian is the median runtime WideShapeMix draws every job around, and
+// wideSigma the spread it draws them with.
+const (
+	WideMedian = 8 * time.Minute
+	wideSigma  = 0.6
+)
+
+// WideShapeMix is a whole-host tier beside smaller ones, at an offered load
+// near the fleet's room: the shape #527 is judged on. The widest tier of the
+// fleet is the whole-host one and takes WideShare of the jobs; the rest are
+// spread over the other tiers, the smallest the most common. Arrivals are a
+// Poisson stream whose rate makes the offered vCPU-time OfferedLoad of the
+// room: the rate is the room times the load over the expected vCPU-time of a
+// job (its vCPU times the lognormal's mean runtime, median·e^(σ²/2)).
+func WideShapeMix(seed uint64, p WideParams) Trace {
+	if p.OfferedLoad <= 0 {
+		p.OfferedLoad = 0.85
+	}
+
+	if p.WideShare <= 0 {
+		p.WideShare = 0.05
+	}
+
+	tiers := slices.Clone(p.Fleet.Tiers)
+	slices.SortStableFunc(tiers, func(a, b TierShape) int { return a.VCPU - b.VCPU })
+
+	// A FLEET OF ONE TIER IS ALL WIDE: there is no narrower tier to mix in,
+	// and the one tier stands for both.
+	wide, narrow := tiers[len(tiers)-1], tiers[:len(tiers)-1]
+	if len(narrow) == 0 {
+		narrow = tiers
+	}
+
+	labels := make([]string, len(narrow))
+	for i := range narrow {
+		labels[i] = narrow[i].Label
+	}
+
+	p.Tiers = labels
+	g := newGenerator(seed, p.Params)
+
+	// THE EXPECTED vCPU OF A JOB, under the same bias pick uses: the i-th
+	// narrow tier is chosen in proportion to 1/(i+1).
+	weights, total := make([]float64, len(narrow)), 0.0
+	for i := range narrow {
+		weights[i] = 1 / float64(i+1)
+		total += weights[i]
+	}
+
+	narrowVCPU := 0.0
+	for i := range narrow {
+		narrowVCPU += weights[i] / total * float64(narrow[i].VCPU)
+	}
+
+	meanVCPU := p.WideShare*float64(wide.VCPU) + (1-p.WideShare)*narrowVCPU
+	meanRuntime := float64(WideMedian) * math.Exp(wideSigma*wideSigma/2)
+
+	room := 0
+	for _, h := range p.Fleet.Hosts {
+		room += h.VCPU
+	}
+
+	room = min(room, p.Fleet.MaxVCPU)
+
+	// Jobs per nanosecond.
+	rate := p.OfferedLoad * float64(room) / (meanVCPU * meanRuntime)
+
+	var t Trace
+
+	at := g.p.Start
+
+	for i := range g.p.Jobs {
+		at = at.Add(time.Duration(g.r.ExpFloat64() / rate))
+
+		tier := g.pick(g.p.Tiers)
+		if g.r.Float64() < p.WideShare {
+			tier = wide.Label
+		}
+
+		t.Arrivals = append(t.Arrivals, g.arrival(at, tier, g.pick(g.p.Repositories), int64(50000+i),
+			g.lognormal(WideMedian, wideSigma)))
+	}
+
+	t.Normalize()
+
+	return t
+}
+
+// ContendedParams shape ContendedTargets.
+type ContendedParams struct {
+	Params
+	// Fleet's tiers are the streams, one per tier, in the owner of the tier's own
+	// target; a tier in Idle gets none.
+	Fleet Fleet
+	Idle  []string
+	// Saturation is the share of the fleet's vCPU room each stream offers alone,
+	// on average; zero means 1.5, so every stream that runs has more work than the
+	// whole fleet holds.
+	Saturation float64
+}
+
+// ContendedTargets is a stream of jobs on each of the fleet's tiers, each of them
+// alone more than the fleet holds, for as long as it has jobs: the shape on which
+// what the admission order gives each target is all that decides what it holds.
+// Jobs is per stream. Every job runs around busyMedian.
+func ContendedTargets(seed uint64, p ContendedParams) Trace {
+	if p.Saturation <= 0 {
+		p.Saturation = 1.5
+	}
+
+	p.Tiers = nil
+	for _, shape := range p.Fleet.Tiers {
+		p.Tiers = append(p.Tiers, shape.Label)
+	}
+
+	g := newGenerator(seed, p.Params)
+
+	room := 0
+	for _, h := range p.Fleet.Hosts {
+		room += h.VCPU
+	}
+
+	room = min(room, p.Fleet.MaxVCPU)
+	mean := float64(busyMedian) * math.Exp(busySigma*busySigma/2)
+
+	var t Trace
+
+	for i, shape := range p.Fleet.Tiers {
+		if slices.Contains(p.Idle, shape.Label) {
+			continue
+		}
+
+		owner := DefaultOwner
+		if shape.Target != "" {
+			owner = ownerOf(shape.Target)
+		}
+
+		gap := float64(shape.VCPU) * mean / (p.Saturation * float64(room))
+		at := g.p.Start
+
+		for j := range g.p.Jobs {
+			at = at.Add(time.Duration(g.r.ExpFloat64() * gap))
+
+			a := g.arrival(at, shape.Label, g.pick(g.p.Repositories), int64(50000+1000*i+j),
+				g.lognormal(busyMedian, busySigma))
+			a.Owner = owner
+			a.WorkflowRef = fmt.Sprintf("%s/%s/.github/workflows/ci.yml@refs/heads/main", owner, a.Repository)
+			t.Arrivals = append(t.Arrivals, a)
+		}
+	}
+
+	t.Normalize()
+
+	return t
+}
+
+// WideFleet is four 32 vCPU hosts with tiers of 2, 4, 8 and 16 vCPU and a
+// whole-host tier of 32, at 4 GiB a vCPU, under a ceiling the hosts add up to.
+func WideFleet() Fleet {
+	f := Fleet{MaxVCPU: 128, MaxMemory: 512 * config.GiB}
+
+	for i := range 4 {
+		f.Hosts = append(f.Hosts, Host{Name: fmt.Sprintf("host-%c", 'a'+i), VCPU: 32, Memory: 128 * config.GiB})
+	}
+
+	for _, vcpu := range []int{2, 4, 8, 16, 32} {
+		f.Tiers = append(f.Tiers, TierShape{Label: fmt.Sprintf("billet-%dvcpu", vcpu), VCPU: vcpu,
+			Memory: config.ByteSize(vcpu) * 4 * config.GiB})
+	}
+
+	return f
 }

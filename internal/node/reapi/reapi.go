@@ -60,6 +60,12 @@ type Volume interface {
 	Close()
 }
 
+// Sizer is a Volume that can say how large an object is without reading it, where
+// opening one can cost a whole download. Size answers as Open does for an absent one.
+type Sizer interface {
+	Size(table Table, hash string) (int64, error)
+}
+
 // Opener admits one call and gives it its session's volume. write says the call
 // may store something, which the node records before the first byte lands.
 type Opener func(ctx context.Context, write bool) (Volume, error)
@@ -172,6 +178,17 @@ func checkFunction(function repb.DigestFunction_Value) error {
 func has(v Volume, d *repb.Digest) (bool, error) {
 	if d.GetHash() == emptyHash && d.GetSizeBytes() == 0 {
 		return true, nil
+	}
+	if sizer, ok := v.(Sizer); ok {
+		size, err := sizer.Size(TableCAS, d.GetHash())
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+
+		return size == d.GetSizeBytes(), nil
 	}
 	file, err := v.Open(TableCAS, d.GetHash())
 	if errors.Is(err, fs.ErrNotExist) {
