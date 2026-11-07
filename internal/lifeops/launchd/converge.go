@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/user"
@@ -535,17 +536,25 @@ func (c *Converger) agentPath(label string) string {
 	return filepath.Join(c.agentsDir, label+".plist")
 }
 
-// installedAgent reads the agent installed for a label, if there is one.
+// installedAgent reads the agent installed for a label, if there is one: at most one byte
+// past maxAgentBytes, which no agent billet ships comes near, so a longer file is read
+// only far enough to be another agent.
 func (c *Converger) installedAgent(label string) (string, bool, error) {
-	body, err := os.ReadFile(c.agentPath(label))
+	f, err := os.Open(c.agentPath(label))
 
 	switch {
-	case err == nil:
-		return string(body), true, nil
 	case errors.Is(err, os.ErrNotExist):
 		return "", false, nil
-	default:
-		return "", false, fmt.Errorf("launchd: read the installed agent %s: %w",
-			c.agentPath(label), err)
+	case err != nil:
+		return "", false, fmt.Errorf("launchd: read the installed agent %s: %w", c.agentPath(label), err)
 	}
+
+	defer func() { _ = f.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(f, maxAgentBytes+1))
+	if err != nil {
+		return "", false, fmt.Errorf("launchd: read the installed agent %s: %w", c.agentPath(label), err)
+	}
+
+	return string(body), true, nil
 }

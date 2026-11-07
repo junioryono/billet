@@ -275,7 +275,7 @@ func (c *Converger) removeAgent(label string) error {
 		// Somebody else removed it. The outcome billet wanted, by another hand.
 		return nil
 
-	case !sameAgent(installed, shipped):
+	case !wroteThisAgent(installed, shipped):
 		return fmt.Errorf("launchd: %s was installed by this run but is no longer the agent "+
 			"billet wrote there, so it has been left alone. Undoing this run did NOT remove it — "+
 			"look at it and remove it yourself if it is not wanted", path)

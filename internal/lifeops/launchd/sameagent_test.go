@@ -107,6 +107,74 @@ func TestAWhitespaceValueIsNotLayout(t *testing.T) {
 	}
 }
 
+// WHAT APPLE'S PLIST PARSER REFUSES IS NOT THE SAME AGENT, though an XML reading of it
+// would be: a CDATA or an entity spelling of a value, a comment inside a value element,
+// a non-breaking space between elements.
+func TestASpellingLaunchdRefusesIsAnotherAgent(t *testing.T) {
+	t.Parallel()
+
+	const shipped = "<plist version=\"1.0\">\n<dict>\n  <key>ExitTimeOut</key>\n  <integer>300</integer>\n" +
+		"  <key>RunAtLoad</key>\n  <true/>\n</dict>\n</plist>\n"
+
+	if !sameAgent(shipped, shipped) {
+		t.Fatal("the fixture is not the same as itself")
+	}
+
+	for what, installed := range map[string]string{
+		"a CDATA integer":                   strings.Replace(shipped, "<integer>300</integer>", "<integer><![CDATA[300]]></integer>", 1),
+		"an entity in an integer":           strings.Replace(shipped, "<integer>300</integer>", "<integer>&#51;00</integer>", 1),
+		"a comment inside a value":          strings.Replace(shipped, "<true/>", "<true><!-- note --></true>", 1),
+		"a comment splitting a value":       strings.Replace(shipped, "<integer>300</integer>", "<integer>3<!-- x -->00</integer>", 1),
+		"a non-breaking space between them": strings.Replace(shipped, "</integer>\n", "</integer> \n", 1),
+		"an unterminated comment":           shipped + "<!-- ",
+		"an unterminated element":           shipped + "<dict",
+		"larger than any agent":             shipped + "<!--" + strings.Repeat("x", maxAgentBytes) + "-->",
+	} {
+		if sameAgent(installed, shipped) {
+			t.Errorf("%s: accepted as billet's own agent", what)
+		}
+	}
+}
+
+// A ROLLBACK REMOVES ONLY WHAT THIS RUN WROTE, byte for byte: a comment an operator added
+// since is theirs, though the agent is still billet's for every other purpose.
+func TestARollbackLeavesAnAgentAnOperatorCommentedOn(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	c := &Converger{agentsDir: dir}
+	path := c.agentPath(deploy.ImagesAgentLabel)
+
+	commented := strings.Replace(deploy.ImagesAgent, "<dict>", "<dict>\n  <!-- why we keep this -->", 1)
+	if err := os.WriteFile(path, []byte(commented), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !sameAgent(commented, deploy.ImagesAgent) {
+		t.Fatal("the commented agent is not billet's own, so this proves nothing about a rollback")
+	}
+
+	if err := c.removeAgent(deploy.ImagesAgentLabel); err == nil {
+		t.Error("a rollback removed an agent an operator had commented on since this run wrote it")
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the operator's agent is gone: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte(deploy.ImagesAgent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.removeAgent(deploy.ImagesAgentLabel); err != nil {
+		t.Fatalf("a rollback of exactly what this run wrote: %v", err)
+	}
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("the agent this run wrote survived its rollback: %v", err)
+	}
+}
+
 func firstBetween(t *testing.T, s, open, closing string) string {
 	t.Helper()
 
