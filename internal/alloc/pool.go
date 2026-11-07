@@ -46,6 +46,12 @@ type PoolOrder struct {
 	// from it.
 	FirstAttempt time.Time
 	Updated      time.Time
+	// NodeFingerprint and NodeCertSerial are the key admitted from the order and the
+	// certificate it was handed; a release revokes that serial first.
+	NodeFingerprint string
+	NodeCertSerial  string
+	// JoinHold is why a person must look before the order admits a node.
+	JoinHold string
 }
 
 // RecordPoolOrder commits an order before its source is asked, so an order whose
@@ -77,26 +83,35 @@ func (a *Allocator) PoolOrders(ctx context.Context) ([]PoolOrder, error) {
 		}
 		out = make([]PoolOrder, 0, len(rows))
 		for i := range rows {
-			r := &rows[i]
-			first, err := time.Parse(timestampFormat, r.FirstAttemptAt)
+			o, err := poolOrderFrom(&rows[i])
 			if err != nil {
-				return fmt.Errorf("alloc: pool order %s: first attempt %q: %w", r.OrderID, r.FirstAttemptAt, err)
+				return err
 			}
-			updated, err := time.Parse(timestampFormat, r.UpdatedAt)
-			if err != nil {
-				return fmt.Errorf("alloc: pool order %s: updated %q: %w", r.OrderID, r.UpdatedAt, err)
-			}
-			out = append(out, PoolOrder{
-				ID: r.OrderID, Source: r.Source, Scope: r.Scope, Shape: r.Shape, Location: r.Location,
-				Arch: config.Arch(r.Arch), State: r.State, HostID: r.HostID, NodeName: r.NodeName,
-				Reason: r.Reason, FirstAttempt: first, Updated: updated,
-			})
+			out = append(out, o)
 		}
 
 		return nil
 	})
 
 	return out, err
+}
+
+func poolOrderFrom(r *ledgerdb.PoolOrder) (PoolOrder, error) {
+	first, err := time.Parse(timestampFormat, r.FirstAttemptAt)
+	if err != nil {
+		return PoolOrder{}, fmt.Errorf("alloc: pool order %s: first attempt %q: %w", r.OrderID, r.FirstAttemptAt, err)
+	}
+	updated, err := time.Parse(timestampFormat, r.UpdatedAt)
+	if err != nil {
+		return PoolOrder{}, fmt.Errorf("alloc: pool order %s: updated %q: %w", r.OrderID, r.UpdatedAt, err)
+	}
+
+	return PoolOrder{
+		ID: r.OrderID, Source: r.Source, Scope: r.Scope, Shape: r.Shape, Location: r.Location,
+		Arch: config.Arch(r.Arch), State: r.State, HostID: r.HostID, NodeName: r.NodeName,
+		Reason: r.Reason, FirstAttempt: first, Updated: updated,
+		NodeFingerprint: r.NodeFingerprint, NodeCertSerial: r.NodeCertSerial, JoinHold: r.JoinHold,
+	}, nil
 }
 
 // PoolOrderPlaced records the host a source named for an order still being ordered.
@@ -115,6 +130,20 @@ func (a *Allocator) PoolOrderPlaced(ctx context.Context, id, hostID string) erro
 func (a *Allocator) PoolOrderUncertain(ctx context.Context, id, reason string) error {
 	return a.movePoolOrder(ctx, id, PoolOrdering, func(w state.WriteOps, now string) (int64, error) {
 		return w.MarkPoolOrderUncertain(ctx, ledgerdb.MarkPoolOrderUncertainParams{OrderID: id, Reason: reason, UpdatedAt: now})
+	})
+}
+
+// UncertainPoolOrderFound records the host its source now lists for an uncertain order,
+// read back where the order was placed: the order is placed, never sent again.
+func (a *Allocator) UncertainPoolOrderFound(ctx context.Context, id, hostID string) error {
+	if hostID == "" {
+		return fmt.Errorf("alloc: pool order %s: a placed order needs the host the source named", id)
+	}
+
+	return a.movePoolOrder(ctx, id, PoolUncertain, func(w state.WriteOps, now string) (int64, error) {
+		return w.MarkUncertainPoolOrderFound(ctx, ledgerdb.MarkUncertainPoolOrderFoundParams{
+			OrderID: id, HostID: hostID, UpdatedAt: now,
+		})
 	})
 }
 

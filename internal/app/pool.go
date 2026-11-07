@@ -11,11 +11,13 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/awsidentity"
 	"github.com/junioryono/billet/internal/awssts"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostsource"
 	"github.com/junioryono/billet/internal/hostsource/awsmetal"
 	"github.com/junioryono/billet/internal/hostsource/phoenixnap"
+	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/pool"
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -67,6 +69,53 @@ func NewPool(cfg *config.Config, ledger *alloc.Allocator, deployment string, log
 	return p, pc.PoolInterval(), nil
 }
 
+// poolJoins is what the node wire asks of a pool host's enrollment: the ledger's half
+// from the allocator and the source's word from the judge.
+type poolJoins struct {
+	*alloc.Allocator
+	*pool.Joins
+}
+
+var _ nodeplane.PoolJoins = poolJoins{}
+
+// NewPoolJoins builds what admits server.pool's hosts on their source's word (ADR-030),
+// over sources of its own built as the pool's are.
+func NewPoolJoins(cfg *config.Config, ledger *alloc.Allocator, deployment string) (nodeplane.PoolJoins, error) {
+	pc := cfg.Server.Pool
+	if pc == nil {
+		return nil, errors.New("app: server.pool is not configured")
+	}
+	sources, err := poolSources(pc, deployment)
+	if err != nil {
+		return nil, err
+	}
+
+	return poolJoins{Allocator: ledger, Joins: pool.NewJoins(ledger, sources, nil)}, nil
+}
+
+// poolWireOptions is the wire's options with a pool's joins added when the config names
+// a pool (ADR-030), so its hosts join on their source's word through the sources the
+// pool orders from.
+//
+// AND WITHOUT ONE: orders a pool placed, and their tokens, outlive a config that names
+// no pool any more, so their hosts are still answered by the ledger, and with no source
+// to ask, each waits for a person.
+func poolWireOptions(cfg *config.Config, ledger *alloc.Allocator, deployment string, opts ...wireOption) ([]wireOption, error) {
+	if cfg.Server.Pool == nil {
+		return append(opts, withPoolJoins(poolJoins{Allocator: ledger, Joins: pool.NewJoins(ledger, nil, nil)})), nil
+	}
+	joins, err := NewPoolJoins(cfg, ledger, deployment)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(opts, withPoolJoins(joins)), nil
+}
+
+// seesHostAddress says whether an enrollment's peer is the host itself: a router in
+// front of the listeners is every enrollment's peer.
+func seesHostAddress(cfg *config.Config) bool { return cfg.Server.TLSRouter == nil }
+
 // schedulePool is the controller's pool loop, and false when the config names no pool
 // or the run is dry, which orders nothing as it accepts no job.
 func schedulePool(cfg *config.Config, ledger *alloc.Allocator, deployment string, dryRun bool) (func(context.Context), bool, error) {
@@ -101,7 +150,13 @@ func poolSources(pc *config.PoolConfig, deployment string) (map[string]hostsourc
 
 			return id.Account, err
 		}
-		src, err := awsmetal.New(prov.Hosts(), m.AvailabilityZone, shapes, account)
+		identity, err := awsidentity.AWS()
+		if err != nil {
+			return nil, err
+		}
+		src, err := awsmetal.New(prov.Hosts(), awsmetal.Config{
+			Region: m.Region, Location: m.AvailabilityZone, Shapes: shapes, Account: account, Identity: identity,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -162,10 +217,11 @@ func PoolBoot(cfg *config.Config, prelude, fingerprint, order, token string) ([]
 	pc := cfg.Server.Pool
 	join := []string{
 		"billet", "join", "--server", pc.JoinServer, "--ca-fingerprint", fingerprint,
-		"--token", token, "--node-name", "pool-" + order, "--provider", string(config.ProviderFirecracker),
+		"--token", token, "--node-name", alloc.PoolNodeName(order), "--pool-order", order,
+		"--provider", string(config.ProviderFirecracker),
 	}
-	if pc.BootstrapAddr != "" {
-		join = append(join, "--bootstrap-addr", pc.BootstrapAddr)
+	if addr := cfg.Server.PoolEnrollAddr(); addr != "" {
+		join = append(join, "--bootstrap-addr", addr)
 	}
 	switch {
 	case cfg.GitHub != nil && cfg.GitHub.Org != "":

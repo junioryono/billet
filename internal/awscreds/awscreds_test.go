@@ -378,6 +378,8 @@ type fakeIMDS struct {
 	// fail: a billet that downgrades to v1 now SUCCEEDS, and success is what the
 	// assertion refuses.
 	v1Only bool
+	// identity serves the instance identity document and its signature.
+	identity bool
 }
 
 func newFakeIMDS(t *testing.T, keyID string, expires time.Time) *fakeIMDS {
@@ -463,6 +465,13 @@ func newFakeIMDS(t *testing.T, keyID string, expires time.Time) *fakeIMDS {
 
 			write(t, w, string(doc))
 
+		case r.URL.Path == "/latest/dynamic/instance-identity/document" && f.identity:
+			write(t, w, `{"instanceId":"i-1","region":"us-west-2"}`)
+
+		case r.URL.Path == "/latest/dynamic/instance-identity/signature" && f.identity:
+			// WRAPPED, as IMDS serves it.
+			write(t, w, "c2lnbmF0dXJl\nb2YgdGhlIGRvY3VtZW50\n")
+
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -471,6 +480,30 @@ func newFakeIMDS(t *testing.T, keyID string, expires time.Time) *fakeIMDS {
 	t.Cleanup(f.Close)
 
 	return f
+}
+
+// AN INSTANCE'S IDENTITY DOCUMENT AND SIGNATURE ARE READ OVER IMDSv2, through the same
+// session token the credentials use, and a host without them, or one serving only
+// IMDSv1, answers an error rather than a document of nothing.
+func TestAnInstanceIdentityIsReadOverIMDSv2(t *testing.T) {
+	t.Parallel()
+	imds := newFakeIMDS(t, "ASIAFROMROLEEXAMP001", time.Now().Add(time.Hour))
+	imds.identity = true
+	doc, sig, err := InstanceIdentity(t.Context(), imds.URL)
+	if err != nil || string(doc) != `{"instanceId":"i-1","region":"us-west-2"}` ||
+		sig != "c2lnbmF0dXJl\nb2YgdGhlIGRvY3VtZW50" || imds.tokens != 1 {
+		t.Fatalf("read %q, %q, %v with %d tokens", doc, sig, err, imds.tokens)
+	}
+
+	none := newFakeIMDS(t, "ASIAFROMROLEEXAMP001", time.Now().Add(time.Hour))
+	if _, _, err := InstanceIdentity(t.Context(), none.URL); err == nil {
+		t.Fatal("a host with no identity document answered one")
+	}
+	v1 := newFakeIMDS(t, "ASIAFROMROLEEXAMP001", time.Now().Add(time.Hour))
+	v1.identity, v1.v1Only = true, true
+	if _, _, err := InstanceIdentity(t.Context(), v1.URL); err == nil {
+		t.Fatal("an IMDSv1 host's identity was read without a session token")
+	}
 }
 
 // The instance role is the preferred way to run this backend: the alternative is

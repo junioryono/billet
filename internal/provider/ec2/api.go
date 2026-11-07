@@ -448,7 +448,10 @@ type instanceItem struct {
 	InstanceID   string `xml:"instanceId"`
 	InstanceType string `xml:"instanceType"`
 	PrivateIP    string `xml:"privateIpAddress"`
-	State        struct {
+	// LaunchTime is when EC2 launched the instance, which its identity document
+	// names as pendingTime (measured equal on 2026-11-06).
+	LaunchTime string `xml:"launchTime"`
+	State      struct {
 		Name string `xml:"name"`
 	} `xml:"instanceState"`
 	// StateReason says WHO stopped it, which "stopped" alone does not.

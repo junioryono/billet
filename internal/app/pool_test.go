@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -121,7 +122,7 @@ func TestAPoolHostsBootRunsThePreludeThenJoins(t *testing.T) {
 	}
 	args, stderr := runBoot(t, boot)
 	want := []string{"join", "--server", "10.77.0.10:7717", "--ca-fingerprint", "SHA256:ab",
-		"--token", joinToken, "--node-name", "pool-p01", "--provider", "firecracker",
+		"--token", joinToken, "--node-name", "pool-p01", "--pool-order", "p01", "--provider", "firecracker",
 		"--bootstrap-addr", "10.77.0.10:7718", "--org", "acme"}
 	if strings.Join(args, "|") != strings.Join(want, "|") {
 		t.Fatalf("join ran as %q, want %q", args, want)
@@ -273,5 +274,73 @@ func TestAPoolWithAnEmptyCredentialVariableIsRefused(t *testing.T) {
 	t.Setenv("BILLET_TEST_POOL_SECRET", "")
 	if _, _, err := NewPool(cfg, nil, "dep", nil); err == nil || !strings.Contains(err.Error(), "BILLET_TEST_POOL_SECRET") {
 		t.Fatalf("an empty secret variable answered %v", err)
+	}
+}
+
+// A POOL'S JOINS REACH THE NODE WIRE WHEN THE CONFIG NAMES A POOL, and when it names
+// none, because a pool's orders and tokens outlive the config that placed them.
+func TestAPoolsJoinsReachTheWire(t *testing.T) {
+	t.Parallel()
+	base := withResizer(nil)
+	cfg := poolBootConfig()
+	cfg.Server.Pool = nil
+	opts, err := poolWireOptions(cfg, nil, "0123456789abcdef0123456789abcdef", base)
+	if err != nil || len(opts) != 2 {
+		t.Fatalf("no pool: %d options, %v", len(opts), err)
+	}
+	// STILL ANSWERED BY THE LEDGER: orders and tokens outlive a config naming no pool.
+	var none wireSettings
+	for _, o := range opts {
+		o(&none)
+	}
+	if none.poolJoins == nil {
+		t.Fatal("with no pool configured, a pool's hosts are not answered at all")
+	}
+
+	cfg = poolBootConfig()
+	cfg.Server.Pool.AWSMetal = &config.PoolAWSMetal{
+		Region: "us-west-2", SubnetID: "subnet-0abc", AvailabilityZone: "us-west-2a",
+		SecurityGroupIDs: []string{"sg-0abc"}, Images: map[config.Arch]string{config.ArchX64: "ami-0abc"},
+		Shapes: []config.PoolShape{{Type: "c7i.metal-24xl", Arch: config.ArchX64}},
+	}
+	opts, err = poolWireOptions(cfg, nil, "0123456789abcdef0123456789abcdef", base)
+	if err != nil || len(opts) != 2 {
+		t.Fatalf("a pool: %d options, %v", len(opts), err)
+	}
+	var s wireSettings
+	for _, o := range opts {
+		o(&s)
+	}
+	if s.poolJoins == nil {
+		t.Fatal("a pool's wire options carry no joins")
+	}
+}
+
+// AN ENROLLMENT'S PEER IS THE HOST ONLY WITHOUT A ROUTER IN FRONT OF THE LISTENERS.
+func TestTheHostsAddressIsSeenOnlyWithoutARouter(t *testing.T) {
+	t.Parallel()
+	cfg := poolBootConfig()
+	if !seesHostAddress(cfg) {
+		t.Fatal("a listener dialled directly does not see the host's address")
+	}
+	cfg.Server.TLSRouter = &config.TLSRouterConfig{}
+	if seesHostAddress(cfg) {
+		t.Fatal("a listener behind a router sees the host's address")
+	}
+}
+
+// A BOOT WITH NO bootstrap_addr DIALS THE ENROLLMENT LISTENER ITSELF, never the node wire,
+// which wants a certificate an ordered host does not have yet.
+func TestAPoolHostsBootDialsTheEnrollmentListener(t *testing.T) {
+	t.Parallel()
+	cfg := poolBootConfig()
+	cfg.Server.Pool.BootstrapAddr, cfg.Server.BootstrapListen = "", "10.77.0.10:7719"
+	boot, err := PoolBoot(cfg, "true\n", "SHA256:ab", "p01", "tok")
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	args, _ := runBoot(t, boot)
+	if i := slices.Index(args, "--bootstrap-addr"); i < 0 || i+1 >= len(args) || args[i+1] != "10.77.0.10:7719" {
+		t.Fatalf("join ran as %q, want it to dial the enrollment listener", args)
 	}
 }

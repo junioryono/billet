@@ -1,0 +1,6 @@
+{
+  "state": "EnrollResponse.state",
+  "fingerprint": "EnrollResponse.fingerprint",
+  "cert_pem": "EnrollResponse.cert_pem",
+  "ca_pem": "EnrollResponse.ca_pem"
+}

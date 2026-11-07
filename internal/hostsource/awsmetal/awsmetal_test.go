@@ -35,6 +35,19 @@ type fakeHosts struct {
 	record     ec2.HostRecord
 	describe   error
 	terminated []string
+	// console is what the host wrote to its console, and consoleErr a failed read;
+	// consoleReads counts the reads.
+	console      string
+	consoleErr   error
+	consoleReads int
+}
+
+func (f *fakeHosts) Console(context.Context, string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.consoleReads++
+
+	return f.console, f.consoleErr
 }
 
 func (f *fakeHosts) Launch(_ context.Context, l ec2.HostLaunch) (ec2.HostRecord, error) {
@@ -80,10 +93,10 @@ func newTestSource(t *testing.T, f *fakeHosts) *Source {
 
 func newTestSourceIn(t *testing.T, f *fakeHosts, account func(context.Context) (string, error)) *Source {
 	t.Helper()
-	s, err := newSource(f, "us-west-2a", []Shape{
+	s, err := newSource(f, Config{Region: "us-west-2", Location: "us-west-2a", Shapes: []Shape{
 		{Type: "m7gd.metal", Arch: config.ArchARM64, Image: "ami-arm"},
 		{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"},
-	}, account)
+	}, Account: account})
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -282,8 +295,14 @@ func TestTheScopeNamesAccountRegionSubnetAndZone(t *testing.T) {
 
 func TestASourceWithoutAnAccountIsRefused(t *testing.T) {
 	t.Parallel()
-	if _, err := newSource(&fakeHosts{}, "us-west-2a", []Shape{{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"}}, nil); err == nil ||
+	shapes := []Shape{{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"}}
+	if _, err := newSource(&fakeHosts{}, Config{Region: "us-west-2", Location: "us-west-2a", Shapes: shapes}); err == nil ||
 		!strings.Contains(err.Error(), "account") {
 		t.Fatalf("a source that cannot name its account answered %v", err)
+	}
+	account := func(context.Context) (string, error) { return "111122223333", nil }
+	if _, err := newSource(&fakeHosts{}, Config{Location: "us-west-2a", Shapes: shapes, Account: account}); err == nil ||
+		!strings.Contains(err.Error(), "region") {
+		t.Fatalf("a source that cannot name its region answered %v", err)
 	}
 }

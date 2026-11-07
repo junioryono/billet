@@ -18,11 +18,13 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func poolHostXML(id, owner, order, state string) string {
 	return fmt.Sprintf(`<item><instanceId>%s</instanceId><instanceType>m7gd.metal</instanceType>`+
-		`<privateIpAddress>10.77.1.9</privateIpAddress><instanceState><name>%s</name></instanceState>`+
+		`<privateIpAddress>10.77.1.9</privateIpAddress><launchTime>2026-11-06T14:26:45.000Z</launchTime>`+
+		`<instanceState><name>%s</name></instanceState>`+
 		`<tagSet><item><key>Name</key><value>billet-pool-%s</value></item>`+
 		`<item><key>sh.billet.pool-owner</key><value>%s</value></item>`+
 		`<item><key>sh.billet.pool-order</key><value>%s</value></item></tagSet></item>`,
@@ -638,5 +640,29 @@ func TestEveryLocalRefusalOfALaunchIsNotSent(t *testing.T) {
 	}
 	if n := f.countOf("RunInstances"); n != 1 {
 		t.Fatalf("%d launches reached EC2, want only the one within the limit", n)
+	}
+}
+
+// A POOL HOST'S RECORD CARRIES ITS PRIVATE ADDRESS AND LAUNCH TIME as EC2 described
+// them, which the join compares with what the host's identity document says; a launch
+// time EC2 did not give, or gave as something else, is zero rather than a guess.
+func TestAPoolHostRecordCarriesItsAddressAndLaunchTime(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		item string
+		want time.Time
+	}{
+		"as EC2 writes it": {poolHostXML("i-1", "dep-1", "o-1", "running"), time.Date(2026, 11, 6, 14, 26, 45, 0, time.UTC)},
+		"absent": {strings.Replace(poolHostXML("i-1", "dep-1", "o-1", "running"),
+			"<launchTime>2026-11-06T14:26:45.000Z</launchTime>", "", 1), time.Time{}},
+		"not a time": {strings.Replace(poolHostXML("i-1", "dep-1", "o-1", "running"),
+			"2026-11-06T14:26:45.000Z", "yesterday", 1), time.Time{}},
+	} {
+		f := newFakeEC2(t)
+		f.respond = func(string, url.Values) (int, string) { return http.StatusOK, describeReply("", c.item) }
+		rec, err := newTestProvider(t, f, nil).Hosts().Describe(t.Context(), "i-1")
+		if err != nil || rec.PrivateIP != "10.77.1.9" || !rec.LaunchTime.Equal(c.want) {
+			t.Errorf("%s: describe = %+v, %v; want launch time %v", name, rec, err, c.want)
+		}
 	}
 }

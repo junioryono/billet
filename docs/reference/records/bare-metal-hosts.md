@@ -33,6 +33,16 @@ What was measured of the two kinds of rented bare metal [ADR-030](../decisions/a
 - **A new account may hold one server.** `GET /bmc/v1/quotas` answered `Servers` with a limit of 1, `Public IPs` 15, `Public IPv6s` 1 and `Storage Networks` 3000 GB. A pool cannot grow past one host here until that is raised.
 - **The order was refused.** `POST /bmc/v1/servers` for one hourly `s1.c1.small` in Ashburn answered `403` with `The request failed since this resource cannot be accessed by the provided credentials.`, although the same token read the catalogue, the stock, the quotas and the (empty) server list. Whether the API client lacks permission to create, or the account cannot yet order, was not established; the boot time, the guest's speed and the NVMe of a phoenixNAP server are owed until an order is accepted.
 
+## The console and the identity document, 2026-11-06
+
+One t3.micro (a Nitro instance; `GetConsoleOutput --latest` needs one) in us-west-2, launched from Ubuntu 24.04 with IMDSv2 required and a hop limit of 1, whose user data read its identity document and signatures over IMDSv2, wrote them to `/dev/console`, then opened `/dev/console` itself and wrote one marker line every 15 s for ten minutes, and shut itself down. A reader called `aws ec2 get-console-output --latest` every 10 s of sleep (about every 22 to 44 s with the call's own time) and noted when each line first appeared. The instance terminated itself; nothing was left behind.
+
+- **Every line reached the console.** All 40 lines appeared, each by the reader's next call after it was written: at most 48 s after its writing, with the reader's interval the larger part of that. The first line was readable 70 s after launch. `Latest` returned the newest 65536 bytes.
+- **A line written by a process that opens `/dev/console` itself arrives as one written to the boot's own standard output does.** Both kinds of line were read back.
+- **The document's `signature` is RSA-SHA256 under the region's RSA certificate.** `openssl dgst -sha256 -verify` against the RSA certificate AWS lists for us-west-2 verified it; as SHA-1, or under the region's RSA-2048 or DSA certificates, it did not. billet's verifier (`internal/awsidentity`, `TestARealDocumentVerifies` given that document) verified it too. The signature is 128 bytes, 172 characters of base64; the document 475 bytes.
+- **The document matches `DescribeInstances`.** Its `pendingTime` was the instance's `LaunchTime` (`2026-11-06T14:26:45Z`) and its `privateIp` the instance's private address.
+- **AWS's certificates differ by region.** Its page of certificates for identity document signatures listed an RSA certificate for 39 regions, one shared by the two China regions and every other distinct; us-west-2's was issued 2024-04-29 and lapses 2029-04-28.
+
 ## Still to measure
 
 - A no-stock and a quota refusal from each source, read as the scaler will read them.
@@ -40,6 +50,6 @@ What was measured of the two kinds of rented bare metal [ADR-030](../decisions/a
 - Single-thread speed inside a Firecracker guest under full load, on each candidate, with cpus pinned so a sibling hyperthread is told apart from the rest of the load.
 - `m6id.metal`, `m8gd.metal-24xl` and `m8id.metal-48xl`, which fit the shape on paper and were not launched.
 - What `DescribeInstances` answers for a terminated metal instance, and for how long, which is what proves an AWS pool host gone.
-- Reading a host's key fingerprint from its console with `GetConsoleOutput`, as the join of ADR-030 does.
+- The console and the identity document on a metal instance, measured above on a t3.micro, and the whole join of ADR-030 from a booted pool host.
 - A store volume attached to a metal instance and handed to a Firecracker guest.
 - phoenixNAP: everything after an accepted order.

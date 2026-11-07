@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 43
+	Version = 44
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -582,6 +582,16 @@ const (
 	// chunk from a pairing below it is refused, and an id below it is no index. Its text
 	// stays on the node either way, so what an older pairing loses is finding it.
 	VersionJobLogs = 43
+
+	// VersionPoolJoin is the version from which an enrollment may carry what a pool
+	// host's platform signed about it (EnrollRequest's identity_document and
+	// identity_signature), which its order's source checks before it vouches (ADR-030).
+	//
+	// ENROLLMENT NEGOTIATES NO VERSION, so the gate is who sends them: only a pool
+	// host, `billet join --pool-order`, which a pool's own boot runs, so its control
+	// plane runs a pool and is at this version. An older plane's strict decoder refuses
+	// a request carrying them; an ordinary node never sends them.
+	VersionPoolJoin = 44
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -1102,6 +1112,13 @@ type EnrollRequest struct {
 	// can reach the port, who could then fill the pending list or take a name
 	// before the machine that should have it.
 	JoinToken string `json:"join_token"`
+	// IdentityDocument and IdentitySignature are what the host's platform signed about
+	// it (an EC2 instance identity document and its base64 signature), which a pool
+	// host sends so its order's source can vouch for it (ADR-030). Sent only by a pool
+	// host, whose control plane runs the pool and so decodes them; an older plane's
+	// strict decoder refuses a request carrying them (VersionPoolJoin).
+	IdentityDocument  string `json:"identity_document,omitempty"`
+	IdentitySignature string `json:"identity_signature,omitempty"`
 }
 
 // EnrollResponse is the decision, or that there is not one yet.
