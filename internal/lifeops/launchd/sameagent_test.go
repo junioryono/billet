@@ -113,8 +113,9 @@ func TestAWhitespaceValueIsNotLayout(t *testing.T) {
 func TestASpellingLaunchdRefusesIsAnotherAgent(t *testing.T) {
 	t.Parallel()
 
+	// <true></true>, not <true/>, so a comment inside it is all that differs.
 	const shipped = "<plist version=\"1.0\">\n<dict>\n  <key>ExitTimeOut</key>\n  <integer>300</integer>\n" +
-		"  <key>RunAtLoad</key>\n  <true/>\n</dict>\n</plist>\n"
+		"  <key>RunAtLoad</key>\n  <true></true>\n</dict>\n</plist>\n"
 
 	if !sameAgent(shipped, shipped) {
 		t.Fatal("the fixture is not the same as itself")
@@ -123,7 +124,7 @@ func TestASpellingLaunchdRefusesIsAnotherAgent(t *testing.T) {
 	for what, installed := range map[string]string{
 		"a CDATA integer":                   strings.Replace(shipped, "<integer>300</integer>", "<integer><![CDATA[300]]></integer>", 1),
 		"an entity in an integer":           strings.Replace(shipped, "<integer>300</integer>", "<integer>&#51;00</integer>", 1),
-		"a comment inside a value":          strings.Replace(shipped, "<true/>", "<true><!-- note --></true>", 1),
+		"a comment inside a value":          strings.Replace(shipped, "<true></true>", "<true><!-- note --></true>", 1),
 		"a comment splitting a value":       strings.Replace(shipped, "<integer>300</integer>", "<integer>3<!-- x -->00</integer>", 1),
 		"a non-breaking space between them": strings.Replace(shipped, "</integer>\n", "</integer> \n", 1),
 		"an unterminated comment":           shipped + "<!-- ",
@@ -160,6 +161,22 @@ func TestARollbackLeavesAnAgentAnOperatorCommentedOn(t *testing.T) {
 
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("the operator's agent is gone: %v", err)
+	}
+
+	// AN EDIT PAST WHAT IS READ is still an edit: the file is the agent this run wrote,
+	// then layout up to the read's end, then the operator's comment.
+	padded := deploy.ImagesAgent + strings.Repeat(" ", maxAgentBytes+1-len(deploy.ImagesAgent)) +
+		"<!-- operator edit -->"
+	if err := os.WriteFile(path, []byte(padded), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.removeAgent(deploy.ImagesAgentLabel); err == nil {
+		t.Error("a rollback removed an agent whose edit lay past the part it read")
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the operator's padded agent is gone: %v", err)
 	}
 
 	if err := os.WriteFile(path, []byte(deploy.ImagesAgent), 0o600); err != nil {

@@ -43,7 +43,12 @@ func sameAgent(installed, shipped string) bool {
 
 // wroteThisAgent reports whether an agent is still exactly what this run installed, which
 // is what a rollback asks before removing it: a comment an operator added since is theirs.
+// A file past the cap was read only in part, and what was not read may be their edit.
 func wroteThisAgent(installed, shipped string) bool {
+	if len(installed) > maxAgentBytes {
+		return false
+	}
+
 	return strings.TrimSpace(installed) == strings.TrimSpace(shipped)
 }
 
