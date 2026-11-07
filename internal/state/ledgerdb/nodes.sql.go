@@ -169,6 +169,26 @@ func (q *Queries) ForgetEveryNode(ctx context.Context) error {
 	return err
 }
 
+const handOverPoolRetirement = `-- name: HandOverPoolRetirement :exec
+UPDATE nodes SET decommission_actor = $1
+ WHERE name = $2 AND decommission_actor = $3
+`
+
+type HandOverPoolRetirementParams struct {
+	ClosingActor string
+	Name         string
+	SealActor    string
+}
+
+// A closed order's node keeps the proved retirement its seal recorded, under the closing
+// actor (@closing_actor), so compute listed after the order closed can no longer undo
+// it: the order is terminal and runs no closing transaction again. Only the seal's own
+// (@seal_actor); a person's decommission stays as they recorded it.
+func (q *Queries) HandOverPoolRetirement(ctx context.Context, arg HandOverPoolRetirementParams) error {
+	_, err := q.db.ExecContext(ctx, handOverPoolRetirement, arg.ClosingActor, arg.Name, arg.SealActor)
+	return err
+}
+
 const listCodeBuildRegistrationPaths = `-- name: ListCodeBuildRegistrationPaths :many
 SELECT name, codebuild_region, codebuild_jit_path, decommissioned_at
   FROM nodes

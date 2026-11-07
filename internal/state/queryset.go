@@ -407,6 +407,7 @@ type WriteOps interface {
 	ContradictPoolRelease(ctx context.Context, node string) (int64, error)
 	ContradictWaitingPoolRelease(ctx context.Context, node string) error
 	UndoPoolRetirement(ctx context.Context, arg ledgerdb.UndoPoolRetirementParams) (int64, error)
+	HandOverPoolRetirement(ctx context.Context, arg ledgerdb.HandOverPoolRetirementParams) error
 	RecordPoolClearanceRun(ctx context.Context, arg ledgerdb.RecordPoolClearanceRunParams) (int64, error)
 	EndPoolClearanceRun(ctx context.Context, orderID string) error
 	ForceClosePoolOrder(ctx context.Context, arg ledgerdb.ForceClosePoolOrderParams) (int64, error)

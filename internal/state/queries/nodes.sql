@@ -400,6 +400,14 @@ SELECT EXISTS(SELECT 1 FROM pool_orders p
 UPDATE nodes SET decommissioned_at = '', decommission_proven = 0, decommission_actor = ''
  WHERE name = @name AND decommission_actor = @actor;
 
+-- name: HandOverPoolRetirement :exec
+-- A closed order's node keeps the proved retirement its seal recorded, under the closing
+-- actor (@closing_actor), so compute listed after the order closed can no longer undo
+-- it: the order is terminal and runs no closing transaction again. Only the seal's own
+-- (@seal_actor); a person's decommission stays as they recorded it.
+UPDATE nodes SET decommission_actor = @closing_actor
+ WHERE name = @name AND decommission_actor = @seal_actor;
+
 -- name: MarkNodeDrainedForRelease :exec
 -- Take a pool host out of placement for its release: unfenced, because the decision is
 -- the control plane's and holds for every incarnation, which the registration upsert

@@ -880,6 +880,14 @@ func settleClosedNodeTx(
 	case err != nil:
 		return fmt.Errorf("alloc: read %s's release facts: %w", node, err)
 	case facts.DecommissionProven == 1:
+		// A PROOF THAT STILL STANDS IS KEPT, and the seal's own becomes the closing's, so
+		// compute listed after the order closed can no longer undo it.
+		if err := q.HandOverPoolRetirement(ctx, ledgerdb.HandOverPoolRetirementParams{
+			ClosingActor: actor, Name: node, SealActor: poolReleaseActor,
+		}); err != nil {
+			return fmt.Errorf("alloc: hand %s's retirement to its closing: %w", node, err)
+		}
+
 		return nil
 	}
 

@@ -594,6 +594,54 @@ func TestASealedNodesPlaceInTheFleetFollowsItsOrder(t *testing.T) {
 	}
 }
 
+// AN ORDER CLOSED WITH ITS SEAL STANDING KEEPS ITS NODE OUT FOR GOOD: compute an inventory
+// in flight lists after the closing no longer undoes the seal's retirement, because the
+// closed order runs no closing transaction again and its host is gone or taken back.
+func TestComputeListedAfterTheCloseLeavesTheNodeOut(t *testing.T) {
+	t.Parallel()
+	for name, close := range map[string]func(t *testing.T, a *Allocator){
+		"closed by a person": func(t *testing.T, a *Allocator) {
+			t.Helper()
+			if err := a.ClosePoolOrder(t.Context(), "pa", "took it back by hand"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"gone on its source's word": func(t *testing.T, a *Allocator) {
+			t.Helper()
+			if err := a.PoolOrderGone(t.Context(), "pa"); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+			a := poolAllocator(t, &now)
+			ctx := t.Context()
+			node := drainingPoolNode(t, a)
+			answerClearance(t, a, node, true)
+			now = now.Add(computeAbsenceGrace)
+			answerClearance(t, a, node, true)
+			if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			if err := a.PoolOrderReleased(ctx, "pa"); err != nil {
+				t.Fatal(err)
+			}
+			close(t, a)
+
+			if err := a.RecordPoolClearance(ctx, PoolClearanceObservation{
+				Order: "pa", Node: node, Fence: fenceOf(t, a, node), Running: true, AskedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(clearance(t, a).Excluded, func(e Exclusion) bool { return e.Node == node && e.Proven }) {
+				t.Fatalf("compute listed after the order was %s returned its node to the fleet", name)
+			}
+		})
+	}
+}
+
 // A BARRIER ANSWER LISTING COMPUTE CONTRADICTS A RELEASE, whatever became of the barrier
 // and though the inventory it carried was never recorded: after the seal the proof is
 // refused, and the contradiction is the same one a clearance answer records.
