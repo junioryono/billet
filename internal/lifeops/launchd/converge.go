@@ -9,7 +9,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/junioryono/billet/deploy"
@@ -549,9 +548,4 @@ func (c *Converger) installedAgent(label string) (string, bool, error) {
 		return "", false, fmt.Errorf("launchd: read the installed agent %s: %w",
 			c.agentPath(label), err)
 	}
-}
-
-// sameAgent reports whether an installed agent is the one this build ships.
-func sameAgent(installed, shipped string) bool {
-	return strings.TrimSpace(installed) == strings.TrimSpace(shipped)
 }
