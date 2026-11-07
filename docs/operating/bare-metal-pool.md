@@ -21,7 +21,7 @@ A control plane with `server.pool` in its config orders Firecracker hosts from r
 
     A node that registers again after step 4 clears its decommission, so the procedure starts again from step 2.
   - **A node's inventory alone is never the proof.** It is stamped when it arrives, not when the node listed it, and a launch still running is in none. A node that drains alone, answering only once its launches settle, is owed; until it exists, releasing a joined host takes a deployment-wide `billet drain --wait`.
-  - **A host a certificate was issued for under its order's name without the order knowing** (by `billet ca issue`, which v0.31.0 still accepted a `pool-` name from) is released as a joined host: the release links the order to that name, so its node's certificates are revoked at the seal.
+  - **A host a certificate was issued for under its order's name without the order knowing** (by `billet ca issue`, which v0.31.0 still accepted a `pool-` name from) is released as a joined host: the release links the order to that name, so its node's certificates are revoked at the seal. A decommission taken before that release does not count, because the order did not yet know its node; follow the procedure below from step 2 after the release.
   - **A host admitted but whose node never registered** was never placeable, so it is sealed as soon as nothing holds it: at the pool's next step, or by `billet pool release <order>` with no `--reason`.
   - **A host nothing joined from** is sealed at once, on the ledger's word that nothing was ever admitted for it, and its tokens are retired.
   - Either way, the order is closed only on the source's own answer that the host is gone. `billet pool` shows a host still draining, and why it was released.

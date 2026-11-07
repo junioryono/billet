@@ -95,6 +95,13 @@ func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string
 				return fmt.Errorf("alloc: retire the join tokens of pool order %s: %w", order, err)
 			}
 
+			// WHAT THE NODE SAID BEFORE ITS ORDER KNEW IT, under a billet that recorded
+			// nothing of it, cannot be read back, so a node linked here is proved again: a
+			// decommission on proof taken from now on.
+			if _, err := q.ContradictPoolRelease(ctx, PoolNodeName(order)); err != nil {
+				return fmt.Errorf("alloc: hold pool order %s's release for a fresh proof: %w", order, err)
+			}
+
 			row.NodeName = PoolNodeName(order)
 		}
 

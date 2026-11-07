@@ -43,18 +43,25 @@ func (q *Queries) ClosePoolOrder(ctx context.Context, arg ClosePoolOrderParams) 
 	return result.RowsAffected()
 }
 
-const contradictPoolRelease = `-- name: ContradictPoolRelease :exec
+const contradictPoolRelease = `-- name: ContradictPoolRelease :execrows
 UPDATE pool_orders SET release_contradicted = 1
- WHERE node_name = $1 AND node_name != '' AND state IN ('placed', 'sealed') AND release_contradicted = 0
+ WHERE node_name = $1 AND node_name != '' AND state IN ('placed', 'sealed')
 `
 
 // The order's node said it is back or runs something (ADR-030): it arrived to register,
 // or an inventory of its current registration reported compute. Its release is proved
 // by no decommission recorded before this; the decommission itself is left as the
-// person recorded it, for the readers that are not the release's.
-func (q *Queries) ContradictPoolRelease(ctx context.Context, node string) error {
-	_, err := q.db.ExecContext(ctx, contradictPoolRelease, node)
-	return err
+// person recorded it, for the readers that are not the release's. An order linked to
+// its node only by its release is contradicted at the link instead (RequestPoolRelease),
+// because what its node said before cannot be read back. Every pool order the node is
+// the node of counts, contradicted already or not, so a caller can tell a pool node from
+// any other.
+func (q *Queries) ContradictPoolRelease(ctx context.Context, node string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, contradictPoolRelease, node)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const countPoolOrderAdmissions = `-- name: CountPoolOrderAdmissions :one

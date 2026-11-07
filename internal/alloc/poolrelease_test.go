@@ -68,8 +68,9 @@ func TestANeverJoinedHostIsSealedByTheAsking(t *testing.T) {
 // A HOST ANYTHING WAS EVER ADMITTED FOR IS NOT RELEASED AS ONE THAT NEVER JOINED: a
 // certificate issued under the order's name before that name was reserved is a node that
 // could have held work, so the asking seals nothing. It links the order to the name and
-// releases it as a joined host: out of placement now, sealed on a proved decommission,
-// and that certificate revoked by the seal.
+// releases it as a joined host, proved again from the link on: a decommission on proof
+// taken before it, when the order did not know its node, seals nothing, and the seal on a
+// fresh one revokes that certificate.
 func TestAHostACertificateWasIssuedForIsReleasedAsJoined(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
@@ -85,6 +86,8 @@ func TestAHostACertificateWasIssuedForIsReleasedAsJoined(t *testing.T) {
 	if placeableHosts(t, a) != 1 {
 		t.Fatal("the node under the order's name is not placeable")
 	}
+	barrier := requestBarrier(t, a)
+	decommissionOnProof(t, a, &now, barrier, node)
 
 	if sealed, err := a.RequestPoolRelease(ctx, "pa", "joined by hand"); err != nil || sealed {
 		t.Fatalf("a host a certificate was issued for: sealed %v, %v", sealed, err)
@@ -92,23 +95,55 @@ func TestAHostACertificateWasIssuedForIsReleasedAsJoined(t *testing.T) {
 	if o := readOrder(t, a, "pa"); o.State != PoolPlaced || o.NodeName != node || o.ReleaseRequested.IsZero() {
 		t.Fatalf("the order after its release was asked for: %+v", o)
 	}
-	if placeableHosts(t, a) != 0 {
-		t.Fatal("the node under the order's name is still placeable")
-	}
 	if left := usesLeft(t, a, "pa"); len(left) != 1 || left[0] != 0 {
 		t.Fatalf("its tokens were not retired: %v", left)
 	}
-	if _, err := a.SealPoolRelease(ctx, "pa"); !errors.Is(err, ErrPoolReleaseWaits) {
-		t.Fatalf("sealing before a proved decommission answered %v", err)
-	}
+	waitsUnsealed(t, a, "a decommission taken before the order knew its node")
 
-	decommissionOnProof(t, a, &now, requestBarrier(t, a), node)
+	registerPoolNode(t, a, node)
+	if placeableHosts(t, a) != 0 {
+		t.Fatal("the node under the order's name came back into placement")
+	}
+	decommissionOnProof(t, a, &now, barrier, node)
 	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
-		t.Fatalf("sealing on a proved decommission: %v", err)
+		t.Fatalf("sealing on a decommission proved since the link: %v", err)
 	}
 	if revoked, err := a.CertRevoked(ctx, "0f"); err != nil || !revoked {
 		t.Fatalf("the certificate issued under its name was not revoked: %v, %v", revoked, err)
 	}
+}
+
+// AN IDLE RUN THAT PREDATES A CONTRADICTION PROVES NO DECOMMISSION AFTER IT: an inventory
+// reporting compute discards the pool node's run with the contradiction, so a delayed
+// empty inventory and a stop leave nothing a decommission can be proved by, and the
+// release waits for answers taken since.
+func TestARunBeforeAContradictionProvesNoDecommission(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := joinedPoolNode(t, a)
+	if _, err := a.RequestPoolRelease(ctx, "pa", "the pool shrinks"); err != nil {
+		t.Fatal(err)
+	}
+	barrier := requestBarrier(t, a)
+	observeNode(t, a, barrier, node, true)
+	now = now.Add(computeAbsenceGrace)
+	observeNode(t, a, barrier, node, true)
+
+	if _, err := a.Reconcile(ctx, node, []string{"some-instance"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Reconcile(ctx, node, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.NodeGone(ctx, node, fenceOf(t, a, node).Epoch); err != nil {
+		t.Fatal(err)
+	}
+	if proven, err := a.Decommission(ctx, DecommissionRequest{Node: node, Actor: "ops"}); err == nil || proven {
+		t.Fatalf("a decommission proved by a run older than the compute reported since: proved %v, %v", proven, err)
+	}
+	waitsUnsealed(t, a, "a run older than the contradiction")
 }
 
 // registerPoolNode registers a pool host's node as a placeable x64 Firecracker host that

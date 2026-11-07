@@ -97,13 +97,17 @@ UPDATE pool_orders
  WHERE order_id = @order_id AND state = 'placed' AND node_name = @node_name
    AND (node_name = '' OR release_requested_at != '');
 
--- name: ContradictPoolRelease :exec
+-- name: ContradictPoolRelease :execrows
 -- The order's node said it is back or runs something (ADR-030): it arrived to register,
 -- or an inventory of its current registration reported compute. Its release is proved
 -- by no decommission recorded before this; the decommission itself is left as the
--- person recorded it, for the readers that are not the release's.
+-- person recorded it, for the readers that are not the release's. An order linked to
+-- its node only by its release is contradicted at the link instead (RequestPoolRelease),
+-- because what its node said before cannot be read back. Every pool order the node is
+-- the node of counts, contradicted already or not, so a caller can tell a pool node from
+-- any other.
 UPDATE pool_orders SET release_contradicted = 1
- WHERE node_name = @node AND node_name != '' AND state IN ('placed', 'sealed') AND release_contradicted = 0;
+ WHERE node_name = @node AND node_name != '' AND state IN ('placed', 'sealed');
 
 -- name: ClearPoolReleaseContradiction :exec
 -- A fresh decommission on the compute barrier's proof, in its own transaction: what the

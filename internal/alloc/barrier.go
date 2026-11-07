@@ -431,7 +431,7 @@ func (a *Allocator) InvalidateBarrierRun(ctx context.Context, node string) error
 			return fmt.Errorf("alloc: discard node %s's idle run: %w", node, err)
 		}
 
-		if err := q.ContradictPoolRelease(ctx, node); err != nil {
+		if _, err := q.ContradictPoolRelease(ctx, node); err != nil {
 			return fmt.Errorf("alloc: contradict the release of pool node %s: %w", node, err)
 		}
 
