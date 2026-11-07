@@ -130,6 +130,43 @@ func (p *PoolConfig) ShapeArch(source, shape string) (Arch, bool) {
 	return "", false
 }
 
+// PoolEnrollAddr is the enrollment listener an ordered host dials: server.pool's
+// bootstrap_addr when it is given, else the TLS router's enroll_addr, else
+// server.bootstrap_listen. Empty when the one chosen names no host another machine
+// can dial (none, a wildcard, loopback), which validation refuses: WHATEVER IT CAME
+// FROM, a rented host would dial it as itself.
+func (s *ServerConfig) PoolEnrollAddr() string {
+	var addr string
+	switch {
+	case s.Pool != nil && strings.TrimSpace(s.Pool.BootstrapAddr) != "":
+		addr = s.Pool.BootstrapAddr
+	case s.TLSRouter != nil && strings.TrimSpace(s.TLSRouter.EnrollAddr) != "":
+		addr = s.TLSRouter.EnrollAddr
+	default:
+		addr = s.BootstrapListen
+	}
+	addr = strings.TrimSpace(addr)
+	if host, _, err := net.SplitHostPort(addr); err == nil && dialableFromElsewhere(host) {
+		return addr
+	}
+
+	return ""
+}
+
+// dialableFromElsewhere is whether host names this machine to another one: not empty,
+// not a wildcard, and not loopback, which a rented host would dial as itself.
+func dialableFromElsewhere(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	// A ZONE NAMES AN INTERFACE OF THE MACHINE THAT WROTE IT, never one a rented host
+	// has, and net.ParseIP reads a zoned literal as no address at all.
+	if h == "" || h == "localhost" || strings.HasSuffix(h, ".localhost") || strings.Contains(h, "%") {
+		return false
+	}
+	ip := net.ParseIP(h)
+
+	return ip == nil || (!ip.IsLoopback() && !ip.IsUnspecified())
+}
+
 // validatePool checks server.pool.
 func (s *ServerConfig) validatePool() []error {
 	p := s.Pool
@@ -138,15 +175,27 @@ func (s *ServerConfig) validatePool() []error {
 	}
 	var errs []error
 
-	if host, port, err := net.SplitHostPort(p.JoinServer); err != nil || host == "" || port == "" ||
-		host == "0.0.0.0" || host == "::" {
+	if host, port, err := net.SplitHostPort(p.JoinServer); err != nil || port == "" || !dialableFromElsewhere(host) {
 		errs = append(errs, fmt.Errorf("server.pool.join_server %q must be the host:port an ordered host dials "+
-			"to reach the node wire", p.JoinServer))
+			"to reach the node wire: no wildcard and no loopback, which the host would dial as itself", p.JoinServer))
 	}
 	if p.BootstrapAddr != "" {
-		if host, port, err := net.SplitHostPort(p.BootstrapAddr); err != nil || host == "" || port == "" {
-			errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr %q must be host:port", p.BootstrapAddr))
+		if host, port, err := net.SplitHostPort(p.BootstrapAddr); err != nil || port == "" || !dialableFromElsewhere(host) {
+			errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr %q must be the host:port an ordered host "+
+				"dials: no wildcard and no loopback", p.BootstrapAddr))
 		}
+	}
+	// AN ORDERED HOST JOINS OVER THE NETWORK OR NOT AT ALL: the node wire wants a
+	// certificate it does not have yet, so without an enrollment listener it could
+	// never ask, and it is billed meanwhile.
+	switch {
+	case strings.TrimSpace(s.BootstrapListen) == "":
+		errs = append(errs, errors.New("server.pool needs server.bootstrap_listen: without it this control "+
+			"plane enrolls nothing over the network, so no host the pool orders could ever join"))
+	case s.PoolEnrollAddr() == "":
+		errs = append(errs, fmt.Errorf("server.pool.bootstrap_addr is required: the enrollment address an "+
+			"ordered host would dial (server.tls_router.enroll_addr, else server.bootstrap_listen %q) names no host "+
+			"it can dial (a wildcard or loopback)", s.BootstrapListen))
 	}
 	if p.BootPrelude == "" || !filepath.IsAbs(p.BootPrelude) {
 		errs = append(errs, fmt.Errorf("server.pool.boot_prelude %q must be an absolute path to the script a "+

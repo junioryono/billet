@@ -237,7 +237,7 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	// BEFORE ANYTHING ELSE, because enrolling is what produces the bundle
 	// everything below reads.
 	if *enroll {
-		return fleetops.EnrollNode(ctx, env, cfg, fleetops.BootstrapBase(cfg, *bootstrapAddr), *caFingerprint, *joinToken)
+		return fleetops.EnrollNode(ctx, env, cfg, fleetops.BootstrapBase(cfg, *bootstrapAddr), *caFingerprint, *joinToken, "")
 	}
 
 	upgrader, err := host.NodeUpgrader(cfg, *cfgPath)

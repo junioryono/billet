@@ -1,6 +1,6 @@
--- migration 76: job_alerts
+-- migration 77: job_alerts
 --
--- The twin of internal/state/migrations/0076_job_alerts.sql; the reasoning is there.
+-- The twin of internal/state/migrations/0077_job_alerts.sql; the reasoning is there.
 --
 -- Everything between the markers below is PUBLISHED BYTES; the prose is not.
 -- Reformat one tab and every ledger that applied this migration refuses to open.

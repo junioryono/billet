@@ -26,6 +26,12 @@ type fakeLedger struct {
 	readErr   error
 	tokenErr  error
 	listCalls int
+	// lapsed is how many orders the next HoldLapsedPoolJoins holds, and holdErr its
+	// failure; holdCalls counts it, and listsBeforeHold the orders read before the first.
+	lapsed          int
+	holdErr         error
+	holdCalls       int
+	listsBeforeHold int
 }
 
 func (l *fakeLedger) RecordPoolOrder(_ context.Context, o alloc.PoolOrder) error {
@@ -80,23 +86,59 @@ func (l *fakeLedger) PoolOrderUncertain(_ context.Context, id, reason string) er
 	return l.move(id, alloc.PoolOrdering, alloc.PoolUncertain, "", reason)
 }
 
+func (l *fakeLedger) UncertainPoolOrderFound(_ context.Context, id, host string) error {
+	if host == "" {
+		return errors.New("a placed order without its host")
+	}
+
+	return l.move(id, alloc.PoolUncertain, alloc.PoolPlaced, host, "")
+}
+
 func (l *fakeLedger) PoolOrderRefused(_ context.Context, id, reason string) error {
 	return l.move(id, alloc.PoolOrdering, alloc.PoolRefused, "", reason)
 }
 
-func (l *fakeLedger) NewJoinToken(_ context.Context, ttl time.Duration, uses int, note string) (string, error) {
+// NewPoolJoinToken mints a token for an order that is being ordered or placed, as
+// the allocator does, and names the order in it, so a test can tell which order's
+// token a boot carried.
+func (l *fakeLedger) NewPoolJoinToken(_ context.Context, order string, ttl time.Duration) (string, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.tokenErr != nil {
 		return "", l.tokenErr
 	}
-	if uses != 1 || ttl <= 0 || !strings.HasPrefix(note, "pool order ") {
-		return "", fmt.Errorf("token asked with uses %d, ttl %v, note %q", uses, ttl, note)
+	if ttl <= 0 {
+		return "", fmt.Errorf("token asked with ttl %v", ttl)
 	}
-	tok := fmt.Sprintf("tok-%d", len(l.tokens)+1)
+	open := false
+	for i := range l.orders {
+		if l.orders[i].ID == order {
+			open = l.orders[i].State == alloc.PoolOrdering || l.orders[i].State == alloc.PoolPlaced
+		}
+	}
+	if !open {
+		return "", fmt.Errorf("%w: a token for order %s, which is not open", alloc.ErrPoolOrderClosed, order)
+	}
+	tok := fmt.Sprintf("tok-%s-%d", order, len(l.tokens)+1)
 	l.tokens = append(l.tokens, tok)
 
 	return tok, nil
+}
+
+func (l *fakeLedger) HoldLapsedPoolJoins(context.Context) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.holdCalls == 0 {
+		l.listsBeforeHold = l.listCalls
+	}
+	l.holdCalls++
+	if l.holdErr != nil {
+		return 0, l.holdErr
+	}
+	n := l.lapsed
+	l.lapsed = 0
+
+	return n, nil
 }
 
 func (l *fakeLedger) CapacityReports(context.Context) (map[string]alloc.TierCapacity, error) {
@@ -353,6 +395,27 @@ func TestDemandOrdersOneHostWhileNoneIsOnItsWay(t *testing.T) {
 	}
 }
 
+// A TIER PINNED TO ONE NODE IS NO POOL'S DEMAND, short of hosts or not: no host the pool
+// orders is that node. The floor is still kept.
+func TestAPinnedTierIsNotDemand(t *testing.T) {
+	t.Parallel()
+	pinned := firecrackerTier("fc-pinned")
+	pinned.Node = "epyc-1"
+	r := newRig(t, Policy{Floor: 0, Max: 3}, pinned)
+	r.report("fc-pinned", true, 0, "")
+	step(t, r)
+	step(t, r)
+	if n := len(r.ledger.states()); n != 0 {
+		t.Fatalf("%d orders for a tier pinned to one node", n)
+	}
+	r = newRig(t, Policy{Floor: 1, Max: 3}, pinned)
+	r.report("fc-pinned", true, 0, "")
+	step(t, r)
+	if n := len(r.ledger.states()); n != 1 {
+		t.Fatalf("%d orders, want the floor's one", n)
+	}
+}
+
 // A TIER THAT NAMES FIRECRACKER AMONG SEVERAL PROVIDERS IS THE POOL'S DEMAND TOO.
 func TestATierOfSeveralProvidersIncludingFirecrackerIsDemand(t *testing.T) {
 	t.Parallel()
@@ -526,7 +589,10 @@ func TestALostAnswerIsReadBackBeforeAnythingElse(t *testing.T) {
 	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolPlaced || len(asked) != 2 || asked[1].Order != "o-1" {
 		t.Fatalf("resent inside the window: %v, asked %+v", got, asked)
 	}
-	if tokens := r.boots["o-1"]; len(tokens) != 2 || tokens[0] == tokens[1] {
+	// EACH SEND'S TOKEN IS THE ORDER'S OWN: the host the source returns booted with the
+	// first send's, so every token it may carry has to admit this order and no other.
+	if tokens := r.boots["o-1"]; len(tokens) != 2 || tokens[0] == tokens[1] ||
+		!strings.HasPrefix(tokens[0], "tok-o-1-") || !strings.HasPrefix(tokens[1], "tok-o-1-") {
 		t.Fatalf("a resend's token: %v", tokens)
 	}
 
@@ -578,6 +644,100 @@ func TestASourceWithoutDeduplicationIsNeverResent(t *testing.T) {
 	step(t, r)
 	if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain || len(r.first.requests()) != 1 {
 		t.Fatalf("%v, asked %d times", got, len(r.first.requests()))
+	}
+}
+
+// AN UNCERTAIN ORDER WHOSE HOST ITS SOURCE NOW LISTS, WHERE IT WAS PLACED, IS PLACED and
+// never sent again, so the host whose answer was lost can join; a failed read, or a
+// source that now orders somewhere else, leaves it uncertain and reads nothing there.
+func TestAnUncertainOrderItsSourceNowListsIsPlaced(t *testing.T) {
+	t.Parallel()
+	uncertain := func(t *testing.T) *rig {
+		t.Helper()
+		r := newRig(t, Policy{Floor: 1, Max: 1})
+		r.first.idempotent = 0
+		r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, errors.New("timeout") }
+		step(t, r)
+		step(t, r)
+		if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain {
+			t.Fatalf("the order is %v, want uncertain", got)
+		}
+
+		return r
+	}
+	listed := func(order string) (hostsource.Host, bool, error) {
+		return hostsource.Host{ID: "found-" + order}, true, nil
+	}
+
+	r := uncertain(t)
+	before := len(r.first.finds())
+	step(t, r)
+	if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain || len(r.first.requests()) != 1 ||
+		len(r.first.finds()) != before+1 {
+		t.Fatalf("listed as absent: %v, sent %d times, read back %d more", got, len(r.first.requests()),
+			len(r.first.finds())-before)
+	}
+	r.first.mu.Lock()
+	r.first.scopeErr = errors.New("sts: throttled")
+	r.first.mu.Unlock()
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "where uncertain order o-1's source orders now") {
+		t.Fatalf("a scope that could not be read answered %v", err)
+	}
+	r.first.mu.Lock()
+	r.first.scopeErr = nil
+	r.first.find = func(string) (hostsource.Host, bool, error) { return hostsource.Host{}, false, errors.New("throttled") }
+	r.first.mu.Unlock()
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "read back uncertain order o-1") {
+		t.Fatalf("a failed read back answered %v", err)
+	}
+	if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain {
+		t.Fatalf("a failed read back decided %v", got)
+	}
+	r.first.mu.Lock()
+	r.first.find = listed
+	r.first.mu.Unlock()
+	step(t, r)
+	got := r.ledger.snapshot()
+	if len(got) != 1 || got["o-1"].State != alloc.PoolPlaced || got["o-1"].HostID != "found-o-1" || len(r.first.requests()) != 1 {
+		t.Fatalf("listed where it was placed: %+v, sent %d times", got, len(r.first.requests()))
+	}
+
+	r = uncertain(t)
+	before = len(r.first.finds())
+	r.first.mu.Lock()
+	r.first.scope, r.first.find = "first:eu-west-1", listed
+	r.first.mu.Unlock()
+	step(t, r)
+	if got := r.ledger.states(); got["o-1"] != alloc.PoolUncertain || len(r.first.finds()) != before {
+		t.Fatalf("a source ordering elsewhere: %v, read back %v", got, r.first.finds())
+	}
+}
+
+// AN ORDER WHOSE SHAPE ITS SOURCE NO LONGER DECLARES CANNOT BE SENT AGAIN, so a lost
+// answer the source lists no host for is uncertain rather than ordering for good, and
+// is still read back where it was placed and placed when its host is listed.
+func TestAnOrderWhoseShapeIsNoLongerDeclaredIsUncertain(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 1, Max: 2})
+	r.first.answer = func(hostsource.Request) (hostsource.Host, error) { return hostsource.Host{}, errors.New("timeout") }
+	step(t, r)
+	r.first.mu.Lock()
+	r.first.shapes, r.first.answer = nil, nil
+	r.first.mu.Unlock()
+	step(t, r)
+	got := r.ledger.snapshot()
+	if got["o-1"].State != alloc.PoolUncertain || !strings.Contains(got["o-1"].Reason, "cannot be sent again") ||
+		len(r.first.requests()) != 1 {
+		t.Fatalf("orders = %+v, sent %d times", got, len(r.first.requests()))
+	}
+	r.first.mu.Lock()
+	r.first.find = func(order string) (hostsource.Host, bool, error) {
+		return hostsource.Host{ID: "found-" + order}, true, nil
+	}
+	r.first.mu.Unlock()
+	step(t, r)
+	if got := r.ledger.snapshot(); got["o-1"].State != alloc.PoolPlaced || got["o-1"].HostID != "found-o-1" {
+		t.Fatalf("listed where it was placed: %+v", got)
 	}
 }
 
@@ -715,4 +875,71 @@ func TestRunStepsAtEveryTickUntilItsContextEnds(t *testing.T) {
 			t.Fatalf("the ledger was read %d times, want 8 (four steps)", calls)
 		}
 	})
+}
+
+// set changes one order in place, as the ledger's own moves would.
+func (l *fakeLedger) set(id string, change func(*alloc.PoolOrder)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := range l.orders {
+		if l.orders[i].ID == id {
+			change(&l.orders[i])
+		}
+	}
+}
+
+// A JOINED ORDER IS NO LONGER ON ITS WAY, so demand grows the pool by another host;
+// A HELD ONE IS NOT ON ITS WAY EITHER, since only a person makes it join, so it does not
+// stop growth for demand. Both still hold a host, so the maximum counts them.
+func TestAJoinedOrHeldOrderLetsDemandGrow(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 0, Max: 3}, firecrackerTier("fc"))
+	r.report("fc", true, 0, "")
+	step(t, r)
+	step(t, r)
+	if n := len(r.ledger.states()); n != 1 {
+		t.Fatalf("%d orders while the first has not joined, want 1", n)
+	}
+	r.ledger.set("o-1", func(o *alloc.PoolOrder) { o.NodeName = alloc.PoolNodeName("o-1") })
+	step(t, r)
+	step(t, r)
+	if got := r.ledger.states(); len(got) != 2 || got["o-2"] != alloc.PoolPlaced {
+		t.Fatalf("orders after the first joined: %v, want a second and no more", got)
+	}
+	r.ledger.set("o-2", func(o *alloc.PoolOrder) { o.JoinHold = "the source contradicted its key" })
+	step(t, r)
+	step(t, r)
+	if got := r.ledger.states(); len(got) != 3 || got["o-3"] != alloc.PoolPlaced {
+		t.Fatalf("orders after the second was held: %v, want a third", got)
+	}
+	r.ledger.set("o-3", func(o *alloc.PoolOrder) { o.NodeName = alloc.PoolNodeName("o-3") })
+	step(t, r)
+	if n := len(r.ledger.states()); n != 3 {
+		t.Fatalf("%d orders past the maximum of 3, which a joined and a held order both count toward", n)
+	}
+}
+
+// EVERY STEP HOLDS THE ORDERS NOTHING CAN JOIN FROM FIRST, before it reads the orders
+// it counts, so a lapsed host is never counted on its way; and a hold that fails is
+// reported without stopping the floor from being kept.
+func TestAStepHoldsLapsedJoinsFirstAndAFailedHoldKeepsTheFloor(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 1, Max: 2})
+	r.ledger.lapsed = 1
+	step(t, r)
+	r.ledger.mu.Lock()
+	calls, before := r.ledger.holdCalls, r.ledger.listsBeforeHold
+	r.ledger.mu.Unlock()
+	if calls != 1 || before != 0 {
+		t.Fatalf("held %d times, after %d reads of the orders; want once, before any", calls, before)
+	}
+
+	r = newRig(t, Policy{Floor: 1, Max: 2})
+	r.ledger.holdErr = errors.New("database is locked")
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "database is locked") {
+		t.Fatalf("a failed hold answered %v", err)
+	}
+	if got := r.ledger.states(); len(got) != 1 || got["o-1"] != alloc.PoolPlaced {
+		t.Fatalf("the floor after a failed hold: %v", got)
+	}
 }

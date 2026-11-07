@@ -461,7 +461,11 @@ type handler struct {
 	ca          *wirecert.CA
 	trust       []byte
 	enrollments Enrollments
-	cachePolicy CachePolicy
+	// poolJoins admits a pool host on its source's word, and seesHostAddress says the
+	// peer of an enrollment is the host itself; nil without a pool.
+	poolJoins       PoolJoins
+	seesHostAddress bool
+	cachePolicy     CachePolicy
 	// resizer authorises a fallback's larger shape in place of the store's own
 	// Resize; nil asks the store.
 	resizer Resizer
@@ -1000,6 +1004,24 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A POOL ORDER'S TOKEN IS ASKED OF ITS SOURCE FIRST (ADR-030), which may admit the
+	// host on its own word, refuse it, or leave it to the request below.
+	poolOrder := ""
+	if h.poolJoins != nil && strings.TrimSpace(req.JoinToken) != "" {
+		order, live, err := h.poolJoins.PoolJoinOrder(r.Context(), req.JoinToken)
+		if err != nil {
+			h.log.Error("could not read which pool order a join token is for", "node", req.Node, "error", err)
+			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, "billet could not read this request; try again")
+
+			return
+		}
+
+		if order != "" && h.poolEnroll(w, r, &req, fingerprint, order, live) {
+			return
+		}
+		poolOrder = order
+	}
+
 	// THE REQUEST AND THE TOKEN IN ONE CALL, because they have to commit
 	// together. The token is spent only for a request that is NEW: a node polls
 	// this endpoint until a human decides, so charging every call would spend a
@@ -1007,6 +1029,21 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 	enrollment, err := h.enrollments.RequestEnrollmentWithToken(
 		r.Context(), req.Node, fingerprint, req.CSRPEM, req.JoinToken)
 	if err != nil {
+		// A POOL HOST'S REQUEST IS ANSWERED AS ONE on this path too, a conflict
+		// included: pending, quoting nothing, so the host keeps asking.
+		if isPoolRefusal(err) || (poolOrder != "" && (errors.Is(err, alloc.ErrEnrollmentConflict) || errors.Is(err, alloc.ErrBadJoinToken))) {
+			h.poolRefusal(w, req.Node, fingerprint, err)
+
+			return
+		}
+
+		if errors.Is(err, alloc.ErrPoolNameReserved) {
+			writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
+				"a node name beginning pool- is reserved for the hosts a pool orders; choose another --node-name")
+
+			return
+		}
+
 		if errors.Is(err, alloc.ErrBadJoinToken) {
 			h.log.Warn("an enrollment was attempted without a usable join token",
 				"node", req.Node, "fingerprint", fingerprint)
