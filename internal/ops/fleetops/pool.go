@@ -17,7 +17,7 @@ const poolUsage = "usage: billet pool [--config PATH]\n" +
 	"       billet pool unhold [--config PATH] <order>\n" +
 	"       billet pool release [--config PATH] --reason TEXT <order>\n" +
 	"       billet pool release [--config PATH] <order>   (seal a release already asked for)\n" +
-	"       billet pool close [--config PATH] --reason TEXT <order>"
+	"       billet pool close [--config PATH] [--force] --reason TEXT <order>"
 
 // Pool is `billet pool`: what the pool of rented bare metal ordered and what became of
 // each order (ADR-030), closing an uncertain order, releasing a held join, and
@@ -263,6 +263,7 @@ func poolClose(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet pool close", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	reason := fs.String("reason", "", "what you checked in the source's console, recorded on the order")
+	force := fs.Bool("force", false, "close a draining host whose release was never proved, which you took back by hand")
 	order, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
@@ -275,10 +276,25 @@ func poolClose(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 	defer closeDB()
+	if *force {
+		if err := a.ForceClosePoolOrder(ctx, order, oneLine(*reason)); err != nil {
+			if errors.Is(err, alloc.ErrPoolOrderMoved) {
+				return fmt.Errorf("billet pool close --force: %s is not a draining host; --force closes only a host "+
+					"whose release was asked for and never proved", order)
+			}
+
+			return fmt.Errorf("billet pool close --force: %w", err)
+		}
+		fmt.Fprintf(env.Stdout, "Closed %s without proof: its node's certificates are revoked, and the order "+
+			"records that a person closed it unproven.\n", order)
+
+		return nil
+	}
 	if err := a.ClosePoolOrder(ctx, order, oneLine(*reason)); err != nil {
 		if errors.Is(err, alloc.ErrPoolOrderMoved) {
 			return fmt.Errorf("billet pool close: %s is neither sealed nor released; only a host whose release is "+
-				"proved is closed by hand", order)
+				"proved is closed by hand, and a draining host whose node can never prove itself again (it died, or "+
+				"lost its credential) is closed with --force once you took it back by hand", order)
 		}
 
 		return err

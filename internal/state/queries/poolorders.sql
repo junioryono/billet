@@ -132,6 +132,14 @@ UPDATE pool_orders SET state = 'gone', reason = @reason, updated_at = @updated_a
 UPDATE pool_orders SET state = 'gone', reason = @reason, updated_at = @updated_at
  WHERE order_id = @order_id AND state IN ('sealed', 'released');
 
+-- name: ForceClosePoolOrder :execrows
+-- A person closes an order whose host's release was asked for and never proved, on their
+-- word that they took the host back by hand: the node that died, or lost the credential
+-- it would prove itself with. Only one a release was asked for of and still linked to the
+-- node the caller read, so a seal or another closure committed since moves nothing.
+UPDATE pool_orders SET state = 'gone', reason = @reason, updated_at = @updated_at
+ WHERE order_id = @order_id AND state = 'placed' AND release_requested_at != '' AND node_name = @node_name;
+
 -- name: CountPoolOrderAdmissions :one
 -- Everything that would show a node joined from an order: an enrollment approved under
 -- it, a request approved under its name, and a certificate ever issued for its name.

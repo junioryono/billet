@@ -363,6 +363,74 @@ func (a *Allocator) PoolOrderGone(ctx context.Context, id string) error {
 	})
 }
 
+// ForceClosePoolOrder closes a joined host's release that was never proved, on a person's
+// word that they took the host back by hand (ADR-030): the way out for a node that died, or
+// lost the credential it would prove itself with, which no decommission on proof can reach
+// again. It is `billet nodes decommission --force` for a pool order, and records itself as
+// unproven in the order's reason.
+//
+// WHAT THE LEDGER CAN STILL HOLD IS HELD: a host that holds a lease, quarantine or custody
+// is refused, so its capacity is settled by the force paths that exist for it
+// (`billet leases release --force`, `billet force-destroy`), each its own decision. In one
+// transaction, the node's certificates are revoked and it is taken out of placement before
+// the order closes, as a seal would.
+func (a *Allocator) ForceClosePoolOrder(ctx context.Context, id, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("alloc: closing pool order %s without proof needs the reason a person gave", id)
+	}
+
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+		now := a.now().UTC()
+
+		row, err := q.ReadPoolOrder(ctx, id)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: no pool order %s", ErrPoolOrderMoved, id)
+		case err != nil:
+			return fmt.Errorf("alloc: read pool order %s: %w", id, err)
+		case row.State != PoolPlaced || row.ReleaseRequestedAt == "" || row.NodeName == "":
+			return fmt.Errorf("%w: pool order %s is %s with no release of a joined host asked for", ErrPoolOrderMoved,
+				id, row.State)
+		}
+
+		counts, err := q.CountNodeHoldings(ctx, row.NodeName)
+		if err != nil {
+			return fmt.Errorf("alloc: count what %s holds: %w", row.NodeName, err)
+		}
+
+		if counts.Outstanding > 0 {
+			return fmt.Errorf("%w: %s still holds %d lease(s), %d in quarantine and %d in custody; settle them "+
+				"first (`billet leases`, `billet leases release --force`, `billet force-destroy`)", ErrPoolReleaseWaits,
+				row.NodeName, counts.Outstanding, counts.Quarantine, counts.Custody)
+		}
+
+		if err := revokeNodeTx(ctx, q, row.NodeName, "its pool host was closed by a person without proof: "+reason,
+			now); err != nil {
+			return err
+		}
+
+		if err := q.MarkNodeDrainedForRelease(ctx, row.NodeName); err != nil {
+			return fmt.Errorf("alloc: take %s out of placement: %w", row.NodeName, err)
+		}
+
+		n, err := q.ForceClosePoolOrder(ctx, ledgerdb.ForceClosePoolOrderParams{
+			Reason: "closed by a person without proof: " + reason, UpdatedAt: ts(now), OrderID: id,
+			NodeName: row.NodeName,
+		})
+		if err != nil {
+			return fmt.Errorf("alloc: close pool order %s: %w", id, err)
+		}
+
+		if n != 1 {
+			return fmt.Errorf("%w: pool order %s moved while it was closed", ErrPoolOrderMoved, id)
+		}
+
+		return nil
+	})
+}
+
 // ClosePoolOrder closes a sealed or released order on a person's word, after they have
 // looked at the source themselves: the way a release closes on a source that never says
 // gone of a host it took back (phoenixNAP), on one no longer configured or ordering

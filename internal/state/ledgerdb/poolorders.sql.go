@@ -84,6 +84,35 @@ func (q *Queries) CountPoolOrderAdmissions(ctx context.Context, arg CountPoolOrd
 	return column_1, err
 }
 
+const forceClosePoolOrder = `-- name: ForceClosePoolOrder :execrows
+UPDATE pool_orders SET state = 'gone', reason = $1, updated_at = $2
+ WHERE order_id = $3 AND state = 'placed' AND release_requested_at != '' AND node_name = $4
+`
+
+type ForceClosePoolOrderParams struct {
+	Reason    string
+	UpdatedAt string
+	OrderID   string
+	NodeName  string
+}
+
+// A person closes an order whose host's release was asked for and never proved, on their
+// word that they took the host back by hand: the node that died, or lost the credential
+// it would prove itself with. Only one a release was asked for of and still linked to the
+// node the caller read, so a seal or another closure committed since moves nothing.
+func (q *Queries) ForceClosePoolOrder(ctx context.Context, arg ForceClosePoolOrderParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, forceClosePoolOrder,
+		arg.Reason,
+		arg.UpdatedAt,
+		arg.OrderID,
+		arg.NodeName,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const holdLapsedPoolJoin = `-- name: HoldLapsedPoolJoin :execrows
 UPDATE pool_orders SET join_hold = $1, updated_at = $2
  WHERE order_id = $3 AND state = 'placed' AND node_name = '' AND join_hold = ''

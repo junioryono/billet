@@ -113,6 +113,55 @@ func TestAHostACertificateWasIssuedForIsReleasedAsJoined(t *testing.T) {
 	}
 }
 
+// A DRAINING HOST WHOSE NODE CAN NEVER PROVE ITSELF AGAIN IS CLOSED BY A PERSON'S FORCE,
+// AND ONLY ONCE NOTHING HOLDS IT: an order whose release was not asked for, or one still
+// holding a lease, is refused and moves nothing; then the node's certificate is revoked,
+// it stays out of placement, and the order says it was closed unproven.
+func TestADrainingHostIsClosedByForceOnlyWhenNothingHoldsIt(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := joinedPoolNode(t, a)
+	leases, err := a.Escrow(ctx, "intel", 1)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("a lease on the host: %v, %v", leases, err)
+	}
+	if err := a.ForceClosePoolOrder(ctx, "pa", "it died"); !errors.Is(err, ErrPoolOrderMoved) {
+		t.Fatalf("forcing an order no release was asked of answered %v", err)
+	}
+	if _, err := a.RequestPoolRelease(ctx, "pa", "it died"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ForceClosePoolOrder(ctx, "pa", "it died"); !errors.Is(err, ErrPoolReleaseWaits) {
+		t.Fatalf("forcing a host that holds a lease answered %v", err)
+	}
+	if o := readOrder(t, a, "pa"); o.State != PoolPlaced {
+		t.Fatalf("a refused force moved the order to %s", o.State)
+	}
+	if revoked, err := a.CertRevoked(ctx, "0a"); err != nil || revoked {
+		t.Fatalf("a refused force revoked the certificate: %v, %v", revoked, err)
+	}
+
+	if err := a.Release(ctx, leases[0].ID, leases[0].Epoch, PhaseDone); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ForceClosePoolOrder(ctx, "pa", "terminated it in the console"); err != nil {
+		t.Fatalf("forcing a host nothing holds: %v", err)
+	}
+	o := readOrder(t, a, "pa")
+	if o.State != PoolGone || o.Reason != "closed by a person without proof: terminated it in the console" {
+		t.Fatalf("the forced order: %+v", o)
+	}
+	if revoked, err := a.CertRevoked(ctx, "0a"); err != nil || !revoked {
+		t.Fatalf("the forced host's certificate was not revoked: %v, %v", revoked, err)
+	}
+	registerPoolNode(t, a, node)
+	if placeableHosts(t, a) != 0 {
+		t.Fatal("a registration put a force-closed host back into placement")
+	}
+}
+
 // AN IDLE RUN TAKEN BEFORE THE RELEASE LINKED ITS ORDER PROVES NOTHING AFTER IT: what the
 // node reported while its order did not know it was never recorded, so the link discards
 // its run, and a decommission after it needs answers taken since.

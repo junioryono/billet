@@ -310,4 +310,20 @@ func TestASecondReleaseSealsWhatTheLedgerProves(t *testing.T) {
 			t.Fatalf("the listing does not say why %q was released:\n%s", want, out)
 		}
 	}
+
+	// A DRAINING HOST THAT CAN NEVER PROVE ITSELF is closed only with --force, which says so.
+	if err := Pool(ctx, env, []string{"close", "--config", cfg, "--reason", "it died", "p-live"}); err == nil ||
+		!strings.Contains(err.Error(), "closed with --force") {
+		t.Fatalf("closing a draining host without --force answered %v", err)
+	}
+	env, out = poolEnv()
+	if err := Pool(ctx, env, []string{"close", "--config", cfg, "--force", "--reason", "it died", "p-live"}); err != nil ||
+		!strings.Contains(out.String(), "Closed p-live without proof") {
+		t.Fatalf("closing a draining host with --force: %v\n%s", err, out)
+	}
+	env, out = poolEnv()
+	if err := Pool(ctx, env, []string{"--config", cfg}); err != nil ||
+		!strings.Contains(out.String(), "closed by a person without proof: it died") {
+		t.Fatalf("the listing after a forced closure: %v\n%s", err, out)
+	}
 }
