@@ -39,6 +39,83 @@ type fakeLedger struct {
 	sealCalls    int
 	// contradicted is every sealed order whose proof the ledger no longer holds.
 	contradicted map[string]bool
+	// idleSince is when each order's joined host last held something; an order absent
+	// holds something now. idleReleases records each ReleaseIdlePoolHost asked, and
+	// idleAnswer, when set, is its answer for that order (the allocator's refusals);
+	// idleErr fails the listing.
+	idleSince    map[string]time.Time
+	idleReleases []idleRelease
+	idleAnswer   map[string]error
+	idleErr      error
+	// unregistered is every joined order whose node has not registered, which serves
+	// nothing; servingErr fails the count of serving hosts.
+	unregistered map[string]bool
+	servingErr   error
+}
+
+func (l *fakeLedger) PoolServingHosts(context.Context) (map[config.Arch]int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.servingErr != nil {
+		return nil, l.servingErr
+	}
+	out := map[config.Arch]int{}
+	for i := range l.orders {
+		o := &l.orders[i]
+		if o.State == alloc.PoolPlaced && o.ReleaseRequested.IsZero() && o.NodeName != "" && !l.unregistered[o.ID] {
+			out[o.Arch]++
+		}
+	}
+
+	return out, nil
+}
+
+type idleRelease struct {
+	order  string
+	cutoff time.Time
+	floor  int
+	reason string
+}
+
+func (l *fakeLedger) PoolIdleHosts(context.Context) ([]alloc.PoolIdleHost, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.idleErr != nil {
+		return nil, l.idleErr
+	}
+	var out []alloc.PoolIdleHost
+	for i := range l.orders {
+		o := &l.orders[i]
+		since, ok := l.idleSince[o.ID]
+		if ok && o.State == alloc.PoolPlaced && o.NodeName != "" && o.ReleaseRequested.IsZero() && o.JoinHold == "" {
+			out = append(out, alloc.PoolIdleHost{Order: o.ID, Node: o.NodeName, Arch: o.Arch, Since: since})
+		}
+	}
+
+	return out, nil
+}
+
+// ReleaseIdlePoolHost records what it was asked and asks for the release, judging
+// nothing itself: the allocator's own checks are its tests', and a refusal here is one a
+// test set (idleAnswer).
+func (l *fakeLedger) ReleaseIdlePoolHost(
+	_ context.Context, order string, cutoff time.Time, floor int, reason string,
+) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.idleReleases = append(l.idleReleases, idleRelease{order: order, cutoff: cutoff, floor: floor, reason: reason})
+	if err := l.idleAnswer[order]; err != nil {
+		return err
+	}
+	for i := range l.orders {
+		if o := &l.orders[i]; o.ID == order {
+			o.ReleaseRequested, o.ReleaseReason = l.now(), reason
+
+			return nil
+		}
+	}
+
+	return fmt.Errorf("no order %s", order)
 }
 
 // contradict records that order's node said, after its seal, that it is back.
@@ -258,6 +335,8 @@ type fakeSource struct {
 	answer     func(req hostsource.Request) (hostsource.Host, error)
 	find       func(order string) (hostsource.Host, bool, error)
 	idempotent time.Duration
+	// confirmsGone is the source's terms saying it answers gone for a host it took back.
+	confirmsGone bool
 	// released is every host the source was asked to take back, releaseErr its answer;
 	// goneAsked every host asked about, and presence and goneErr the answer.
 	released   []string
@@ -341,7 +420,7 @@ func (s *fakeSource) Release(_ context.Context, proof hostsource.ReleaseProof) e
 func (s *fakeSource) Terms(shape string) (hostsource.Terms, error) {
 	for _, known := range s.shapes {
 		if known == shape {
-			return hostsource.Terms{IdempotentFor: s.idempotent}, nil
+			return hostsource.Terms{IdempotentFor: s.idempotent, ConfirmsGone: s.confirmsGone}, nil
 		}
 	}
 

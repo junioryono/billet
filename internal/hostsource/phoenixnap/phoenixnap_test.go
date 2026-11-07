@@ -485,7 +485,8 @@ func TestAnOrderHereIsNotIdempotent(t *testing.T) {
 	t.Parallel()
 	_, srv := newFake(t)
 	terms, err := source(t, srv).Terms("s2.c2.small")
-	if err != nil || terms.IdempotentFor != 0 || terms.BillingUnit != time.Hour {
+	// NOR DOES IT CONFIRM GONE, so the pool never shrinks itself here.
+	if err != nil || terms.IdempotentFor != 0 || terms.BillingUnit != time.Hour || terms.ConfirmsGone {
 		t.Fatalf("terms = %+v, %v", terms, err)
 	}
 }

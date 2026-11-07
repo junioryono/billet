@@ -156,6 +156,11 @@ type Terms struct {
 	// Preemptible is a host the source may take back with warning. A pool never runs
 	// jobs on one (ADR-030), and a source that offers only these is refused.
 	Preemptible bool
+	// ConfirmsGone is a source whose Gone answers gone for a host it took back, so a
+	// released order closes without a person. The pool shrinks itself only through such
+	// a source: a release elsewhere holds a place under the maximum until a person
+	// closes it. The zero value does not.
+	ConfirmsGone bool
 }
 
 // Source is one kind of rented bare metal.

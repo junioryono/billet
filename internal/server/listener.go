@@ -241,6 +241,13 @@ type Listener struct {
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
 	beforePoolReconcile func()
+	// TEST-ONLY: a background poll has returned and been dated, and the loop has not yet
+	// received its answer, let alone taken it (dateEmptyAnswer). Nil in every deployment.
+	afterPollDated func()
+	// TEST-ONLY: the loop has received a background poll's answer, the poll aside has
+	// finished, and the loop has not yet taken it (dateEmptyAnswer). Nil in every
+	// deployment.
+	beforeAnswerTaken func()
 
 	// timings is where this listener reports its loop's times. lastAnswered is when
 	// its last poll was answered, on the loop's goroutine alone.
@@ -319,6 +326,9 @@ type Listener struct {
 	waitingFor  int
 	demandKnown bool
 	demandAt    time.Time
+	// answeredAt is when GitHub last answered this tier's poll with nothing new
+	// (dateEmptyAnswer). Guarded by mu; reported, never scheduled on.
+	answeredAt time.Time
 	// demandReleases is the tier's release generation read with the runner
 	// count waitingFor was made from (alloc.ActiveRunnersAt).
 	demandReleases int64
