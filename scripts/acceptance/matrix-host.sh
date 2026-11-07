@@ -44,7 +44,7 @@
 # lock to be free (a reboot frees it; nothing else does while the run lives), then destroys whatever the run left (`billet acceptance down`, idempotent)
 # and removes the workspace; a run still live after that is said, and nothing is taken
 # down beside it. It is the step every path ends with. Before the workspace goes, the
-# services' logs are kept in <run-dir>/logs on this host, never in <run-dir>/out, which
+# services' logs are moved to <run-dir>/logs on this host, never to <run-dir>/out, which
 # the workflow uploads: they name the account's resources, and a cell that failed for a
 # reason only the node saw cannot be explained once they are gone (run 42406366812).
 set -uo pipefail
@@ -160,10 +160,18 @@ down)
 		echo "matrix: no workspace at $ws; nothing to take down"
 		exit 0
 	fi
+	# MOVED, NOT COPIED: the workspace is under the run directory, so a rename keeps a log
+	# of any size at once and in no more space, and the teardown never waits on it. Never
+	# through a symlink at either end, so a log cannot be sent into out/.
 	for log in server.log node.log; do
-		[ -f "$ws/$log" ] || continue
-		if ! { mkdir -p "$run_dir/logs" && cp "$ws/$log" "$run_dir/logs/$log"; }; then
-			echo "matrix: could not keep $ws/$log; the teardown removes it" >&2
+		src="$ws/$log" dst="$run_dir/logs/$log"
+		[ -e "$src" ] || [ -L "$src" ] || continue
+		if [ -L "$src" ] || [ ! -f "$src" ] || [ -L "$run_dir/logs" ] || [ -L "$dst" ] || [ -e "$dst" ]; then
+			echo "matrix: $src is not kept: it is not a plain file, or $dst is taken; the teardown removes it" >&2
+			continue
+		fi
+		if ! { { [ -d "$run_dir/logs" ] || mkdir -m 700 "$run_dir/logs"; } && mv "$src" "$dst"; }; then
+			echo "matrix: could not keep $src; the teardown removes it" >&2
 		fi
 	done
 	"$billet" acceptance down --workspace "$ws"

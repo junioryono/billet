@@ -225,6 +225,12 @@ init-iam)
 matrix-teardown-policy)
 	echo '{"Version":"2012-10-17","Statement":[{"Sid":"BilletMatrixDecommissionState"}]}'
 	;;
+acceptance-down)
+	# A teardown that succeeds removes the workspace, as the real one does.
+	ws=""
+	while [ "$#" -gt 0 ]; do [ "$1" = --workspace ] && ws=$2; shift; done
+	if [ "$(cat "$FAKE/$key.exit" 2>/dev/null || echo 0)" = 0 ]; then rm -rf "$ws"; fi
+	;;
 esac
 exit "$(cat "$FAKE/$key.exit" 2>/dev/null || echo 0)"
 `
@@ -572,20 +578,94 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	if log, err := os.ReadFile(filepath.Join(f.dir, "billet.log")); err == nil && strings.Contains(string(log), "acceptance down") {
 		t.Fatalf("stopped took the deployment down:\n%s", log)
 	}
-	// THE SERVICES' LOGS OUTLIVE THE WORKSPACE, on the host and not in what is uploaded.
-	if err := os.WriteFile(filepath.Join(dir, "ws", "node.log"), []byte("the node's own account\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	f.fixture(t, "acceptance-down.exit", "4")
 	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "down", dir); code != 4 {
 		t.Fatalf("a down that failed: exit %d\n%s", code, out)
 	}
-	if kept, err := os.ReadFile(filepath.Join(dir, "logs", "node.log")); err != nil || string(kept) != "the node's own account\n" {
-		t.Errorf("down did not keep the node's log in the run directory: %q, %v", kept, err)
+}
+
+// THE SERVICES' LOGS OUTLIVE THE TEARDOWN, ON THE HOST AND NOWHERE ELSE: a successful
+// down removes the workspace they were written in, so they are moved out of it first,
+// into a private directory beside the run and never into out/, which is uploaded. A log
+// that would go through a symlink is not kept, and the teardown runs and answers anyway.
+func TestTheMatrixHostDownKeepsTheServicesLogsOnTheHost(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "python3")
+	f.command(t, "billet", fakeBillet)
+	stage := func() string {
+		t.Helper()
+		dir := hostRunDir(t, f)
+		for name, body := range map[string]string{
+			"acceptance.json": "{}", "server.log": "SERVER-SENTINEL\n", "node.log": "NODE-SENTINEL\n",
+		} {
+			if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "ws", name), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "out"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "out", "run.log"), []byte("the run's own log\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		return dir
 	}
-	if _, err := os.Stat(filepath.Join(dir, "out", "node.log")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the node's log is among what the workflow uploads: %v", err)
+	noSentinelIn := func(dir string) {
+		t.Helper()
+		err := filepath.WalkDir(filepath.Join(dir, "out"), func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			if strings.Contains(string(body), "SENTINEL") {
+				t.Errorf("%s, among what the workflow uploads, holds a service's log:\n%s", path, body)
+			}
+
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
+
+	dir := stage()
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 {
+		t.Fatalf("down: exit %d\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ws")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the fake teardown left the workspace, so nothing here proves a log outlived it: %v", err)
+	}
+	for name, want := range map[string]string{"server.log": "SERVER-SENTINEL\n", "node.log": "NODE-SENTINEL\n"} {
+		kept, err := os.ReadFile(filepath.Join(dir, "logs", name))
+		if err != nil || string(kept) != want {
+			t.Errorf("down did not keep %s past the teardown: %q, %v", name, kept, err)
+		}
+	}
+	if info, err := os.Stat(filepath.Join(dir, "logs")); err != nil || info.Mode().Perm() != 0o700 {
+		t.Errorf("the kept logs' directory is %v, %v; want 0700", info.Mode().Perm(), err)
+	}
+	noSentinelIn(dir)
+
+	// A logs directory that is a symlink into out/ keeps nothing, and the teardown still
+	// runs and gives down its status.
+	dir = stage()
+	if err := os.Symlink(filepath.Join(dir, "out"), filepath.Join(dir, "logs")); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "is not kept") {
+		t.Fatalf("down through a symlinked logs directory: exit %d\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ws")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a log that could not be kept stopped the teardown: %v", err)
+	}
+	noSentinelIn(dir)
 }
 
 // fakeSSM answers send-command with a command id and get-command-invocation from
