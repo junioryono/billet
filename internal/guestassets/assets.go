@@ -36,3 +36,22 @@ var ExecEnvScript string
 //
 //go:embed docker-daemon.json
 var DockerDaemonJSON string
+
+// DockerShimScript sits ahead of the real docker client and points a build's BuildKit
+// cache client at the guest's adapter.
+//
+//go:embed docker-shim.sh
+var DockerShimScript string
+
+// The container hook's wrapper, the pin of GitHub's hook it wraps, and that hook's
+// notices, for an image built from a binary rather than a checkout.
+var (
+	//go:embed container-hook.js
+	ContainerHookScript string
+	//go:embed container-hook.pin
+	ContainerHookPin string
+	//go:embed container-hook.LICENSE
+	ContainerHookLicense string
+	//go:embed container-hook.NOTICE
+	ContainerHookNotice string
+)

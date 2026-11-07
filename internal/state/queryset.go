@@ -86,6 +86,15 @@ type ReadOps interface {
 	ListAdmissionRows(ctx context.Context) ([]ledgerdb.Admission, error)
 	ListAppliedMigrations(ctx context.Context) ([]ledgerdb.ListAppliedMigrationsRow, error)
 	ListAttributedFailures(ctx context.Context, arg ledgerdb.ListAttributedFailuresParams) ([]ledgerdb.ListAttributedFailuresRow, error)
+	ListRerunCandidates(ctx context.Context, arg ledgerdb.ListRerunCandidatesParams) ([]ledgerdb.ListRerunCandidatesRow, error)
+	ListRerunDecisions(ctx context.Context, since string) ([]ledgerdb.ListRerunDecisionsRow, error)
+	ReadOpenRerun(ctx context.Context, arg ledgerdb.ReadOpenRerunParams) (ledgerdb.ReadOpenRerunRow, error)
+	ListOpenReruns(ctx context.Context, arg ledgerdb.ListOpenRerunsParams) ([]ledgerdb.ListOpenRerunsRow, error)
+	ListBoundRerunTiers(ctx context.Context, arg ledgerdb.ListBoundRerunTiersParams) ([]string, error)
+	ListRerunCandidatesOfRun(ctx context.Context, arg ledgerdb.ListRerunCandidatesOfRunParams) ([]ledgerdb.ListRerunCandidatesOfRunRow, error)
+	ListRerunTiers(ctx context.Context) ([]ledgerdb.RerunTier, error)
+	ReadRerunOfAttempt(ctx context.Context, arg ledgerdb.ReadRerunOfAttemptParams) (ledgerdb.ReadRerunOfAttemptRow, error)
+	CountRunReruns(ctx context.Context, arg ledgerdb.CountRunRerunsParams) (int64, error)
 	ListBarrierRuns(ctx context.Context, barrierID string) ([]ledgerdb.ListBarrierRunsRow, error)
 	ListCacheBlocks(ctx context.Context) ([]ledgerdb.CacheBlock, error)
 	ListCodeBuildRegistrationPaths(ctx context.Context, provider string) ([]ledgerdb.ListCodeBuildRegistrationPathsRow, error)
@@ -140,6 +149,8 @@ type ReadOps interface {
 	ReadRetirement(ctx context.Context, deployment string) (ledgerdb.ControllerRetirement, error)
 	ReadEnrollment(ctx context.Context, name string) (ledgerdb.NodeEnrollment, error)
 	ReadEnrollmentFingerprint(ctx context.Context, name string) (string, error)
+	ReadJoinTokenOrder(ctx context.Context, arg ledgerdb.ReadJoinTokenOrderParams) (ledgerdb.ReadJoinTokenOrderRow, error)
+	ReadPoolOrder(ctx context.Context, orderID string) (ledgerdb.PoolOrder, error)
 	ReadJobConclusion(ctx context.Context, leaseID string) (sql.NullString, error)
 	ReadJobFailureReason(ctx context.Context, leaseID string) (string, error)
 	ReadJobNode(ctx context.Context, leaseID string) (sql.NullString, error)
@@ -151,6 +162,7 @@ type ReadOps interface {
 	ReadJobWait(ctx context.Context, leaseID string) (ledgerdb.ReadJobWaitRow, error)
 	ListJobWaits(ctx context.Context, arg ledgerdb.ListJobWaitsParams) ([]ledgerdb.ListJobWaitsRow, error)
 	ListJobFacts(ctx context.Context, arg ledgerdb.ListJobFactsParams) ([]ledgerdb.ListJobFactsRow, error)
+	ListPoolOrders(ctx context.Context) ([]ledgerdb.PoolOrder, error)
 	ListJobRuntimes(ctx context.Context, arg ledgerdb.ListJobRuntimesParams) ([]ledgerdb.ListJobRuntimesRow, error)
 	ListJobsForExport(ctx context.Context,
 		arg ledgerdb.ListJobsForExportParams) ([]ledgerdb.ListJobsForExportRow, error)
@@ -278,6 +290,21 @@ type WriteOps interface {
 	ReclaimLease(ctx context.Context, arg ledgerdb.ReclaimLeaseParams) error
 	RecordCredentialSweep(ctx context.Context, arg ledgerdb.RecordCredentialSweepParams) error
 	RecordListenerCapacity(ctx context.Context, arg ledgerdb.RecordListenerCapacityParams) error
+	InsertPoolOrder(ctx context.Context, arg ledgerdb.InsertPoolOrderParams) error
+	MarkPoolOrderPlaced(ctx context.Context, arg ledgerdb.MarkPoolOrderPlacedParams) (int64, error)
+	MarkPoolOrderUncertain(ctx context.Context, arg ledgerdb.MarkPoolOrderUncertainParams) (int64, error)
+	MarkUncertainPoolOrderFound(ctx context.Context, arg ledgerdb.MarkUncertainPoolOrderFoundParams) (int64, error)
+	MarkPoolOrderRefused(ctx context.Context, arg ledgerdb.MarkPoolOrderRefusedParams) (int64, error)
+	MarkPoolOrderAbandoned(ctx context.Context, arg ledgerdb.MarkPoolOrderAbandonedParams) (int64, error)
+	LinkPoolOrderNode(ctx context.Context, arg ledgerdb.LinkPoolOrderNodeParams) (int64, error)
+	HoldPoolOrderJoin(ctx context.Context, arg ledgerdb.HoldPoolOrderJoinParams) (int64, error)
+	HoldLapsedPoolJoins(ctx context.Context, arg ledgerdb.HoldLapsedPoolJoinsParams) (int64, error)
+	HoldLapsedPoolJoin(ctx context.Context, arg ledgerdb.HoldLapsedPoolJoinParams) (int64, error)
+	ReleasePoolOrderJoin(ctx context.Context, arg ledgerdb.ReleasePoolOrderJoinParams) (int64, error)
+	SpendPoolJoinToken(ctx context.Context, arg ledgerdb.SpendPoolJoinTokenParams) (sql.Result, error)
+	RetirePoolJoinTokens(ctx context.Context, poolOrder string) error
+	InsertAdmittedEnrollment(ctx context.Context, arg ledgerdb.InsertAdmittedEnrollmentParams) error
+	AdmitPendingEnrollment(ctx context.Context, arg ledgerdb.AdmitPendingEnrollmentParams) (int64, error)
 	RefreshLeaseHolder(ctx context.Context, arg ledgerdb.RefreshLeaseHolderParams) error
 	RecordBarrierRun(ctx context.Context, arg ledgerdb.RecordBarrierRunParams) error
 	RecordHistoryCacheObservation(ctx context.Context, arg ledgerdb.RecordHistoryCacheObservationParams) error
@@ -288,6 +315,14 @@ type WriteOps interface {
 	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
 	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
 	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error
+	InsertRerunIntent(ctx context.Context, arg ledgerdb.InsertRerunIntentParams) error
+	AskRerunsForTier(ctx context.Context, arg ledgerdb.AskRerunsForTierParams) error
+	ForgetRerunTier(ctx context.Context, tier string) error
+	AddRerunTry(ctx context.Context, arg ledgerdb.AddRerunTryParams) error
+	SettleRerun(ctx context.Context, arg ledgerdb.SettleRerunParams) error
+	BindJobToRerun(ctx context.Context, arg ledgerdb.BindJobToRerunParams) error
+	SettleJobsOfRerun(ctx context.Context, arg ledgerdb.SettleJobsOfRerunParams) error
+	RecordJobRerunDecision(ctx context.Context, arg ledgerdb.RecordJobRerunDecisionParams) error
 	RecordJobRunnerID(ctx context.Context, arg ledgerdb.RecordJobRunnerIDParams) error
 	RecordJobUsage(ctx context.Context, arg ledgerdb.RecordJobUsageParams) (int64, error)
 	RecordJobSeries(ctx context.Context, arg ledgerdb.RecordJobSeriesParams) error

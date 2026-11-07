@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,6 +36,36 @@ var ErrDenied = errors.New("nodeclient: an operator denied this node")
 // again — with the pending request still recorded and the join token already
 // spent, so the operator's approval landed on a node that had stopped asking.
 var ErrEnrollUnavailable = errors.New("nodeclient: the control plane cannot take this enrollment right now")
+
+// ErrUnreachable means the control plane's answer did not arrive: the request failed
+// on its way, or its answer was cut off. NOT A VERDICT: an enrollment whose answer was
+// lost may have been recorded, or admitted, so the caller asks again with the same key
+// and is answered what was decided.
+var ErrUnreachable = errors.New("nodeclient: the control plane's answer did not arrive")
+
+// lost wraps a failed request in ErrUnreachable unless TLS answered it: a certificate
+// that does not verify, a peer that speaks no TLS, or an alert the peer sent (a
+// listener that wants a client certificate) is the same answer every time, so asking
+// again would wait for good on something only a person can change.
+func lost(err error) error {
+	if is[*tls.CertificateVerificationError](err) || is[x509.UnknownAuthorityError](err) ||
+		is[x509.HostnameError](err) || is[x509.CertificateInvalidError](err) || is[tls.RecordHeaderError](err) {
+		return err
+	}
+	// crypto/tls reports an alert its peer sent as a net.OpError of this Op.
+	if op, ok := errors.AsType[*net.OpError](err); ok && op.Op == "remote error" {
+		return err
+	}
+
+	return fmt.Errorf("%w: %w", ErrUnreachable, err)
+}
+
+// is reports whether err's chain holds a T.
+func is[T error](err error) bool {
+	_, ok := errors.AsType[T](err)
+
+	return ok
+}
 
 // FetchCA reads a control plane's authority and checks it against a fingerprint
 // the operator supplied.
@@ -90,19 +121,26 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 			"(a control plane that serves enrollment on an address of its own — "+
 			"server.bootstrap_listen — cannot be reached for this on its node wire, which "+
 			"requires a client certificate this machine does not have yet. Dial that address "+
-			"with --bootstrap-addr)", err)
+			"with --bootstrap-addr)", lost(err))
 	}
 
 	defer res.Body.Close()
 
+	// THE STATUS CODE, NEVER ITS TEXT: nothing on this connection is believed yet, and
+	// what an answer wrote reaches a pool host's console.
+	if res.StatusCode >= http.StatusInternalServerError {
+		return nil, "", fmt.Errorf("%w: the control plane answered HTTP %d for its authority", ErrUnreachable,
+			res.StatusCode)
+	}
+
 	if res.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("nodeclient: the control plane returned %s for its authority",
-			res.Status)
+		return nil, "", fmt.Errorf("nodeclient: the control plane answered HTTP %d for its authority",
+			res.StatusCode)
 	}
 
 	var body nodeapi.CAResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return nil, "", fmt.Errorf("nodeclient: decode the authority: %w", err)
+		return nil, "", fmt.Errorf("%w: decode the authority: %w", ErrUnreachable, err)
 	}
 
 	got, err := wirecert.FingerprintOfCAPEM([]byte(body.CAPEM))
@@ -121,7 +159,16 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 			base, got, wantFingerprint)
 	}
 
-	return []byte(body.CAPEM), body.Deployment, nil
+	// ONLY THE CERTIFICATE THE FINGERPRINT NAMES: the rest of the bundle came on a
+	// connection nothing has authenticated, and a root appended to it would be trusted
+	// for the enrollment, which carries the join token, the request and a pool host's
+	// signed identity (Codex, 2026-11-06).
+	pinned, err := pinnedAuthority([]byte(body.CAPEM), wantFingerprint)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return pinned, body.Deployment, nil
 }
 
 // ConfirmAuthority asks the control plane at base for its authority again,
@@ -176,10 +223,14 @@ func ConfirmAuthority(ctx context.Context, base string, caPEM []byte, fingerprin
 		return "", nil, fmt.Errorf("nodeclient: the control plane at %s did not prove it holds a key the "+
 			"authority %s signed (a control plane in the middle of a CA rotation presents the previous "+
 			"authority's certificate; finish it with `billet ca retire` and join again): %w",
-			base, fingerprint, err)
+			base, fingerprint, lost(err))
 	}
 
 	defer res.Body.Close()
+
+	if res.StatusCode >= http.StatusInternalServerError {
+		return "", nil, fmt.Errorf("%w: the control plane returned %s for its authority", ErrUnreachable, res.Status)
+	}
 
 	if res.StatusCode != http.StatusOK {
 		return "", nil, fmt.Errorf("nodeclient: the control plane returned %s for its authority", res.Status)
@@ -187,7 +238,7 @@ func ConfirmAuthority(ctx context.Context, base string, caPEM []byte, fingerprin
 
 	var body nodeapi.CAResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return "", nil, fmt.Errorf("nodeclient: decode the authority: %w", err)
+		return "", nil, fmt.Errorf("%w: decode the authority: %w", ErrUnreachable, err)
 	}
 
 	return body.Deployment, pinned, nil
@@ -240,6 +291,22 @@ func pinnedAuthority(caPEM []byte, fingerprint string) ([]byte, error) {
 func Enroll(
 	ctx context.Context, base, name, joinToken string, caPEM, csrPEM []byte,
 ) ([]byte, []byte, error) {
+	return EnrollWithIdentity(ctx, base, name, joinToken, caPEM, csrPEM, Identity{})
+}
+
+// Identity is what a pool host's platform signed about it, sent with its enrollment
+// so its order's source can vouch for it (ADR-030). The zero value sends nothing.
+type Identity struct {
+	Document  []byte
+	Signature string
+}
+
+// EnrollWithIdentity is Enroll carrying a pool host's identity. It is sent only when
+// non-empty, because a control plane older than the fields refuses a request naming
+// them, and an ordinary node has none to send.
+func EnrollWithIdentity(
+	ctx context.Context, base, name, joinToken string, caPEM, csrPEM []byte, identity Identity,
+) ([]byte, []byte, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, nil, errors.New("nodeclient: the authority could not be parsed for verification")
@@ -262,6 +329,7 @@ func Enroll(
 
 	payload, err := json.Marshal(nodeapi.EnrollRequest{
 		Node: name, CSRPEM: string(csrPEM), JoinToken: joinToken,
+		IdentityDocument: string(identity.Document), IdentitySignature: identity.Signature,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("nodeclient: encode the enrollment request: %w", err)
@@ -276,7 +344,13 @@ func Enroll(
 
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("nodeclient: ask to enroll: %w", err)
+		if !errors.Is(lost(err), ErrUnreachable) {
+			return nil, nil, fmt.Errorf("nodeclient: the control plane did not prove it holds a key the authority "+
+				"you named signed (a control plane in the middle of a CA rotation presents the previous authority's "+
+				"certificate; finish it with `billet ca retire` and enroll again): %w", err)
+		}
+
+		return nil, nil, fmt.Errorf("nodeclient: ask to enroll: %w", lost(err))
 	}
 
 	defer res.Body.Close()
@@ -290,13 +364,19 @@ func Enroll(
 		return nil, nil, fmt.Errorf("%w (%s)", ErrEnrollUnavailable, res.Status)
 	}
 
+	// A SERVER ERROR IS NO REFUSAL: a proxy's 502 or 504, or the plane's own 500, may
+	// stand where an admission it committed should have been.
+	if res.StatusCode >= http.StatusInternalServerError {
+		return nil, nil, fmt.Errorf("%w: the control plane answered %s", ErrUnreachable, res.Status)
+	}
+
 	if res.StatusCode != http.StatusOK {
 		return nil, nil, fmt.Errorf("nodeclient: the control plane refused this enrollment: %s", res.Status)
 	}
 
 	var body nodeapi.EnrollResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return nil, nil, fmt.Errorf("nodeclient: decode the enrollment response: %w", err)
+		return nil, nil, fmt.Errorf("%w: decode the enrollment response: %w", ErrUnreachable, err)
 	}
 
 	switch body.State {

@@ -39,6 +39,11 @@ var ErrQuota = errors.New("hostsource: the account's quota is reached")
 // why, rather than reading the order back and placing it again.
 var ErrRefused = errors.New("hostsource: the source refused the request")
 
+// ErrNotSent means the order failed before anything was sent to the source: a local
+// refusal, or a read the order depended on (a quota, a stock list) that failed. No
+// host can exist for it, so it is not could-not-tell.
+var ErrNotSent = errors.New("hostsource: the order was not sent")
+
 // ErrNoProof is a release refused because its proof is missing or names another host.
 var ErrNoProof = errors.New("hostsource: a host is released only on proof it holds nothing or never joined")
 
@@ -157,6 +162,11 @@ type Terms struct {
 type Source interface {
 	// Name is the source's kind, for logs and the ledger: "aws-metal", "phoenixnap".
 	Name() string
+	// Scope is where this source orders (an AWS account, region, subnet and zone; a
+	// phoenixNAP account), recorded with each order, so a lost order is read back and
+	// sent again only where it was placed. An error is could-not-tell: nothing is
+	// ordered, and no order is resolved, on it.
+	Scope(ctx context.Context) (string, error)
 	// Order asks for one host. ErrNoStock and ErrQuota are the source's own refusals;
 	// any other error is could-not-tell, and the pool reads the order back by its
 	// identifier before it orders again.

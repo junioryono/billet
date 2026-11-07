@@ -242,6 +242,9 @@ type ServerConfig struct {
 	// TokenBroker takes this deployment's installation tokens from a broker. With it,
 	// no target names a key and this host holds none.
 	TokenBroker *TokenBrokerConfig `yaml:"token_broker,omitempty"`
+
+	// Pool orders Firecracker hosts from rented bare metal ahead of demand (ADR-030).
+	Pool *PoolConfig `yaml:"pool,omitempty"`
 	// MaxVCPU and MaxMemory bound what the allocator will ever hand out across every
 	// tier combined. Required and positive: capacity is escrowed before each listener
 	// advertises, so an absent ceiling lets concurrent listeners collectively
@@ -281,6 +284,8 @@ type ServerConfig struct {
 	// least 1MiB; absent, 14 days and 128MiB. See retention.go.
 	TestResultsRetention string   `yaml:"test_results_retention,omitempty"`
 	TestResultsMaxBytes  ByteSize `yaml:"test_results_max_bytes,omitempty"`
+	// Logs bounds this control plane's index of what jobs wrote. See logs.go.
+	Logs *ServerLogsConfig `yaml:"logs,omitempty"`
 	// Metrics serves the control plane's Prometheus metrics. Absent, nothing is
 	// served: there is no default address.
 	Metrics *MetricsConfig `yaml:"metrics,omitempty"`
@@ -694,6 +699,7 @@ func (c *Config) validateServer() []error {
 	errs = append(errs, c.Server.validateControllers()...)
 	errs = append(errs, c.validateIdentity()...)
 	errs = append(errs, c.Server.validateTokenBroker()...)
+	errs = append(errs, c.Server.validatePool()...)
 	if err := validateHostPort("server.listen", c.Server.Listen); err != nil {
 		errs = append(errs, err)
 	}
@@ -731,6 +737,9 @@ func (c *Config) validateServer() []error {
 		errs = append(errs, err)
 	}
 	if _, err := c.Server.TestResultsBound(); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := c.Server.Logs.Limits(); err != nil {
 		errs = append(errs, err)
 	}
 	return errs

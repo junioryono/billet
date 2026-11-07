@@ -35,7 +35,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A heartbeat pass's budget starts after it holds the mutex.**
 - **Exactly one party renews a lease, and every defect here was a moment when that count was zero.**
 - **An inventory that shrinks is capacity that gets resold.**
-- **billet attributes a lost job; it never re-runs one.**
+- **billet attributes a lost job, and re-runs one only for a tier that asks and only on GitHub's proof of a lost runner.**
 - **A reserved fleet's claim is released by a proof.**
 
 ### Custody, quarantine, drains and sessions: [references/custody-and-drains.md](references/custody-and-drains.md)
@@ -55,6 +55,15 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A clean exit withdraws; silence still means nothing.**
 - **A restart waits for its own message session, and so does a failover.**
 - **A tier whose session fails keeps everything it holds while it reopens (#207).**
+
+### The pool of rented bare metal: [references/pool.md](references/pool.md)
+
+- **A pool order is committed before its source is asked, and read back before anything else is done about it (ADR-030).**
+- **A lost answer is sent again only inside the source's deduplication window; past it, the order is uncertain and a person decides.**
+- **Nothing is ordered on an architecture while an order there is unknown, and demand grows the pool one host at a time while any placed host has not joined.**
+- **An order records its source's scope and is read back only there; a resend the source refuses is uncertain, not refused.**
+- **A pool host joins on its source's word only when every check vouches for its key; a contradiction holds its order, and could-not-tell waits for a person (ADR-030).**
+- **Only a whole console line names a key, and nothing a pool host's join prints can be one.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

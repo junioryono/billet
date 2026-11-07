@@ -35,6 +35,9 @@
   "failure_reason": "",
   "disruption": "",
   "disrupted_at": "",
+  "rerun_decision": "",
+  "rerun_decided_at": "",
+  "rerun_attempt": 0,
   "cache": {
     "image": "",
     "image_generation": "",

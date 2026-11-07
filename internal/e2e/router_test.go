@@ -384,7 +384,7 @@ func enrollThroughRouter(t *testing.T, routerPort string, d *routedDeployment, n
 	}
 
 	if err := d.stack.alloc.DecideEnrollment(ctx, nodeName, fingerprint, alloc.EnrollApproved,
-		string(signed.CertPEM)); err != nil {
+		string(signed.CertPEM), ""); err != nil {
 		t.Fatalf("DecideEnrollment: %v", err)
 	}
 

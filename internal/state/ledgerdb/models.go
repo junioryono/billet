@@ -159,6 +159,25 @@ type NodeEnrollment struct {
 	RequestedAt string
 	DecidedAt   string
 	Source      string
+	PoolOrder   string
+}
+
+type PoolOrder struct {
+	OrderID         string
+	Source          string
+	Scope           string
+	Shape           string
+	Location        string
+	Arch            string
+	State           string
+	HostID          string
+	NodeName        string
+	Reason          string
+	FirstAttemptAt  string
+	UpdatedAt       string
+	NodeFingerprint string
+	NodeCertSerial  string
+	JoinHold        string
 }
 
 type PoolRunner struct {
@@ -178,6 +197,11 @@ type PoolRunner struct {
 	JobWorkflowRef     string
 	JobEvent           string
 	GithubTarget       string
+}
+
+type RerunTier struct {
+	Tier       string
+	AskedSince string
 }
 
 type RevokedCert struct {

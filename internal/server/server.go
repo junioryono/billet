@@ -139,6 +139,9 @@ type Server struct {
 	starter *rollout.Starter
 	// startEvery paces the starter. Zero selects the starter's default.
 	startEvery time.Duration
+
+	// rerunEvery and rerunSettle pace the re-run loop; see WithRerunPacing.
+	rerunEvery, rerunSettle time.Duration
 }
 
 // ControlPlaneOption configures a Server.
@@ -267,6 +270,15 @@ func WithDrainTimeout(d time.Duration) ControlPlaneOption {
 // deletes a job's detail past it.
 func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.detailRetention = d }
+}
+
+// WithRerunPacing sets how often the re-run loop looks for jobs to decide about,
+// and how long after a job's result its run waits.
+//
+// Exposed for WithCleanupRetry's reason: the defaults are minutes, and a scenario
+// about a request that settles on a later pass would otherwise wait them out.
+func WithRerunPacing(every, settle time.Duration) ControlPlaneOption {
+	return func(s *Server) { s.rerunEvery, s.rerunSettle = every, settle }
 }
 
 // WithTestResultsRetention is server.test_results_retention and
@@ -497,6 +509,13 @@ func (s *Server) Run(ctx context.Context) error {
 	// the listeners and unable to stop them: it decides nothing.
 	group.Background("github queue times", func(ctx context.Context) {
 		s.fillQueueTimes(ctx, targets)
+	})
+
+	// AND A JOB BILLET ENDED IS RE-RUN WHERE A TIER ASKS, under the same rule: GitHub
+	// slow, refusing or gone costs the re-run and never a job waiting to start.
+	limits := s.rerunLimits()
+	group.Background("disrupted job re-runs", func(ctx context.Context) {
+		s.rerunDisrupted(ctx, targets, limits)
 	})
 
 	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.

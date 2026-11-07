@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 41
+	Version = 44
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -560,6 +560,38 @@ const (
 	// test holds equal), and such a tier is refused to one at dispatch and again at
 	// delivery.
 	VersionTartVerified = 41
+
+	// VersionEC2GuestCaches is the version from which an EC2 node carries the caches
+	// it serves to a guest into that guest's boot script (ADR-024).
+	//
+	// REPORTED BY DOING LESS, WHERE THE LAUNCH IS SENT: an older EC2 node refuses a
+	// launch that names a guest cache, which would fail every job on a tier that
+	// merely has them by default. So the plane sends it the tier's cache block with
+	// them off, and its job runs as it did before them. Delivery holds a launch that
+	// names them to a node at this version or above.
+	VersionEC2GuestCaches = 42
+
+	// VersionJobLogs is the version from which a node can send a job's step logs to be
+	// indexed (POST /v1/nodes/{node}/logs, LogChunkRequest), a registration's answer names
+	// the index (RegisterResponse's log_index_id), and the plane can ask a node for lines
+	// it holds (CommandReadLog).
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT: below it a node
+	// ships nothing, and the plane sends no CommandReadLog, which an older node answers as
+	// an unknown command after a wait, and no log_index_id. CHECKED WHERE IT IS READ: a
+	// chunk from a pairing below it is refused, and an id below it is no index. Its text
+	// stays on the node either way, so what an older pairing loses is finding it.
+	VersionJobLogs = 43
+
+	// VersionPoolJoin is the version from which an enrollment may carry what a pool
+	// host's platform signed about it (EnrollRequest's identity_document and
+	// identity_signature), which its order's source checks before it vouches (ADR-030).
+	//
+	// ENROLLMENT NEGOTIATES NO VERSION, so the gate is who sends them: only a pool
+	// host, `billet join --pool-order`, which a pool's own boot runs, so its control
+	// plane runs a pool and is at this version. An older plane's strict decoder refuses
+	// a request carrying them; an ordinary node never sends them.
+	VersionPoolJoin = 44
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -687,6 +719,12 @@ const (
 	// dispatched, and its answer is recorded against a fence captured before it
 	// was sent — which is what turns bounded staleness into an ordering.
 	CommandInventory CommandKind = "inventory"
+
+	// CommandReadLog asks a node for lines of a job's log it holds (VersionJobLogs), taken in
+	// its turn from the queue like any command, and answered busy when the node has its limit
+	// of reads running. Run
+	// beside the node's loop, like a launch, so a search never waits behind a destroy.
+	CommandReadLog CommandKind = "read_log"
 )
 
 // RegisterRequest is a node introducing itself.
@@ -827,6 +865,10 @@ type RegisterResponse struct {
 	// which is why they are not what Version is checked against.
 	MinVersion int `json:"min_version,omitempty"`
 	MaxVersion int `json:"max_version,omitempty"`
+	// LogIndexID names the index of job logs this control plane holds, from
+	// VersionJobLogs and empty where it holds none. A node ships what it holds to an id it
+	// has not shipped to.
+	LogIndexID string `json:"log_index_id,omitempty"`
 	// Deployment is which installation answered.
 	//
 	// SO THE NODE CAN CHECK TOO. TLS already binds this — the node verifies the
@@ -906,6 +948,46 @@ type Command struct {
 	// Upgrade is the release an upgrade command names, and the rollout that asked
 	// for it.
 	Upgrade *UpgradeSpec `json:"upgrade,omitempty"`
+
+	// LogRead is what CommandReadLog asks for.
+	LogRead *LogReadSpec `json:"log_read,omitempty"`
+}
+
+// The most a CommandReadLog answer carries. JSON can spell a byte of text in six, and a
+// line costs about 50 bytes of its own, so an answer at both bounds fits the 1 MiB body.
+const (
+	MaxLogReadBytes = 128 << 10
+	MaxLogReadLines = 2 << 10
+)
+
+// LogLineRange is an inclusive range of a job's line numbers.
+type LogLineRange struct {
+	First int64 `json:"first"`
+	Last  int64 `json:"last"`
+}
+
+// LogReadSpec names lines of one lease's log.
+type LogReadSpec struct {
+	Lease    string         `json:"lease"`
+	Ranges   []LogLineRange `json:"ranges"`
+	MaxBytes int            `json:"max_bytes"`
+}
+
+// LogLine is one line of a job's log. WHAT THE JOB WROTE, on the guest's clock.
+type LogLine struct {
+	Line     int64  `json:"line"`
+	AtMillis int64  `json:"at_ms,omitempty"`
+	Text     string `json:"text"`
+}
+
+// LogReadResult is a node's answer. Held false is a node that holds nothing of the lease,
+// which is never no such lines; Cut says a bound stopped the read; Unreadable counts the
+// chunks that could not be read back.
+type LogReadResult struct {
+	Held       bool      `json:"held"`
+	Cut        bool      `json:"cut,omitempty"`
+	Unreadable int       `json:"unreadable,omitempty"`
+	Lines      []LogLine `json:"lines,omitempty"`
 }
 
 // UpgradeSpec is one instruction to replace a node's own billet.
@@ -1030,6 +1112,13 @@ type EnrollRequest struct {
 	// can reach the port, who could then fill the pending list or take a name
 	// before the machine that should have it.
 	JoinToken string `json:"join_token"`
+	// IdentityDocument and IdentitySignature are what the host's platform signed about
+	// it (an EC2 instance identity document and its base64 signature), which a pool
+	// host sends so its order's source can vouch for it (ADR-030). Sent only by a pool
+	// host, whose control plane runs the pool and so decodes them; an older plane's
+	// strict decoder refuses a request carrying them (VersionPoolJoin).
+	IdentityDocument  string `json:"identity_document,omitempty"`
+	IdentitySignature string `json:"identity_signature,omitempty"`
 }
 
 // EnrollResponse is the decision, or that there is not one yet.
@@ -1180,4 +1269,7 @@ type CommandResult struct {
 	// InventoryKnown exists to prevent, not to be copied.
 	BarrierID string   `json:"barrier_id,omitempty"`
 	Instances []string `json:"instances,omitempty"`
+
+	// Log is CommandReadLog's answer.
+	Log *LogReadResult `json:"log,omitempty"`
 }

@@ -48,6 +48,12 @@ type ListenerCapacity struct {
 	HeldBy      string `json:"held_by,omitempty"`
 	HeldBySince string `json:"held_by_since,omitempty"`
 	Refusal     string `json:"refusal,omitempty"`
+	// HostShortage says this tier has work it could not buy for, and every limit the
+	// allocator named was a host: none live that can place its shape, or no room on
+	// those that can. A sealed deployment, a tier at its cap, a spent share or ceiling
+	// never set it, so a pool that orders hosts for it orders them only where hosts are
+	// what is missing (ADR-030). An older control plane writes none, read as false.
+	HostShortage bool `json:"host_shortage,omitempty"`
 	// Unstarted is how many jobs GitHub has assigned this tier beyond the
 	// runners it has, as its last reconciliation counted them: GitHub's demand,
 	// whatever the admission order makes of it. Waiting is the same count only

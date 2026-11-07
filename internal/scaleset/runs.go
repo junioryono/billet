@@ -80,15 +80,92 @@ func (c *Client) RunJobs(
 
 		return jobs, nil
 	}
-	refused, ok := errors.AsType[*billetgithub.APIError](err)
+
+	return nil, installationError(err, server.ErrQueueTimesThrottled, server.ErrQueueTimesRefused)
+}
+
+// installationError says whether GitHub's answer stops the App installation rather
+// than the one request: a throttle wraps throttled, and a refused credential or
+// permission refused. The one reading of those two answers, for every sweep that
+// pauses an installation on them.
+func installationError(err, throttled, refused error) error {
+	answer, ok := errors.AsType[*billetgithub.APIError](err)
 	switch {
-	case ok && refused.RateLimited:
-		return nil, fmt.Errorf("scaleset: %w: %w", server.ErrQueueTimesThrottled, err)
-	case ok && (refused.Status == http.StatusUnauthorized || refused.Status == http.StatusForbidden):
-		return nil, fmt.Errorf("scaleset: %w: %w", server.ErrQueueTimesRefused, err)
+	case ok && answer.RateLimited:
+		return fmt.Errorf("scaleset: %w: %w", throttled, err)
+	case ok && (answer.Status == http.StatusUnauthorized || answer.Status == http.StatusForbidden):
+		return fmt.Errorf("scaleset: %w: %w", refused, err)
 	default:
-		return nil, fmt.Errorf("scaleset: %w", err)
+		return fmt.Errorf("scaleset: %w", err)
 	}
+}
+
+var _ server.RunReruns = (*Client)(nil)
+
+// LatestAttempt reads the attempt a run is on through the target's App client and,
+// once the run is completed, its jobs in the server's terms.
+func (c *Client) LatestAttempt(ctx context.Context, owner, repository string, runID int64,
+) (server.RunAttempt, error) {
+	reruns, err := c.runReruns()
+	if err != nil {
+		return server.RunAttempt{}, err
+	}
+	attempt, err := reruns.LatestAttempt(ctx, owner, repository, runID)
+	if err != nil {
+		return server.RunAttempt{}, rerunError(err)
+	}
+
+	out := server.RunAttempt{Completed: attempt.Status == billetgithub.RunStatusCompleted, Attempt: attempt.Attempt}
+	for i := range attempt.Jobs {
+		job := &attempt.Jobs[i]
+		out.Jobs = append(out.Jobs, server.AttemptJob{ID: job.ID, RunnerName: job.RunnerName, Attempt: job.RunAttempt,
+			RunnerLost: job.RunnerLost(), Failed: job.Failed()})
+	}
+
+	return out, nil
+}
+
+// RerunFailedJobs asks GitHub to run a run's failed jobs again.
+func (c *Client) RerunFailedJobs(ctx context.Context, owner, repository string, runID int64) error {
+	reruns, err := c.runReruns()
+	if err != nil {
+		return err
+	}
+
+	return rerunError(reruns.RerunFailedJobs(ctx, owner, repository, runID))
+}
+
+// RerunJob asks GitHub to run one job again.
+func (c *Client) RerunJob(ctx context.Context, owner, repository string, jobID int64) error {
+	reruns, err := c.runReruns()
+	if err != nil {
+		return err
+	}
+
+	return rerunError(reruns.RerunJob(ctx, owner, repository, jobID))
+}
+
+func (c *Client) runReruns() (billetgithub.RunReruns, error) {
+	reruns, ok := c.policy.(billetgithub.RunReruns)
+	if c.policy == nil || !ok {
+		return nil, billetgithub.ErrRunEvidenceUnavailable
+	}
+
+	return reruns, nil
+}
+
+// rerunError says in the server's terms what stops a run's turn differently: a
+// throttle and a refused credential pause the App installation rather than the one
+// run, and a run already going is not a failure.
+func rerunError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, billetgithub.ErrRunAlreadyRunning) {
+		return fmt.Errorf("scaleset: %w: %w", server.ErrRerunRunning, err)
+	}
+
+	return installationError(err, server.ErrRerunThrottled, server.ErrRerunRefused)
 }
 
 // RESTBudget is the installation's REST budget as GitHub last stated it to the

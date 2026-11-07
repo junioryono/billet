@@ -1131,6 +1131,17 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	// data. The declarations themselves are checked structurally elsewhere.
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			`ALTER TABLE node_enrollments DROP COLUMN pool_order`,
+			`DROP INDEX join_tokens_pool_order_idx`,
+			`ALTER TABLE join_tokens DROP COLUMN pool_order`,
+			`DROP INDEX pool_orders_state_idx`,
+			`DROP TABLE pool_orders`,
+			`DROP INDEX job_history_rerun_decided_idx`,
+			`ALTER TABLE job_history DROP COLUMN rerun_decision`,
+			`ALTER TABLE job_history DROP COLUMN rerun_decided_at`,
+			`ALTER TABLE job_history DROP COLUMN rerun_attempt`,
+			`DROP TABLE job_reruns`,
+			`DROP TABLE rerun_tiers`,
 			`DROP INDEX job_history_usage_seq`,
 			`DROP INDEX job_history_usage_unnumbered`,
 			`ALTER TABLE job_history DROP COLUMN usage_mark`,
@@ -1286,6 +1297,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	requireIndex(t, upgraded, "job_egress_recorded_at")
 	requireIndex(t, upgraded, "job_test_results_recorded_at")
 	requireIndex(t, upgraded, "job_history_started_idx")
+	requireIndex(t, upgraded, "job_history_rerun_decided_idx")
 	requireIndex(t, upgraded, "job_history_github_run_idx")
 	requireIndex(t, upgraded, "job_history_run_idx")
 

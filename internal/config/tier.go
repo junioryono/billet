@@ -184,6 +184,9 @@ type Tier struct {
 	// Cache configures every cache the tier's jobs get: whose writes publish,
 	// which caches are on, and how large each may grow. See TierCache.
 	Cache *TierCache `yaml:"cache,omitempty"`
+	// Logs keeps this tier's jobs' step logs on the node that ran them and indexes them
+	// so `billet logs search` finds them. Absent means none is kept. See logs.go.
+	Logs *TierLogs `yaml:"logs,omitempty"`
 	// Network is what the tier asks of its guests' network; see TierEgress.
 	Network *TierNetwork `yaml:"network,omitempty"`
 
@@ -204,6 +207,33 @@ type Tier struct {
 	// unmet reserved slot away from competing tiers. Reserve for tiers that need a hard
 	// guarantee under contention. Zero is the default.
 	Reserved int `yaml:"reserved,omitempty"`
+
+	// Retry says what billet does about a job of this tier it ended itself.
+	// Absent, nothing: a job that went red stays red until a person re-runs it.
+	Retry *TierRetry `yaml:"retry,omitempty"`
+}
+
+// MaxDisruptedReruns is the most re-runs retry.disrupted may ask for. Billet's
+// own bound, not GitHub's: a run its infrastructure keeps ending is a fleet
+// problem, and more attempts would hide it.
+const MaxDisruptedReruns = 5
+
+// TierRetry is the re-run policy of one tier.
+type TierRetry struct {
+	// Disrupted is how many times billet asks GitHub to re-run a workflow run whose
+	// job on this tier it proved its own infrastructure ended, counted across the
+	// run's attempts. Zero, the default, is never. ADR-029 holds what counts as that
+	// proof, and the App must hold `actions: write` for a tier that sets it.
+	Disrupted int `yaml:"disrupted"`
+}
+
+// DisruptedReruns is how many re-runs the tier allows, zero when it says nothing.
+func (t Tier) DisruptedReruns() int {
+	if t.Retry == nil {
+		return 0
+	}
+
+	return t.Retry.Disrupted
 }
 
 // WorkloadTrust is the launch authority shared by a tier's runner pool.
@@ -404,6 +434,8 @@ const (
 func (t Tier) ProviderErrors(where string) []error {
 	var errs []error
 
+	errs = append(errs, t.validateLogs(where)...)
+
 	// BOTH SPELLINGS IS AN ERROR, not a merge. Guessing which one an operator
 	// meant is not a kindness when the answer decides where untrusted code runs.
 	if t.Provider != "" && len(t.Providers) > 0 {
@@ -464,18 +496,31 @@ func (t Tier) ReservationErrors(where string) []error {
 	return errs
 }
 
-// InterceptionErrors reports tiers that could reach a backend without the local
-// storage and guest control the transparent Actions cache requires.
+// RetryErrors reports everything wrong with a tier's re-run policy.
+//
+// EXPORTED BECAUSE alloc.New CANNOT ASSUME its catalogue came through Load, and
+// a negative count would read as no limit to anything comparing against it.
+func (t Tier) RetryErrors(where string) []error {
+	if n := t.DisruptedReruns(); n < 0 || n > MaxDisruptedReruns {
+		return []error{fmt.Errorf("%s: retry.disrupted %d is not between 0 and %d",
+			where, n, MaxDisruptedReruns)}
+	}
+
+	return nil
+}
+
+// InterceptionErrors reports tiers that could reach a backend without the site
+// store and guest control the transparent Actions cache requires.
 //
 // Exported because alloc.New cannot assume its catalogue came through Load.
 //
-// THE SAME RULE HOLDS FOR EVERY CACHE THE NODE SERVES TO A GUEST IT CONTROLS:
-// the Actions cache, the Git proxy and the Bazel and Go caches each mount a
-// site-store volume on the host, which only a firecracker node has.
+// THE SAME RULE HOLDS FOR EVERY CACHE THE NODE SERVES TO A GUEST IT CONTROLS: the
+// Actions cache, the Git proxy and the Bazel and Go caches. Each backend's answer and
+// its reason are ADR-024.
 func (t Tier) InterceptionErrors(where string) []error {
 	cache := t.EffectiveCache()
 	explicit := t.explicitGuestCaches()
-	if !cache.needsGuestCacheServices() || len(explicit) == 0 {
+	if !cache.NeedsGuestCacheServices() || len(explicit) == 0 {
 		return nil
 	}
 
@@ -486,15 +531,39 @@ func (t Tier) InterceptionErrors(where string) []error {
 	what := "the " + strings.Join(enabled, ", ") + " cache"
 
 	providers := t.AcceptableProviders()
-	if len(providers) != 1 || providers[0] != ProviderFirecracker {
-		return []error{fmt.Errorf("%s: %s requires only the firecracker provider; "+
-			"remote and fallback providers cannot reach this node's site-local store", where, what)}
+	if len(providers) != 1 {
+		return []error{fmt.Errorf("%s: %s requires one provider, firecracker or ec2; a job placed on "+
+			"a fallback provider cannot reach the first one's site store", where, what)}
+	}
+	if !serveGuestCaches(providers[0]) {
+		return []error{fmt.Errorf("%s: %s requires the firecracker or ec2 provider, and %s cannot "+
+			"have it: %s", where, what, providers[0], guestCacheRefusal(providers[0]))}
 	}
 	if t.GuestOS != GuestLinux {
 		return []error{fmt.Errorf("%s: %s currently requires a Linux guest", where, what)}
 	}
 
 	return nil
+}
+
+// serveGuestCaches reports whether a backend's guest can be served the node's caches
+// (ADR-024).
+func serveGuestCaches(p ProviderKind) bool {
+	return p == ProviderFirecracker || p == ProviderEC2
+}
+
+// guestCacheRefusal says why a backend's guest cannot be, in ADR-024's terms.
+func guestCacheRefusal(p ProviderKind) string {
+	switch p {
+	case ProviderCodeBuild:
+		return "the build host is not billet's, and a reserved fleet's is not scrubbed between builds"
+	case ProviderTart:
+		return "no site store exists for a Mac yet"
+	case ProviderDocker:
+		return "the docker backend is for trials, and its containers share the host's kernel"
+	default:
+		return "nothing serves that backend"
+	}
 }
 
 // ReservedVCPU is the vCPU a tier's floor holds back from other tiers.
@@ -845,6 +914,7 @@ func (c *Config) validateTiers() []error {
 		errs = append(errs, t.InterceptionErrors(where)...)
 		errs = append(errs, t.EgressErrors(where)...)
 		errs = append(errs, t.ReservationErrors(where)...)
+		errs = append(errs, t.RetryErrors(where)...)
 		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
 		}

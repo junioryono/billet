@@ -398,7 +398,7 @@ func recordIssued(ctx context.Context, env cli.Env, cfgPath, name string, bundle
 
 	defer closeDB()
 
-	if err := recordIssuedCert(ctx, a, bundle, name, alloc.CertIssued); err != nil {
+	if _, err := recordIssuedCert(ctx, a, bundle, name, alloc.CertIssued); err != nil {
 		return err
 	}
 

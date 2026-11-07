@@ -201,6 +201,15 @@ server:
   # test_results_retention: 336h
   # test_results_max_bytes: 128MiB
 
+  # This control plane's index of what jobs wrote, where a tier sets logs.keep: a file
+  # of its own a day under identity_dir, not in the ledger, about three times the text
+  # it covers. The text stays on the node that ran the job. At least 1h and 64MiB;
+  # absent, 336h and 32GiB. See ADR-031.
+  #
+  # logs:
+  #   retention: 336h
+  #   max_bytes: 32GiB
+
   # Prometheus metrics for this control plane, at http://<listen>/metrics.
   # Absent, nothing is served. A literal loopback address (127.0.0.1 or [::1],
   # not localhost) unless allow_remote is true: the endpoint has no
@@ -1096,8 +1105,18 @@ node:
   #   tls_cert: /etc/billet/cache/tls.crt
   #   tls_key: /etc/billet/cache/tls.key
 
+  # What this node keeps of its jobs' step logs, where a tier sets logs.keep: compressed
+  # under state_dir, the oldest jobs evicted whole. At least 1h, 64MiB and 1MiB; absent, 336h,
+  # 64GiB and 64MiB. Only a node with monitoring.guest receives any. See ADR-031.
+  #
+  # logs:
+  #   retention: 336h
+  #   max_bytes: 64GiB
+  #   max_job_bytes: 64MiB
+
 # Tiers are yours to define — this is not a fixed catalog. The label is what
 # users put in `runs-on`.
+
 tiers:
   # SEVERAL SIZES OF ONE TIER, WITHOUT WRITING EACH ONE OUT.
   #
@@ -1129,6 +1148,20 @@ tiers:
   # before it advertises, so a ladder of three is three slots held before any job
   # arrives, and `billet check` prints how much of the machine that is.
 
+  # RE-RUNNING WHAT BILLET ENDED. GitHub does not requeue a job whose runner
+  # vanished, so by default a job billet's infrastructure ended stays red until a
+  # person re-runs it. A tier can ask billet to do it:
+  #
+  #   retry:
+  #     disrupted: 1   # re-runs per workflow run, 0 to 5; absent or 0 is never
+  #
+  # ONLY ON PROOF. The ledger must have recorded a disruption from a closed list
+  # and GitHub's own record must show a lost runner, so a job that failed on its
+  # own is never re-run. It re-runs what a deploy would have to do twice, so ask
+  # only for a tier whose jobs can bear that. The App needs `actions: write`
+  # (`billet github-app create --actions-write`), and `billet check` refuses an App
+  # holding it where no tier asks. ADR-029.
+  #
   # RESERVING A FLOOR. Every tier shares one budget, and headroom is whatever is
   # left — so a tier with steady demand can hold all of it. The others then
   # advertise zero capacity, their jobs queue at GitHub indefinitely, and nothing
@@ -1236,6 +1269,8 @@ tiers:
     #   bazel:        { enabled: true, max_size: 50GiB }
     #   go:           { enabled: true, max_size: 20GiB, test_results: false }
     #   npm:          { enabled: true }    # on, as every cache is; the store is the node's (ADR-020)
+    # logs:
+    #   keep: true                     # this tier's jobs' step logs, for `billet logs search`
 
   - label: billet-8vcpu-ubuntu-2404
     provider: firecracker

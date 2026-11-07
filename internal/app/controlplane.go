@@ -448,7 +448,43 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 
 	cp := c.cp
 
+	wireOpts := []wireOption{}
+	logIndexID := ""
+
+	// AN INDEX ONLY WHERE A TIER ASKS, so a deployment that keeps no logs holds no directory
+	// of them and its nodes are told of no index.
+	if cp.cfg.KeepsJobLogs() {
+		limits, err := cp.cfg.Server.Logs.Limits()
+		if err != nil {
+			return nil, err
+		}
+
+		// A CONTROL PLANE WITH NO INDEX STILL SCHEDULES: it loses search and no decision (ADR-031).
+		// Its nodes are told of no index, and keep what they hold until one is back. An id that
+		// cannot be read is never replaced by a new one, since that would ship everything again.
+		index, err := state.OpenLogIndex(LogIndexDir(cp.cfg))
+		if err != nil {
+			slog.Warn("this control plane has no index of job logs, so nothing new is searchable", "error", err)
+		} else {
+			logIndexID = index.ID()
+			wireOpts = append(wireOpts, withLogIndex(newLogIndexSink(index, cp.allocator)))
+
+			// CLOSED WHEN THIS ENDS, with the wire: a chunk arriving after that is told it could
+			// not be kept, and its node ships it again.
+			c.loops.Background("log index retention", func(ctx context.Context) {
+				retainLogIndex(ctx, index, limits, slog.Default())
+
+				if err := index.Close(); err != nil {
+					slog.Warn("could not close the index of job logs", "error", err)
+				}
+			})
+		}
+	}
+
 	planeOpts := append([]nodeplane.Option{
+		// What this control plane's index is, so a node ships what it keeps to one it has
+		// not reached.
+		nodeplane.WithLogIndexID(logIndexID),
 		nodeplane.WithRegistrar(cp.allocator),
 		// The declared places, so a node claiming one nobody declared is refused
 		// here rather than recorded. A node's own config cannot make this check —
@@ -477,11 +513,22 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 	// binds to this once it has built the scheduler.
 	resizes := &resizeGate{alloc: cp.allocator}
 
-	wire, err := ServeNodeWire(ctx, cp.cfg, cp.host.ServerAccess, nodes, cp.allocator,
-		cp.planeJIT, cp.allocator, cp.allocator, cp.db, withResizer(resizes.resize))
+	wireOpts, err := poolWireOptions(cp.cfg, cp.allocator, cp.deployment, append(wireOpts, withResizer(resizes.resize))...)
 	if err != nil {
 		return nil, err
 	}
+
+	wire, err := ServeNodeWire(ctx, cp.cfg, cp.host.ServerAccess, nodes, cp.allocator,
+		cp.planeJIT, cp.allocator, cp.allocator, cp.db, wireOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// THE OPERATOR SOCKET, ONCE THERE IS A PLANE TO ANSWER FROM. An index or none, since
+	// what it serves grows beyond the logs.
+	c.loops.Background("operator socket", func(ctx context.Context) {
+		serveOperator(ctx, cp.cfg, &operatorServer{jobs: cp.allocator, plane: nodes, log: slog.Default()})
+	})
 
 	return &ServingWire{ServedWire: wire, nodes: nodes, resizes: resizes, servedBy: c}, nil
 }
@@ -599,6 +646,17 @@ func (c *Controller) Schedule(
 	// answer runs in another process; nothing on a sealed, idle deployment would
 	// otherwise ever put that question to a node.
 	c.loops.Background("compute barrier", func(ctx context.Context) { wire.nodes.BarrierLoop(ctx) })
+
+	// AND THE POOL, when the config names one (ADR-030). Only the controller runs it,
+	// because two would each order what the floor and the demand call for; a dry run
+	// orders nothing, as it accepts no job.
+	poolLoop, pooled, err := schedulePool(cp.cfg, cp.allocator, cp.deployment, opts.DryRun)
+	if err != nil {
+		return nil, err
+	}
+	if pooled {
+		c.loops.Background("pool", poolLoop)
+	}
 
 	// THE REMOTE PLANE DRIVES ALL COMPUTE, and it is the only thing that can. A
 	// control plane without it serves the node wire, accepts registrations, and then

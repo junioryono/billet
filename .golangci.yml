@@ -283,6 +283,8 @@ linters:
               desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
             - pkg: "github.com/junioryono/billet/internal/rollout"
               desc: "A host source writes no ledger; the pool reads what a release needs and passes a proof."
+            - pkg: "github.com/junioryono/billet/internal/pool"
+              desc: "A host source answers the pool and nothing above it."
             - pkg: "github.com/junioryono/billet/cmd"
               desc: "Host sources must not import cmd/."
 
@@ -384,6 +386,26 @@ linters:
           list-mode: strict
           files:
             - "${config-path}/internal/supervise/**"
+          allow:
+            - $gostd
+
+        # THE IDENTITY DOCUMENT'S VERIFIER IS A LEAF. It is what lets a pool host in
+        # without a person (ADR-030), so it reads nothing but the bytes it is handed
+        # and the certificates it embeds: the standard library only.
+        awsidentity:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/awsidentity/**"
+          allow:
+            - $gostd
+
+        # THE POOL HOST'S CONSOLE LINE IS A LEAF. A host writes it and a host source
+        # reads it, and neither may import the other's layer, so the one spelling
+        # imports nothing either does: the standard library only.
+        joinconsole:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/joinconsole/**"
           allow:
             - $gostd
 
@@ -754,7 +776,19 @@ linters:
           allow:
             - $gostd
             - github.com/junioryono/billet/internal/guestreport$
+            - github.com/junioryono/billet/internal/joblog$
             - github.com/junioryono/billet/internal/regularfile$
+
+        # A CHUNK OF A JOB'S LOG IS READ BY THE AGENT, THE NODE, THE INDEX AND THE LOGS
+        # COMMAND, and is the standard library's alone so none of them imports another
+        # through it. Measured at zero violations when it went in.
+        joblog:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/joblog/**"
+            - "!$test"
+          allow:
+            - $gostd
 
         # A LEDGER WRITER MAY NOT REACH THE NETWORK, AND THE BLAST RADIUS IS WHY.
         #
@@ -806,6 +840,8 @@ linters:
               desc: "The ledger is a lower layer than a guest's network policy, which runs nft and opens sockets; a call inside a transaction holds the writer slot for it."
             - pkg: "github.com/junioryono/billet/internal/hostsource"
               desc: "A host source calls a provider's API (ADR-030): the release proof is built inside the transaction, and the source is called after it commits."
+            - pkg: "github.com/junioryono/billet/internal/pool"
+              desc: "The pool asks host sources over the network; a ledger writer calls it never, and it calls the ledger through alloc."
             - pkg: "github.com/junioryono/billet/internal/store"
               desc: "The ledger is a lower layer than site storage; an rbd call inside a transaction holds the single writer slot."
             - pkg: "github.com/junioryono/billet/internal/tokenbroker"

@@ -249,6 +249,9 @@ type NodeConfig struct {
 	// Monitoring measures each job from the host. Absent means off; see
 	// NodeMonitoringConfig.
 	Monitoring *NodeMonitoringConfig `yaml:"monitoring,omitempty"`
+	// Logs bounds the step logs this node keeps, which a tier asks for and which only a
+	// node with monitoring.guest receives. See logs.go.
+	Logs *NodeLogsConfig `yaml:"logs,omitempty"`
 	// Power lowers the CPU's ceiling while this node is idle. Absent means off;
 	// see NodePowerConfig.
 	Power *NodePowerConfig `yaml:"power,omitempty"`
@@ -836,6 +839,9 @@ func (c *Config) validateNode() []error {
 
 	if c.Node.StateDir == "" {
 		errs = append(errs, errors.New("node.state_dir is required"))
+	}
+	if _, err := c.Node.Logs.Limits(); err != nil {
+		errs = append(errs, err)
 	}
 	errs = append(errs, c.validateControlPlanes()...)
 

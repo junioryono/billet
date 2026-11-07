@@ -24,6 +24,9 @@ billet.yaml
 !testdata/**/*.pem
 !testdata/**/*.key
 !testdata/**/*.crt
+# AWS's public certificates for instance identity documents, which the binary embeds:
+# public keys, and a build without them does not compile.
+!internal/awsidentity/certificates.pem
 
 # `billet ca issue <node>` writes here when --out is not given, which is the
 # right default for an operator standing in their home directory and the wrong
