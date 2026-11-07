@@ -57,11 +57,18 @@ The tests in `internal/egress/realegress_linux_test.go` run under `BILLET_TEST_E
 
 **The last `drop`** is not observable on this kernel: a frame of no protocol billet reads does not arrive with or without it, so `reject` appears to stop it first (not traced further). It stays because the rule's purpose is not to depend on what `reject` does with a frame it has no answer for.
 
+## On kernel 6.8
+
+Ubuntu 24.04's general-availability kernel, which a stock install boots: measured on 2026-11-07 on an `m7i.xlarge` in `us-east-2` running Ubuntu 24.04.5 with `linux-image-generic`, kernel `6.8.0-149-generic`, nft 1.0.9, and destroyed afterwards. `main` as of `227cdd82`, which carries #727, was built there and `internal/egress`'s unit tests and every real test above run five times in a thrown-away namespace: all passed, 0 failures in 5 runs. Each real test prepares its host as a node does, so the dry run of a whole listed guest's rules is accepted on 6.8 too.
+
+6.8 behaves as 7.0 does where it matters most. The frame to `01:80:c2:00:00:0e` reached a socket on the gateway with no rules and `rp_filter` 0, and did not with 2, so the bridge-port rule is needed on 6.8 as well, and stops it there. Rules taken away and put back, a held socket moved across a flush and a restart, a guest nothing can serve, forged frames and a neighbour's connection all held as they do on 7.0.
+
+A stock cloud image does not boot the generic kernel as it comes: Ubuntu's EC2 image boots without an initrd (`GRUB_FORCE_PARTUUID`), and the generic kernel loads its NVMe driver from one, so it panicked mounting the root filesystem until the initrd was put back. That is the image's, not billet's, and a host installed from Ubuntu's own installer boots it as it is.
+
 Upgrading from tables without the bridge-port rule needed no converge: the node's next start added it, since its base script makes the tables what they should be in one transaction.
 
 ## What this did not prove
 
-- **Kernel 6.8**, Ubuntu 24.04's GA kernel. Everything here ran on 7.0. `billet check` and every node's start dry-run a whole listed guest's rules against the kernel it has, so a kernel that refuses any of them says so and refuses a listed launch rather than running it open.
 - **The link-local frame from a real guest.** It was sent from a veth port in a namespace, not from a Firecracker guest's tap. The kernel's source for the bridge treats the two alike (read, not run); the real guest's run proves only that the rule did not stop anything it should not.
 - **A guest harming a neighbour.** The ADR's list of what this does not do includes claiming a neighbour's DNS tuple first, and taking its MAC or address on the bridge. Those were read from the rules and the kernel's source and not run.
 - **At scale.** One or two guests at a time.
