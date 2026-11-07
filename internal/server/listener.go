@@ -244,6 +244,10 @@ type Listener struct {
 	// TEST-ONLY: a background poll has returned and been dated, and the loop has not yet
 	// received its answer, let alone taken it (dateEmptyAnswer). Nil in every deployment.
 	afterPollDated func()
+	// TEST-ONLY: the loop has received a background poll's answer, the poll aside has
+	// finished, and the loop has not yet taken it (dateEmptyAnswer). Nil in every
+	// deployment.
+	beforeAnswerTaken func()
 
 	// timings is where this listener reports its loop's times. lastAnswered is when
 	// its last poll was answered, on the loop's goroutine alone.

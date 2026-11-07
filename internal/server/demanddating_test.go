@@ -410,14 +410,18 @@ func TestAnAnswerTakenLateKeepsItsPollsDate(t *testing.T) {
 
 	var beforeTaken time.Time
 
+	// THE CLOCK MOVES between the poll's return and the loop's receipt of its answer.
 	l.afterPollDated = func() {
-		l.mu.Lock()
-		beforeTaken = l.answeredAt
-		l.mu.Unlock()
-
 		mu.Lock()
 		now = returned.Add(time.Hour)
 		mu.Unlock()
+	}
+	// AND NOTHING HAS DATED IT when the loop has it and has not taken it: the poll aside
+	// has finished by then, so a date it recorded would show here.
+	l.beforeAnswerTaken = func() {
+		l.mu.Lock()
+		beforeTaken = l.answeredAt
+		l.mu.Unlock()
 	}
 
 	if answer := l.exchange(t.Context(), 1, false); !errors.Is(answer.err, ErrNoMessage) {
