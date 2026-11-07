@@ -102,6 +102,10 @@ func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string
 				return fmt.Errorf("alloc: hold pool order %s's release for a fresh proof: %w", order, err)
 			}
 
+			if err := q.DeleteBarrierRun(ctx, PoolNodeName(order)); err != nil {
+				return fmt.Errorf("alloc: discard %s's idle run: %w", PoolNodeName(order), err)
+			}
+
 			row.NodeName = PoolNodeName(order)
 		}
 

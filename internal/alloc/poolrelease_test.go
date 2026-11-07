@@ -113,6 +113,38 @@ func TestAHostACertificateWasIssuedForIsReleasedAsJoined(t *testing.T) {
 	}
 }
 
+// AN IDLE RUN TAKEN BEFORE THE RELEASE LINKED ITS ORDER PROVES NOTHING AFTER IT: what the
+// node reported while its order did not know it was never recorded, so the link discards
+// its run, and a decommission after it needs answers taken since.
+func TestARunBeforeTheLinkProvesNoDecommission(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	placedOrder(t, a, "pa")
+	node := PoolNodeName("pa")
+	if err := a.RecordIssuedCert(ctx, IssuedCert{Serial: "0f", Node: node, Source: CertIssued,
+		NotAfter: "2027-11-07T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	registerPoolNode(t, a, node)
+	barrier := requestBarrier(t, a)
+	observeNode(t, a, barrier, node, true)
+	now = now.Add(computeAbsenceGrace)
+	observeNode(t, a, barrier, node, true)
+
+	if _, err := a.RequestPoolRelease(ctx, "pa", "joined by hand"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.NodeGone(ctx, node, fenceOf(t, a, node).Epoch); err != nil {
+		t.Fatal(err)
+	}
+	if proven, err := a.Decommission(ctx, DecommissionRequest{Node: node, Actor: "ops"}); err == nil || proven {
+		t.Fatalf("a decommission proved by a run taken before the link: proved %v, %v", proven, err)
+	}
+	waitsUnsealed(t, a, "a run taken before the link")
+}
+
 // AN IDLE RUN THAT PREDATES A CONTRADICTION PROVES NO DECOMMISSION AFTER IT: an inventory
 // reporting compute discards the pool node's run with the contradiction, so a delayed
 // empty inventory and a stop leave nothing a decommission can be proved by, and the

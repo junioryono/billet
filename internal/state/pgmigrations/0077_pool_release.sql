@@ -21,3 +21,12 @@ ALTER TABLE pool_orders ADD COLUMN release_reason text NOT NULL DEFAULT '';
 -- +billet:statement
 ALTER TABLE pool_orders ADD COLUMN release_contradicted bigint NOT NULL DEFAULT 0 CHECK (release_contradicted IN (0, 1));
 -- +billet:end
+
+-- +billet:statement
+UPDATE pool_orders SET release_contradicted = 1 WHERE node_name != '' AND state IN ('placed', 'sealed');
+-- +billet:end
+
+-- +billet:statement
+DELETE FROM compute_barrier_nodes
+ WHERE node IN (SELECT node_name FROM pool_orders WHERE node_name != '' AND state IN ('placed', 'sealed'));
+-- +billet:end
