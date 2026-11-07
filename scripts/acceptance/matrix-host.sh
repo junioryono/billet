@@ -43,7 +43,10 @@
 # down requests a stop, waits up to MATRIX_DOWN_WAIT seconds (default 1800) for the run's
 # lock to be free (a reboot frees it; nothing else does while the run lives), then destroys whatever the run left (`billet acceptance down`, idempotent)
 # and removes the workspace; a run still live after that is said, and nothing is taken
-# down beside it. It is the step every path ends with.
+# down beside it. It is the step every path ends with. Before the workspace goes, the
+# services' logs are kept in <run-dir>/logs on this host, never in <run-dir>/out, which
+# the workflow uploads: they name the account's resources, and a cell that failed for a
+# reason only the node saw cannot be explained once they are gone (run 42406366812).
 set -uo pipefail
 
 usage() {
@@ -157,6 +160,12 @@ down)
 		echo "matrix: no workspace at $ws; nothing to take down"
 		exit 0
 	fi
+	for log in server.log node.log; do
+		[ -f "$ws/$log" ] || continue
+		if ! { mkdir -p "$run_dir/logs" && cp "$ws/$log" "$run_dir/logs/$log"; }; then
+			echo "matrix: could not keep $ws/$log; the teardown removes it" >&2
+		fi
+	done
 	"$billet" acceptance down --workspace "$ws"
 	;;
 *)

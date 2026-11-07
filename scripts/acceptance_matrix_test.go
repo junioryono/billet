@@ -572,9 +572,19 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	if log, err := os.ReadFile(filepath.Join(f.dir, "billet.log")); err == nil && strings.Contains(string(log), "acceptance down") {
 		t.Fatalf("stopped took the deployment down:\n%s", log)
 	}
+	// THE SERVICES' LOGS OUTLIVE THE WORKSPACE, on the host and not in what is uploaded.
+	if err := os.WriteFile(filepath.Join(dir, "ws", "node.log"), []byte("the node's own account\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	f.fixture(t, "acceptance-down.exit", "4")
 	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "down", dir); code != 4 {
 		t.Fatalf("a down that failed: exit %d\n%s", code, out)
+	}
+	if kept, err := os.ReadFile(filepath.Join(dir, "logs", "node.log")); err != nil || string(kept) != "the node's own account\n" {
+		t.Errorf("down did not keep the node's log in the run directory: %q, %v", kept, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "out", "node.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the node's log is among what the workflow uploads: %v", err)
 	}
 }
 
