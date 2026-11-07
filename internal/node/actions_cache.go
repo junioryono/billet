@@ -292,6 +292,29 @@ func (s *CacheService) actionsResponse(
 
 		return nil, false, nil
 	}
+	// A STORE THAT HAS STOPPED ANSWERING IS NOT ASKED. A lookup or a reservation goes to
+	// GitHub, as one the store failed to answer does, without waiting for it to fail; on
+	// probation it goes on, and its volume is admitted or not where it is asked for.
+	// A finalize and a blob are bound to a volume only this node holds, so they fail
+	// here, as one the store failed does: a blob's read or write waits in the kernel on
+	// that volume, holding what its cleanup needs, and a save's failure is the client's
+	// warning. A blob URL nobody signed fails the same, being no one else's to answer.
+	switch req.URL.Path {
+	case actionsCreatePath, actionsDownloadPath:
+		if s.breaker.isOpen() {
+			s.observeActions(req.Context(), session, alloc.ActionsCacheBypassed)
+
+			return nil, false, nil
+		}
+	case actionsFinalizePath:
+		if !s.breaker.admit() {
+			return nil, true, errStoreOpen
+		}
+	default:
+		if !s.breaker.allow() {
+			return nil, true, errStoreOpen
+		}
+	}
 	// A CALL THAT IS ANSWERED HERE IS NOT OBSERVED HERE. Whether the guest was
 	// served is known only once the handler has answered, and a handler that
 	// fails is retried through GitHub by the proxy, which is where the final
@@ -781,7 +804,11 @@ func (s *CacheService) createActionsCache(
 	if store := s.archiveStore(); store != nil {
 		return s.createObjectArchive(ctx, store, session, storeKey, request.Key, request.Version, origin)
 	}
-	if _, err := s.store.Current(ctx, storeKey); err == nil {
+	if err := s.asked(ctx, session, "an Actions cache lookup", func(askCtx context.Context) error {
+		_, err := s.store.Current(askCtx, storeKey)
+
+		return err
+	}); err == nil {
 		return actionsJSONResponse(map[string]any{
 			"ok": false, "message": "a cache entry already exists for this key and version",
 		})
@@ -797,7 +824,15 @@ func (s *CacheService) createActionsCache(
 	if err != nil {
 		return nil, err
 	}
-	volume, err := s.store.Create(ctx, storeKey, actionsVolumeSize)
+	volume, _, err := s.acquireVolume(ctx, session, cacheWorkLimit,
+		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
+			created, err := s.handOver(session.instance, "an Actions cache reservation",
+				func() (storecontract.Volume, error) {
+					return s.store.Create(acquireCtx, storeKey, actionsVolumeSize)
+				})
+
+			return created, false, err
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -1022,6 +1057,7 @@ func (s *CacheService) finalizeActionsCache(
 	}
 	lease, fence, err := s.store.AcquireWriter(ctx, archive.StoreKey,
 		session.instance+"/actions/"+archive.ID, cacheWriterTTL)
+	s.countedPublication(session.instance, "an Actions cache writer", err)
 	if err != nil {
 		return nil, err
 	}
@@ -1042,6 +1078,7 @@ func (s *CacheService) finalizeActionsCache(
 		}
 	}
 	candidate, err := s.store.Snapshot(ctx, archive.Volume)
+	s.countedPublication(session.instance, "an Actions cache snapshot", err)
 	if err != nil {
 		return nil, abandon(err)
 	}
@@ -1078,6 +1115,7 @@ func (s *CacheService) publishActionsReceipt(
 		return s.publishObjectReceipt(ctx, session, receipt)
 	}
 	current, err := s.store.Current(ctx, receipt.StoreKey)
+	s.countedPublication(session.instance, "an Actions cache lookup", err)
 	if err == nil {
 		return s.completeReceipt(ctx, session, receipt, current)
 	}
@@ -1092,6 +1130,7 @@ func (s *CacheService) publishActionsReceipt(
 	for attempt := range 2 {
 		err = s.store.PublishCAS(ctx, receipt.StoreKey, "", receipt.Candidate,
 			receipt.Lease, receipt.Fence)
+		s.countedPublish(session.instance, err)
 		if !errors.Is(err, storecontract.ErrConflict) {
 			if err != nil {
 				return nil, err
@@ -1105,6 +1144,7 @@ func (s *CacheService) publishActionsReceipt(
 			return actionsReceiptResponse(receipt)
 		}
 		current, currentErr := s.store.Current(ctx, receipt.StoreKey)
+		s.countedPublication(session.instance, "an Actions cache lookup", currentErr)
 		if currentErr == nil {
 			return s.completeReceipt(ctx, session, receipt, current)
 		}
@@ -1167,6 +1207,7 @@ func (s *CacheService) reacquireReceiptWriter(
 	}
 	lease, fence, err := s.store.AcquireWriter(ctx, receipt.StoreKey,
 		session.instance+"/actions/"+receipt.ID, cacheWriterTTL)
+	s.countedPublication(session.instance, "an Actions cache writer", err)
 	if err != nil {
 		return err
 	}
@@ -1237,7 +1278,13 @@ func (s *CacheService) findActionsCache(
 		for index, key := range request.RestoreKeys {
 			restore[index] = candidate + key
 		}
-		found, foundGeneration, err := matcher.Match(ctx, candidate+request.Key, restore)
+		var found, foundGeneration string
+		err := s.asked(ctx, session, "an Actions cache lookup", func(askCtx context.Context) error {
+			var err error
+			found, foundGeneration, err = matcher.Match(askCtx, candidate+request.Key, restore)
+
+			return err
+		})
 		if errors.Is(err, storecontract.ErrMiss) {
 			continue
 		}
@@ -1255,7 +1302,15 @@ func (s *CacheService) findActionsCache(
 	if !ok || !validActionsCacheField(matchedKey) {
 		return nil, errors.New("site cache returned a key outside the Actions namespace")
 	}
-	volume, err := s.store.Clone(ctx, matched, generation)
+	volume, _, err := s.acquireVolume(ctx, session, cacheWorkLimit,
+		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
+			cloned, err := s.handOver(session.instance, "an Actions cache restore",
+				func() (storecontract.Volume, error) {
+					return s.store.Clone(acquireCtx, matched, generation)
+				})
+
+			return cloned, false, err
+		})
 	if err != nil {
 		return nil, err
 	}

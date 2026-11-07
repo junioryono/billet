@@ -85,6 +85,17 @@ type CacheObservationRequest struct {
 	NpmCache string `json:"npm_cache,omitempty"`
 }
 
+// CacheStoreRequest says what a node's breaker is doing about its site's store
+// (VersionCacheBreaker). Since is RFC 3339 on the node's clock. It carries no words of
+// the store's, which are the node's to log.
+type CacheStoreRequest struct {
+	Store    string `json:"store"`
+	State    string `json:"state"`
+	Since    string `json:"since"`
+	Failures int    `json:"failures,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
 // UsageRequest reports what the host measured a lease's job do, once, before
 // the compute is destroyed (VersionJobUsage). Series is optional: a node that
 // could not encode one still reports the summary.

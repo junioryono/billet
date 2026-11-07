@@ -291,7 +291,7 @@ func TestAnOversizedCloneThatCouldNotBeDiscardedIsProvedBeforeItIsUsed(t *testin
 				t.Fatalf("NewCacheService: %v", err)
 			}
 
-			volume, cold, err := service.cloneWithin(t.Context(), "acme/api/go", 1<<30)
+			volume, cold, err := service.cloneWithin(t.Context(), "billet-prove", "acme/api/go", 1<<30)
 			if tc.wantErr {
 				if err == nil || !errors.Is(err, tc.err) {
 					t.Fatalf("cloneWithin = %+v, %v, want %v", volume, err, tc.err)

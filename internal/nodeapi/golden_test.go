@@ -47,6 +47,7 @@ var wireTypes = map[string]any{
 	"LogReadResult":             LogReadResult{},
 	"LogReadSpec":               LogReadSpec{},
 	"CachePolicyResponse":       CachePolicyResponse{},
+	"CacheStoreRequest":         CacheStoreRequest{},
 	"Command":                   Command{},
 	"CommandResult":             CommandResult{},
 	"DescribeRequest":           DescribeRequest{},

@@ -29,12 +29,15 @@ const (
 	// ImageCacheUnused means the cache session closed without the guest ever
 	// asking for an image store.
 	ImageCacheUnused ImageCache = "unused"
+	// ImageCacheBypassed means the node's breaker had stopped asking the site's
+	// store, so the job started cold without it having been asked.
+	ImageCacheBypassed ImageCache = "bypassed"
 )
 
 // Valid reports whether this is a token billet may write.
 func (c ImageCache) Valid() bool {
 	switch c {
-	case ImageCacheWarm, ImageCacheCold, ImageCacheUnavailable, ImageCacheUnused:
+	case ImageCacheWarm, ImageCacheCold, ImageCacheUnavailable, ImageCacheUnused, ImageCacheBypassed:
 		return true
 	}
 
@@ -79,13 +82,16 @@ const (
 	// ActionsCacheUnused means interception was on and the session closed
 	// without a CacheService request ever arriving.
 	ActionsCacheUnused ActionsCache = "unused"
+	// ActionsCacheBypassed means the node's breaker had stopped asking the site's
+	// store, so the request went to GitHub without it having been asked.
+	ActionsCacheBypassed ActionsCache = "bypassed"
 )
 
 // Valid reports whether this is a token billet may write.
 func (c ActionsCache) Valid() bool {
 	switch c {
 	case ActionsCacheServed, ActionsCacheSpliced, ActionsCacheDisabled,
-		ActionsCacheUnavailable, ActionsCacheOff, ActionsCacheUnused:
+		ActionsCacheUnavailable, ActionsCacheOff, ActionsCacheUnused, ActionsCacheBypassed:
 		return true
 	}
 
@@ -115,12 +121,16 @@ const (
 	// BuildCacheUnused means the tier enabled the cache and the session ended
 	// without the guest asking for it.
 	BuildCacheUnused BuildCache = "unused"
+	// BuildCacheBypassed means the node's breaker had stopped asking the site's
+	// store, so the guest was told a miss without it having been asked.
+	BuildCacheBypassed BuildCache = "bypassed"
 )
 
 // Valid reports whether this is a token billet may write.
 func (c BuildCache) Valid() bool {
 	switch c {
-	case BuildCacheWarm, BuildCacheCold, BuildCacheDisabled, BuildCacheUnavailable, BuildCacheUnused:
+	case BuildCacheWarm, BuildCacheCold, BuildCacheDisabled, BuildCacheUnavailable, BuildCacheUnused,
+		BuildCacheBypassed:
 		return true
 	}
 
@@ -150,6 +160,25 @@ type CacheObservation struct {
 	CacheGeneration string       `json:"cache_generation,omitempty"`
 	ActionsCache    ActionsCache `json:"actions_cache,omitempty"`
 	BuildCaches
+}
+
+// WithoutBypassed says every bypassed cache as unavailable, for a control plane whose
+// wire predates the word, which refuses a whole observation over one it does not know.
+// It is true as far as it goes: the job went on without the store.
+func (o CacheObservation) WithoutBypassed() CacheObservation {
+	if o.ImageCache == ImageCacheBypassed {
+		o.ImageCache = ImageCacheUnavailable
+	}
+	if o.ActionsCache == ActionsCacheBypassed {
+		o.ActionsCache = ActionsCacheUnavailable
+	}
+	for _, build := range []*BuildCache{&o.Sticky, &o.Git, &o.Bazel, &o.Go, &o.Npm} {
+		if *build == BuildCacheBypassed {
+			*build = BuildCacheUnavailable
+		}
+	}
+
+	return o
 }
 
 // Validate refuses an observation billet must not write: an unknown token, a

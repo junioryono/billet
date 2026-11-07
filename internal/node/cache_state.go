@@ -14,6 +14,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/regularfile"
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 const (
@@ -74,6 +75,8 @@ type durableCacheSession struct {
 	Actions     map[string]*actionsArchive            `json:"actions,omitempty"`
 	Hosts       map[config.CacheKind]*hostVolume      `json:"hosts,omitempty"`
 	Receipts    map[string]*actionsReceipt            `json:"actions_receipts,omitempty"`
+	// Late is every volume the store came back with after its job stopped waiting.
+	Late []storecontract.Volume `json:"late,omitempty"`
 }
 
 // CacheSessionRecords is the raw text of every cache custody record a node
@@ -198,6 +201,7 @@ func (s *CacheService) loadSessions() error {
 			actions:  record.Actions,
 			receipts: record.Receipts,
 			hosts:    record.Hosts,
+			late:     record.Late,
 			casAdmit: make(chan struct{}, casConcurrency),
 			gitAdmit: make(chan struct{}, gitSessionWork),
 			gitFetch: make(chan struct{}, 1),
@@ -287,7 +291,7 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 		LeaseID: session.leaseID, Epoch: session.epoch,
 		Observed: session.observed,
 		Closed:   session.closed, Slots: session.slots, Actions: session.actions,
-		Receipts: session.receipts, Hosts: session.hosts,
+		Receipts: session.receipts, Hosts: session.hosts, Late: session.late,
 	}
 	encoded, err := json.Marshal(record)
 	if err != nil {

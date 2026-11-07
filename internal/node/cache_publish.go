@@ -119,12 +119,20 @@ func (s *CacheService) publishDeferred(
 		return abandon(reason)
 	}
 
+	// A STORE THAT HAS STOPPED ANSWERING IS ASKED AGAIN NEXT PASS, inside the window,
+	// and nothing here holds the cache loop for it meanwhile. On probation it may be the
+	// only thing that could settle it, on a node with no job left to ask for a volume.
+	if !s.breaker.admit() {
+		return false, nil
+	}
+
 	if journal.Phase == "" {
 		journal.Phase = phaseSnapshotting
 		if err := s.persistSession(session); err != nil {
 			return false, err
 		}
 		candidate, err := s.store.Snapshot(ctx, attachment.Volume)
+		s.countedPublication(session.instance, "a cache snapshot", err)
 		if errors.Is(err, storecontract.ErrVolumeGone) {
 			// NOTHING IS LEFT TO RETRY: an earlier attempt's failure took the clone,
 			// and that failure is what was logged. Asking again until the window
@@ -174,13 +182,16 @@ func (s *CacheService) publishDeferred(
 
 	candidate := *journal.Candidate
 	current, currentErr := s.store.Current(ctx, key)
+	s.countedPublication(session.instance, "a cache lookup", currentErr)
 	if currentErr == nil && current == candidate.Generation {
 		// A publication a crash interrupted after the pointer moved.
 		journal.Phase = phasePublished
 
 		return true, errors.Join(s.releaseWriter(ctx, lease, fence), s.persistSession(session))
 	}
-	if err := s.publish(ctx, attachment, candidate, lease, fence); err != nil {
+	err = s.publish(ctx, attachment, candidate, lease, fence)
+	s.countedPublish(session.instance, err)
+	if err != nil {
 		journal.Phase = phaseSnapshotted
 		journal.Attempts++
 
@@ -260,6 +271,21 @@ func volumeCeiling(setting config.CacheSetting) int64 {
 	return int64(setting.MaxSize)
 }
 
+// cloneOrCreate is the volume a job asked for: a clone of key's newest generation no
+// larger than ceiling, or a fresh volume of size, which it also answers cold for.
+func (s *CacheService) cloneOrCreate(
+	ctx context.Context, session, key string, ceiling, size int64,
+) (storecontract.Volume, bool, error) {
+	volume, cold, err := s.cloneWithin(ctx, session, key, ceiling)
+	if cold {
+		volume, err = s.handOver(session, "a new volume", func() (storecontract.Volume, error) {
+			return s.store.Create(ctx, key, size)
+		})
+	}
+
+	return volume, cold, err
+}
+
 // cloneWithin clones a key's current generation, or reports a cold cache.
 //
 // A GENERATION LARGER THAN THE CEILING IS NOT HANDED OUT: its clone is
@@ -267,9 +293,11 @@ func volumeCeiling(setting config.CacheSetting) int64 {
 // max_size re-seeds its caches rather than leaving them at the old size. A store
 // that cannot say how large a clone is keeps it.
 func (s *CacheService) cloneWithin(
-	ctx context.Context, key string, ceiling int64,
+	ctx context.Context, session, key string, ceiling int64,
 ) (storecontract.Volume, bool, error) {
-	volume, err := s.store.Clone(ctx, key, "")
+	volume, err := s.handOver(session, "a clone", func() (storecontract.Volume, error) {
+		return s.store.Clone(ctx, key, "")
+	})
 	if errors.Is(err, storecontract.ErrMiss) {
 		return storecontract.Volume{}, true, nil
 	}

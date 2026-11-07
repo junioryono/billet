@@ -90,6 +90,38 @@ tiers:
 
 Everything above is what that tier gets with no `cache` block at all. [Configuration](../reference/configuration.md) has every field.
 
+## When a store stops answering
+
+A cache beside the compute shares its failure domain, and a store that fails often hangs rather than refuses. Each node keeps a breaker for its site's store (Ceph or ebs-s3), so that when the store stops answering, jobs stop asking it.
+
+**What opens it.** Three different jobs failing within five minutes, with no volume handed over between them, on what a job waits on: a clone, a fresh volume, a lookup, a publication that times out, or the first byte of a content-addressed read. One job counts once, whatever it does, so no job can turn the cache off for the others. Past its own limit a call counts as a timeout while it is still waiting, so a store stuck where nothing can cancel the call counts all the same. A miss and a conflict are the store answering, and do not count. Neither does a discard, a renewal, eviction or the trash purge, which fail for reasons of their own while clones work. Nor does a publication the store refuses: a candidate whose filesystem is not clean is that job's problem and not the store's.
+
+**While it is open, nothing asks the store.**
+
+| Cache | What a job gets at once | Recorded as |
+|---|---|---|
+| Docker image store | a cold start on the guest's own disk | `bypassed` |
+| Sticky disk | the step goes on without the disk | `bypassed` |
+| Go and Bazel | a miss, so the build goes on with its local cache | `bypassed` |
+| Actions cache | a lookup or a save goes to GitHub, recorded `bypassed`; a save already reserved here fails, recorded `unavailable`, which the client reports as a warning | `bypassed` or `unavailable` |
+| Publication | a job's own commit answers that nothing was published, and what it wrote is discarded with its session; a publication deferred past the job waits for the next pass, inside its window | |
+
+The Git mirrors and the npm cache live on the node's own disk and go on as before.
+
+**The deadline.** A job waits at most 60 seconds on Ceph, or 30 on ebs-s3, for the store to hand over a volume. Past that it starts cold, which counts against the breaker, and the call goes on without it: a clone cut short can leave a volume behind, so the node holds what it comes back with in the session's durable record and discards it, off the job's path. So the first three jobs of an outage each wait a deadline, and the rest wait nothing.
+
+**How it comes back.** While it is open the node asks the store once every 30 seconds, bounded at 10. A store that answers is on probation, because what the probe reads is not everything a job needs: one job at a time asks it for a volume or publishes to it, a volume handed over or a publication made closes the breaker, and a failure opens it again at once. Every other job goes on cold meanwhile, and a job that goes away without an answer lets the next one try after a deadline. A site with no jobs and nothing to publish stays on probation until it has one, and the metric below reads 0.
+
+**What it does not do.** A breaker decides only whether a job uses a cache. It never touches capacity, custody or teardown, a timeout is never read as a volume being gone, and no published generation is lost. A writer lease that will not publish is released as it always is. Five things it cannot help with:
+
+- **A guest's mounted volume.** A job already using a volume whose OSDs have gone waits on its own disk's IO, in the guest's kernel.
+- **A pool that is gone.** A new job's root disk is an RBD clone in the cache pool, so with that pool's OSDs stopped, or no monitors at all, a Firecracker node launches nothing, cache or not, and the breaker is never asked: the launch fails, and its capacity comes back when the launch's own cleanup proves it. What the breaker covers is a store that answers launches and not caches, such as a cache index whose lock a holder has not let go of.
+- **A call already waiting.** A sticky disk or Go request that started before the breaker opened ends at its own limit, or at the deadline if it was asking for a volume.
+- **A store that fails for one job.** Fewer than three jobs failing in five minutes open nothing.
+- **A save that straddles the store's recovery.** A save that began at GitHub while the breaker was open and finishes after it closed fails, and the client reports a warning.
+
+`billet status` names each host whose breaker is open or on probation, and `billet_cache_breaker_open{store}` is the same fact for a dashboard. A restart closes the breaker, because a verdict kept across one could cost every job its cache until a probe ran.
+
 ## Seeing and stopping a cache
 
 ```bash
@@ -101,7 +133,7 @@ billet cache enable  --repository acme/api --kind git
 
 A block covers one cache or all of them, for an organisation or a repository, and so reaches the tiers whose caches belong to a repository: a repository target's, or one with `cache_scope`. The node asks it before attaching a cache, again every 30 seconds while a content-addressed cache is in use, and again before a deferred publication moves the pointer. A tier with no repository scope is nothing a block can name, so turn its caches off in its own `cache` block. A block an older binary wrote covers the Actions cache, which is all it ever meant.
 
-Each job's history records what every cache did: `warm` (it already held something the job used), `cold` (the job used it and it held nothing the job used), `disabled`, `unavailable` (the store failed and the job went on without it) or `unused`. A job whose outcome was not observed is counted as such, never as a miss.
+Each job's history records what every cache did: `warm` (it already held something the job used), `cold` (the job used it and it held nothing the job used), `disabled`, `unavailable` (the store failed and the job went on without it), `bypassed` (the node had stopped asking the store, so the job went on without it being asked) or `unused`. A job whose outcome was not observed is counted as such, never as a miss.
 
 ## Older nodes
 

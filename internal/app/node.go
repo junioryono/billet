@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/awscreds"
@@ -70,6 +71,8 @@ type Node struct {
 	// gitObserved is what the Git proxy reports to, set by GitMetrics' source
 	// when the node serves metrics and nil, which reports nowhere, when not.
 	gitObserved node.GitObserver
+	// cacheService is what the store breaker's gauge reads, once there is one.
+	cacheService atomic.Pointer[node.CacheService]
 	// powered is what the idle power policy reports to, set by PowerMetrics'
 	// source when the node serves metrics and nil, which reports nowhere, when
 	// not.
@@ -354,6 +357,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	defer stopCache()
 	if cacheService != nil {
 		cacheService.SetGitObserver(n.gitObserved)
+		n.cacheService.Store(cacheService)
 	}
 
 	stopShipping := shipJobLogs(ctx, cacheService, n.client)
@@ -450,6 +454,12 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		EC2Shapes:      RemoteShapes(cfg),
 		Architectures:  NodeArchitectures(cfg, runtime.GOARCH),
 		CodeBuildFleet: codeBuildFleet(cfg),
+
+		Registered: func() {
+			if cacheService != nil {
+				cacheService.ResendStoreState()
+			}
+		},
 
 		CodeBuildJITParameterPath: codeBuildJITPath(cfg),
 		CodeBuildRegion:           codeBuildRegion(cfg),
