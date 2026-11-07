@@ -981,7 +981,7 @@ func startFirstNode(t *testing.T, log *slog.Logger, c *assembled, np nodeProcess
 	t.Helper()
 
 	first := startNodeLoop(t, log, c.wire.Addr, np)
-	c.awaitRegistered(t, 1)
+	c.awaitRegistered(t)
 
 	return first
 }

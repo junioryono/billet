@@ -436,7 +436,7 @@ func startRoutedNode(t *testing.T, routerPort string, d *routedDeployment, nodeN
 		hurry: d.stack.hurry, identity: identity,
 	})
 	d.stack.stopNode = d.node.stop
-	d.stack.assembled.awaitRegistered(t, 1)
+	d.stack.assembled.awaitRegistered(t)
 }
 
 // runRoutedJob takes one job through a deployment behind the router, from offer to the

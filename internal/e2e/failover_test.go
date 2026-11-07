@@ -83,7 +83,7 @@ func TestANodeFollowsTheDeploymentToTheControllerServingIt(t *testing.T) {
 		hurry: make(chan struct{}), controllers: []string{first.wire.Addr, second},
 	})
 
-	first.awaitRegistered(t, 1)
+	first.awaitRegistered(t)
 
 	if got := first.wire.Plane().CurrentIncarnationForTest(host); got != node.incarnation {
 		t.Fatalf("the first controller holds incarnation %q, the node is %q", got, node.incarnation)
@@ -264,7 +264,7 @@ func TestASupersededProcessFollowsTheControllerThatReplacedTheOneItKnew(t *testi
 			}
 
 			holder := start(holderProvider, true)
-			first.awaitRegistered(t, 1)
+			first.awaitRegistered(t)
 
 			stopFirst := runScheduler(t, first)
 
