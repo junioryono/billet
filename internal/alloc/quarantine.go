@@ -815,6 +815,23 @@ func recordInventoryTx(
 		return fmt.Errorf("alloc: record what node %s reports running: %w", node, err)
 	}
 
+	if running > 0 {
+		pool, err := q.ContradictPoolRelease(ctx, node)
+		if err != nil {
+			return fmt.Errorf("alloc: contradict the release of pool node %s: %w", node, err)
+		}
+
+		// AND A POOL NODE'S IDLE RUN GOES WITH IT, so the next decommission that clears the
+		// contradiction is proved by answers taken after it, never by a run that predates
+		// the compute this reported (ADR-030). Only a pool node's: any other host's run is
+		// the drain's to judge, and an empty barrier answer there clears a stale positive.
+		if pool > 0 {
+			if err := q.DeleteBarrierRun(ctx, node); err != nil {
+				return fmt.Errorf("alloc: discard pool node %s's idle run: %w", node, err)
+			}
+		}
+	}
+
 	return nil
 }
 

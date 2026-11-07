@@ -366,6 +366,25 @@ func (a *Allocator) LookupEnrollment(ctx context.Context, name string) (Enrollme
 func (a *Allocator) DecideEnrollment(
 	ctx context.Context, name, fingerprint, decision, certPEM, certSerial string,
 ) error {
+	return a.decideEnrollment(ctx, name, fingerprint, decision, certPEM, certSerial, nil)
+}
+
+// ApproveEnrollment approves a pending request and records the certificate issued for
+// it, IN THE DECISION'S TRANSACTION and after its checks: a refused approval (a
+// fingerprint that does not match, a request decided already, a pool order that admits
+// nothing) records no certificate, which a pool host's release reads as proof that
+// nothing was ever admitted for its order.
+func (a *Allocator) ApproveEnrollment(ctx context.Context, name, fingerprint, certPEM string, cert IssuedCert) error {
+	if cert.Serial == "" {
+		return fmt.Errorf("alloc: approving %s needs the serial of the certificate issued for it", name)
+	}
+
+	return a.decideEnrollment(ctx, name, fingerprint, EnrollApproved, certPEM, cert.Serial, &cert)
+}
+
+func (a *Allocator) decideEnrollment(
+	ctx context.Context, name, fingerprint, decision, certPEM, certSerial string, issued *IssuedCert,
+) error {
 	if decision != EnrollApproved && decision != EnrollDenied {
 		return fmt.Errorf("alloc: %q is not a decision", decision)
 	}
@@ -398,6 +417,12 @@ func (a *Allocator) DecideEnrollment(
 			}
 
 			return fmt.Errorf("%w: %s is %s already", ErrNotPending, name, existing.State)
+		}
+
+		if issued != nil {
+			if err := recordIssuedCertTx(ctx, q, *issued, ts(a.now().UTC())); err != nil {
+				return err
+			}
 		}
 
 		if err := q.DecideEnrollment(ctx, ledgerdb.DecideEnrollmentParams{
