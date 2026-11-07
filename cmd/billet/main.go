@@ -88,6 +88,8 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: host.Fleet},
 		{Name: "github-app", Summary: "create and install the GitHub App billet uses",
 			Run: setup.GitHubApp},
+		{Name: "migrate", Summary: "point a repository's workflows at this deployment's tiers",
+			Run: setup.Migrate},
 		{Name: "broker", Summary: "hold App keys for deployments that hold none, and mint their installation tokens",
 			Run: setup.Broker},
 		{Name: "teardown", Summary: "delete the scale sets billet created on GitHub",

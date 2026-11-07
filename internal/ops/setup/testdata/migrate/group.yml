@@ -1,0 +1,13 @@
+name: group
+on: [push]
+jobs:
+  block:
+    runs-on:
+      group: ubuntu-runners
+      labels: ubuntu-latest
+    steps:
+      - run: echo block
+  flow:
+    runs-on: {group: ubuntu-runners, labels: [ubuntu-latest, linux]}
+    steps:
+      - run: echo flow

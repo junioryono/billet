@@ -746,9 +746,11 @@ linters:
         # THE GUEST'S NUMBERS ARE SHOWN, NEVER DECIDED ON. internal/guestreport is
         # what the in-VM agent reports, and the job is root in its VM, so every
         # number in it is the guest's own unverified view. The agent writes it, the
-        # node accepts and merges it, and the two operator families render it; the
-        # ledger and the plane carry the encoded report as opaque bytes and never
-        # decode a guest number, so nothing they decide can rest on one. Tests may
+        # node accepts and merges it, and the two operator families render it, one
+        # of them also advising from it, labelled as the guest's (`billet jobs
+        # rightsize`); the ledger and the plane carry the encoded report as opaque
+        # bytes and never decode a guest number, so nothing they decide can rest on
+        # one. Tests may
         # decode it anywhere. Measured at zero violations when it went in, with a
         # denied import from internal/nodeplane and internal/state shown reported.
         guestview:
