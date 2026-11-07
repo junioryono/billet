@@ -64,7 +64,7 @@ Every operator step was the command an operator runs, on the controller's host: 
 
 **How long GitHub held a stopped control plane's session.** Three graceful stops, each a handover that closes no session: the successor's session opened 64 s after the first stop (6 attempts, 52 s of waiting), 60 s after the second (6 attempts, 52 s) and 69 s after the PostgreSQL one (7 attempts, 62 s). The 2026-09-04 measurement in `openSession`'s comment, refused at 60 s and open at 91 or 92 s, was of abandoned sessions; these are a bracket of the same kind, not an expiry.
 
-**A job queued in the moment after `billet resume`** (run 42392947357, queued seconds after the resume at 16:46:39, by the same command) had not been offered by 16:56, while the tier by then advertised four runners; it was cancelled, and a job queued at 16:56 was held at 16:57. One observation, not measured further.
+**A job queued in the moment after `billet resume`** (run 42392947357, dispatched seconds after the resume at 16:46:39) had not been offered by 16:56, while the tier by then advertised four runners; it was cancelled, and a job queued at 16:56 was held at 16:57. One observation, not measured further.
 
 **Other observations.** The lease of a running job, held or not, reads `launching` in the ledger, and a drain names it so: nothing advances a lease past `launching`, which #795 records. On the probe host, `ss -ltn` at the end showed only its resolver, sshd and the tunnel's own listener, and nothing was left: no VM, no jail, no snapshot device. The instance, the runner group, the workflow, both scale sets and the PostgreSQL container were removed afterwards.
 
