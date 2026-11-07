@@ -914,7 +914,7 @@ func (q *Queries) ReadNodeSize(ctx context.Context, name string) (ReadNodeSizeRo
 	return i, err
 }
 
-const undoPoolRetirement = `-- name: UndoPoolRetirement :exec
+const undoPoolRetirement = `-- name: UndoPoolRetirement :execrows
 UPDATE nodes SET decommissioned_at = '', decommission_proven = 0, decommission_actor = ''
  WHERE name = $1 AND decommission_actor = $2
 `
@@ -928,9 +928,12 @@ type UndoPoolRetirementParams struct {
 // retirement the seal recorded is undone, so `billet drain` expects the node again and
 // waits on it rather than counting it proved idle. Only the seal's own (@actor); a
 // decommission a person recorded stays theirs.
-func (q *Queries) UndoPoolRetirement(ctx context.Context, arg UndoPoolRetirementParams) error {
-	_, err := q.db.ExecContext(ctx, undoPoolRetirement, arg.Name, arg.Actor)
-	return err
+func (q *Queries) UndoPoolRetirement(ctx context.Context, arg UndoPoolRetirementParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, undoPoolRetirement, arg.Name, arg.Actor)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const upsertNodeRegistration = `-- name: UpsertNodeRegistration :one

@@ -596,11 +596,48 @@ func (a *Allocator) PoolOrderReleased(ctx context.Context, id string) error {
 }
 
 // PoolOrderGone records the source's own terminal answer that a released host is gone.
+//
+// THE SOURCE'S WORD IS PROOF THE NODE IS GONE, so a node whose seal's retirement was undone
+// since leaves the fleet proved, in the same transaction (settleClosedNodeTx).
 func (a *Allocator) PoolOrderGone(ctx context.Context, id string) error {
-	return a.movePoolOrder(ctx, id, PoolReleased, func(w state.WriteOps, now string) (int64, error) {
-		return w.MarkPoolOrderGone(ctx, ledgerdb.MarkPoolOrderGoneParams{
-			Reason: "its source said the host is gone", OrderID: id, UpdatedAt: now,
+	return a.closePoolOrderTx(ctx, id, PoolReleased, true, "billet pool (its source said gone)",
+		func(w state.WriteOps, now string) (int64, error) {
+			return w.MarkPoolOrderGone(ctx, ledgerdb.MarkPoolOrderGoneParams{
+				Reason: "its source said the host is gone", OrderID: id, UpdatedAt: now,
+			})
 		})
+}
+
+// closePoolOrderTx moves order id to gone with move, and settles its node out of the
+// fleet in the same transaction, proved or not as the closing says.
+func (a *Allocator) closePoolOrderTx(
+	ctx context.Context, id, from string, proven bool, actor string,
+	move func(state.WriteOps, string) (int64, error),
+) error {
+	now := a.now().UTC()
+
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		q := state.WriteQueries(tx)
+
+		row, err := q.ReadPoolOrder(ctx, id)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: no pool order %s", ErrPoolOrderMoved, id)
+		case err != nil:
+			return fmt.Errorf("alloc: read pool order %s: %w", id, err)
+		}
+
+		n, err := move(q, ts(now))
+		if err != nil {
+			return fmt.Errorf("alloc: move pool order %s: %w", id, err)
+		}
+
+		if n != 1 {
+			return fmt.Errorf("%w: %s is not %s", ErrPoolOrderMoved, id, from)
+		}
+
+		return settleClosedNodeTx(ctx, q, row.NodeName, proven, actor, now)
 	})
 }
 
@@ -696,9 +733,12 @@ func (a *Allocator) ClosePoolOrder(ctx context.Context, id, reason string) error
 		return fmt.Errorf("alloc: closing pool order %s needs the reason a person gave", id)
 	}
 
-	return a.movePoolOrder(ctx, id, PoolSealed+" or "+PoolReleased, func(w state.WriteOps, now string) (int64, error) {
-		return w.ClosePoolOrder(ctx, ledgerdb.ClosePoolOrderParams{
-			Reason: "closed by a person: " + reason, OrderID: id, UpdatedAt: now,
+	// A PERSON'S WORD IS NOT PROOF: a node the seal's proof no longer covers leaves the
+	// fleet recorded unproven, so every later drain says so rather than waiting on it.
+	return a.closePoolOrderTx(ctx, id, PoolSealed+" or "+PoolReleased, false, "billet pool close",
+		func(w state.WriteOps, now string) (int64, error) {
+			return w.ClosePoolOrder(ctx, ledgerdb.ClosePoolOrderParams{
+				Reason: "closed by a person: " + reason, OrderID: id, UpdatedAt: now,
+			})
 		})
-	})
 }

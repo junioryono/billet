@@ -392,7 +392,7 @@ SELECT EXISTS(SELECT 1 FROM pool_orders p
                WHERE (p.node_name = @name OR 'pool-' || p.order_id = @name)
                  AND p.state IN ('sealed', 'released', 'gone'));
 
--- name: UndoPoolRetirement :exec
+-- name: UndoPoolRetirement :execrows
 -- A sealed pool host's node listed compute since its seal retired it (ADR-030): the
 -- retirement the seal recorded is undone, so `billet drain` expects the node again and
 -- waits on it rather than counting it proved idle. Only the seal's own (@actor); a

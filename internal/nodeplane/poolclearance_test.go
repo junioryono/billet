@@ -149,14 +149,35 @@ func TestASlowPoolNodeHoldsUpOnlyItsOwnRelease(t *testing.T) {
 	quick(1)
 	untilPoolAskDone(t, p, "quick")
 
+	// THE SLOW NODE'S FIRST QUESTION IS OUT, queued and never taken, before anything is
+	// asked of it again.
+	for deadline := time.Now().Add(10 * time.Second); p.QueuedForTest(barrierHostName) != 1; {
+		if time.Now().After(deadline) {
+			t.Fatal("the slow node's first question was never queued")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
 	agePoolAsk(p, "slow")
 	agePoolAsk(p, "quick")
-	p.schedulePoolAsks(ctx)
-	quick(2)
+	p.poolMu.Lock()
+	aged := p.poolAskedAt["slow"]
+	p.poolMu.Unlock()
 
-	if got := p.QueuedForTest(barrierHostName); got != 1 {
-		t.Fatalf("the slow node holds %d queued asks, want its first alone", got)
+	p.schedulePoolAsks(ctx)
+
+	// THE CLAIM IS TAKEN BEFORE THE SCHEDULE RETURNS, so a second ask of the slow node,
+	// had one been started, would already have moved when it was last asked.
+	p.poolMu.Lock()
+	again := p.poolAskedAt["slow"]
+	p.poolMu.Unlock()
+
+	if !again.Equal(aged) {
+		t.Fatal("the slow node was asked again while its first question was still out")
 	}
+
+	quick(2)
 }
 
 // A NODE WHOSE WIRE HAS NO INVENTORY IS NOT ASKED FOR ITS RELEASE, as it is not for the

@@ -839,19 +839,63 @@ func computeListedTx(ctx context.Context, q state.WriteOps, node string) error {
 		return fmt.Errorf("alloc: contradict the release of pool node %s: %w", node, err)
 	}
 
-	if pool > 0 {
+	// A SEAL'S OWN RETIREMENT OF THE NODE IS UNDONE, whatever its order became since (a
+	// released host is not yet a gone one), so a drain expects the node again rather
+	// than counting as proved idle one that has since listed compute; a person's
+	// decommission is theirs, and stays.
+	undone, err := q.UndoPoolRetirement(ctx, ledgerdb.UndoPoolRetirementParams{
+		Name: node, Actor: poolReleaseActor,
+	})
+	if err != nil {
+		return fmt.Errorf("alloc: return pool node %s to the fleet: %w", node, err)
+	}
+
+	if pool > 0 || undone > 0 {
 		if err := q.DeleteBarrierRun(ctx, node); err != nil {
 			return fmt.Errorf("alloc: discard pool node %s's idle run: %w", node, err)
 		}
+	}
 
-		// AND A SEAL'S OWN RETIREMENT OF THE NODE IS UNDONE, so a drain expects it again
-		// rather than counting as proved idle a node that has since listed compute; a
-		// person's decommission is theirs, and stays.
-		if err := q.UndoPoolRetirement(ctx, ledgerdb.UndoPoolRetirementParams{
-			Name: node, Actor: poolReleaseActor,
-		}); err != nil {
-			return fmt.Errorf("alloc: return pool node %s to the fleet: %w", node, err)
-		}
+	return nil
+}
+
+// settleClosedNodeTx takes a closed order's node out of the fleet when nothing has
+// already proved it gone: an order closed is a host taken back, and a node left a member
+// would hold every later drain open on a machine that cannot answer. A person's word is
+// recorded unproven (proven 0), as `billet nodes decommission --force` records it, and a
+// source's own answer that the host is gone as proved. A node already decommissioned on
+// proof keeps that record, and a node that never registered has none.
+func settleClosedNodeTx(
+	ctx context.Context, q state.WriteOps, node string, proven bool, actor string, now time.Time,
+) error {
+	if node == "" {
+		return nil
+	}
+
+	facts, err := q.ReadNodeReleaseFacts(ctx, node)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("alloc: read %s's release facts: %w", node, err)
+	case facts.DecommissionProven == 1:
+		return nil
+	}
+
+	recorded := int64(0)
+	if proven {
+		recorded = 1
+	}
+
+	if err := q.DecommissionNode(ctx, ledgerdb.DecommissionNodeParams{
+		DecommissionedAt: ts(now), DecommissionProven: recorded, DecommissionActor: actor, Name: node,
+	}); err != nil {
+		return fmt.Errorf("alloc: take %s out of the fleet: %w", node, err)
+	}
+
+	if err := q.DeleteBarrierRun(ctx, node); err != nil {
+		return fmt.Errorf("alloc: clear the barrier run of node %s: %w", node, err)
 	}
 
 	return nil

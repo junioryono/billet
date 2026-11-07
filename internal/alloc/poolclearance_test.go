@@ -521,6 +521,79 @@ func TestComputeListedAfterTheSealReturnsTheNodeToTheFleet(t *testing.T) {
 	}
 }
 
+// WHAT A DRAIN EXPECTS OF A SEALED HOST'S NODE FOLLOWS EVERYTHING SAID OF IT SINCE: compute
+// listed after the source took the host back (released, not yet gone) returns the node
+// to the fleet and ends any barrier run recorded since; a person closing the order then
+// excludes it unproven, and the source's own answer that it is gone excludes it proved,
+// so no later drain waits on a node that cannot answer. Closing an order whose seal
+// still stands keeps the seal's proof.
+func TestASealedNodesPlaceInTheFleetFollowsItsOrder(t *testing.T) {
+	t.Parallel()
+	closeByHand := func(t *testing.T, a *Allocator) {
+		t.Helper()
+		if err := a.ClosePoolOrder(t.Context(), "pa", "took it back by hand"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, c := range map[string]struct {
+		listed bool
+		close  func(t *testing.T, a *Allocator)
+		proven bool
+	}{
+		"closed by a person after compute was listed": {true, closeByHand, false},
+		"gone on its source's word after compute was listed": {true, func(t *testing.T, a *Allocator) {
+			t.Helper()
+			if err := a.PoolOrderGone(t.Context(), "pa"); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		"closed by a person with the seal standing": {false, closeByHand, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+			a := poolAllocator(t, &now)
+			ctx := t.Context()
+			node := drainingPoolNode(t, a)
+			answerClearance(t, a, node, true)
+			now = now.Add(computeAbsenceGrace)
+			answerClearance(t, a, node, true)
+			if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			if err := a.PoolOrderReleased(ctx, "pa"); err != nil {
+				t.Fatal(err)
+			}
+
+			if c.listed {
+				// A BARRIER ANSWER IN FLIGHT AT THE SEAL, recorded after it, is a run the
+				// compute listed must end.
+				observeNode(t, a, requestBarrier(t, a), node, true)
+				if storedRuns(t, a) != 1 {
+					t.Fatal("no barrier run was staged")
+				}
+				if err := a.RecordPoolClearance(ctx, PoolClearanceObservation{
+					Order: "pa", Node: node, Fence: fenceOf(t, a, node), Running: true, AskedAt: now,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if slices.ContainsFunc(clearance(t, a).Excluded, func(e Exclusion) bool { return e.Node == node }) {
+					t.Fatal("a released host's node that listed compute since is still excluded from the fleet")
+				}
+				if got := storedRuns(t, a); got != 0 {
+					t.Fatalf("compute listed left %d barrier run(s) standing", got)
+				}
+			}
+
+			c.close(t, a)
+			excluded := clearance(t, a).Excluded
+			if !slices.ContainsFunc(excluded, func(e Exclusion) bool { return e.Node == node && e.Proven == c.proven }) {
+				t.Fatalf("after the order was %s, the node's exclusion is %+v, want proven %v", name, excluded, c.proven)
+			}
+		})
+	}
+}
+
 // A BARRIER ANSWER LISTING COMPUTE CONTRADICTS A RELEASE, whatever became of the barrier
 // and though the inventory it carried was never recorded: after the seal the proof is
 // refused, and the contradiction is the same one a clearance answer records.
