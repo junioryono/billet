@@ -67,6 +67,12 @@ func cmdAcceptanceRun(ctx context.Context, env cli.Env, args []string) error {
 			"for none proves nothing about whether anything can run here", *jobs)
 	}
 
+	// A WAIT WITH NO LENGTH is no bound at all: the compute barrier after the jobs takes
+	// its bound from it, and a drain given none waits forever.
+	if *wait <= 0 {
+		return fmt.Errorf("--wait %s: an acceptance run needs a positive bound on its wait", *wait)
+	}
+
 	// AND NOT MORE THAN THE HISTORY CAN SHOW. The wait counts terminal rows from a
 	// bounded read, so a request above that bound can never be satisfied — the run
 	// would wait out its whole `--wait` against a ledger that already held enough

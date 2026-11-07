@@ -5,11 +5,27 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
+
+// A RUN NEEDS A POSITIVE WAIT, refused before anything starts: its compute barrier takes
+// its bound from --wait, and a drain given none waits forever.
+func TestARunRefusesAWaitWithNoLength(t *testing.T) {
+	t.Parallel()
+
+	for _, wait := range []string{"0s", "-1m"} {
+		err := cmdAcceptanceRun(t.Context(), processEnv(), []string{
+			"--workspace", filepath.Join(t.TempDir(), "never-made"), "--wait", wait,
+		})
+		if err == nil || !strings.Contains(err.Error(), "positive bound") {
+			t.Errorf("--wait %s answered %v, want a refusal of a wait with no length", wait, err)
+		}
+	}
+}
 
 // STOPPED IS PROVED BY THE SERVICES' OWN LOCKS: a run's control plane or node that still
 // holds its lock is live, whatever the run that started it said, and only when both
