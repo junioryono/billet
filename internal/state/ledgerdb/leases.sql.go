@@ -640,6 +640,69 @@ func (q *Queries) ListLeaseIDsOnNode(ctx context.Context, arg ListLeaseIDsOnNode
 	return items, nil
 }
 
+const listOpenLeasesForHold = `-- name: ListOpenLeasesForHold :many
+SELECT l.id, COALESCE(l.node, l.target_node, '') AS node, l.vcpu, l.memory, l.tier, l.phase, l.created_at,
+       COALESCE(h.repo, '') AS repo, COALESCE(h.workflow_ref, '') AS workflow_ref,
+       COALESCE(h.job_name, '') AS job_name, COALESCE(h.started_at, '') AS started_at
+  FROM leases l
+  LEFT JOIN job_history h ON h.lease_id = l.id
+ WHERE l.phase NOT IN ('done','failed')
+ ORDER BY l.id
+ LIMIT CAST($1 AS BIGINT)
+`
+
+type ListOpenLeasesForHoldRow struct {
+	ID          string
+	Node        string
+	Vcpu        int64
+	Memory      int64
+	Tier        string
+	Phase       string
+	CreatedAt   string
+	Repo        string
+	WorkflowRef string
+	JobName     string
+	StartedAt   string
+}
+
+// Every open lease, with its host and what its runtime is predicted from, for
+// choosing a host to hold for a waiting shape. Bounded: a fleet past the bound is
+// one the choice cannot be made for, and says so.
+func (q *Queries) ListOpenLeasesForHold(ctx context.Context, maxRows int64) ([]ListOpenLeasesForHoldRow, error) {
+	rows, err := q.db.QueryContext(ctx, listOpenLeasesForHold, maxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListOpenLeasesForHoldRow
+	for rows.Next() {
+		var i ListOpenLeasesForHoldRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Node,
+			&i.Vcpu,
+			&i.Memory,
+			&i.Tier,
+			&i.Phase,
+			&i.CreatedAt,
+			&i.Repo,
+			&i.WorkflowRef,
+			&i.JobName,
+			&i.StartedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listServiceableRunnerLeaseIDs = `-- name: ListServiceableRunnerLeaseIDs :many
 SELECT leases.id FROM leases
  WHERE leases.tier = $1

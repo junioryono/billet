@@ -303,6 +303,9 @@ type BarrierObservation struct {
 	// that could not read its provider, or that reported instances, is not empty
 	// and its run is discarded.
 	Empty bool
+	// Running says the host read its provider and listed compute, which contradicts a
+	// pool release of it whether or not this barrier is still the one in force.
+	Running bool
 }
 
 // RecordBarrierObservation stores one fenced observation, or ends the run.
@@ -320,6 +323,15 @@ type BarrierObservation struct {
 func (a *Allocator) RecordBarrierObservation(ctx context.Context, obs BarrierObservation) error {
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		q := state.WriteQueries(tx)
+
+		// COMPUTE LISTED CONTRADICTS A POOL RELEASE FIRST, whatever became of the barrier:
+		// the inventory the same answer carried may not have been recorded, and this is
+		// then the only record of it (ADR-030).
+		if obs.Running {
+			if err := computeListedNowTx(ctx, q, obs.Node, obs.Fence.Epoch); err != nil {
+				return err
+			}
+		}
 
 		current, found, err := readBarrierTx(ctx, q)
 		if err != nil {
@@ -378,7 +390,11 @@ func (a *Allocator) RecordBarrierObservation(ctx context.Context, obs BarrierObs
 	})
 }
 
-// InvalidateBarrierRun discards a host's continuous-empty run.
+// InvalidateBarrierRun discards a host's continuous-empty run, and contradicts the
+// release of a pool host whose decommission proved it: the machine arriving contradicts
+// a person's word that it is gone, whether or not its registration is then refused
+// (ADR-030). The decommission itself stays as recorded, for the drain's clearance and a
+// CodeBuild fleet's claim, which a registration that is accepted moves.
 //
 // CALLED WHEN A REGISTRATION BEGINS, not when it commits. The ledger's epoch —
 // which is what fences a run — does not move until the registration's write
@@ -409,7 +425,7 @@ func (a *Allocator) InvalidateBarrierRun(ctx context.Context, node string) error
 
 	if err := a.db.View(ctx, func(q querier) error {
 		var err error
-		found, err = state.ReadQueries(q).BarrierRunExists(ctx, node)
+		found, err = state.ReadQueries(q).ArrivalHasProof(ctx, node)
 
 		return err
 	}); err != nil {
@@ -421,8 +437,14 @@ func (a *Allocator) InvalidateBarrierRun(ctx context.Context, node string) error
 	}
 
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
-		if err := state.WriteQueries(tx).DeleteBarrierRun(ctx, node); err != nil {
+		q := state.WriteQueries(tx)
+
+		if err := q.DeleteBarrierRun(ctx, node); err != nil {
 			return fmt.Errorf("alloc: discard node %s's idle run: %w", node, err)
+		}
+
+		if err := q.ContradictWaitingPoolRelease(ctx, node); err != nil {
+			return fmt.Errorf("alloc: contradict the release of pool node %s: %w", node, err)
 		}
 
 		return nil

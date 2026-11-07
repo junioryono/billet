@@ -438,6 +438,20 @@ func verifyScript(arch string, contract int, nonce string) (string, reportSchema
 		writeVerifyComponents(&b, step)
 	}
 
+	if contract >= 5 {
+		writeVerifyGuestCaches(&b, step)
+
+		// THE RECORD NAMES THE RUNNER THAT RUNS, because the cache conformance
+		// workflow refuses a candidate image by it, and a record of another version
+		// would pass an image that is not the one under test. Here, under the root
+		// the components step set, so a test points it at a fixture.
+		step("image record")
+		b.WriteString("test \"$(sed -n 's/^RUNNER_VERSION=//p' \"$billet_root\"" + imageRecordPath +
+			")\" = \"$billet_runner\"\n")
+		b.WriteString("test \"$(sed -n 's/^AMI_CONTRACT=//p' \"$billet_root\"" + imageRecordPath +
+			")\" = '" + strconv.Itoa(contract) + "'\n")
+	}
+
 	step("done")
 	b.WriteString("billet_verdict=" + verdictOK + "\n")
 
@@ -618,6 +632,60 @@ func writeVerifyEntryPoint(b *strings.Builder, step func(string)) {
 			"exit 1 ;;\n")
 		b.WriteString("esac\n")
 	}
+}
+
+// guestCacheFiles are the files of the guest half of every cache, in the order the
+// verifier digests them.
+func guestCacheFiles() ([]struct{ path, body string }, error) {
+	library, err := guestCachesLibrary()
+	if err != nil {
+		return nil, err
+	}
+
+	return []struct{ path, body string }{
+		{guestCachesPath, library},
+		{"/usr/local/bin/billet-actions-proxy", guestassets.ActionsProxyScript},
+		{"/usr/local/bin/billet-dns-upstreams", guestassets.DNSUpstreamsScript},
+		{"/usr/local/bin/docker", guestassets.DockerShimScript},
+		{"/opt/billet/bin/docker", guestassets.DockerShimScript},
+		{"/usr/local/lib/billet/container-hook/index.js", guestassets.ContainerHookScript},
+	}, nil
+}
+
+// writeVerifyGuestCaches asserts what AMIContract 5 is about: the image carries the
+// guest half of every cache, byte for byte, and what it runs runs.
+//
+// ONE DIGEST OVER ALL OF THEM, because the verification script is user data with a
+// budget, and a failure this far into a verification is a rebuild whichever file it
+// was. `cat` of a missing file changes the digest as surely as a changed one.
+func writeVerifyGuestCaches(b *strings.Builder, step func(string)) {
+	step("guest caches")
+
+	files, err := guestCacheFiles()
+	if err != nil {
+		b.WriteString("echo 'this billet cannot say what its guest caches are' >&2; exit 1\n")
+
+		return
+	}
+
+	digest := sha256.New()
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		digest.Write([]byte(f.body))
+		paths = append(paths, "\"$billet_root"+f.path+"\"")
+	}
+	b.WriteString("billet_sum=$(cat " + strings.Join(paths, " ") + " | sha256sum)\n")
+	b.WriteString("case \"$billet_sum\" in\n")
+	b.WriteString("  '" + hex.EncodeToString(digest.Sum(nil)) + "  -') ;;\n")
+	b.WriteString("  *) echo 'the guest caches are not the files this billet installs' >&2; exit 1 ;;\n")
+	b.WriteString("esac\n")
+
+	// WHAT THEY RUN, the way a job's step runs it: an image whose helper cannot start
+	// has a Go cache that fails every build.
+	b.WriteString("test -x \"$billet_root/usr/sbin/dnsmasq\"\n")
+	b.WriteString("test -s \"$billet_root/usr/local/lib/billet/container-hook/upstream.js\"\n")
+	b.WriteString("test -x \"$billet_root/opt/billet/bin/bazel-credential-helper\"\n")
+	b.WriteString(verifyRunAsRunner + " \"$billet_root" + guestBilletPath + "\" version >/dev/null\n")
 }
 
 // writeVerifyToolchains runs each of arch's toolchains the way a job's step

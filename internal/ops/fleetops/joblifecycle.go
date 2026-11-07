@@ -135,6 +135,16 @@ func describeFailure(rec alloc.JobRecord) string {
 		}
 		parts = append(parts, disruption)
 	}
+	if rec.RerunDecision != "" {
+		rerun := "re-run: " + strconv.Quote(string(rec.RerunDecision))
+		if rec.RerunAttempt > 0 {
+			rerun += fmt.Sprintf(" of attempt %d", rec.RerunAttempt)
+		}
+		if rec.RerunDecidedAt != "" {
+			rerun += " at " + rec.RerunDecidedAt
+		}
+		parts = append(parts, rerun)
+	}
 	if len(parts) == 0 {
 		return "none recorded"
 	}

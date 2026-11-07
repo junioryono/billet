@@ -312,6 +312,19 @@ SELECT tier,
   FROM leases WHERE phase NOT IN ('done','failed')
  GROUP BY tier;
 
+-- name: ListOpenLeasesForHold :many
+-- Every open lease, with its host and what its runtime is predicted from, for
+-- choosing a host to hold for a waiting shape. Bounded: a fleet past the bound is
+-- one the choice cannot be made for, and says so.
+SELECT l.id, COALESCE(l.node, l.target_node, '') AS node, l.vcpu, l.memory, l.tier, l.phase, l.created_at,
+       COALESCE(h.repo, '') AS repo, COALESCE(h.workflow_ref, '') AS workflow_ref,
+       COALESCE(h.job_name, '') AS job_name, COALESCE(h.started_at, '') AS started_at
+  FROM leases l
+  LEFT JOIN job_history h ON h.lease_id = l.id
+ WHERE l.phase NOT IN ('done','failed')
+ ORDER BY l.id
+ LIMIT CAST(@max_rows AS BIGINT);
+
 -- name: CountActiveRunnerLeases :one
 -- How many runners GitHub could still route a job to, in one tier.
 --

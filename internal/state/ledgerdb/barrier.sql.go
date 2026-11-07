@@ -21,19 +21,26 @@ func (q *Queries) AnyBarrierRunExists(ctx context.Context) (bool, error) {
 	return exists, err
 }
 
-const barrierRunExists = `-- name: BarrierRunExists :one
-SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = $1)
+const arrivalHasProof = `-- name: ArrivalHasProof :one
+SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = $1
+              UNION ALL
+              SELECT 1 FROM pool_orders
+               WHERE node_name = $1 AND node_name != '' AND state = 'placed'
+                 AND (release_contradicted = 0 OR clear_since != ''))
 `
 
-// Whether one host has a run at all.
+// Whether one host has anything an arrival discards: a continuous-empty run, or a pool
+// order still waiting on it whose release its decommission still proves, or one with a
+// clearance run, which the arrival ends whether or not the release was contradicted
+// before (ADR-030). A sealed order is not an arrival's (ContradictWaitingPoolRelease).
 //
 // READ BEFORE THE WRITE, and that is not a micro-optimisation: the invalidation
 // runs on EVERY registration, ahead of the revocation check, so a credential an
 // operator has taken back can call it as fast as it can open connections. An
 // unconditional write transaction would let it reserve SQLite's single writer
 // slot over and over and starve every scheduling decision in the process.
-func (q *Queries) BarrierRunExists(ctx context.Context, node string) (bool, error) {
-	row := q.db.QueryRowContext(ctx, barrierRunExists, node)
+func (q *Queries) ArrivalHasProof(ctx context.Context, node string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, arrivalHasProof, node)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err

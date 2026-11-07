@@ -163,7 +163,9 @@ func TestCIScopeReplayRuleCoversTheReplayClosure(t *testing.T) {
 	const module = "github.com/junioryono/billet/"
 	seen := 0
 	for _, pkg := range strings.Fields(string(out)) {
-		if !strings.HasPrefix(pkg, module+"internal/") {
+		// Every package of billet's, not only internal/: deploy is in the
+		// closure through internal/lifeops.
+		if !strings.HasPrefix(pkg, module) {
 			continue
 		}
 		// A test binary appears as "pkg.test" and its package as "pkg [pkg.test]".
@@ -449,6 +451,8 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"internal/provider/simulated/sim.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/store/ceph/ceph.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/provider/testdata/shape.json", families(append([]string{"replay"}, application...)...)},
+		// The EC2 provider embeds its text, so it is part of every binary.
+		{"scripts/build-guest-image.sh", families(append([]string{"replay"}, application...)...)},
 		{"internal/store/embedded/schema.json", families(append([]string{"replay"}, application...)...)},
 		{"tools/lint/go.work", "all"},
 		{"internal/state/migrations/0099_x.sql", families(append([]string{"postgres", "replay"}, application...)...)},
@@ -459,7 +463,10 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"internal/pgdump/pgdump_test.go", families(append([]string{"postgres"}, application...)...)},
 		{"internal/e2e/restore_test.go", families(append([]string{"postgres"}, application...)...)},
 		{"internal/e2e/lifecycle_test.go", families(application...)},
-		{"deploy/billet-server.service", families(application...)},
+		{"deploy/billet-server.service", families(append([]string{"replay"}, application...)...)},
+		// The one package of scripts/ the harness builds, not its tests.
+		{"scripts/amibuild.go", families("lint", "postgres", "replay")},
+		{"scripts/amibuild_test.go", families("lint")},
 		// The collection and the retirement shard checker.
 		{"ansible_collections/junioryono/billet/roles/host/tasks/main.yml",
 			families("host_lifecycle", "postgres_command", "postgres_retirement")},

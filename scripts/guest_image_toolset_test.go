@@ -1,6 +1,8 @@
 package scripts_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,7 +60,7 @@ func TestTheDeclarationMustMatchItsPinBeforeAnythingIsBuilt(t *testing.T) {
 			}
 
 			script := "#!/usr/bin/env bash\nset -euo pipefail\n" +
-				"TOOLSET_FILE=" + toolset + "\nTOOLSET_PIN=" + pin + "\n" +
+				"TOOLSET_FILE=" + toolset + "\nTOOLSET_PIN=" + pin + "\nTOOLSET_PIN_KEY=x64\n" +
 				guestImageFunction(t, "verify_toolset") + "\n" +
 				"verify_toolset\necho VERIFIED\n"
 
@@ -105,4 +107,52 @@ func runHarness(t *testing.T, script string) (string, error) {
 	out, err := exec.CommandContext(t.Context(), "bash", path).CombinedOutput()
 
 	return string(out), err
+}
+
+// EACH MACHINE'S TOOLSET IS HELD TO ITS OWN LINE OF THE PIN, the first for x64 and the
+// one named for arm64: the wrong line reads as an edit, and a line that is not there
+// must not read as a declaration nobody pinned.
+func TestAToolsetIsHeldToItsMachinesLineOfThePin(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("{}\n")
+	sum := sha256.Sum256(body)
+	right := hex.EncodeToString(sum[:])
+	wrong := strings.Repeat("0", 64)
+
+	for name, tc := range map[string]struct {
+		key, pin string
+		want     bool
+	}{
+		"x64's line":                {"x64", "commit " + right + "\narm64 " + wrong + "\n", true},
+		"arm64's line":              {"arm64", "commit " + wrong + "\narm64 " + right + "\n", true},
+		"arm64 reading x64's":       {"arm64", "commit " + right + "\narm64 " + wrong + "\n", false},
+		"x64 reading arm64's":       {"x64", "commit " + wrong + "\narm64 " + right + "\n", false},
+		"arm64 with no line at all": {"arm64", "commit " + right + "\n", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			toolset := filepath.Join(dir, "toolset.json")
+			pin := filepath.Join(dir, "pinned.txt")
+
+			if err := os.WriteFile(toolset, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.WriteFile(pin, []byte(tc.pin), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			script := "#!/usr/bin/env bash\nset -euo pipefail\n" +
+				"TOOLSET_FILE=" + toolset + "\nTOOLSET_PIN=" + pin + "\nTOOLSET_PIN_KEY=" + tc.key + "\n" +
+				guestImageFunction(t, "verify_toolset") + "\nverify_toolset\necho VERIFIED\n"
+
+			out, err := runHarness(t, script)
+			if got := err == nil && strings.Contains(out, "VERIFIED"); got != tc.want {
+				t.Fatalf("verified = %v, want %v (%v)\n%s", got, tc.want, err, out)
+			}
+		})
+	}
 }

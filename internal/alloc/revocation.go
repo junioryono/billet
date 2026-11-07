@@ -113,6 +113,9 @@ const (
 	CertEnrolled = "enrolled"
 	CertIssued   = "issued"
 	CertRenewed  = "renewed"
+	// CertPool is a certificate signed for a pool host its source vouched for
+	// (ADR-030), with no person comparing its fingerprint.
+	CertPool = "pool"
 )
 
 // RecordIssuedCert writes down a credential at the moment it is handed out.
@@ -285,54 +288,15 @@ func (a *Allocator) RevokeNode(ctx context.Context, node, reason string) ([]Issu
 	// first and the renewal is refused for renewing a revoked certificate.
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		revoked = nil
-		now := ts(a.now().UTC())
-
 		q := state.WriteQueries(tx)
 
-		live, err := liveCertsForTx(ctx, q, node, now)
+		live, err := liveCertsForTx(ctx, q, node, ts(a.now().UTC()))
 		if err != nil {
 			return err
 		}
 
-		for i := range live {
-			if err := q.RevokeCert(ctx, ledgerdb.RevokeCertParams{
-				Serial:    live[i].Serial,
-				Node:      node,
-				Reason:    reason,
-				RevokedAt: now,
-			}); err != nil {
-				return fmt.Errorf("alloc: revoke certificate %s: %w", live[i].Serial, err)
-			}
-		}
-
-		// AND A CUTOFF, which is what reaches the credentials billet cannot name.
-		//
-		// Two ways for one to exist: a deployment upgraded from a version that did
-		// not record serials, and a name issued more than once before it did — the
-		// admission trail keeps one row per node and overwrites it, so an earlier
-		// certificate is unrecoverable. Recording the moment refuses every
-		// certificate for this name minted before it, seen or not, while a
-		// replacement issued afterwards still works.
-		// ROUNDED UP TO THE NEXT SECOND, because a certificate cannot express
-		// anything finer. X.509 stores validity at one-second resolution, so the
-		// issuance moment recovered from a certificate is always truncated — and a
-		// cutoff carrying nanoseconds would sit AFTER a replacement minted in the
-		// same second, refusing it. Rounding up puts the boundary between whole
-		// seconds, where both sides can express it.
-		//
-		// The ambiguity inside the revocation's own second resolves toward
-		// REFUSING: a credential minted in that second is treated as predating the
-		// revocation. Re-issuing a second later is a second's inconvenience;
-		// accepting a compromised certificate is not recoverable.
-		cutoff := ts(a.now().UTC().Truncate(time.Second).Add(time.Second))
-
-		if err := q.RecordNodeRevocation(ctx, ledgerdb.RecordNodeRevocationParams{
-			Node:          node,
-			RevokedBefore: cutoff,
-			Reason:        reason,
-			RevokedAt:     now,
-		}); err != nil {
-			return fmt.Errorf("alloc: record the revocation cutoff for %s: %w", node, err)
+		if err := revokeNodeTx(ctx, q, node, reason, a.now().UTC()); err != nil {
+			return err
 		}
 
 		revoked = live
@@ -392,4 +356,60 @@ func (a *Allocator) CertRevokedFor(
 	})
 
 	return revoked, err
+}
+
+// revokeNodeTx withdraws every credential a node holds, inside the caller's transaction:
+// each certificate outstanding by serial, and a cutoff for those billet cannot name.
+// RevokeNode is its one transaction; a pool host's release seal is another, so its
+// certificates are revoked before its source is asked to take it back.
+func revokeNodeTx(ctx context.Context, q state.WriteOps, node, reason string, at time.Time) error {
+	now := ts(at)
+
+	live, err := liveCertsForTx(ctx, q, node, now)
+	if err != nil {
+		return err
+	}
+
+	for i := range live {
+		if err := q.RevokeCert(ctx, ledgerdb.RevokeCertParams{
+			Serial:    live[i].Serial,
+			Node:      node,
+			Reason:    reason,
+			RevokedAt: now,
+		}); err != nil {
+			return fmt.Errorf("alloc: revoke certificate %s: %w", live[i].Serial, err)
+		}
+	}
+
+	// AND A CUTOFF, which is what reaches the credentials billet cannot name.
+	//
+	// Two ways for one to exist: a deployment upgraded from a version that did
+	// not record serials, and a name issued more than once before it did — the
+	// admission trail keeps one row per node and overwrites it, so an earlier
+	// certificate is unrecoverable. Recording the moment refuses every
+	// certificate for this name minted before it, seen or not, while a
+	// replacement issued afterwards still works.
+	// ROUNDED UP TO THE NEXT SECOND, because a certificate cannot express
+	// anything finer. X.509 stores validity at one-second resolution, so the
+	// issuance moment recovered from a certificate is always truncated — and a
+	// cutoff carrying nanoseconds would sit AFTER a replacement minted in the
+	// same second, refusing it. Rounding up puts the boundary between whole
+	// seconds, where both sides can express it.
+	//
+	// The ambiguity inside the revocation's own second resolves toward
+	// REFUSING: a credential minted in that second is treated as predating the
+	// revocation. Re-issuing a second later is a second's inconvenience;
+	// accepting a compromised certificate is not recoverable.
+	cutoff := ts(at.Truncate(time.Second).Add(time.Second))
+
+	if err := q.RecordNodeRevocation(ctx, ledgerdb.RecordNodeRevocationParams{
+		Node:          node,
+		RevokedBefore: cutoff,
+		Reason:        reason,
+		RevokedAt:     now,
+	}); err != nil {
+		return fmt.Errorf("alloc: record the revocation cutoff for %s: %w", node, err)
+	}
+
+	return nil
 }

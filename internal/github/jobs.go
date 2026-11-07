@@ -30,7 +30,8 @@ type JobRecords interface {
 }
 
 // QueueTimes reads what GitHub's list of a run's jobs says of each, by the name of
-// the runner that ran it: when GitHub queued it and the commit it ran on.
+// the runner that ran it: when GitHub queued it, the commit it ran on and which
+// attempt of the run it was.
 //
 // GITHUB'S QUEUE TIME IS THE JOB'S created_at, because the scale-set protocol
 // does not carry it: every JobStarted, JobAssigned and JobCompleted billet's
@@ -38,6 +39,10 @@ type JobRecords interface {
 // queueTime 0001-01-01, and no JobAvailable arrived at all. The REST record's
 // created_at fell a second or less before the start's scaleSetAssignTime on the
 // jobs compared. It is whole seconds.
+//
+// THE ATTEMPT IS THE RECORD'S run_attempt, which no scale-set message carries
+// either (actions/scaleset v0.4.0, checked 2026-10-16). A re-run keeps the run id
+// and lists each attempt's jobs under it, on runners of their own.
 type QueueTimes interface {
 	RunJobs(ctx context.Context, owner, repository string, runID int64) (map[string]RunJob, error)
 }
@@ -56,12 +61,21 @@ type RunJob struct {
 	RunAttempt int64
 }
 
-// WorkflowJob is the part of GitHub's job record `billet jobs show` reads.
+// WorkflowJob is the part of GitHub's job record `billet jobs show` reads. Status
+// is the job's own, `completed` once GitHub has concluded it and its steps, and
+// empty where the record does not say.
 type WorkflowJob struct {
 	ID         int64
 	Name       string
 	RunAttempt int64
+	Status     string
 	Steps      []JobStep
+}
+
+// RunJobRecords reads every job of a run, with its steps, by the name of the runner
+// that ran it. A target's policy client implements it.
+type RunJobRecords interface {
+	RunnerJobs(ctx context.Context, owner, repository string, runID int64) (map[string]WorkflowJob, error)
 }
 
 // JobStep is one step of a job as GitHub records it. StartedAt and
@@ -112,6 +126,19 @@ func NewJobRecordsAt(base string, target Target, appID, installationID int64,
 	return newRunnerGroupPolicyClient(defaultPolicyBounds, base, target, appID, installationID, privateKey)
 }
 
+// NewJobRecordsWith is the job-record reader on tokens a source hands it, for a
+// deployment holding no App key of its own.
+func NewJobRecordsWith(base string, target Target, appID, installationID int64, tokens TokenSource) JobRecords {
+	if base == "" {
+		base = apiBase
+	}
+
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, base, target, appID, installationID, nil)
+	c.tokens = tokens
+
+	return c
+}
+
 // jobRecord is one entry of GitHub's job list, every field a pointer so an
 // absent one is told from an empty one. RunnerName is raw so that an absent
 // field (could not tell) is told from null (no runner yet).
@@ -121,8 +148,11 @@ type jobRecord struct {
 	RunAttempt *int64          `json:"run_attempt"`
 	RunnerName json.RawMessage `json:"runner_name"`
 	CreatedAt  *string         `json:"created_at"`
+	Status     *string         `json:"status"`
+	Conclusion *string         `json:"conclusion"`
 	HeadSHA    *string         `json:"head_sha"`
 	HeadBranch *string         `json:"head_branch"`
+	StartedAt  *string         `json:"started_at"`
 	Steps      *[]struct {
 		Number      *int64  `json:"number"`
 		Name        *string `json:"name"`
@@ -153,7 +183,7 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 	}
 
 	var matches []WorkflowJob
-	err := c.listRunJobs(ctx, owner, repository, runID, MaxRunJobs, func(record jobRecord, name string) error {
+	err := c.listRunJobs(ctx, owner, repository, runID, "all", MaxRunJobs, func(record jobRecord, name string) error {
 		if name != runnerName {
 			return nil
 		}
@@ -179,15 +209,16 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 	}
 }
 
-// RunJobs reads when GitHub queued each job of a run that has a runner and the
-// commit it ran on, keyed by the runner's name, across every attempt of the run.
+// RunnerJobs reads every job of a run that has a runner, with its steps, keyed by
+// the runner's name, across every attempt of the run, in one read of the list.
 //
-// A NAME TWO JOBS SHARE IS LEFT OUT rather than given either's record, and a job
-// whose created_at is absent or unreadable is left out with it: the caller
-// reads a missing name as could-not-tell.
-func (c *runnerGroupPolicyClient) RunJobs(
+// A NAME TWO JOBS SHARE IS LEFT OUT rather than given either's record, and the
+// caller reads a missing name as could-not-tell; so is a record that does not say
+// enough to read. The list is bounded as RunJobs' is, since it is read beside
+// scheduling from the same hourly budget.
+func (c *runnerGroupPolicyClient) RunnerJobs(
 	ctx context.Context, owner, repository string, runID int64,
-) (map[string]RunJob, error) {
+) (map[string]WorkflowJob, error) {
 	if !c.configured() {
 		return nil, errJobRecordsUnavailable
 	}
@@ -195,9 +226,9 @@ func (c *runnerGroupPolicyClient) RunJobs(
 		return nil, fmt.Errorf("github: a workflow run needs a positive id, not %d", runID)
 	}
 
-	jobs := map[string]RunJob{}
+	jobs := map[string]WorkflowJob{}
 	shared := map[string]bool{}
-	err := c.listRunJobs(ctx, owner, repository, runID, MaxQueueTimeRunJobs, func(record jobRecord,
+	err := c.listRunJobs(ctx, owner, repository, runID, "all", MaxQueueTimeRunJobs, func(record jobRecord,
 		name string,
 	) error {
 		if name == "" || shared[name] {
@@ -208,20 +239,10 @@ func (c *runnerGroupPolicyClient) RunJobs(
 			shared[name] = true
 			return nil
 		}
-		queued, ok := createdAt(record.CreatedAt)
-		if !ok {
+		job, readable := readableJob(record)
+		if !readable {
 			shared[name] = true
 			return nil
-		}
-		job := RunJob{QueuedAt: queued}
-		if record.HeadSHA != nil {
-			job.HeadSHA = *record.HeadSHA
-		}
-		if record.HeadBranch != nil {
-			job.HeadBranch = *record.HeadBranch
-		}
-		if record.RunAttempt != nil {
-			job.RunAttempt = *record.RunAttempt
 		}
 		jobs[name] = job
 		return nil
@@ -233,14 +254,130 @@ func (c *runnerGroupPolicyClient) RunJobs(
 	return jobs, nil
 }
 
-// listRunJobs hands visit every job of a run, across every attempt, with the
-// name of the runner it ran on (empty for none).
+// readableJob is a job record read, false for one too incomplete to read, which
+// RunnerJobs leaves out as could-not-tell rather than fail the whole run for.
+func readableJob(record jobRecord) (WorkflowJob, bool) {
+	job, err := workflowJobOf(record)
+
+	return job, err == nil
+}
+
+// RunJobs reads when GitHub queued each job of a run that has a runner, the commit
+// it ran on and which attempt of the run it was, keyed by the runner's name, across
+// every attempt of the run.
+//
+// A RE-RUN OF FAILED JOBS CARRIES EACH PASSED JOB FORWARD: GitHub lists it again under
+// the new attempt, with the same runner, a new id, the same start and finish and a
+// created_at of when the re-run was asked for (measured on billet's own runs on
+// 2026-11-04: run 39813415826's job on one runner is attempt 2 created 17:09:06 and
+// attempt 3 created 20:03:23, both started 17:22:38). The runner ran it once, in the
+// lowest attempt it is listed under, and that entry holds what is true of it.
+//
+// A NAME TWO JOBS SHARE OTHERWISE IS LEFT OUT rather than given either's record: a
+// name listed more than once is a carried job only when every entry names its own
+// attempt and they all give the same start, which a copy keeps and two runs on one
+// runner do not. So is a name any entry of which has an absent or unreadable
+// created_at, and the caller reads a missing name as could-not-tell.
+func (c *runnerGroupPolicyClient) RunJobs(
+	ctx context.Context, owner, repository string, runID int64,
+) (map[string]RunJob, error) {
+	if !c.configured() {
+		return nil, errJobRecordsUnavailable
+	}
+	if runID <= 0 {
+		return nil, fmt.Errorf("github: a workflow run needs a positive id, not %d", runID)
+	}
+
+	// EVERY ENTRY OF A NAME IS READ BEFORE THE NAME IS DECIDED, so the answer cannot
+	// depend on the order GitHub lists them in.
+	listed := map[string][]runEntry{}
+	unreadable := map[string]bool{}
+	err := c.listRunJobs(ctx, owner, repository, runID, "all", MaxQueueTimeRunJobs, func(record jobRecord,
+		name string,
+	) error {
+		if name == "" {
+			return nil
+		}
+		queued, ok := createdAt(record.CreatedAt)
+		if !ok {
+			unreadable[name] = true
+			return nil
+		}
+		job := RunJob{QueuedAt: queued}
+		if record.HeadSHA != nil {
+			job.HeadSHA = *record.HeadSHA
+		}
+		if record.HeadBranch != nil {
+			job.HeadBranch = *record.HeadBranch
+		}
+		if record.RunAttempt != nil && *record.RunAttempt > 0 {
+			job.RunAttempt = *record.RunAttempt
+		}
+		entry := runEntry{job: job}
+		if record.StartedAt != nil {
+			entry.started = *record.StartedAt
+		}
+		listed[name] = append(listed[name], entry)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	jobs := map[string]RunJob{}
+	for name, entries := range listed {
+		if unreadable[name] {
+			continue
+		}
+		if job, ok := ranOn(entries); ok {
+			jobs[name] = job
+		}
+	}
+
+	return jobs, nil
+}
+
+// runEntry is one entry of a run's job list under a runner's name: what it says of
+// the job, and its started_at as GitHub spelled it, which a carried copy repeats.
+type runEntry struct {
+	job     RunJob
+	started string
+}
+
+// ranOn is the entry of the job a runner ran, from every entry GitHub lists under the
+// runner's name: the one entry there is, or the lowest attempt of several, which
+// every later attempt carried forward. False is a name the entries cannot settle: an
+// entry with no attempt beside another, two entries of one attempt, or entries that
+// do not all give the same recorded start, which are two runs and no copy.
+func ranOn(entries []runEntry) (RunJob, bool) {
+	if len(entries) == 1 {
+		return entries[0].job, true
+	}
+
+	seen := map[int64]bool{}
+	lowest := entries[0]
+	for _, e := range entries {
+		if e.job.RunAttempt <= 0 || seen[e.job.RunAttempt] || e.started == "" || e.started != entries[0].started {
+			return RunJob{}, false
+		}
+		seen[e.job.RunAttempt] = true
+		if e.job.RunAttempt < lowest.job.RunAttempt {
+			lowest = e
+		}
+	}
+
+	return lowest.job, true
+}
+
+// listRunJobs hands visit every job of a run the filter names, `all` for every
+// attempt or `latest` for the newest, with the name of the runner it ran on (empty
+// for none).
 //
 // THE WHOLE LIST OR AN ERROR: a list longer than maxJobs, one whose count
 // changes while it is read, or one that repeats a job is could-not-tell rather
 // than a prefix. maxJobs is at most MaxRunJobs.
 func (c *runnerGroupPolicyClient) listRunJobs(ctx context.Context, owner, repository string,
-	runID int64, maxJobs int, visit func(record jobRecord, runnerName string) error,
+	runID int64, filter string, maxJobs int, visit func(record jobRecord, runnerName string) error,
 ) error {
 	endpoint, err := repositoryEndpoint(c.base, owner, repository)
 	if err != nil {
@@ -259,7 +396,7 @@ func (c *runnerGroupPolicyClient) listRunJobs(ctx context.Context, owner, reposi
 			return fmt.Errorf("github: run %d's %d jobs did not arrive in %d pages",
 				runID, total, maxPages)
 		}
-		query := url.Values{"filter": {"all"}, "per_page": {strconv.Itoa(runJobsPerPage)},
+		query := url.Values{"filter": {filter}, "per_page": {strconv.Itoa(runJobsPerPage)},
 			"page": {strconv.Itoa(page)}}
 		var body struct {
 			TotalCount *int         `json:"total_count"`
@@ -347,6 +484,9 @@ func workflowJobOf(record jobRecord) (WorkflowJob, error) {
 	job := WorkflowJob{ID: *record.ID, Name: *record.Name}
 	if record.RunAttempt != nil {
 		job.RunAttempt = *record.RunAttempt
+	}
+	if record.Status != nil {
+		job.Status = *record.Status
 	}
 	for _, s := range *record.Steps {
 		if s.Number == nil || s.Name == nil {

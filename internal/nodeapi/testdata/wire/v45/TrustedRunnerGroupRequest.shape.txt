@@ -1,0 +1,5 @@
+TrustedRunnerGroupRequest.tier tag omitempty
+TrustedRunnerGroupRequest.tier string
+TrustedRunnerGroupRequest.group string
+TrustedRunnerGroupRequest.workflows slice
+TrustedRunnerGroupRequest.workflows[] string

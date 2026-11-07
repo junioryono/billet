@@ -199,6 +199,37 @@ func TestCheckNamesAComponentNoLongerAccepted(t *testing.T) {
 }
 
 // TIERS THAT SHARE AN IMAGE ARE NAMED TOGETHER, once.
+// A COMPONENT THE MACHINE'S TEMPLATE DOES NOT INSTALL IS NAMED, because nothing else says
+// so: an arm64 image leaves out Firefox alone, so a deployment accepting Chrome gets no
+// completion and no gap either, and a job finds no Chrome. What the image does leave out
+// and completed says nothing of the kind.
+func TestCheckNamesAnAcceptedComponentTheImageDoesNotOffer(t *testing.T) {
+	t.Parallel()
+
+	store := fakeComponentsChecker{verified: "g20261104000000", records: map[string]ceph.GenerationComponents{
+		"g20261104000000": {LeftOut: []string{"firefox"}, Installed: map[string]string{"firefox": "159.0.1"}},
+	}}
+
+	out := checkComponents(t, store, "images:\n  accept: [firefox, google-chrome]\n", "")
+	if !strings.Contains(out, "does not offer google-chrome") {
+		t.Errorf("an accepted component the template has no installer for was not named:\n%s", out)
+	}
+	if strings.Contains(out, "does not offer firefox") {
+		t.Errorf("a component the image offers was named as one it does not:\n%s", out)
+	}
+
+	if out := checkComponents(t, store, "images:\n  accept: [firefox]\n", ""); strings.Contains(out, "does not offer") {
+		t.Errorf("a deployment accepting only what is offered was told otherwise:\n%s", out)
+	}
+
+	// LEFT OUT AND NOT YET INSTALLED IS OFFERED: a completion brings it, and a generation
+	// waiting for one is told so elsewhere.
+	store.records["g20261104000000"] = ceph.GenerationComponents{LeftOut: []string{"firefox"}}
+	if out := checkComponents(t, store, "images:\n  accept: [firefox]\n", ""); strings.Contains(out, "does not offer") {
+		t.Errorf("a component the image left out to complete was named as one it does not offer:\n%s", out)
+	}
+}
+
 func TestCheckNamesEveryTierThatBootsAnImage(t *testing.T) {
 	store := fakeComponentsChecker{verified: completedGeneration, records: map[string]ceph.GenerationComponents{
 		completedGeneration: {LeftOut: []string{"codeql"}, Installed: map[string]string{}},

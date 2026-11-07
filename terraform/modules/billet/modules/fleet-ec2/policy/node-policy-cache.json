@@ -20,9 +20,31 @@
       "Action": [
         "ec2:RunInstances"
       ],
-      "Resource": [
-        "*"
+      "NotResource": [
+        "arn:TFPARTITION:ec2:*:*:instance/*",
+        "arn:TFPARTITION:ec2:*:*:volume/*"
       ]
+    },
+    {
+      "Sid": "BilletRuntimeLaunchOwned",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:ec2:*:*:instance/*",
+        "arn:TFPARTITION:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "aws:TagKeys": [
+            "sh.billet.owner"
+          ]
+        },
+        "Null": {
+          "aws:RequestTag/sh.billet.owner": "false"
+        }
+      }
     },
     {
       "Sid": "BilletRuntimeDenyForeignSnapshot",
@@ -204,6 +226,32 @@
           ]
         }
       }
+    },
+    {
+      "Sid": "BilletCacheObjectsEvict",
+      "Effect": "Allow",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:s3:::TFBUCKET/TFPREFIX/owners/*/archives/*",
+        "arn:TFPARTITION:s3:::TFBUCKET/TFPREFIX/owners/*/archive-used/*",
+        "arn:TFPARTITION:s3:::TFBUCKET/TFPREFIX/owners/*/stage/*",
+        "arn:TFPARTITION:s3:::TFBUCKET/TFPREFIX/owners/*/blobs/*",
+        "arn:TFPARTITION:s3:::TFBUCKET/TFPREFIX/owners/*/blob-uses/*"
+      ]
+    },
+    {
+      "Sid": "BilletCacheUploads",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Resource": [
+        "arn:TFPARTITION:s3:::TFBUCKET"
+      ]
     }
   ]
 }

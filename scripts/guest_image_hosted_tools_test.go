@@ -35,8 +35,15 @@ func hostedToolsArray(t *testing.T) (string, []string) {
 func runHostedGate(t *testing.T, root string) string {
 	t.Helper()
 
+	return runHostedGateAs(t, root, "X64")
+}
+
+// runHostedGateAs is runHostedGate on a machine whose GOROOT variables end in SUFFIX.
+func runHostedGateAs(t *testing.T, root, suffix string) string {
+	t.Helper()
+
 	declaration, _ := hostedToolsArray(t)
-	script := "#!/usr/bin/env bash\nset -euo pipefail\nFAILED=0\n" +
+	script := "#!/usr/bin/env bash\nset -euo pipefail\nFAILED=0\nGOROOT_SUFFIX=" + suffix + "\n" +
 		"pass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n" +
 		declaration + "\n" + checkImageFunction(t, "image_resolve") + "\n" +
 		checkImageFunction(t, "image_executable") + "\n" + checkImageFunction(t, "check_hosted_tools") + "\n" +

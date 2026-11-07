@@ -8,6 +8,44 @@ import (
 	"testing"
 )
 
+// AN IMAGE WITH A JOB-STARTED HOOK OF ITS OWN NAMES IT, because the runner runs one and
+// interception takes that slot. What it does cannot fail the job: this hook runs it
+// last, whatever it answers, and a failure of it is its own business.
+func TestTheJobStartedHookRunsTheImagesOwnAfterItself(t *testing.T) {
+	t.Parallel()
+
+	hook := jobStartedHook(t)
+	dir := t.TempDir()
+	source := filepath.Join(dir, "ca.pem")
+	environment := filepath.Join(dir, "github.env")
+	for _, file := range []string{source, environment} {
+		if err := os.WriteFile(file, nil, 0o600); err != nil {
+			t.Fatalf("write %s: %v", file, err)
+		}
+	}
+	ran := filepath.Join(dir, "ran")
+	next := filepath.Join(dir, "next.sh")
+	if err := forkSafeWriteFile(next, []byte("#!/bin/sh\necho \"$GITHUB_ENV\" >"+shellQuote(ran)+"\nexit 7\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	run := exec.CommandContext(t.Context(), "sh", "-c", hook)
+	run.Env = append(os.Environ(),
+		"RUNNER_TEMP="+dir, "GITHUB_ENV="+environment, "BILLET_ACTIONS_CA_SOURCE="+source,
+		"BILLET_JOB_STARTED_NEXT="+next,
+	)
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("the hook failed with the image's hook failing: %v\n%s", err, output)
+	}
+	got, err := os.ReadFile(ran)
+	if err != nil {
+		t.Fatalf("the image's hook did not run: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != environment {
+		t.Fatalf("the image's hook saw %q", got)
+	}
+}
+
 // THE HOOK IS THE ONLY THING A WORKFLOW EXPRESSION CAN READ.
 //
 // The agent putting BILLET_ACTIONS_CACHE_URL in the runner's environment is half

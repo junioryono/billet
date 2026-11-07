@@ -509,3 +509,117 @@ func TestTheReportNamesTheWaiterThatHoldsTheLine(t *testing.T) {
 			head.Listener.Refusal)
 	}
 }
+
+// A TIER NO HOST CAN PLACE PUBLISHES A HOST SHORTAGE, though it never waits in line and
+// so publishes no Waiting, and so does one whose hosts are full; a tier refused at its own
+// cap does not, because more hosts would not buy it anything, and neither does a tier
+// whose work has gone, whatever refusal it last kept (ADR-030: the pool's demand).
+func TestATierNoHostCanPlacePublishesAHostShortage(t *testing.T) {
+	t.Parallel()
+
+	arm := tierOf("a-arm", 4)
+	arm.Arch = config.ArchARM64 // the registered hosts report no architecture
+	capped := tierOf("b-capped", 4)
+	capped.MaxConcurrent = 1
+	capped.Arch = config.ArchX64
+	full := tierOf("c-full", 4)
+	full.Arch = config.ArchX64
+
+	a, _, listeners := loggedListeners(t, []config.Tier{arm, capped, full}, 64, config.AdmissionFair)
+	// ONE LEASE FILLS THE x64 HOST, so the capped tier is at its cap and its hosts are
+	// full at once: only the cap says more hosts would not have bought it anything.
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "x64-host", Provider: config.ProviderFirecracker, VCPU: capped.VCPU, Memory: 64 * config.GiB,
+		Architectures: []config.Arch{config.ArchX64},
+	}); err != nil {
+		t.Fatalf("register an x64 host: %v", err)
+	}
+	for _, l := range listeners {
+		if err := l.reconcilePool(t.Context(), 3); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		l.reportCapacity(t.Context(), nil, "")
+	}
+
+	got, err := a.CapacityReport(t.Context(), "a-arm")
+	if err != nil {
+		t.Fatalf("read the arm tier's report: %v", err)
+	}
+	if !got.Listener.HostShortage || got.Listener.Waiting != 0 {
+		t.Errorf("a tier no host can place: shortage %t, waiting %d (%+v); want a shortage and no wait in line",
+			got.Listener.HostShortage, got.Listener.Waiting, got.Listener)
+	}
+	if !strings.Contains(got.Listener.Refusal, "no live host can place its shape") {
+		t.Errorf("the arm tier's refusal is %q, want no host", got.Listener.Refusal)
+	}
+
+	got, err = a.CapacityReport(t.Context(), "b-capped")
+	if err != nil {
+		t.Fatalf("read the capped tier's report: %v", err)
+	}
+	if got.Listener.HostShortage {
+		t.Errorf("a tier at its own cap published a host shortage: %+v", got.Listener)
+	}
+	for _, want := range []string{"max_concurrent of 1", "no room on its hosts (x64-host)"} {
+		if !strings.Contains(got.Listener.Refusal, want) {
+			t.Errorf("the capped tier's refusal is %q, want %q in it", got.Listener.Refusal, want)
+		}
+	}
+
+	got, err = a.CapacityReport(t.Context(), "c-full")
+	if err != nil {
+		t.Fatalf("read the full tier's report: %v", err)
+	}
+	if !got.Listener.HostShortage || !strings.Contains(got.Listener.Refusal, "no room on its hosts (x64-host)") {
+		t.Errorf("a tier whose hosts are full: shortage %t, refusal %q; want a shortage for no room",
+			got.Listener.HostShortage, got.Listener.Refusal)
+	}
+
+	// ITS COUNT MADE UNKNOWN, as a recovered session makes it, and then the tier
+	// draining: the refusal it kept survives each, and neither is a shortage.
+	fullTier := listeners[2]
+	fullTier.undate()
+	fullTier.reportCapacity(t.Context(), nil, "")
+	if got, err = a.CapacityReport(t.Context(), "c-full"); err != nil || got.Listener.HostShortage {
+		t.Errorf("a tier whose count is unknown: %+v, %v; want no shortage", got.Listener, err)
+	}
+	if err := fullTier.reconcilePool(t.Context(), 3); err != nil {
+		t.Fatalf("recount: %v", err)
+	}
+	fullTier.reportCapacity(t.Context(), nil, "")
+	if got, err = a.CapacityReport(t.Context(), "c-full"); err != nil || !got.Listener.HostShortage {
+		t.Fatalf("a tier counted again: %+v, %v; want its shortage back", got.Listener, err)
+	}
+	fullTier.mu.Lock()
+	fullTier.draining = true
+	fullTier.mu.Unlock()
+	fullTier.reportCapacity(t.Context(), nil, "")
+	if got, err = a.CapacityReport(t.Context(), "c-full"); err != nil || got.Listener.HostShortage {
+		t.Errorf("a draining tier: %+v, %v; want no shortage", got.Listener, err)
+	}
+
+	// THE ARM TIER'S WORK GOES: a count of none, under whatever refusal it last kept,
+	// is no shortage. A reconcile to nothing clears the refusal itself today; the
+	// count is held here with the refusal kept, which is the state the guard is for.
+	arms := listeners[0]
+	arms.mu.Lock()
+	kept := arms.refused
+	arms.mu.Unlock()
+	if kept.room == nil || !kept.room.NoHost {
+		t.Fatalf("the arm tier kept no host refusal to stage with: %+v", kept)
+	}
+	if err := arms.reconcilePool(t.Context(), 0); err != nil {
+		t.Fatalf("reconcile to nothing: %v", err)
+	}
+	arms.mu.Lock()
+	arms.refused = kept
+	arms.mu.Unlock()
+	arms.reportCapacity(t.Context(), nil, "")
+	got, err = a.CapacityReport(t.Context(), "a-arm")
+	if err != nil {
+		t.Fatalf("read the arm tier's report: %v", err)
+	}
+	if got.Listener.HostShortage {
+		t.Errorf("a tier with no work waiting published a host shortage: %+v", got.Listener)
+	}
+}

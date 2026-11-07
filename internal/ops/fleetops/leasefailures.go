@@ -14,12 +14,13 @@ import (
 // cmdLeasesFailures shows jobs that did not succeed while billet's own
 // infrastructure was disrupted.
 //
-// ATTRIBUTION, NOT ACTION. billet does not re-run any of these and will not:
-// re-running is a side effect on somebody's repository, and a deploy or a
-// migration must not happen twice because a machine went away. GitHub does not
-// requeue a job whose runner vanished mid-execution either, so what is missing
-// without this view is not a retry — it is any way at all for the person whose
-// build went red to tell a broken host from a broken test.
+// ATTRIBUTION, AND WHAT BECAME OF IT. Re-running is a side effect on somebody's
+// repository, and a deploy or a migration must not happen twice because a machine
+// went away, so billet re-runs only for a tier that asks and only on the proof
+// ADR-029 holds, and says here what it decided. GitHub does not requeue a job whose
+// runner vanished mid-execution, so for every other row what this view gives is any
+// way at all for the person whose build went red to tell a broken host from a
+// broken test.
 //
 // It reports two facts and joins them nowhere else: GitHub's own conclusion for
 // the job, and what billet observed happening to that lease. The footer says
@@ -68,11 +69,12 @@ func cmdLeasesFailures(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "their leases could still have been running them. That is CIRCUMSTANTIAL: billet\n")
 	fmt.Fprintf(env.Stdout, "cannot tell a broken host from a broken build, and a job on this list may have\n")
 	fmt.Fprintf(env.Stdout, "failed on its own merits.\n\n")
-	fmt.Fprintf(env.Stdout, "Nothing has been re-run. GitHub does not requeue a job whose runner vanished\n")
-	fmt.Fprintf(env.Stdout, "mid-execution, and billet does not re-run one for you — re-running is a side\n")
-	fmt.Fprintf(env.Stdout, "effect on your repository, and a deploy or a migration must not happen twice\n")
-	fmt.Fprintf(env.Stdout, "because a machine went away. Re-run failed jobs from the workflow run page if\n")
-	fmt.Fprintf(env.Stdout, "the disruption explains the failure.\n")
+	fmt.Fprintf(env.Stdout, "GitHub does not requeue a job whose runner vanished mid-execution. billet re-runs\n")
+	fmt.Fprintf(env.Stdout, "one only for a tier with retry.disrupted, and only when GitHub's own record of the\n")
+	fmt.Fprintf(env.Stdout, "job shows its runner was lost, because re-running is a side effect on your\n")
+	fmt.Fprintf(env.Stdout, "repository and a deploy or a migration must not happen twice because a machine\n")
+	fmt.Fprintf(env.Stdout, "went away. RE-RUN says what was decided; a dash is nothing decided. Otherwise\n")
+	fmt.Fprintf(env.Stdout, "re-run failed jobs from the workflow run page if the disruption explains the failure.\n")
 
 	return nil
 }
@@ -92,22 +94,36 @@ func printAttributedFailures(env cli.Env, failures []alloc.AttributedFailure) {
 	//
 	// THE VARIABLE-LENGTH FIELD IS LAST, because the reclaim detail is a sentence a
 	// node wrote and every column after it would be pushed around by its width.
-	fmt.Fprintln(w, "LEASE\tTIER\tNODE\tRUN\tGITHUB SAID\tDISRUPTED\tBILLET SAW")
+	fmt.Fprintln(w, "LEASE\tTIER\tNODE\tRUN\tGITHUB SAID\tDISRUPTED\tRE-RUN\tBILLET SAW")
 
 	for i := range failures {
 		f := &failures[i]
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			f.LeaseID, f.Tier, orUnknown(f.Node),
 			identifier(f.RunID),
 			// QUOTED. GitHub's result is a free-form string from an upstream
 			// billet does not control, and the reclaim detail beside it is text a
 			// NODE supplied — both are printed into a report an operator reads as
 			// billet's own output, where an unquoted newline forges a row.
-			strconv.Quote(f.Result), ago(f.DisruptedAt),
+			strconv.Quote(f.Result), ago(f.DisruptedAt), rerunColumn(f.RerunDecision),
 			explainDisruption(f.Disruption, f.Detail))
 	}
 
 	_ = w.Flush()
+}
+
+// rerunColumn renders a re-run decision, or a dash for none. Quoted where this
+// binary does not know the word, which a newer binary may have written.
+func rerunColumn(d alloc.RerunDecision) string {
+	switch d {
+	case "":
+		return "-"
+	case alloc.RerunRequested, alloc.RerunUnconfirmed, alloc.RerunUnproven, alloc.RerunMixed, alloc.RerunLimit,
+		alloc.RerunSuperseded, alloc.RerunExpired, alloc.RerunFailed:
+		return string(d)
+	default:
+		return strconv.Quote(string(d))
+	}
 }
 
 // explainDisruption renders one disruption in an operator's language.

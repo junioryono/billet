@@ -63,8 +63,8 @@ func TestRuntimeOnlyPolicy(t *testing.T) {
 	}
 
 	want := []string{
-		"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeDenyForeignSnapshot",
-		"BilletRuntimeTag", "BilletRuntimeTerminate",
+		"BilletRuntimeRead", "BilletRuntimeLaunch", "BilletRuntimeLaunchOwned",
+		"BilletRuntimeDenyForeignSnapshot", "BilletRuntimeTag", "BilletRuntimeTerminate",
 	}
 	if got := sids(p); !slices.Equal(got, want) {
 		t.Fatalf("a compute-only policy has statements %v, want %v", got, want)
@@ -81,11 +81,11 @@ func TestRuntimeOnlyPolicy(t *testing.T) {
 }
 
 // THE RUNTIME MUTATIONS ARE BOUNDED. Terminate is conditioned on the owner tag,
-// CreateTags is restricted to create-time, and neither RunInstances nor the
-// describes carry a tag condition (they cannot be scoped that way). This is the
-// blast-radius boundary: with create-time-only tagging, a role can carry billet's
-// owner tag only onto what it creates, so a tag-conditioned terminate reaches only
-// billet's own instances.
+// CreateTags is restricted to create-time, and the describes carry no condition
+// (they are not resource-scopable). This is the blast-radius boundary: with
+// create-time-only tagging, a role can carry billet's owner tag only onto what it
+// creates, so a tag-conditioned terminate reaches only billet's own instances. The
+// launch grant's own split is TestALaunchTagsWhatItCreatesAndStaysOnItsNetwork's.
 func TestRuntimeMutationsAreBounded(t *testing.T) {
 	p, err := Inputs{}.Build()
 	if err != nil {
@@ -108,11 +108,6 @@ func TestRuntimeMutationsAreBounded(t *testing.T) {
 		t.Errorf("Terminate is not conditioned on the owner tag: %v", got)
 	}
 
-	// Launch and read must NOT carry a condition — a tag condition there would deny
-	// legitimate launches and describes.
-	if stmt(t, p, "BilletRuntimeLaunch").Condition != nil {
-		t.Error("RunInstances carries a condition; it cannot be scoped by tag without denying launches")
-	}
 	if stmt(t, p, "BilletRuntimeRead").Condition != nil {
 		t.Error("the describes carry a condition; they are not resource-scopable")
 	}

@@ -1,0 +1,25 @@
+{
+  "LogReadResult.cut": {
+    "held": false,
+    "cut": true,
+    "unreadable": 926425963,
+    "lines": [
+      {
+        "line": 76470893,
+        "at_ms": 2102434414,
+        "text": "LogReadResult.lines[0].text"
+      }
+    ]
+  },
+  "LogReadResult.held": {
+    "held": true,
+    "unreadable": 926425963,
+    "lines": [
+      {
+        "line": 76470893,
+        "at_ms": 2102434414,
+        "text": "LogReadResult.lines[0].text"
+      }
+    ]
+  }
+}

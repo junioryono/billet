@@ -9,6 +9,37 @@ import (
 	"context"
 )
 
+const admitPendingEnrollment = `-- name: AdmitPendingEnrollment :execrows
+UPDATE node_enrollments
+   SET state = 'approved', cert_pem = $1, source = 'pool', decided_at = $2
+ WHERE name = $3 AND fingerprint = $4 AND pool_order = $5 AND state = 'pending'
+`
+
+type AdmitPendingEnrollmentParams struct {
+	CertPem     string
+	DecidedAt   string
+	Name        string
+	Fingerprint string
+	PoolOrder   string
+}
+
+// Approve a pool host's request that was recorded while its source could not yet say
+// which key is its own, on the source's word: only that request, by its key and its
+// order, and only while it is still pending.
+func (q *Queries) AdmitPendingEnrollment(ctx context.Context, arg AdmitPendingEnrollmentParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, admitPendingEnrollment,
+		arg.CertPem,
+		arg.DecidedAt,
+		arg.Name,
+		arg.Fingerprint,
+		arg.PoolOrder,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const decideEnrollment = `-- name: DecideEnrollment :exec
 UPDATE node_enrollments
    SET state = $1, cert_pem = $2, decided_at = $3
@@ -33,9 +64,40 @@ func (q *Queries) DecideEnrollment(ctx context.Context, arg DecideEnrollmentPara
 	return err
 }
 
+const insertAdmittedEnrollment = `-- name: InsertAdmittedEnrollment :exec
+INSERT INTO node_enrollments
+     (name, fingerprint, csr_pem, cert_pem, state, source, requested_at, decided_at, pool_order)
+VALUES ($1, $2, $3, $4, 'approved', 'pool', $5, $6, $7)
+`
+
+type InsertAdmittedEnrollmentParams struct {
+	Name        string
+	Fingerprint string
+	CsrPem      string
+	CertPem     string
+	RequestedAt string
+	DecidedAt   string
+	PoolOrder   string
+}
+
+// Record a pool host admitted on its source's word (ADR-030): approved as it is
+// recorded, with the certificate it is handed and the order it joined from.
+func (q *Queries) InsertAdmittedEnrollment(ctx context.Context, arg InsertAdmittedEnrollmentParams) error {
+	_, err := q.db.ExecContext(ctx, insertAdmittedEnrollment,
+		arg.Name,
+		arg.Fingerprint,
+		arg.CsrPem,
+		arg.CertPem,
+		arg.RequestedAt,
+		arg.DecidedAt,
+		arg.PoolOrder,
+	)
+	return err
+}
+
 const insertEnrollment = `-- name: InsertEnrollment :exec
-INSERT INTO node_enrollments (name, fingerprint, csr_pem, state, requested_at)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO node_enrollments (name, fingerprint, csr_pem, state, requested_at, pool_order)
+VALUES ($1, $2, $3, $4, $5, $6)
 `
 
 type InsertEnrollmentParams struct {
@@ -44,9 +106,11 @@ type InsertEnrollmentParams struct {
 	CsrPem      string
 	State       string
 	RequestedAt string
+	PoolOrder   string
 }
 
-// Record a request for a name nothing holds.
+// Record a request for a name nothing holds, and the pool order it came in under, if
+// any.
 func (q *Queries) InsertEnrollment(ctx context.Context, arg InsertEnrollmentParams) error {
 	_, err := q.db.ExecContext(ctx, insertEnrollment,
 		arg.Name,
@@ -54,12 +118,13 @@ func (q *Queries) InsertEnrollment(ctx context.Context, arg InsertEnrollmentPara
 		arg.CsrPem,
 		arg.State,
 		arg.RequestedAt,
+		arg.PoolOrder,
 	)
 	return err
 }
 
 const listEnrollments = `-- name: ListEnrollments :many
-SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source
+SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source, pool_order
   FROM node_enrollments ORDER BY requested_at
 `
 
@@ -82,6 +147,7 @@ func (q *Queries) ListEnrollments(ctx context.Context) ([]NodeEnrollment, error)
 			&i.RequestedAt,
 			&i.DecidedAt,
 			&i.Source,
+			&i.PoolOrder,
 		); err != nil {
 			return nil, err
 		}
@@ -97,7 +163,7 @@ func (q *Queries) ListEnrollments(ctx context.Context) ([]NodeEnrollment, error)
 }
 
 const listEnrollmentsInState = `-- name: ListEnrollmentsInState :many
-SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source
+SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source, pool_order
   FROM node_enrollments WHERE state = $1 ORDER BY requested_at
 `
 
@@ -126,6 +192,7 @@ func (q *Queries) ListEnrollmentsInState(ctx context.Context, state string) ([]N
 			&i.RequestedAt,
 			&i.DecidedAt,
 			&i.Source,
+			&i.PoolOrder,
 		); err != nil {
 			return nil, err
 		}
@@ -142,7 +209,7 @@ func (q *Queries) ListEnrollmentsInState(ctx context.Context, state string) ([]N
 
 const readEnrollment = `-- name: ReadEnrollment :one
 
-SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source
+SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source, pool_order
   FROM node_enrollments WHERE name = $1
 `
 
@@ -166,6 +233,7 @@ func (q *Queries) ReadEnrollment(ctx context.Context, name string) (NodeEnrollme
 		&i.RequestedAt,
 		&i.DecidedAt,
 		&i.Source,
+		&i.PoolOrder,
 	)
 	return i, err
 }
@@ -189,8 +257,8 @@ func (q *Queries) ReadEnrollmentFingerprint(ctx context.Context, name string) (s
 const replaceDeniedEnrollment = `-- name: ReplaceDeniedEnrollment :exec
 UPDATE node_enrollments
    SET fingerprint = $1, csr_pem = $2, cert_pem = '', state = $3,
-       source = 'enrolled', requested_at = $4, decided_at = ''
- WHERE name = $5
+       source = 'enrolled', requested_at = $4, decided_at = '', pool_order = $5
+ WHERE name = $6
 `
 
 type ReplaceDeniedEnrollmentParams struct {
@@ -198,6 +266,7 @@ type ReplaceDeniedEnrollmentParams struct {
 	CsrPem      string
 	State       string
 	RequestedAt string
+	PoolOrder   string
 	Name        string
 }
 
@@ -215,6 +284,7 @@ func (q *Queries) ReplaceDeniedEnrollment(ctx context.Context, arg ReplaceDenied
 		arg.CsrPem,
 		arg.State,
 		arg.RequestedAt,
+		arg.PoolOrder,
 		arg.Name,
 	)
 	return err
@@ -229,7 +299,8 @@ ON CONFLICT (name) DO UPDATE SET
   cert_pem    = excluded.cert_pem,
   state       = excluded.state,
   source      = excluded.source,
-  decided_at  = excluded.decided_at
+  decided_at  = excluded.decided_at,
+  pool_order  = ''
 `
 
 type UpsertIssuedEnrollmentParams struct {

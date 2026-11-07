@@ -435,6 +435,39 @@ func (i *IMDS) redacted() string {
 // rather than making the first job of the day look like a slow launch.
 const imdsTimeout = 2 * time.Second
 
+// InstanceIdentity reads this instance's identity document and its base64 RSA-SHA256
+// signature over IMDSv2, which a pool host sends with its enrollment so the control
+// plane can verify, under AWS's certificate, which instance is asking (ADR-030).
+// endpoint is the metadata service's, empty for the link-local default. An error
+// means none could be read: billet is not on EC2, or IMDS is closed.
+//
+// THE SAME CLIENT AS THE CREDENTIALS', IMDSv2 only and bounded, so there is one way
+// billet asks the metadata service anything.
+func InstanceIdentity(ctx context.Context, endpoint string) ([]byte, string, error) {
+	if endpoint == "" {
+		endpoint = defaultIMDSEndpoint
+	}
+
+	client := &http.Client{Timeout: imdsTimeout}
+
+	token, err := imdsToken(ctx, client, endpoint)
+	if err != nil {
+		return nil, "", err
+	}
+
+	doc, err := imdsGet(ctx, client, endpoint, "/latest/dynamic/instance-identity/document", token)
+	if err != nil {
+		return nil, "", fmt.Errorf("awscreds: read the instance identity document: %w", err)
+	}
+
+	sig, err := imdsGet(ctx, client, endpoint, "/latest/dynamic/instance-identity/signature", token)
+	if err != nil {
+		return nil, "", fmt.Errorf("awscreds: read the instance identity signature: %w", err)
+	}
+
+	return []byte(doc), strings.TrimSpace(sig), nil
+}
+
 // Credentials satisfies Source, caching until shortly before expiry.
 func (i *IMDS) Credentials(ctx context.Context) (awssig.Credentials, error) {
 	i.mu.Lock()

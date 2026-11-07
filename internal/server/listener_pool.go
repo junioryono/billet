@@ -50,7 +50,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	}
 
 	// READ ONCE, so every purchase in this loop and the record below judge the
-	// tier as it stood at one instant.
+	// tier as it stood at one instant, unless targets are weighted (below).
 	admission := l.admission(ctx)
 
 	launched := false
@@ -120,6 +120,13 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			}
 			batch = append(batch, poolLaunch{lease: lease, job: job})
 			active++
+
+			// A WEIGHTED ORDER IS JUDGED ON WHAT THE LAST PURCHASE HELD: a target
+			// behind by one lease's worth would otherwise buy its whole backlog on
+			// the rank it had when it was behind.
+			if admission.TargetRank != nil {
+				admission = l.admission(ctx)
+			}
 		}
 
 		l.endBatchBuying()
@@ -186,6 +193,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		l.order.waitsOnLaunches(l.tier, admission)
 	case active < desired && admission.CanGrow:
 		l.order.waits(l.tier, admission)
+		l.askForAHold(ctx, admission)
 	default:
 		l.order.served(l.tier)
 	}
@@ -401,6 +409,36 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 	return nil
 }
 
+// askForAHold tells the order which hosts this waiting tier could be held, under the
+// order that holds hosts. A tier the ceiling or its target's share refuses is waiting
+// for room a hold cannot keep. A read that failed holds nothing: what withholds room
+// from others is what a failed read must not keep doing, and nothing here may fail a
+// reconciliation.
+func (l *Listener) askForAHold(ctx context.Context, admission alloc.TierAdmission) {
+	if !l.order.holds() {
+		return
+	}
+
+	if admission.CeilingBound || admission.ShareBound {
+		l.order.mayHold(l.tier, nil)
+
+		return
+	}
+
+	candidates, behindAsLarge, err := l.alloc.HoldCandidates(ctx, l.tier, l.order.heldAgainst(l.tier), l.order.ownHold(l.tier))
+	if err != nil {
+		l.log.Warn("could not read which host to hold for this waiting tier", "tier", l.tier, "error", err)
+	}
+
+	if behindAsLarge {
+		l.order.behindAsLarge(l.tier)
+
+		return
+	}
+
+	l.order.mayHold(l.tier, candidates)
+}
+
 // admission is what the order needs to know about this tier: whether room could
 // ever reach it, and the hosts it competes for.
 //
@@ -489,6 +527,10 @@ func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, dispatch.J
 // The retiring row is the crash-recovery journal: any failed phase is retried on
 // the next scale-set message before another idle member is selected.
 func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner) {
+	if l.retirementHeld(ctx, member) {
+		return
+	}
+
 	lease, err := l.alloc.Lease(ctx, member.LeaseID)
 	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
 		l.log.Error("could not read a retiring pool member's lease", "tier", l.tier,

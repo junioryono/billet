@@ -24,7 +24,11 @@ const shownDestinations = 20
 //
 // A JOB WHOSE FLOWS WERE NOT TOTALLED SAYS SO, never an empty table, which
 // would read as a job that sent nothing.
-func renderDestinations(w io.Writer, d *alloc.JobDestinations) {
+//
+// names is what each address answered for, nil when nothing watched the job's
+// resolver: the column then is not there, rather than saying of every destination
+// that it has no known name.
+func renderDestinations(w io.Writer, d *alloc.JobDestinations, names map[string][]string) {
 	fmt.Fprintln(w)
 	if d == nil {
 		fmt.Fprintln(w, "destinations not measured (node.monitoring.flows, on a firecracker node)")
@@ -45,7 +49,7 @@ func renderDestinations(w io.Writer, d *alloc.JobDestinations) {
 		for _, dest := range shown {
 			width = max(width, len(dest.Addr))
 		}
-		row := func(addr, sent, received, connections, unanswered, slowest string) {
+		row := func(addr, sent, received, connections, unanswered, slowest, named string) {
 			fmt.Fprintf(w, "%s%-*s  %10s  %10s  %11s", pad, width, addr, sent, received, connections)
 			if d.UnansweredCounted {
 				fmt.Fprintf(w, "  %10s", unanswered)
@@ -53,12 +57,18 @@ func renderDestinations(w io.Writer, d *alloc.JobDestinations) {
 			if d.RepliesTimed {
 				fmt.Fprintf(w, "  %13s", slowest)
 			}
+			// LAST, AND NOT PADDED: the one column whose width is the guest's to choose.
+			if names != nil {
+				fmt.Fprintf(w, "  %s", named)
+			}
 			fmt.Fprintln(w)
 		}
-		row("address", "sent", "received", "connections", "unanswered", "slowest reply")
+		row("address", "sent", "received", "connections", "unanswered", "slowest reply",
+			"names (from the node's resolver, best effort)")
 		for _, dest := range shown {
 			row(dest.Addr, cli.HumanBytes(dest.SentBytes), cli.HumanBytes(dest.ReceivedBytes),
-				groupDigits(dest.Connections), groupDigits(dest.Unanswered), slowestReply(dest))
+				groupDigits(dest.Connections), groupDigits(dest.Unanswered), slowestReply(dest),
+				destinationNames(names, dest.Addr))
 		}
 	}
 	if rest := sorted[len(shown):]; len(rest) > 0 {

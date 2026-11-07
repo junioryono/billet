@@ -175,6 +175,12 @@ func printPreserved(env cli.Env, cfg *config.Config, cfgPath string) {
 	fmt.Fprintf(env.Stdout, "         config    %s\n", cfgPath)
 
 	for _, keyPath := range app.KeyFilePaths(cfg) {
+		if cfg.Server != nil && cfg.Server.TokenBroker != nil && keyPath == cfg.Server.TokenBroker.ClientKeyPath {
+			fmt.Fprintf(env.Stdout, "         broker key %s  (the broker knows this host by it)\n", keyPath)
+
+			continue
+		}
+
 		fmt.Fprintf(env.Stdout, "         app key   %s  (GitHub issues this ONCE and will not reissue it)\n",
 			keyPath)
 	}

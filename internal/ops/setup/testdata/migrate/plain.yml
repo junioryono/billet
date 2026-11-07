@@ -1,0 +1,19 @@
+# A comment above everything, which must survive.
+name: plain
+
+on: [push]   # and one here
+
+jobs:
+  bare:
+    runs-on: ubuntu-latest   # why this runner
+    steps:
+      - run: echo bare
+  double:
+    runs-on: "ubuntu-24.04"
+    steps:
+      - run: echo double
+  single:
+    # A comment inside the job.
+    runs-on:    'ubuntu-latest'
+    steps:
+      - run: echo single

@@ -8,16 +8,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/hostauthority"
+	"github.com/junioryono/billet/internal/joinconsole"
 	"github.com/junioryono/billet/internal/nodeclient"
-	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -27,7 +30,7 @@ import (
 // Slow, because the thing it is waiting for is a HUMAN reading a fingerprint. A
 // tight loop would fill the control plane's log with one line per node per
 // second while somebody walks to another machine to compare a value.
-const enrollPollEvery = 5 * time.Second
+var enrollPollEvery = 5 * time.Second
 
 // cmdNodes is the operator's side of enrollment.
 func Nodes(ctx context.Context, env cli.Env, args []string) error {
@@ -218,11 +221,19 @@ func NodesPending(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(env.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NODE\tFINGERPRINT\tSTATE\tHOW\tASKED")
+	fmt.Fprintln(w, "NODE\tFINGERPRINT\tSTATE\tHOW\tPOOL ORDER\tASKED")
 
 	for i := range pending {
 		e := &pending[i]
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name, e.Fingerprint, e.State, e.Source, e.RequestedAt)
+
+		// THE ORDER A POOL HOST ASKED UNDER, so a person comparing its fingerprint can
+		// find the host its source placed (ADR-030).
+		order := e.PoolOrder
+		if order == "" {
+			order = "-"
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", e.Name, e.Fingerprint, e.State, e.Source, order, e.RequestedAt)
 	}
 
 	if err := w.Flush(); err != nil {
@@ -291,7 +302,10 @@ func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision st
 
 	defer closeDB()
 
-	certPEM := ""
+	var (
+		certPEM string
+		issued  alloc.IssuedCert
+	)
 
 	if decision == alloc.EnrollApproved {
 		deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
@@ -329,17 +343,24 @@ func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision st
 			return err
 		}
 
-		// RECORDED BEFORE IT IS HANDED OVER. Revocation names a serial, so a
-		// credential billet never wrote down cannot be taken back — and this is
-		// the first of the three ways one comes into existence.
-		if err := recordIssuedCert(ctx, a, bundle, name, alloc.CertEnrolled); err != nil {
+		// RECORDED BEFORE IT IS HANDED OVER, and in the approval's own transaction.
+		// Revocation names a serial, so a credential billet never wrote down cannot be
+		// taken back; and an approval the ledger refuses records none, so a refused
+		// one leaves no trace that a node was admitted.
+		if issued, err = issuedCert(bundle, name, alloc.CertEnrolled); err != nil {
 			return err
 		}
 
 		certPEM = string(bundle.CertPEM)
 	}
 
-	if err := a.DecideEnrollment(ctx, name, *fingerprint, decision, certPEM); err != nil {
+	if decision == alloc.EnrollApproved {
+		err = a.ApproveEnrollment(ctx, name, *fingerprint, certPEM, issued)
+	} else {
+		err = a.DecideEnrollment(ctx, name, *fingerprint, decision, "", "")
+	}
+
+	if err != nil {
 		return err
 	}
 
@@ -413,7 +434,8 @@ func backfillIssuedCerts(ctx context.Context, env cli.Env, a *alloc.Allocator) e
 	return nil
 }
 
-// recordIssuedCert writes a credential into the list revocation reads.
+// recordIssuedCert writes a credential into the list revocation reads, and answers
+// its serial.
 //
 // EVERY WAY A CERTIFICATE COMES INTO EXISTENCE GOES THROUGH HERE — approval,
 // `billet ca issue`, and renewal over the wire. Revocation is keyed on serial,
@@ -422,18 +444,28 @@ func backfillIssuedCerts(ctx context.Context, env cli.Env, a *alloc.Allocator) e
 // is a credential it cannot take back.
 func recordIssuedCert(
 	ctx context.Context, a *alloc.Allocator, bundle wirecert.Bundle, node, source string,
-) error {
-	leaf, err := wirecert.LeafOf(bundle)
+) (string, error) {
+	c, err := issuedCert(bundle, node, source)
 	if err != nil {
-		return fmt.Errorf("read back the certificate just issued to %s: %w", node, err)
+		return "", err
 	}
 
-	return a.RecordIssuedCert(ctx, alloc.IssuedCert{
+	return c.Serial, a.RecordIssuedCert(ctx, c)
+}
+
+// issuedCert is the record of a certificate just issued to node.
+func issuedCert(bundle wirecert.Bundle, node, source string) (alloc.IssuedCert, error) {
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		return alloc.IssuedCert{}, fmt.Errorf("read back the certificate just issued to %s: %w", node, err)
+	}
+
+	return alloc.IssuedCert{
 		Serial:   wirecert.Serial(leaf),
 		Node:     node,
 		Source:   source,
 		NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
-	})
+	}, nil
 }
 
 // controlPlaneAllocator is app.OpenOperator's allocator, for a command that
@@ -485,14 +517,32 @@ func BootstrapBase(cfg *config.Config, flag string) string {
 // ends displaying the same number, over a channel an attacker on the network
 // does not control. That comparison is the trust decision; everything else here
 // is transport.
-func EnrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFingerprint, joinToken string) error {
+//
+// A POOL HOST (poolOrder names the order it was booted for, ADR-030) ALSO SAYS ITS
+// FINGERPRINT ON THE SYSTEM CONSOLE before every attempt, where a source that reads the
+// console of the exact host it placed can say which key is that host's, and sends the
+// identity its platform signed, when it has one; its name is its order's.
+func EnrollNode(
+	ctx context.Context, env cli.Env, cfg *config.Config, base, caFingerprint, joinToken, poolOrder string,
+) error {
 	if cfg.Node.TLS == nil {
 		return errors.New("enrolling writes a certificate, so node.tls must say where to put it")
 	}
 
-	caPEM, deployment, err := nodeclient.FetchCA(ctx, base, caFingerprint)
+	if poolOrder != "" && cfg.Node.Name != alloc.PoolNodeName(poolOrder) {
+		return fmt.Errorf("a host joining from pool order %s is node %s, and this config names %q",
+			poolOrder, alloc.PoolNodeName(poolOrder), cfg.Node.Name)
+	}
+
+	caPEM, deployment, err := fetchCA(ctx, env, base, caFingerprint, poolOrder != "")
 	if err != nil {
 		return err
+	}
+
+	// THE FINGERPRINT PROVED THE AUTHORITY, NOT THE DEPLOYMENT BESIDE IT, which came on the
+	// same unverified connection, so it is printed only once it is a deployment's id.
+	if deploymentid.Validate(deployment) != nil {
+		return errors.New("the control plane names no deployment billet would mint")
 	}
 
 	name := cfg.Node.Name
@@ -521,11 +571,41 @@ func EnrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFi
 
 	fmt.Fprintf(env.Stdout, "Asking to join deployment %s as %q.\n\n", deployment, name)
 	fmt.Fprintf(env.Stdout, "  this node's fingerprint  %s\n\n", fingerprint)
-	fmt.Fprintf(env.Stdout, "On the control plane, check it matches and approve:\n\n")
+
+	if poolOrder != "" {
+		fmt.Fprintf(env.Stdout, "A pool host: its order's source may vouch for it. Otherwise, on the control plane,\n")
+		fmt.Fprintf(env.Stdout, "check the fingerprint matches and approve:\n\n")
+	} else {
+		fmt.Fprintf(env.Stdout, "On the control plane, check it matches and approve:\n\n")
+	}
+
 	fmt.Fprintf(env.Stdout, "  billet nodes approve %s --fingerprint %s\n\n", name, fingerprint)
 
+	var (
+		identity         nodeclient.Identity
+		warned, unsigned bool
+	)
+
 	for {
-		certPEM, signedBy, err := nodeclient.Enroll(ctx, base, name, joinToken, caPEM, csrPEM)
+		if poolOrder != "" {
+			// BEFORE EVERY ATTEMPT, because the source reads the newest 64 KiB of the
+			// console and a long boot can push one line out of it.
+			if err := announceOnConsole(poolOrder, fingerprint); err != nil && !warned {
+				warned = true
+				fmt.Fprintf(env.Stderr, "this pool host could not write its fingerprint to %s, so its source "+
+					"cannot vouch for it and a person approves it: %v\n", consolePath, err)
+			}
+
+			// UNTIL ONE IS READ, because the metadata service can be slow to answer
+			// early in a boot, and a host that sent none once would wait for a person
+			// for good.
+			if identity.Document == nil {
+				identity = poolIdentity(ctx, env, !unsigned)
+				unsigned = identity.Document == nil
+			}
+		}
+
+		certPEM, signedBy, err := nodeclient.EnrollWithIdentity(ctx, base, name, joinToken, caPEM, csrPEM, identity)
 
 		switch {
 		case err == nil:
@@ -559,6 +639,11 @@ func EnrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFi
 			// request the control plane had already recorded and a join token it had
 			// already spent, over a busy ledger.
 			fmt.Fprintf(env.Stdout, "  the control plane is busy; still waiting\n")
+		case errors.Is(err, nodeclient.ErrUnreachable) && ctx.Err() == nil:
+			// NOT A VERDICT EITHER: the answer lost may have been an approval, which
+			// the same key is handed again. A pool host's boot runs this once, so
+			// giving up here left an admitted host that never started its node.
+			fmt.Fprintf(env.Stdout, "  the control plane's answer did not arrive; asking again: %v\n", err)
 		default:
 			return err
 		}
@@ -573,6 +658,72 @@ func EnrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFi
 		case <-wait.C:
 		}
 	}
+}
+
+// fetchCA reads the control plane's authority. A pool host, which nobody is watching,
+// asks again while the answer does not arrive, so a boot that reaches the network
+// before the control plane is reachable still joins; a person sees the failure.
+func fetchCA(ctx context.Context, env cli.Env, base, caFingerprint string, unattended bool) ([]byte, string, error) {
+	for {
+		caPEM, deployment, err := nodeclient.FetchCA(ctx, base, caFingerprint)
+		if err == nil || !unattended || !errors.Is(err, nodeclient.ErrUnreachable) || ctx.Err() != nil {
+			return caPEM, deployment, err
+		}
+
+		fmt.Fprintf(env.Stderr, "the control plane's authority did not arrive; asking again: %v\n", err)
+
+		wait := time.NewTimer(enrollPollEvery)
+
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+
+			return nil, "", ctx.Err()
+		case <-wait.C:
+		}
+	}
+}
+
+// consolePath is the system console a pool host says its fingerprint on, and
+// instanceIdentity reads what its platform signed about it; a test replaces both.
+var (
+	consolePath      = "/dev/console"
+	instanceIdentity = func(ctx context.Context) ([]byte, string, error) { return awscreds.InstanceIdentity(ctx, "") }
+)
+
+// announceOnConsole writes the pool host's line to the system console, opened for
+// writing only and never created: a console that is not there is a failure to say so,
+// not a file to make. O_NOCTTY, because a process leading its own session (a service)
+// would otherwise take the console as its controlling terminal, and a hangup or an
+// interrupt typed there would reach it.
+func announceOnConsole(order, fingerprint string) error {
+	f, err := os.OpenFile(consolePath, os.O_WRONLY|os.O_APPEND|syscall.O_NOCTTY, 0)
+	if err != nil {
+		return err
+	}
+
+	// ON A LINE OF ITS OWN, since only a whole line is read and the console may be
+	// part way through another.
+	_, werr := fmt.Fprintf(f, "\n%s\n", joinconsole.Line(order, fingerprint))
+
+	return errors.Join(werr, f.Close())
+}
+
+// poolIdentity is the identity document the host's platform signed, or none: a host
+// that is not on EC2, or whose metadata service is closed, has none, and its join waits
+// for a person instead.
+func poolIdentity(ctx context.Context, env cli.Env, say bool) nodeclient.Identity {
+	doc, sig, err := instanceIdentity(ctx)
+	if err != nil {
+		if say {
+			fmt.Fprintf(env.Stdout, "No identity document to send yet (%v); the source cannot vouch without one, "+
+				"and it is read again before every attempt.\n\n", err)
+		}
+
+		return nodeclient.Identity{}
+	}
+
+	return nodeclient.Identity{Document: doc, Signature: sig}
 }
 
 // pendingIdentity is the key and request this node is enrolling with, generated
@@ -764,7 +915,7 @@ func CAToken(ctx context.Context, env cli.Env, args []string) error {
 
 	// A LOOPBACK NODE WIRE IS NOT AN ADDRESS ANOTHER MACHINE HAS: printed as
 	// --server, it names the joining machine itself.
-	if nodeplane.LoopbackOnly(cfg.Server.Listen) {
+	if !cfg.Server.WireServesTLS() {
 		fmt.Fprintf(env.Stdout, "This control plane's node wire listens only on loopback (%s), so no other "+
 			"machine can join it. Bind server.listen to an address the fleet reaches (and set "+
 			"server.bootstrap_listen for enrollment), restart, and run billet ca token again for the "+
@@ -803,6 +954,10 @@ func joinCommand(cfg *config.Config, token string) string {
 // nodeWireAddr is the node-wire address a joining machine dials, with a
 // wildcard host left for the operator, as enrollAddrFlag leaves it.
 func nodeWireAddr(cfg *config.Config) string {
+	if cfg.Server.TLSRouter != nil {
+		return cfg.Server.TLSRouter.NodeAddr
+	}
+
 	host, port, err := net.SplitHostPort(strings.TrimSpace(cfg.Server.Listen))
 	if err != nil {
 		return "<this control plane's node-wire address>"
@@ -839,6 +994,10 @@ func caFingerprintOrAsk(cfg *config.Config) string {
 // the third thing in that hand-off, and leaving them to derive it is how the
 // enrollment ends in a handshake failure that names no cause.
 func enrollAddrFlag(cfg *config.Config) string {
+	if cfg.Server.TLSRouter != nil && cfg.Server.TLSRouter.EnrollAddr != "" {
+		return " --bootstrap-addr " + cfg.Server.TLSRouter.EnrollAddr
+	}
+
 	addr := strings.TrimSpace(cfg.Server.BootstrapListen)
 	if addr == "" {
 		return ""

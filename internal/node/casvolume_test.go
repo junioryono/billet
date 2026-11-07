@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,9 @@ type deviceVolumes struct {
 	// target ends with it.
 	targets    []string
 	failSuffix string
+	// mountedButFailedSuffix mounts a target ending with it and then reports the
+	// mount failed, as a mount command killed after the kernel mounted does.
+	mountedButFailedSuffix string
 	// damaged are the devices that refuse every mount the way the kernel
 	// refuses a corrupt ext4.
 	damaged map[string]bool
@@ -66,6 +70,7 @@ func (d *deviceVolumes) mount(device, target string) error {
 	d.mu.Lock()
 	d.targets = append(d.targets, target)
 	fail := d.failSuffix != "" && strings.HasSuffix(target, d.failSuffix)
+	mountedButFailed := d.mountedButFailedSuffix != "" && strings.HasSuffix(target, d.mountedButFailedSuffix)
 	damaged := d.damaged[device]
 	d.mu.Unlock()
 	if fail {
@@ -77,8 +82,14 @@ func (d *deviceVolumes) mount(device, target string) error {
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return err
 	}
+	if err := os.Symlink(d.dir(device), target); err != nil {
+		return err
+	}
+	if mountedButFailed {
+		return errors.New("signal: killed: ")
+	}
 
-	return os.Symlink(d.dir(device), target)
+	return nil
 }
 
 func (d *deviceVolumes) MountNew(_ context.Context, device, target string) error {
@@ -932,6 +943,44 @@ func TestAFailedCASAttachIsNotRetriedUntilTheBackoffPasses(t *testing.T) {
 	if len(storage.keys) != 3 || storage.created != 1 {
 		t.Fatalf("storage saw %d key(s) and created %d volume(s), want 3 and 1: one failed attach "+
 			"inside the backoff and one after it", len(storage.keys), storage.created)
+	}
+}
+
+// A MOUNT THAT REPORTED FAILURE IS STILL UNMOUNTED BEFORE ITS VOLUME GOES. A mount
+// command killed by its context can finish in the kernel; on 2026-11-06 one left a
+// Go cache volume mounted that the node recorded as never mounted, so its release
+// skipped the unmount and the discard could not unmap the device, for hours.
+func TestAVolumeWhoseMountReportedFailureIsUnmountedBeforeItIsDiscarded(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+	volumes.mountedButFailedSuffix = "/go"
+
+	body := "compiled object"
+	if got := casRequest(t, service, token, http.MethodGet, "/v1/cas/go/cas/"+digestOf(body), ""); got.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET with the mount reported failed = %d, want 503", got.Code)
+	}
+	volumes.mu.Lock()
+	targets := slices.Clone(volumes.targets)
+	volumes.mu.Unlock()
+	if len(targets) != 1 {
+		t.Fatalf("mounted %v, want the one Go cache target", targets)
+	}
+	if mounted, err := volumes.Mounted(t.Context(), targets[0]); err != nil || !mounted {
+		t.Fatalf("the reported-failed mount is not standing in as mounted (%v, %v); the test proves nothing", mounted, err)
+	}
+
+	finish(t, service, instance)
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+
+	if mounted, err := volumes.Mounted(t.Context(), targets[0]); err != nil || mounted {
+		t.Fatalf("the volume is still mounted at %s after its session closed (%v, %v)", targets[0], mounted, err)
+	}
+	if storage.discarded != 1 {
+		t.Fatalf("discarded %d volume(s), want the job's one", storage.discarded)
 	}
 }
 

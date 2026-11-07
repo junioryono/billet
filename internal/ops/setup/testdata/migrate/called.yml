@@ -1,0 +1,17 @@
+name: called
+on:
+  workflow_call:
+    inputs:
+      os:
+        type: string
+      greeting:
+        type: string
+jobs:
+  own:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo own
+  theirs:
+    runs-on: ${{ inputs.os }}
+    steps:
+      - run: echo theirs

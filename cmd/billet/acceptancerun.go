@@ -67,6 +67,12 @@ func cmdAcceptanceRun(ctx context.Context, env cli.Env, args []string) error {
 			"for none proves nothing about whether anything can run here", *jobs)
 	}
 
+	// A WAIT WITH NO LENGTH is no bound at all: the compute barrier after the jobs takes
+	// its bound from it, and a drain given none waits forever.
+	if *wait <= 0 {
+		return fmt.Errorf("--wait %s: an acceptance run needs a positive bound on its wait", *wait)
+	}
+
 	// AND NOT MORE THAN THE HISTORY CAN SHOW. The wait counts terminal rows from a
 	// bounded read, so a request above that bound can never be satisfied — the run
 	// would wait out its whole `--wait` against a ledger that already held enough
@@ -80,6 +86,11 @@ func cmdAcceptanceRun(ctx context.Context, env cli.Env, args []string) error {
 
 	ws, err := requireAcceptanceWorkspace(*workspace)
 	if err != nil {
+		return err
+	}
+
+	// BEFORE ANYTHING IS STARTED, so no service this run starts inherits the lock.
+	if err := keepAcceptanceLock(env.Getenv); err != nil {
 		return err
 	}
 
@@ -148,7 +159,9 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 	// ITS FAILURE IS NOT THE RUN'S. A fleet that will not go quiet is worth
 	// reporting and is not a reason to skip the teardown, so the error is
 	// collected and everything below happens either way.
-	proved, proofErr := proveAcceptanceComputeClear(ctx, env, ws, opts.wait)
+	// ITS OWN BOUND, NOT --wait's AGAIN: the jobs have had --wait, and a caller budgets
+	// the run as --wait plus this, the stop's grace and the evidence.
+	proved, proofErr := proveAcceptanceComputeClear(ctx, env, ws, min(opts.wait, acceptanceDrainWait))
 	if proofErr != nil {
 		fmt.Fprintf(env.Stderr, "acceptance: the compute barrier did not clear: %v\n", proofErr)
 	}
@@ -178,6 +191,7 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 		fmt.Fprintf(env.Stderr, "acceptance: could not write the evidence: %v\n", err)
 	}
 
+	var downErr error
 	if opts.noTeardown {
 		// SAID EXACTLY: the services are STOPPED. An earlier version of this said
 		// the deployment "was left standing", which was false — both children are
@@ -187,16 +201,15 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 			"but nothing was destroyed.\n")
 		fmt.Fprintf(env.Stdout, "This run's scale sets and compute are still there. Destroy them with\n")
 		fmt.Fprintf(env.Stdout, "  billet acceptance down --workspace %s\n", dir)
-
-		return waitErr
+	} else {
+		downErr = tearDownAcceptance(teardownCtx, env, ws, proved)
 	}
 
-	downErr := tearDownAcceptance(teardownCtx, env, ws, proved)
-
-	// THE RUN'S OWN FAILURE WINS. A teardown that also failed is reported beside
-	// it rather than replacing it, because "the job did not run" and "the cleanup
-	// did not finish" are two things an operator has to know and only one of them
-	// is what they came for.
+	// THE RUN'S OWN FAILURE WINS, AND THE PROOF'S FAILS IT EITHER WAY. A teardown that
+	// also failed is reported beside it rather than replacing it, because "the job did
+	// not run" and "the cleanup did not finish" are two things an operator has to know
+	// and only one of them is what they came for; and a run sent --no-teardown is torn
+	// down later by `down`, which has no barrier of its own to fail.
 	return errors.Join(waitErr, proofErr, downErr)
 }
 

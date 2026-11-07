@@ -68,7 +68,37 @@ run "sentinels_fully_substituted" {
     error_message = "the BilletCacheList statement must scope s3:prefix to exactly the real cache_prefix on the bare bucket ARN"
   }
 
-  # THE LAUNCH BOUNDARY, structurally. ec2:RunInstances is granted on "*" and it
+  # THE LAUNCH TAG, structurally (#779): the instance and its volumes are launched
+  # only under billet's owner tag, so the role cannot make compute no billet role
+  # can list or terminate. The unconditioned NotResource grant beside it must
+  # exclude both, or it hands them back without the condition.
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.node.policy).Statement :
+      try(
+        s.Sid == "BilletRuntimeLaunchOwned" &&
+        s.Effect == "Allow" &&
+        tolist(s.Resource) == tolist(["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"]) &&
+        s.Condition.Null["aws:RequestTag/sh.billet.owner"] == "false" &&
+        tolist(s.Condition["ForAnyValue:StringEquals"]["aws:TagKeys"]) == tolist(["sh.billet.owner"]),
+        false
+      )
+      ]) && anytrue([
+      for s in jsondecode(aws_iam_role_policy.node.policy).Statement :
+      try(
+        s.Sid == "BilletRuntimeLaunch" &&
+        s.Effect == "Allow" &&
+        tolist(s.Action) == tolist(["ec2:RunInstances"]) &&
+        tolist(s.NotResource) == tolist(["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"]) &&
+        !can(s.Resource) && !can(s.Condition),
+        false
+      )
+    ])
+    error_message = "the node policy must launch an instance and its volumes only under billet's owner tag, in the real partition"
+  }
+
+  # THE LAUNCH BOUNDARY, structurally. ec2:RunInstances is granted unconditioned on
+  # every resource type but the instance and its volumes, and it
   # authorises every snapshot a block-device mapping names, so without this Deny
   # the node role can launch an instance with the control plane's ledger snapshot
   # attached and read the deployment identity and the CA key off it. Asserted as a
@@ -1335,4 +1365,78 @@ run "a_builder_without_an_override_still_attaches" {
     condition     = length(aws_iam_role_policy.builder) == 1
     error_message = "a builder with no override is the ordinary shape and must apply"
   }
+}
+
+# THE NODE ROLE'S BOUNDARY IS THE ONE NAMED, OR NONE: an operator whose automation adds
+# a grant to the role sets one so the grant can never exceed it, and an unset boundary
+# must render no boundary rather than an empty string IAM would refuse.
+run "node_role_carries_the_boundary_it_is_given" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id                        = "vpc-0f0f0f0f0f0f0f0f0"
+    name                          = "billet-test"
+    node_permissions_boundary_arn = "arn:aws:iam::123456789012:policy/billet-test-boundary"
+  }
+
+  assert {
+    condition     = aws_iam_role.node.permissions_boundary == "arn:aws:iam::123456789012:policy/billet-test-boundary"
+    error_message = "the node role does not carry the boundary it was given"
+  }
+}
+
+run "node_role_carries_no_boundary_by_default" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id = "vpc-0f0f0f0f0f0f0f0f0"
+    name   = "billet-test"
+  }
+
+  assert {
+    condition     = aws_iam_role.node.permissions_boundary == null
+    error_message = "the node role carries a boundary nobody named"
+  }
+}
+
+run "a_boundary_that_is_no_policy_arn_is_refused" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id                        = "vpc-0f0f0f0f0f0f0f0f0"
+    name                          = "billet-test"
+    node_permissions_boundary_arn = "billet-test-boundary"
+  }
+
+  expect_failures = [var.node_permissions_boundary_arn]
+}
+
+# A ROLE IS NO BOUNDARY: IAM takes only a managed policy, and an ARN that names a role
+# would plan and then fail at apply.
+run "a_boundary_that_names_a_role_is_refused" {
+  command = plan
+
+  module {
+    source = "./modules/fleet-ec2"
+  }
+
+  variables {
+    vpc_id                        = "vpc-0f0f0f0f0f0f0f0f0"
+    name                          = "billet-test"
+    node_permissions_boundary_arn = "arn:aws:iam::123456789012:role/billet-test-boundary"
+  }
+
+  expect_failures = [var.node_permissions_boundary_arn]
 }

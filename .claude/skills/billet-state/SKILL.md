@@ -20,6 +20,8 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The writer slot is observed from inside `DB.Tx`, and the observer must return at once.**
 - **A ledger writer reaches no network.**
 - **A PostgreSQL recovery crosses its own fence with `OpenPostgresRecovery`, and the archive's PostgreSQL reads are peeks, not opens (`pgpeek.go`, #19).**
+- **A migration does not rewrite job_history.**
+- **The reader pool is sized by the deployment's budget, and an idle one goes (#556).**
 - **Three open modes, and what each may do.**
 - **An open's own startup budget is a deadline, and a caller can tell it from its own.**
 - **Only `ledgertest`'s template build may stretch an open's startup budget (`WithStartupBudget`).**
@@ -51,6 +53,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The gate that proves the set still fits the schema is `TestEveryGeneratedQueryPreparesAgainstTheMigratedSchema`.**
 - **Raw SQL is banned mechanically.**
 - **Migrations 53 to 55 carry #226's cache evidence and outcomes.**
+- **`job_history.run_attempt` (migration 71) is a job's run attempt, zero being not recorded and never a first attempt.**
 - **The ledger is not authoritative for cache generation pointers.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).

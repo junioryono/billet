@@ -24,7 +24,9 @@ Pin the module to a release in your own configuration: the `?ref=` names the ver
 
 The module's IAM is exactly what `billet init iam` prints for the same config, kept equal by a drift test, so the module can never grant a permission billet would not ask for. `billet init iam --builder` adds what `billet ami build` needs (with `--payload-bucket` for the bucket the build is staged in); `--controller-sweep` adds the CodeBuild registration sweep. The module's `builder` input attaches that same generated document as its own inline policy, so the build can run on the controller rather than from a workstation's credentials.
 
-The node role may launch instances but may not launch one from a snapshot this deployment does not own, which is an explicit deny rather than a narrower grant: `ec2:RunInstances` authorises every snapshot a block-device mapping names, and the account a fleet runs in is usually also where the control plane's ledger snapshots live. billet's own launches name no snapshot, so nothing it does is refused by it. In account-wide mode the deny asks only that the snapshot carry billet's owner tag, so another billet deployment's snapshot in the same account is still reachable; a per-deployment KMS key is what closes that, the same as for the cache.
+The node role may launch an instance only when the launch tags it and its volumes with billet's owner tag, so it cannot launch compute that billet would neither list nor terminate. The policy `billet init iam` prints asks for this deployment's own value in that tag, and names the node's subnet and security groups as the only ones a launch may use. The Terraform module's rendering names no network, because its committed policy carries no ids; pass `billet init iam` output as `iam_policy_json` for the narrower one.
+
+The node role may not launch an instance from a snapshot this deployment does not own, which is an explicit deny rather than a narrower grant: `ec2:RunInstances` authorises every snapshot a block-device mapping names, and the account a fleet runs in is usually also where the control plane's ledger snapshots live. billet's own launches name no snapshot, so nothing it does is refused by it. In account-wide mode the deny asks only that the snapshot carry billet's owner tag, so another billet deployment's snapshot in the same account is still reachable; a per-deployment KMS key is what closes that, the same as for the cache.
 
 ## The node
 
@@ -57,6 +59,8 @@ node:
 
 `node.ebs_s3` and `node.cache` are two halves of one thing, and the second one is what a guest actually talks to. A store with no listener is a cache nothing can reach: nothing hands the guest a cache endpoint, so every job's `/var/lib/docker` is the instance's root volume, every image is pulled cold, and no volume, snapshot or state object is ever created. That combination loaded, started and ran jobs silently until `billet check` learned to refuse it, and it is a check refusal rather than a config-load one because `billet decommission` (which purges what the cache left behind) and `billet init iam` (which renders its grants) both read the store block on a config whose listener is already gone. The certificate must name the `guest_endpoint` host and its issuer must already be in the AMI's trust store — bake it in with `billet ami build --ca-cert <issuer.pem>` — and the listener should admit the runner security groups only. Leave both blocks out for a node with no cache at all.
 
+With both blocks, the node serves every cache a tier can have on this backend ([Build caches](../operating/build-caches.md) has what that asks of its disk and network), and the module grants what they need. Add an S3 gateway endpoint to an adopted VPC, or every archive crosses your NAT.
+
 `billet init --provider ec2` writes the `ec2` block from flags; the two cache blocks are yours to add together. One `ec2` node is a serial launch queue (a node executes one command at a time), which is invisible when a node is one machine's worth of jobs and visible when it stands for sixty; run several `ec2` nodes, each registered with its own budget, if that binds.
 
 ## The image
@@ -67,9 +71,42 @@ A tier's `image:` (or `launch.ec2.image`) is an AMI id, and an AMI id is region-
 billet ami build --config billet.yaml --region us-west-2 --subnet subnet-… --security-group sg-…
 ```
 
-`ami build` runs GitHub's own `actions/runner-images` template for the architecture, the same one the Firecracker guest image runs ([ADR-022](../reference/decisions/adr-022-every-linux-image-from-githubs-template.md)), on a builder of that architecture (`--arch arm64` for Graviton; the builder defaults to c7i.4xlarge or c7g.4xlarge with a 120 GiB root, which is also every job's root). So a workflow finds GitHub's toolchains, toolcache and JDKs on either backend, and GitHub's own tests, run during the build, decide whether the image matches theirs. The components GitHub's image carries and billet does not redistribute (Chrome, Edge, Firefox, the Android SDK and CodeQL, where the architecture's template has them) are installed only when the deployment accepts them, by the rule `billet images pull` follows: the config's `images.accept`, and on a node's config also what its control plane accepts, as the node recorded it at its last registration (a node that cannot show its own deployment's recorded acceptance, because it recorded none, recorded another deployment's, or cannot read the record or its identity, is refused rather than built without). The image records which it carries. The build runs on the builder itself, reboots once where the template does, and announces its verdict on the instance's console, so a step that fails ends `ami build` with the step named rather than at the timeout. It then **boots the image it made** and asserts on the artifact rather than on the builder: free space, the Docker storage driver on a fresh boot, the runner, the toolchains run as the runner account under the job's own environment, every recorded component, and the absence of every component not recorded. Only then does it stamp the contract tag and the components. An image billet has not booted carries no tag, and `billet check` reports it as unknown; an image from an older contract is reported as needing a rebuild; `billet ami verify <ami>` stamps an existing image. Measured on 2026-10-25 and 26 in us-west-2: the template and billet's layer took 40 to 43 minutes on x64 and 38 to 39 on arm64, the snapshot 59 to 60 and 45 to 48 minutes to become available, and the verifier's boot four to six, so 1 h 44 min to 1 h 49 min and 1 h 29 min to 1 h 32 min in all; `--timeout` defaults to three hours, and an image a timeout leaves unstamped is stamped later by `billet ami verify <ami>`.
+`ami build` runs GitHub's own `actions/runner-images` template for the architecture, the same one the Firecracker guest image runs ([ADR-022](../reference/decisions/adr-022-every-linux-image-from-githubs-template.md)), on a builder of that architecture (`--arch arm64` for Graviton; the builder defaults to c7i.4xlarge or c7g.4xlarge with a 120 GiB root, which is also every job's root). So a workflow finds GitHub's toolchains, toolcache and JDKs on either backend, and GitHub's own tests, run during the build, decide whether the image matches theirs. The components GitHub's image carries and billet does not redistribute (Chrome, Edge, Firefox, the Android SDK and CodeQL, where the architecture's template has them) are installed only when the deployment accepts them, by the rule `billet images pull` follows: the config's `images.accept`, and on a node's config also what its control plane accepts, as the node recorded it at its last registration (a node that cannot show its own deployment's recorded acceptance, because it recorded none, recorded another deployment's, or cannot read the record or its identity, is refused rather than built without). The image records which it carries. The build runs on the builder itself, reboots once where the template does, and announces its verdict on the instance's console, so a step that fails ends `ami build` with the step named rather than at the timeout. It then **boots the image it made** and asserts on the artifact rather than on the builder: free space, the Docker storage driver on a fresh boot, the runner, the toolchains run as the runner account under the job's own environment, every recorded component, and the absence of every component not recorded. Only then does it stamp the contract tag and the components. An image billet has not booted carries no tag, and `billet check` reports it as unknown; an image from an older contract is reported as needing a rebuild; `billet ami verify <ami>` stamps an existing image. Measured on 2026-10-25 and 26 in us-west-2: the template and billet's layer took 40 to 43 minutes on x64 and 38 to 39 on arm64, the snapshot 59 to 60 and 45 to 48 minutes to become available, and the verifier's boot four to six, so 1 h 44 min to 1 h 49 min and 1 h 29 min to 1 h 32 min in all; `--timeout` defaults to three hours, and an image a timeout leaves unstamped is stamped later by `billet ami verify <ami>`. Accept them before the first `ami build`, as [Your first config](../getting-started/first-config.md#accept-the-licensed-image-components-linux) describes, or the AMI lacks them.
+
+The image carries billet itself, for the Go and Bazel caches' helpers: the binary running the build, where it is a static linux build of the image's architecture, or the one `--guest-billet` names. A build from a Mac or for the other architecture needs that flag, and it is refused before a builder launches without it.
 
 The builder checks the Actions runner tarball against the sha256 billet pins for it, the same digest the Firecracker guest image is checked with, and stops before unpacking anything that does not match. The pin covers one release, the one `--runner-version` defaults to; to build another, pass `--runner-sha256` with the sha256 of `actions-runner-linux-<arch>-<version>.tar.gz` from that release's page, or the build is refused before a builder launches.
+
+## Windows jobs
+
+An `ec2` tier can run Windows jobs on an AMI billet builds in your account from Amazon's license-included Windows Server 2025 image ([ADR-026](../reference/decisions/adr-026-windows-on-ec2.md)).
+
+```bash
+BASE=$(aws ssm get-parameter --region us-west-2 \
+  --name /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base \
+  --query Parameter.Value --output text)
+billet ami build --os windows --config billet.yaml --base-image "$BASE" --payload-bucket my-bucket \
+  --region us-west-2 --subnet subnet-… --security-group sg-… --public-ip
+```
+
+```yaml
+tiers:
+  - label: windows-2025
+    provider: ec2
+    guest_os: windows
+    trust: untrusted
+    vcpu: 4
+    memory: 8GiB
+    image: ami-…
+```
+
+`--os windows` is held to what the base image reports, in both directions, and so is a tier's `guest_os` against its AMI, at `billet check` and again before a launch sends anything.
+
+The trust rules are the Linux instance's: untrusted work needs `untrusted_security_group_ids`, gets no instance profile, and the metadata service is IMDSv2 with one hop. The job's runner runs as the local administrator `runner`, as GitHub's runs as `runneradmin`, so a job can install software; the instance is the boundary, and it is destroyed with the job.
+
+A Windows image carries what the floor in ADR-026 lists, not what GitHub's hosted `windows-2025` carries: no Visual Studio, no Docker, no Java or .NET SDK beyond what Windows ships, no Windows updates past the base image's month. `actions/setup-*` downloads what is missing. `differences-windows.tsv` lists every step of GitHub's template the build leaves out and why. billet's caches have no client in a Windows guest, so a Windows tier sets no `cache`, `intercept` or `cache_scope`.
+
+A first boot is the slow part: a job started about two minutes after its launch where a Linux one takes under one, so count that against a tier's wait. GitHub takes back an assignment left unstarted after five minutes, so every Windows launch asks EBS to read the image's snapshot at a provisioned 200 MiB/s. AWS charges that once per launch on the snapshot's full size, about $0.09 on a 36 GiB image, on top of the instance and its volume. Linux containers inside a Windows guest are out of scope.
 
 ## Spot
 
@@ -81,7 +118,7 @@ Real private-repository jobs have launched on EC2, registered through JIT config
 
 ## Cost
 
-Declared prices report exposure; they do not gate admission. `billet check` reports one node's conservative peak; `billet status` reports the deployment-wide peak across registered cloud nodes under the shared ceiling, disconnected registrations included because their instances may still be billable. An AWS budget is the account-wide backstop. `billet decommission --yes` removes the instances and the EBS+S3 cache billet made outside Terraform; run it before `terraform destroy`.
+Declared prices report exposure; they do not gate admission. `billet check` reports one node's conservative peak; `billet status` reports the deployment-wide peak across registered cloud nodes under the shared ceiling, disconnected registrations included because their instances may still be billable. An AWS budget is the account-wide backstop. `billet decommission --yes` removes the instances and the EBS+S3 cache billet made outside Terraform; run it before `terraform destroy`, on the node's host (it finds the deployment's identity in the node's state directory) and with a credential that may delete every object under the cache prefix. The node's own role may not: the policy billet renders lets it delete what eviction removes and never the state objects, so under that role decommission removes the snapshots and the archives and then stops with `AccessDenied` on the first state object (measured 2026-11-05, [site acceptance](../reference/records/site-acceptance.md)).
 
 ## Everything in AWS
 

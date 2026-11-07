@@ -32,6 +32,9 @@ type Target struct {
 	// its key goes to. Every one the archive carries must be here with the same
 	// identity, and every one here must be in the archive.
 	Targets []TargetPath
+	// KeysWithBroker says this host's config takes its tokens from a broker, so no
+	// App key is installed here, whatever the archive carries.
+	KeysWithBroker bool
 
 	// LedgerBackend is what THIS host's config says its ledger is — "sqlite",
 	// "postgres", or empty for a config that names none (which is sqlite).
@@ -1167,6 +1170,26 @@ func canonical(path string) (string, error) {
 }
 
 func (p *Plan) planAppKey() {
+	// THE CONFIG SAYS THIS HOST HOLDS NO KEY, and a restore does not make it hold
+	// one. Moving to a broker after this archive was written is ordinary, and the
+	// key in it stays in the archive.
+	if p.Target.KeysWithBroker {
+		return
+	}
+
+	// THE ARCHIVE HAS NONE AND THE CONFIG WANTS ONE: nothing here could install it,
+	// and a control plane restored without it fails its first token.
+	if p.Archive.Manifest.KeysWithBroker {
+		p.refuse(lifeops.Refusal{
+			What: fmt.Sprintf("this archive carries no App key, because a token broker held this deployment's "+
+				"keys when it was written, and %s names no broker", p.Target.ConfigPath),
+			Remedy: "set server.token_broker in that config and remove private_key_path, or install the App key " +
+				"yourself and restore with a config that takes tokens from the broker first",
+		})
+
+		return
+	}
+
 	p.planOneAppKey(EntryAppKey, "github.private_key_path", p.Target.AppKeyPath,
 		"GitHub App private key")
 
