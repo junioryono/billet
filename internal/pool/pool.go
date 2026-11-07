@@ -68,7 +68,7 @@ type Ledger interface {
 	PoolOrderGone(ctx context.Context, id string) error
 	CapacityReports(ctx context.Context) (map[string]alloc.TierCapacity, error)
 	PoolIdleHosts(ctx context.Context) ([]alloc.PoolIdleHost, error)
-	ReleaseIdlePoolHost(ctx context.Context, order string, idleBefore time.Time, reason string) error
+	ReleaseIdlePoolHost(ctx context.Context, order string, idleBefore time.Time, floor int, reason string) error
 }
 
 // Choice is one place a host may be ordered from.
@@ -203,7 +203,7 @@ func (p *Pool) Step(ctx context.Context) error {
 	if orders, err = p.ledger.PoolOrders(ctx); err != nil {
 		return errors.Join(append(errs, err)...)
 	}
-	demand, err := p.demand(ctx)
+	demand, quiet, err := p.demand(ctx)
 	if err != nil {
 		// COULD-NOT-TELL IS NOT NO DEMAND, and it is not demand either: the floor is
 		// still kept, and growth for demand waits for a reading.
@@ -230,7 +230,7 @@ func (p *Pool) Step(ctx context.Context) error {
 	}
 	// SHRINKING READS DEMAND, so a reading it could not take shrinks nothing.
 	if p.cfg.IdleAfter > 0 && err == nil {
-		if serr := p.shrink(ctx, orders, demand); serr != nil {
+		if serr := p.shrink(ctx, orders, quiet); serr != nil {
 			errs = append(errs, serr)
 		}
 	}
@@ -238,26 +238,42 @@ func (p *Pool) Step(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// shrink asks for the release of the joined host idle longest on each architecture
-// above its floor with no demand, nothing unknown and nothing on its way, when it has
-// held nothing for IdleAfter. One host per architecture per step: each release counts
-// as leaving from the next step on, and the floor is read again then.
-func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, demand map[config.Arch]bool) error {
+// shrink asks for the release of the joined host idle longest on each architecture whose
+// joined hosts outnumber its floor, whose demand is known to be none, and with nothing
+// unknown and nothing on its way, when it has held nothing for IdleAfter. A host a tier
+// pins by name is never one: no host the pool orders could replace it. Nor is a host of a
+// source that does not confirm gone, whose released order would hold a place under the
+// maximum until a person closed it. One host per architecture per step: each release
+// counts as leaving from the next step on, and the floor is read again then.
+func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, quiet map[config.Arch]bool) error {
 	idle, err := p.ledger.PoolIdleHosts(ctx)
 	if err != nil {
 		return fmt.Errorf("pool: read the idle hosts: %w", err)
+	}
+	pinned := map[string]bool{}
+	for i := range p.cfg.Tiers {
+		if n := p.cfg.Tiers[i].Node; n != "" {
+			pinned[n] = true
+		}
+	}
+	byID := map[string]*alloc.PoolOrder{}
+	for i := range orders {
+		byID[orders[i].ID] = &orders[i]
 	}
 	cutoff := p.now().Add(-p.cfg.IdleAfter)
 	var errs []error
 	for arch, a := range p.cfg.Archs {
 		c := count(orders, arch)
-		if c.unknown > 0 || c.onItsWay > 0 || demand[arch] || c.active-c.leaving <= a.Floor {
+		if c.unknown > 0 || c.onItsWay > 0 || !quiet[arch] || c.usable <= a.Floor {
 			continue
 		}
 		var pick *alloc.PoolIdleHost
 		for i := range idle {
 			h := &idle[i]
-			if h.Arch == arch && !h.Since.After(cutoff) && (pick == nil || h.Since.Before(pick.Since)) {
+			if h.Arch != arch || h.Since.After(cutoff) || pinned[h.Node] || !p.confirmsGone(byID[h.Order]) {
+				continue
+			}
+			if pick == nil || h.Since.Before(pick.Since) {
 				pick = h
 			}
 		}
@@ -266,9 +282,11 @@ func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, demand map[
 		}
 		reason := fmt.Sprintf("idle since %s, past server.pool.idle_after %s",
 			pick.Since.UTC().Format(time.RFC3339), p.cfg.IdleAfter)
-		switch err := p.ledger.ReleaseIdlePoolHost(ctx, pick.Order, cutoff, reason); {
+		switch err := p.ledger.ReleaseIdlePoolHost(ctx, pick.Order, cutoff, a.Floor, reason); {
 		case errors.Is(err, alloc.ErrPoolHostNotIdle):
 			p.log.Info("a pool host the pool would release took work first; it stays", "order", pick.Order)
+		case errors.Is(err, alloc.ErrPoolAtFloor):
+			p.log.Info("a pool host the pool would release is needed for the floor now; it stays", "order", pick.Order)
 		case err != nil:
 			errs = append(errs, err)
 		default:
@@ -280,11 +298,32 @@ func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, demand map[
 	return errors.Join(errs...)
 }
 
+// confirmsGone says whether an order's source answers gone for a host it took back, as
+// its terms for the order's shape say; an order or terms it cannot read is not.
+func (p *Pool) confirmsGone(o *alloc.PoolOrder) bool {
+	if o == nil {
+		return false
+	}
+	src := p.cfg.Sources[o.Source]
+	if src == nil {
+		return false
+	}
+	terms, err := src.Terms(o.Shape)
+
+	return err == nil && terms.ConfirmsGone
+}
+
+// IdleAfter is how long a joined host must have held nothing before the pool asks for
+// its release, zero when the pool never shrinks itself.
+func (p *Pool) IdleAfter() time.Duration { return p.cfg.IdleAfter }
+
 // counts are an architecture's orders that hold or may hold a host (active), those
 // whose outcome is not known (unknown), those placed, not yet joined and not held for a
-// person (onItsWay), and those whose host is being released (leaving), which are active
-// until the source says they are gone.
-type counts struct{ active, unknown, onItsWay, leaving int }
+// person (onItsWay), those whose host is being released (leaving), which are active
+// until the source says they are gone, and those a node joined from with no release asked
+// for (usable), the hosts that can take work now, which alone keep the floor a shrink
+// leaves.
+type counts struct{ active, unknown, onItsWay, leaving, usable int }
 
 func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 	var c counts
@@ -302,7 +341,9 @@ func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 			switch {
 			case !o.ReleaseRequested.IsZero():
 				c.leaving++
-			case o.NodeName == "" && o.JoinHold == "":
+			case o.NodeName != "":
+				c.usable++
+			case o.JoinHold == "":
 				// A HELD ORDER IS NOT ON ITS WAY: its host joins only once a person acts,
 				// and counting it would stop growth for demand until then.
 				c.onItsWay++
@@ -317,15 +358,22 @@ func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 }
 
 // demand is the architectures a Firecracker tier is short of hosts on (work it could
-// not buy for, and only hosts to blame), by a report
-// fresh enough to say so. A Firecracker tier whose report is missing, stale or in error
-// makes the whole reading unknown.
-func (p *Pool) demand(ctx context.Context) (map[config.Arch]bool, error) {
+// not buy for, and only hosts to blame), and the architectures known to have no demand at
+// all (quiet): every Firecracker tier there counted its unstarted work and found none,
+// and is short of nothing. A report a listener writes with its count unknown (a session
+// recovered, a launch ended) says no shortage and is not quiet, because no shortage is
+// not no demand. Both are read from reports fresh enough to say so. A Firecracker tier
+// whose report is missing, stale or in error makes the whole reading unknown.
+func (p *Pool) demand(ctx context.Context) (map[config.Arch]bool, map[config.Arch]bool, error) {
 	reports, err := p.ledger.CapacityReports(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrDemandUnknown, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrDemandUnknown, err)
 	}
 	out := map[config.Arch]bool{}
+	quiet := map[config.Arch]bool{}
+	for arch := range p.cfg.Archs {
+		quiet[arch] = true
+	}
 	var unknown []string
 	for i := range p.cfg.Tiers {
 		t := &p.cfg.Tiers[i]
@@ -346,12 +394,15 @@ func (p *Pool) demand(ctx context.Context) (map[config.Arch]bool, error) {
 		if r.Listener.HostShortage {
 			out[t.Arch] = true
 		}
+		if u := r.Listener.Unstarted; u == nil || *u != 0 || r.Listener.HostShortage {
+			quiet[t.Arch] = false
+		}
 	}
 	if len(unknown) > 0 {
-		return out, fmt.Errorf("%w: no fresh report for %v", ErrDemandUnknown, unknown)
+		return out, nil, fmt.Errorf("%w: no fresh report for %v", ErrDemandUnknown, unknown)
 	}
 
-	return out, nil
+	return out, quiet, nil
 }
 
 func servesFirecracker(t *config.Tier) bool {

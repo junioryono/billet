@@ -242,7 +242,8 @@ func TestTermsGiveTheClientTokenWindow(t *testing.T) {
 	t.Parallel()
 	s := newTestSource(t, &fakeHosts{})
 	terms, err := s.Terms("m7gd.metal")
-	if err != nil || terms.IdempotentFor != 10*time.Minute || terms.BillingUnit != time.Second || terms.Preemptible {
+	if err != nil || terms.IdempotentFor != 10*time.Minute || terms.BillingUnit != time.Second || terms.Preemptible ||
+		!terms.ConfirmsGone {
 		t.Fatalf("terms = %+v, %v", terms, err)
 	}
 	if _, err := s.Terms("c7i.metal-24xl"); err == nil {

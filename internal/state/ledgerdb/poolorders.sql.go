@@ -106,6 +106,21 @@ func (q *Queries) CountPoolOrderAdmissions(ctx context.Context, arg CountPoolOrd
 	return column_1, err
 }
 
+const countPoolServingHosts = `-- name: CountPoolServingHosts :one
+SELECT CAST(COUNT(*) AS BIGINT) FROM pool_orders
+ WHERE arch = $1 AND state = 'placed' AND release_requested_at = '' AND node_name != ''
+`
+
+// An architecture's joined hosts still serving: placed, a node joined, no release asked
+// for. The floor an automatic release must leave is counted from these, in the release's
+// own transaction, so a release a person asked for meanwhile is counted too.
+func (q *Queries) CountPoolServingHosts(ctx context.Context, arch string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countPoolServingHosts, arch)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const endPoolClearanceRun = `-- name: EndPoolClearanceRun :exec
 UPDATE pool_orders SET clear_since = '', clear_observed_at = ''
  WHERE order_id = $1 AND state = 'placed'

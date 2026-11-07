@@ -223,3 +223,10 @@ SELECT p.order_id, p.node_name, p.arch,
    AND p.join_hold = ''
    AND NOT EXISTS (SELECT 1 FROM leases l
                     WHERE COALESCE(l.node, l.target_node) = p.node_name AND l.phase NOT IN ('done','failed'));
+
+-- name: CountPoolServingHosts :one
+-- An architecture's joined hosts still serving: placed, a node joined, no release asked
+-- for. The floor an automatic release must leave is counted from these, in the release's
+-- own transaction, so a release a person asked for meanwhile is counted too.
+SELECT CAST(COUNT(*) AS BIGINT) FROM pool_orders
+ WHERE arch = @arch AND state = 'placed' AND release_requested_at = '' AND node_name != '';

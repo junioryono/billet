@@ -16,6 +16,11 @@ import (
 // was not idle long enough. Nothing was written.
 var ErrPoolHostNotIdle = errors.New("alloc: the pool host is not idle")
 
+// ErrPoolAtFloor is an automatic release that would leave its architecture fewer serving
+// hosts than its floor, counted in the release's own transaction: a person's release
+// committed since the scaler read the pool counts. Nothing was written.
+var ErrPoolAtFloor = errors.New("alloc: the pool is at its floor")
+
 // PoolIdleHost is a joined pool host that holds nothing, with when it last held
 // something: the end of its newest job, or its node's admission if it never ran one.
 type PoolIdleHost struct {
@@ -56,10 +61,13 @@ func (a *Allocator) PoolIdleHosts(ctx context.Context) ([]PoolIdleHost, error) {
 
 // ReleaseIdlePoolHost asks for the release of a joined pool host on the pool's word, in
 // one transaction that reads it again: it must still hold nothing, have no release asked
-// for, and have held nothing since idleBefore. Otherwise it answers ErrPoolHostNotIdle
-// and writes nothing. The release then proves itself as any other does (ADR-030): a
-// timer proposes a drain; only the proof releases.
-func (a *Allocator) ReleaseIdlePoolHost(ctx context.Context, order string, idleBefore time.Time, reason string) error {
+// for, and have held nothing since idleBefore, or it answers ErrPoolHostNotIdle; and its
+// architecture must keep at least floor serving hosts without it, or it answers
+// ErrPoolAtFloor. Either way nothing is written. The release then proves itself as any
+// other does (ADR-030): a timer proposes a drain; only the proof releases.
+func (a *Allocator) ReleaseIdlePoolHost(
+	ctx context.Context, order string, idleBefore time.Time, floor int, reason string,
+) error {
 	if reason == "" {
 		return fmt.Errorf("alloc: releasing idle pool order %s needs a reason", order)
 	}
@@ -81,6 +89,15 @@ func (a *Allocator) ReleaseIdlePoolHost(ctx context.Context, order string, idleB
 		if !ok || since.After(idleBefore) {
 			return fmt.Errorf("%w: pool order %s has not been idle since %s", ErrPoolHostNotIdle, order,
 				idleBefore.UTC().Format(time.RFC3339))
+		}
+
+		serving, err := q.CountPoolServingHosts(ctx, row.Arch)
+		if err != nil {
+			return fmt.Errorf("alloc: count %s's serving pool hosts: %w", row.Arch, err)
+		}
+		if serving-1 < int64(floor) {
+			return fmt.Errorf("%w: releasing pool order %s would leave %s %d serving host(s), below its floor of %d",
+				ErrPoolAtFloor, order, row.Arch, serving-1, floor)
 		}
 
 		return requestJoinedReleaseTx(ctx, q, order, row.NodeName, reason, a.now().UTC())

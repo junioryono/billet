@@ -1,12 +1,24 @@
 package alloc
 
 import (
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
 )
+
+// joinedPoolHost places order id, admits a node from it with certificate serial, and
+// registers that node.
+func joinedPoolHost(t *testing.T, a *Allocator, id, serial string) {
+	t.Helper()
+	tok := placedOrder(t, a, id)
+	if _, err := a.AdmitPoolEnrollment(t.Context(), admission(t, a, id, "SHA256:"+id, tok, serial)); err != nil {
+		t.Fatalf("admit %s: %v", id, err)
+	}
+	registerPoolNode(t, a, PoolNodeName(id))
+}
 
 // A POOL HOST'S IDLENESS STARTS AT ITS NEWEST JOB'S END, OR ITS ADMISSION, and the pool's
 // request for its release reads it again in its own transaction: a host holding a lease
@@ -34,28 +46,32 @@ func TestAPoolHostsIdlenessDecidesItsReleaseInOneTransaction(t *testing.T) {
 	if idle, err := a.PoolIdleHosts(ctx); err != nil || len(idle) != 0 {
 		t.Fatalf("a host holding a lease is idle: %+v, %v", idle, err)
 	}
-	if err := a.ReleaseIdlePoolHost(ctx, "pa", now, "idle"); !errors.Is(err, ErrPoolHostNotIdle) {
+	if err := a.ReleaseIdlePoolHost(ctx, "pa", now, 0, "idle"); !errors.Is(err, ErrPoolHostNotIdle) {
 		t.Fatalf("releasing a host that holds a lease answered %v", err)
 	}
 	if o := readOrder(t, a, "pa"); !o.ReleaseRequested.IsZero() {
 		t.Fatal("a refused idle release asked for the release")
 	}
 
+	// A LEASE THAT FAILED holds nothing either, and its end starts the host's idleness.
 	ended := start.Add(15 * time.Minute)
 	now = ended
-	if err := a.Release(ctx, leases[0].ID, leases[0].Epoch, PhaseDone); err != nil {
+	if err := a.Release(ctx, leases[0].ID, leases[0].Epoch, PhaseFailed); err != nil {
 		t.Fatal(err)
 	}
 	idle, err = a.PoolIdleHosts(ctx)
 	if err != nil || len(idle) != 1 || !idle[0].Since.Equal(ended) {
 		t.Fatalf("after its job: %+v, %v; want it idle since the job ended", idle, err)
 	}
-	if err := a.ReleaseIdlePoolHost(ctx, "pa", ended.Add(-time.Second), "idle"); !errors.Is(err, ErrPoolHostNotIdle) {
+	if err := a.ReleaseIdlePoolHost(ctx, "pa", ended.Add(-time.Second), 0, "idle"); !errors.Is(err, ErrPoolHostNotIdle) {
 		t.Fatalf("a host idle for less than the cutoff answered %v", err)
+	}
+	if err := a.ReleaseIdlePoolHost(ctx, "pa", ended, 0, ""); err == nil {
+		t.Fatal("an idle release with no reason was asked for")
 	}
 
 	now = ended.Add(30 * time.Minute)
-	if err := a.ReleaseIdlePoolHost(ctx, "pa", now.Add(-20*time.Minute), "idle past idle_after"); err != nil {
+	if err := a.ReleaseIdlePoolHost(ctx, "pa", now.Add(-20*time.Minute), 0, "idle past idle_after"); err != nil {
 		t.Fatalf("a host idle past the cutoff: %v", err)
 	}
 	o := readOrder(t, a, "pa")
@@ -68,13 +84,78 @@ func TestAPoolHostsIdlenessDecidesItsReleaseInOneTransaction(t *testing.T) {
 	if idle, err := a.PoolIdleHosts(ctx); err != nil || len(idle) != 0 {
 		t.Fatalf("a host whose release was asked for is still offered: %+v, %v", idle, err)
 	}
-	if err := a.ReleaseIdlePoolHost(ctx, "pa", now, "again"); !errors.Is(err, ErrPoolHostNotIdle) {
+	if err := a.ReleaseIdlePoolHost(ctx, "pa", now, 0, "again"); !errors.Is(err, ErrPoolHostNotIdle) {
 		t.Fatalf("a second idle release answered %v", err)
 	}
 }
 
-// AN UNREADABLE TIME IS NEVER IDLE: a time this binary cannot parse makes the answer
-// unknown rather than old, so it never proposes a release.
+// THE FLOOR IS COUNTED IN THE RELEASE'S OWN TRANSACTION: a person's release of one of two
+// hosts, committed after the scaler read the pool, leaves the other needed for a floor of
+// one, and the scaler's release of it is refused and writes nothing.
+func TestAnIdleReleaseCountsTheFloorInItsOwnTransaction(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	joinedPoolHost(t, a, "pa", "0a")
+	joinedPoolHost(t, a, "pb", "0b")
+	now = now.Add(time.Hour)
+	cutoff := now.Add(-20 * time.Minute)
+
+	if idle, err := a.PoolIdleHosts(ctx); err != nil || len(idle) != 2 {
+		t.Fatalf("two idle hosts: %+v, %v", idle, err)
+	}
+	if _, err := a.RequestPoolRelease(ctx, "pb", "a person's word"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ReleaseIdlePoolHost(ctx, "pa", cutoff, 1, "idle"); !errors.Is(err, ErrPoolAtFloor) {
+		t.Fatalf("releasing the floor's last host answered %v", err)
+	}
+	if o := readOrder(t, a, "pa"); !o.ReleaseRequested.IsZero() {
+		t.Fatal("a release refused at the floor was recorded")
+	}
+	if err := a.ReleaseIdlePoolHost(ctx, "pa", cutoff, 0, "idle"); err != nil {
+		t.Fatalf("with no floor: %v", err)
+	}
+}
+
+// AN UNREADABLE TIME IN THE LEDGER IS NEVER IDLE: a host whose newest job's end the
+// ledger holds in a form this binary cannot parse is not listed, and its release is
+// refused, writing nothing.
+func TestAnUnreadableIdleTimeInTheLedgerIsNeverIdle(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	joinedPoolNode(t, a)
+	leases, err := a.Escrow(ctx, "intel", 1)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("a lease on the host: %v, %v", leases, err)
+	}
+	if err := a.Release(ctx, leases[0].ID, leases[0].Epoch, PhaseDone); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE job_history SET finished_at = 'yesterday' WHERE lease_id = $1`, leases[0].ID)
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Hour)
+	if idle, err := a.PoolIdleHosts(ctx); err != nil || len(idle) != 0 {
+		t.Fatalf("a host with an unreadable job end is listed idle: %+v, %v", idle, err)
+	}
+	if err := a.ReleaseIdlePoolHost(ctx, "pa", now, 0, "idle"); !errors.Is(err, ErrPoolHostNotIdle) {
+		t.Fatalf("releasing it answered %v", err)
+	}
+	if o := readOrder(t, a, "pa"); !o.ReleaseRequested.IsZero() {
+		t.Fatal("a host with an unreadable job end had its release asked for")
+	}
+}
+
+// AN UNREADABLE TIME IS NEVER IDLE, and the later of the two times is the one read: a
+// time this binary cannot parse makes the answer unknown rather than old.
 func TestAnUnreadableIdleTimeIsNeverIdle(t *testing.T) {
 	t.Parallel()
 	ok := ts(time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC))
@@ -90,6 +171,9 @@ func TestAnUnreadableIdleTimeIsNeverIdle(t *testing.T) {
 	}
 	later := ts(time.Date(2026, 11, 7, 13, 0, 0, 0, time.UTC))
 	if since, read := idleSince(later, ok); !read || since.Format(timestampFormat) != later {
-		t.Errorf("the later of the two: %v, %t", since, read)
+		t.Errorf("a job end after the admission: %v, %t", since, read)
+	}
+	if since, read := idleSince(ok, later); !read || since.Format(timestampFormat) != later {
+		t.Errorf("an admission after the job end: %v, %t", since, read)
 	}
 }
