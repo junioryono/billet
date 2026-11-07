@@ -324,7 +324,7 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 		if out, code := f.run(t, "acceptance/matrix-host.sh", []string{"MATRIX_POLL=0.1"}, "run", dir, "27"); strconv.Itoa(code) != status {
 			t.Fatalf("a run that ended %s: exit %d\n%s", status, code, out)
 		}
-		if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 240m --no-teardown\n") {
+		if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 210m --no-teardown\n") {
 			t.Fatalf("billet was run as:\n%s", log)
 		}
 		if got, err := os.ReadFile(filepath.Join(dir, "run.exit")); err != nil || string(got) != status+"\n" {

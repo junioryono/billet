@@ -45,9 +45,12 @@ jobs:
   matrix:
     runs-on: ubuntu-24.04
     environment: acceptance
-    # FIVE DISPATCH PHASES OF AT MOST 45 MINUTES EACH (images, cold, warm, and the
-    # two-writer runs of each architecture), the host's run waiting 240 of them, then the
-    # judge and the teardown: GitHub's six hours for a hosted job is the ceiling.
+    # THE BUDGET, inside GitHub's six hours for a hosted job: the host's run waits 210
+    # minutes for its jobs, 20 more for its compute barrier and 5 for each service's stop
+    # (SSM gives it 250), then the judge (15) and the teardown (`stopped` and `down`, at
+    # most 30 and 40). Five dispatch phases of at most 45 minutes each (images, cold, warm,
+    # and each architecture's two-writer runs) can outlast the host's wait; a run that
+    # does fails its phase or its jobs' count, and never passes.
     timeout-minutes: 360
     env:
       ARCHS: ${{ inputs.archs || 'x64' }}
@@ -95,7 +98,7 @@ jobs:
           role-to-assume: ${{ secrets.ACCEPTANCE_ROLE_ARN }}
           aws-region: ${{ vars.ACCEPTANCE_REGION }}
           role-session-name: billet-acceptance-${{ github.run_id }}
-          # LONGER THAN THE RUN: the host's run may wait 240 minutes, and polling SSM
+          # LONGER THAN THE RUN: the host's run may take 250 minutes, and polling SSM
           # after the session ended would leave the host running. The judge and the
           # teardown take a session of their own.
           role-duration-seconds: 18000
@@ -192,7 +195,7 @@ jobs:
           # DISPATCHED AT ONCE AFTER THIS, though the deployment's scale sets exist only
           # once its server has started: a job queued on a label before its scale set
           # existed was assigned when the control plane came up (2026-09-04).
-          id=$(scripts/acceptance/ssm-run.sh send "$HOST" 16200 \
+          id=$(scripts/acceptance/ssm-run.sh send "$HOST" 15000 \
             "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' run '$RUN_DIR' '${{ steps.repo.outputs.jobs }}'")
           echo "id=$id" >>"$GITHUB_OUTPUT"
       - id: labels
@@ -299,7 +302,7 @@ jobs:
           scripts/acceptance/ssm-run.sh run "$HOST" 120 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' stop '$RUN_DIR'"
       - name: Wait for the host's run, which writes the evidence and stops its services
         if: ${{ always() && steps.host-run.outputs.id != '' }}
-        run: scripts/acceptance/ssm-run.sh wait "$HOST" "${{ steps.host-run.outputs.id }}" 16200
+        run: scripts/acceptance/ssm-run.sh wait "$HOST" "${{ steps.host-run.outputs.id }}" 15000
       # A SESSION OF ITS OWN FOR THE JUDGE AND THE TEARDOWN, as long as the first: the
       # teardown may wait for the run twice (`stopped`, then `down`) before it can say
       # what it left, and the first session may be near its end by now.
@@ -410,12 +413,17 @@ jobs:
             aws iam delete-role-policy --role-name "$HOST_ROLE" --policy-name "billet-matrix-$RUN-down"
           gone "the App key's parameter" ParameterNotFound \
             aws ssm delete-parameter --name "/billet-acceptance/runs/$RUN/app-key"
-          if ! aws ec2 stop-instances --instance-ids "$HOST" >/dev/null; then
-            echo "could not stop the host $HOST" >&2
+          if ! aws ec2 stop-instances --instance-ids "$HOST" >/dev/null ||
+            ! aws ec2 wait instance-stopped --instance-ids "$HOST"; then
+            echo "could not stop the host $HOST, or could not see it stopped" >&2
             status=1
           fi
-          # THE HOLD GOES LAST, and only while it is still this run's.
-          if held=$(aws ssm get-parameter --name /billet-acceptance/held --query Parameter.Value \
+          # THE HOLD GOES LAST, AND ONLY AFTER A CLEAN TEARDOWN: every policy, the key's
+          # parameter and the host itself gone or proved absent, and the hold still this
+          # run's. Anything else keeps it, so no later run starts beside what is left.
+          if [ "$status" -ne 0 ]; then
+            echo "the host stays held: delete /billet-acceptance/held once what is said above is done" >&2
+          elif held=$(aws ssm get-parameter --name /billet-acceptance/held --query Parameter.Value \
             --output text 2>&1) && [ "$held" = "$RUN" ]; then
             gone "the host's hold" ParameterNotFound aws ssm delete-parameter --name /billet-acceptance/held
           else

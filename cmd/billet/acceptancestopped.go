@@ -20,8 +20,10 @@ var errAcceptanceLive = errors.New("a service of this acceptance run still lives
 // objects: `acceptance run` may return while the node it started is still draining, past
 // its stop's grace, and a lock that run handed down says nothing about that node.
 //
-// THREE ANSWERS: nil when it took and released both locks, errAcceptanceLive when one is
-// held, and any other error when it could not tell, which is never read as stopped.
+// THREE ANSWERS: nil when neither lock is held, errAcceptanceLive when one is, and any
+// other error when it could not tell, which is never read as stopped. It probes the
+// locks through state.LockHeld, which creates nothing, so asking as another account
+// leaves no file a service could not open later.
 func cmdAcceptanceStopped(env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet acceptance stopped", env.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
@@ -51,35 +53,37 @@ func acceptanceStopped(cfg *config.Config, deployment string) error {
 			return errors.New("could not tell whether this run's control plane has ended: its config " +
 				"names no identity directory")
 		}
-		lock, err := state.LockStateDir(dir)
+		path := state.DirectoryLockPath(dir)
+		held, err := state.LockHeld(path)
 		switch {
-		case errors.Is(err, state.ErrLocked):
-			return fmt.Errorf("%w: its control plane holds %s", errAcceptanceLive, state.DirectoryLockPath(dir))
 		case err != nil:
 			return fmt.Errorf("could not tell whether this run's control plane has ended: %w", err)
-		}
-		if err := lock.Release(); err != nil {
-			return fmt.Errorf("could not release the control plane's lock this took: %w", err)
+		case held:
+			return fmt.Errorf("%w: its control plane holds %s", errAcceptanceLive, path)
 		}
 	}
 
 	if cfg.Node != nil {
+		// A NODE ALLOWED TO RUN UNLOCKED proves nothing by a free lock: it starts without
+		// one when none could be placed.
+		if cfg.Node.AllowUnlockedDeployment {
+			return errors.New("could not tell whether this run's node has ended: its config allows it to " +
+				"run without the deployment lock (node.allow_unlocked_deployment)")
+		}
 		if deployment == "" {
 			return errors.New("could not tell whether this run's node has ended: the workspace records " +
 				"no deployment id, which names the node's lock")
 		}
-		lock, err := state.LockDeployment(deployment, state.LockOptions{Dir: cfg.Node.LockDir})
+		path, err := state.DeploymentLockPath(cfg.Node.LockDir, deployment)
+		if err != nil {
+			return fmt.Errorf("could not tell whether this run's node has ended: %w", err)
+		}
+		held, err := state.LockHeld(path)
 		switch {
-		case errors.Is(err, state.ErrDeploymentLocked):
-			return fmt.Errorf("%w: its node holds the lock on deployment %s", errAcceptanceLive, deployment)
 		case err != nil:
 			return fmt.Errorf("could not tell whether this run's node has ended: %w", err)
-		case lock.Degraded() != "":
-			return fmt.Errorf("could not tell whether this run's node has ended: no lock could be "+
-				"placed (%s)", lock.Degraded())
-		}
-		if err := lock.Release(); err != nil {
-			return fmt.Errorf("could not release the node's lock this took: %w", err)
+		case held:
+			return fmt.Errorf("%w: its node holds %s", errAcceptanceLive, path)
 		}
 	}
 

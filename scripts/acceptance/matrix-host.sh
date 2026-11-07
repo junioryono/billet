@@ -95,7 +95,7 @@ prepare)
 	;;
 run)
 	[ "$#" -eq 3 ] || usage
-	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 240m --no-teardown
+	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 210m --no-teardown
 	;;
 stop)
 	[ "$#" -eq 2 ] || usage

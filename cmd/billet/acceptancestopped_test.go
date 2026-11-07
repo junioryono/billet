@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -27,6 +29,16 @@ func TestStoppedIsProvedByTheServicesOwnLocks(t *testing.T) {
 
 	if err := acceptanceStopped(cfg, ws.DeploymentID); err != nil {
 		t.Fatalf("a run with neither service alive: %v", err)
+	}
+	// AND ASKING MADE NOTHING the services would later have to open.
+	nodeLock, err := state.DeploymentLockPath(cfg.Node.LockDir, ws.DeploymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{state.DirectoryLockPath(cfg.Server.IdentityDir), nodeLock} {
+		if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("asking created %s: %v", path, err)
+		}
 	}
 
 	plane, err := state.LockStateDir(cfg.Server.IdentityDir)
@@ -56,5 +68,14 @@ func TestStoppedIsProvedByTheServicesOwnLocks(t *testing.T) {
 	}
 	if err := acceptanceStopped(cfg, ws.DeploymentID); err != nil {
 		t.Errorf("once both locks are released: %v", err)
+	}
+
+	// A NODE ALLOWED TO RUN UNLOCKED is not proved stopped by a free lock.
+	unlocked := *cfg.Node
+	unlocked.AllowUnlockedDeployment = true
+	loose := *cfg
+	loose.Node = &unlocked
+	if err := acceptanceStopped(&loose, ws.DeploymentID); err == nil || errors.Is(err, errAcceptanceLive) {
+		t.Errorf("a node allowed to run unlocked answered %v, want could not tell", err)
 	}
 }

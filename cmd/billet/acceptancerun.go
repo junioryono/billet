@@ -153,7 +153,9 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 	// ITS FAILURE IS NOT THE RUN'S. A fleet that will not go quiet is worth
 	// reporting and is not a reason to skip the teardown, so the error is
 	// collected and everything below happens either way.
-	proved, proofErr := proveAcceptanceComputeClear(ctx, env, ws, opts.wait)
+	// ITS OWN BOUND, NOT --wait's AGAIN: the jobs have had --wait, and a caller budgets
+	// the run as --wait plus this, the stop's grace and the evidence.
+	proved, proofErr := proveAcceptanceComputeClear(ctx, env, ws, min(opts.wait, acceptanceDrainWait))
 	if proofErr != nil {
 		fmt.Fprintf(env.Stderr, "acceptance: the compute barrier did not clear: %v\n", proofErr)
 	}
