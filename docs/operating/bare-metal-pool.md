@@ -28,6 +28,7 @@ A control plane with `server.pool` in its config orders Firecracker hosts from r
   - **A host nothing joined from** is sealed at once, on the ledger's word that nothing was ever admitted for it, and its tokens are retired.
   - Either way, the order is closed only on the source's own answer that the host is gone. `billet pool` shows a host still draining, and why it was released.
   - **phoenixNAP never says gone of a server it took back.** So on phoenixNAP, wherever the source is no longer configured or now orders somewhere else, and for a sealed host taken back by hand, a person closes the sealed or released order with `billet pool close --reason TEXT <order>`, after checking the source's console. The order's reason records that a person closed it.
+  - **A node of a sealed, released or gone order is refused at registration**, for good, so a node already on its way in when its host was sealed or closed cannot rejoin the fleet; a host only draining still registers, and stays out of placement.
   - **A `pool-` name is the pool's.** `billet ca issue` and `billet join` refuse one without its order, and a node registering under a sealed order's name is not placeable.
 - **Not yet:** the pool does not shrink itself; a person releases a host. The pool's IAM, including the console read the join needs on AWS, is owed.
 

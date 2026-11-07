@@ -153,6 +153,7 @@ type ReadOps interface {
 	ReadPoolOrder(ctx context.Context, orderID string) (ledgerdb.PoolOrder, error)
 	CountPoolOrderAdmissions(ctx context.Context, arg ledgerdb.CountPoolOrderAdmissionsParams) (int64, error)
 	ReadNodeReleaseFacts(ctx context.Context, name string) (ledgerdb.ReadNodeReleaseFactsRow, error)
+	PoolHostReleased(ctx context.Context, name string) (bool, error)
 	CountNodeHoldings(ctx context.Context, node string) (ledgerdb.CountNodeHoldingsRow, error)
 	ReadJobConclusion(ctx context.Context, leaseID string) (sql.NullString, error)
 	ReadJobFailureReason(ctx context.Context, leaseID string) (string, error)

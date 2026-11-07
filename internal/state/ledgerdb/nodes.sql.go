@@ -689,6 +689,24 @@ func (q *Queries) MarkNodeNotLive(ctx context.Context, arg MarkNodeNotLiveParams
 	return err
 }
 
+const poolHostReleased = `-- name: PoolHostReleased :one
+SELECT EXISTS(SELECT 1 FROM pool_orders p
+               WHERE (p.node_name = $1 OR 'pool-' || p.order_id = $1)
+                 AND p.state IN ('sealed', 'released', 'gone'))
+`
+
+// Whether a node's pool order is sealed, released or gone (ADR-030): its host is being
+// taken back or was, and a registration under it is refused in the registration's own
+// transaction, so one in flight when the seal or a forced close committed cannot put the
+// node back into the fleet. Its derived name counts, linked or not. A host whose release
+// is only asked for still registers, held out of placement, so it can be drained.
+func (q *Queries) PoolHostReleased(ctx context.Context, name string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, poolHostReleased, name)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const readLeaseTargetSize = `-- name: ReadLeaseTargetSize :one
 SELECT l.target_node, l.vcpu, l.memory, n.live
   FROM leases l LEFT JOIN nodes n ON n.name = l.target_node

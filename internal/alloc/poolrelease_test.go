@@ -159,9 +159,12 @@ func TestADrainingHostIsClosedByForceOnlyWhenNothingHoldsIt(t *testing.T) {
 	if unproven := clearance(t, a).Unproven(); !slices.Equal(unproven, []string{node}) {
 		t.Fatalf("the force-closed node is not excluded from the fleet as unproven: %v", unproven)
 	}
-	registerPoolNode(t, a, node)
-	if placeableHosts(t, a) != 0 {
-		t.Fatal("a registration put a force-closed host back into placement")
+
+	// A REGISTRATION AUTHENTICATED BEFORE THE CLOSE, landing after it, is refused, and the
+	// exclusion it would have cleared stands.
+	refusedRegistration(t, a, node, "a registration after the forced close")
+	if unproven := clearance(t, a).Unproven(); !slices.Equal(unproven, []string{node}) {
+		t.Fatalf("a registration after the forced close undid the exclusion: %v", unproven)
 	}
 }
 
@@ -273,6 +276,20 @@ func decommissionOnProof(t *testing.T, a *Allocator, now *time.Time, barrier Com
 	}
 }
 
+// refusedRegistration asserts that a node registering under a released pool order's name
+// is refused in the registration's own transaction, and that it is not placeable after.
+func refusedRegistration(t *testing.T, a *Allocator, node, why string) {
+	t.Helper()
+	if _, err := a.RegisterNode(t.Context(), NodeRegistration{Name: node, Provider: config.ProviderFirecracker,
+		VCPU: 8, Memory: 32 * config.GiB, Architectures: []config.Arch{config.ArchX64},
+		WireMin: 12, WireMax: BarrierWireVersion, WireVersion: BarrierWireVersion}); !errors.Is(err, ErrPoolHostReleased) {
+		t.Fatalf("%s: the registration answered %v", why, err)
+	}
+	if placeableHosts(t, a) != 0 {
+		t.Fatalf("%s: the node is placeable", why)
+	}
+}
+
 // waitsUnsealed asserts that sealing order pa is refused and writes nothing: the order
 // stays placed and its node's certificate, serial, which the ledger records as issued,
 // stays unrevoked.
@@ -368,10 +385,7 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	if o := readOrder(t, a, "pa"); o.State != PoolGone || o.Reason != "its source said the host is gone" {
 		t.Fatalf("the order: %+v, want gone on its source's word", o)
 	}
-	registerPoolNode(t, a, node)
-	if placeableHosts(t, a) != 0 {
-		t.Fatal("a registration put a released host back into placement")
-	}
+	refusedRegistration(t, a, node, "a registration after the host is gone")
 }
 
 // contradictions are what contradicts a pool host's release after its decommission on
@@ -582,14 +596,11 @@ func TestAnAdmittedHostThatNeverRegisteredIsSealed(t *testing.T) {
 	if revoked, err := a.CertRevoked(ctx, "0a"); err != nil || !revoked {
 		t.Fatalf("its certificate was not revoked: %v, %v", revoked, err)
 	}
-	registerArchNode(t, a, PoolNodeName("pa"), config.ArchX64)
-	if placeableHosts(t, a) != 0 {
-		t.Fatal("a first registration after the seal is placeable")
-	}
+	refusedRegistration(t, a, PoolNodeName("pa"), "a first registration after the seal")
 }
 
 // AN UNJOINED ORDER'S SEAL FENCES ITS NAME: a node registering under the name the order
-// would have given it is not placeable, though nothing linked it.
+// would have given it is refused, though nothing linked it, every time.
 func TestASealedUnjoinedOrderFencesItsName(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
@@ -599,14 +610,8 @@ func TestASealedUnjoinedOrderFencesItsName(t *testing.T) {
 	if sealed, err := a.RequestPoolRelease(ctx, "pa", "it never booted"); err != nil || !sealed {
 		t.Fatalf("seal: %v, %v", sealed, err)
 	}
-	registerArchNode(t, a, PoolNodeName("pa"), config.ArchX64)
-	if placeableHosts(t, a) != 0 {
-		t.Fatal("a node under a sealed order's name is placeable")
-	}
-	registerArchNode(t, a, PoolNodeName("pa"), config.ArchX64)
-	if placeableHosts(t, a) != 0 {
-		t.Fatal("a node registering again under a sealed order's name is placeable")
-	}
+	refusedRegistration(t, a, PoolNodeName("pa"), "a node under a sealed order's name")
+	refusedRegistration(t, a, PoolNodeName("pa"), "a node registering again under a sealed order's name")
 }
 
 // A SEALED OR RELEASED ORDER A PERSON CLOSES SAYS SO, and no other is closed by hand.

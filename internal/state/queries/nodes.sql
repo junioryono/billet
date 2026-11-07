@@ -382,6 +382,16 @@ UPDATE nodes SET live = 0
 UPDATE nodes SET drained = 1
  WHERE name = @name AND epoch = @epoch AND incarnation = @incarnation;
 
+-- name: PoolHostReleased :one
+-- Whether a node's pool order is sealed, released or gone (ADR-030): its host is being
+-- taken back or was, and a registration under it is refused in the registration's own
+-- transaction, so one in flight when the seal or a forced close committed cannot put the
+-- node back into the fleet. Its derived name counts, linked or not. A host whose release
+-- is only asked for still registers, held out of placement, so it can be drained.
+SELECT EXISTS(SELECT 1 FROM pool_orders p
+               WHERE (p.node_name = @name OR 'pool-' || p.order_id = @name)
+                 AND p.state IN ('sealed', 'released', 'gone'));
+
 -- name: MarkNodeDrainedForRelease :exec
 -- Take a pool host out of placement for its release: unfenced, because the decision is
 -- the control plane's and holds for every incarnation, which the registration upsert
