@@ -5,12 +5,14 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -213,6 +215,28 @@ func TestThePoolIsScheduledOnlyWhenConfiguredAndNotDry(t *testing.T) {
 	}
 	if _, _, err := schedulePool(cfg, nil, "dep", false); err == nil || !strings.Contains(err.Error(), "boot_prelude") {
 		t.Fatalf("an oversized prelude answered %v", err)
+	}
+}
+
+// THE POOL THE CONTROLLER BUILDS SHRINKS AS ITS CONFIG SAYS: idle_after reaches the
+// scaler, and a config without one builds a pool that never shrinks itself.
+func TestThePoolShrinksAsItsConfigSays(t *testing.T) {
+	t.Parallel()
+	prelude := filepath.Join(t.TempDir(), "prelude.sh")
+	if err := os.WriteFile(prelude, []byte("true\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	for idleAfter, want := range map[string]time.Duration{"": 0, "20m": 20 * time.Minute} {
+		cfg := poolBootConfig()
+		cfg.Server.Pool.BootPrelude = prelude
+		cfg.Server.Pool.IdleAfter = idleAfter
+		p, _, err := NewPool(cfg, nil, "dep", slog.Default())
+		if err != nil {
+			t.Fatalf("idle_after %q: %v", idleAfter, err)
+		}
+		if got := p.IdleAfter(); got != want {
+			t.Errorf("idle_after %q built a pool that shrinks after %v, want %v", idleAfter, got, want)
+		}
 	}
 }
 

@@ -188,7 +188,9 @@ func (s *Source) Scope(context.Context) (string, error) { return Name + ":" + s.
 // Terms are an hourly plan's: billed by the started hour, no minimum term. The lead
 // time is not measured, since no order has been accepted, so it is zero, which the
 // pool reads as unknown. An order is NOT idempotent: the API takes no idempotency key,
-// so an order whose answer was lost is never placed again without a person.
+// so an order whose answer was lost is never placed again without a person. Nor does it
+// confirm gone: a server it took back is not answered gone, so a person closes the order
+// and the pool never shrinks itself here.
 func (s *Source) Terms(shape string) (hostsource.Terms, error) {
 	if _, ok := s.shapes[shape]; !ok {
 		return hostsource.Terms{}, fmt.Errorf("phoenixnap: %s is not a declared shape", shape)

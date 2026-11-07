@@ -18,7 +18,11 @@
 // tokens all lapsed with nothing joined is held for a person, as is one whose join the
 // source contradicted. A held order still holds its host and is no longer on its way.
 //
-// SHRINKING IS NOT HERE. A host leaves only by drain, on proof it holds nothing.
+// THE POOL SHRINKS ONLY BY DRAIN. With server.pool.idle_after set, a step asks for the
+// release of one joined host per architecture that has held nothing for that long, when
+// the architecture is above its floor, has no demand and nothing on its way; the release
+// then takes the host out of placement and seals it only on proof it holds nothing, as a
+// person's would. A timer proposes; only the proof releases (ADR-030).
 package pool
 
 import (
@@ -63,6 +67,9 @@ type Ledger interface {
 	PoolOrderReleased(ctx context.Context, id string) error
 	PoolOrderGone(ctx context.Context, id string) error
 	CapacityReports(ctx context.Context) (map[string]alloc.TierCapacity, error)
+	PoolIdleHosts(ctx context.Context) ([]alloc.PoolIdleHost, error)
+	PoolServingHosts(ctx context.Context) (map[config.Arch]int, error)
+	ReleaseIdlePoolHost(ctx context.Context, order string, idleBefore time.Time, floor int, reason string) error
 }
 
 // Choice is one place a host may be ordered from.
@@ -84,7 +91,10 @@ type Config struct {
 	Archs          map[config.Arch]Policy
 	Sources        map[string]hostsource.Source
 	RefusalBackoff time.Duration
-	TokenLife      time.Duration
+	// IdleAfter is how long a joined host must have held nothing before the pool asks
+	// for its release; zero, the pool never shrinks itself.
+	IdleAfter time.Duration
+	TokenLife time.Duration
 	// DemandFreshness is the oldest a capacity report may be and still count.
 	DemandFreshness time.Duration
 	// Boot renders an ordered host's first boot from its order and join token.
@@ -194,7 +204,7 @@ func (p *Pool) Step(ctx context.Context) error {
 	if orders, err = p.ledger.PoolOrders(ctx); err != nil {
 		return errors.Join(append(errs, err)...)
 	}
-	demand, err := p.demand(ctx)
+	demand, quiet, err := p.demand(ctx)
 	if err != nil {
 		// COULD-NOT-TELL IS NOT NO DEMAND, and it is not demand either: the floor is
 		// still kept, and growth for demand waits for a reading.
@@ -219,9 +229,123 @@ func (p *Pool) Step(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	// SHRINKING READS DEMAND, so a reading it could not take shrinks nothing.
+	if p.cfg.IdleAfter > 0 && err == nil {
+		if serr := p.shrink(ctx, orders, quiet); serr != nil {
+			errs = append(errs, serr)
+		}
+	}
 
 	return errors.Join(errs...)
 }
+
+// shrink asks for the release of the joined host idle longest on each architecture whose
+// serving hosts (a node joined and registered, no release asked for) outnumber its floor, whose demand is known to be none, and with nothing
+// unknown and nothing on its way, when it has held nothing for IdleAfter. A host a tier
+// pins by name is never one: no host the pool orders could replace it. Nor is a host of a
+// source that does not confirm gone, whose released order would hold a place under the
+// maximum until a person closed it. One host per architecture per step: each release
+// counts as leaving from the next step on, and the floor is read again then.
+func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, quiet map[config.Arch]bool) error {
+	idle, err := p.ledger.PoolIdleHosts(ctx)
+	if err != nil {
+		return fmt.Errorf("pool: read the idle hosts: %w", err)
+	}
+	serving, err := p.ledger.PoolServingHosts(ctx)
+	if err != nil {
+		return fmt.Errorf("pool: count the serving hosts: %w", err)
+	}
+	pinned := map[string]bool{}
+	for i := range p.cfg.Tiers {
+		if n := p.cfg.Tiers[i].Node; n != "" {
+			pinned[n] = true
+		}
+	}
+	byID := map[string]*alloc.PoolOrder{}
+	for i := range orders {
+		byID[orders[i].ID] = &orders[i]
+	}
+	cutoff := p.now().Add(-p.cfg.IdleAfter)
+	releasable := p.releasableBy(ctx)
+	var errs []error
+	for arch, a := range p.cfg.Archs {
+		c := count(orders, arch)
+		if c.unknown > 0 || c.onItsWay > 0 || !quiet[arch] || serving[arch] <= a.Floor {
+			continue
+		}
+		var pick *alloc.PoolIdleHost
+		for i := range idle {
+			h := &idle[i]
+			if h.Arch != arch || h.Since.After(cutoff) || pinned[h.Node] || !releasable(byID[h.Order]) {
+				continue
+			}
+			if pick == nil || h.Since.Before(pick.Since) {
+				pick = h
+			}
+		}
+		if pick == nil {
+			continue
+		}
+		reason := fmt.Sprintf("idle since %s, past server.pool.idle_after %s",
+			pick.Since.UTC().Format(time.RFC3339), p.cfg.IdleAfter)
+		switch err := p.ledger.ReleaseIdlePoolHost(ctx, pick.Order, cutoff, a.Floor, reason); {
+		case errors.Is(err, alloc.ErrPoolHostNotIdle):
+			p.log.Info("a pool host the pool would release took work first; it stays", "order", pick.Order)
+		case errors.Is(err, alloc.ErrPoolAtFloor):
+			p.log.Info("a pool host the pool would release is needed for the floor now; it stays", "order", pick.Order)
+		case err != nil:
+			errs = append(errs, err)
+		default:
+			p.log.Info("releasing an idle pool host, by drain", "order", pick.Order, "arch", arch,
+				"idle_since", pick.Since)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// releasableBy answers whether an order's host could be taken back and its order closed
+// with no person: its source is configured, answers gone for a host it took back (its
+// terms for the order's shape), and orders where the order was placed now, because a
+// release is sent only there and one refused elsewhere would hold the host, billed and
+// serving nothing. Each source's scope is read once a step; an order, terms or a scope
+// it cannot read is not releasable.
+func (p *Pool) releasableBy(ctx context.Context) func(o *alloc.PoolOrder) bool {
+	scopes := map[string]string{}
+	unread := map[string]bool{}
+
+	return func(o *alloc.PoolOrder) bool {
+		if o == nil {
+			return false
+		}
+		src := p.cfg.Sources[o.Source]
+		if src == nil {
+			return false
+		}
+		if terms, err := src.Terms(o.Shape); err != nil || !terms.ConfirmsGone {
+			return false
+		}
+		if unread[o.Source] {
+			return false
+		}
+		scope, ok := scopes[o.Source]
+		if !ok {
+			var err error
+			if scope, err = src.Scope(ctx); err != nil {
+				unread[o.Source] = true
+
+				return false
+			}
+			scopes[o.Source] = scope
+		}
+
+		return scope == o.Scope
+	}
+}
+
+// IdleAfter is how long a joined host must have held nothing before the pool asks for
+// its release, zero when the pool never shrinks itself.
+func (p *Pool) IdleAfter() time.Duration { return p.cfg.IdleAfter }
 
 // counts are an architecture's orders that hold or may hold a host (active), those
 // whose outcome is not known (unknown), those placed, not yet joined and not held for a
@@ -260,41 +384,71 @@ func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 }
 
 // demand is the architectures a Firecracker tier is short of hosts on (work it could
-// not buy for, and only hosts to blame), by a report
-// fresh enough to say so. A Firecracker tier whose report is missing, stale or in error
-// makes the whole reading unknown.
-func (p *Pool) demand(ctx context.Context) (map[config.Arch]bool, error) {
+// not buy for, and only hosts to blame), and the architectures known to have no demand at
+// all (quiet): every Firecracker tier there counted its unstarted work and found none,
+// is short of nothing, and had its poll answered by GitHub recently enough to say so. A
+// report a listener writes with its count unknown (a session recovered, a launch ended)
+// says no shortage and is not quiet, because no shortage is not no demand; nor is one
+// republished from a poll GitHub has not answered for longer than the freshness, whose
+// own date is new and whose count is old. A tier naming no architecture may be placed on
+// any host, so every architecture's quiet answers to it too, though it is no
+// architecture's demand to grow for. Both are read from reports fresh enough to say so.
+// A Firecracker tier with an architecture whose report is missing, stale or in error makes
+// the whole reading unknown.
+func (p *Pool) demand(ctx context.Context) (map[config.Arch]bool, map[config.Arch]bool, error) {
 	reports, err := p.ledger.CapacityReports(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrDemandUnknown, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrDemandUnknown, err)
 	}
 	out := map[config.Arch]bool{}
+	quiet := map[config.Arch]bool{}
+	for arch := range p.cfg.Archs {
+		quiet[arch] = true
+	}
+	notQuiet := func(t *config.Tier) {
+		if t.Arch != "" {
+			quiet[t.Arch] = false
+
+			return
+		}
+		for arch := range quiet {
+			quiet[arch] = false
+		}
+	}
 	var unknown []string
 	for i := range p.cfg.Tiers {
 		t := &p.cfg.Tiers[i]
 		// A TIER PINNED TO ONE NODE IS NO POOL'S DEMAND: no host the pool orders is that
 		// node, so growing for it would order hosts its work can never run on, up to the
 		// maximum, while it waits as before.
-		if !servesFirecracker(t) || t.Arch == "" || t.Node != "" {
+		if !servesFirecracker(t) || t.Node != "" {
 			continue
 		}
 		r, ok := reports[t.Label]
 		observed, parseErr := time.Parse(time.RFC3339Nano, r.ObservedAt)
-		switch {
-		case !ok, r.ObservationError != "", parseErr != nil, p.now().Sub(observed) > p.cfg.DemandFreshness:
-			unknown = append(unknown, t.Label)
+		if !ok || r.ObservationError != "" || parseErr != nil || p.now().Sub(observed) > p.cfg.DemandFreshness {
+			if t.Arch == "" {
+				notQuiet(t)
+			} else {
+				unknown = append(unknown, t.Label)
+			}
 
 			continue
 		}
-		if r.Listener.HostShortage {
+		if r.Listener.HostShortage && t.Arch != "" {
 			out[t.Arch] = true
+		}
+		answered, answerErr := time.Parse(time.RFC3339Nano, r.Listener.AnsweredAt)
+		if u := r.Listener.Unstarted; u == nil || *u != 0 || r.Listener.HostShortage || answerErr != nil ||
+			p.now().Sub(answered) > p.cfg.DemandFreshness {
+			notQuiet(t)
 		}
 	}
 	if len(unknown) > 0 {
-		return out, fmt.Errorf("%w: no fresh report for %v", ErrDemandUnknown, unknown)
+		return out, nil, fmt.Errorf("%w: no fresh report for %v", ErrDemandUnknown, unknown)
 	}
 
-	return out, nil
+	return out, quiet, nil
 }
 
 func servesFirecracker(t *config.Tier) bool {
