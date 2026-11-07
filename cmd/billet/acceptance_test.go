@@ -1176,8 +1176,13 @@ func TestOnlyJobsThisRunWaitedForCountTowardsIt(t *testing.T) {
 	t.Parallel()
 
 	before := []acceptanceJob{
-		{LeaseID: "old-1", Billet: "succeeded", RunID: 1},
-		{LeaseID: "old-2", Billet: "failed", RunID: 1},
+		{LeaseID: "old-1", Billet: "succeeded", RunID: 1, StartedAt: "2026-11-07T09:00:00Z"},
+		{LeaseID: "old-2", Billet: "failed", RunID: 1, GitHub: "failed"},
+	}
+
+	if got := newTerminalJobs(before, map[string]bool{}); len(got) != 2 {
+		t.Fatalf("the earlier jobs are not ones the wait would count without a baseline (%+v), "+
+			"so the baseline is proved by nothing", got)
 	}
 
 	baseline := map[string]bool{"old-1": true, "old-2": true}
@@ -1208,6 +1213,23 @@ func TestOnlyJobsThisRunWaitedForCountTowardsIt(t *testing.T) {
 	}
 	if strings.Join(ids, ",") != "new-1,new-5" {
 		t.Errorf("the wait counted %v; only the new, finished jobs GitHub started or answered for should count", ids)
+	}
+}
+
+// A FULL HISTORY READ IS COULD-NOT-TELL, NOT A REASON TO KEEP WAITING. Rows that count
+// for nothing still take the bounded read's rows, so a read that comes back full may
+// hold the jobs waited for past its bound.
+func TestAFullHistoryReadIsCouldNotTell(t *testing.T) {
+	t.Parallel()
+
+	if err := historyMayHideJobs(acceptanceJobLimit, acceptanceJobLimit-2, acceptanceJobLimit); err == nil {
+		t.Error("a full read short of the count was taken as one that could still be waited on")
+	}
+	if err := historyMayHideJobs(acceptanceJobLimit-1, 3, 10); err != nil {
+		t.Errorf("a read short of the bound saw every row, and was refused: %v", err)
+	}
+	if err := historyMayHideJobs(acceptanceJobLimit, 10, 10); err != nil {
+		t.Errorf("a full read that already holds the count was refused: %v", err)
 	}
 }
 

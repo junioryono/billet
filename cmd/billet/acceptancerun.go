@@ -519,6 +519,10 @@ func waitForAcceptanceJobs(ctx context.Context, env cli.Env, ws acceptanceWorksp
 			return nil
 		}
 
+		if err := historyMayHideJobs(len(jobs), len(terminal), opts.jobs); err != nil {
+			return err
+		}
+
 		if time.Now().After(deadline) {
 			return fmt.Errorf("gave up after %s with %d of %d NEW job(s) finished; the "+
 				"teardown still runs", opts.wait, len(terminal), opts.jobs)
@@ -530,4 +534,22 @@ func waitForAcceptanceJobs(ctx context.Context, env cli.Env, ws acceptanceWorksp
 			return fmt.Errorf("stopped waiting: %w", ctx.Err())
 		}
 	}
+}
+
+// historyMayHideJobs answers whether a read of read history rows, counting counted of
+// want, could have missed jobs the wait is waiting for.
+//
+// A FULL READ CANNOT TELL. The read is bounded and oldest first, and a lease that
+// counts for nothing (a runner GitHub gave no job, a launch that failed, a job of an
+// earlier run) still takes one of its rows, so a deployment that finished every job
+// it was asked for can hold the last of them past the bound: the wait would run out
+// its whole --wait against them, and a timeout is not what happened.
+func historyMayHideJobs(read, counted, want int) error {
+	if counted >= want || read < acceptanceJobLimit {
+		return nil
+	}
+
+	return fmt.Errorf("the ledger's job history holds at least the %d rows this run reads, %d of "+
+		"them NEW jobs that count of the %d waited for, so it cannot tell whether the rest have "+
+		"finished; read the history with `billet jobs`", acceptanceJobLimit, counted, want)
 }

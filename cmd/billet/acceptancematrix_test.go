@@ -186,7 +186,7 @@ type matrixWorkflowJob struct {
 func TestEachArchitectureFetchesItsOwnSharedCacheContent(t *testing.T) {
 	t.Parallel()
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "npm"),
+	if err := forkSafeWriteFile(filepath.Join(bin, "npm"),
 		[]byte("#!/bin/sh\n[ \"$1\" = install ] && echo \"$@\" > \"$NPM_ASKED\"\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
