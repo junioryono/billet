@@ -241,9 +241,9 @@ type Listener struct {
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
 	beforePoolReconcile func()
-	// TEST-ONLY: the loop has a background poll's answer and has not yet taken it
-	// (dateEmptyAnswer). Nil in every deployment.
-	beforeAnswerTaken func()
+	// TEST-ONLY: a background poll has returned and been dated, and the loop has not yet
+	// received its answer, let alone taken it (dateEmptyAnswer). Nil in every deployment.
+	afterPollDated func()
 
 	// timings is where this listener reports its loop's times. lastAnswered is when
 	// its last poll was answered, on the loop's goroutine alone.

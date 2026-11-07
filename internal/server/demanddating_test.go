@@ -377,9 +377,9 @@ func TestOnlyAnEmptyAnswerIsDatedWhenItsPollReturned(t *testing.T) {
 }
 
 // AN ANSWER TAKEN LATE KEEPS ITS POLL'S DATE, and nothing dates it before the loop takes
-// it: the clock moves past the demand freshness between the poll's return and the loop
-// taking the answer, as a long reconciliation would make it, and the date recorded is
-// still the poll's return.
+// it: the clock moves past the demand freshness after the poll returned and before the
+// loop receives its answer, as a long reconciliation would make it, and the date
+// recorded is still the poll's return, never the answer's receipt.
 func TestAnAnswerTakenLateKeepsItsPollsDate(t *testing.T) {
 	t.Parallel()
 
@@ -410,7 +410,7 @@ func TestAnAnswerTakenLateKeepsItsPollsDate(t *testing.T) {
 
 	var beforeTaken time.Time
 
-	l.beforeAnswerTaken = func() {
+	l.afterPollDated = func() {
 		l.mu.Lock()
 		beforeTaken = l.answeredAt
 		l.mu.Unlock()

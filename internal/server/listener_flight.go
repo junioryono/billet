@@ -429,6 +429,10 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 
 		answer.msg, answer.err = l.timedPoll(ctx, session, lastMessageID, advertised)
 		answer.at = l.clock()
+
+		if l.afterPollDated != nil {
+			l.afterPollDated()
+		}
 	})
 
 	var beside error
@@ -438,9 +442,6 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 		case <-answered:
 			polling.Wait()
 			answer.beside = beside
-			if l.beforeAnswerTaken != nil {
-				l.beforeAnswerTaken()
-			}
 			l.dateEmptyAnswer(answer)
 
 			return answer
