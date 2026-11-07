@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "channel": "stable",
-  "tag": "v0.30.0",
-  "manifest_sha256": "efe86b6b3adf33deb2f2ccda94d1cd2a8ae939134dd218b2259a723faa80a905",
-  "published_at": "2026-11-05T17:55:41.014733556Z",
-  "expires_at": "2026-11-15T17:55:41.014733556Z",
+  "tag": "v0.31.0",
+  "manifest_sha256": "fe4664bc800e50a5458c8a3e85c9a410445880d9aa30d3ffd50f93a6062769d6",
+  "published_at": "2026-11-07T03:39:41.944211106Z",
+  "expires_at": "2026-11-17T03:39:41.944211106Z",
   "release_immutable": true
 }
