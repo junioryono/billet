@@ -79,15 +79,18 @@ run "sentinels_fully_substituted" {
         s.Sid == "BilletRuntimeLaunchOwned" &&
         s.Effect == "Allow" &&
         tolist(s.Resource) == tolist(["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"]) &&
-        s.Condition.Null["aws:RequestTag/sh.billet.owner"] == "false",
+        s.Condition.Null["aws:RequestTag/sh.billet.owner"] == "false" &&
+        tolist(s.Condition["ForAnyValue:StringEquals"]["aws:TagKeys"]) == tolist(["sh.billet.owner"]),
         false
       )
       ]) && anytrue([
       for s in jsondecode(aws_iam_role_policy.node.policy).Statement :
       try(
         s.Sid == "BilletRuntimeLaunch" &&
-        contains(s.NotResource, "arn:aws:ec2:*:*:instance/*") &&
-        contains(s.NotResource, "arn:aws:ec2:*:*:volume/*"),
+        s.Effect == "Allow" &&
+        tolist(s.Action) == tolist(["ec2:RunInstances"]) &&
+        tolist(s.NotResource) == tolist(["arn:aws:ec2:*:*:instance/*", "arn:aws:ec2:*:*:volume/*"]) &&
+        !can(s.Resource) && !can(s.Condition),
         false
       )
     ])

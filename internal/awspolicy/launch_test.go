@@ -58,8 +58,17 @@ func TestALaunchTagsWhatItCreatesAndStaysOnItsNetwork(t *testing.T) {
 			}
 
 			cond, ok := owned.Condition[tc.op].(map[string]any)
-			if !ok || len(owned.Condition) != 1 {
-				t.Fatalf("the owned launch grant's condition is %v, want only %s", owned.Condition, tc.op)
+			if !ok || len(owned.Condition) != 2 {
+				t.Fatalf("the owned launch grant's condition is %v, want %s and the exact tag key",
+					owned.Condition, tc.op)
+			}
+
+			// THE KEY IN BILLET'S OWN SPELLING: the RequestTag condition alone matches
+			// `sh.billet.Owner` too, which billet's inventory never finds.
+			keys, _ := owned.Condition["ForAnyValue:StringEquals"].(map[string]any)
+			if list, _ := keys["aws:TagKeys"].([]string); !slices.Equal(list, []string{"sh.billet.owner"}) {
+				t.Errorf("the owned launch grant does not require the exact key sh.billet.owner "+
+					"among the request's tag keys: %v", owned.Condition)
 			}
 
 			got := cond["aws:RequestTag/sh.billet.owner"]

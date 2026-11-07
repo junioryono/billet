@@ -36,6 +36,11 @@
         "arn:TFPARTITION:ec2:*:*:volume/*"
       ],
       "Condition": {
+        "ForAnyValue:StringEquals": {
+          "aws:TagKeys": [
+            "sh.billet.owner"
+          ]
+        },
         "Null": {
           "aws:RequestTag/sh.billet.owner": "false"
         }

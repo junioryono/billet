@@ -1561,8 +1561,9 @@ func (n Network) check() error {
 // AND ASKED OF EC2 ITSELF the same day, `billet check --authorize` under a real
 // node role holding this rendering, which dry-runs billet's own launch request for
 // a trusted and an untrusted tier on an arm64 AMI. Before: both authorized in the
-// node's subnet AND in another subnet of the same VPC, which is the exposure. After:
-// both authorized in the node's subnet, and both UnauthorizedOperation in the other.
+// node's subnet AND in another subnet of the same VPC, which is the exposure. After,
+// with launchTagCondition's exact tag key too: both authorized in the node's subnet,
+// and both UnauthorizedOperation in the other.
 func launchStatements(partition string, in Inputs) []Statement {
 	arn := func(kind string) string { return "arn:" + partition + ":ec2:*:*:" + kind }
 
@@ -1608,19 +1609,33 @@ func launchStatements(partition string, in Inputs) []Statement {
 // policy, or in account-wide mode an owner tag of any value. The same values
 // createTagCondition admits, asked of every launch rather than only of one that
 // sends tags.
+//
+// AND THE KEY IN EXACTLY BILLET'S SPELLING. IAM matches the tag key inside a
+// condition key name case-insensitively, so `aws:RequestTag/sh.billet.owner` alone
+// is satisfied by a tag `sh.billet.Owner`, which EC2 keeps as a different key and
+// billet's owner-filtered inventory never finds. aws:TagKeys compares values, and
+// StringEquals on a value is case-sensitive. Simulated 2026-11-07: billet's own
+// keys are allowed; `sh.billet.Owner` in their place, or no owner key, is denied on
+// instance/* and volume/*.
 func launchTagCondition(owner string, builder bool) map[string]any {
 	key := "aws:RequestTag/" + ec2.OwnerTagKey
 
+	var cond map[string]any
+
 	switch {
 	case owner == "":
-		return nullPresent(key)
+		cond = nullPresent(key)
 	case builder:
-		return map[string]any{"StringLike": map[string]any{
+		cond = map[string]any{"StringLike": map[string]any{
 			key: []string{owner, ec2.BuilderOwnerPattern(owner)},
 		}}
 	default:
-		return map[string]any{"StringEquals": map[string]any{key: owner}}
+		cond = map[string]any{"StringEquals": map[string]any{key: owner}}
 	}
+
+	cond["ForAnyValue:StringEquals"] = map[string]any{"aws:TagKeys": []string{ec2.OwnerTagKey}}
+
+	return cond
 }
 
 // createTagCondition is the condition on CreateTags: always restricted to
