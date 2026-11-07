@@ -19,6 +19,10 @@ import (
 // A path that does not exist is a lock nobody holds, because a holder keeps open the
 // file it locked; a lock file removed while held is the one case that answer misses.
 // Any other failure to look is an error, never "not held".
+//
+// THE PROBE IS A LOCK FOR AN INSTANT, so a service that starts in that instant fails
+// its own non-blocking take and says so; it is never left running unlocked. A caller
+// asks only once it has stopped what would start one.
 func LockHeld(path string) (bool, error) {
 	f, _, err := regularfile.Open(path, regularfile.Options{NoFollow: true})
 	if errors.Is(err, fs.ErrNotExist) {
