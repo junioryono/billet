@@ -84,7 +84,6 @@ Print the IAM policy this config's node role needs, derived from the config: cac
 |---|---|
 | `--builder` | also grant what `billet ami build` needs |
 | `--builder-subnet <id>`, `--builder-security-group <id>` | with `--builder`, also let launches use the subnet and the group `billet ami build` is told to launch with, when they are not the config's |
-
 | `--payload-bucket <bucket>` | with `--builder`, also grant put, get and delete on the objects `billet ami build --payload-bucket` stages there (`billet-payload-*`) and nothing else |
 | `--build-role` | print the CodeBuild build service role's policy instead of the node's |
 | `--controller-sweep` | print the control plane's grant for sweeping staged registrations under this node's parameter path |

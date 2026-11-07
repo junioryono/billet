@@ -71,20 +71,29 @@ func TestALaunchTagsWhatItCreatesAndStaysOnItsNetwork(t *testing.T) {
 				t.Errorf("the owned launch grant admits owner %v, want %v", got, tc.value)
 			}
 
+			// THE EXCLUSIONS ARE EXACT, in both directions. One missing hands the owned
+			// grant's resources, or the network, back without their scope; one extra (an
+			// image, a network interface) is a resource type nothing then grants, and
+			// every launch is refused.
 			launch := stmt(t, p, "BilletRuntimeLaunch")
-			if launch.Condition != nil || len(launch.Resource) != 0 {
-				t.Errorf("the unconditioned launch grant carries %v on %v; it is a NotResource "+
-					"grant with no condition", launch.Condition, launch.Resource)
+			if launch.Effect != "Allow" || !slices.Equal(launch.Action, []string{"ec2:RunInstances"}) ||
+				launch.Condition != nil || len(launch.Resource) != 0 {
+				t.Errorf("the unconditioned launch grant is %s %v with %v on %v; it is an Allow "+
+					"of ec2:RunInstances by NotResource with no condition",
+					launch.Effect, launch.Action, launch.Condition, launch.Resource)
 			}
 
-			for _, r := range created {
-				if !slices.Contains(launch.NotResource, r) {
-					t.Errorf("the unconditioned launch grant does not exclude %s, so it grants "+
-						"what the owned grant conditions: %v", r, launch.NotResource)
-				}
+			excluded := created
+			if tc.in.Network != nil {
+				excluded = append(slices.Clone(created),
+					"arn:aws:ec2:*:*:subnet/*", "arn:aws:ec2:*:*:security-group/*")
 			}
 
-			scopedNetwork := []string{"arn:aws:ec2:*:*:subnet/*", "arn:aws:ec2:*:*:security-group/*"}
+			if !slices.Equal(launch.NotResource, excluded) {
+				t.Errorf("the unconditioned launch grant excludes %v, want exactly %v",
+					launch.NotResource, excluded)
+			}
+
 			if tc.in.Network == nil {
 				for _, s := range p.Statement {
 					if s.Sid == "BilletRuntimeLaunchNetwork" {
@@ -92,21 +101,7 @@ func TestALaunchTagsWhatItCreatesAndStaysOnItsNetwork(t *testing.T) {
 					}
 				}
 
-				for _, r := range scopedNetwork {
-					if slices.Contains(launch.NotResource, r) {
-						t.Errorf("a policy that names no network excludes %s from the launch "+
-							"grant, so no subnet or group is granted at all", r)
-					}
-				}
-
 				return
-			}
-
-			for _, r := range scopedNetwork {
-				if !slices.Contains(launch.NotResource, r) {
-					t.Errorf("the unconditioned launch grant does not exclude %s, so every "+
-						"subnet or group in the account stays granted: %v", r, launch.NotResource)
-				}
 			}
 
 			net := stmt(t, p, "BilletRuntimeLaunchNetwork")
@@ -115,9 +110,10 @@ func TestALaunchTagsWhatItCreatesAndStaysOnItsNetwork(t *testing.T) {
 				"arn:aws:ec2:*:*:security-group/sg-0123456789abcdef0",
 				"arn:aws:ec2:*:*:security-group/sg-fedcba9876543210f",
 			}
-			if net.Effect != "Allow" || net.Condition != nil || !slices.Equal(net.Resource, want) {
-				t.Errorf("the network grant is %s %v on %v, want an unconditioned Allow on %v",
-					net.Effect, net.Condition, net.Resource, want)
+			if net.Effect != "Allow" || !slices.Equal(net.Action, []string{"ec2:RunInstances"}) ||
+				net.Condition != nil || !slices.Equal(net.Resource, want) {
+				t.Errorf("the network grant is %s %v with %v on %v, want an unconditioned Allow "+
+					"of ec2:RunInstances on %v", net.Effect, net.Action, net.Condition, net.Resource, want)
 			}
 		})
 	}
@@ -171,6 +167,24 @@ func TestALaunchNetworkIsRefusedWhenItWidensOrGrantsNothing(t *testing.T) {
 				t.Fatalf("Build answered %v, want a refusal saying %q", err, tc.want)
 			}
 		})
+	}
+
+	// A PARTITION THAT IS NOT ONE IS REFUSED, because it lands in every exclusion:
+	// one carrying a separator excludes an ARN no instance has, and the
+	// unconditioned grant then reaches the instance the owned grant scopes.
+	for _, partition := range []string{
+		"aws:ec2:*:*:instance/i-0123456789abcdef0", "aws*", "${aws:partition}", "aws/x",
+	} {
+		_, err := Inputs{Partition: partition}.Build()
+		if err == nil || !strings.Contains(err.Error(), "is not a partition") {
+			t.Errorf("partition %q: Build answered %v, want a refusal", partition, err)
+		}
+	}
+
+	for _, partition := range []string{"aws", "aws-cn", "aws-us-gov", "TFPARTITION"} {
+		if _, err := (Inputs{Partition: partition}).Build(); err != nil {
+			t.Errorf("partition %q was refused: %v", partition, err)
+		}
 	}
 
 	// AND THE EIGHT-DIGIT FORM, which older subnets and groups still carry, is an id.

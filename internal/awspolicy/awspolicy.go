@@ -479,6 +479,16 @@ func (in Inputs) Build() (Policy, error) {
 		partition = "aws"
 	}
 
+	// THE PARTITION LANDS IN EVERY ARN, and in the launch grant's NotResource it
+	// decides what is excluded: one carrying a `:` or a `*` would exclude an ARN no
+	// resource has, and the unconditioned grant would then reach the instance and
+	// the network the other two statements scope. Letters and hyphens are every
+	// partition AWS has and the terraform module's sentinel.
+	if !partitionPattern.MatchString(partition) {
+		return Policy{}, fmt.Errorf("awspolicy: %q is not a partition (letters and hyphens, "+
+			"such as aws, aws-cn or aws-us-gov)", partition)
+	}
+
 	suffix := in.DNSSuffix
 	if suffix == "" {
 		suffix = dnsSuffix(partition)
@@ -1497,6 +1507,7 @@ func withCacheOwnerPresent(owner map[string]any) map[string]any {
 }
 
 var (
+	partitionPattern       = regexp.MustCompile(`^[A-Za-z]+(-[A-Za-z]+)*$`)
 	subnetIDPattern        = regexp.MustCompile(`^subnet-[0-9a-z]+$`)
 	securityGroupIDPattern = regexp.MustCompile(`^sg-[0-9a-z]+$`)
 )
