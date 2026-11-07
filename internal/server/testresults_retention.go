@@ -7,6 +7,10 @@ import (
 	"github.com/junioryono/billet/internal/config"
 )
 
+// endedHoldsKept is how long an ended hold's row stays: past any retry of the completion that
+// reads it, which an ended row is what sends on to the destroy.
+const endedHoldsKept = 7 * 24 * time.Hour
+
 // retireTestResults deletes test results past their retention and past the bound on
 // how much of them is kept, on the job detail retention's schedule and batches, until
 // ctx ends. It decides nothing: a pass that fails is logged and the next one tries
@@ -41,6 +45,15 @@ func (s *Server) retireTestResultsOnce(ctx context.Context, now time.Time) {
 		s.log.Warn("could not list test results past their retention; trying again", "error", err)
 	} else if n := s.deleteTestResults(ctx, expired); n > 0 {
 		s.log.Info("deleted test results past their retention", "jobs", n, "retention", retention)
+	}
+
+	// WHAT A HOLD DID IS IN THE LOG; its row is only what a hold reads while it lasts.
+	if _, err := s.alloc.EndLapsedLeaseHolds(ctx); err != nil {
+		s.log.Warn("could not end holds past their bound; trying again", "error", err)
+	}
+
+	if _, err := s.alloc.ForgetEndedLeaseHolds(ctx, now.Add(-endedHoldsKept)); err != nil {
+		s.log.Warn("could not forget ended holds; trying again", "error", err)
 	}
 
 	// AFTER THE RETENTION, so a pass does not count what it has just deleted.

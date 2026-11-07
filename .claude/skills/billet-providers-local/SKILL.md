@@ -30,11 +30,15 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The kernel is linked into each jail and stays root-owned.**
 - **Two defects survived every unit test and died on the first real launch**
 - **A restore loads paused, links its snapshot read-only, and is configured only by the jailer.**
+- **A guest's network policy goes on its tap's name before the tap exists, and comes off only on proof it is gone.**
+- **A frame to a link-local MAC never reaches the bridge's prerouting hook, so no rule there sees it.**
 
 ### Tart: [references/tart.md](references/tart.md)
 
 - **`tart run` is the VM, and nothing believes its exit status.**
 - **Tart has no labels, so ownership is a marker file and the order is the invariant.**
+- **A `@verified` tier boots a clone of a base billet booted, and a launch reaches no network (ADR-021).**
+- **A guest holds a slot or a token through its own process (`slots.go`).**
 - **`List` cross-checks tart's JSON against the vms directory and asks `tart get` about each absence.**
 - **`tart stop` requests a stop.**
 - **The store lock closes the delete race.**

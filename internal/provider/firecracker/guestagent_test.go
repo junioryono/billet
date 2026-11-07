@@ -444,7 +444,9 @@ func TestTheGuestAgentInstallsActionsInterceptionForEveryRunnerSurface(t *testin
 
 	for _, want := range []string{
 		"fetch actions-proxy", "fetch actions-ca-pem", "cat /etc/ssl/certs/ca-certificates.crt",
-		"actions_ca_dir=/home/runner/runner/_work/_billet",
+		// RELATIVE TO THE RUNNER'S HOME, whose default is this image's: an EC2 image
+		// cuts this region out and sets its own.
+		"actions_ca_dir=${BILLET_RUNNER_HOME:-/home/runner/runner}/_work/_billet",
 		`actions_ca_path="$actions_ca_dir/actions-cache-ca.pem"`,
 		// The runner reaches the intercepted origin by a DNS remap, not a proxy
 		// variable: only the node CA and the job-started hook are published to it.

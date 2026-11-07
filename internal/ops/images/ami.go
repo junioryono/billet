@@ -1,11 +1,14 @@
 package images
 
 import (
+	"bytes"
 	"context"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -56,14 +59,19 @@ func AMI(ctx context.Context, env cli.Env, args []string) error {
 func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ami build", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
-	base := fs.String("base-image", "", "AMI to provision from (an EBS-backed Ubuntu 24.04 image)")
+	base := fs.String("base-image", "",
+		"AMI to provision from (an EBS-backed Ubuntu 24.04 image, or Windows Server 2025 with --os windows)")
+	osName := fs.String("os", string(config.GuestLinux),
+		"the image's operating system: linux, from GitHub's ubuntu-24.04 template, or windows, from "+
+			"the steps of its windows-2025 template billet carries (ADR-026)")
 	shape := fs.String("instance-type", "",
 		"shape of the BUILDER, not of your jobs; a Nitro shape, whose live console billet "+
 			"reads the build's verdict from (default: "+ec2.DefaultBuilderType("x64")+" for x64, "+
 			ec2.DefaultBuilderType("arm64")+" for arm64)")
 	disk := fs.Int64("builder-disk", 0,
 		"root volume for the BUILDER in GiB, which becomes the image's root (default: "+
-			strconv.Itoa(ec2.DefaultBuilderDiskGiB)+")")
+			strconv.Itoa(ec2.DefaultBuilderDiskGiB)+", or "+strconv.Itoa(ec2.DefaultWindowsBuilderDiskGiB)+
+			" with --os windows)")
 	arch := fs.String("arch", "x64", "runner build to install: x64 or arm64")
 	version := fs.String("runner-version", runnerrelease.Pinned(), "actions/runner release")
 	runnerSHA := fs.String("runner-sha256", "",
@@ -72,6 +80,9 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	name := fs.String("name", "", "name for the produced AMI (default: billet-runner-<timestamp>)")
 	caCert := fs.String("ca-cert", "",
 		"PEM file of CA(s) to trust in the image's host store — the cache endpoint's issuer")
+	guestBillet := fs.String("guest-billet", "",
+		"a static linux billet binary of --arch for the image to carry, which its Go and "+
+			"Bazel caches run (default: this binary, where it is one)")
 	payloadBucket := fs.String("payload-bucket", "",
 		"REQUIRED. S3 bucket to stage the build in (GitHub's template, the scripts that "+
 			"run it and billet's layer), fetched by the builder through a presigned URL")
@@ -125,6 +136,23 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 			"halfway through a build you paid for")
 	}
 
+	windows := *osName == string(config.GuestWindows)
+	if !windows && *osName != string(config.GuestLinux) {
+		return fmt.Errorf("--os %q is not linux or windows", *osName)
+	}
+
+	// REFUSED BEFORE ANYTHING IS BOUGHT, and a Windows image's own: GitHub publishes
+	// its windows-2025 template for x64 alone, and nothing on it would read the
+	// cache endpoint's issuer.
+	if windows && *arch != "x64" {
+		return fmt.Errorf("--os windows builds for x64 alone, and this asks for %q", *arch)
+	}
+
+	if windows && *caCert != "" {
+		return errors.New("--ca-cert is the cache endpoint's issuer, and a Windows image has no " +
+			"client for billet's caches")
+	}
+
 	// REFUSED HERE, BEFORE A MACHINE IS BOUGHT. The build is GitHub's template and
 	// the scripts that run it, hundreds of kilobytes against EC2's 16384 bytes of
 	// user data, so it is staged in S3 and fetched by a bootstrap.
@@ -141,7 +169,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 
 	// RESOLVED BEFORE THE CONFIG IS READ OR ANYTHING IS BOUGHT, for the reason the
 	// bucket is: a build that cannot check its runner is refused, not discovered.
-	digest, err := runnerDigest(*version, *arch, *runnerSHA)
+	digest, err := runnerDigestForOS(windows, *version, *arch, *runnerSHA)
 	if err != nil {
 		return err
 	}
@@ -163,7 +191,18 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		*name = "billet-runner-" + time.Now().UTC().Format("20060102-150405")
 	}
 
-	accept, err := amiAccept(env, *cfgPath)
+	// NOTHING TO COMPLETE A WINDOWS IMAGE WITH: images.accept names what a Linux
+	// template leaves out, and billet installs none of it on Windows (ADR-026).
+	var accept []string
+
+	if !windows {
+		accept, err = amiAccept(env, *cfgPath)
+		if err != nil {
+			return err
+		}
+	}
+
+	guest, err := guestBilletFor(*guestBillet, *arch)
 	if err != nil {
 		return err
 	}
@@ -208,6 +247,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 
 	image, err := p.BuildImage(build, ec2.BuildSpec{
 		BaseImage:          *base,
+		Windows:            windows,
 		InstanceType:       *shape,
 		BuilderDiskGiB:     *disk,
 		Arch:               *arch,
@@ -215,6 +255,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		RunnerSHA256:       digest,
 		Name:               *name,
 		CACertPEM:          caCertPEM,
+		GuestBillet:        guest,
 		Accept:             accept,
 		PayloadBucket:      *payloadBucket,
 		Verify:             *verify,
@@ -240,8 +281,76 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "  - label: your-label\n")
 	fmt.Fprintf(env.Stdout, "    provider: ec2\n")
 	fmt.Fprintf(env.Stdout, "    image: %s\n", image)
-	fmt.Fprintf(env.Stdout, "    command: [/usr/local/bin/billet-runner]\n\n")
+	if windows {
+		fmt.Fprintf(env.Stdout, "    guest_os: windows\n\n")
+	} else {
+		fmt.Fprintf(env.Stdout, "    command: [/usr/local/bin/billet-runner]\n\n")
+	}
 	fmt.Fprintf(env.Stdout, "An AMI id is REGION-SCOPED: this one only works in %s.\n", cfg.Region)
+
+	return nil
+}
+
+// guestBilletFor is the billet the image carries for its build caches: the file
+// named, or this very binary where it can run on the image, so an image and the
+// billet that built it are one version unless somebody says otherwise.
+//
+// CHECKED BEFORE A MACHINE IS BOUGHT: an image whose helper cannot run has a Go cache
+// that fails every build (GOCACHEPROG takes precedence and has no fallback when it
+// cannot start), and nothing would say so until a job did.
+func guestBilletFor(path, arch string) ([]byte, error) {
+	if path == "" && (runtime.GOOS != "linux" || runtime.GOARCH != goArch(arch)) {
+		return nil, fmt.Errorf("--guest-billet is required: the image needs a static linux/%s "+
+			"billet for its build caches and this one is %s/%s; use the matching binary from "+
+			"the same release", goArch(arch), runtime.GOOS, runtime.GOARCH)
+	}
+	if path == "" {
+		self, err := os.Executable()
+		if err != nil {
+			return nil, fmt.Errorf("find this binary to put in the image: %w", err)
+		}
+		path = self
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read the billet for the image: %w", err)
+	}
+	if err := checkGuestBillet(body, arch); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+
+	return body, nil
+}
+
+// goArch is Go's name for a runner architecture.
+func goArch(arch string) string {
+	if arch == "arm64" {
+		return "arm64"
+	}
+
+	return "amd64"
+}
+
+// checkGuestBillet refuses a binary the image could not run.
+func checkGuestBillet(body []byte, arch string) error {
+	file, err := elf.NewFile(bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("not a linux binary: %w", err)
+	}
+	defer file.Close()
+
+	want := elf.EM_X86_64
+	if arch == "arm64" {
+		want = elf.EM_AARCH64
+	}
+	if file.Machine != want {
+		return fmt.Errorf("built for %s, and this image is %s", file.Machine, want)
+	}
+	for _, program := range file.Progs {
+		if program.Type == elf.PT_INTERP {
+			return errors.New("not static: it asks for a dynamic linker, and a job's image need not carry that one")
+		}
+	}
 
 	return nil
 }
@@ -280,6 +389,19 @@ func amiAccept(env cli.Env, cfgPath string) ([]string, error) {
 	return out, nil
 }
 
+// runnerDigestForOS is runnerDigest for the image being built. A Windows image
+// installs the one Windows runner build, whose name and pin are not an architecture's.
+func runnerDigestForOS(windows bool, version, arch, supplied string) (string, error) {
+	if !windows {
+		return runnerDigest(version, arch, supplied)
+	}
+
+	pinned, ok := ec2.PinnedWindowsRunnerSHA256()
+
+	return resolveRunnerDigest(version, "actions-runner-win-x64-"+version+".zip", "win-x64",
+		pinned, ok, supplied)
+}
+
 // runnerDigest is the sha256 the build checks the runner tarball against.
 //
 // ONLY THE PINNED RELEASE HAS A DIGEST BILLET KNOWS, so --runner-version takes
@@ -293,6 +415,14 @@ func runnerDigest(version, arch, supplied string) (string, error) {
 		return "", err
 	}
 
+	pinned, ok := ec2.PinnedRunnerSHA256(arch)
+
+	return resolveRunnerDigest(version, "actions-runner-"+platform+"-"+version+".tar.gz", platform,
+		pinned, ok, supplied)
+}
+
+// resolveRunnerDigest holds a supplied digest to the pin for one runner archive.
+func resolveRunnerDigest(version, tarball, platform, pinned string, ok bool, supplied string) (string, error) {
 	// THE VERSION FIRST, because the remedy for an unpinned release is a digest
 	// and no digest makes `v2.337.0` or an empty version a release.
 	if !ec2.IsRunnerVersion(version) {
@@ -300,8 +430,6 @@ func runnerDigest(version, arch, supplied string) (string, error) {
 			"it is three numbers, without the leading v, such as %s",
 			version, runnerrelease.Pinned())
 	}
-
-	tarball := "actions-runner-" + platform + "-" + version + ".tar.gz"
 
 	if supplied != "" && !ec2.IsRunnerSHA256(supplied) {
 		return "", fmt.Errorf("--runner-sha256 %q is not a sha256: 64 lowercase hex digits, as "+
@@ -321,7 +449,6 @@ func runnerDigest(version, arch, supplied string) (string, error) {
 
 	// NO PIN FOR THIS ARCHITECTURE IS THE UNPINNED CASE, so the operator's digest
 	// is what decides it; unreachable while every mapped platform is pinned.
-	pinned, ok := ec2.PinnedRunnerSHA256(arch)
 	if !ok {
 		if supplied != "" {
 			return supplied, nil
@@ -365,7 +492,10 @@ func cmdAMIVerify(ctx context.Context, env cli.Env, args []string) error {
 	// THE CONSOLE LAGS AND THE VERIFIER DWELLS, so this is a boot plus several
 	// minutes rather than a boot. It is a deadline and not a wait: billet
 	// terminates the verifier the moment it has read a report.
-	timeout := fs.Duration("timeout", 20*time.Minute,
+	//
+	// PAST A WINDOWS IMAGE'S OWN WINDOW, since this cannot say which it is until it asks:
+	// a deadline this short would end the wait before windowsVerifyWindow ever could.
+	timeout := fs.Duration("timeout", 45*time.Minute,
 		"how long to wait for the image to report on itself")
 
 	// parseWithName, BECAUSE THE FLAGS COME AFTER THE ID IN EVERY EXAMPLE ANYBODY

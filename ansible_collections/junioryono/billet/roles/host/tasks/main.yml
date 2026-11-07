@@ -184,8 +184,18 @@
     # whatever the expression returns — a test outside it always says string.
     - name: Decide what this host's config asks of the GitHub App key
       ansible.builtin.set_fact:
+        # A DEPLOYMENT ON A TOKEN BROKER HOLDS NO KEY, and billet refuses one beside the
+        # block. Its client key is the host's own, made once by `billet broker client-key`
+        # and registered at the broker, so this role neither installs nor asks for it.
+        billet_github_tokens_from_broker: >-
+          {{ billet_effective_config is mapping
+             and (billet_effective_config.server | default({}, true)) is mapping
+             and 'token_broker' in (billet_effective_config.server | default({}, true)) }}
         billet_github_key_required: >-
-          {{ billet_effective_config is mapping and 'github' in billet_effective_config }}
+          {{ billet_effective_config is mapping and 'github' in billet_effective_config
+             and not (billet_effective_config is mapping
+                      and (billet_effective_config.server | default({}, true)) is mapping
+                      and 'token_broker' in (billet_effective_config.server | default({}, true))) }}
         billet_github_key_path: >-
           {{ ((billet_effective_config | default({})).github | default({})).private_key_path | default('', true) }}
         billet_github_key_path_is_string: >-
@@ -245,7 +255,8 @@
              }] }}
       loop: >-
         {{ (billet_effective_config.targets | default([]))
-           if (billet_effective_config is mapping and (billet_effective_config.targets | default([])) is not none)
+           if (billet_effective_config is mapping and (billet_effective_config.targets | default([])) is not none
+               and not (billet_github_tokens_from_broker | bool))
            else [] }}
       loop_control:
         label: "{{ item.name | default('?') }}"

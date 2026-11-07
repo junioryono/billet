@@ -620,3 +620,50 @@ func TestAnActionResultIsAMissWhenATreesFileIsMissing(t *testing.T) {
 		t.Fatalf("a complete result: %v", err)
 	}
 }
+
+// sizedVolume answers sizes and refuses to be opened.
+type sizedVolume struct {
+	dirVolume
+	t     *testing.T
+	sizes map[string]int64
+}
+
+func (v sizedVolume) Open(reapi.Table, string) (*os.File, error) {
+	v.t.Error("asking whether an object is there opened it")
+
+	return nil, fs.ErrNotExist
+}
+
+func (v sizedVolume) Size(_ reapi.Table, hash string) (int64, error) {
+	size, ok := v.sizes[hash]
+	if !ok {
+		return 0, fs.ErrNotExist
+	}
+
+	return size, nil
+}
+
+// ON A STORE OF OBJECTS AN OPEN IS A DOWNLOAD, and a build asks about thousands of
+// objects it may never read, so a volume that can say a size is asked for that.
+func TestAskingWhatIsMissingOpensNothingWhereSizesAreKnown(t *testing.T) {
+	t.Parallel()
+	inner, _ := volumeIn(t)
+	held, wrongSize, absent := digestOf([]byte("held")), digestOf([]byte("wrong")), digestOf([]byte("absent"))
+	volume := sizedVolume{dirVolume: inner, t: t, sizes: map[string]int64{
+		held.GetHash(): held.GetSizeBytes(), wrongSize.GetHash(): wrongSize.GetSizeBytes() + 1,
+	}}
+	conn := serve(t, func(context.Context, bool) (reapi.Volume, error) { return volume, nil })
+
+	missing, err := repb.NewContentAddressableStorageClient(conn).FindMissingBlobs(t.Context(),
+		&repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{held, wrongSize, absent}})
+	if err != nil {
+		t.Fatalf("FindMissingBlobs: %v", err)
+	}
+	got := map[string]bool{}
+	for _, digest := range missing.GetMissingBlobDigests() {
+		got[digest.GetHash()] = true
+	}
+	if got[held.GetHash()] || !got[wrongSize.GetHash()] || !got[absent.GetHash()] {
+		t.Fatalf("missing = %v", got)
+	}
+}

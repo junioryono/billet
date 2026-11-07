@@ -32,6 +32,28 @@ type nodeRow struct {
 // equal), because nodeapi imports this package.
 const CacheAuthorityWireVersion = 23
 
+// EgressWireVersion is the oldest wire a node can honour a tier's allowlist on,
+// mirrored from nodeapi.VersionEgress as CacheAuthorityWireVersion is.
+const EgressWireVersion = 40
+
+// WindowsGuestsWireVersion is the oldest wire a node boots a Windows guest on,
+// mirrored from nodeapi.VersionWindowsGuests for the same reason (ADR-026).
+const WindowsGuestsWireVersion = 39
+
+// TartVerifiedWireVersion is the oldest wire a Tart host reads `<image>@verified` on,
+// mirrored from nodeapi.VersionTartVerified for the same reason (ADR-021).
+const TartVerifiedWireVersion = 41
+
+// guestWireFloor is the oldest wire a host can start the tier's guest on at all,
+// which no report asks what the tier would have without.
+func guestWireFloor(t config.Tier) int {
+	if t.GuestOS == config.GuestWindows {
+		return WindowsGuestsWireVersion
+	}
+
+	return 0
+}
+
 // eligibleNodes lists the live hosts a tier could actually be placed on.
 //
 // A FILTER, NOT A CHOICE. It answers "which machines may serve this tier at
@@ -42,7 +64,19 @@ const CacheAuthorityWireVersion = 23
 // placement. An unordered candidate set makes the same fleet produce different
 // answers on different runs, which is untestable and unexplainable in a log.
 func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier) ([]nodeRow, error) {
-	return a.eligibleNodesFor(ctx, tx, t, t.NeedsCacheAwareNode())
+	return a.eligibleNodesFor(ctx, tx, t, wireFloor(t))
+}
+
+// wireFloor is the oldest wire a host may be on to be placed the tier: the one that boots
+// its guest, and the one that honours its cache block. Every placement path asks it, so a
+// Windows tier is never charged to a host the plane will refuse to send it to.
+func wireFloor(t config.Tier) int {
+	floor := guestWireFloor(t)
+	if t.NeedsCacheAwareNode() {
+		floor = max(floor, CacheAuthorityWireVersion)
+	}
+
+	return floor
 }
 
 // WaitsForCacheAwareHost reports whether a tier is placed nowhere only because
@@ -55,13 +89,30 @@ func (a *Allocator) WaitsForCacheAwareHost(ctx context.Context, t config.Tier) (
 	if !t.NeedsCacheAwareNode() {
 		return false, nil
 	}
+
+	return a.waitsForWire(ctx, t, CacheAuthorityWireVersion)
+}
+
+// WaitsForWindowsHost reports the same of a Windows tier: every host it could
+// otherwise use is too old to boot its guest.
+func (a *Allocator) WaitsForWindowsHost(ctx context.Context, t config.Tier) (bool, error) {
+	if t.GuestOS != config.GuestWindows {
+		return false, nil
+	}
+
+	return a.waitsForWire(ctx, t, WindowsGuestsWireVersion)
+}
+
+// waitsForWire reports whether a host large enough for one of the tier's runners
+// exists below floor and none exists at it.
+func (a *Allocator) waitsForWire(ctx context.Context, t config.Tier, floor int) (bool, error) {
 	var waits bool
 	err := a.db.View(ctx, func(tx querier) error {
-		honouring, err := a.eligibleNodesFor(ctx, tx, t, true)
+		honouring, err := a.eligibleNodesFor(ctx, tx, t, floor)
 		if err != nil || slices.ContainsFunc(honouring, func(n nodeRow) bool { return n.holdsOne(t) }) {
 			return err
 		}
-		without, err := a.eligibleNodesFor(ctx, tx, t, false)
+		without, err := a.eligibleNodesFor(ctx, tx, t, 0)
 		waits = slices.ContainsFunc(without, func(n nodeRow) bool { return n.holdsOne(t) })
 
 		return err
@@ -79,23 +130,23 @@ func (n nodeRow) holdsOne(t config.Tier) bool {
 	return ok && n.vcpu >= cost.vcpu && n.memory >= cost.memory
 }
 
-// eligibleNodesFor is eligibleNodes with the cache-block rule as a parameter,
-// so a report can ask what the tier would have without it.
+// eligibleNodesFor is eligibleNodes with the oldest wire as a parameter, so a
+// report can ask what the tier would have without it.
 func (a *Allocator) eligibleNodesFor(
-	ctx context.Context, tx querier, t config.Tier, needsCacheAware bool,
+	ctx context.Context, tx querier, t config.Tier, minWire int,
 ) ([]nodeRow, error) {
 	rows, err := a.liveNodes(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
 
-	return a.eligibleFrom(rows, t, needsCacheAware), nil
+	return a.eligibleFrom(rows, t, minWire), nil
 }
 
 // eligibleFrom is the hosts of rows a tier could be placed on: the filter
 // eligibleNodesFor applies to the ledger, applied to rows already read, so a
 // question that measured the fleet once asks it of every tier.
-func (a *Allocator) eligibleFrom(rows []nodeRow, t config.Tier, needsCacheAware bool) []nodeRow {
+func (a *Allocator) eligibleFrom(rows []nodeRow, t config.Tier, minWire int) []nodeRow {
 	accepts := t.AcceptableProviders()
 
 	var out []nodeRow
@@ -135,10 +186,24 @@ func (a *Allocator) eligibleFrom(rows []nodeRow, t config.Tier, needsCacheAware 
 			continue
 		}
 
-		// A HOST THAT CANNOT HONOUR THE TIER'S CACHE BLOCK IS NOT A CANDIDATE, or
-		// placement would choose it again and again for a launch the plane then
-		// refuses to send, and newer hosts beside it would sit unused.
-		if n.wire < CacheAuthorityWireVersion && needsCacheAware {
+		// A HOST THAT CANNOT HONOUR THE TIER'S CACHE BLOCK OR BOOT ITS GUEST IS NOT A
+		// CANDIDATE, or placement would choose it again and again for a launch the
+		// plane then refuses to send, and newer hosts beside it would sit unused.
+		if n.wire < minWire {
+			continue
+		}
+
+		// NOR ONE THAT CANNOT HONOUR ITS ALLOWLIST, for the same reason, and always:
+		// a report asking what a tier would have without the cache rule still may
+		// not count a host that would run the job open if it were sent.
+		if n.wire < EgressWireVersion && t.NeedsEgressAwareNode() {
+			continue
+		}
+
+		// NOR A TART HOST THAT WOULD HAND `@verified` TO `tart fqn` AS A NAME, and
+		// always, as the allowlist is. A host of another backend is not asked: there
+		// the spelling names a Firecracker generation.
+		if n.provider == config.ProviderTart && n.wire < TartVerifiedWireVersion && t.NamesTartVerified() {
 			continue
 		}
 

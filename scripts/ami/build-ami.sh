@@ -240,14 +240,20 @@ completer=$work/completer
 "$repo/scripts/runner-images/install-completer.sh" "$completer" "$repo/internal/runnerimages/$toolset"
 offered=()
 plan_file=$repo/scripts/runner-images/$plan
+if ! template_offers=$("$repo/scripts/check-guest-component.sh" offered "$plan_file"); then
+	die "could not read $plan_file to tell which components it installs"
+fi
 for name in "${accept[@]}"; do
-	script=$("$repo/scripts/check-guest-component.sh" installer "$name")
+	# A NAME THAT IS NO COMPONENT ENDS THE BUILD, as it did asking for its installer: it
+	# is not one GitHub's template happens not to install.
+	"$repo/scripts/check-guest-component.sh" installer "$name" >/dev/null ||
+		die "$name is not a component billet completes"
 	found=0
-	grep -qF "\"id\": \"$script\"" "$plan_file" || found=$?
+	grep -qxF -- "$name" <<<"$template_offers" || found=$?
 	case "$found" in
 	0) offered+=("$name") ;;
 	1) echo "build-ami: $name is accepted and GitHub's template for $scope does not install it, so this image does not carry it" ;;
-	*) die "could not read $plan_file to tell whether it installs $name" ;;
+	*) die "could not tell whether GitHub's template for $scope installs $name" ;;
 	esac
 done
 components=()
@@ -293,6 +299,10 @@ for name in $names; do
 done
 
 at=layer
+# WHAT THE GUEST'S CACHES NEED THAT GITHUB'S IMAGE DOES NOT CARRY: dnsmasq-base, for the
+# container resolver, as the firecracker guest's build adds it after its template (ADR-024).
+apt-get -o DPkg::Lock::Timeout=600 update
+DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends dnsmasq-base
 bash "$layer"
 
 # NOTHING OF THE BUILD STAYS IN THE IMAGE: its unit, its inputs, its record, and

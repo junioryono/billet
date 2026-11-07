@@ -37,10 +37,13 @@ jobs:
           - { package: ./internal/endpoint, fuzz: FuzzEndpointParse }
           - { package: ./internal/cli, fuzz: FuzzParseWithName }
           - { package: ./internal/guestreport, fuzz: FuzzDecode }
+          - { package: ./internal/joblog, fuzz: FuzzDecode }
           - { package: ./internal/guestagent, fuzz: FuzzStepLine }
           - { package: ./internal/guestagent, fuzz: FuzzPIDStat }
           - { package: ./internal/guestagent, fuzz: FuzzJUnitParse }
           - { package: ./internal/usage, fuzz: FuzzDecodeSeriesGaps }
+          - { package: ./internal/egress, fuzz: FuzzReadQuestion }
+          - { package: ./internal/egress, fuzz: FuzzReadAnswer }
     steps:
       - uses: actions/checkout@v6
 

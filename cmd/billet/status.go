@@ -52,6 +52,9 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	// it before the capacity numbers that will look perfectly healthy underneath.
 	fleetops.PrintForceDestroy(ctx, env, a, admission)
 
+	// AND WHAT A HOLD IS KEEPING, since it looks like capacity with no job on it.
+	fleetops.PrintHolds(ctx, env, a)
+
 	// AND A ROLLOUT IN ONE LINE, because it explains the other half of what an
 	// operator is looking at: hosts on two versions, capacity down by one machine,
 	// a node reporting nothing. `billet rollout status` is the full picture; this
@@ -145,6 +148,7 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	printComputeBarrier(ctx, env, a)
 	printWireWindow(ctx, env, a)
 	printCacheAwareWaits(ctx, env, a, cfg.Tiers)
+	printWindowsWaits(ctx, env, a, cfg.Tiers)
 
 	held, err := a.Held(ctx)
 	if err != nil {
@@ -414,6 +418,45 @@ func cacheAwareWaits(tiers []config.Tier, waits func(config.Tier) (bool, error))
 			"would ignore its cache block and read, publish or keep more than it allows, and "+
 			"none of the hosts it could run on speaks %d yet", label, tiers[i].Label,
 			nodeapi.VersionCacheAuthority, nodeapi.VersionCacheAuthority))
+	}
+
+	return lines, nil
+}
+
+// printWindowsWaits names every Windows tier that waits for a host new enough to
+// boot its guest.
+func printWindowsWaits(ctx context.Context, env cli.Env, a *alloc.Allocator, tiers []config.Tier) {
+	lines, err := windowsWaits(tiers, func(t config.Tier) (bool, error) {
+		return a.WaitsForWindowsHost(ctx, t)
+	})
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "windows   unavailable: %v\n", err)
+	}
+	for _, line := range lines {
+		fmt.Fprintln(env.Stdout, line)
+	}
+}
+
+// windowsWaits is a line for each tier placed nowhere only because every host it
+// could otherwise use is too old to boot Windows.
+func windowsWaits(tiers []config.Tier, waits func(config.Tier) (bool, error)) ([]string, error) {
+	var lines []string
+	for i := range tiers {
+		waiting, err := waits(tiers[i])
+		if err != nil {
+			return lines, err
+		}
+		if !waiting {
+			continue
+		}
+		label := "windows"
+		if len(lines) > 0 {
+			label = ""
+		}
+		lines = append(lines, fmt.Sprintf("%-9s tier %s WAITS FOR A HOST ON PROTOCOL %d: an older host "+
+			"would write a Linux boot script for its AMI, which starts and registers nothing, and "+
+			"none of the hosts it could run on speaks %d yet", label, tiers[i].Label,
+			nodeapi.VersionWindowsGuests, nodeapi.VersionWindowsGuests))
 	}
 
 	return lines, nil

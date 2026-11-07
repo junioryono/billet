@@ -35,7 +35,30 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`awspolicy` is one generator with three consumers and a measured boundary.**
 - **`ec2:CreateVolume` from a snapshot authorises the snapshot as well**
 - **`ec2:RunInstances` on `*` authorises every snapshot a block-device mapping names**
+- **The launch grant is split by the resource types `RunInstances` authorizes, because one grant on `*` reached every subnet and group in the account (#779).**
 - **The runner is root on its own instance, and the instance is the boundary.**
+- **The AMI carries the guest half of every cache, and its library is cut from the firecracker agent's own text at build time (ADR-024).**
+- **A pool host carries tags of its own, never a job instance's owner tag, and its order is its `ClientToken` (ADR-030).**
+
+### Windows on ec2: [references/windows.md](references/windows.md)
+
+- **A lease's guest OS decides the boot script, and the AMI is held to it in both directions.**
+- **User data runs as the local Administrator, not SYSTEM.**
+- **COM1 does not exist on the stock AMI, and EC2Launch does not use it.**
+- **A line reaches `GetConsoleOutput` only while the port stays open.**
+- **`ec2launch reset --shutdown`'s exit status says nothing.**
+- **A page file in the image costs a job its assignment.**
+- **A Windows launch asks for a provisioned read of its snapshot.**
+- **A Windows image is `reset`, not sysprepped.**
+- **The scheduled task needs an explicit execution limit and priority.**
+- **A step's preference does not cross a process.**
+- **Amazon's AMI is not Azure's.**
+- **GitHub's steps read the account's profile, and SYSTEM has none to read.**
+- **EC2Launch keeps the user data it ran.**
+- **A failed start ends the instance's charge, not the lease.**
+- **A build's own output reaches the console only as a bounded tail on failure.**
+- **A file named `*_windows.go` builds only on Windows.**
+- **The tests run PowerShell 7's parser, not 5.1's.**
 
 ### codebuild: [references/codebuild.md](references/codebuild.md)
 

@@ -103,7 +103,7 @@ func TestTheJobsJSONRecordCarriesItsWholeLife(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := renderJobJSON(&out, rec, nil, nil, "", nil, jobTests{}, nil); err != nil {
+	if err := renderJobJSON(&out, rec, nil, nil, "", nil, jobEgress{}, jobTests{}, nil); err != nil {
 		t.Fatalf("renderJobJSON: %v", err)
 	}
 	var got jobJSON

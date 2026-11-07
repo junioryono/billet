@@ -42,7 +42,8 @@ locals {
 # amazonaws.com here would render a trust policy no China EC2 instance can
 # assume — the test suite pins the suffix substitution.
 resource "aws_iam_role" "node" {
-  name = "${var.name}-node"
+  name                 = "${var.name}-node"
+  permissions_boundary = var.node_permissions_boundary_arn == "" ? null : var.node_permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

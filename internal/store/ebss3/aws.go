@@ -85,8 +85,9 @@ func New(cfg config.EBSS3Config, owner string, credentials CredentialSource) (*S
 	now := time.Now
 	blocks := newEBSAPI(cfg, owner, credentials, httpClient, ebsEndpoint, now, waitContext)
 	objects := newS3API(cfg, credentials, httpClient, s3Endpoint, now)
+	objects.bulk = bulkClient()
 
-	return newStore(cfg, owner, blocks, objects), nil
+	return newStore(cfg, owner, blocks, objects, withBulk(objects)), nil
 }
 
 func nilCredentialSource(credentials CredentialSource) bool {
@@ -111,9 +112,11 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 }
 
 type s3API struct {
-	cfg      config.EBSS3Config
-	creds    CredentialSource
-	http     *http.Client
+	cfg   config.EBSS3Config
+	creds CredentialSource
+	http  *http.Client
+	// bulk carries whole objects, whose bodies outlast http's bound on an exchange.
+	bulk     *http.Client
 	endpoint string
 	now      func() time.Time
 }
@@ -948,6 +951,74 @@ func (e ebsAPI) DeleteSnapshot(ctx context.Context, id string) error {
 	}
 
 	return err
+}
+
+// Owned counts this store's snapshots and volumes in every state, filtered by both
+// ownership tags, which is the predicate a delete checks. A volume `deleting` is not
+// counted: AWS accepted its delete, which the purge before a sweep is what asked for.
+func (e ebsAPI) Owned(ctx context.Context) (int, int, error) {
+	owned := func(values url.Values) url.Values {
+		values.Set("Filter.1.Name", "tag:"+cacheOwnerTag)
+		values.Set("Filter.1.Value.1", e.owner)
+		values.Set("Filter.2.Name", "tag:"+ownerTag)
+		values.Set("Filter.2.Value.1", e.deploymentOwner)
+
+		return values
+	}
+
+	snapshots := 0
+	seen := map[string]bool{}
+	for next := ""; ; {
+		values := owned(url.Values{"Owner.1": {"self"}})
+		if next != "" {
+			values.Set("NextToken", next)
+		}
+		page, err := e.describeSnapshots(ctx, values)
+		if err != nil {
+			return 0, 0, err
+		}
+		snapshots += len(page.Snapshots)
+		if page.NextToken == "" {
+			break
+		}
+		if seen[page.NextToken] {
+			return 0, 0, errors.New("ebs-s3: a paginated EBS snapshot listing repeated its token")
+		}
+		seen[page.NextToken] = true
+		next = page.NextToken
+	}
+
+	volumes := 0
+	seen = map[string]bool{}
+	for next := ""; ; {
+		values := owned(url.Values{"Action": {"DescribeVolumes"}})
+		if next != "" {
+			values.Set("NextToken", next)
+		}
+		var result struct {
+			Volumes []struct {
+				ID    string `xml:"volumeId"`
+				State string `xml:"status"`
+			} `xml:"volumeSet>item"`
+			NextToken string `xml:"nextToken"`
+		}
+		if err := e.call(ctx, values, &result); err != nil {
+			return 0, 0, err
+		}
+		for _, volume := range result.Volumes {
+			if volume.State != "deleting" {
+				volumes++
+			}
+		}
+		if result.NextToken == "" {
+			return snapshots, volumes, nil
+		}
+		if seen[result.NextToken] {
+			return 0, 0, errors.New("ebs-s3: a paginated EBS volume listing repeated its token")
+		}
+		seen[result.NextToken] = true
+		next = result.NextToken
+	}
 }
 
 // ListAvailableVolumes finds only this store's unattached volumes. Attached

@@ -1,0 +1,7 @@
+{
+  "tier": "TrustedRunnerGroupRequest.tier",
+  "group": "TrustedRunnerGroupRequest.group",
+  "workflows": [
+    "TrustedRunnerGroupRequest.workflows[0]"
+  ]
+}

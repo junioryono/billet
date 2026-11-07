@@ -325,10 +325,10 @@ func TestActionsCacheInterceptionRequiresAHostBackedCacheNode(t *testing.T) {
 	}
 
 	remote := strings.Replace(withIntercept, "    provider: firecracker\n",
-		"    provider: ec2\n", 1)
+		"    provider: codebuild\n", 1)
 	if _, err := Load(writeConfig(t, remote)); err == nil ||
-		!strings.Contains(err.Error(), "only the firecracker provider") {
-		t.Fatalf("interception on remote compute was not refused clearly: %v", err)
+		!strings.Contains(err.Error(), "requires the firecracker or ec2 provider") {
+		t.Fatalf("interception on a refused backend was not refused clearly: %v", err)
 	}
 }
 

@@ -96,6 +96,15 @@ var migrationsAreFrozen = map[int]struct{ Name, Sum string }{
 	69: {"job_destination_reply_times", "ea906fa6c8c2a5d220d287f83e1e91268a3704879142610a8296f1bf7d7faa54"},
 	70: {"node_architectures", "bf2692e3a86d7c642f0e4af2a0c17045fb6f85af2800e23d2bf8276f3c7a52cf"},
 	71: {"job_test_results", "442ff627433ddfa837e7fb3fb76152ebc360f8b6c36e14089116cacca16a4227"},
+	72: {"usage_export", "67b354d8f1697faca44bb9b4a65dd26ba1b9e8c1e4b815cfbf205e78217a4dd6"},
+	73: {"job_egress", "7b32480a5635e43d130a19fed3db2bea02600f7b741b5b3aa8dfb801d2f05975"},
+	74: {"job_reruns", "19cb0b92fa3568b329394b149230f67ebcd99788d5d4eeae0845da2ca4cafada"},
+	75: {"pool_orders", "8bfcce18490eec6816f9afb51588dbdfa445c035e3aa048b52f062b6a9b62a15"},
+	76: {"pool_join", "1685b7ddd8a53c188305327c041369e2ff90752becc956e887c7b1cd3ea49273"},
+	77: {"lease_holds", "09a0bfc1bde1dde616c329c10a3a0c4e43b636d940779462773ed3395f112541"},
+	78: {"job_alerts", "b4c50e2f7b22ab88eb9e16db8801637e8be50962284888ed346419330b7e5a8e"},
+	79: {"pool_release", "93d44e12bef11ad969e7b3cb48565772ccf29b76293ba70b1b7c78183898df55"},
+	80: {"pool_clearance", "eaadc9ce7310f5c5280218363874f0d7e059bd78f7f9b3a7ce5c4dbee0f2cbde"},
 }
 
 func TestNoShippedMigrationHasBeenEdited(t *testing.T) {

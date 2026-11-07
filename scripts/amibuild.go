@@ -9,19 +9,44 @@ package scripts
 
 import (
 	"embed"
+	"fmt"
 	"io/fs"
 	"slices"
+	"strings"
 )
 
 // amiBuild is every file the EC2 builder runs, at its path under scripts/.
 //
 //go:embed run-runner-images.sh check-guest-component.sh
 //go:embed ami/build-ami.sh ami/ami-target.sh ami/billet-ami-build.service
-//go:embed runner-images/upstream runner-images/completer
+//go:embed runner-images/upstream/helpers runner-images/upstream/images/ubuntu runner-images/completer
 //go:embed runner-images/plan.json runner-images/plan-arm64.json runner-images/differences.tsv
 //go:embed runner-images/pam-environment.awk runner-images/write-image-env.sh
 //go:embed runner-images/install-completer.sh runner-images/LICENSE
 var amiBuild embed.FS
+
+// amiBuildWindows is every file the EC2 builder runs on a Windows build, at its path
+// under scripts/ (ADR-026): the entry points and driver billet writes, the Windows tree
+// of GitHub's template, the plan derived from it and what billet does differently.
+//
+//go:embed windows/build-ami.ps1 windows/ec2-layer.ps1 windows/billet-runner.ps1
+//go:embed windows/billet-runner-service.ps1 windows/billet-job-started.ps1 windows/prepare-aws-tools.ps1
+//go:embed windows/prepare-documents.ps1
+//go:embed runner-images/upstream/images/windows/assets runner-images/upstream/images/windows/scripts
+//go:embed runner-images/plan-windows-2025.json runner-images/differences-windows.tsv
+//go:embed runner-images/LICENSE
+var amiBuildWindows embed.FS
+
+// WindowsPlan is the plan's path under scripts/ in what AMIBuildWindows returns.
+const WindowsPlan = "runner-images/plan-windows-2025.json"
+
+// The entry points' paths under scripts/, which the verifier holds a booted image's
+// copies to.
+const (
+	WindowsRunnerEntry   = "windows/billet-runner.ps1"
+	WindowsRunnerService = "windows/billet-runner-service.ps1"
+	WindowsJobStarted    = "windows/billet-job-started.ps1"
+)
 
 // amiBuildExecutables are the embedded files the tree marks executable. An
 // embedded file carries no mode, so the stager is told which they are, and a test
@@ -35,6 +60,37 @@ var amiBuildExecutables = []string{
 	"runner-images/install-completer.sh",
 	"runner-images/upstream/images/ubuntu/scripts/build/install-copilot-cli.sh",
 	"runner-images/write-image-env.sh",
+}
+
+// guestImageScript is the firecracker guest's build, which holds the guest half of
+// every cache. The EC2 image is built from a region of it rather than from a copy.
+//
+//go:embed build-guest-image.sh
+var guestImageScript string
+
+// GuestImageBlock is one region of the guest build between `# <marker>_BEGIN` and
+// `# <marker>_END`, whole lines and unchanged, so the EC2 image runs what the
+// firecracker guest runs.
+func GuestImageBlock(marker string) (string, error) {
+	return cutGuestImageBlock(guestImageScript, marker)
+}
+
+func cutGuestImageBlock(script, marker string) (string, error) {
+	begin, end := "# "+marker+"_BEGIN", "# "+marker+"_END\n"
+	_, rest, found := strings.Cut(script, begin)
+	if !found {
+		return "", fmt.Errorf("the guest build no longer marks %s", marker)
+	}
+	_, rest, found = strings.Cut(rest, "\n")
+	if !found {
+		return "", fmt.Errorf("%s_BEGIN ends the guest build", marker)
+	}
+	block, _, found := strings.Cut(rest, end)
+	if !found {
+		return "", fmt.Errorf("the guest build's %s has no end marker", marker)
+	}
+
+	return block, nil
 }
 
 // AMIBuildService is the systemd unit's path under scripts/; the builder installs
@@ -51,14 +107,24 @@ type AMIBuildFile struct {
 
 // AMIBuild is every file the EC2 builder runs, in path order.
 func AMIBuild() ([]AMIBuildFile, error) {
+	return walkBuild(amiBuild)
+}
+
+// AMIBuildWindows is every file the EC2 builder runs on a Windows build, in path
+// order. PowerShell reads a script whatever its mode, so none is marked executable.
+func AMIBuildWindows() ([]AMIBuildFile, error) {
+	return walkBuild(amiBuildWindows)
+}
+
+func walkBuild(tree embed.FS) ([]AMIBuildFile, error) {
 	var out []AMIBuildFile
 
-	err := fs.WalkDir(amiBuild, ".", func(path string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(tree, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
 
-		body, err := amiBuild.ReadFile(path)
+		body, err := tree.ReadFile(path)
 		if err != nil {
 			return err
 		}

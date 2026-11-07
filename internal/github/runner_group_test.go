@@ -13,11 +13,23 @@ import (
 	"time"
 )
 
+// seedToken gives a client's key source a token it has already minted, so a test
+// about a read reaches its request without an exchange.
+func seedToken(t *testing.T, c *runnerGroupPolicyClient, bearer string) {
+	t.Helper()
+
+	source, ok := c.tokens.(appKeyTokens)
+	if !ok {
+		t.Fatalf("the client's source is a %T, not the App key's", c.tokens)
+	}
+
+	source.token = NewToken(bearer, time.Now().Add(time.Hour), nil)
+}
+
 func TestRunnerGroupPolicyClientRedactsEveryRenderingPath(t *testing.T) {
 	key, _ := testKeyPKCS1(t)
 	c := newRunnerGroupPolicyClient(defaultPolicyBounds, "https://api.example.test", OrganizationTarget("acme"), 11, 22, key)
-	c.token = "cached-installation-secret"
-	c.expiresAt = time.Now().Add(time.Hour)
+	seedToken(t, c, "cached-installation-secret")
 
 	render := func(format string) string {
 		var out strings.Builder
@@ -45,7 +57,7 @@ func TestRunnerGroupPolicyClientRedactsEveryRenderingPath(t *testing.T) {
 		rendered = append(rendered, out.String())
 	}
 	for _, output := range rendered {
-		if strings.Contains(output, string(key)) || strings.Contains(output, c.token) {
+		if strings.Contains(output, string(key)) || strings.Contains(output, "cached-installation-secret") {
 			t.Fatalf("credential leaked through rendering: %q", output)
 		}
 	}
@@ -159,8 +171,7 @@ func TestRunnerRecoveryPreservesOnlyAnExactBusyEphemeralRunner(t *testing.T) {
 			srv := httptest.NewServer(mux)
 			defer srv.Close()
 			c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
-			c.token = "cached-token"
-			c.expiresAt = time.Now().Add(time.Hour)
+			seedToken(t, c, "cached-token")
 			got, err := c.InspectScaleSetRunner(t.Context(), "billet-l1", tc.runnerID)
 			if tc.wantErr {
 				if err == nil {

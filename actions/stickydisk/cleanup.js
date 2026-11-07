@@ -39,7 +39,13 @@ async function cleanup() {
       process.stdout.write("billet will publish this sticky-disk update once the job's result proves it ran on the default branch\n");
       return;
     }
-    if (!result.published) warning(`billet discarded this sticky-disk update (${result.reason || "cache unavailable"}); the job result is unchanged`);
+    // SAID EITHER WAY, so a job's log is evidence of what became of its write: a
+    // reader of it otherwise cannot tell a publication from a step that never ran.
+    if (result.published) {
+      process.stdout.write(`billet published this sticky-disk update as generation ${result.generation}\n`);
+      return;
+    }
+    warning(`billet discarded this sticky-disk update (${result.reason || "cache unavailable"}); the job result is unchanged`);
   } catch (error) {
     warning(`billet could not commit the sticky disk; the job result is unchanged: ${error.message}`);
   }

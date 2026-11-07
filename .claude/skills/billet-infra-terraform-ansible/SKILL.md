@@ -50,6 +50,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`actions/converge-fleet` is the consumer's one pin, and the collection it runs is the checkout it runs from.**
 - **`ssh_access` never hardens a host its own converge leaves with no way in, and that refusal is not gated.**
 - **The guest resolver refuses private answers and caps its cache at five minutes.**
+- **The guest firewall's `billet egress resolver` rule is what lets a redirected query reach a node's resolver.**
 - **The Ceph health alert mails a problem once, and nothing else.**
 
 ### The preparation dry run: [references/preparation-dry-run.md](references/preparation-dry-run.md)

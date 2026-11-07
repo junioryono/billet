@@ -89,8 +89,13 @@ jobs:
     # test-postgres job still fails in it rather than reporting success for a
     # backend nothing exercised, and a run that also lost this variable fails
     # here.
+    #
+    # THE REFERENCE ROUTER IS RUN, NOT READ: internal/e2e runs HAProxy on
+    # deploy/router/haproxy.cfg, and this makes its absence a failure rather
+    # than a skip that quietly passes.
     env:
       BILLET_TEST_POSTGRES_ELSEWHERE: test-postgres
+      BILLET_TEST_HAPROXY: required
 
     steps:
       # THE WHOLE HISTORY AND ITS TAGS, because the actions suite asks
@@ -171,6 +176,17 @@ jobs:
           sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apparmor
+
+      - name: Install the router the reference configuration is tested on
+        # Installed only where the image lacks it, for the reason the step above gives.
+        # It starts nothing here: the package's own service is stopped at once, because
+        # what is under test is the file billet ships.
+        run: |
+          [ "$(dpkg-query -W -f '${db:Status-Status}' haproxy 2>/dev/null)" = installed ] && { echo "haproxy already installed"; exit 0; }
+          sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends haproxy
+          sudo systemctl stop haproxy || true
 
       # -race matters more than usual here: the control plane is a capacity
       # allocator with concurrent scale-set listeners, and a data race in that

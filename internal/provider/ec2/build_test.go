@@ -138,7 +138,7 @@ func TestTheCloudRunnerNeverInheritsTheReadinessCapability(t *testing.T) {
 		t.Fatal("the EC2 runner entry point is not delimited")
 	}
 	if !strings.Contains(entrypoint, privilegeDrop+" ") ||
-		!strings.Contains(entrypoint, "billet_env_add BILLET_CACHE_TOKEN \"${BILLET_CACHE_TOKEN:-}\"\n") {
+		!strings.Contains(entrypoint, "billet_env_add \"${billet_entry%%=*}\" \"${billet_entry#*=}\"\n") {
 		t.Fatal("the EC2 runner does not receive its cache session through a clean environment")
 	}
 	if strings.Contains(script, "BILLET_CACHE_READY_TOKEN") {
@@ -1309,5 +1309,37 @@ func TestTheImageStoreAssertionsActuallyRefuse(t *testing.T) {
 					tc.name, err, out)
 			}
 		})
+	}
+}
+
+// THE IMAGE SAYS WHICH RUNNER IT CARRIES, in the record and the form the cache
+// conformance workflow reads, so a candidate image is checked on EC2 as on Firecracker.
+// Executed, because the workflow's parse is what has to agree with the line.
+func TestTheLayerRecordsTheRunnerItInstalled(t *testing.T) {
+	t.Parallel()
+	script, err := layerScript(BuildSpec{RunnerSHA256: testRunnerDigest, RunnerVersion: "2.337.0", Arch: "x64"})
+	if err != nil {
+		t.Fatalf("layerScript: %v", err)
+	}
+	var record string
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(line, "printf 'RUNNER_VERSION=") {
+			record = line
+		}
+	}
+	if record == "" || strings.Index(script, record) < strings.Index(script, "tar xzf runner.tar.gz") {
+		t.Fatalf("the layer does not record the runner after unpacking it:\n%s", script)
+	}
+	path := filepath.Join(t.TempDir(), "billet-image")
+	record = strings.Replace(record, "> "+imageRecordPath, "> '"+path+"'", 1)
+	if output, err := exec.CommandContext(t.Context(), "sh", "-c", record).CombinedOutput(); err != nil {
+		t.Fatalf("the record line failed: %v\n%s", err, output)
+	}
+	got, err := exec.CommandContext(t.Context(), "sed", "-n", "s/^RUNNER_VERSION=//p", path).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "2.337.0\n" {
+		t.Fatalf("the conformance workflow would read %q", got)
 	}
 }

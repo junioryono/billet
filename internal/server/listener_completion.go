@@ -266,6 +266,7 @@ func (l *Listener) recordJobResult(ctx context.Context, job dispatch.Job, leaseI
 	// them the wait is unknown, never another job's.
 	if job.RunnerName == "" {
 		job.QueuedAt, job.ScaleSetAssignedAt, job.RunnerAssignedAt = time.Time{}, time.Time{}, time.Time{}
+		job.FinishedAt = time.Time{}
 	}
 	l.recordJobIdentity(ctx, leaseID, job, 0)
 }
@@ -311,6 +312,32 @@ func withCompletionIdentity(completion *state.PendingCompletion, job dispatch.Jo
 	completion.JobRepository = job.Repository
 	completion.JobWorkflowRef = job.WorkflowRef
 	completion.JobEvent = job.Event
+
+	// ONLY FROM A COMPLETION THAT NAMES ITS RUNNER, the rule recordJobResult keeps: one
+	// that names none may have found this lease by a request id another job now holds.
+	if job.RunnerName != "" {
+		completion.JobRunnerAssignedAt = completionTime(job.RunnerAssignedAt)
+		completion.JobFinishedAt = completionTime(job.FinishedAt)
+	}
+}
+
+func completionTime(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+
+	return at.UTC().Format(time.RFC3339Nano)
+}
+
+// parsedCompletionTime is zero for a time the row does not hold, which is what a job
+// says of a time the message left out.
+func parsedCompletionTime(at string) time.Time {
+	parsed, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return time.Time{}
+	}
+
+	return parsed
 }
 
 func (l *Listener) recordReleaseOnly(
@@ -587,6 +614,8 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 
 	l.mu.Unlock()
 
+	l.restoreHolds(ctx, completions)
+
 	// THE RESULT IS RE-RECORDED FROM THE DURABLE ROW, OUTSIDE THE MUTEX.
 	//
 	// PutPendingCompletion commits before RecordJobResult, so a process that died
@@ -624,6 +653,13 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 			Result: completion.Result, CompletionID: completion.MessageID,
 			JobID: completion.JobID, Owner: completion.JobOwner, Repository: completion.JobRepository,
 			WorkflowRef: completion.JobWorkflowRef, Event: completion.JobEvent}, completion.LeaseID)
+
+		// THE RESULT'S TIME IS NOW, AND THE JOB'S IS NOT: what a usage record bills on has to
+		// come back with the rest of what the completion said. recordJobResult drops a
+		// restored job's times because it names no runner; this row kept them only if it did.
+		l.recordJobIdentity(ctx, completion.LeaseID, dispatch.Job{JobID: completion.JobID,
+			RunnerAssignedAt: parsedCompletionTime(completion.JobRunnerAssignedAt),
+			FinishedAt:       parsedCompletionTime(completion.JobFinishedAt)}, 0)
 	}
 
 	return nil
@@ -697,6 +733,14 @@ func (l *Listener) complete(ctx context.Context, job dispatch.Job) {
 	// capacity stays charged until a node happens to report an inventory, or
 	// forever if that node never comes back.
 	before, beforeOutcome, _ := l.completionRelease(job.RequestID)
+
+	// A FAILED JOB'S VM CAN BE KEPT A WHILE, on a tier that says so. The cleanup clock comes
+	// back to it, and when the hold ends this goes on as it would have.
+	if l.holdCompletion(ctx, job, before) {
+		return
+	}
+
+	l.notHeld(job.RequestID)
 
 	if err := l.destroyCompleted(ctx, job, before, beforeOutcome); err != nil {
 		// THE RUNNER IS HOLDING IT, SO THIS LISTENER LETS GO.

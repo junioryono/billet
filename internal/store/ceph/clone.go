@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 // ErrNoSuchImage is returned when a golden image or its snapshot is not there.
@@ -433,29 +435,125 @@ type mappedDevice struct {
 
 // mappedDevices lists the host devices a cache-pool image is mapped to.
 func (c *Client) mappedDevices(ctx context.Context, name string) ([]string, error) {
+	rows, _, err := c.cacheMappings(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	var found []string
+	for _, row := range rows {
+		if row.Device != "" {
+			found = append(found, row.Device)
+		}
+	}
+
+	return found, nil
+}
+
+// cacheMappings lists the kernel's mappings of a cache-pool image, in the pool's
+// default namespace, the only one `pool/name` addresses. incomplete says a row did
+// not say whose it is, so it could have been this image's.
+func (c *Client) cacheMappings(ctx context.Context, name string) ([]mappedDevice, bool, error) {
 	out, err := c.rbdCmd(ctx, true, "device", "list")
 	if err != nil {
-		return nil, fmt.Errorf("ceph: list the mapped rbd devices: %w", err)
+		return nil, false, fmt.Errorf("ceph: list the mapped rbd devices: %w", err)
 	}
 
 	// A `null` UNMARSHALS INTO A SLICE HAPPILY and would read as "nothing is
 	// mapped" — which here means "skip the unmap and remove an image the kernel is
 	// still holding". An empty table is `[]`, so nil is not a shape rbd produces.
-	var devices []mappedDevice
+	var devices []*mappedDevice
 	if err := json.Unmarshal(trimSpace(out), &devices); err != nil || devices == nil {
-		return nil, fmt.Errorf("ceph: %s did not answer with a json device list; is it the rbd "+
+		return nil, false, fmt.Errorf("ceph: %s did not answer with a json device list; is it the rbd "+
 			"command?", c.bin)
 	}
 
-	var found []string
+	var found []mappedDevice
+	incomplete := false
 
 	for _, d := range devices {
-		if d.Pool == c.cfg.CachePool && d.Name == name && d.Device != "" {
-			found = append(found, d.Device)
+		if d == nil || d.Pool == "" || d.Name == "" {
+			incomplete = true
+
+			continue
+		}
+		if d.Pool == c.cfg.CachePool && d.Namespace == "" && d.Name == name {
+			found = append(found, *d)
 		}
 	}
 
-	return found, nil
+	return found, incomplete, nil
+}
+
+// MappedDevice names the device the kernel has a writable cache volume's head
+// mapped to now, from the kernel's table and by the image's name.
+//
+// GONE MEANS THE IMAGE IS, because this answer has a volume's writes thrown away. A
+// missing row does not prove it: `rbd device list` skips a device whose attributes
+// it could not read and still succeeds (Ceph 20.2.3, krbd.cc's dump_one_image), and
+// a mapping's watch can lapse while the kernel re-registers it, so neither says the
+// kernel let go. A failed snapshot's cleanup moves the image to the trash, which is
+// the case this answer exists for; an image still listed with no row is could not
+// tell, and a publication asks again until its window ends.
+func (c *Client) MappedDevice(ctx context.Context, volume storecontract.Volume) (string, error) {
+	unknown := func(err error) error { return fmt.Errorf("%w: %w", storecontract.ErrDeviceUnknown, err) }
+
+	name := strings.TrimPrefix(volume.Handle, c.cfg.CachePool+"/")
+	rows, incomplete, err := c.cacheMappings(ctx, name)
+	if err != nil {
+		return "", unknown(err)
+	}
+	if incomplete {
+		return "", unknown(fmt.Errorf("ceph: %s listed a mapped device without its pool and image", c.bin))
+	}
+
+	var devices []string
+	for _, row := range rows {
+		switch {
+		case row.Snap == "" || row.Device == "":
+			return "", unknown(fmt.Errorf("ceph: %s listed %s without its snapshot and device",
+				c.bin, volume.Handle))
+		case row.Snap == "-":
+			devices = append(devices, row.Device)
+		}
+	}
+
+	switch {
+	case slices.Contains(devices, volume.Device):
+		return volume.Device, nil
+	case len(devices) == 1:
+		return devices[0], nil
+	case len(devices) > 1:
+		return "", unknown(fmt.Errorf("ceph: %s is mapped to %v, none of them the recorded %s",
+			volume.Handle, devices, bounded(volume.Device)))
+	}
+
+	exists, err := c.imageExists(ctx, volume.Handle)
+	if err != nil {
+		return "", unknown(err)
+	}
+	if exists {
+		return "", unknown(fmt.Errorf("ceph: the device list has no row for %s, which still exists",
+			volume.Handle))
+	}
+
+	return "", fmt.Errorf("%w: %s no longer exists, recorded on %s", storecontract.ErrVolumeGone,
+		volume.Handle, bounded(volume.Device))
+}
+
+// imageExists reports whether the cache pool lists an image, which a removed or
+// trashed one it does not.
+//
+// FROM THE POOL'S LISTING AND NOT AN ENOENT. `rbd status` answers ENOENT for a pool
+// that will not open and for an image whose parent is missing (Ceph 20.2.3, Utils.cc
+// and RefreshRequest.cc), and both of those can still hold a volume's writes. A
+// listing that fails says nothing.
+func (c *Client) imageExists(ctx context.Context, handle string) (bool, error) {
+	names, err := c.cacheImages(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	return slices.Contains(names, strings.TrimPrefix(handle, c.cfg.CachePool+"/")), nil
 }
 
 // checkCloneName refuses a clone name billet cannot address.

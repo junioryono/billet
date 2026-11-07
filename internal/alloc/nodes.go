@@ -377,6 +377,14 @@ func (a *Allocator) Decommission(ctx context.Context, req DecommissionRequest) (
 			return fmt.Errorf("alloc: decommission node %s: %w", req.Node, err)
 		}
 
+		// A PROOF TAKEN SINCE OUTWEIGHS WHAT THE NODE SAID BEFORE IT, for a pool host's
+		// release (ADR-030); in this transaction, so the two are ordered by the ledger.
+		if proven {
+			if err := q.ClearPoolReleaseContradiction(ctx, req.Node); err != nil {
+				return fmt.Errorf("alloc: clear what contradicted pool node %s's release: %w", req.Node, err)
+			}
+		}
+
 		// ITS BARRIER RUN GOES WITH IT. A host nobody expects to answer must not
 		// leave an observation behind that a later barrier could read as its own.
 		if err := q.DeleteBarrierRun(ctx, req.Node); err != nil {

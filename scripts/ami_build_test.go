@@ -203,7 +203,7 @@ func newAMIBuildFixture(t *testing.T, scope, accept string) amiBuildFixture {
 		t.Fatal(err)
 	}
 
-	for _, name := range []string{"cloud-init", "sync"} {
+	for _, name := range []string{"cloud-init", "sync", "apt-get"} {
 		if err := forkSafeWriteFile(filepath.Join(dir, "bin", name), []byte(fakeMachineCommand), 0o755); err != nil {
 			t.Fatal(err)
 		}

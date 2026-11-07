@@ -232,3 +232,46 @@ func writeStub(t *testing.T, dir, name, body string) {
 		t.Fatalf("write %s stub: %v", name, err)
 	}
 }
+
+// AN IMAGE THAT ENABLES DOCKER AT BOOT HAS A DAEMON THAT READ ITS CONFIGURATION BEFORE THE
+// BOOT CHANGED IT, and `start` on a running service does nothing, so a cold path must
+// restart it when told. A container would otherwise be answered that the npm registry
+// is its own loopback (measured in a guest, 2026-10-23). Told nothing, the helper starts
+// it, which is all a Firecracker guest's has ever done.
+func TestDockerCacheRestartsADaemonThatMissedTheBootsConfiguration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, changed, want string
+	}{
+		{"told the configuration changed", "1", "restart docker.service\n"},
+		{"told nothing", "", "start docker.service\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			shadow := t.TempDir()
+			calls := filepath.Join(shadow, "systemctl.log")
+			writeStub(t, shadow, "systemctl", "printf '%s\\n' \"$*\" >> \"$BILLET_TEST_SYSTEMCTL_LOG\"\n")
+			script := filepath.Join(shadow, "docker-cache.sh")
+			if err := writeExecutable(script, []byte(DockerCacheScript), 0o755); err != nil {
+				t.Fatalf("write Docker cache script: %v", err)
+			}
+			run := exec.CommandContext(t.Context(), script, "prepare")
+			run.Env = append(os.Environ(),
+				"PATH="+shadow+":"+os.Getenv("PATH"),
+				"BILLET_CACHE_ENDPOINT=", "BILLET_CACHE_TOKEN=",
+				"BILLET_DOCKER_CONFIG_CHANGED="+tc.changed,
+				"BILLET_TEST_SYSTEMCTL_LOG="+calls,
+			)
+			if output, err := combinedOutputRetry(t, run); err != nil {
+				t.Fatalf("prepare: %v\n%s", err, output)
+			}
+			got, err := os.ReadFile(calls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("systemctl was asked %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

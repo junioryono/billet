@@ -13,3 +13,6 @@ import (
 func ExecutePolledForTest(ctx, launchCtx context.Context, compute Compute, cmd nodeapi.Command) nodeapi.CommandResult {
 	return executePolled(ctx, launchCtx, nil, compute, cmd, false, time.Second, nodeapi.Version)
 }
+
+// LogReadsAtOnce is logReadsAtOnce.
+const LogReadsAtOnce = logReadsAtOnce

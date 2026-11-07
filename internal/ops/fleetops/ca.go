@@ -17,7 +17,6 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/initconfig"
-	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -236,6 +235,14 @@ func CAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
 		return err
 	}
 
+	// A POOL'S NAME IS ITS ORDER'S (ADR-030): its node joins only through the order, which
+	// links it and whose release seals it, and a certificate issued past the order would
+	// admit a node the pool may be taking back.
+	if alloc.IsPoolNodeName(name) {
+		return fmt.Errorf("billet ca issue: %s begins pool-, which is reserved for the hosts a pool orders; they "+
+			"join through their order (`billet pool`)", name)
+	}
+
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
@@ -399,7 +406,7 @@ func recordIssued(ctx context.Context, env cli.Env, cfgPath, name string, bundle
 
 	defer closeDB()
 
-	if err := recordIssuedCert(ctx, a, bundle, name, alloc.CertIssued); err != nil {
+	if _, err := recordIssuedCert(ctx, a, bundle, name, alloc.CertIssued); err != nil {
 		return err
 	}
 
@@ -470,7 +477,7 @@ func cmdCAShow(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "  billet node --enroll --ca-fingerprint %s%s\n",
 		ca.Fingerprint(), enrollAddrFlag(cfg))
 
-	if cfg.Server.BootstrapListen == "" && !nodeplane.LoopbackOnly(cfg.Server.Listen) {
+	if cfg.Server.BootstrapListen == "" && cfg.Server.WireServesTLS() {
 		fmt.Fprintf(env.Stdout, "\nThis control plane serves no enrollment address, so that command has\n")
 		fmt.Fprintf(env.Stdout, "nowhere to ask: its node wire requires a certificate an enrolling machine\n")
 		fmt.Fprintf(env.Stdout, "does not have yet. Either issue the bundle here and copy it out of band:\n\n")

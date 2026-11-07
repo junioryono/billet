@@ -30,7 +30,13 @@ discard_attached() {
 }
 
 start_cold() {
-	if ! systemctl start docker.service; then
+	# A DAEMON ALREADY RUNNING READ ITS CONFIGURATION BEFORE THE BOOT CHANGED IT, on an
+	# image that enables Docker at boot, and `start` would leave it as it was.
+	action=start
+	if [ -n "${BILLET_DOCKER_CONFIG_CHANGED:-}" ]; then
+		action=restart
+	fi
+	if ! systemctl "$action" docker.service; then
 		log "Docker did not start"
 
 		return 1
@@ -148,7 +154,12 @@ prepare() {
 	esac
 
 	request=$(printf '{"architecture":"%s"}' "$architecture")
-	if ! response=$(cache_call /v1/docker-store "$request" 780 2>/dev/null); then
+	# THE RUNNER STARTS ONLY AFTER THIS ANSWER, so the wait is how long GitHub can
+	# list this guest's runner offline (#320). The node bounds the whole request
+	# at four minutes (dockerStoreRequestLimit) and this waits twenty seconds
+	# past that. A node older than that bound is cut off mid-request when this
+	# gives up; whatever its session had recorded, its teardown discards.
+	if ! response=$(cache_call /v1/docker-store "$request" 260 2>/dev/null); then
 		log "the Docker image store is unavailable; pulling cold"
 		start_cold
 

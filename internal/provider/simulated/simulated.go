@@ -198,6 +198,11 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, errors.New("simulated: a spec needs a name")
 	}
 
+	if spec.Egress != nil {
+		return nil, fmt.Errorf("simulated: %s has a network policy, which only a firecracker guest's "+
+			"tap can carry", spec.Name)
+	}
+
 	if spec.JITConfig == "" {
 		return nil, fmt.Errorf("simulated: %s has no JIT config, so nothing would register", spec.Name)
 	}

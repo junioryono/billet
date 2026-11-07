@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"regexp"
 	"slices"
@@ -160,8 +161,6 @@ type plane struct {
 	direct bool
 	// backgroundLaunches is Options.BackgroundLaunches, read when the stack is built.
 	backgroundLaunches bool
-	// completed counts the JobCompleted messages delivered.
-	completed int
 	// order is the tier labels in the order their sessions may open.
 	order []string
 
@@ -181,6 +180,21 @@ type plane struct {
 	// declinedThenRun counts assignments acknowledged with no runner minted for
 	// them that a later runner took: work billet declined and ran once it could.
 	declinedThenRun int
+	// declined counts, per tier, the jobs billet refused to buy for at least
+	// once: an offer it acknowledged without acquiring, or a direct assignment
+	// it acknowledged with no runner minted for it. Counted once a job, not
+	// once a refusal, because how often a waiting job is offered again is the
+	// harness's nudge cadence, which is not GitHub's; refusedJobs remembers
+	// which jobs were counted.
+	declined    map[string]int
+	refusedJobs map[int64]bool
+	// booting are the jobs a minted runner has taken whose start has not been
+	// delivered: GitHub still holds them for the runner, which the ledger may
+	// not yet have named. started and completed are the jobs whose start and
+	// completion were delivered, which the ledger must have recorded.
+	booting   map[int64]bool
+	started   map[int64]bool
+	completed map[int64]bool
 }
 
 var (
@@ -206,6 +220,11 @@ func newPlane(t *testing.T, clock *Clock, fleet Fleet, trace Trace) *plane {
 		runners:     map[string]*runner{},
 		runnersByID: map[int64]*runner{},
 		nextRunner:  1000,
+		declined:    map[string]int{},
+		refusedJobs: map[int64]bool{},
+		booting:     map[int64]bool{},
+		started:     map[int64]bool{},
+		completed:   map[int64]bool{},
 	}
 	p.cond = sync.NewCond(&p.mu)
 
@@ -576,6 +595,7 @@ func (p *plane) mint(w http.ResponseWriter, r *http.Request, s *scaleSet) {
 	}
 
 	if rn.job != 0 {
+		p.booting[rn.job] = true
 		started := p.clock.Now().Add(p.boot)
 		heap.Push(&p.events, event{at: started, kind: eventStarted, seq: rn.job, runner: rn})
 		heap.Push(&p.events, event{
@@ -980,7 +1000,23 @@ func (p *plane) ack(w http.ResponseWriter, s *scaleSet, msgID int) {
 	}
 
 	// An assignment the message carried and nothing minted for waits for the
-	// next runner on the set.
+	// next runner on the set, and an offer it carried that billet did not
+	// acquire waits at GitHub: each a purchase billet refused.
+	refused := slices.Clone(s.inflight)
+
+	for _, id := range s.queue[0].offered {
+		if _, waiting := s.available[id]; waiting {
+			refused = append(refused, id)
+		}
+	}
+
+	for _, id := range refused {
+		if !p.refusedJobs[id] {
+			p.refusedJobs[id] = true
+			p.declined[s.name]++
+		}
+	}
+
 	s.unpaired = append(s.unpaired, s.inflight...)
 	s.inflight = nil
 	s.queue = s.queue[1:]
@@ -1003,11 +1039,19 @@ func (p *plane) pushLocked(s *scaleSet, assigned, offered []int64, jobs ...map[s
 }
 
 // jobJSON is one job entry with the trace's own facts on it.
+//
+// GITHUB'S QUEUE TIME IS THE ARRIVAL, on every message. A deployment reads it
+// from GitHub's REST record of the run (#582), which the scripted service does
+// not serve; carried on the message, it lands in the same column, so a
+// replayed deployment's ledger holds the arrival a trace exported from it
+// (billet jobs export) reads back.
 func (p *plane) jobJSON(kind string, a Arrival, fields fakeactions.JobFields) map[string]any {
 	fields.Owner = a.Owner
 	fields.Repository = a.Repository
 	fields.WorkflowRef = a.WorkflowRef
 	fields.RunID = a.RunID
+	fields.Name = a.Job
+	fields.QueuedAt = a.At
 
 	// UNDER DIRECT ASSIGNMENT NO RUNNER REQUEST ID, as on GitHub.com: the job
 	// is named by its own id, and billet gives it an identity of its own.
@@ -1017,7 +1061,14 @@ func (p *plane) jobJSON(kind string, a Arrival, fields fakeactions.JobFields) ma
 		fields.JobID = "job-" + itoa(a.Seq)
 	}
 
-	return fields.Apply(fakeactions.JobJSON(kind, request, "push", a.Tier))
+	job := fields.Apply(fakeactions.JobJSON(kind, request, "push", a.Tier))
+
+	// THE TRACE'S NAME, EMPTY INCLUDED: Apply leaves JobJSON's default in place
+	// for an empty one, and a name the trace does not have would be learned and
+	// exported as the job's.
+	job["jobDisplayName"] = a.Job
+
+	return job
 }
 
 // schedule adds an event the run loop will deliver.
@@ -1072,12 +1123,14 @@ func (p *plane) deliver(ev event) {
 		p.pushLocked(s, nil, []int64{a.Seq}, p.jobJSON("JobAvailable", a, fakeactions.JobFields{}))
 
 	case eventStarted:
+		delete(p.booting, a.Seq)
+		p.started[a.Seq] = true
 		p.pushLocked(ev.runner.set, nil, nil, p.jobJSON("JobStarted", a, fakeactions.JobFields{
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name,
 		}))
 
 	case eventCompleted:
-		p.completed++
+		p.completed[a.Seq] = true
 		delete(ev.runner.set.assigned, a.Seq)
 		p.pushLocked(ev.runner.set, nil, nil, p.jobJSON("JobCompleted", a, fakeactions.JobFields{
 			RunnerID: ev.runner.id, RunnerName: ev.runner.name, Result: a.Result,
@@ -1085,12 +1138,52 @@ func (p *plane) deliver(ev event) {
 	}
 }
 
+// waitingJobs is every job GitHub still holds for a runner: offered or
+// assigned and not yet taken, or taken by a runner still booting, in the
+// plane's own books. A job the ledger has no row for and the plane does not
+// hold either is lost, not queued.
+func (p *plane) waitingJobs() map[int64]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	out := map[int64]bool{}
+
+	for _, s := range p.sets {
+		for id := range s.available {
+			out[id] = true
+		}
+
+		for _, id := range s.unpaired {
+			out[id] = true
+		}
+
+		for _, id := range s.inflight {
+			out[id] = true
+		}
+	}
+
+	for id := range p.booting {
+		out[id] = true
+	}
+
+	return out
+}
+
+// deliveredJobs is every job whose start, and every job whose completion, the
+// plane delivered.
+func (p *plane) deliveredJobs() (map[int64]bool, map[int64]bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return maps.Clone(p.started), maps.Clone(p.completed)
+}
+
 // everyJobCompleted says whether GitHub has told billet every job in the trace finished.
 func (p *plane) everyJobCompleted() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	return p.completed >= len(p.jobs)
+	return len(p.completed) >= len(p.jobs)
 }
 
 // AwaitIdle returns once every tier's session is open, its queue is empty and

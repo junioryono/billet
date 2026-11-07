@@ -37,10 +37,16 @@ type pendingCleanup struct {
 	// parking it, so the destroy need not ask GitHub a second time. In memory only: a
 	// restart asks again, which is safe because a removal is idempotent.
 	deregistered bool
+	// parkedAt is when a completion was handed to the cleanup loop, zero for any other
+	// obligation.
+	parkedAt time.Time
 	// Doubles after each failure, up to maxRetryEvery.
 	wait time.Duration
 	// Zero means immediately, which is what a freshly recorded failure wants.
 	at time.Time
+	// held says this completion's destroy is waiting for a hold, which a shutdown leaves alone as
+	// it leaves a running job: the next process finds the completion and the hold both durable.
+	held bool
 	// GitHub re-offers an unacquired job indefinitely, so the message is worth
 	// exactly once per obligation.
 	declined bool
@@ -175,10 +181,15 @@ func (l *Listener) startAttempts(ctx context.Context, pending []dispatch.Job) {
 			return
 		}
 		l.attempting[job.RequestID] = true
+
+		var parkedAt time.Time
+		if entry := l.cleanup[job.RequestID]; entry != nil {
+			parkedAt = entry.parkedAt
+		}
 		l.mu.Unlock()
 
 		l.attempts.Go(func() {
-			defer l.endAttempt(job.RequestID)
+			defer l.endAttempt(job.RequestID, parkedAt)
 
 			l.attempt(ctx, job)
 		})
@@ -195,17 +206,22 @@ func (l *Listener) startAttempts(ctx context.Context, pending []dispatch.Job) {
 // own backoff, and a tombstone or a retirement that could not be written sets none, so
 // with every place taken each end would wake the next attempt at the same failure, at
 // the speed the ledger refuses it.
-func (l *Listener) endAttempt(requestID int64) {
+func (l *Listener) endAttempt(requestID int64, parkedAt time.Time) {
 	l.mu.Lock()
 	delete(l.attempting, requestID)
 
-	if entry, pending := l.cleanup[requestID]; pending && entry.due(time.Now()) {
+	entry, pending := l.cleanup[requestID]
+	if pending && entry.due(time.Now()) {
 		entry.failed(time.Now(), l.retryFirst, l.retryMax)
 	}
 
 	waiting := l.attemptsWaiting
 	l.attemptsWaiting = false
 	l.mu.Unlock()
+
+	if !pending && !parkedAt.IsZero() {
+		l.timings.teardownTook(l.tier, time.Since(parkedAt))
+	}
 
 	if waiting {
 		l.wakeCleanup()

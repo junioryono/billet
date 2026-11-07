@@ -12,7 +12,8 @@
 // rather than its documentation (the firecracker backend's history is why):
 //
 //   - `tart run` has no daemon mode: the process IS the VM. It is therefore
-//     started detached, in its own session with its output in the VM directory,
+//     started detached, in its own session with its output under billet's own
+//     directory (never the VM's bundle; see runLogDir),
 //     so a billet restart or upgrade does not kill every guest on the host —
 //     billet's promise is that running jobs keep running — MEASURED against a
 //     real GitHub Actions job on this backend, both ways: a node SIGKILLed
@@ -68,7 +69,9 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
+	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/usage"
 )
 
@@ -85,9 +88,14 @@ type Instance = provider.Instance
 // live jobs. See state.DeploymentID.
 const ownerMarker = "billet-owner"
 
-// runLog is where the detached `tart run` process writes its output, inside the
-// VM directory so it is removed with the VM and cannot collide across guests.
-const runLog = "billet-run.log"
+// runLogDir holds what each detached `tart run` writes, one file a VM, under billet's
+// own directory in tart's store.
+//
+// NOT INSIDE THE VM'S BUNDLE, where nothing but tart's own files belong. It was moved
+// out (#776) on a probe that blamed it for ASIF macOS guests failing to start (3 of 4
+// with it, 3 of 3 without); the failures went on, and the cause was billet's `tart list`
+// during the disk's attach (see bootVM). The log's place was never the cause.
+const runLogDir = "run-logs"
 
 // stagingSuffix marks a clone that has not yet been renamed to its lease name.
 // A staging name never equals a lease's instance name, so a crash between clone
@@ -314,6 +322,46 @@ type Provider struct {
 	// VM's address to be compared across every store that could hold it.
 	uid int
 
+	// stateDir is node.state_dir, where verified images are recorded (ADR-021). Empty
+	// for a provider that only inspects a host, and `@verified` then refuses.
+	stateDir string
+	// macOSLimit reads this node's limit as its control plane last said it: the limit,
+	// and whether there is a record. A func because the record changes at every
+	// registration, after this provider is built.
+	macOSLimit func() (int, bool, error)
+	// beforeCleanup runs just before a verification's cleanup, and nothing sets it outside
+	// tests, which have no other way to say that a refused verification never got there.
+	beforeCleanup func()
+	// beforeRunLogLock runs just before an absent VM's run log takes the store lock, and
+	// nothing sets it outside tests, which publish a VM there to prove the absence is
+	// asked again under the lock.
+	beforeRunLogLock func()
+	// startGate keeps this provider's own `tart list` out of the window between an ASIF
+	// VM's `tart run` and its guest's first answer: each such start holds it shared, and a
+	// listing exclusively. See bootVM.
+	startGate sync.RWMutex
+	// guestUp asks whether a starting VM's guest answers. Nil is the real question,
+	// `tart exec`; a test stands in for it to watch the gate or hold the answer back.
+	guestUp func(ctx context.Context, name string) (bool, error)
+	// afterRunStart runs just after a start spawns `tart run`, and nothing sets it outside
+	// tests, which ask there whether the gate is already the start's.
+	afterRunStart func(name string)
+	// installer installs the records. Its zero value is the real one, and a test fails a
+	// step of it.
+	installer durablefile.Installer
+	// now is the clock a deadline and a yield request are read against.
+	now func() time.Time
+	// registry asks what a tag names now. A seam for tests, which reach no registry.
+	registry func(ctx context.Context, key string) (string, error)
+	// signal sends a signal to a process proved to be a probe's.
+	signal func(pid int, sig syscall.Signal) error
+	// yieldWait, yieldRetry and yieldPoll pace a launch waiting on a probe, and
+	// probeWindow bounds a guest's answers. Seams for the reason execRetry is.
+	yieldWait   time.Duration
+	yieldRetry  time.Duration
+	yieldPoll   time.Duration
+	probeWindow time.Duration
+
 	// names serializes Launch and Destroy per VM name. Destroy's stop→prove→
 	// delete is not atomic, and a Launch admitted into that window could have
 	// its fresh VM deleted on the strength of the corpse's proof. The node runs
@@ -403,6 +451,16 @@ func WithHome(dir string) Option {
 	return func(p *Provider) { p.home = dir }
 }
 
+// WithStateDir sets node.state_dir, where verified images are recorded.
+func WithStateDir(dir string) Option {
+	return func(p *Provider) { p.stateDir = dir }
+}
+
+// WithMacOSLimit sets how this node's macOS limit is read. See Provider.macOSLimit.
+func WithMacOSLimit(read func() (int, bool, error)) Option {
+	return func(p *Provider) { p.macOSLimit = read }
+}
+
 // New builds a tart provider. owner names this billet deployment and is written
 // into every VM directory it creates.
 func New(owner string, opts ...Option) (*Provider, error) {
@@ -435,6 +493,14 @@ func New(owner string, opts ...Option) (*Provider, error) {
 		bridges:      hostBridges,
 		processPath:  usage.ProcessPath,
 		processStart: hostProcessStart,
+
+		now:         time.Now,
+		registry:    defaultRegistry,
+		signal:      syscall.Kill,
+		yieldWait:   yieldWait,
+		yieldRetry:  yieldRetry,
+		yieldPoll:   yieldPoll,
+		probeWindow: probeWindow,
 	}
 
 	for _, opt := range opts {
@@ -641,6 +707,11 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
 
+	if spec.Egress != nil {
+		return nil, fmt.Errorf("tart: %s has a network policy, which only a firecracker guest's "+
+			"tap can carry", spec.Name)
+	}
+
 	unlock := p.lockName(spec.Name)
 	defer unlock()
 
@@ -671,9 +742,33 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 			"destroy it before relaunching", spec.Name)
 	}
 
-	image, err := p.resolveImage(ctx, spec.Image)
-	if err != nil {
-		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+	// `@VERIFIED` NEVER REACHES `tart fqn`, which would read it as a name. It resolves to
+	// the local base of the newest record, so the clone below has no network and no
+	// fallback, and what boots is a copy of what was probed.
+	var (
+		image    string
+		verified *VerifiedRecord
+		pinned   heldFile
+		err      error
+	)
+
+	if ref, ok := config.TartVerifiedImage(spec.Image); ok {
+		rec, held, err := p.resolveVerified(ctx, config.TartImageKey(ref))
+		if err != nil {
+			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+		}
+
+		// HELD THROUGH THE CLONE AND NO LONGER, so an unpromote that comes after this answer
+		// waits for the clone rather than removing what this launch resolved, and not for
+		// the minutes of a boot that no longer needs the base.
+		pinned = held
+		defer pinned.release()
+
+		image, verified = rec.Base, &rec
+	} else {
+		if image, err = p.resolveImage(ctx, spec.Image); err != nil {
+			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+		}
 	}
 
 	staging := spec.Name + stagingSuffix
@@ -681,7 +776,15 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 	}
 
-	if _, err := p.run(ctx, "clone", image, staging); err != nil {
+	if verified != nil {
+		err := p.cloneHeldBase(ctx, *verified, staging)
+
+		pinned.release()
+
+		if err != nil {
+			return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+		}
+	} else if _, err := p.run(ctx, "clone", image, staging); err != nil {
 		return nil, fmt.Errorf("tart: clone %s for %s: %w", image, spec.Name, err)
 	}
 
@@ -700,6 +803,26 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 	}
+
+	// BEFORE THE LEASE NAME EXISTS, because a guest the limit refuses is a staging clone
+	// to discard, not a stopped VM under a lease name for custody to own. The operating
+	// system comes from the clone, since a tier's word for it is not what Apple counts.
+	guestOS, err := p.guestOSOf(staging)
+	if err != nil {
+		p.discardStaging(ctx, staging)
+
+		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+	}
+
+	claim, err := p.claimGuest(ctx, spec.Name, guestOS, false)
+	if err != nil {
+		p.discardStaging(ctx, staging)
+
+		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+	}
+
+	// Billet's copies only. The guest's process holds its own from the start below.
+	defer claim.release()
 
 	// THE ONE MOMENT A LEASE NAME COMES INTO EXISTENCE, and it happens under the
 	// host-wide store lock — the other half of the pair Destroy's delete is. See
@@ -723,8 +846,16 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 	}
 
-	if err := p.startDetached(spec.Name, netFlags...); err != nil {
-		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
+	// THE SLOT GOES WITH THE START, whatever bootVM answers: the guest's process holds
+	// its own copy from the moment it is started.
+	bootErr := p.bootVM(ctx, spec.Name, claim.files, netFlags...)
+
+	// Released now rather than at return, which is minutes away: only the guest's process
+	// holds a slot, so that a billet that dies here does not matter to it.
+	claim.release()
+
+	if bootErr != nil {
+		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, bootErr)
 	}
 
 	if err := p.proveStarted(ctx, spec.Name); err != nil {
@@ -975,11 +1106,272 @@ func (p *Provider) applyShape(ctx context.Context, name string, spec provider.Sp
 // host. Its output goes to a file in the VM directory, because a dropped stderr
 // is how "the VM never booted" becomes undiagnosable.
 func (p *Provider) startDetached(name string, netFlags ...string) error {
-	logPath := filepath.Join(p.vmDir(name), runLog)
+	return p.startDetachedHolding(name, nil, netFlags...)
+}
 
-	out, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+// startDetachedHolding is startDetached passing open files to the VM's process, which
+// inherits them, and so holds any lock on them for as long as it or a child of it lives.
+func (p *Provider) startDetachedHolding(name string, held []*os.File, netFlags ...string) error {
+	_, err := p.startRun(name, held, netFlags...)
+
+	return err
+}
+
+// bootVM starts the VM's `tart run`, and for an ASIF disk returns once its guest first
+// answers, or says why it never did.
+//
+// NO `tart list` RUNS WHILE AN ASIF DISK IS BEING ATTACHED, from this provider. `tart
+// list` and `tart get` size every VM they show, and an ASIF disk is sized by running
+// `diskutil image info` on it (tart 2.41.1: List.swift, VMDirectory.diskSizeBytes,
+// Diskutil.imageInfo), while `tart run` takes the lock that makes `tart list` say running
+// before it asks the framework to start the VM and attach that disk (Run.swift). Measured
+// on a fleet Mac (macOS 27.2, golden-gate 27.2 at 6 vCPU and 24 GiB, 2026-11-07), with
+// `diskutil image info` looped every 0.3 s for 60 s beside a fresh `tart run`: from the
+// start, it failed the start 2 of 2 with "Internal Virtualization error"; from the moment
+// the framework's process first held the disk (0.2 to 0.4 s in), 1 of 3; from 5, 15 or
+// 30 s after that, from `tart ip` answering (5.6 to 6.5 s) and from the guest's first
+// `tart exec` answer (13.3 to 15.5 s), none of 3 each, as with no polling at all. So the
+// disk being held is not the end of the window, and the guest answering is past it with
+// room: that is what the start waits for. A raw disk is only stat'ed, so its start takes
+// none of this.
+//
+// THE GATE IS THE START'S, NOT THE CALLER'S. The start holds startGate shared from before
+// `tart run` until its guest answers, the run ends, or the start window does, in a
+// goroutine of its own, because the run is detached: a caller that gives up has not
+// stopped it attaching. Every listing this provider makes takes the gate exclusively, so
+// a node's listings wait out each ASIF boot. Another process running `tart list`
+// meanwhile (another deployment, an operator, `billet check`) is outside what this can
+// hold.
+func (p *Provider) bootVM(ctx context.Context, name string, held []*os.File, netFlags ...string) error {
+	asif, err := p.diskIsASIF(name)
 	if err != nil {
-		return fmt.Errorf("open run log: %w", err)
+		return err
+	}
+
+	if !asif {
+		_, err := p.startRun(name, held, netFlags...)
+
+		return err
+	}
+
+	if err := p.enterStart(ctx); err != nil {
+		return err
+	}
+
+	// NOTHING IS STARTED FOR A CALLER THAT HAS GONE while the gate was awaited.
+	if err := ctx.Err(); err != nil {
+		p.startGate.RUnlock()
+
+		return fmt.Errorf("start %s: %w", name, err)
+	}
+
+	exited, err := p.startRun(name, held, netFlags...)
+	if err != nil {
+		p.startGate.RUnlock()
+
+		return err
+	}
+
+	done := make(chan error, 1)
+
+	// NOT THE CALLER'S CANCELLATION: the run goes on attaching after a caller gives up.
+	attaching := context.WithoutCancel(ctx)
+
+	// THE GOROUTINE OWNS THE GATE FROM HERE, and releases it BEFORE it publishes the
+	// answer (defers run last first), so a caller that has the answer finds it released.
+	go func() {
+		var err error
+
+		defer func() { done <- err }()
+		defer p.startGate.RUnlock()
+
+		if p.afterRunStart != nil {
+			p.afterRunStart(name)
+		}
+
+		err = p.awaitGuest(attaching, name, exited)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for %s's guest to answer: %w", name, ctx.Err())
+	}
+}
+
+// enterStart takes the start gate shared, waiting for a listing in progress as long as
+// the caller does.
+func (p *Provider) enterStart(ctx context.Context) error {
+	retry := time.NewTimer(startGatePoll)
+	defer retry.Stop()
+
+	for !p.startGate.TryRLock() {
+		retry.Reset(startGatePoll)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for a listing to finish before a start: %w", ctx.Err())
+		case <-retry.C:
+		}
+	}
+
+	return nil
+}
+
+// awaitGuest waits, on the start window's clock and with no caller's cancellation, until the VM's guest
+// answers or its run has ended. Each look is bounded, so an exec that blocks (a guest
+// agent not yet listening holds one for 30 s) cannot outlast the window, and a run that
+// ends is noticed between looks.
+func (p *Provider) awaitGuest(ctx context.Context, name string, exited <-chan struct{}) error {
+	deadline := time.Now().Add(p.startWindow)
+
+	retry := time.NewTimer(p.proveRetry)
+	defer retry.Stop()
+
+	var lastErr error
+
+	for {
+		answered, err := p.lookForGuest(ctx, name, deadline)
+		if answered {
+			return nil
+		}
+
+		if err != nil {
+			lastErr = err
+		}
+
+		select {
+		case <-exited:
+			// ASKED ONCE MORE, because the guest may have answered and the run ended
+			// between the question and this answer; a `tart run` that has ended is a VM
+			// that has.
+			answered, err := p.lookForGuest(ctx, name, deadline)
+			if answered {
+				return nil
+			}
+
+			if err != nil {
+				return fmt.Errorf("the VM never started: %s (its guest did not answer: %w)", p.runLogTail(name), err)
+			}
+
+			return fmt.Errorf("the VM never started: %s", p.runLogTail(name))
+		default:
+		}
+
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return fmt.Errorf("the VM never started: %s (its guest did not answer: %w)",
+					p.runLogTail(name), lastErr)
+			}
+
+			return fmt.Errorf("the VM never started: %s", p.runLogTail(name))
+		}
+
+		retry.Reset(p.proveRetry)
+
+		select {
+		case <-exited:
+		case <-retry.C:
+		}
+	}
+}
+
+// guestLook bounds one asking of the guest.
+const guestLook = 10 * time.Second
+
+// lookForGuest asks the guest once, ending at the earlier of guestLook and deadline.
+func (p *Provider) lookForGuest(ctx context.Context, name string, deadline time.Time) (bool, error) {
+	if bound := time.Now().Add(guestLook); bound.Before(deadline) {
+		deadline = bound
+	}
+
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	if p.guestUp != nil {
+		return p.guestUp(ctx, name)
+	}
+
+	return p.guestAnswers(ctx, name)
+}
+
+// guestAnswers asks the guest to run nothing, through `tart exec`, which sizes no disk.
+// An exec that fails is a guest not yet answering, and its error quotes nothing the guest
+// wrote (guestAnswer).
+func (p *Provider) guestAnswers(ctx context.Context, name string) (bool, error) {
+	if _, err := p.guestAnswer(ctx, name, ":"); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// diskIsASIF reads the VM's disk format from its config.json as tart does: `asif` is
+// ASIF, and an absent or other value is raw.
+func (p *Provider) diskIsASIF(name string) (bool, error) {
+	raw, err := regularfile.ReadFile(filepath.Join(p.vmDir(name), "config.json"), maxVMConfig,
+		regularfile.Options{NoFollow: true})
+	if err != nil {
+		return false, fmt.Errorf("read %s's configuration for its disk format: %w", name, err)
+	}
+
+	var cfg struct {
+		DiskFormat string `json:"diskFormat"`
+	}
+
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return false, fmt.Errorf("read %s's configuration for its disk format: %w", name, err)
+	}
+
+	return cfg.DiskFormat == "asif", nil
+}
+
+// withoutStarts runs fn while no ASIF VM this provider started is still before its guest's
+// first answer, waiting for one at most the start window, and refusing past it. See bootVM.
+func (p *Provider) withoutStarts(ctx context.Context, fn func() error) error {
+	deadline := time.Now().Add(p.startWindow)
+
+	retry := time.NewTimer(startGatePoll)
+	defer retry.Stop()
+
+	for !p.startGate.TryLock() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("tart: an ASIF VM this node started had no answering guest after %s, "+
+				"and listing VMs before then sizes its disk under the attach", p.startWindow)
+		}
+
+		retry.Reset(startGatePoll)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("tart: waiting for an ASIF VM's guest to answer before listing: %w", ctx.Err())
+		case <-retry.C:
+		}
+	}
+
+	defer p.startGate.Unlock()
+
+	return fn()
+}
+
+// startGatePoll is how often a listing, or a start, asks again for the gate.
+const startGatePoll = 50 * time.Millisecond
+
+// startRun starts `tart run` detached, and returns a channel closed when it exits.
+func (p *Provider) startRun(name string, held []*os.File, netFlags ...string) (<-chan struct{}, error) {
+	logPath := p.runLogPath(name)
+
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return nil, fmt.Errorf("prepare the run log directory: %w", err)
+	}
+
+	// TRUNCATED, because a probe's name is reused by every verification of its image,
+	// and the tail of an earlier run would read as this one's reason. O_NOFOLLOW: the
+	// name must be the log itself, not a link to a file the node would then write.
+	out, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open run log: %w", err)
 	}
 
 	defer func() {
@@ -1001,26 +1393,31 @@ func (p *Provider) startDetached(name string, netFlags ...string) error {
 	cmd := exec.Command(p.tart, args...)
 	cmd.Stdout = out
 	cmd.Stderr = out
+	cmd.ExtraFiles = held
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start tart run: %w", err)
+		return nil, fmt.Errorf("start tart run: %w", err)
 	}
+
+	exited := make(chan struct{})
 
 	// Reaped, never believed: Setsid detaches the session, not the parenthood,
 	// so an exited child stays a zombie until someone waits on it — one per
-	// finished VM, for as long as this node runs. The Wait exists solely to
-	// reap; its result is logged and nothing more, because the exit status of
-	// this process proves nothing about the VM (the jailer lesson) and List
-	// reads tart's own state instead.
+	// finished VM, for as long as this node runs. Its result is logged and
+	// nothing more, because the exit status of this process proves nothing about
+	// the VM (the jailer lesson) and List reads tart's own state instead; that it
+	// ended is the one thing bootVM takes from it.
 	go func() {
+		defer close(exited)
+
 		if err := cmd.Wait(); err != nil {
 			p.log.Debug("the detached tart run process exited with an error; the VM's "+
 				"state is read from tart, not from this", "runner", name, "error", err)
 		}
 	}()
 
-	return nil
+	return exited, nil
 }
 
 // resolverScript configures the guest's resolvers and proves the result, or
@@ -1457,7 +1854,7 @@ func (p *Provider) proveStarted(ctx context.Context, name string) error {
 // runLogTail returns the last of what the detached `tart run` wrote, which is
 // where the reason a VM refused to start actually appears.
 func (p *Provider) runLogTail(name string) string {
-	b, err := os.ReadFile(filepath.Join(p.vmDir(name), runLog))
+	b, err := os.ReadFile(p.runLogPath(name))
 	if err != nil {
 		return "no reason recorded (" + err.Error() + ")"
 	}
@@ -1473,6 +1870,65 @@ func (p *Provider) runLogTail(name string) string {
 	}
 
 	return tail
+}
+
+// runLogPath is where the detached `tart run` of a VM writes.
+func (p *Provider) runLogPath(name string) string {
+	return filepath.Join(p.home, storeStateDir, runLogDir, name+".log")
+}
+
+// removeRunLog drops a deleted VM's run log. The VM is gone either way, so a log that
+// cannot be removed is reported and fails nothing.
+func (p *Provider) removeRunLog(name string) {
+	if err := os.Remove(p.runLogPath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		p.log.Warn("could not remove a deleted VM's run log", "vm", name, "error", err)
+	}
+}
+
+// removeAbsentVMRunLog removes the run log of a VM found absent, under the store lock
+// and only while the VM is still absent there.
+//
+// THE STORE LOCK, NOT THE NAME'S MUTEX: that mutex is this process's, and another billet
+// sharing the store publishes a VM under the store lock, then opens its log. So the
+// absence is asked again under the lock, and a VM that appeared keeps its log.
+//
+// ONE ATTEMPT AT THE LOCK, NEVER A WAIT: the teardown it follows is already proved, and
+// waiting out another billet's slow delete would hold the node's command slot and the
+// capacity it releases for the length of the lock's window. A held lock leaves the log.
+func (p *Provider) removeAbsentVMRunLog(ctx context.Context, name string) {
+	if _, err := os.Lstat(p.runLogPath(name)); errors.Is(err, os.ErrNotExist) {
+		return
+	}
+
+	if p.beforeRunLogLock != nil {
+		p.beforeRunLogLock()
+	}
+
+	// A CANCELLED CONTEXT ENDS THE WAIT AT ONCE: lockStore tries the flock before it looks
+	// at any deadline, and then sees this one already done (a retry the scheduler lets
+	// in first is a moment, never the lock's window).
+	once, cancel := context.WithCancel(ctx)
+	cancel()
+
+	unlock, err := p.lockStore(once, "remove the run log of "+name)
+	if err != nil {
+		reason := "the store lock could not be taken"
+		if errors.Is(err, errStoreLockBusy) {
+			reason = "another billet held the store lock"
+		}
+
+		p.log.Warn("left a deleted VM's run log, since "+reason, "vm", name, "error", err)
+
+		return
+	}
+
+	defer unlock()
+
+	if _, err := os.Stat(p.vmDir(name)); !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+
+	p.removeRunLog(name)
 }
 
 // launchStatus reports what BILLET's launcher recorded about this launch, in
@@ -1916,6 +2372,10 @@ func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, e
 			}
 		}
 
+		// A DELETE INTERRUPTED BEFORE ITS LOG WENT, or a VM an operator removed, leaves
+		// the log nothing else would find.
+		p.removeAbsentVMRunLog(ctx, id)
+
 		return provider.TeardownStopped, nil
 	} else if err != nil {
 		return provider.TeardownRequested, fmt.Errorf("tart: inspect %s: %w", id, err)
@@ -2222,6 +2682,50 @@ type listedVM struct {
 // between appears as a directory without a row and fails toward the error side;
 // reconciliation retries, and a transient refusal is the safe direction.
 func (p *Provider) list(ctx context.Context) ([]listedVM, error) {
+	var vms []listedVM
+
+	// THE CROSS-CHECK'S `tart get` SIZES A DISK TOO, so it runs inside the same gate.
+	err := p.withoutStarts(ctx, func() error {
+		var err error
+
+		vms, err = p.listRowsNow(ctx)
+		if err != nil {
+			return err
+		}
+
+		seen := make(map[string]bool, len(vms))
+		for _, vm := range vms {
+			seen[vm.Name] = true
+		}
+
+		return p.crossCheckStore(ctx, seen)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return vms, nil
+}
+
+// listRows is tart's own answer, each row readable and named once, which vouches for the
+// rows it holds and says nothing about the ones it does not. It waits out any start in
+// its disk's window, as list does.
+func (p *Provider) listRows(ctx context.Context) ([]listedVM, error) {
+	var vms []listedVM
+
+	err := p.withoutStarts(ctx, func() error {
+		var err error
+
+		vms, err = p.listRowsNow(ctx)
+
+		return err
+	})
+
+	return vms, err
+}
+
+// listRowsNow is listRows for a caller already holding the start gate.
+func (p *Provider) listRowsNow(ctx context.Context) ([]listedVM, error) {
 	out, err := p.run(ctx, "list", "--format", "json", "--source", "local")
 	if err != nil {
 		return nil, fmt.Errorf("tart: list VMs: %w", err)
@@ -2250,10 +2754,6 @@ func (p *Provider) list(ctx context.Context) ([]listedVM, error) {
 		}
 
 		seen[vm.Name] = true
-	}
-
-	if err := p.crossCheckStore(ctx, seen); err != nil {
-		return nil, err
 	}
 
 	return vms, nil

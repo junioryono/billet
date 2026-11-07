@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -126,6 +125,18 @@ type LeaseStore interface {
 	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 }
 
+// LogIndexer indexes one chunk of a job's log for the node that says it holds it. A
+// refusal wrapping ErrRefused is permanent, so the node does not send the chunk again;
+// anything else is could-not-tell.
+type LogIndexer interface {
+	IndexLogChunk(ctx context.Context, node, leaseID string, firstLine int64, data []byte) error
+}
+
+// WithLogIndex serves the route that takes chunks of jobs' logs.
+func WithLogIndex(x LogIndexer) HandlerOption {
+	return func(h *handler) { h.logs = x }
+}
+
 // GuestReportStore keeps what the agent inside a lease's guest told the node:
 // the guest's own unverified view, fenced on the epoch, the first report kept.
 //
@@ -139,6 +150,24 @@ type GuestReportStore interface {
 // The allocator is the store the control plane serves the wire with, and it
 // keeps guest reports; this fails the build if it ever stops.
 var _ GuestReportStore = (*alloc.Allocator)(nil)
+
+// LeaseHoldStore answers whether a failed job's VM is being held. ASKED OF THE LEASE STORE as
+// GuestReportStore is; a store that keeps none holds nothing.
+type LeaseHoldStore interface {
+	LeaseHoldOf(ctx context.Context, leaseID string) (alloc.LeaseHold, error)
+}
+
+// The allocator keeps them; this fails the build if it ever stops.
+var _ LeaseHoldStore = (*alloc.Allocator)(nil)
+
+// EgressReportStore keeps what the host saw of a lease's network, fenced on the
+// epoch, the first report kept. Asked of the lease store for GuestReportStore's
+// reason.
+type EgressReportStore interface {
+	RecordLeaseEgress(ctx context.Context, leaseID string, epoch int64, report alloc.JobEgress) error
+}
+
+var _ EgressReportStore = (*alloc.Allocator)(nil)
 
 // CachePolicy answers the kill switch for one cache of one repository.
 type CachePolicy interface {
@@ -324,6 +353,10 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 		h.guests = guests
 	}
 
+	if egress, ok := store.(EgressReportStore); ok {
+		h.egress = egress
+	}
+
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -361,6 +394,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/cache", h.forOwnLease(h.cacheObservation))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/usage", h.forOwnLease(h.leaseUsage))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/guest", h.forOwnLease(h.guestReport))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/egress", h.forOwnLease(h.egressReport))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}/cache-authority", h.forOwnLease(h.cacheAuthority))
@@ -376,6 +410,8 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/remove", h.forOwnOrEndedLease(h.removeRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/recover", h.forOwnLease(h.recoverRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
+	mux.HandleFunc("POST /v1/nodes/{node}/logs", h.forNode(h.logChunk))
+	mux.HandleFunc("POST /v1/nodes/{node}/streams/{stream}", h.forNode(h.stream))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
 
 	return mux
@@ -435,13 +471,22 @@ type handler struct {
 	ca          *wirecert.CA
 	trust       []byte
 	enrollments Enrollments
-	cachePolicy CachePolicy
+	// poolJoins admits a pool host on its source's word, and seesHostAddress says the
+	// peer of an enrollment is the host itself; nil without a pool.
+	poolJoins       PoolJoins
+	seesHostAddress bool
+	cachePolicy     CachePolicy
 	// resizer authorises a fallback's larger shape in place of the store's own
 	// Resize; nil asks the store.
 	resizer Resizer
 	// guests keeps guest reports; nil when the lease store keeps none, and the
 	// route then refuses.
 	guests GuestReportStore
+	// logs indexes what jobs wrote; nil when this control plane keeps no index.
+	logs LogIndexer
+	// egress keeps egress reports; nil when the lease store keeps none, and the
+	// route refuses.
+	egress EgressReportStore
 	// authorities remembers what GitHub's record said about a running job, so a
 	// job whose cache calls cannot be proved does not ask GitHub on every call.
 	authorities authorityMemory
@@ -969,6 +1014,24 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A POOL ORDER'S TOKEN IS ASKED OF ITS SOURCE FIRST (ADR-030), which may admit the
+	// host on its own word, refuse it, or leave it to the request below.
+	poolOrder := ""
+	if h.poolJoins != nil && strings.TrimSpace(req.JoinToken) != "" {
+		order, live, err := h.poolJoins.PoolJoinOrder(r.Context(), req.JoinToken)
+		if err != nil {
+			h.log.Error("could not read which pool order a join token is for", "node", req.Node, "error", err)
+			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable, "billet could not read this request; try again")
+
+			return
+		}
+
+		if order != "" && h.poolEnroll(w, r, &req, fingerprint, order, live) {
+			return
+		}
+		poolOrder = order
+	}
+
 	// THE REQUEST AND THE TOKEN IN ONE CALL, because they have to commit
 	// together. The token is spent only for a request that is NEW: a node polls
 	// this endpoint until a human decides, so charging every call would spend a
@@ -976,6 +1039,21 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 	enrollment, err := h.enrollments.RequestEnrollmentWithToken(
 		r.Context(), req.Node, fingerprint, req.CSRPEM, req.JoinToken)
 	if err != nil {
+		// A POOL HOST'S REQUEST IS ANSWERED AS ONE on this path too, a conflict
+		// included: pending, quoting nothing, so the host keeps asking.
+		if isPoolRefusal(err) || (poolOrder != "" && (errors.Is(err, alloc.ErrEnrollmentConflict) || errors.Is(err, alloc.ErrBadJoinToken))) {
+			h.poolRefusal(w, req.Node, fingerprint, err)
+
+			return
+		}
+
+		if errors.Is(err, alloc.ErrPoolNameReserved) {
+			writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
+				"a node name beginning pool- is reserved for the hosts a pool orders; choose another --node-name")
+
+			return
+		}
+
 		if errors.Is(err, alloc.ErrBadJoinToken) {
 			h.log.Warn("an enrollment was attempted without a usable join token",
 				"node", req.Node, "fingerprint", fingerprint)
@@ -1735,6 +1813,84 @@ func (h *handler) guestReport(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// logChunk indexes one chunk of a job's log. A LOG IS WHAT THE JOB WROTE, and nothing here
+// decides from it. The lease is only a name until the indexer checks the job ran on this
+// node, and a superseded process may finish shipping what it kept: a chunk is about a job
+// already over, not capacity.
+func (h *handler) logChunk(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.LogChunkRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionJobLogs {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, fmt.Sprintf(
+			"a job log needs wire %d and this node negotiated %d", nodeapi.VersionJobLogs, wire))
+
+		return
+	}
+
+	// NOT A REFUSAL, which a node takes as for good and marks past: an index can come back under
+	// the id the node still holds. Its next registration says whether there is one.
+	if h.logs == nil {
+		writeErr(w, http.StatusServiceUnavailable, "", "this control plane holds no index of job logs now")
+
+		return
+	}
+
+	err := h.logs.IndexLogChunk(r.Context(), r.PathValue("node"), req.Lease, req.FirstLine, req.Data)
+
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, ErrRefused):
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+	default:
+		writeErr(w, http.StatusServiceUnavailable, "", err.Error())
+	}
+}
+
+// egressReport keeps what the host saw of a lease's network, which nothing on the
+// control plane decides from.
+//
+// REFUSED FROM A PAIRING THAT NEGOTIATED BELOW VersionEgress, and VALIDATED AT THE
+// BOUNDARY, for guestReport's reasons.
+func (h *handler) egressReport(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.EgressReportRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionEgress {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, fmt.Sprintf(
+			"an egress report needs wire %d and this node negotiated %d", nodeapi.VersionEgress, wire))
+
+		return
+	}
+
+	if err := req.Report.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+
+	if h.egress == nil {
+		writeErr(w, http.StatusNotImplemented, nodeapi.CodeRefused, "this control plane keeps no egress reports")
+
+		return
+	}
+
+	if err := h.egress.RecordLeaseEgress(r.Context(), r.PathValue("lease"), req.Epoch, req.Report); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *handler) resize(w http.ResponseWriter, r *http.Request) {
 	var req nodeapi.ResizeRequest
 	if !decode(w, r, &req) {
@@ -2462,6 +2618,24 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		case alloc.PoolRunnerIdle:
 			req.RunnerName = binding.RunnerName
 		case alloc.PoolRunnerRetiring:
+			// A HELD VM'S RUNNER IS RETIRING AND ITS VM IS WANTED. A completion journals the runner
+			// first, and a retired answer would have the node destroy what a hold is keeping, when
+			// its lease was quarantined by a control plane away for a lease's life. BUSY AND NOT
+			// TRACKED: the node keeps the VM, renews it and asks again on every tend, so it hears
+			// retired once the hold ends, whether or not a listener is left to destroy it. Tracked is
+			// never asked again, and a tier removed meanwhile would keep the VM for ever. Could-not-tell
+			// is refused, since the node asks again and a retired answer cannot be taken back.
+			if holds, ok := h.store.(LeaseHoldStore); ok {
+				hold, err := holds.LeaseHoldOf(r.Context(), leaseID)
+				if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+					writeStoreErr(w, err)
+					return
+				}
+				if err == nil && hold.Holding() && time.Now().Before(hold.Until) {
+					writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryBusy})
+					return
+				}
+			}
 			if !resolve() {
 				return
 			}
@@ -2718,49 +2892,6 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 	default:
 		writeErr(w, http.StatusInternalServerError, "", err.Error())
 	}
-}
-
-// LoopbackOnly reports whether an address is safe to serve the node wire on
-// without TLS.
-//
-// config.LoopbackAddr answers the same question for validation, and the two must
-// agree: whether a node needs a certificate is decided by whether the listener
-// will ask for one.
-//
-// Until mTLS lands the node names itself in the path and nothing verifies that
-// claim, so a listener reachable beyond this host would let anything on the
-// network bind leases and take commands. Refusing is the only honest option; the
-// alternative is a deployment that looks like it works and has no boundary at
-// all.
-func LoopbackOnly(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		// Not an address billet can reason about, so not one it will serve on.
-		return false
-	}
-
-	// AN EMPTY HOST IS THE WILDCARD, NOT LOOPBACK, and the first version of this
-	// function said the opposite. net.Listen("tcp", ":7717") binds every
-	// interface, so treating ":7717" as safe served the unauthenticated wire to
-	// the whole network while reporting that it had not — with a JIT credential
-	// endpoint behind it. The test asserted that behaviour too, which pinned the
-	// hole rather than catching it.
-	if host == "" {
-		return false
-	}
-
-	// The one hostname whose meaning is fixed by convention everywhere billet
-	// runs. Anything else that might resolve to loopback is not trusted: what it
-	// resolves to is not knowable here and can change under the process.
-	if host == "localhost" {
-		return true
-	}
-
-	// ASKED, not pattern-matched. 127.0.0.1, ::1 and the rest of 127/8 are all
-	// loopback and a prefix test on the string got some of them by accident.
-	ip := net.ParseIP(host)
-
-	return ip != nil && ip.IsLoopback()
 }
 
 // hasJIT reports whether any credential-holding source is attached.
