@@ -47,6 +47,27 @@ type fakeLedger struct {
 	idleReleases []idleRelease
 	idleAnswer   map[string]error
 	idleErr      error
+	// unregistered is every joined order whose node has not registered, which serves
+	// nothing; servingErr fails the count of serving hosts.
+	unregistered map[string]bool
+	servingErr   error
+}
+
+func (l *fakeLedger) PoolServingHosts(context.Context) (map[config.Arch]int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.servingErr != nil {
+		return nil, l.servingErr
+	}
+	out := map[config.Arch]int{}
+	for i := range l.orders {
+		o := &l.orders[i]
+		if o.State == alloc.PoolPlaced && o.ReleaseRequested.IsZero() && o.NodeName != "" && !l.unregistered[o.ID] {
+			out[o.Arch]++
+		}
+	}
+
+	return out, nil
 }
 
 type idleRelease struct {

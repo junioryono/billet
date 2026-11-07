@@ -167,7 +167,7 @@ type ReadOps interface {
 	ListPoolClearanceTargets(ctx context.Context) ([]ledgerdb.ListPoolClearanceTargetsRow, error)
 	ListPoolIdleHosts(ctx context.Context) ([]ledgerdb.ListPoolIdleHostsRow, error)
 	ReadPoolIdleHost(ctx context.Context, orderID string) (ledgerdb.ReadPoolIdleHostRow, error)
-	CountPoolServingHosts(ctx context.Context, arch string) (int64, error)
+	ListPoolServingHosts(ctx context.Context) ([]ledgerdb.ListPoolServingHostsRow, error)
 	PoolHostReleased(ctx context.Context, name string) (bool, error)
 	CountNodeHoldings(ctx context.Context, node string) (ledgerdb.CountNodeHoldingsRow, error)
 	ReadJobConclusion(ctx context.Context, leaseID string) (sql.NullString, error)

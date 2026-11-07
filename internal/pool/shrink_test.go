@@ -141,6 +141,11 @@ func TestThePoolKeepsItsHostsWhenItMayNotShrink(t *testing.T) {
 			r.pool.cfg.Tiers = append(r.pool.cfg.Tiers, pin, pinB)
 		}},
 		"a source that never says gone": {setup: func(r *rig) { r.first.confirmsGone = false }},
+		"a host admitted whose node never registered, in the floor's place": {floor: 1, setup: func(r *rig) {
+			r.ledger.mu.Lock()
+			defer r.ledger.mu.Unlock()
+			r.ledger.unregistered = map[string]bool{"o-b": true}
+		}},
 		"a count republished from a poll GitHub stopped answering": {setup: func(r *rig) {
 			r.reportAnswered("fc", 0, DefaultDemandFreshness+time.Second)
 		}},
@@ -253,6 +258,13 @@ func TestAShrinkThatFailedSaysSo(t *testing.T) {
 	r.ledger.idleErr = listing
 	if err := r.pool.Step(t.Context()); !errors.Is(err, listing) {
 		t.Fatalf("a failed idle listing answered %v", err)
+	}
+
+	counting := errors.New("the ledger could not count")
+	r = shrinkRig(t, Policy{Floor: 0, Max: 4}, map[string]time.Duration{"o-a": time.Hour})
+	r.ledger.servingErr = counting
+	if err := r.pool.Step(t.Context()); !errors.Is(err, counting) || len(asked(r)) != 0 {
+		t.Fatalf("a failed count of serving hosts answered %v after asking %v", err, asked(r))
 	}
 
 	asking := errors.New("the ledger could not write")

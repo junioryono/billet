@@ -119,6 +119,35 @@ func TestAnIdleReleaseCountsTheFloorInItsOwnTransaction(t *testing.T) {
 	}
 }
 
+// A HOST ADMITTED WHOSE NODE NEVER REGISTERED SERVES NOTHING: its order names its node from
+// the approval, but it is not counted as serving, so it holds no floor up, and its own
+// release takes nothing from the floor.
+func TestAnUnregisteredHostHoldsNoFloor(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	joinedPoolHost(t, a, "pa", "0a")
+	tok := placedOrder(t, a, "pb")
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pb", "SHA256:pb", tok, "0b")); err != nil {
+		t.Fatalf("admit pb: %v", err)
+	}
+	if o := readOrder(t, a, "pb"); o.NodeName != PoolNodeName("pb") {
+		t.Fatalf("pb's order names %q; the approval links its node before it registers", o.NodeName)
+	}
+	if serving, err := a.PoolServingHosts(ctx); err != nil || serving[config.ArchX64] != 1 {
+		t.Fatalf("serving = %v, %v; want only the registered host", serving, err)
+	}
+	now = now.Add(time.Hour)
+	cutoff := now.Add(-20 * time.Minute)
+	if err := a.ReleaseIdlePoolHost(ctx, "pa", cutoff, 1, "idle"); !errors.Is(err, ErrPoolAtFloor) {
+		t.Fatalf("releasing the floor's only registered host answered %v", err)
+	}
+	if err := a.ReleaseIdlePoolHost(ctx, "pb", cutoff, 1, "idle"); err != nil {
+		t.Fatalf("releasing a host that never registered, at the floor: %v", err)
+	}
+}
+
 // AN UNREADABLE TIME IN THE LEDGER IS NEVER IDLE: a host whose newest job's end the
 // ledger holds in a form this binary cannot parse is not listed, and its release is
 // refused, writing nothing.

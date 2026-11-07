@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -293,5 +294,57 @@ func TestAnAnsweredPollDatesTheReport(t *testing.T) {
 
 	if answered.Before(start.Add(-time.Second)) || answered.After(time.Now().Add(time.Second)) {
 		t.Errorf("AnsweredAt %v is not when the poll was answered (between %v and now)", answered, start)
+	}
+}
+
+// AN ANSWER IS DATED WHERE THE POLL RETURNED, in both of the loop's ways of polling: with
+// background launches the loop may consume the answer long after, inside a
+// reconciliation, and an answer dated then would date an old count as current.
+func TestAnAnswerIsDatedWhenItsPollReturned(t *testing.T) {
+	t.Parallel()
+
+	for name, background := range map[string]bool{"inline": false, "background": true} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			a, label, _, _ := workTier(t)
+			returned := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+
+			var (
+				mu  sync.Mutex
+				now = returned.Add(-time.Hour)
+			)
+
+			session := &fakeSession{stats: &Statistics{}, onGet: func() (*Message, error) {
+				mu.Lock()
+				now = returned
+				mu.Unlock()
+
+				return nil, ErrNoMessage
+			}}
+
+			opts := []Option{WithLogger(slog.New(slog.DiscardHandler)), WithRunner(&fakeRunner{})}
+			if background {
+				opts = append(opts, WithBackgroundLaunches())
+			}
+
+			l := NewListener(a, label, session, opts...)
+			l.now = func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+
+				return now
+			}
+
+			answer := l.exchange(t.Context(), 1, false)
+
+			mu.Lock()
+			now = returned.Add(time.Hour)
+			mu.Unlock()
+
+			if !errors.Is(answer.err, ErrNoMessage) || !answer.at.Equal(returned) {
+				t.Fatalf("answer %v dated %v, want the poll's return at %v", answer.err, answer.at, returned)
+			}
+		})
 	}
 }

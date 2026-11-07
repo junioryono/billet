@@ -386,6 +386,10 @@ func (l *Listener) joinLaunches(ctx context.Context) {
 type exchanged struct {
 	msg *Message
 	err error
+	// at is when the poll returned, taken where it returned: with background launches
+	// the loop may consume the answer long after, inside a reconciliation, and an
+	// answer dated at its consumption would date an old count as current.
+	at time.Time
 	// beside is a failure of the reconciliation an ended launch woke while the poll
 	// was out, for the loop to treat as it treats its own reconciliation's. The
 	// answer in hand is not handled then, and GitHub delivers it again.
@@ -409,7 +413,7 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 	if !l.backgroundLaunches {
 		msg, err := l.timedPoll(ctx, l.session, l.lastMessageID, advertised)
 
-		return exchanged{msg: msg, err: err}
+		return exchanged{msg: msg, err: err, at: l.clock()}
 	}
 
 	var (
@@ -424,6 +428,7 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 		defer close(answered)
 
 		answer.msg, answer.err = l.timedPoll(ctx, session, lastMessageID, advertised)
+		answer.at = l.clock()
 	})
 
 	var beside error

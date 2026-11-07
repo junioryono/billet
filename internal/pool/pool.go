@@ -68,6 +68,7 @@ type Ledger interface {
 	PoolOrderGone(ctx context.Context, id string) error
 	CapacityReports(ctx context.Context) (map[string]alloc.TierCapacity, error)
 	PoolIdleHosts(ctx context.Context) ([]alloc.PoolIdleHost, error)
+	PoolServingHosts(ctx context.Context) (map[config.Arch]int, error)
 	ReleaseIdlePoolHost(ctx context.Context, order string, idleBefore time.Time, floor int, reason string) error
 }
 
@@ -239,7 +240,7 @@ func (p *Pool) Step(ctx context.Context) error {
 }
 
 // shrink asks for the release of the joined host idle longest on each architecture whose
-// joined hosts outnumber its floor, whose demand is known to be none, and with nothing
+// serving hosts (a node joined and registered, no release asked for) outnumber its floor, whose demand is known to be none, and with nothing
 // unknown and nothing on its way, when it has held nothing for IdleAfter. A host a tier
 // pins by name is never one: no host the pool orders could replace it. Nor is a host of a
 // source that does not confirm gone, whose released order would hold a place under the
@@ -249,6 +250,10 @@ func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, quiet map[c
 	idle, err := p.ledger.PoolIdleHosts(ctx)
 	if err != nil {
 		return fmt.Errorf("pool: read the idle hosts: %w", err)
+	}
+	serving, err := p.ledger.PoolServingHosts(ctx)
+	if err != nil {
+		return fmt.Errorf("pool: count the serving hosts: %w", err)
 	}
 	pinned := map[string]bool{}
 	for i := range p.cfg.Tiers {
@@ -265,7 +270,7 @@ func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, quiet map[c
 	var errs []error
 	for arch, a := range p.cfg.Archs {
 		c := count(orders, arch)
-		if c.unknown > 0 || c.onItsWay > 0 || !quiet[arch] || c.usable <= a.Floor {
+		if c.unknown > 0 || c.onItsWay > 0 || !quiet[arch] || serving[arch] <= a.Floor {
 			continue
 		}
 		var pick *alloc.PoolIdleHost
@@ -344,11 +349,9 @@ func (p *Pool) IdleAfter() time.Duration { return p.cfg.IdleAfter }
 
 // counts are an architecture's orders that hold or may hold a host (active), those
 // whose outcome is not known (unknown), those placed, not yet joined and not held for a
-// person (onItsWay), those whose host is being released (leaving), which are active
-// until the source says they are gone, and those a node joined from with no release asked
-// for (usable), the hosts that can take work now, which alone keep the floor a shrink
-// leaves.
-type counts struct{ active, unknown, onItsWay, leaving, usable int }
+// person (onItsWay), and those whose host is being released (leaving), which are active
+// until the source says they are gone.
+type counts struct{ active, unknown, onItsWay, leaving int }
 
 func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 	var c counts
@@ -366,9 +369,7 @@ func count(orders []alloc.PoolOrder, arch config.Arch) counts {
 			switch {
 			case !o.ReleaseRequested.IsZero():
 				c.leaving++
-			case o.NodeName != "":
-				c.usable++
-			case o.JoinHold == "":
+			case o.NodeName == "" && o.JoinHold == "":
 				// A HELD ORDER IS NOT ON ITS WAY: its host joins only once a person acts,
 				// and counting it would stop growth for demand until then.
 				c.onItsWay++

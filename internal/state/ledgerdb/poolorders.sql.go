@@ -106,21 +106,6 @@ func (q *Queries) CountPoolOrderAdmissions(ctx context.Context, arg CountPoolOrd
 	return column_1, err
 }
 
-const countPoolServingHosts = `-- name: CountPoolServingHosts :one
-SELECT CAST(COUNT(*) AS BIGINT) FROM pool_orders
- WHERE arch = $1 AND state = 'placed' AND release_requested_at = '' AND node_name != ''
-`
-
-// An architecture's joined hosts still serving: placed, a node joined, no release asked
-// for. The floor an automatic release must leave is counted from these, in the release's
-// own transaction, so a release a person asked for meanwhile is counted too.
-func (q *Queries) CountPoolServingHosts(ctx context.Context, arch string) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countPoolServingHosts, arch)
-	var column_1 int64
-	err := row.Scan(&column_1)
-	return column_1, err
-}
-
 const endPoolClearanceRun = `-- name: EndPoolClearanceRun :exec
 UPDATE pool_orders SET clear_since = '', clear_observed_at = ''
  WHERE order_id = $1 AND state = 'placed'
@@ -468,6 +453,47 @@ func (q *Queries) ListPoolOrders(ctx context.Context) ([]PoolOrder, error) {
 	return items, nil
 }
 
+const listPoolServingHosts = `-- name: ListPoolServingHosts :many
+SELECT p.arch, CAST(COUNT(*) AS BIGINT) AS hosts FROM pool_orders p
+ WHERE p.state = 'placed' AND p.release_requested_at = '' AND p.node_name != ''
+   AND EXISTS (SELECT 1 FROM nodes n WHERE n.name = p.node_name)
+ GROUP BY p.arch
+ ORDER BY p.arch
+`
+
+type ListPoolServingHostsRow struct {
+	Arch  string
+	Hosts int64
+}
+
+// Each architecture's hosts still serving: placed, a node joined from it and registered,
+// no release asked for. A node is linked to its order when its enrollment is approved,
+// before it registers, and a host whose node never registered serves nothing. The floor
+// an automatic release must leave is counted from these, by the scaler and again in the
+// release's own transaction, so a release a person asked for meanwhile is counted too.
+func (q *Queries) ListPoolServingHosts(ctx context.Context) ([]ListPoolServingHostsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPoolServingHosts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPoolServingHostsRow
+	for rows.Next() {
+		var i ListPoolServingHostsRow
+		if err := rows.Scan(&i.Arch, &i.Hosts); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markPoolOrderAbandoned = `-- name: MarkPoolOrderAbandoned :execrows
 UPDATE pool_orders SET state = 'abandoned', reason = $1, updated_at = $2
 WHERE order_id = $3 AND state = 'uncertain'
@@ -604,6 +630,7 @@ func (q *Queries) MarkUncertainPoolOrderFound(ctx context.Context, arg MarkUncer
 
 const readPoolIdleHost = `-- name: ReadPoolIdleHost :one
 SELECT p.order_id, p.node_name, p.arch,
+       CAST(CASE WHEN EXISTS (SELECT 1 FROM nodes n WHERE n.name = p.node_name) THEN 1 ELSE 0 END AS BIGINT) AS registered,
        CAST(COALESCE((SELECT MAX(h.finished_at) FROM job_history h WHERE h.node = p.node_name), '') AS TEXT) AS last_finished,
        CAST(COALESCE((SELECT MAX(e.decided_at) FROM node_enrollments e
                        WHERE e.name = p.node_name AND e.state = 'approved'), '') AS TEXT) AS joined
@@ -618,12 +645,14 @@ type ReadPoolIdleHostRow struct {
 	OrderID      string
 	NodeName     string
 	Arch         string
+	Registered   int64
 	LastFinished string
 	Joined       string
 }
 
 // One order's row of ListPoolIdleHosts, read again in the transaction that asks for its
-// release, so a host that took work since is not proposed.
+// release, so a host that took work since is not proposed, with whether its node has
+// registered, which decides whether its release takes a host from the floor.
 func (q *Queries) ReadPoolIdleHost(ctx context.Context, orderID string) (ReadPoolIdleHostRow, error) {
 	row := q.db.QueryRowContext(ctx, readPoolIdleHost, orderID)
 	var i ReadPoolIdleHostRow
@@ -631,6 +660,7 @@ func (q *Queries) ReadPoolIdleHost(ctx context.Context, orderID string) (ReadPoo
 		&i.OrderID,
 		&i.NodeName,
 		&i.Arch,
+		&i.Registered,
 		&i.LastFinished,
 		&i.Joined,
 	)

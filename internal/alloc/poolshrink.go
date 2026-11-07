@@ -91,17 +91,53 @@ func (a *Allocator) ReleaseIdlePoolHost(
 				idleBefore.UTC().Format(time.RFC3339))
 		}
 
-		serving, err := q.CountPoolServingHosts(ctx, row.Arch)
+		serving, err := servingHosts(ctx, q)
 		if err != nil {
-			return fmt.Errorf("alloc: count %s's serving pool hosts: %w", row.Arch, err)
+			return err
 		}
-		if serving-1 < int64(floor) {
+		// A HOST WHOSE NODE NEVER REGISTERED SERVES NOTHING, so its release leaves the
+		// floor as it was.
+		left := serving[config.Arch(row.Arch)]
+		if row.Registered == 1 {
+			left--
+		}
+		if left < floor {
 			return fmt.Errorf("%w: releasing pool order %s would leave %s %d serving host(s), below its floor of %d",
-				ErrPoolAtFloor, order, row.Arch, serving-1, floor)
+				ErrPoolAtFloor, order, row.Arch, left, floor)
 		}
 
 		return requestJoinedReleaseTx(ctx, q, order, row.NodeName, reason, a.now().UTC())
 	})
+}
+
+// PoolServingHosts counts each architecture's pool hosts that can take work: placed, a
+// node joined from it and registered, no release asked for. A host whose node was
+// admitted but never registered is not one, though its order names the node.
+func (a *Allocator) PoolServingHosts(ctx context.Context) (map[config.Arch]int, error) {
+	var out map[config.Arch]int
+
+	err := a.db.View(ctx, func(q querier) error {
+		var err error
+		out, err = servingHosts(ctx, state.ReadQueries(q))
+
+		return err
+	})
+
+	return out, err
+}
+
+func servingHosts(ctx context.Context, q state.ReadOps) (map[config.Arch]int, error) {
+	rows, err := q.ListPoolServingHosts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("alloc: count the serving pool hosts: %w", err)
+	}
+
+	out := make(map[config.Arch]int, len(rows))
+	for _, r := range rows {
+		out[config.Arch(r.Arch)] = int(r.Hosts)
+	}
+
+	return out, nil
 }
 
 // idleSince is the later of a host's newest job's end and its node's admission, and
