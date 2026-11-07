@@ -426,12 +426,21 @@ func readAcceptanceJobs(ctx context.Context, ws acceptanceWorkspace) ([]acceptan
 // re-run, so its ledger may already hold finished jobs — and counting those let a
 // second `run --jobs 1` succeed on its first poll with no workflow having reached
 // the deployment at all.
+//
+// AND ONLY A JOB GITHUB GAVE IT: a lease whose runner started and was never assigned one
+// (a pool slot GitHub had no job for) ends with nothing of GitHub's on it, no run that
+// bought it, none that started on it and no result, and counting it ended a run of the
+// matrix two jobs early, with the last writers still waiting (run 42386061079,
+// 2026-11-07).
 func newTerminalJobs(jobs []acceptanceJob, baseline map[string]bool) []acceptanceJob {
 	var out []acceptanceJob
 
 	for i := range jobs {
-		if jobs[i].Billet != "" && !baseline[jobs[i].LeaseID] {
-			out = append(out, jobs[i])
+		j := &jobs[i]
+		ranAJob := j.RunID != 0 || j.GitHubRunID != 0 || j.GitHub != ""
+
+		if j.Billet != "" && ranAJob && !baseline[j.LeaseID] {
+			out = append(out, *j)
 		}
 	}
 

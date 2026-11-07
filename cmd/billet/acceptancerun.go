@@ -490,7 +490,10 @@ func waitForAcceptanceJobs(ctx context.Context, env cli.Env, ws acceptanceWorksp
 	ticker := time.NewTicker(acceptancePoll)
 	defer ticker.Stop()
 
-	reported := 0
+	// BY LEASE, NOT BY POSITION: the history is read again at every poll and its order
+	// can move, so printing from the count already printed listed some jobs twice and
+	// others never (run 42386061079, 2026-11-07).
+	reported := map[string]bool{}
 
 	for {
 		jobs, err := readAcceptanceJobs(ctx, ws)
@@ -499,14 +502,15 @@ func waitForAcceptanceJobs(ctx context.Context, env cli.Env, ws acceptanceWorksp
 		}
 
 		terminal := newTerminalJobs(jobs, baseline)
-		if len(terminal) > reported {
-			for i := range terminal[reported:] {
-				j := &terminal[reported+i]
-				fmt.Fprintf(env.Stdout, "  %s  tier=%s run=%d github=%q billet=%q\n",
-					j.LeaseID, j.Tier, j.RunID, j.GitHub, j.Billet)
+		for i := range terminal {
+			j := &terminal[i]
+			if reported[j.LeaseID] {
+				continue
 			}
 
-			reported = len(terminal)
+			reported[j.LeaseID] = true
+			fmt.Fprintf(env.Stdout, "  %s  tier=%s run=%d github=%q billet=%q\n",
+				j.LeaseID, j.Tier, j.RunID, j.GitHub, j.Billet)
 		}
 
 		if len(terminal) >= opts.jobs {

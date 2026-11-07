@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -171,7 +172,70 @@ type matrixWorkflowJob struct {
 	Steps    []struct {
 		Uses string            `yaml:"uses"`
 		With map[string]string `yaml:"with"`
+		Run  string            `yaml:"run"`
 	} `yaml:"steps"`
+}
+
+// EACH ARCHITECTURE FETCHES ITS OWN, AND ITS WARM JOB THE SAME AGAIN: one node serves
+// both architectures' tiers and keeps one Git mirror and one registry cache, so with a
+// package or a repository in common the second architecture's cold job read warm (run
+// 42386061079, 2026-11-07). The npm job's script is executed for each architecture
+// against a fake npm, and the git job's checkout names its repository by architecture.
+func TestEachArchitectureFetchesItsOwnSharedCacheContent(t *testing.T) {
+	t.Parallel()
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "npm"),
+		[]byte("#!/bin/sh\n[ \"$1\" = install ] && echo \"$@\" > \"$NPM_ASKED\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installs := func(file, arch string) string {
+		t.Helper()
+		var script string
+		for _, s := range matrixWorkflowJobs(t, file)["npm"].Steps {
+			if s.Run != "" {
+				script = s.Run
+			}
+		}
+		asked := filepath.Join(t.TempDir(), "asked")
+		cmd := exec.CommandContext(t.Context(), "bash", "-c", script)
+		cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"RUNNER_ARCH="+arch, "NPM_ASKED="+asked)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s's npm job on %s: %v\n%s", file, arch, err, out)
+		}
+		got, err := os.ReadFile(asked)
+		if err != nil {
+			t.Fatalf("%s's npm job on %s installed nothing: %v", file, arch, err)
+		}
+
+		return strings.Fields(string(got))[len(strings.Fields(string(got)))-1]
+	}
+	for _, arch := range []string{"X64", "ARM64"} {
+		if cold, warm := installs("matrix-cold.yml", arch), installs("matrix-warm.yml", arch); cold != warm {
+			t.Errorf("on %s the cold job installs %s and the warm job %s", arch, cold, warm)
+		}
+	}
+	if x, arm := installs("matrix-cold.yml", "X64"), installs("matrix-cold.yml", "ARM64"); x == arm ||
+		strings.Split(x, "@")[0] == strings.Split(arm, "@")[0] {
+		t.Errorf("both architectures install from one package (%s, %s); its metadata would be shared", x, arm)
+	}
+
+	repo := func(file string) string {
+		t.Helper()
+		for _, s := range matrixWorkflowJobs(t, file)["git"].Steps {
+			if strings.HasPrefix(s.Uses, "actions/checkout@") {
+				return s.With["repository"]
+			}
+		}
+		t.Fatalf("%s's git job checks nothing out", file)
+
+		return ""
+	}
+	cold, warm := repo("matrix-cold.yml"), repo("matrix-warm.yml")
+	if cold != warm || !strings.Contains(cold, "runner.arch == 'ARM64'") || !strings.Contains(cold, "github.repository") {
+		t.Errorf("the git jobs check out %q (cold) and %q (warm); want one repository per architecture, "+
+			"the same in both", cold, warm)
+	}
 }
 
 // EVERY CACHE KEY A MATRIX JOB NAMES CARRIES ITS TIER AND ITS RUN'S TAG: the matrix
