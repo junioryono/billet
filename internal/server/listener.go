@@ -319,6 +319,9 @@ type Listener struct {
 	waitingFor  int
 	demandKnown bool
 	demandAt    time.Time
+	// answeredAt is when GitHub last answered this tier's poll, with a message or with
+	// none. Guarded by mu; reported, never scheduled on.
+	answeredAt time.Time
 	// demandReleases is the tier's release generation read with the runner
 	// count waitingFor was made from (alloc.ActiveRunnersAt).
 	demandReleases int64
@@ -1078,6 +1081,13 @@ func (l *Listener) Run(ctx context.Context) error {
 		if err == nil || errors.Is(err, ErrNoMessage) {
 			polled++
 			l.sessionFailures = 0
+
+			// GITHUB ANSWERED, with a message or with none, so the statistics in hand are
+			// as current as its session: what a pool reads before it shrinks, where a
+			// report republished from a stalled poll would read as fresh by its own date.
+			l.mu.Lock()
+			l.answeredAt = l.clock()
+			l.mu.Unlock()
 
 			// AN EMPTY EXCHANGE SENT WITH THE ADVERTISEMENT WITHDRAWN VOUCHES FOR
 			// THE STATISTICS IN HAND: GitHub assigns nothing past committed work

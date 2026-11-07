@@ -246,3 +246,52 @@ func TestAReplacedSessionDoesNotKeepTheOldDate(t *testing.T) {
 			"(%d at %q)", *afterReopen.Unstarted, afterReopen.UnstartedAt)
 	}
 }
+
+// AN ANSWERED POLL DATES THE REPORT WITH GITHUB'S ANSWER, which the pool reads before it
+// shrinks: a report republished from a stalled poll is stamped now, and only AnsweredAt
+// says when GitHub last answered. Before any poll is answered it is absent.
+func TestAnAnsweredPollDatesTheReport(t *testing.T) {
+	t.Parallel()
+
+	a, label, published, _ := workTier(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	var polls atomic.Int32
+
+	var beforeAnswer alloc.ListenerCapacity
+
+	session := &fakeSession{stats: &Statistics{}, onPoll: func(int) {
+		if polls.Add(1) >= 3 {
+			cancel()
+		}
+	}, onGet: func() (*Message, error) {
+		if polls.Load() == 1 {
+			beforeAnswer = published()
+		}
+
+		return nil, ErrNoMessage
+	}}
+
+	start := time.Now()
+
+	l := NewListener(a, label, session, WithLogger(slog.New(slog.DiscardHandler)),
+		WithRunner(&fakeRunner{}), WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if beforeAnswer.AnsweredAt != "" {
+		t.Errorf("a report published before any poll was answered says GitHub answered at %s", beforeAnswer.AnsweredAt)
+	}
+
+	answered, err := time.Parse(time.RFC3339Nano, published().AnsweredAt)
+	if err != nil {
+		t.Fatalf("an answered poll left no readable AnsweredAt: %v", err)
+	}
+
+	if answered.Before(start.Add(-time.Second)) || answered.After(time.Now().Add(time.Second)) {
+		t.Errorf("AnsweredAt %v is not when the poll was answered (between %v and now)", answered, start)
+	}
+}

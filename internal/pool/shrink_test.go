@@ -38,13 +38,24 @@ func shrinkRig(t *testing.T, policy Policy, ages map[string]time.Duration) *rig 
 	return r
 }
 
-// reportQuiet sets a tier's fresh report with its unstarted work counted.
+// reportQuiet sets a tier's fresh report with its unstarted work counted and its poll
+// answered by GitHub now.
 func (r *rig) reportQuiet(label string, unstarted int) {
+	r.reportAnswered(label, unstarted, 0)
+}
+
+// reportAnswered sets a tier's fresh report with its unstarted work counted and its poll
+// last answered age ago; a negative age is a report with no answer recorded.
+func (r *rig) reportAnswered(label string, unstarted int, age time.Duration) {
 	r.ledger.mu.Lock()
 	defer r.ledger.mu.Unlock()
+	answered := ""
+	if age >= 0 {
+		answered = r.now.Add(-age).UTC().Format(time.RFC3339Nano)
+	}
 	r.ledger.reports[label] = alloc.TierCapacity{
 		ObservedAt: r.now.UTC().Format(time.RFC3339Nano),
-		Listener:   alloc.ListenerCapacity{Unstarted: &unstarted},
+		Listener:   alloc.ListenerCapacity{Unstarted: &unstarted, AnsweredAt: answered},
 	}
 }
 
@@ -130,6 +141,25 @@ func TestThePoolKeepsItsHostsWhenItMayNotShrink(t *testing.T) {
 			r.pool.cfg.Tiers = append(r.pool.cfg.Tiers, pin, pinB)
 		}},
 		"a source that never says gone": {setup: func(r *rig) { r.first.confirmsGone = false }},
+		"a count republished from a poll GitHub stopped answering": {setup: func(r *rig) {
+			r.reportAnswered("fc", 0, DefaultDemandFreshness+time.Second)
+		}},
+		"a count with no answer recorded": {setup: func(r *rig) { r.reportAnswered("fc", 0, -1) }},
+		"a tier of no architecture with work": {setup: func(r *rig) {
+			anyArch := firecrackerTier("any")
+			anyArch.Arch = ""
+			r.pool.cfg.Tiers = append(r.pool.cfg.Tiers, anyArch)
+			r.reportQuiet("any", 2)
+		}},
+		"a tier of no architecture unreported": {setup: func(r *rig) {
+			anyArch := firecrackerTier("any")
+			anyArch.Arch = ""
+			r.pool.cfg.Tiers = append(r.pool.cfg.Tiers, anyArch)
+		}},
+		"a source now ordering elsewhere": {setup: func(r *rig) { r.first.scope = "first:another-account" }},
+		"a source whose scope cannot be read": {setup: func(r *rig) {
+			r.first.scopeErr = errors.New("the credentials expired")
+		}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -154,6 +184,21 @@ func (r *rig) place(id, state, node string) {
 	r.ledger.orders = append(r.ledger.orders, alloc.PoolOrder{ID: id, Source: "first", Scope: "first:us-west-2",
 		Shape: "z1d.metal", Arch: config.ArchX64, State: state, HostID: "host-" + id, NodeName: node,
 		FirstAttempt: r.now, Updated: r.now})
+}
+
+// A QUIET TIER OF NO ARCHITECTURE KEEPS NOTHING: it may be placed on any host, so it is
+// asked, and having counted no work it lets the pool shrink.
+func TestAQuietTierOfNoArchitectureLetsThePoolShrink(t *testing.T) {
+	t.Parallel()
+	r := shrinkRig(t, Policy{Floor: 0, Max: 4}, map[string]time.Duration{"o-a": time.Hour})
+	anyArch := firecrackerTier("any")
+	anyArch.Arch = ""
+	r.pool.cfg.Tiers = append(r.pool.cfg.Tiers, anyArch)
+	r.reportQuiet("any", 0)
+	step(t, r)
+	if got := asked(r); !slices.Equal(got, []string{"o-a"}) {
+		t.Fatalf("asked %v, want o-a", got)
+	}
 }
 
 // ONE ARCHITECTURE'S SHRINK NEVER TAKES ANOTHER'S HOST: an arm64 host idle longer than
