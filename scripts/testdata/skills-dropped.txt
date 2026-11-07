@@ -207,3 +207,4 @@ c98615d09bc8 ADR-024 serves `actions/cache` on EC2 tiers too; the sentence now s
 40d9aac87d10 ADR-029 (#541): `actions: write` is in billet's set where a tier sets retry.disrupted, so the rule now says what widening it is never the answer to.
 d340aa161466 ADR-029 (#541): a tier can now ask for a re-run, on GitHub's proof of a lost runner; the invariant says so, and the default stays never.
 381a102332db #779: RunInstances is now split by resource type (AWS evaluates a launch per resource ARN), so the claim that it cannot be narrowed is wrong; the sentence now says the snapshot stays among the unconditioned types, and the next rule states the split.
+51982af1d975 #799: eviction no longer reclaims a chain over passes; one pass alternates the purge, outside the cache lock, with rounds of generations under it, so the sentence now says that.

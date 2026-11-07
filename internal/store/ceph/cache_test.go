@@ -2111,16 +2111,14 @@ func TestEvictionReclaimsTheRetiredWriterAfterItsGeneration(t *testing.T) {
 	if f.images[candidate.Handle] {
 		t.Fatal("eviction kept the expired generation")
 	}
-	// EVICTION NEVER DELETES FROM THE TRASH: it holds the lock every writer waits
-	// on, and a discarded volume takes minutes to delete. The purge does it.
-	if len(f.trash) != 1 {
-		t.Fatalf("eviction deleted from the trash under the cache lock: %d left", len(f.trash))
-	}
-	if _, err := c.PurgeTrash(t.Context()); err != nil {
-		t.Fatalf("PurgeTrash: %v", err)
-	}
+	// THE WRITER GOES IN THE SAME PASS, by the purge between eviction's rounds, and
+	// never under the lock every writer waits on: a discarded volume takes minutes
+	// to delete.
 	if len(f.trash) != 0 {
-		t.Fatalf("the purge left %d retired writers after their children were removed", len(f.trash))
+		t.Fatalf("the pass left %d retired writers after their children were removed", len(f.trash))
+	}
+	if call := trashDeletedUnderLock(f); call != "" {
+		t.Fatalf("eviction ran %q under the cache lock", call)
 	}
 }
 

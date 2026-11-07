@@ -2,12 +2,15 @@ package ceph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 // evictingClient is cacheClient with a runner of the test's own in front of the
@@ -38,10 +41,30 @@ func (f *cacheFake) callIndex(fragments ...string) int {
 	})
 }
 
+// trashDeletedUnderLock reports the first `trash rm` the fake ran while the cache
+// lock was held, or "".
+func trashDeletedUnderLock(f *cacheFake) string {
+	locked := false
+
+	for _, call := range f.calls {
+		switch {
+		case slices.Contains(call, "lock") && slices.Contains(call, "add"):
+			locked = true
+		case slices.Contains(call, "lock") && slices.Contains(call, "rm"):
+			locked = false
+		case locked && slices.Contains(call, "trash") && slices.Contains(call, "rm"):
+			return strings.Join(call, " ")
+		}
+	}
+
+	return ""
+}
+
 // AN EXPIRED WRITABLE VOLUME GOES TO THE TRASH, AFTER THE LOCK, AND A GENERATION
 // IS REMOVED WITH `rbd rm`. The volume's `rbd rm` was cut short by the command's
 // bound under the lock every writer waits on; `rbd trash mv` is metadata only and
-// the purge deletes the data. Eviction still never deletes from the trash.
+// the purge deletes the data. Eviction deletes from the trash only between its
+// rounds, with the lock released.
 func TestEvictionTrashesAnExpiredVolumeAndRemovesAGenerationWithRm(t *testing.T) {
 	t.Parallel()
 
@@ -74,12 +97,16 @@ func TestEvictionTrashesAnExpiredVolumeAndRemovesAGenerationWithRm(t *testing.T)
 		t.Errorf("the expired generation was not removed with rbd rm")
 	}
 
-	if _, ok := f.trash["id-discarded"]; !ok || f.ranWith("trash", "rm") {
-		t.Error("eviction deleted from the trash")
+	if _, ok := f.trash["id-discarded"]; ok || !f.ranWith("trash", "rm") {
+		t.Error("eviction's purge between rounds left the discard in the trash")
 	}
 
-	if n, err := c.PurgeTrash(t.Context()); err != nil || n != 2 || len(f.trash) != 0 {
-		t.Errorf("PurgeTrash = %d, %v, trash %v; want the evicted volume and the discard deleted",
+	if call := trashDeletedUnderLock(f); call != "" {
+		t.Errorf("eviction ran %q under the cache lock", call)
+	}
+
+	if n, err := c.PurgeTrash(t.Context()); err != nil || n != 1 || len(f.trash) != 0 {
+		t.Errorf("PurgeTrash = %d, %v, trash %v; want the volume eviction moved there deleted",
 			n, err, f.trash)
 	}
 
@@ -400,5 +427,177 @@ func TestEvictionReportsABoundedNumberOfFailures(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "1 generation(s) from cache-g-") {
 		t.Errorf("Evict = %v, want the generation left for the next pass named", err)
+	}
+}
+
+// setIndexRecord writes one pointer or generation record into the cache index.
+func setIndexRecord(t *testing.T, f *cacheFake, c *Client, metadataKey string, record cachePointer) {
+	t.Helper()
+
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("encode %s: %v", metadataKey, err)
+	}
+	if f.metadata[c.cacheIndex()] == nil {
+		f.metadata[c.cacheIndex()] = map[string]string{}
+	}
+	f.metadata[c.cacheIndex()][metadataKey] = string(encoded)
+}
+
+// A SUPERSEDED GENERATION GOES supersededGrace AFTER ITS LAST USE, NOT THE KEY'S
+// RETENTION (#799), and only on a positive reading: its record names its key and
+// that key's pointer names another generation. Everything else, used two hours ago,
+// is kept for the retention: a key's current generation, one a job holds, one with
+// no record and one whose record names no key.
+func TestASupersededGenerationLeavesAfterItsGraceNotItsRetention(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	twoHours := now.Add(-2 * time.Hour)
+	f := newCacheFake()
+	c := evictingClient(t, f, f.run)
+	f.freshVolume(now)
+
+	const key, other = "acme/api/go", "acme/api/docker"
+	current := expiredGeneration(twoHours, 'a')
+	superseded := expiredGeneration(twoHours, 'b')
+	recent := expiredGeneration(twoHours, 'c')
+	held := expiredGeneration(twoHours, 'd')
+	otherCurrent := expiredGeneration(twoHours, 'e')
+	unrecorded := expiredGeneration(twoHours, 'f')
+	keyless := expiredGeneration(twoHours, '0')
+	pointerless := expiredGeneration(twoHours, '1')
+
+	used := map[string]time.Time{
+		current: now, superseded: twoHours, recent: now.Add(-supersededGrace / 2), held: twoHours,
+		otherCurrent: twoHours, unrecorded: twoHours, keyless: twoHours, pointerless: twoHours,
+	}
+	for handle, at := range used {
+		f.addVolume(handle)
+		f.metadata[handle] = map[string]string{cacheMetaPrefix + "used_at": at.Format(time.RFC3339Nano)}
+	}
+
+	record := func(k, handle string, usedAt time.Time) cachePointer {
+		return cachePointer{Key: k, Generation: "gen-" + handle, Handle: handle, UsedAt: usedAt,
+			RetentionHours: 7 * 24}
+	}
+	setIndexRecord(t, f, c, pointerKey(key), record(key, current, now))
+	setIndexRecord(t, f, c, pointerKey(other), record(other, otherCurrent, twoHours))
+	for _, handle := range []string{current, superseded, recent, held} {
+		setIndexRecord(t, f, c, generationKey(key, "gen-"+handle), record(key, handle, used[handle]))
+	}
+	setIndexRecord(t, f, c, generationKey(other, "gen-"+otherCurrent), record(other, otherCurrent, twoHours))
+	setIndexRecord(t, f, c, generationKey(key, "gen-"+keyless), record("", keyless, twoHours))
+	setIndexRecord(t, f, c, generationKey("acme/api/gone", "gen-"+pointerless),
+		record("acme/api/gone", pointerless, twoHours))
+
+	active, err := json.Marshal(cacheActive{Key: key, Handle: held, Generation: "gen-" + held,
+		Expires: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatalf("encode active record: %v", err)
+	}
+	f.metadata[c.cacheIndex()][activeKey("lease-1")] = string(active)
+
+	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	if f.images[superseded] {
+		t.Error("eviction kept a superseded generation unused for longer than its grace")
+	}
+	if _, ok := f.metadata[c.cacheIndex()][generationKey(key, "gen-"+superseded)]; ok {
+		t.Error("eviction left the removed generation's record")
+	}
+
+	for handle, why := range map[string]string{
+		current:      "the key's current generation",
+		recent:       "a superseded generation used inside its grace",
+		held:         "a superseded generation a job's active record names",
+		otherCurrent: "another key's current generation, inside its retention",
+		unrecorded:   "a generation no record names",
+		keyless:      "a generation whose record names no key",
+		pointerless:  "a generation whose key has no pointer",
+	} {
+		if !f.images[handle] || f.ranWith("rm", handle) {
+			t.Errorf("eviction removed %s (%s)", why, handle)
+		}
+	}
+}
+
+// ONE PASS UNWINDS A LINEAGE A COMPACTION CUT OFF. Each generation is parented
+// through the writer it was published from, so the history behind a compacted
+// current generation leaves a writer and a generation at a time, and the pass
+// alternates the purge and a round of eviction until a round removes nothing,
+// never deleting from the trash under the cache lock.
+func TestOnePassUnwindsALineageACompactionCutOff(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	now := time.Now().UTC()
+	key := "acme/api/go"
+	var previous string
+	var generations []storecontract.Candidate
+
+	for i := range 5 {
+		var volume storecontract.Volume
+		var err error
+		if i == 0 {
+			volume, err = c.Create(t.Context(), key, 1<<30)
+		} else {
+			volume, err = c.Clone(t.Context(), key, "")
+		}
+		if err != nil {
+			t.Fatalf("generation %d volume: %v", i+1, err)
+		}
+
+		commitTime := now.Add(time.Duration(i) * time.Second)
+		lease, fence, err := c.acquireWriterAt(t.Context(), key, fmt.Sprintf("lease-%d", i+1), time.Minute,
+			commitTime)
+		if err != nil {
+			t.Fatalf("generation %d AcquireWriter: %v", i+1, err)
+		}
+		candidate, err := c.snapshotAt(t.Context(), volume, commitTime)
+		if err != nil {
+			t.Fatalf("generation %d Snapshot: %v", i+1, err)
+		}
+		if err := c.publishCASAt(t.Context(), key, previous, candidate, lease, fence, commitTime); err != nil {
+			t.Fatalf("generation %d PublishCAS: %v", i+1, err)
+		}
+		generations = append(generations, candidate)
+		previous = candidate.Generation
+	}
+
+	current := generations[len(generations)-1]
+	if parent := f.parents[current.Handle]; parent != "" {
+		t.Fatalf("the current generation was not compacted: it still has parent %q", parent)
+	}
+	if len(f.trash) != len(generations) {
+		t.Fatalf("the trash holds %d retired writers, want %d", len(f.trash), len(generations))
+	}
+
+	// TWO HOURS: past the grace and far inside the retention.
+	for _, candidate := range generations[:len(generations)-1] {
+		f.metadata[candidate.Handle][cacheMetaPrefix+"used_at"] = now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	}
+
+	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	if !f.images[current.Handle] {
+		t.Fatal("eviction removed the key's current generation")
+	}
+	for _, candidate := range generations[:len(generations)-1] {
+		if f.images[candidate.Handle] {
+			t.Errorf("one pass kept superseded ancestor %s behind a compacted current generation",
+				candidate.Handle)
+		}
+	}
+	if len(f.trash) != 0 {
+		t.Errorf("one pass left retired writers behind a compacted current generation: %v", f.trash)
+	}
+	if call := trashDeletedUnderLock(f); call != "" {
+		t.Errorf("eviction ran %q under the cache lock", call)
 	}
 }
