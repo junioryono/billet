@@ -544,7 +544,22 @@ func TestApprovingAPoolRequestLinksItsOrder(t *testing.T) {
 	}
 	closeDB()
 
+	// AN APPROVAL THE LEDGER REFUSES RECORDS NO CERTIFICATE, so it leaves no trace that a
+	// node was admitted from the order.
 	env, out := poolEnv()
+	if err := Nodes(ctx, env, []string{"approve", "--config", cfgPath, "--fingerprint", "SHA256:" + strings.Repeat("x", 43),
+		alloc.PoolNodeName("pa")}); err == nil {
+		t.Fatalf("an approval naming another fingerprint was taken\n%s", out)
+	}
+	a, closeDB, err = ControlPlaneAllocator(ctx, cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if certs, err := a.LiveCertsFor(ctx, alloc.PoolNodeName("pa")); err != nil || len(certs) != 0 {
+		t.Fatalf("a refused approval recorded %+v, %v", certs, err)
+	}
+	closeDB()
+
 	if err := Nodes(ctx, env, []string{"approve", "--config", cfgPath, "--fingerprint", fp, alloc.PoolNodeName("pa")}); err != nil {
 		t.Fatalf("approve: %v\n%s", err, out)
 	}

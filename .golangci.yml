@@ -409,6 +409,17 @@ linters:
           allow:
             - $gostd
 
+        # THE RELEASE PROOF IS A LEAF. The ledger builds it in the transaction that
+        # seals a pool host and a host source requires it, and neither may import the
+        # other (ledgerwriters refuses hostsource to alloc), so it imports nothing
+        # either does: the standard library only.
+        releaseproof:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/releaseproof/**"
+          allow:
+            - $gostd
+
         # THE ENDING RECORD IS A LEAF. The node writes it and every command that
         # stops or starts a node judges it, so whatever it imported the node and
         # those commands would import. The standard library and the two file

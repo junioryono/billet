@@ -147,6 +147,9 @@ var (
 	// plane starts — so a claim that lapsed with liveness would let a differently
 	// named node advertise a fleet's whole capacity on top of live work.
 	ErrFleetHeld = errors.New("alloc: that fleet's shared capacity is already claimed")
+	// ErrPoolHostReleased means a node registered under a pool order whose host is sealed,
+	// released or gone (ADR-030). Nothing on the node resolves it, so it is a refusal.
+	ErrPoolHostReleased = errors.New("alloc: that pool host was released")
 )
 
 // Limits is the global ceiling the allocator escrows against.
@@ -2741,6 +2744,18 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 					"on-demand compute by removing node.codebuild.fleet_arn",
 					ErrFleetHeld, name, fleet, holder, holder)
 			}
+		}
+
+		// EXCEPT A POOL HOST BEING TAKEN BACK (ADR-030): a seal or a person's forced close
+		// excluded it, and a registration authenticated before that committed would
+		// otherwise clear the exclusion below and be expected by every later drain.
+		// Inside the transaction, so the two are ordered by the ledger.
+		switch released, err := q.PoolHostReleased(ctx, name); {
+		case err != nil:
+			return fmt.Errorf("alloc: read whether node %s's pool host was released: %w", name, err)
+		case released:
+			return fmt.Errorf("%w: node %s's pool order is sealed, released or gone, so its host is being "+
+				"taken back or was; `billet pool` shows it", ErrPoolHostReleased, name)
 		}
 
 		// A HOST THAT COMES BACK IS A MEMBER AGAIN, and the statement is what says

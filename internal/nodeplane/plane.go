@@ -1268,7 +1268,7 @@ func (p *Plane) register(
 		// the database answers — and a node that treated it as permanent would stay
 		// down after the control plane recovered.
 		switch {
-		case errors.Is(err, alloc.ErrFleetHeld):
+		case errors.Is(err, alloc.ErrFleetHeld), errors.Is(err, alloc.ErrPoolHostReleased):
 			return nodeapi.RegisterResponse{}, fmt.Errorf("%w: %w", ErrRefused, err)
 
 		case err != nil:

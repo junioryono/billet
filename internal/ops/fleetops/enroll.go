@@ -302,7 +302,10 @@ func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision st
 
 	defer closeDB()
 
-	certPEM, serial := "", ""
+	var (
+		certPEM string
+		issued  alloc.IssuedCert
+	)
 
 	if decision == alloc.EnrollApproved {
 		deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
@@ -340,17 +343,24 @@ func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision st
 			return err
 		}
 
-		// RECORDED BEFORE IT IS HANDED OVER. Revocation names a serial, so a
-		// credential billet never wrote down cannot be taken back — and this is
-		// the first of the three ways one comes into existence.
-		if serial, err = recordIssuedCert(ctx, a, bundle, name, alloc.CertEnrolled); err != nil {
+		// RECORDED BEFORE IT IS HANDED OVER, and in the approval's own transaction.
+		// Revocation names a serial, so a credential billet never wrote down cannot be
+		// taken back; and an approval the ledger refuses records none, so a refused
+		// one leaves no trace that a node was admitted.
+		if issued, err = issuedCert(bundle, name, alloc.CertEnrolled); err != nil {
 			return err
 		}
 
 		certPEM = string(bundle.CertPEM)
 	}
 
-	if err := a.DecideEnrollment(ctx, name, *fingerprint, decision, certPEM, serial); err != nil {
+	if decision == alloc.EnrollApproved {
+		err = a.ApproveEnrollment(ctx, name, *fingerprint, certPEM, issued)
+	} else {
+		err = a.DecideEnrollment(ctx, name, *fingerprint, decision, "", "")
+	}
+
+	if err != nil {
 		return err
 	}
 
@@ -435,19 +445,27 @@ func backfillIssuedCerts(ctx context.Context, env cli.Env, a *alloc.Allocator) e
 func recordIssuedCert(
 	ctx context.Context, a *alloc.Allocator, bundle wirecert.Bundle, node, source string,
 ) (string, error) {
-	leaf, err := wirecert.LeafOf(bundle)
+	c, err := issuedCert(bundle, node, source)
 	if err != nil {
-		return "", fmt.Errorf("read back the certificate just issued to %s: %w", node, err)
+		return "", err
 	}
 
-	serial := wirecert.Serial(leaf)
+	return c.Serial, a.RecordIssuedCert(ctx, c)
+}
 
-	return serial, a.RecordIssuedCert(ctx, alloc.IssuedCert{
-		Serial:   serial,
+// issuedCert is the record of a certificate just issued to node.
+func issuedCert(bundle wirecert.Bundle, node, source string) (alloc.IssuedCert, error) {
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		return alloc.IssuedCert{}, fmt.Errorf("read back the certificate just issued to %s: %w", node, err)
+	}
+
+	return alloc.IssuedCert{
+		Serial:   wirecert.Serial(leaf),
 		Node:     node,
 		Source:   source,
 		NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
-	})
+	}, nil
 }
 
 // controlPlaneAllocator is app.OpenOperator's allocator, for a command that

@@ -1041,3 +1041,20 @@ func TestCAIssueHonoursALifetime(t *testing.T) {
 		}
 	}
 }
+
+// A POOL'S NAME IS NOT ISSUED BY HAND: its node joins through its order, which the
+// release seals, and a certificate issued past the order would admit it anyway.
+func TestCAIssueRefusesAPoolName(t *testing.T) {
+	t.Parallel()
+
+	cfg := writeCAConfig(t, t.TempDir())
+	out := filepath.Join(t.TempDir(), "bundle")
+
+	err := CAIssue(t.Context(), processEnv(), []string{"--config", cfg, "--out", out, "pool-p1"})
+	if err == nil || !strings.Contains(err.Error(), "reserved for the hosts a pool orders") {
+		t.Fatalf("issuing a pool name answered %v", err)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("a refused issue wrote %s (%v)", out, err)
+	}
+}

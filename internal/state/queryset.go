@@ -62,7 +62,7 @@ var errReadOnlyHandle = errors.New(
 // TestReadOpsHoldsExactlyTheQueriesThatOnlyRead rather than by review.
 type ReadOps interface {
 	AnyBarrierRunExists(ctx context.Context) (bool, error)
-	BarrierRunExists(ctx context.Context, node string) (bool, error)
+	ArrivalHasProof(ctx context.Context, node string) (bool, error)
 	CertRevocation(ctx context.Context, serial string) (int64, error)
 	CountActiveRunnerLeases(ctx context.Context, tier string) (int64, error)
 	CountActiveRunnersAt(ctx context.Context, tier string) (ledgerdb.CountActiveRunnersAtRow, error)
@@ -162,6 +162,10 @@ type ReadOps interface {
 	ReadEnrollmentFingerprint(ctx context.Context, name string) (string, error)
 	ReadJoinTokenOrder(ctx context.Context, arg ledgerdb.ReadJoinTokenOrderParams) (ledgerdb.ReadJoinTokenOrderRow, error)
 	ReadPoolOrder(ctx context.Context, orderID string) (ledgerdb.PoolOrder, error)
+	CountPoolOrderAdmissions(ctx context.Context, arg ledgerdb.CountPoolOrderAdmissionsParams) (int64, error)
+	ReadNodeReleaseFacts(ctx context.Context, name string) (ledgerdb.ReadNodeReleaseFactsRow, error)
+	PoolHostReleased(ctx context.Context, name string) (bool, error)
+	CountNodeHoldings(ctx context.Context, node string) (ledgerdb.CountNodeHoldingsRow, error)
 	ReadJobConclusion(ctx context.Context, leaseID string) (sql.NullString, error)
 	ReadJobFailureReason(ctx context.Context, leaseID string) (string, error)
 	ReadJobNode(ctx context.Context, leaseID string) (sql.NullString, error)
@@ -307,6 +311,12 @@ type WriteOps interface {
 	MarkPoolOrderPlaced(ctx context.Context, arg ledgerdb.MarkPoolOrderPlacedParams) (int64, error)
 	MarkPoolOrderUncertain(ctx context.Context, arg ledgerdb.MarkPoolOrderUncertainParams) (int64, error)
 	MarkUncertainPoolOrderFound(ctx context.Context, arg ledgerdb.MarkUncertainPoolOrderFoundParams) (int64, error)
+	RequestPoolOrderRelease(ctx context.Context, arg ledgerdb.RequestPoolOrderReleaseParams) (int64, error)
+	ClosePoolOrder(ctx context.Context, arg ledgerdb.ClosePoolOrderParams) (int64, error)
+	SealPoolOrder(ctx context.Context, arg ledgerdb.SealPoolOrderParams) (int64, error)
+	MarkPoolOrderReleased(ctx context.Context, arg ledgerdb.MarkPoolOrderReleasedParams) (int64, error)
+	MarkPoolOrderGone(ctx context.Context, arg ledgerdb.MarkPoolOrderGoneParams) (int64, error)
+	MarkNodeDrainedForRelease(ctx context.Context, name string) error
 	MarkPoolOrderRefused(ctx context.Context, arg ledgerdb.MarkPoolOrderRefusedParams) (int64, error)
 	MarkPoolOrderAbandoned(ctx context.Context, arg ledgerdb.MarkPoolOrderAbandonedParams) (int64, error)
 	LinkPoolOrderNode(ctx context.Context, arg ledgerdb.LinkPoolOrderNodeParams) (int64, error)
@@ -393,6 +403,9 @@ type WriteOps interface {
 	UpsertComputeBarrier(ctx context.Context, arg ledgerdb.UpsertComputeBarrierParams) error
 	UpsertIssuedEnrollment(ctx context.Context, arg ledgerdb.UpsertIssuedEnrollmentParams) error
 	UpsertNodeInventory(ctx context.Context, arg ledgerdb.UpsertNodeInventoryParams) error
+	ContradictPoolRelease(ctx context.Context, node string) (int64, error)
+	ForceClosePoolOrder(ctx context.Context, arg ledgerdb.ForceClosePoolOrderParams) (int64, error)
+	ClearPoolReleaseContradiction(ctx context.Context, node string) error
 	UpsertNodeRegistration(ctx context.Context, arg ledgerdb.UpsertNodeRegistrationParams) (int64, error)
 	UpsertPendingCompletion(ctx context.Context, arg ledgerdb.UpsertPendingCompletionParams) error
 	UpsertScaleSet(ctx context.Context, arg ledgerdb.UpsertScaleSetParams) error
