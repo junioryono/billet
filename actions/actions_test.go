@@ -269,6 +269,39 @@ func TestBuilderCleanupReportsGrowthAndPrunesAnOversizedMount(t *testing.T) {
 	}
 }
 
+// A BUILD WITH NO CACHE MOUNT PUBLISHES ITS LAYERS: buildctl du answers such a builder
+// with `null`, the nil slice Go encodes (measured on the pinned BuildKit v0.32.2,
+// 2026-11-07), which is no mounts and nothing to enforce, never a reason to discard. An
+// answer that is empty, or not a list, still discards.
+func TestBuilderCleanupPublishesABuildWithNoCacheMount(t *testing.T) {
+	t.Parallel()
+
+	for name, c := range map[string]struct {
+		usage   string
+		publish bool
+	}{
+		"no cache mount":  {"null\n", true},
+		"an empty answer": {"", false},
+		"not a list":      {"{\"id\":\"mount-1\"}\n", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			statePath := t.TempDir()
+			discardMarker := filepath.Join(t.TempDir(), "billet-buildkit-discard")
+			if err := os.WriteFile(discardMarker, nil, 0o600); err != nil {
+				t.Fatalf("write publication guard: %v", err)
+			}
+
+			output, _ := runBuilderCleanupWith(t, statePath, discardMarker, c.usage, c.usage, false, false)
+			_, err := os.Stat(discardMarker)
+			if published := os.IsNotExist(err); published != c.publish {
+				t.Fatalf("%s: published %v, want %v:\n%s", name, published, c.publish, output)
+			}
+		})
+	}
+}
+
 func TestBuilderCleanupDiscardsThePublicationWhenACeilingCannotBeEnforced(t *testing.T) {
 	t.Parallel()
 
@@ -483,6 +516,22 @@ func runBuilderCleanup(
 ) (string, string) {
 	t.Helper()
 
+	usage := "[{\"id\":\"mount-1\",\"mutable\":true,\"inUse\":false,\"size\":3072,\"description\":\"cached mount /root/.cache from buildkit\",\"recordType\":\"exec.cachemount\"}," +
+		"{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}]\n"
+	remaining := "[{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}]\n"
+
+	return runBuilderCleanupWith(t, statePath, discardMarker, usage, remaining, failPrune, failRemove)
+}
+
+// runBuilderCleanupWith runs the cleanup against a fake docker whose first `buildctl du`
+// prints usage and every later one remaining.
+func runBuilderCleanupWith(
+	t *testing.T,
+	statePath, discardMarker, usage, remaining string,
+	failPrune, failRemove bool,
+) (string, string) {
+	t.Helper()
+
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node is not installed on this build host")
@@ -493,12 +542,9 @@ func runBuilderCleanup(
 	seen := filepath.Join(tools, "du-seen")
 	before := filepath.Join(tools, "before.json")
 	after := filepath.Join(tools, "after.json")
-	usage := "[{\"id\":\"mount-1\",\"mutable\":true,\"inUse\":false,\"size\":3072,\"description\":\"cached mount /root/.cache from buildkit\",\"recordType\":\"exec.cachemount\"}," +
-		"{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}]\n"
 	if err := os.WriteFile(before, []byte(usage), 0o600); err != nil {
 		t.Fatalf("write usage fixture: %v", err)
 	}
-	remaining := "[{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}]\n"
 	if err := os.WriteFile(after, []byte(remaining), 0o600); err != nil {
 		t.Fatalf("write post-prune fixture: %v", err)
 	}

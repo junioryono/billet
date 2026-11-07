@@ -31,8 +31,12 @@ function cacheMountUsage() {
     "du", "--filter", "type==exec.cachemount", "--format", "{{json .}}",
   ]), "buildctl du");
   // buildctl executes the template once with its complete UsageInfo slice, so
-  // `json .` is one array rather than one JSON object per output line.
-  const records = JSON.parse(String(result.stdout || "null"));
+  // `json .` is one array rather than one JSON object per output line. With no cache
+  // mount that slice is nil, which Go encodes as `null` (measured on BuildKit v0.32.2,
+  // the image this action pins, 2026-11-07): no mounts, not an unreadable answer, and a
+  // build with no cache mount must still publish its layers. Empty output is refused.
+  const parsed = JSON.parse(String(result.stdout || ""));
+  const records = parsed === null ? [] : parsed;
   if (!Array.isArray(records)) {
     throw new Error("buildctl du did not return a cache-mount array");
   }

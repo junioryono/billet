@@ -7,7 +7,10 @@ name: matrix-writers
 # job that wrote it (its post step's commit), so a's completion is a's publication, and
 # b's commit comes after it. Under cas, b's commit has a stale parent and is refused, so
 # the reader finds a's generation; under last-write-wins b's replaces it, so the reader
-# finds b's. The reader needs both jobs, so both commits have settled when it clones, and
+# finds b's. WRITER A WAITS FOR B TO HAVE CLONED before its own job ends, so a's
+# publication always comes after both writers took the seed: a b that only reached a
+# runner once a had published would clone a's generation, not the seed, and under cas its
+# commit would then not be stale (run 42358345989, 2026-11-07, where it found a's marker). The reader needs both jobs, so both commits have settled when it clones, and
 # it finds one writer's generation whole, never one writer's marker over the other's
 # payload. AND IT READS EACH WRITER'S OWN LOG, where the sticky disk's post step says what
 # became of its write: writer a must have published, and writer b must have been
@@ -77,6 +80,28 @@ jobs:
           sum=$(sudo sha256sum /mnt/matrix/payload | cut -d' ' -f1)
           echo "a $sum" | sudo tee /mnt/matrix/marker
           sync
+      - name: Wait until writer b has cloned the seed, so this writer publishes after it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WRITER: writer-cas-b
+          STEP: Clone the seed, and write this writer's generation
+        run: |
+          set -euo pipefail
+          jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs"
+          for _ in $(seq 120); do
+            state=$(gh api "$jobs" --jq ".jobs[] | select(.name == \"$WRITER\") | (.steps // [])[] | select(.name == \"$STEP\") | .status")
+            case "$state" in
+            in_progress | completed) echo "MATRIX $WRITER has cloned"; exit 0 ;;
+            esac
+            job=$(gh api "$jobs" --jq ".jobs[] | select(.name == \"$WRITER\") | .status")
+            if [ "$job" = completed ]; then
+              echo "MATRIX $WRITER ended before it cloned, so nothing orders this writer after it" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "MATRIX $WRITER did not clone in 20 minutes" >&2
+          exit 1
   writer-cas-b:
     needs: seed-cas
     runs-on: ${{ inputs.runs_on }}
@@ -129,12 +154,15 @@ jobs:
           set -euo pipefail
           jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs"
           # A COMPLETED JOB'S LOG CAN TAKE A MOMENT TO BE SERVED; one never served fails.
+          # CURL, NOT gh api: a job's log is full of terminal escape sequences, which the
+          # runner image's gh refuses to write anywhere (run 42358345989, 2026-11-07).
           writer_log() {
             local id
             id=$(gh api "$jobs" --jq ".jobs[] | select(.name == \"$1\") | .id")
             test -n "$id"
             for _ in $(seq 12); do
-              if gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$id/logs" >"$1.log" 2>/dev/null; then return 0; fi
+              if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/jobs/$id/logs" -o "$1.log"; then return 0; fi
               sleep 10
             done
             echo "MATRIX GitHub served no log for $1" >&2
@@ -196,6 +224,28 @@ jobs:
           sum=$(sudo sha256sum /mnt/matrix/payload | cut -d' ' -f1)
           echo "a $sum" | sudo tee /mnt/matrix/marker
           sync
+      - name: Wait until writer b has cloned the seed, so this writer publishes after it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WRITER: writer-lww-b
+          STEP: Clone the seed, and write this writer's generation
+        run: |
+          set -euo pipefail
+          jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs"
+          for _ in $(seq 120); do
+            state=$(gh api "$jobs" --jq ".jobs[] | select(.name == \"$WRITER\") | (.steps // [])[] | select(.name == \"$STEP\") | .status")
+            case "$state" in
+            in_progress | completed) echo "MATRIX $WRITER has cloned"; exit 0 ;;
+            esac
+            job=$(gh api "$jobs" --jq ".jobs[] | select(.name == \"$WRITER\") | .status")
+            if [ "$job" = completed ]; then
+              echo "MATRIX $WRITER ended before it cloned, so nothing orders this writer after it" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "MATRIX $WRITER did not clone in 20 minutes" >&2
+          exit 1
   writer-lww-b:
     needs: seed-lww
     runs-on: ${{ inputs.runs_on }}
@@ -248,12 +298,15 @@ jobs:
           set -euo pipefail
           jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs"
           # A COMPLETED JOB'S LOG CAN TAKE A MOMENT TO BE SERVED; one never served fails.
+          # CURL, NOT gh api: a job's log is full of terminal escape sequences, which the
+          # runner image's gh refuses to write anywhere (run 42358345989, 2026-11-07).
           writer_log() {
             local id
             id=$(gh api "$jobs" --jq ".jobs[] | select(.name == \"$1\") | .id")
             test -n "$id"
             for _ in $(seq 12); do
-              if gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$id/logs" >"$1.log" 2>/dev/null; then return 0; fi
+              if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/jobs/$id/logs" -o "$1.log"; then return 0; fi
               sleep 10
             done
             echo "MATRIX GitHub served no log for $1" >&2
