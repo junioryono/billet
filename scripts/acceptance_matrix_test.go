@@ -663,6 +663,10 @@ func TestTheMatrixHostDownKeepsTheServicesLogsOnTheHost(t *testing.T) {
 		"a directory anyone may read": func(dir string) error {
 			return os.Mkdir(filepath.Join(dir, "logs"), 0o755)
 		},
+		// Private and the caller's, so only the rule that the teardown creates it refuses.
+		"a private directory already there": func(dir string) error {
+			return os.Mkdir(filepath.Join(dir, "logs"), 0o700)
+		},
 	} {
 		dir = stage()
 		if err := plant(dir); err != nil {
