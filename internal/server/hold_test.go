@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/state"
 )
 
 const testHold = time.Hour
@@ -375,6 +377,93 @@ func TestAListenerStoppedBeforeItsSessionOpensJoinsItsCleanup(t *testing.T) {
 
 		if !slices.Contains(p.destroyed, 11) {
 			t.Errorf("destroyed %v; want the owed VM gone", p.destroyed)
+		}
+	})
+}
+
+// A SEALED DEPLOYMENT GETS NO NEW HOLD BEFORE A RESTARTED LISTENER'S SESSION OPENS (#783). The poll
+// loop reads admission only once the session is open, so the hold reads the ledger itself: a failed
+// job whose predecessor recorded its completion and held nothing is destroyed, not held for an hour
+// in front of the drain that sealed it.
+func TestASealedDeploymentGetsNoNewHoldBeforeTheSessionOpens(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		db := openState(t)
+
+		a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, runnerlessTiers())
+		if err != nil {
+			t.Fatalf("alloc.New: %v", err)
+		}
+
+		registerDefaultHosts(t, a)
+
+		p := newRunnerlessPoolOver(t, a, job11)
+		p.l.completionStore = db
+
+		runner := p.launchedFor11(t)
+
+		started := job11
+		started.RunnerID, started.RunnerName = 77, runner.RunnerName
+
+		if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
+			Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+			t.Fatalf("start job 11: %v", err)
+		}
+
+		// THE PREDECESSOR RECORDED THE COMPLETION AND HELD NOTHING: its tier held nothing then, and
+		// its destroy did not go through.
+		p.l.runner = &fakeRunner{onDestroy: func(int64) error { return errors.New("the node is busy") }}
+
+		failed := started
+		failed.Result = "Failed"
+		p.complete(t, failed)
+
+		if _, err := a.LeaseHoldOf(t.Context(), runner.LeaseID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+			t.Fatalf("a hold before the restart: %v", err)
+		}
+
+		if _, err := db.Seal(t.Context(), state.SealRequest{
+			Provenance: state.ProvenanceOperator, Reason: "draining", Actor: "ops",
+		}); err != nil {
+			t.Fatalf("Seal: %v", err)
+		}
+
+		l := NewListener(a, p.l.tier, nil,
+			WithRunner(&fakeRunner{onDestroy: func(requestID int64) error {
+				p.destroyed = append(p.destroyed, requestID)
+
+				return nil
+			}}),
+			WithRunnerRegistry(p.registry),
+			WithSessionReopen(func(ctx context.Context) (Session, error) {
+				<-ctx.Done()
+
+				return nil, ctx.Err()
+			}))
+		l.holdOnFailure, l.completionStore = testHold, db
+		l.writeJobResult = func(context.Context, string, string, int64) error { return nil }
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- l.Run(ctx) }()
+
+		time.Sleep(l.heartbeatInterval() + time.Second)
+		synctest.Wait()
+
+		if hold, err := a.LeaseHoldOf(t.Context(), runner.LeaseID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+			t.Errorf("a hold was opened on a sealed deployment: %+v, %v", hold, err)
+		}
+
+		if !slices.Contains(p.destroyed, 11) {
+			t.Errorf("destroyed %v; want the failed job's VM gone, as nothing may hold it", p.destroyed)
+		}
+
+		cancel()
+
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Errorf("Run = %v, want the cancellation", err)
 		}
 	})
 }
