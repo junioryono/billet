@@ -12,7 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
-// resultSucceeded is the ONE completion result billet recognises, and it is
+// ResultSucceeded is the ONE completion result billet recognises, and it is
 // measured rather than read: the vendored scale-set client enumerates none, so
 // the only value this codebase has ever seen confirmed is the one node teardown
 // already keys its cache settlement on.
@@ -21,7 +21,7 @@ import (
 // treated as NOT succeeded. That direction is deliberate: an unknown result is
 // "could not tell", and collapsing that into "fine" would hide exactly the job
 // an operator came here looking for.
-const resultSucceeded = "succeeded"
+const ResultSucceeded = "succeeded"
 
 // RecordJobResult stores GitHub's own conclusion for the job a lease ran.
 //
@@ -197,7 +197,7 @@ func (a *Allocator) AttributedFailures(
 
 		rows, err := state.ReadQueries(tx).ListAttributedFailures(ctx,
 			ledgerdb.ListAttributedFailuresParams{
-				Succeeded: resultSucceeded,
+				Succeeded: ResultSucceeded,
 				Since:     ts(since.UTC()),
 				MaxRows:   int64(limit),
 			})

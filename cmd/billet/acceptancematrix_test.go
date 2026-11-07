@@ -8,11 +8,66 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lease"
+	"github.com/junioryono/billet/internal/store/ebss3"
 
 	"gopkg.in/yaml.v3"
 )
+
+// THE TEARDOWN'S DELETE REACHES THIS DEPLOYMENT'S STATE OBJECTS AND NO OTHER'S. Runs
+// share the bucket's prefix and are told apart by their owner digest, so a grant on
+// owners/*/state/* would let one run's teardown delete another's (2026-11-07).
+func TestTheTeardownPolicyNamesOnlyThisDeploymentsState(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{Node: &config.NodeConfig{Site: "us-west-2a", EBSS3: &config.EBSS3Config{
+		Region: "us-west-2", AvailabilityZone: "us-west-2a", Bucket: "cache-bucket", Prefix: "billet-cache",
+	}}}
+	policy, ok, err := matrixTeardownPolicy(cfg, "d1")
+	if err != nil || !ok || len(policy.Statement) != 1 || len(policy.Statement[0].Resource) != 1 {
+		t.Fatalf("teardown policy = %+v, %v, %v", policy, ok, err)
+	}
+	statement := policy.Statement[0]
+	if statement.Effect != "Allow" || !slices.Equal(statement.Action, []string{"s3:DeleteObject"}) {
+		t.Fatalf("the teardown grants %s %v, want only s3:DeleteObject", statement.Effect, statement.Action)
+	}
+	resource := statement.Resource[0]
+	granted := func(key string) bool {
+		return strings.HasPrefix("arn:aws:s3:::cache-bucket/"+key, strings.TrimSuffix(resource, "*"))
+	}
+	mine := ebss3.StatePrefix(*cfg.Node.EBSS3, "d1/us-west-2a")
+	if !strings.HasSuffix(resource, "*") || !granted(mine+"k.json") {
+		t.Fatalf("%s does not reach this deployment's state object %s", resource, mine+"k.json")
+	}
+	if other := ebss3.StatePrefix(*cfg.Node.EBSS3, "d2/us-west-2a"); granted(other + "k.json") {
+		t.Fatalf("%s reaches another deployment's state object %s", resource, other+"k.json")
+	}
+	if archive := strings.TrimSuffix(mine, "state/") + "archives/x"; granted(archive) {
+		t.Fatalf("%s reaches this deployment's archive %s", resource, archive)
+	}
+
+	if _, ok, err := matrixTeardownPolicy(&config.Config{Node: &config.NodeConfig{}}, "d1"); ok || err != nil {
+		t.Fatalf("a config with no ebs-s3 cache rendered a teardown policy: %v, %v", ok, err)
+	}
+	if _, _, err := matrixTeardownPolicy(cfg, ""); err == nil {
+		t.Fatal("a workspace with no deployment id rendered a policy for an unknown prefix")
+	}
+}
+
+// A CELL WANTS THE LEDGER'S WORD FOR SUCCESS, which is the scale-set message's, never
+// the REST API's: the first real run (42358345989, 2026-11-07) failed every cell whose
+// jobs succeeded, each "GitHub reported "succeeded", want "success"".
+func TestEveryRunCellWantsTheLedgersWordForSuccess(t *testing.T) {
+	t.Parallel()
+	for _, c := range matrixCells() {
+		if c.Run != nil && c.Run.GitHub != alloc.ResultSucceeded {
+			t.Errorf("%s %s %s %s wants GitHub's %q, which the ledger never records", c.Backend, c.Arch,
+				c.Cache, c.Case, c.Run.GitHub)
+		}
+	}
+}
 
 // THE MATRIX IS THE WHOLE CROSS PRODUCT: every backend, architecture, cache and case
 // once, so a combination nobody declared is a failure here rather than a silence in a
@@ -228,7 +283,7 @@ func matrixTestTiers() map[string]matrixTier {
 
 func coldGitJob() acceptanceJob {
 	return acceptanceJob{
-		LeaseID: "l-accept-x64", Tier: "accept-x64", GitHub: "success", Provider: "ec2", InstanceType: "c7i.large",
+		LeaseID: "l-accept-x64", Tier: "accept-x64", GitHub: alloc.ResultSucceeded, Provider: "ec2", InstanceType: "c7i.large",
 		Trust:       "trusted",
 		WorkflowRef: "billet-testbed/acceptance-matrix/.github/workflows/matrix-cold.yml@refs/heads/main",
 		JobName:     "git",
@@ -264,7 +319,7 @@ func TestACellIsJudgedOnGitHubsResultAndTheNodesObservation(t *testing.T) {
 		reason  string
 	}{
 		"both witnesses agree":               {func(*acceptanceJob) {}, verdictPass, ""},
-		"GitHub failed it":                   {func(j *acceptanceJob) { j.GitHub = "failure" }, verdictFail, `GitHub reported "failure"`},
+		"GitHub failed it":                   {func(j *acceptanceJob) { j.GitHub = "failed" }, verdictFail, `GitHub reported "failed"`},
 		"the node saw it warm":               {func(j *acceptanceJob) { j.Cache.Git = "warm" }, verdictFail, `observed git "warm", want "cold"`},
 		"the node saw nothing":               {func(j *acceptanceJob) { j.Cache.Git = "" }, verdictFail, "recorded no git observation"},
 		"its history was unread":             {func(j *acceptanceJob) { j.Unread = "disk on fire" }, verdictFail, "disk on fire"},
@@ -358,7 +413,7 @@ func TestEveryJobOfACellIsJudged(t *testing.T) {
 	t.Parallel()
 	cell := cellOf(t, config.ArchX64, "git", "cold")
 	again := coldGitJob()
-	again.LeaseID, again.GitHub = "l-again", "failure"
+	again.LeaseID, again.GitHub = "l-again", "failed"
 	got := judgeCell(cell, []acceptanceJob{coldGitJob(), again}, matrixScope{tiers: matrixTestTiers()})
 	if got.Verdict != verdictFail || !strings.Contains(got.Reason, "l-again") || len(got.Jobs) != 2 {
 		t.Fatalf("%+v", got)
@@ -399,7 +454,7 @@ func TestARunFailsOnAFailedCellOrOneThatShouldHaveRun(t *testing.T) {
 		!strings.Contains(err.Error(), "should have run did not") {
 		t.Errorf("a run covering x64 with its cells unrun answered %v", err)
 	}
-	job.GitHub = "failure"
+	job.GitHub = "failed"
 	doc = judgeMatrix(matrixCells(), acceptanceEvidenceDoc{Jobs: []acceptanceJob{job}}, matrixScope{tiers: matrixTestTiers()})
 	if err := matrixOutcome(doc, nil); err == nil || !strings.Contains(err.Error(), "1 cell(s) failed") {
 		t.Errorf("a failed cell answered %v", err)

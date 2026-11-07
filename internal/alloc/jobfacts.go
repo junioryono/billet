@@ -60,7 +60,7 @@ func (f *JobFact) Duration() (time.Duration, bool) {
 }
 
 // Succeeded says GitHub's result is the one word billet recognises as success.
-func (f *JobFact) Succeeded() bool { return f.Result == resultSucceeded }
+func (f *JobFact) Succeeded() bool { return f.Result == ResultSucceeded }
 
 // Attributed says the job did not succeed and billet's own lifecycle has
 // something to say about it: a disruption was recorded, or its lease failed. Two

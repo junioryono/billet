@@ -1341,6 +1341,11 @@ func TestPurgeRemovesTheObjectHalfAndLeavesNoUploadBilling(t *testing.T) {
 	if _, _, err := store.AcquireWriter(t.Context(), "state-key", "holder", time.Hour); err != nil {
 		t.Fatal(err)
 	}
+	// WHAT A SWEEP READS IS WHAT THE PURGE TAKES, the state object counted on its own.
+	if residue, err := store.Residue(t.Context()); err != nil ||
+		residue != (Residue{StateObjects: 1, CacheObjects: 4}) {
+		t.Fatalf("Residue = %+v, %v; want 1 state object and 4 cache objects", residue, err)
+	}
 
 	report, err := store.Purge(t.Context())
 	if err != nil {
@@ -1356,6 +1361,9 @@ func TestPurgeRemovesTheObjectHalfAndLeavesNoUploadBilling(t *testing.T) {
 	}
 	if len(bulk.uploads) != 0 {
 		t.Fatal("Purge left a multipart upload billing")
+	}
+	if residue, err := store.Residue(t.Context()); err != nil || !residue.Empty() {
+		t.Fatalf("Residue after the purge = %+v, %v; want none", residue, err)
 	}
 }
 

@@ -49,6 +49,10 @@ type blockAPI interface {
 	ListSnapshots(ctx context.Context) ([]snapshotInfo, error)
 	DeleteSnapshot(ctx context.Context, id string) error
 	ListAvailableVolumes(ctx context.Context) ([]volumeInfo, error)
+	// Owned counts the snapshots and volumes carrying both of this store's ownership
+	// tags in any state, attached and unfinished included: what a teardown's sweep
+	// must find gone, where the listings above are only what a purge may take.
+	Owned(ctx context.Context) (snapshots, volumes int, err error)
 }
 
 type objectAPI interface {
@@ -246,10 +250,14 @@ type keyState struct {
 	Active      map[string]activeState     `json:"active,omitempty"`
 }
 
-func (s Store) statePrefix() string {
-	digest := sha256.Sum256([]byte(s.owner))
+func (s Store) statePrefix() string { return StatePrefix(s.cfg, s.owner) }
 
-	return s.cfg.Prefix + "/owners/" + hex.EncodeToString(digest[:]) + "/state/"
+// StatePrefix is where a store for owner keeps its state objects, the names a
+// decommission deletes and billet's rendered node policy never lets a node delete.
+func StatePrefix(cfg config.EBSS3Config, owner string) string {
+	digest := sha256.Sum256([]byte(owner))
+
+	return cfg.Prefix + "/owners/" + hex.EncodeToString(digest[:]) + "/state/"
 }
 
 func (s Store) requestToken(parts ...string) string {
@@ -1046,6 +1054,62 @@ func (s Store) Purge(ctx context.Context) (PurgeReport, error) {
 	}
 
 	return report, nil
+}
+
+// Residue counts what this store's namespace still holds, read without removing
+// anything.
+type Residue struct {
+	Snapshots    int
+	Volumes      int
+	StateObjects int
+	// CacheObjects counts archives, content-addressed entries, their records and
+	// unfinished uploads.
+	CacheObjects int
+}
+
+// Empty reports whether nothing was found.
+func (r Residue) Empty() bool { return r == Residue{} }
+
+// Residue reads what this store still owns, for a teardown's sweep: the state and
+// object halves through the listings Purge walks, and every snapshot and volume
+// carrying both ownership tags in any state, so a pending snapshot or an attached
+// volume Purge would not take is still found, and another deployment's resource it
+// skips is not counted. A state object a purge could not delete is found here, where
+// a sweep of instances alone said nothing remained (measured 2026-11-07). A listing
+// that fails is an error, never an empty residue.
+func (s Store) Residue(ctx context.Context) (Residue, error) {
+	var residue Residue
+
+	keys, err := s.objects.List(ctx, s.statePrefix())
+	if err != nil {
+		return residue, err
+	}
+	residue.StateObjects = len(keys)
+
+	residue.Snapshots, residue.Volumes, err = s.blocks.Owned(ctx)
+	if err != nil {
+		return residue, err
+	}
+
+	if s.bulk == nil {
+		return residue, nil
+	}
+	objects, err := s.bulk.ListObjects(ctx, s.ownerPrefix())
+	if err != nil {
+		return residue, err
+	}
+	for _, object := range objects {
+		if !strings.HasPrefix(object.Key, s.statePrefix()) {
+			residue.CacheObjects++
+		}
+	}
+	uploads, err := s.bulk.ListMultipart(ctx, s.ownerPrefix())
+	if err != nil {
+		return residue, err
+	}
+	residue.CacheObjects += len(uploads)
+
+	return residue, nil
 }
 
 // purgeDelete deletes one owned resource, skipping (rather than aborting on) a

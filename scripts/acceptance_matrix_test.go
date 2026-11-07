@@ -222,6 +222,9 @@ acceptance-run)
 init-iam)
 	echo '{"Version":"2012-10-17"}'
 	;;
+matrix-teardown-policy)
+	echo '{"Version":"2012-10-17","Statement":[{"Sid":"BilletMatrixDecommissionState"}]}'
+	;;
 esac
 exit "$(cat "$FAKE/$key.exit" 2>/dev/null || echo 0)"
 `
@@ -269,9 +272,14 @@ func TestTheMatrixHostPreparesADeploymentWithItsTiersAndPolicy(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(dir, "iam.json")); err != nil || !strings.Contains(string(got), "2012-10-17") {
 		t.Errorf("iam.json = %q, %v", got, err)
 	}
+	if got, err := os.ReadFile(filepath.Join(dir, "teardown.json")); err != nil ||
+		!strings.Contains(string(got), "BilletMatrixDecommissionState") {
+		t.Errorf("teardown.json = %q, %v", got, err)
+	}
 	log := billetLog(t, f)
 	if !strings.Contains(log, "acceptance up --config /base.yaml --workspace "+dir+"/ws --account 111122223333") ||
-		!strings.Contains(log, "init iam --config "+dir+"/ws/billet.yaml --kms-key-arn arn:aws:kms:us-west-2:111122223333:key/k\n") {
+		!strings.Contains(log, "init iam --config "+dir+"/ws/billet.yaml --kms-key-arn arn:aws:kms:us-west-2:111122223333:key/k\n") ||
+		!strings.Contains(log, "acceptance matrix teardown-policy --workspace "+dir+"/ws\n") {
 		t.Errorf("billet was run as:\n%s", log)
 	}
 
@@ -282,6 +290,16 @@ func TestTheMatrixHostPreparesADeploymentWithItsTiersAndPolicy(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prepare", dir, "/b", "1", "k", "arn:aws:iam::1:role/guest"); code != 0 ||
 		!strings.Contains(billetLog(t, f), "--kms-key-arn k --role-arn arn:aws:iam::1:role/guest") {
 		t.Errorf("a guest role: exit %d\n%s\n%s", code, out, billetLog(t, f))
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "billet", fakeBillet)
+	f.fixture(t, "tiers", "ec2 x64 accept-x64\n")
+	f.fixture(t, "matrix-teardown-policy.exit", "1")
+	dir = hostRunDir(t, f)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prepare", dir, "/b", "1", "k"); code == 0 ||
+		!strings.Contains(out, "teardown's policy could not be rendered") {
+		t.Errorf("a teardown policy that could not be rendered: exit %d\n%s", code, out)
 	}
 
 	f = newMatrixFakes(t, "jq")
@@ -306,7 +324,7 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 		if out, code := f.run(t, "acceptance/matrix-host.sh", []string{"MATRIX_POLL=0.1"}, "run", dir, "27"); strconv.Itoa(code) != status {
 			t.Fatalf("a run that ended %s: exit %d\n%s", status, code, out)
 		}
-		if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 150m") {
+		if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 210m --no-teardown\n") {
 			t.Fatalf("billet was run as:\n%s", log)
 		}
 		if got, err := os.ReadFile(filepath.Join(dir, "run.exit")); err != nil || string(got) != status+"\n" {
@@ -532,6 +550,28 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	if log, err := os.ReadFile(filepath.Join(f.dir, "billet.log")); err == nil && strings.Contains(string(log), "acceptance down") {
 		t.Fatalf("down ran beside a live run:\n%s", log)
 	}
+	// STOPPED ANSWERS WHETHER A RUN LIVES, and takes nothing down either way: the
+	// teardown's grant goes on the role only after it says none does.
+	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "stopped", locked); code != 1 || !strings.Contains(out, "still live") {
+		t.Fatalf("stopped beside a live run: exit %d\n%s", code, out)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "stopped", dir); code != 0 || !strings.Contains(out, "no run lives") {
+		t.Fatalf("stopped with no live run: exit %d\n%s", code, out)
+	}
+	if log := billetLog(t, f); !strings.Contains(log, "acceptance stopped --workspace "+dir+"/ws\n") {
+		t.Fatalf("stopped never asked the services' own locks:\n%s", log)
+	}
+	// A SERVICE THAT OUTLIVED THE RUN, a node draining past its stop's grace, is live.
+	f.fixture(t, "acceptance-stopped.exit", "1")
+	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "stopped", dir); code != 1 || !strings.Contains(out, "may still live") {
+		t.Fatalf("stopped beside a service that outlived the run: exit %d\n%s", code, out)
+	}
+	if err := os.Remove(filepath.Join(f.dir, "acceptance-stopped.exit")); err != nil {
+		t.Fatal(err)
+	}
+	if log, err := os.ReadFile(filepath.Join(f.dir, "billet.log")); err == nil && strings.Contains(string(log), "acceptance down") {
+		t.Fatalf("stopped took the deployment down:\n%s", log)
+	}
 	f.fixture(t, "acceptance-down.exit", "4")
 	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "down", dir); code != 4 {
 		t.Fatalf("a down that failed: exit %d\n%s", code, out)
@@ -671,7 +711,7 @@ func dispatchSent(t *testing.T, f matrixFakes) []string {
 
 var dispatchEnv = []string{"MATRIX_SETTLE=0", "MATRIX_POLL=0", "MATRIX_LIST_WAIT=1", "MATRIX_TIMEOUT=3"}
 
-// THE COLD PHASE SENDS EVERY LABEL'S COLD, TWO-WRITER AND FAILED-WRITER RUNS, records
+// THE COLD PHASE SENDS EVERY LABEL'S COLD AND FAILED-WRITER RUNS, never a two-writer one, records
 // each run it started, and returns only once EVERY label's cold run has finished: with
 // one architecture's still running, it fails rather than let the warm phase start.
 func TestTheMatrixDispatchersColdPhaseWaitsForEveryArchitecture(t *testing.T) {
@@ -686,24 +726,24 @@ func TestTheMatrixDispatchersColdPhaseWaitsForEveryArchitecture(t *testing.T) {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
 	want := []string{
-		"matrix-cold.yml accept-x64 t1", "matrix-writers.yml accept-x64 t1", "matrix-writer-fails.yml accept-x64 t1",
-		"matrix-cold.yml accept-arm t1", "matrix-writers.yml accept-arm t1", "matrix-writer-fails.yml accept-arm t1",
+		"matrix-cold.yml accept-x64 t1", "matrix-writer-fails.yml accept-x64 t1",
+		"matrix-cold.yml accept-arm t1", "matrix-writer-fails.yml accept-arm t1",
 	}
 	if got := dispatchSent(t, f); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("sent\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	if got, err := os.ReadFile(runs); err != nil || string(got) != "1\n2\n3\n4\n5\n6\n" {
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "1\n2\n3\n4\n" {
 		t.Fatalf("the runs file is %q, %v; want every run started, by id", got, err)
 	}
 
-	// The x64 cold run (id 1) finishes; the arm one (id 4) does not.
+	// The x64 cold run (id 1) finishes; the arm one (id 3) does not.
 	f = newMatrixFakes(t, "jq")
 	f.command(t, "gh", fakeDispatchGH)
 	f.fixture(t, "done-1", "")
 	runs = filepath.Join(t.TempDir(), "runs")
 	out, code = f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cold", "billet-testbed/m", "t2", runs,
 		"accept-x64", "accept-arm")
-	if code != 1 || !strings.Contains(out, "run 4 did not complete") {
+	if code != 1 || !strings.Contains(out, "run 3 did not complete") {
 		t.Fatalf("an arm cold run still running: exit %d\n%s", code, out)
 	}
 
@@ -717,8 +757,7 @@ func TestTheMatrixDispatchersColdPhaseWaitsForEveryArchitecture(t *testing.T) {
 }
 
 // THE WARM PHASE SENDS EACH LABEL'S WARM RUN WITH THE COLD RUNS' TAG, and waits for
-// every run the runs file names, the cold phase's two-writer and failed-writer runs
-// included.
+// every run the runs file names, the cold phase's failed-writer runs included.
 func TestTheMatrixDispatchersWarmPhaseWaitsForEveryRun(t *testing.T) {
 	t.Parallel()
 	f := newMatrixFakes(t, "jq")
@@ -733,11 +772,11 @@ func TestTheMatrixDispatchersWarmPhaseWaitsForEveryRun(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "every matrix run for tag t1 has completed") {
 		t.Fatalf("warm: exit %d\n%s", code, out)
 	}
-	if got := dispatchSent(t, f); len(got) != 4 || got[3] != "matrix-warm.yml accept-x64 t1" {
+	if got := dispatchSent(t, f); len(got) != 3 || got[2] != "matrix-warm.yml accept-x64 t1" {
 		t.Fatalf("sent %q", got)
 	}
 
-	// A two-writer run from the cold phase (id 2) still running fails the warm phase.
+	// A failed-writer run from the cold phase (id 2) still running fails the warm phase.
 	f = newMatrixFakes(t, "jq")
 	f.command(t, "gh", fakeDispatchGH)
 	runs = filepath.Join(t.TempDir(), "runs")
@@ -746,12 +785,44 @@ func TestTheMatrixDispatchersWarmPhaseWaitsForEveryRun(t *testing.T) {
 		"accept-x64"); code != 0 {
 		t.Fatalf("cold: exit %d\n%s", code, out)
 	}
-	for _, id := range []string{"3", "4"} {
-		f.fixture(t, "done-"+id, "")
-	}
+	f.fixture(t, "done-3", "")
 	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "warm", "billet-testbed/m", "t2", runs,
 		"accept-x64"); code != 1 || !strings.Contains(out, "run 2 did not complete") {
 		t.Fatalf("a cold-phase run still running: exit %d\n%s", code, out)
+	}
+}
+
+// THE TWO-WRITER RUNS GO ONE ARCHITECTURE AT A TIME: each label's run is sent only once
+// the one before it has finished, so two architectures' writer a never hold every slot,
+// and one still running sends no other and fails the phase.
+func TestTheMatrixDispatchersWritersPhaseRunsOneArchitectureAtATime(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-all", "")
+	runs := filepath.Join(t.TempDir(), "runs")
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "writers", "billet-testbed/m", "t1", runs,
+		"accept-x64", "accept-arm")
+	if code != 0 || !strings.Contains(out, "the two-writer runs are done") {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	want := []string{"matrix-writers.yml accept-x64 t1", "matrix-writers.yml accept-arm t1"}
+	if got := dispatchSent(t, f); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", got, want)
+	}
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "1\n2\n" {
+		t.Fatalf("the runs file is %q, %v", got, err)
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	out, code = f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "writers", "billet-testbed/m", "t2",
+		filepath.Join(t.TempDir(), "runs"), "accept-x64", "accept-arm")
+	if code != 1 || !strings.Contains(out, "run 1 did not complete") {
+		t.Fatalf("an x64 writers run still running: exit %d\n%s", code, out)
+	}
+	if got := dispatchSent(t, f); len(got) != 1 {
+		t.Fatalf("the arm writers run was sent beside a running x64 one: %q", got)
 	}
 }
 

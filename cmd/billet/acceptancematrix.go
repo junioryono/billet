@@ -14,9 +14,13 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/awspolicy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lease"
+	"github.com/junioryono/billet/internal/store/ebss3"
 )
 
 // The acceptance matrix (#554): every backend, architecture, cache and case billet
@@ -81,7 +85,9 @@ type matrixRun struct {
 	Workflow string `json:"workflow"`
 	// Job is the job's name as GitHub reports it.
 	Job string `json:"job"`
-	// GitHub is the result GitHub must report for the job.
+	// GitHub is the result GitHub must report for the job, in the ledger's words, which
+	// are the scale-set message's (alloc.ResultSucceeded), never the REST API's
+	// "success": the first real run failed every cell that passed on that word.
 	GitHub string `json:"github"`
 	// Observe names the node's observation the cell reads (matrixObservation), and
 	// Want the token it must hold.
@@ -145,14 +151,14 @@ func matrixCellFor(cache, kase string) matrixCell {
 			workflow = "matrix-images-" + kase + ".yml"
 		}
 
-		return matrixCell{Run: &matrixRun{Workflow: workflow, Job: cache, GitHub: "success",
+		return matrixCell{Run: &matrixRun{Workflow: workflow, Job: cache, GitHub: alloc.ResultSucceeded,
 			Observe: observe, Want: want}}
 	case "two-writers-cas", "two-writers-lww":
 		mode := strings.TrimPrefix(kase, "two-writers-")
 		switch {
 		case cache == "sticky-disks":
 			return matrixCell{Run: &matrixRun{Workflow: "matrix-writers.yml", Job: "reader-" + mode,
-				GitHub: "success", Observe: observe, Want: string(lease.BuildCacheWarm)}}
+				GitHub: alloc.ResultSucceeded, Observe: observe, Want: string(lease.BuildCacheWarm)}}
 		case cache == "docker-builder":
 			return matrixCell{Unsupported: true, Why: "the builder's state is a sticky disk published " +
 				"last-write-wins; two writers are the sticky-disks cells"}
@@ -171,7 +177,7 @@ func matrixCellFor(cache, kase string) matrixCell {
 		switch cache {
 		case "sticky-disks":
 			return matrixCell{Run: &matrixRun{Workflow: "matrix-writer-fails.yml", Job: "reader",
-				GitHub: "success", Observe: observe, Want: string(lease.BuildCacheWarm)}}
+				GitHub: alloc.ResultSucceeded, Observe: observe, Want: string(lease.BuildCacheWarm)}}
 		case "docker-builder":
 			return matrixCell{Unsupported: true, Why: "the builder's state is a sticky disk; a failed " +
 				"writer is the sticky-disks cell"}
@@ -446,9 +452,58 @@ func cmdAcceptanceMatrix(env cli.Env, args []string) error {
 		return cmdMatrixJobs(env, args[1:])
 	case "judge":
 		return cmdMatrixJudge(env, args[1:])
+	case "teardown-policy":
+		return cmdMatrixTeardownPolicy(env, args[1:])
 	}
 
-	return fmt.Errorf("billet acceptance matrix %s: unknown subcommand; it is cells, tiers, jobs or judge", args[0])
+	return fmt.Errorf("billet acceptance matrix %s: unknown subcommand; it is cells, tiers, jobs, judge or "+
+		"teardown-policy", args[0])
+}
+
+// cmdMatrixTeardownPolicy prints the IAM policy a run's teardown needs beside the node's
+// own: s3:DeleteObject on this deployment's cache state objects, which `billet
+// decommission` deletes and billet's rendered node policy never lets a node delete
+// (2026-11-07). It names this deployment's own state prefix, the store's own
+// derivation, so the grant reaches no other deployment's state under the same bucket
+// prefix. A workspace whose config has no ebs-s3 cache prints nothing.
+func cmdMatrixTeardownPolicy(env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet acceptance matrix teardown-policy", env.Stdout)
+	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
+	if err := cli.Parse(fs, args); err != nil {
+		return err
+	}
+	ws, err := requireAcceptanceWorkspace(*workspace)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return err
+	}
+	policy, ok, err := matrixTeardownPolicy(cfg, ws.DeploymentID)
+	if err != nil || !ok {
+		return err
+	}
+
+	return writeJSON(env.Stdout, policy)
+}
+
+func matrixTeardownPolicy(cfg *config.Config, deployment string) (awspolicy.Policy, bool, error) {
+	if cfg.Node == nil || cfg.Node.EBSS3 == nil {
+		return awspolicy.Policy{}, false, nil
+	}
+	if deployment == "" {
+		return awspolicy.Policy{}, false, errors.New("the workspace records no deployment id, so its " +
+			"cache's state prefix is unknown")
+	}
+	store := *cfg.Node.EBSS3
+	prefix := ebss3.StatePrefix(store, app.CacheNamespace(deployment, cfg.Node.Site))
+
+	return awspolicy.Policy{Version: "2012-10-17", Statement: []awspolicy.Statement{{
+		Sid: "BilletMatrixDecommissionState", Effect: "Allow", Action: []string{"s3:DeleteObject"},
+		Resource: []string{fmt.Sprintf("arn:%s:s3:::%s/%s*", awspolicy.PartitionForRegion(store.Region),
+			store.Bucket, prefix)},
+	}}}, true, nil
 }
 
 // matrixJobsPerArch is how many jobs one dispatch of every matrix workflow runs on one

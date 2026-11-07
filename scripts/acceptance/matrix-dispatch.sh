@@ -3,17 +3,22 @@
 #   matrix-dispatch.sh images <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh cold <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh warm <owner/repo> <tag> <runs-file> <label>...
+#   matrix-dispatch.sh writers <owner/repo> <tag> <runs-file> <label>...
 #
 # Dispatches the acceptance matrix's workflows in <owner/repo> for each tier label and
 # appends the id of every run it starts to <runs-file>, which is what `billet acceptance
 # matrix judge --runs` reads. `images` runs first and alone on each tier: it sends the
 # image store's cold run, waits for it, waits MATRIX_SETTLE seconds, and sends and waits
 # for the warm one, because every job on a tier publishes an image-store generation and
-# none may run beside that pair. `cold` sends the cold, two-writer and failed-writer runs and
-# waits for the cold ones to finish; `warm` waits MATRIX_SETTLE seconds more, so the cold
-# runs' publications have time to land, sends the warm runs with the same tag, and waits
-# for every run in <runs-file> to finish. Three phases, because each is a step of its own
-# with an installation token of its own, and a token lasts an hour.
+# none may run beside that pair. `cold` sends the cold and failed-writer runs and waits for
+# the cold ones to finish; `warm` waits MATRIX_SETTLE seconds more, so the cold runs'
+# publications have time to land, sends the warm runs with the same tag, and waits for
+# every run in <runs-file> to finish. `writers` comes last, and sends each label's
+# two-writer run only once the one before it has finished, because each writer a holds a
+# runner while it waits for its writer b, and two architectures' at once could hold every
+# slot (the workflow calls it once per architecture, so each has its own deadline). Every
+# phase is a step of its own with an installation token of its own, because a token lasts
+# an hour.
 #
 # It judges nothing (a run's conclusion is not the matrix's verdict; the judge reads the
 # ledger). It exits 0 when every run it waited for completed, and 1 when one could not
@@ -27,7 +32,7 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,4p' "$0" >&2
+	sed -n '2,6p' "$0" >&2
 	exit 2
 }
 
@@ -115,9 +120,7 @@ cold)
 	for label in "$@"; do
 		id=$(dispatch matrix-cold.yml "$label") || exit 1
 		cold+=("$id")
-		for workflow in matrix-writers.yml matrix-writer-fails.yml; do
-			dispatch "$workflow" "$label" >/dev/null || exit 1
-		done
+		dispatch matrix-writer-fails.yml "$label" >/dev/null || exit 1
 	done
 	await "${cold[@]}" || exit 1
 	echo "the cold runs are done"
@@ -138,6 +141,13 @@ warm)
 	fi
 	await "${every[@]}" || exit 1
 	echo "every matrix run for tag $tag has completed"
+	;;
+writers)
+	for label in "$@"; do
+		id=$(dispatch matrix-writers.yml "$label") || exit 1
+		await "$id" || exit 1
+	done
+	echo "the two-writer runs are done"
 	;;
 *)
 	usage
