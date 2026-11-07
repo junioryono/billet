@@ -110,6 +110,8 @@ type stub struct {
 	envLog string
 	// cloneOS is the operating system a clone of an image reports, linux when empty.
 	cloneOS string
+	// cloneASIF, when present, makes a clone's config.json name an ASIF disk.
+	cloneASIF string
 	// cloneStacked makes a clone of an image a stacked VM: an overlay and no disk.
 	cloneStacked string
 	// cloneSuspended makes a clone carry a saved suspension.
@@ -189,6 +191,7 @@ func newStub(t *testing.T) *stub {
 
 		envLog:            filepath.Join(dir, "env.log"),
 		cloneOS:           filepath.Join(dir, "clone-os"),
+		cloneASIF:         filepath.Join(dir, "clone-asif"),
 		cloneStacked:      filepath.Join(dir, "clone-stacked"),
 		cloneSuspended:    filepath.Join(dir, "clone-suspended"),
 		imageBytes:        filepath.Join(dir, "image-bytes"),
@@ -300,7 +303,9 @@ clone)
   else
     guest_os=linux
     if [ -s "` + s.cloneOS + `" ]; then guest_os=$(cat "` + s.cloneOS + `"); fi
-    printf '{"os":"%s","macAddress":"02:00:00:00:00:01"}\n' "$guest_os" > "$vms/$dst/config.json"
+    format=raw
+    if [ -e "` + s.cloneASIF + `" ]; then format=asif; fi
+    printf '{"os":"%s","macAddress":"02:00:00:00:00:01","diskFormat":"%s"}\n' "$guest_os" "$format" > "$vms/$dst/config.json"
     printf 'nvram\n' > "$vms/$dst/nvram.bin"
     if [ -e "` + s.cloneStacked + `" ]; then
       : > "$vms/$dst/overlay.asif"
