@@ -29,11 +29,19 @@ func answerPoolAsk(t *testing.T, p *Plane, node, wantID string, instances []stri
 	}
 }
 
+// agePoolAsk makes order's last ask a round old, so the next schedule asks it again.
+func agePoolAsk(p *Plane, order string) {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+
+	p.poolAskedAt[order] = time.Now().Add(-barrierRound)
+}
+
 // A POOL RELEASE ASKS ITS NODE WITHOUT THE DEPLOYMENT'S BARRIER (ADR-030): with no drain
-// waiting, the barrier loop asks the connected node of each release what it runs, under
-// the release's own id, and records the answer against the fence read before the
-// question, empty or not. A node not connected is not asked; a pass inside the round
-// asks nothing, and the first pass after it asks again.
+// waiting, the clearance loop asks the connected node of each release what it runs,
+// under the release's own id, and records the answer against the fence read before the
+// question: empty, or compute listed. A node not connected is not asked; a schedule
+// inside the round asks nothing, and the first after it asks again.
 func TestAPoolReleaseAsksItsNodeWithoutTheDeploymentsBarrier(t *testing.T) {
 	t.Parallel()
 
@@ -44,15 +52,15 @@ func TestAPoolReleaseAsksItsNodeWithoutTheDeploymentsBarrier(t *testing.T) {
 	}
 	p, reg := barrierPlane(t, store)
 
-	p.barrierPass(t.Context())
+	p.schedulePoolAsks(t.Context())
 	answerPoolAsk(t, p, barrierHostName, "pool-release-o1", nil)
-	p.poolRound.Wait()
+	p.poolAsks.Wait()
 
 	observed := store.poolObservations()
 	if len(observed) != 1 {
 		t.Fatalf("want one clearance answer recorded, got %+v", observed)
 	}
-	if obs := observed[0]; obs.Order != "o1" || obs.Node != barrierHostName || !obs.Empty ||
+	if obs := observed[0]; obs.Order != "o1" || obs.Node != barrierHostName || !obs.Empty || obs.Running ||
 		obs.Fence.Epoch != reg.current() || obs.Fence.Dispatch != 9 {
 		t.Fatalf("the answer was recorded as %+v, want o1's empty answer under the fence read before it", obs)
 	}
@@ -60,32 +68,25 @@ func TestAPoolReleaseAsksItsNodeWithoutTheDeploymentsBarrier(t *testing.T) {
 		t.Fatalf("a release's answer was recorded against the deployment's barrier: %+v", got)
 	}
 
-	// A CANCELLED PASS, so a round wrongly started inside the pace returns at once rather
-	// than waiting on a node nobody plays.
-	cancelled, cancel := context.WithCancel(t.Context())
-	cancel()
-	p.barrierPass(cancelled)
-	p.poolRound.Wait()
-	if got := store.poolRoundCount(); got != 1 {
-		t.Fatalf("a pass inside the round started another: %d rounds", got)
+	p.schedulePoolAsks(t.Context())
+	p.poolAsks.Wait()
+	if got := p.QueuedForTest(barrierHostName); got != 0 {
+		t.Fatalf("a schedule inside the round asked again: %d queued", got)
 	}
 
-	p.poolAskedAt = time.Now().Add(-barrierRound)
-	p.barrierPass(t.Context())
+	agePoolAsk(p, "o1")
+	p.schedulePoolAsks(t.Context())
 	answerPoolAsk(t, p, barrierHostName, "pool-release-o1", []string{"l1"})
-	p.poolRound.Wait()
+	p.poolAsks.Wait()
 
-	if got := store.poolRoundCount(); got != 2 {
-		t.Fatalf("the first pass after the round did not ask again: %d rounds", got)
-	}
-	if observed := store.poolObservations(); len(observed) != 2 || observed[1].Empty {
+	if observed := store.poolObservations(); len(observed) != 2 || observed[1].Empty || !observed[1].Running {
 		t.Fatalf("a node listing an instance was recorded as %+v", observed)
 	}
 }
 
-// A NODE SLOW TO ANSWER HOLDS UP ONLY ITS OWN RELEASE: the pass returns while it is
-// still asked, so the deployment's barrier is not delayed, and another release's node
-// is asked and recorded beside it.
+// A NODE SLOW TO ANSWER HOLDS UP ONLY ITS OWN RELEASE: while its ask is still out,
+// another release's node is asked, answers, and is asked again a round later; the slow
+// node is not asked a second time beside the first.
 func TestASlowPoolNodeHoldsUpOnlyItsOwnRelease(t *testing.T) {
 	t.Parallel()
 
@@ -104,32 +105,32 @@ func TestASlowPoolNodeHoldsUpOnlyItsOwnRelease(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer func() {
 		cancel()
-		p.poolRound.Wait()
+		p.poolAsks.Wait()
 	}()
 
-	passed := make(chan struct{})
-
-	go func() {
-		defer close(passed)
-
-		p.barrierPass(ctx)
-	}()
-
-	select {
-	case <-passed:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the pass waited on the pool's nodes")
+	quick := func(round int) {
+		t.Helper()
+		answerPoolAsk(t, p, "fast", "pool-release-quick", nil)
+		select {
+		case obs := <-store.poolRecorded:
+			if obs.Order != "quick" || !obs.Empty {
+				t.Fatalf("round %d recorded %+v, want the quick node's empty answer", round, obs)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("round %d: the quick node's answer waited on the slow one", round)
+		}
 	}
 
-	answerPoolAsk(t, p, "fast", "pool-release-quick", nil)
+	p.schedulePoolAsks(ctx)
+	quick(1)
 
-	select {
-	case obs := <-store.poolRecorded:
-		if obs.Order != "quick" || !obs.Empty {
-			t.Fatalf("recorded %+v, want the quick node's empty answer", obs)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the quick node's answer waited on the slow one")
+	agePoolAsk(p, "slow")
+	agePoolAsk(p, "quick")
+	p.schedulePoolAsks(ctx)
+	quick(2)
+
+	if got := p.QueuedForTest(barrierHostName); got != 1 {
+		t.Fatalf("the slow node holds %d queued asks, want its first alone", got)
 	}
 }
 
@@ -153,13 +154,73 @@ func TestAPoolNodeBelowTheBarrierProtocolIsNotAsked(t *testing.T) {
 	}
 	store.setFence("old", alloc.NodeFence{Epoch: 1, Dispatch: 1, WireVersion: nodeapi.VersionComputeBarrier - 1})
 
-	p.barrierPass(t.Context())
-	p.poolRound.Wait()
+	p.schedulePoolAsks(t.Context())
+	p.poolAsks.Wait()
 
 	if got := p.QueuedForTest("old"); got != 0 {
 		t.Fatalf("an older node was handed %d command(s)", got)
 	}
 	if got := store.poolObservations(); len(got) != 0 {
 		t.Fatalf("an older node's release recorded %+v", got)
+	}
+}
+
+// THE POOL'S CLEARANCES RUN ON A LOOP OF THEIR OWN: with a deployment barrier waiting on
+// a node that never answers, a release's node is still asked.
+func TestAPoolReleaseIsAskedWhileTheDeploymentsBarrierWaits(t *testing.T) {
+	t.Parallel()
+
+	store := newBarrierStore()
+	store.poolRecorded = make(chan alloc.PoolClearanceObservation, 4)
+	p, reg := barrierPlane(t, store)
+	register(t, p, "fast", config.ProviderDocker)
+	store.setFence("fast", alloc.NodeFence{
+		Epoch: reg.current(), Dispatch: 1, WireVersion: nodeapi.VersionComputeBarrier, Live: true,
+	})
+	store.poolTargets = []alloc.PoolClearanceTarget{{Order: "quick", Node: "fast"}}
+	p.barrierPace = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	looped := make(chan struct{})
+
+	go func() {
+		defer close(looped)
+
+		p.BarrierLoop(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-looped
+	}()
+
+	// THE DEPLOYMENT'S BARRIER ASKS barrierHostName, which nobody plays, so its pass waits;
+	// the fast node is asked twice, once for the barrier and once for its release, and only
+	// the release's ask is answered here.
+	deadline := time.After(10 * time.Second)
+
+	for {
+		cmd, took, err := p.Poll(ctx, "fast", "")
+		if err != nil || !took {
+			t.Fatalf("the fast node was not asked: took %v, %v", took, err)
+		}
+		if cmd.BarrierID == "pool-release-quick" {
+			if err := p.Result("fast", "", nodeapi.CommandResult{ID: cmd.ID, OK: true, BarrierID: cmd.BarrierID}); err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+
+			break
+		}
+		if err := p.Result("fast", "", nodeapi.CommandResult{ID: cmd.ID, OK: true, BarrierID: cmd.BarrierID}); err != nil {
+			t.Fatalf("Result: %v", err)
+		}
+	}
+
+	select {
+	case obs := <-store.poolRecorded:
+		if obs.Order != "quick" {
+			t.Fatalf("recorded %+v", obs)
+		}
+	case <-deadline:
+		t.Fatal("the release was not asked while the deployment's barrier waited")
 	}
 }

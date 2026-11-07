@@ -363,3 +363,50 @@ func TestOnlyADrainingOrdersIdleNodeIsAsked(t *testing.T) {
 		t.Fatalf("an answer from another node moved the run: %+v", o)
 	}
 }
+
+// COMPUTE A NODE LISTED IS A CONTRADICTION WHATEVER THE ORDER BECAME SINCE IT WAS ASKED:
+// an answer of its current registration listing compute, recorded after the seal, refuses
+// the release proof, though the inventory the same answer carried was never recorded;
+// one of an earlier registration says nothing about the host now. A listing read after
+// the order moved on is neither a refusal nor an error.
+func TestComputeListedAfterTheSealContradictsTheRelease(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := drainingPoolNode(t, a)
+	answerClearance(t, a, node, true)
+	now = now.Add(computeAbsenceGrace)
+	answerClearance(t, a, node, true)
+	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	listed := func(fence NodeFence) {
+		t.Helper()
+		if err := a.RecordPoolClearance(ctx, PoolClearanceObservation{
+			Order: "pa", Node: node, Fence: fence, Running: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	earlier := fenceOf(t, a, node)
+	earlier.Epoch--
+	listed(earlier)
+	if _, err := a.PoolReleaseProof(ctx, "pa"); err != nil {
+		t.Fatalf("an earlier registration's listing refused the proof: %v", err)
+	}
+
+	listed(fenceOf(t, a, node))
+	if _, err := a.PoolReleaseProof(ctx, "pa"); !errors.Is(err, ErrPoolReleaseContradicted) {
+		t.Fatalf("the proof after compute listed since the seal answered %v", err)
+	}
+
+	if err := a.ClosePoolOrder(ctx, "pa", "took it back by hand"); err != nil {
+		t.Fatal(err)
+	}
+	if refused, err := a.PoolReleaseRefused(ctx, "pa"); err != nil || refused {
+		t.Fatalf("a closed order's refusal read: %v, %v", refused, err)
+	}
+}

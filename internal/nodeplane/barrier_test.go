@@ -229,9 +229,7 @@ type barrierStore struct {
 	// against them.
 	poolTargets  []alloc.PoolClearanceTarget
 	poolObserved []alloc.PoolClearanceObservation
-	// poolRounds counts the rounds that asked which releases wait on their nodes, and
 	// poolRecorded, when a test sets it, receives each answer recorded (buffer it).
-	poolRounds   int
 	poolRecorded chan alloc.PoolClearanceObservation
 }
 
@@ -358,16 +356,7 @@ func (s *barrierStore) PoolClearanceTargets(context.Context) ([]alloc.PoolCleara
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.poolRounds++
-
 	return slices.Clone(s.poolTargets), nil
-}
-
-func (s *barrierStore) poolRoundCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.poolRounds
 }
 
 func (s *barrierStore) RecordPoolClearance(_ context.Context, obs alloc.PoolClearanceObservation) error {

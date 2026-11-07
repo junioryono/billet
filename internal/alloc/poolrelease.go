@@ -333,6 +333,10 @@ type PoolClearanceObservation struct {
 	// Empty says the node read its provider and found no billet compute. An answer
 	// that is not empty, or that is not an answer, is not.
 	Empty bool
+	// Running says the node read its provider and listed compute: not merely no answer,
+	// but a contradiction of the release, which is recorded as one whatever the order
+	// has become since it was asked.
+	Running bool
 }
 
 // RecordPoolClearance stores one answer to an order's clearance, or ends its run
@@ -357,7 +361,30 @@ func (a *Allocator) RecordPoolClearance(ctx context.Context, obs PoolClearanceOb
 			return nil
 		case err != nil:
 			return fmt.Errorf("alloc: read pool order %s: %w", obs.Order, err)
-		case row.State != PoolPlaced || row.ReleaseRequestedAt == "" || row.NodeName != obs.Node:
+		case row.NodeName != obs.Node:
+			return nil
+		case obs.Running:
+			// COMPUTE LISTED IS A CONTRADICTION, recorded here whatever the order has become
+			// since the question, sealed included: the inventory the same answer carried may
+			// not have been recorded (a reconciliation that failed), and this is then the only
+			// record of it. Only an answer of the node's current registration says so.
+			fence, err := q.ReadNodeFence(ctx, obs.Node)
+
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				return nil
+			case err != nil:
+				return fmt.Errorf("alloc: read the fence of node %s: %w", obs.Node, err)
+			case fence.Epoch != obs.Fence.Epoch:
+				return nil
+			}
+
+			if _, err := q.ContradictPoolRelease(ctx, obs.Node); err != nil {
+				return fmt.Errorf("alloc: contradict the release of pool node %s: %w", obs.Node, err)
+			}
+
+			return nil
+		case row.State != PoolPlaced || row.ReleaseRequestedAt == "":
 			return nil
 		}
 
@@ -509,7 +536,9 @@ func (a *Allocator) PoolReleaseRefused(ctx context.Context, order string) (bool,
 	err := a.db.View(ctx, func(tx querier) error {
 		_, err := poolReleaseProofTx(ctx, state.ReadQueries(tx), order)
 		refused = errors.Is(err, ErrPoolReleaseContradicted)
-		if refused {
+		// AN ORDER THAT MOVED ON SINCE THE CALLER READ IT is not refused: a release that
+		// completed in between is the ordinary case, and a listing must not fail on it.
+		if refused || errors.Is(err, ErrPoolOrderMoved) {
 			return nil
 		}
 

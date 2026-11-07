@@ -102,8 +102,20 @@ func (p *Plane) BarrierLoop(ctx context.Context) {
 		return
 	}
 
-	// A POOL ROUND IS JOINED BEFORE THE LOOP RETURNS, as every loop's goroutines are.
-	defer p.poolRound.Wait()
+	// THE POOL'S CLEARANCES ON A LOOP OF THEIR OWN, so a deployment barrier waiting on a
+	// slow node never delays a release, and joined before this returns, as every loop's
+	// goroutines are.
+	var pool sync.WaitGroup
+
+	pool.Add(1)
+
+	go func() {
+		defer pool.Done()
+
+		p.poolClearanceLoop(ctx)
+	}()
+
+	defer pool.Wait()
 
 	// A STEERED PACE COMES BEFORE THE FIRST ROUND TOO, or the round the loop
 	// starts with could land among a harness's own.
@@ -129,32 +141,9 @@ func (p *Plane) BarrierLoop(ctx context.Context) {
 	}
 }
 
-// barrierPass runs one round and reports how long to wait before the next.
-//
-// TWO QUESTIONS, EACH ON ITS OWN PACE: the deployment's barrier, when a drain waits on
-// one, and the nodes pool releases wait on, which need no seal, so a host leaving the pool
-// is proved idle while the rest of the deployment keeps working (ADR-030).
+// barrierPass runs one round of the deployment's barrier, if a drain waits on one, and
+// reports how long to wait before the next.
 func (p *Plane) barrierPass(ctx context.Context) time.Duration {
-	wait := p.deploymentBarrierPass(ctx)
-
-	if (p.poolAskedAt.IsZero() || time.Since(p.poolAskedAt) >= barrierRound) && p.poolAsking.CompareAndSwap(false, true) {
-		p.poolAskedAt = time.Now()
-		p.poolRound.Add(1)
-
-		go func() {
-			defer p.poolRound.Done()
-			defer p.poolAsking.Store(false)
-
-			p.askPoolClearances(ctx)
-		}()
-	}
-
-	return wait
-}
-
-// deploymentBarrierPass runs one round of the deployment's barrier, if a drain waits on
-// one, and reports how long to wait before the next.
-func (p *Plane) deploymentBarrierPass(ctx context.Context) time.Duration {
 	barrier, found, err := p.barriers.ComputeBarrierInForce(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -295,22 +284,52 @@ func answersInventory(n *node) bool {
 // Over-invalidating is possible and harmless: a launch that lands between the
 // capture and the queueing costs this round.
 func (p *Plane) askNode(ctx context.Context, n *node, barrierID string) {
-	fence, empty, asked := p.inventoryOf(ctx, n, barrierID)
+	fence, listed, asked := p.inventoryOf(ctx, n, barrierID)
 	if !asked {
 		return
 	}
 
-	obs := alloc.BarrierObservation{Node: n.name, BarrierID: barrierID, Fence: fence, Empty: empty}
+	obs := alloc.BarrierObservation{Node: n.name, BarrierID: barrierID, Fence: fence, Empty: listed == listedNothing}
 	if err := p.barriers.RecordBarrierObservation(ctx, obs); err != nil && ctx.Err() == nil {
 		p.log.Warn("could not record what a host said it is running",
 			"node", n.name, "error", err)
 	}
 }
 
-// askPoolClearances asks each node a pool release waits on what it runs, and records
-// each answer against the fence read before the question, as askNode does for the
-// deployment's barrier. A node not connected is not asked, and says nothing.
-func (p *Plane) askPoolClearances(ctx context.Context) {
+// poolClearanceLoop asks the nodes pool releases wait on what they run (ADR-030), with
+// no seal, so a host leaving the pool proves itself idle while the deployment keeps
+// working. It returns once ctx is done and every ask it started has.
+func (p *Plane) poolClearanceLoop(ctx context.Context) {
+	defer p.poolAsks.Wait()
+
+	wait := p.barrierPace
+
+	for {
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+
+				return
+			case <-timer.C:
+			}
+		}
+
+		p.schedulePoolAsks(ctx)
+
+		wait = barrierIdle
+		if p.barrierPace > 0 {
+			wait = p.barrierPace
+		}
+	}
+}
+
+// schedulePoolAsks starts an ask of each release's connected node that is due: not
+// asked within barrierRound, no ask of it still out, and fewer than barrierFanOut out in
+// all. Each runs on its own, so one node slow to answer holds up only its own release.
+func (p *Plane) schedulePoolAsks(ctx context.Context) {
 	targets, err := p.barriers.PoolClearanceTargets(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -320,47 +339,81 @@ func (p *Plane) askPoolClearances(ctx context.Context) {
 		return
 	}
 
-	// AT MOST barrierFanOut AT ONCE, each on its own, so one node slow to answer holds up
-	// only its own release.
-	var (
-		wg   sync.WaitGroup
-		slot = make(chan struct{}, barrierFanOut)
-	)
+	waiting := make(map[string]bool, len(targets))
 
 	for _, target := range targets {
+		waiting[target.Order] = true
+
 		n := p.poolClearanceNode(target.Node)
-		if n == nil {
+		if n == nil || !p.claimPoolAsk(target.Order, time.Now()) {
 			continue
 		}
 
-		wg.Add(1)
+		p.poolAsks.Add(1)
 
 		go func() {
-			defer wg.Done()
-
-			select {
-			case slot <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-
-			defer func() { <-slot }()
+			defer p.poolAsks.Done()
+			defer p.finishPoolAsk(target.Order)
 
 			p.askPoolClearance(ctx, n, target)
 		}()
 	}
 
-	wg.Wait()
+	p.forgetPoolAsks(waiting)
+}
+
+// claimPoolAsk takes the right to ask order's node now, or says it is not due.
+func (p *Plane) claimPoolAsk(order string, now time.Time) bool {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+
+	if p.poolAskedAt == nil {
+		p.poolAskedAt, p.poolInFlight = map[string]time.Time{}, map[string]bool{}
+	}
+
+	if p.poolInFlight[order] || len(p.poolInFlight) >= barrierFanOut {
+		return false
+	}
+
+	if last, ok := p.poolAskedAt[order]; ok && now.Sub(last) < barrierRound {
+		return false
+	}
+
+	p.poolInFlight[order], p.poolAskedAt[order] = true, now
+
+	return true
+}
+
+func (p *Plane) finishPoolAsk(order string) {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+
+	delete(p.poolInFlight, order)
+}
+
+// forgetPoolAsks drops what it knew of an order no release waits on any more.
+func (p *Plane) forgetPoolAsks(waiting map[string]bool) {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+
+	for order := range p.poolAskedAt {
+		if !waiting[order] && !p.poolInFlight[order] {
+			delete(p.poolAskedAt, order)
+		}
+	}
 }
 
 // askPoolClearance asks one release's node what it runs and records the answer.
 func (p *Plane) askPoolClearance(ctx context.Context, n *node, target alloc.PoolClearanceTarget) {
-	fence, empty, asked := p.inventoryOf(ctx, n, poolClearanceID(target.Order))
+	fence, listed, asked := p.inventoryOf(ctx, n, poolClearanceID(target.Order))
 	if !asked {
 		return
 	}
 
-	obs := alloc.PoolClearanceObservation{Order: target.Order, Node: target.Node, Fence: fence, Empty: empty}
+	obs := alloc.PoolClearanceObservation{
+		Order: target.Order, Node: target.Node, Fence: fence,
+		Empty: listed == listedNothing, Running: listed == listedCompute,
+	}
 	if err := p.barriers.RecordPoolClearance(ctx, obs); err != nil && ctx.Err() == nil {
 		p.log.Warn("could not record what a pool host leaving said it is running",
 			"order", target.Order, "node", target.Node, "error", err)
@@ -386,30 +439,40 @@ func (p *Plane) poolClearanceNode(name string) *node {
 	return n
 }
 
+// listing is what an inventory answer said: nothing, compute, or no answer at all (a
+// host that could not be asked, could not read its provider, or answered another question).
+type listing int
+
+const (
+	listedNoAnswer listing = iota
+	listedNothing
+	listedCompute
+)
+
 // inventoryOf asks one host what it is running under askID, and reports the fence read
-// before the question, whether the answer was an empty inventory, and whether there is
-// anything to record: a host the ledger has no fence for has none.
-func (p *Plane) inventoryOf(ctx context.Context, n *node, barrierID string) (alloc.NodeFence, bool, bool) {
+// before the question, what the answer listed, and whether there is anything to record:
+// a host the ledger has no fence for has none.
+func (p *Plane) inventoryOf(ctx context.Context, n *node, barrierID string) (alloc.NodeFence, listing, bool) {
 	fence, found, err := p.barriers.NodeFenceOf(ctx, n.name)
 	if err != nil {
 		if ctx.Err() == nil {
 			p.log.Warn("could not read a host's barrier fence", "node", n.name, "error", err)
 		}
 
-		return alloc.NodeFence{}, false, false
+		return alloc.NodeFence{}, listedNoAnswer, false
 	}
 
 	if !found {
 		// In the plane's map and not in the ledger. Nothing can be proved about a
 		// host the clearance query will never walk, so there is nothing to record.
-		return alloc.NodeFence{}, false, false
+		return alloc.NodeFence{}, listedNoAnswer, false
 	}
 
 	id, err := commandID()
 	if err != nil {
 		p.log.Warn("could not mint an inventory command id", "node", n.name, "error", err)
 
-		return alloc.NodeFence{}, false, false
+		return alloc.NodeFence{}, listedNoAnswer, false
 	}
 
 	pend := &pending{
@@ -426,13 +489,13 @@ func (p *Plane) inventoryOf(ctx context.Context, n *node, barrierID string) (all
 
 	res, err := p.dispatch(ctx, n, pend)
 
-	empty := false
+	listed := listedNoAnswer
 
 	switch {
 	case err != nil:
 		// A host that could not be asked has not said it is empty. The run ends.
 		if ctx.Err() != nil {
-			return alloc.NodeFence{}, false, false
+			return alloc.NodeFence{}, listedNoAnswer, false
 		}
 
 		p.log.Info("a host did not answer what it is running; its idle run starts again",
@@ -447,7 +510,10 @@ func (p *Plane) inventoryOf(ctx context.Context, n *node, barrierID string) (all
 		p.log.Warn("a host answered an inventory for a different barrier",
 			"node", n.name, "asked", barrierID, "answered", res.BarrierID)
 	default:
-		empty = len(res.Instances) == 0
+		listed = listedNothing
+		if len(res.Instances) > 0 {
+			listed = listedCompute
+		}
 
 		// A REAL INVENTORY, SO IT SETTLES REAL CAPACITY. The quarantine resolver
 		// is the one path that already fences an inventory against the node epoch,
@@ -465,7 +531,7 @@ func (p *Plane) inventoryOf(ctx context.Context, n *node, barrierID string) (all
 		}
 	}
 
-	return fence, empty, true
+	return fence, listed, true
 }
 
 // BarrierTargetsForTest names the hosts a barrier round would ask, sorted.
