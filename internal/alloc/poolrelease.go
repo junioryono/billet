@@ -304,8 +304,8 @@ func sealPoolOrderTx(ctx context.Context, q state.WriteOps, order, node, request
 //
 // AND STILL PROVES (Codex, 2026-11-07): a joined host's holdings are read again at every
 // ask, because an inventory already in flight when the seal committed can report compute
-// after it, and a node arriving withdraws its decommission's proof. Both are durable in
-// decommission_proven, so a contradicted seal answers ErrPoolReleaseContradicted at every
+// after it, and a node arriving contradicts its release. Both are durable in the order's
+// release_contradicted, so a contradicted seal answers ErrPoolReleaseContradicted at every
 // ask until a person takes the host back and closes the order.
 func (a *Allocator) PoolReleaseProof(ctx context.Context, order string) (releaseproof.Proof, error) {
 	var proof releaseproof.Proof

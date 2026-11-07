@@ -37,15 +37,18 @@ type Holdings struct {
 	Leases     int
 	Quarantine int
 	Custody    int
-	// Inventory is how many instances the node's last inventory reported: one from its
-	// current registration, received after the host was sealed against placement, so
-	// nothing could have been placed on it since. Negative when there is no such report.
+	// Inventory is how many instances the host is proved to run, never an inventory's
+	// count alone, which is not proof (ADR-030): zero only when its node never registered,
+	// or was decommissioned on the compute barrier's proof with nothing it said since
+	// contradicting that; the instances an inventory of its current registration reports
+	// when there are any; negative, could-not-tell, otherwise. The caller derives it.
 	Inventory int
 }
 
 // NewDrained builds the proof a drained host is released on: sealed against placement,
-// and holding no lease, no quarantine and no custody, with its node's last inventory
-// empty. A count that could not be read refuses like a holding.
+// and holding no lease, no quarantine and no custody, and proved to run nothing (see
+// Holdings.Inventory for what proves it). A count that could not be read refuses like a
+// holding.
 func NewDrained(h Holdings) (Proof, error) {
 	counts := []int{h.Leases, h.Quarantine, h.Custody, h.Inventory}
 	switch {
