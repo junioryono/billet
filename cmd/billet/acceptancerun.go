@@ -183,6 +183,7 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 		fmt.Fprintf(env.Stderr, "acceptance: could not write the evidence: %v\n", err)
 	}
 
+	var downErr error
 	if opts.noTeardown {
 		// SAID EXACTLY: the services are STOPPED. An earlier version of this said
 		// the deployment "was left standing", which was false — both children are
@@ -192,16 +193,15 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 			"but nothing was destroyed.\n")
 		fmt.Fprintf(env.Stdout, "This run's scale sets and compute are still there. Destroy them with\n")
 		fmt.Fprintf(env.Stdout, "  billet acceptance down --workspace %s\n", dir)
-
-		return waitErr
+	} else {
+		downErr = tearDownAcceptance(teardownCtx, env, ws, proved)
 	}
 
-	downErr := tearDownAcceptance(teardownCtx, env, ws, proved)
-
-	// THE RUN'S OWN FAILURE WINS. A teardown that also failed is reported beside
-	// it rather than replacing it, because "the job did not run" and "the cleanup
-	// did not finish" are two things an operator has to know and only one of them
-	// is what they came for.
+	// THE RUN'S OWN FAILURE WINS, AND THE PROOF'S FAILS IT EITHER WAY. A teardown that
+	// also failed is reported beside it rather than replacing it, because "the job did
+	// not run" and "the cleanup did not finish" are two things an operator has to know
+	// and only one of them is what they came for; and a run sent --no-teardown is torn
+	// down later by `down`, which has no barrier of its own to fail.
 	return errors.Join(waitErr, proofErr, downErr)
 }
 

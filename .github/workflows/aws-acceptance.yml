@@ -45,7 +45,10 @@ jobs:
   matrix:
     runs-on: ubuntu-24.04
     environment: acceptance
-    timeout-minutes: 300
+    # FIVE DISPATCH PHASES OF AT MOST 45 MINUTES EACH (images, cold, warm, and the
+    # two-writer runs of each architecture), the host's run waiting 240 of them, then the
+    # judge and the teardown: GitHub's six hours for a hosted job is the ceiling.
+    timeout-minutes: 360
     env:
       ARCHS: ${{ inputs.archs || 'x64' }}
       RUN: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -92,23 +95,37 @@ jobs:
           role-to-assume: ${{ secrets.ACCEPTANCE_ROLE_ARN }}
           aws-region: ${{ vars.ACCEPTANCE_REGION }}
           role-session-name: billet-acceptance-${{ github.run_id }}
-          # LONGER THAN THE RUN: the host's run may wait 150 minutes, and polling SSM
-          # after the session ended would leave the host running.
+          # LONGER THAN THE RUN: the host's run may wait 240 minutes, and polling SSM
+          # after the session ended would leave the host running. The judge and the
+          # teardown take a session of their own.
           role-duration-seconds: 18000
-      - name: No earlier run was left for a person
+      - id: hold
+        name: Hold the host for this run
         run: |
-          set -euo pipefail
-          # A RUN LEFT TO FINISH ITS TEARDOWN HOLDS THE HOST: a second run beside it
-          # would share its node and could stop the host under it. A person who has
-          # finished it deletes /billet-acceptance/held.
-          if held=$(aws ssm get-parameter --name /billet-acceptance/held --query Parameter.Value --output text 2>&1); then
-            echo "run $held was left for a person to finish its teardown on $HOST; delete /billet-acceptance/held once it is" >&2
-            exit 1
+          set -uo pipefail
+          # THE HOST IS HELD FOR THE LENGTH OF THE RUN, and taken in one step: a put that
+          # refuses to overwrite is the one answer to whether another run holds it. Every
+          # later step that touches the host runs only when this one succeeded, so a run
+          # refused here leaves a held host as it found it. The hold is released only
+          # once this run's teardown finished; a run left for a person keeps it, and the
+          # person deletes /billet-acceptance/held once the teardown is done.
+          if err=$(aws ssm put-parameter --name /billet-acceptance/held --type String --value "$RUN" \
+            --no-overwrite 2>&1 >/dev/null); then
+            exit 0
           fi
-          case "$held" in
-          *ParameterNotFound*) ;;
-          *) echo "could not tell whether an earlier run holds the host: $held" >&2; exit 1 ;;
+          # AN ANSWER LOST AFTER THE PUT LANDED is this run's hold all the same.
+          if held=$(aws ssm get-parameter --name /billet-acceptance/held --query Parameter.Value \
+            --output text 2>&1) && [ "$held" = "$RUN" ]; then
+            exit 0
+          fi
+          case "$err" in
+          *ParameterAlreadyExists*)
+            echo "run $held holds the host $HOST, or was left for a person to finish its teardown;" \
+              "delete /billet-acceptance/held once it is done" >&2
+            ;;
+          *) echo "could not tell whether another run holds the host: $err" >&2 ;;
           esac
+          exit 1
       - name: Send this run's binary and scripts
         run: |
           set -euo pipefail
@@ -175,7 +192,7 @@ jobs:
           # DISPATCHED AT ONCE AFTER THIS, though the deployment's scale sets exist only
           # once its server has started: a job queued on a label before its scale set
           # existed was assigned when the control plane came up (2026-09-04).
-          id=$(scripts/acceptance/ssm-run.sh send "$HOST" 10800 \
+          id=$(scripts/acceptance/ssm-run.sh send "$HOST" 16200 \
             "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' run '$RUN_DIR' '${{ steps.repo.outputs.jobs }}'")
           echo "id=$id" >>"$GITHUB_OUTPUT"
       - id: labels
@@ -277,12 +294,22 @@ jobs:
       # was recorded, because a run SSM accepted before the step that sent it failed is
       # still a run; the teardown's `down` waits for it too.
       - name: Stop the host's run early
-        if: ${{ failure() || cancelled() }}
+        if: ${{ (failure() || cancelled()) && steps.hold.outcome == 'success' }}
         run: |
           scripts/acceptance/ssm-run.sh run "$HOST" 120 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' stop '$RUN_DIR'"
       - name: Wait for the host's run, which writes the evidence and stops its services
         if: ${{ always() && steps.host-run.outputs.id != '' }}
-        run: scripts/acceptance/ssm-run.sh wait "$HOST" "${{ steps.host-run.outputs.id }}" 10800
+        run: scripts/acceptance/ssm-run.sh wait "$HOST" "${{ steps.host-run.outputs.id }}" 16200
+      # A SESSION OF ITS OWN FOR THE JUDGE AND THE TEARDOWN, as long as the first: the
+      # teardown may wait for the run twice (`stopped`, then `down`) before it can say
+      # what it left, and the first session may be near its end by now.
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: ${{ always() && steps.hold.outcome == 'success' }}
+        with:
+          role-to-assume: ${{ secrets.ACCEPTANCE_ROLE_ARN }}
+          aws-region: ${{ vars.ACCEPTANCE_REGION }}
+          role-session-name: billet-acceptance-${{ github.run_id }}-down
+          role-duration-seconds: 18000
       - name: Judge the cells
         if: ${{ always() && steps.host-run.outputs.id != '' }}
         run: |
@@ -311,14 +338,8 @@ jobs:
             out/run.log
             out/runs
           if-no-files-found: ignore
-      - uses: aws-actions/configure-aws-credentials@v4
-        if: always()
-        with:
-          role-to-assume: ${{ secrets.ACCEPTANCE_ROLE_ARN }}
-          aws-region: ${{ vars.ACCEPTANCE_REGION }}
-          role-session-name: billet-acceptance-${{ github.run_id }}-down
       - name: Take everything down
-        if: always()
+        if: ${{ always() && steps.hold.outcome == 'success' }}
         env:
           PREPARED: ${{ steps.prepare.outcome }}
         run: |
@@ -379,10 +400,8 @@ jobs:
             echo "left for a person to finish the teardown in $RUN_DIR on $HOST, which is left running:" >&2
             echo "  the policies billet-matrix-$RUN and billet-matrix-$RUN-down on $HOST_ROLE, /srv/billet-accept/app.pem on the host," >&2
             echo "  and the parameter /billet-acceptance/runs/$RUN/app-key" >&2
-            # AND THE HOST IS HELD, so no later run starts beside this one.
-            if ! aws ssm put-parameter --name /billet-acceptance/held --type String --value "$RUN" --overwrite >/dev/null; then
-              echo "could not mark the host held; a later run could start beside this one" >&2
-            fi
+            # AND THE HOST STAYS HELD, by this run's hold, so no later run starts beside it.
+            echo "the host stays held: delete /billet-acceptance/held once the teardown is done" >&2
             exit "$status"
           fi
           gone "the run's node policy" NoSuchEntity \
@@ -393,6 +412,14 @@ jobs:
             aws ssm delete-parameter --name "/billet-acceptance/runs/$RUN/app-key"
           if ! aws ec2 stop-instances --instance-ids "$HOST" >/dev/null; then
             echo "could not stop the host $HOST" >&2
+            status=1
+          fi
+          # THE HOLD GOES LAST, and only while it is still this run's.
+          if held=$(aws ssm get-parameter --name /billet-acceptance/held --query Parameter.Value \
+            --output text 2>&1) && [ "$held" = "$RUN" ]; then
+            gone "the host's hold" ParameterNotFound aws ssm delete-parameter --name /billet-acceptance/held
+          else
+            echo "the host's hold is not this run's to release: $held" >&2
             status=1
           fi
           exit "$status"

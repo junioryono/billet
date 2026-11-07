@@ -324,7 +324,7 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 		if out, code := f.run(t, "acceptance/matrix-host.sh", []string{"MATRIX_POLL=0.1"}, "run", dir, "27"); strconv.Itoa(code) != status {
 			t.Fatalf("a run that ended %s: exit %d\n%s", status, code, out)
 		}
-		if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 150m --no-teardown\n") {
+		if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 240m --no-teardown\n") {
 			t.Fatalf("billet was run as:\n%s", log)
 		}
 		if got, err := os.ReadFile(filepath.Join(dir, "run.exit")); err != nil || string(got) != status+"\n" {
@@ -557,6 +557,17 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	}
 	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "stopped", dir); code != 0 || !strings.Contains(out, "no run lives") {
 		t.Fatalf("stopped with no live run: exit %d\n%s", code, out)
+	}
+	if log := billetLog(t, f); !strings.Contains(log, "acceptance stopped --workspace "+dir+"/ws\n") {
+		t.Fatalf("stopped never asked the services' own locks:\n%s", log)
+	}
+	// A SERVICE THAT OUTLIVED THE RUN, a node draining past its stop's grace, is live.
+	f.fixture(t, "acceptance-stopped.exit", "1")
+	if out, code := f.run(t, "acceptance/matrix-host.sh", env, "stopped", dir); code != 1 || !strings.Contains(out, "may still live") {
+		t.Fatalf("stopped beside a service that outlived the run: exit %d\n%s", code, out)
+	}
+	if err := os.Remove(filepath.Join(f.dir, "acceptance-stopped.exit")); err != nil {
+		t.Fatal(err)
 	}
 	if log, err := os.ReadFile(filepath.Join(f.dir, "billet.log")); err == nil && strings.Contains(string(log), "acceptance down") {
 		t.Fatalf("stopped took the deployment down:\n%s", log)

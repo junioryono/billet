@@ -36,8 +36,9 @@
 # still be writing.
 #
 # stopped requests a stop and waits as down does, and takes nothing down: it exits 0 only
-# once no run lives in <run-dir>, which is when the caller may put the teardown's grant
-# on the role, so no live node ever holds it.
+# once no run lives in <run-dir> and `billet acceptance stopped` has taken both of the
+# run's services' own locks, which is when the caller may put the teardown's grant on
+# the role, so no live node ever holds it.
 #
 # down requests a stop, waits up to MATRIX_DOWN_WAIT seconds (default 1800) for the run's
 # lock to be free (a reboot frees it; nothing else does while the run lives), then destroys whatever the run left (`billet acceptance down`, idempotent)
@@ -94,7 +95,7 @@ prepare)
 	;;
 run)
 	[ "$#" -eq 3 ] || usage
-	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 150m --no-teardown
+	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 240m --no-teardown
 	;;
 stop)
 	[ "$#" -eq 2 ] || usage
@@ -134,6 +135,12 @@ stopped)
 			echo "matrix: the run is still live; its workspace is $ws" >&2
 			exit 1
 		fi
+	fi
+	# AND ITS SERVICES, by their own locks: the run returns once its stop's grace is
+	# over, and a node still draining past it holds none of the run's lock.
+	if [ -f "$ws/acceptance.json" ] && ! "$billet" acceptance stopped --workspace "$ws"; then
+		echo "matrix: a service of the run may still live; its workspace is $ws" >&2
+		exit 1
 	fi
 	echo "matrix: no run lives in $run_dir"
 	;;
