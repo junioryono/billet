@@ -146,6 +146,27 @@ func (l *Listener) recoverSession(ctx context.Context, cause error) error {
 	}
 }
 
+// openFirstSession opens the session of a listener built without one, through the open
+// WithSessionReopen gave it, which waits out a session a stopped control plane left.
+//
+// BEFORE ANY POLL AND AFTER THE CLEANUP LOOP STARTED, and nothing that runs meanwhile reads
+// the session: the heartbeat and cleanup loops never do, so it is set here without the mutex,
+// as install sets it while the poll loop is the only reader.
+func (l *Listener) openFirstSession(ctx context.Context) error {
+	if l.reopen == nil {
+		return fmt.Errorf("server: the listener for %s has no session and nothing to open one with", l.tier)
+	}
+
+	session, err := l.reopen(ctx)
+	if err != nil {
+		return err
+	}
+
+	l.session = session
+
+	return nil
+}
+
 // install makes session this listener's, as a restart would find it.
 func (l *Listener) install(session Session) {
 	l.session = session

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"strings"
@@ -241,6 +242,101 @@ func TestAHoldSurvivesARestart(t *testing.T) {
 			})
 		})
 	}
+}
+
+// A RESTARTED LISTENER DESTROYS A HELD VM AT ITS BOUND WHILE ITS SESSION IS STILL REFUSED (#783).
+// GitHub keeps a stopped control plane's session for about 90 s, and the completions a restart
+// restores need none of it: their cleanup runs before the session opens, through Run itself.
+func TestARestartDestroysAHeldVMAtItsBoundBeforeItsSessionOpens(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p, _, failed := heldPool(t, "Failed")
+		p.complete(t, failed)
+
+		store, runner := p.l.completionStore, p.l.runner
+
+		time.Sleep(testHold - time.Minute)
+
+		var opens atomic.Int64
+
+		release := make(chan struct{})
+		l := NewListener(p.a, p.l.tier, nil, WithRunner(runner), WithRunnerRegistry(p.registry),
+			WithSessionReopen(func(ctx context.Context) (Session, error) {
+				opens.Add(1)
+
+				// REFUSED UNTIL THE TEST SAYS, as GitHub refuses the successor of a session
+				// a stopped control plane left.
+				select {
+				case <-release:
+					return p.session, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}))
+		l.holdOnFailure, l.completionStore = testHold, store
+		l.writeJobResult = func(context.Context, string, string, int64) error { return nil }
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- l.Run(ctx) }()
+
+		synctest.Wait()
+
+		if len(p.destroyed) != 0 {
+			t.Fatalf("destroyed %v inside the hold, while the session waits", p.destroyed)
+		}
+
+		// PAST THE BOUND, with the session still refused, and long enough for the cleanup clock.
+		time.Sleep(time.Minute + 30*time.Second)
+		synctest.Wait()
+
+		if opens.Load() != 1 {
+			t.Fatalf("the session was asked for %d times, want one open still waiting", opens.Load())
+		}
+
+		if !slices.Contains(p.destroyed, 11) {
+			t.Errorf("destroyed %v past the bound while the session was refused; the held VM waited for GitHub",
+				p.destroyed)
+		}
+
+		close(release)
+		cancel()
+
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run = %v", err)
+		}
+	})
+}
+
+// A LISTENER STOPPED WHILE ITS FIRST SESSION IS REFUSED RETURNS, closes nothing it never opened, and
+// leaves its cleanup loop joined (#783).
+func TestAListenerStoppedBeforeItsSessionOpensReturns(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p := newRunnerlessPool(t, job11)
+
+		l := NewListener(p.a, p.l.tier, nil, WithRunner(p.l.runner), WithRunnerRegistry(p.registry),
+			WithSessionReopen(func(ctx context.Context) (Session, error) {
+				<-ctx.Done()
+
+				return nil, ctx.Err()
+			}))
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+
+		go func() { done <- l.Run(ctx) }()
+
+		synctest.Wait()
+		cancel()
+
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Errorf("Run = %v, want the cancellation", err)
+		}
+	})
 }
 
 // AN ENDED HOLD ENDS IT: whatever ended it, the next pass destroys, and what ended it stands.
