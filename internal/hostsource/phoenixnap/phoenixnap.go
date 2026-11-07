@@ -182,6 +182,9 @@ func (s *Source) LogValue() slog.Value { return slog.StringValue(s.String()) }
 // Name is the source's kind.
 func (s *Source) Name() string { return Name }
 
+// Scope is the account the API client orders in, named by the client.
+func (s *Source) Scope(context.Context) (string, error) { return Name + ":" + s.creds.ClientID, nil }
+
 // Terms are an hourly plan's: billed by the started hour, no minimum term. The lead
 // time is not measured, since no order has been accepted, so it is zero, which the
 // pool reads as unknown. An order is NOT idempotent: the API takes no idempotency key,
@@ -229,19 +232,23 @@ func (s *Source) Order(ctx context.Context, req hostsource.Request) (hostsource.
 	arch, declared := s.shapes[req.Shape]
 	switch {
 	case !orderPattern.MatchString(req.Order):
-		return hostsource.Host{}, fmt.Errorf("phoenixnap: order %q is not 1 to 48 lowercase letters, digits and dashes", req.Order)
+		return hostsource.Host{}, fmt.Errorf("%w: phoenixnap: order %q is not 1 to 48 lowercase letters, digits and dashes",
+			hostsource.ErrNotSent, req.Order)
 	case req.Location == "":
-		return hostsource.Host{}, errors.New("phoenixnap: an order needs a location")
+		return hostsource.Host{}, fmt.Errorf("%w: phoenixnap: an order needs a location", hostsource.ErrNotSent)
 	case !declared:
-		return hostsource.Host{}, fmt.Errorf("phoenixnap: %s is not a declared shape", req.Shape)
+		return hostsource.Host{}, fmt.Errorf("%w: phoenixnap: %s is not a declared shape", hostsource.ErrNotSent, req.Shape)
 	case req.Arch != "" && req.Arch != arch:
-		return hostsource.Host{}, fmt.Errorf("phoenixnap: %s is %s, not %s", req.Shape, arch, req.Arch)
+		return hostsource.Host{}, fmt.Errorf("%w: phoenixnap: %s is %s, not %s", hostsource.ErrNotSent, req.Shape, arch, req.Arch)
 	}
+	// BEFORE THE POST, A FAILED READ SENT NOTHING: an order that stops here can have
+	// placed no server, so it is not could-not-tell. The source's own answers (a full
+	// quota, no stock, a refusal) stay what they are.
 	if err := s.checkQuota(ctx); err != nil {
-		return hostsource.Host{}, err
+		return hostsource.Host{}, beforeThePost(err)
 	}
 	if err := s.checkStock(ctx, req.Shape, req.Location); err != nil {
-		return hostsource.Host{}, err
+		return hostsource.Host{}, beforeThePost(err)
 	}
 	body, err := json.Marshal(orderBody{
 		Hostname:     hostnamePrefix + req.Order,
@@ -255,7 +262,7 @@ func (s *Source) Order(ctx context.Context, req hostsource.Request) (hostsource.
 		}},
 	})
 	if err != nil {
-		return hostsource.Host{}, fmt.Errorf("phoenixnap: encode the order: %w", err)
+		return hostsource.Host{}, fmt.Errorf("%w: phoenixnap: encode the order: %w", hostsource.ErrNotSent, err)
 	}
 	var got server
 	if err := s.call(ctx, http.MethodPost, "/bmc/v1/servers", body, &got); err != nil {
@@ -266,6 +273,16 @@ func (s *Source) Order(ctx context.Context, req hostsource.Request) (hostsource.
 	}
 
 	return got.host(), nil
+}
+
+// beforeThePost keeps the source's own answers and marks every other failure before
+// the order was sent as one that sent nothing.
+func beforeThePost(err error) error {
+	if errors.Is(err, hostsource.ErrQuota) || errors.Is(err, hostsource.ErrNoStock) || errors.Is(err, hostsource.ErrRefused) {
+		return err
+	}
+
+	return fmt.Errorf("%w: %w", hostsource.ErrNotSent, err)
 }
 
 // Describe reads one server.
