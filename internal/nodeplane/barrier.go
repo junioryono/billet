@@ -418,6 +418,10 @@ func (p *Plane) forgetPoolAsks(waiting map[string]bool) {
 
 // askPoolClearance asks one release's node what it runs and records the answer.
 func (p *Plane) askPoolClearance(ctx context.Context, n *node, target alloc.PoolClearanceTarget) {
+	// THE TIME THE QUESTION IS PUT, before it is dispatched, is what the run is measured
+	// by: an answer recorded late says nothing about the time it was recorded.
+	askedAt := time.Now()
+
 	fence, listed, asked := p.inventoryOf(ctx, n, poolClearanceID(target.Order))
 	if !asked {
 		return
@@ -425,7 +429,7 @@ func (p *Plane) askPoolClearance(ctx context.Context, n *node, target alloc.Pool
 
 	obs := alloc.PoolClearanceObservation{
 		Order: target.Order, Node: target.Node, Fence: fence,
-		Empty: listed == listedNothing, Running: listed == listedCompute,
+		Empty: listed == listedNothing, Running: listed == listedCompute, AskedAt: askedAt,
 	}
 	if err := p.barriers.RecordPoolClearance(ctx, obs); err != nil && ctx.Err() == nil {
 		p.log.Warn("could not record what a pool host leaving said it is running",

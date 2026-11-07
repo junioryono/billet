@@ -405,6 +405,7 @@ type WriteOps interface {
 	UpsertIssuedEnrollment(ctx context.Context, arg ledgerdb.UpsertIssuedEnrollmentParams) error
 	UpsertNodeInventory(ctx context.Context, arg ledgerdb.UpsertNodeInventoryParams) error
 	ContradictPoolRelease(ctx context.Context, node string) (int64, error)
+	UndoPoolRetirement(ctx context.Context, arg ledgerdb.UndoPoolRetirementParams) error
 	RecordPoolClearanceRun(ctx context.Context, arg ledgerdb.RecordPoolClearanceRunParams) (int64, error)
 	EndPoolClearanceRun(ctx context.Context, orderID string) error
 	ForceClosePoolOrder(ctx context.Context, arg ledgerdb.ForceClosePoolOrderParams) (int64, error)

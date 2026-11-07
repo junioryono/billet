@@ -392,6 +392,14 @@ SELECT EXISTS(SELECT 1 FROM pool_orders p
                WHERE (p.node_name = @name OR 'pool-' || p.order_id = @name)
                  AND p.state IN ('sealed', 'released', 'gone'));
 
+-- name: UndoPoolRetirement :exec
+-- A sealed pool host's node listed compute since its seal retired it (ADR-030): the
+-- retirement the seal recorded is undone, so `billet drain` expects the node again and
+-- waits on it rather than counting it proved idle. Only the seal's own (@actor); a
+-- decommission a person recorded stays theirs.
+UPDATE nodes SET decommissioned_at = '', decommission_proven = 0, decommission_actor = ''
+ WHERE name = @name AND decommission_actor = @actor;
+
 -- name: MarkNodeDrainedForRelease :exec
 -- Take a pool host out of placement for its release: unfenced, because the decision is
 -- the control plane's and holds for every incarnation, which the registration upsert

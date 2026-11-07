@@ -337,7 +337,15 @@ type PoolClearanceObservation struct {
 	// but a contradiction of the release, which is recorded as one whatever the order
 	// has become since it was asked.
 	Running bool
+	// AskedAt is when the question was put, read before it was dispatched. The run is
+	// measured between the times its answers were ASKED, never when they were recorded,
+	// so an early answer recorded late cannot span the grace; zero is no answer.
+	AskedAt time.Time
 }
+
+// poolReleaseActor is who a seal records as decommissioning its node, which a
+// contradiction since undoes (computeListedTx), and no person's decommission is.
+const poolReleaseActor = "billet pool release"
 
 // RecordPoolClearance stores one answer to an order's clearance, or ends its run
 // (ADR-030): a pool host draining alone proves itself idle without the deployment's
@@ -397,12 +405,13 @@ func (a *Allocator) RecordPoolClearance(ctx context.Context, obs PoolClearanceOb
 			return end()
 		case err != nil:
 			return fmt.Errorf("alloc: read the fence of node %s: %w", obs.Node, err)
-		case fence.Epoch != obs.Fence.Epoch || fence.DispatchGeneration != obs.Fence.Dispatch || !obs.Empty:
+		case fence.Epoch != obs.Fence.Epoch || fence.DispatchGeneration != obs.Fence.Dispatch || !obs.Empty ||
+			obs.AskedAt.IsZero():
 			return end()
 		}
 
 		if _, err := q.RecordPoolClearanceRun(ctx, ledgerdb.RecordPoolClearanceRunParams{
-			Epoch: fence.Epoch, Dispatch: fence.DispatchGeneration, Now: ts(a.now().UTC()),
+			Epoch: fence.Epoch, Dispatch: fence.DispatchGeneration, Now: ts(obs.AskedAt.UTC()),
 			OrderID: obs.Order, Node: obs.Node,
 		}); err != nil {
 			return fmt.Errorf("alloc: record pool order %s's clearance: %w", obs.Order, err)
@@ -459,7 +468,7 @@ func retireReleasedNodeTx(ctx context.Context, q state.WriteOps, node string, no
 	}
 
 	if err := q.DecommissionNode(ctx, ledgerdb.DecommissionNodeParams{
-		DecommissionedAt: ts(now), DecommissionProven: 1, DecommissionActor: "billet pool release",
+		DecommissionedAt: ts(now), DecommissionProven: 1, DecommissionActor: poolReleaseActor,
 		Name: node,
 	}); err != nil {
 		return fmt.Errorf("alloc: take %s out of the fleet: %w", node, err)

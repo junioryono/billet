@@ -324,7 +324,7 @@ func TestASecondReleaseSealsWhatTheLedgerProves(t *testing.T) {
 		t.Fatalf("the fence of pool-p-live: %v, %v", found, err)
 	}
 	if err := a.RecordPoolClearance(ctx, alloc.PoolClearanceObservation{
-		Order: "p-live", Node: alloc.PoolNodeName("p-live"), Fence: fence, Empty: true,
+		Order: "p-live", Node: alloc.PoolNodeName("p-live"), Fence: fence, Empty: true, AskedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}

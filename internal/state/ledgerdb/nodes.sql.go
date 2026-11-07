@@ -914,6 +914,25 @@ func (q *Queries) ReadNodeSize(ctx context.Context, name string) (ReadNodeSizeRo
 	return i, err
 }
 
+const undoPoolRetirement = `-- name: UndoPoolRetirement :exec
+UPDATE nodes SET decommissioned_at = '', decommission_proven = 0, decommission_actor = ''
+ WHERE name = $1 AND decommission_actor = $2
+`
+
+type UndoPoolRetirementParams struct {
+	Name  string
+	Actor string
+}
+
+// A sealed pool host's node listed compute since its seal retired it (ADR-030): the
+// retirement the seal recorded is undone, so `billet drain` expects the node again and
+// waits on it rather than counting it proved idle. Only the seal's own (@actor); a
+// decommission a person recorded stays theirs.
+func (q *Queries) UndoPoolRetirement(ctx context.Context, arg UndoPoolRetirementParams) error {
+	_, err := q.db.ExecContext(ctx, undoPoolRetirement, arg.Name, arg.Actor)
+	return err
+}
+
 const upsertNodeRegistration = `-- name: UpsertNodeRegistration :one
 INSERT INTO nodes
    (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live,

@@ -843,6 +843,15 @@ func computeListedTx(ctx context.Context, q state.WriteOps, node string) error {
 		if err := q.DeleteBarrierRun(ctx, node); err != nil {
 			return fmt.Errorf("alloc: discard pool node %s's idle run: %w", node, err)
 		}
+
+		// AND A SEAL'S OWN RETIREMENT OF THE NODE IS UNDONE, so a drain expects it again
+		// rather than counting as proved idle a node that has since listed compute; a
+		// person's decommission is theirs, and stays.
+		if err := q.UndoPoolRetirement(ctx, ledgerdb.UndoPoolRetirementParams{
+			Name: node, Actor: poolReleaseActor,
+		}); err != nil {
+			return fmt.Errorf("alloc: return pool node %s to the fleet: %w", node, err)
+		}
 	}
 
 	return nil

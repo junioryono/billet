@@ -26,7 +26,7 @@ func answerClearanceAt(t *testing.T, a *Allocator, node string, fence NodeFence,
 		}
 	}
 	if err := a.RecordPoolClearance(t.Context(), PoolClearanceObservation{
-		Order: "pa", Node: node, Fence: fence, Empty: empty,
+		Order: "pa", Node: node, Fence: fence, Empty: empty, AskedAt: a.now(),
 	}); err != nil {
 		t.Fatalf("record a clearance answer: %v", err)
 	}
@@ -361,6 +361,97 @@ func TestOnlyADrainingOrdersIdleNodeIsAsked(t *testing.T) {
 	}
 	if o := readOrder(t, a, "pa"); !o.ClearanceSince.Equal(standing) {
 		t.Fatalf("an answer from another node moved the run: %+v", o)
+	}
+}
+
+// THE RUN IS MEASURED BY WHEN ITS ANSWERS WERE ASKED: an answer asked thirty seconds
+// after the first and recorded only after the grace spans thirty seconds, not the grace;
+// the first answer asked after the grace proves it.
+func TestAnAnswerRecordedLateSpansOnlyWhenItWasAsked(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := drainingPoolNode(t, a)
+	start := now
+
+	answerClearance(t, a, node, true)
+	now = start.Add(computeAbsenceGrace + time.Minute)
+	if err := a.RecordPoolClearance(ctx, PoolClearanceObservation{
+		Order: "pa", Node: node, Fence: fenceOf(t, a, node), Empty: true, AskedAt: start.Add(30 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitsUnsealed(t, a, "0a", "an answer asked thirty seconds in and recorded after the grace")
+
+	answerClearance(t, a, node, true)
+	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+		t.Fatalf("sealing on an answer asked after the grace: %v", err)
+	}
+}
+
+// AN ANSWER THAT DOES NOT SAY WHEN IT WAS ASKED IS NO ANSWER, and ends the run.
+func TestAnAnswerWithNoAskedTimeEndsTheRun(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	node := drainingPoolNode(t, a)
+	answerClearance(t, a, node, true)
+	if readOrder(t, a, "pa").ClearanceSince.IsZero() {
+		t.Fatal("the first answer began no run")
+	}
+	if err := a.RecordPoolClearance(t.Context(), PoolClearanceObservation{
+		Order: "pa", Node: node, Fence: fenceOf(t, a, node), Empty: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if o := readOrder(t, a, "pa"); !o.ClearanceSince.IsZero() {
+		t.Fatalf("an answer with no asked time kept the run: %+v", o)
+	}
+}
+
+// A SEAL'S OWN RETIREMENT OF ITS NODE IS UNDONE BY COMPUTE LISTED SINCE, so a drain
+// expects the node again rather than counting it proved idle; a person's decommission on
+// proof is theirs, and stays.
+func TestComputeListedAfterTheSealReturnsTheNodeToTheFleet(t *testing.T) {
+	t.Parallel()
+	for name, prove := range map[string]func(t *testing.T, a *Allocator, now *time.Time, node string){
+		"its own answers": func(t *testing.T, a *Allocator, now *time.Time, node string) {
+			t.Helper()
+			answerClearance(t, a, node, true)
+			*now = now.Add(computeAbsenceGrace)
+			answerClearance(t, a, node, true)
+		},
+		"a person's decommission": func(t *testing.T, a *Allocator, now *time.Time, node string) {
+			t.Helper()
+			decommissionOnProof(t, a, now, requestBarrier(t, a), node)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+			a := poolAllocator(t, &now)
+			ctx := t.Context()
+			node := drainingPoolNode(t, a)
+			prove(t, a, &now, node)
+			if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+
+			if err := a.RecordPoolClearance(ctx, PoolClearanceObservation{
+				Order: "pa", Node: node, Fence: fenceOf(t, a, node), Running: true, AskedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			excluded := slices.ContainsFunc(clearance(t, a).Excluded, func(e Exclusion) bool {
+				return e.Node == node && e.Proven
+			})
+			if want := name == "a person's decommission"; excluded != want {
+				t.Fatalf("after compute listed since the seal, the node is excluded as proved %v, want %v",
+					excluded, want)
+			}
+		})
 	}
 }
 
