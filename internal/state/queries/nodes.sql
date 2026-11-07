@@ -392,6 +392,22 @@ SELECT EXISTS(SELECT 1 FROM pool_orders p
                WHERE (p.node_name = @name OR 'pool-' || p.order_id = @name)
                  AND p.state IN ('sealed', 'released', 'gone'));
 
+-- name: UndoPoolRetirement :execrows
+-- A sealed pool host's node listed compute since its seal retired it (ADR-030): the
+-- retirement the seal recorded is undone, so `billet drain` expects the node again and
+-- waits on it rather than counting it proved idle. Only the seal's own (@actor); a
+-- decommission a person recorded stays theirs.
+UPDATE nodes SET decommissioned_at = '', decommission_proven = 0, decommission_actor = ''
+ WHERE name = @name AND decommission_actor = @actor;
+
+-- name: HandOverPoolRetirement :exec
+-- A closed order's node keeps the proved retirement its seal recorded, under the closing
+-- actor (@closing_actor), so compute listed after the order closed can no longer undo
+-- it: the order is terminal and runs no closing transaction again. Only the seal's own
+-- (@seal_actor); a person's decommission stays as they recorded it.
+UPDATE nodes SET decommission_actor = @closing_actor
+ WHERE name = @name AND decommission_actor = @seal_actor;
+
 -- name: MarkNodeDrainedForRelease :exec
 -- Take a pool host out of placement for its release: unfenced, because the decision is
 -- the control plane's and holds for every incarnation, which the registration upsert
@@ -399,11 +415,12 @@ SELECT EXISTS(SELECT 1 FROM pool_orders p
 UPDATE nodes SET drained = 1 WHERE name = @name;
 
 -- name: ReadNodeReleaseFacts :one
--- What a pool host's release proof reads of its node: its current epoch, whether a person
+-- What a pool host's release proof reads of its node: its current epoch and launch-dispatch
+-- generation, which a clearance run must have been taken under, whether a person
 -- decommissioned it on the compute barrier's proof, and its last inventory, which is null
 -- when it never reported one; an inventory of the current epoch reporting compute
 -- outweighs the decommission.
-SELECT n.epoch, n.decommission_proven, i.node_epoch, i.running
+SELECT n.epoch, n.dispatch_generation, n.decommission_proven, i.node_epoch, i.running
   FROM nodes n
   LEFT JOIN node_inventory i ON i.node = n.name
  WHERE n.name = @name;

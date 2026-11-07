@@ -57,11 +57,22 @@ func Pool(ctx context.Context, env cli.Env, args []string) error {
 
 		return nil
 	}
+	// WHAT THE RELEASE WOULD BE REFUSED ON NOW, never the contradiction flag alone: every
+	// registration sets the flag, and a host its node proved idle since is released
+	// though it reads set.
+	refused := map[string]bool{}
+	for i := range orders {
+		if o := &orders[i]; o.State == alloc.PoolSealed && o.ReleaseContradicted {
+			if refused[o.ID], err = a.PoolReleaseRefused(ctx, o.ID); err != nil {
+				return err
+			}
+		}
+	}
 
-	return printPoolOrders(env, orders)
+	return printPoolOrders(env, orders, refused)
 }
 
-func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
+func printPoolOrders(env cli.Env, orders []alloc.PoolOrder, refused map[string]bool) error {
 	w := tabwriter.NewWriter(env.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "ORDER\tARCH\tSOURCE\tSCOPE\tSHAPE\tLOCATION\tSTATE\tHOST\tNODE\tFIRST ATTEMPT\tREASON")
 	uncertain := 0
@@ -89,15 +100,19 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 		if o := &orders[i]; !o.ReleaseRequested.IsZero() {
 			if !releases {
 				fmt.Fprintf(env.Stdout, "\nReleased by a person (ADR-030). A draining host is out of placement, and is "+
-					"sealed, revoked and released once nothing holds it and its node is decommissioned on proof "+
-					"(docs/operating/bare-metal-pool.md).\n")
+					"sealed, revoked and released once nothing holds it and its node has answered empty twice across "+
+					"five minutes, or was decommissioned on proof (docs/operating/bare-metal-pool.md).\n")
 				releases = true
 			}
 			st := o.State
 			switch {
+			case o.State == alloc.PoolPlaced && !o.ClearanceSince.IsZero():
+				// HOW FAR THE NODE'S OWN PROOF HAS GOT, as answers; the proof is the ledger's.
+				st = fmt.Sprintf("draining, its node empty from %s to %s",
+					o.ClearanceSince.UTC().Format(time.RFC3339), o.ClearanceObserved.UTC().Format(time.RFC3339))
 			case o.State == alloc.PoolPlaced:
 				st = "draining"
-			case o.State == alloc.PoolSealed && o.ReleaseContradicted:
+			case refused[o.ID]:
 				// ITS NODE SAID IT IS BACK AFTER THE SEAL, so its source is never asked.
 				st = "sealed, contradicted since: take it back by hand and `billet pool close` it"
 			}
@@ -226,10 +241,11 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 
 		return nil
 	}
-	fmt.Fprintf(env.Stdout, "Released %s from placement. Once nothing holds its host and its node is decommissioned "+
-		"on proof (`billet nodes decommission %s`), the pool seals it, revokes its node's certificates and asks its "+
-		"source to take it back, or `billet pool release %s` (no reason) seals it; `billet pool` shows where it is.\n",
-		order, alloc.PoolNodeName(order), order)
+	fmt.Fprintf(env.Stdout, "Released %s from placement. The control plane asks its node what it runs; once nothing "+
+		"holds the host and the node has answered empty twice across five minutes, the pool seals it, revokes its "+
+		"node's certificates and asks its source to take it back, or `billet pool release %s` (no reason) seals it. "+
+		"Or drain the deployment and decommission it on proof (`billet nodes decommission %s`); a node that cannot "+
+		"answer proves neither. `billet pool` shows where it is.\n", order, order, alloc.PoolNodeName(order))
 
 	return nil
 }
@@ -241,7 +257,8 @@ func sealPoolRelease(ctx context.Context, env cli.Env, a *alloc.Allocator, order
 	if _, err := a.SealPoolRelease(ctx, order); err != nil {
 		if errors.Is(err, alloc.ErrPoolReleaseWaits) {
 			return fmt.Errorf("billet pool release: %s is out of placement and cannot be sealed yet: %w. Until "+
-				"nothing holds it and `billet nodes decommission %s` has said it was proved, it is not; "+
+				"nothing holds it and its node has answered empty twice across five minutes, or "+
+				"`billet nodes decommission %s` has said it was proved, it is not; "+
 				"docs/operating/bare-metal-pool.md has the procedure", order, err, alloc.PoolNodeName(order))
 		}
 

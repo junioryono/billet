@@ -25,12 +25,14 @@ const arrivalHasProof = `-- name: ArrivalHasProof :one
 SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = $1
               UNION ALL
               SELECT 1 FROM pool_orders
-               WHERE node_name = $1 AND node_name != '' AND state IN ('placed', 'sealed')
-                 AND release_contradicted = 0)
+               WHERE node_name = $1 AND node_name != '' AND state = 'placed'
+                 AND (release_contradicted = 0 OR clear_since != ''))
 `
 
 // Whether one host has anything an arrival discards: a continuous-empty run, or a pool
-// order whose release its decommission still proves (ADR-030).
+// order still waiting on it whose release its decommission still proves, or one with a
+// clearance run, which the arrival ends whether or not the release was contradicted
+// before (ADR-030). A sealed order is not an arrival's (ContradictWaitingPoolRelease).
 //
 // READ BEFORE THE WRITE, and that is not a micro-optimisation: the invalidation
 // runs on EVERY registration, ahead of the revocation check, so a credential an

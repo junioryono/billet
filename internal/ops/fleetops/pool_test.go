@@ -270,7 +270,9 @@ func TestASecondReleaseSealsWhatTheLedgerProves(t *testing.T) {
 	for _, id := range []string{"p-quiet", "p-live"} {
 		env, out := poolEnv()
 		if err := Pool(ctx, env, []string{"release", "--config", cfg, "--reason", "the pool shrinks", id}); err != nil ||
-			!strings.Contains(out.String(), "Released "+id+" from placement") {
+			!strings.Contains(out.String(), "Released "+id+" from placement") ||
+			!strings.Contains(out.String(), "`billet pool release "+id+"` (no reason)") ||
+			!strings.Contains(out.String(), "`billet nodes decommission pool-"+id+"`") {
 			t.Fatalf("the first release of %s: %v\n%s", id, err, out)
 		}
 	}
@@ -311,6 +313,29 @@ func TestASecondReleaseSealsWhatTheLedgerProves(t *testing.T) {
 		}
 	}
 
+	// A DRAINING HOST WHOSE NODE HAS STARTED PROVING ITSELF says how far it has got.
+	a, closeDB, err = ControlPlaneAllocator(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(closeDB)
+	fence, found, err := a.NodeFenceOf(ctx, alloc.PoolNodeName("p-live"))
+	if err != nil || !found {
+		t.Fatalf("the fence of pool-p-live: %v, %v", found, err)
+	}
+	if err := a.RecordPoolClearance(ctx, alloc.PoolClearanceObservation{
+		Order: "p-live", Node: alloc.PoolNodeName("p-live"), Fence: fence, Empty: true, AskedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closeDB()
+	env, out = poolEnv()
+	if err := Pool(ctx, env, []string{"--config", cfg}); err != nil ||
+		!strings.Contains(out.String(), "p-live (draining, its node empty from ") ||
+		!strings.Contains(out.String(), " to ") {
+		t.Fatalf("the listing does not say how far the node's proof has got: %v\n%s", err, out)
+	}
+
 	// A DRAINING HOST THAT CAN NEVER PROVE ITSELF is closed only with --force, which says so.
 	if err := Pool(ctx, env, []string{"close", "--config", cfg, "--reason", "it died", "p-live"}); err == nil ||
 		!strings.Contains(err.Error(), "closed with --force") {
@@ -325,5 +350,25 @@ func TestASecondReleaseSealsWhatTheLedgerProves(t *testing.T) {
 	if err := Pool(ctx, env, []string{"--config", cfg}); err != nil ||
 		!strings.Contains(out.String(), "closed by a person without proof: it died") {
 		t.Fatalf("the listing after a forced closure: %v\n%s", err, out)
+	}
+}
+
+// A SEALED RELEASE IS LISTED AS CONTRADICTED ONLY WHERE ITS PROOF IS REFUSED NOW, never on
+// the contradiction flag alone, which every registration of its node sets.
+func TestASealedReleaseIsListedContradictedOnlyWhereItsProofIsRefused(t *testing.T) {
+	t.Parallel()
+	orders := []alloc.PoolOrder{{
+		ID: "p1", Arch: config.ArchX64, Source: "aws-metal", Scope: "s", Shape: "m", State: alloc.PoolSealed,
+		ReleaseContradicted: true, ReleaseRequested: time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC),
+		ReleaseReason: "the pool shrinks",
+	}}
+	for _, refused := range []bool{false, true} {
+		env, out := poolEnv()
+		if err := printPoolOrders(env, orders, map[string]bool{"p1": refused}); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(out.String(), "contradicted since"); got != refused {
+			t.Fatalf("refused %v: the listing says contradicted %v:\n%s", refused, got, out)
+		}
 	}
 }

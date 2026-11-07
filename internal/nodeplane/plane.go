@@ -112,6 +112,14 @@ type Plane struct {
 	barriers BarrierStore
 	// barrierPace replaces the loop's own waits between rounds when set.
 	barrierPace time.Duration
+	// poolMu guards what the pool clearance loop knows of each release's asks: when each
+	// order's node was last asked (poolAskedAt) and which asks are still out
+	// (poolInFlight). Each ask runs on its own, joined through poolAsks, so a node slow
+	// to answer holds up only its own release.
+	poolMu       sync.Mutex
+	poolAskedAt  map[string]time.Time
+	poolInFlight map[string]bool
+	poolAsks     sync.WaitGroup
 
 	// deployment is the identity this control plane belongs to. A node carrying a
 	// different one is refused: it would label its compute with an identity this

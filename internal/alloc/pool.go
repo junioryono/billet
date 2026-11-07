@@ -60,6 +60,13 @@ type PoolOrder struct {
 	// decommission on proof, that it is back or runs something; its release waits for a
 	// fresh one, or a sealed one for a person.
 	ReleaseContradicted bool
+	// ClearanceSince and ClearanceObserved are the first and the latest empty answer of
+	// the clearance run its release waits on, zero with no run (migration 80).
+	ClearanceSince    time.Time
+	ClearanceObserved time.Time
+	// ClearanceGeneration counts the release's contradictions; an answer is recorded only
+	// under the one read before it was asked.
+	ClearanceGeneration int64
 }
 
 // RecordPoolOrder commits an order before its source is asked, so an order whose
@@ -122,6 +129,20 @@ func poolOrderFrom(r *ledgerdb.PoolOrder) (PoolOrder, error) {
 		}
 	}
 
+	var clearSince, clearObserved time.Time
+	for _, f := range []struct {
+		raw  string
+		into *time.Time
+		what string
+	}{{r.ClearSince, &clearSince, "clearance since"}, {r.ClearObservedAt, &clearObserved, "clearance observed"}} {
+		if f.raw == "" {
+			continue
+		}
+		if *f.into, err = time.Parse(timestampFormat, f.raw); err != nil {
+			return PoolOrder{}, fmt.Errorf("alloc: pool order %s: %s %q: %w", r.OrderID, f.what, f.raw, err)
+		}
+	}
+
 	return PoolOrder{
 		ID: r.OrderID, Source: r.Source, Scope: r.Scope, Shape: r.Shape, Location: r.Location,
 		Arch: config.Arch(r.Arch), State: r.State, HostID: r.HostID, NodeName: r.NodeName,
@@ -129,6 +150,8 @@ func poolOrderFrom(r *ledgerdb.PoolOrder) (PoolOrder, error) {
 		NodeFingerprint: r.NodeFingerprint, NodeCertSerial: r.NodeCertSerial, JoinHold: r.JoinHold,
 		ReleaseRequested: requested, ReleaseReason: r.ReleaseReason,
 		ReleaseContradicted: r.ReleaseContradicted == 1,
+		ClearanceSince:      clearSince, ClearanceObserved: clearObserved,
+		ClearanceGeneration: r.ClearGeneration,
 	}, nil
 }
 

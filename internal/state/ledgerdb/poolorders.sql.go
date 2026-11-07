@@ -44,7 +44,8 @@ func (q *Queries) ClosePoolOrder(ctx context.Context, arg ClosePoolOrderParams) 
 }
 
 const contradictPoolRelease = `-- name: ContradictPoolRelease :execrows
-UPDATE pool_orders SET release_contradicted = 1
+UPDATE pool_orders SET release_contradicted = 1, clear_since = '', clear_observed_at = '',
+       clear_generation = clear_generation + 1
  WHERE node_name = $1 AND node_name != '' AND state IN ('placed', 'sealed')
 `
 
@@ -56,12 +57,33 @@ UPDATE pool_orders SET release_contradicted = 1
 // because what its node said before cannot be read back. Every pool order the node is
 // the node of counts, contradicted already or not, so a caller can tell a pool node from
 // any other.
+//
+// AND IT ENDS THE ORDER'S CLEARANCE RUN, in this one statement, so no caller can record a
+// contradiction and leave the run standing: a run that reaches proved therefore began
+// after the last contradiction, and is proof for the order whatever release_contradicted
+// says (migration 80).
 func (q *Queries) ContradictPoolRelease(ctx context.Context, node string) (int64, error) {
 	result, err := q.db.ExecContext(ctx, contradictPoolRelease, node)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const contradictWaitingPoolRelease = `-- name: ContradictWaitingPoolRelease :exec
+UPDATE pool_orders SET release_contradicted = 1, clear_since = '', clear_observed_at = '',
+       clear_generation = clear_generation + 1
+ WHERE node_name = $1 AND node_name != '' AND state = 'placed'
+`
+
+// The order's node arrived to register while its release still waits on it (ADR-030):
+// ContradictPoolRelease for a placed order alone. A sealed order is not contradicted by
+// an arrival: the seal revoked the node's certificates, so a node that comes back, as one
+// proved idle by its own answers and never stopped will, is refused and can never be
+// handed work, and its arrival says nothing of the compute the seal proved absent.
+func (q *Queries) ContradictWaitingPoolRelease(ctx context.Context, node string) error {
+	_, err := q.db.ExecContext(ctx, contradictWaitingPoolRelease, node)
+	return err
 }
 
 const countPoolOrderAdmissions = `-- name: CountPoolOrderAdmissions :one
@@ -82,6 +104,20 @@ func (q *Queries) CountPoolOrderAdmissions(ctx context.Context, arg CountPoolOrd
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const endPoolClearanceRun = `-- name: EndPoolClearanceRun :exec
+UPDATE pool_orders SET clear_since = '', clear_observed_at = ''
+ WHERE order_id = $1 AND state = 'placed'
+`
+
+// An answer that was not empty, or not an answer, or not taken where the run could stand:
+// the run is over. Only while the order waits on its node: a sealed order's run is what
+// its proof is read from, and an answer that arrives after the seal does not end it (a
+// contradiction still does, through ContradictPoolRelease).
+func (q *Queries) EndPoolClearanceRun(ctx context.Context, orderID string) error {
+	_, err := q.db.ExecContext(ctx, endPoolClearanceRun, orderID)
+	return err
 }
 
 const forceClosePoolOrder = `-- name: ForceClosePoolOrder :execrows
@@ -267,9 +303,51 @@ func (q *Queries) LinkPoolOrderNode(ctx context.Context, arg LinkPoolOrderNodePa
 	return result.RowsAffected()
 }
 
+const listPoolClearanceTargets = `-- name: ListPoolClearanceTargets :many
+SELECT p.order_id, p.node_name, p.clear_generation FROM pool_orders p
+ WHERE p.state = 'placed' AND p.release_requested_at != '' AND p.node_name != ''
+   AND NOT EXISTS (SELECT 1 FROM leases l
+                    WHERE COALESCE(l.node, l.target_node) = p.node_name AND l.phase NOT IN ('done','failed'))
+ ORDER BY p.order_id
+`
+
+type ListPoolClearanceTargetsRow struct {
+	OrderID         string
+	NodeName        string
+	ClearGeneration int64
+}
+
+// The orders whose node the control plane asks what it runs, for a release that proves
+// itself without the deployment's seal (migration 80): placed, a release asked for, a node
+// linked, and nothing in the ledger holding that node. A sealed order is never asked: its
+// node's certificates are revoked, a failed ask would end the run its proof is read from.
+func (q *Queries) ListPoolClearanceTargets(ctx context.Context) ([]ListPoolClearanceTargetsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPoolClearanceTargets)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPoolClearanceTargetsRow
+	for rows.Next() {
+		var i ListPoolClearanceTargetsRow
+		if err := rows.Scan(&i.OrderID, &i.NodeName, &i.ClearGeneration); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPoolOrders = `-- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted,
+       clear_epoch, clear_dispatch, clear_since, clear_observed_at, clear_generation
 FROM pool_orders
 ORDER BY first_attempt_at, order_id
 `
@@ -302,6 +380,11 @@ func (q *Queries) ListPoolOrders(ctx context.Context) ([]PoolOrder, error) {
 			&i.ReleaseRequestedAt,
 			&i.ReleaseReason,
 			&i.ReleaseContradicted,
+			&i.ClearEpoch,
+			&i.ClearDispatch,
+			&i.ClearSince,
+			&i.ClearObservedAt,
+			&i.ClearGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -452,7 +535,8 @@ func (q *Queries) MarkUncertainPoolOrderFound(ctx context.Context, arg MarkUncer
 
 const readPoolOrder = `-- name: ReadPoolOrder :one
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted,
+       clear_epoch, clear_dispatch, clear_since, clear_observed_at, clear_generation
 FROM pool_orders
 WHERE order_id = $1
 `
@@ -479,8 +563,51 @@ func (q *Queries) ReadPoolOrder(ctx context.Context, orderID string) (PoolOrder,
 		&i.ReleaseRequestedAt,
 		&i.ReleaseReason,
 		&i.ReleaseContradicted,
+		&i.ClearEpoch,
+		&i.ClearDispatch,
+		&i.ClearSince,
+		&i.ClearObservedAt,
+		&i.ClearGeneration,
 	)
 	return i, err
+}
+
+const recordPoolClearanceRun = `-- name: RecordPoolClearanceRun :execrows
+UPDATE pool_orders
+   SET clear_since = CASE WHEN clear_epoch = $1 AND clear_dispatch = $2 AND clear_since != ''
+                          THEN clear_since ELSE $3 END,
+       clear_epoch = $1, clear_dispatch = $2, clear_observed_at = $4
+ WHERE order_id = $5 AND state = 'placed' AND release_requested_at != '' AND node_name = $6
+   AND clear_generation = $7
+`
+
+type RecordPoolClearanceRunParams struct {
+	Epoch      int64
+	Dispatch   int64
+	Recorded   string
+	Asked      string
+	OrderID    string
+	Node       string
+	Generation int64
+}
+
+// One empty answer to the order's clearance, taken against the fence it names: the run's
+// first answer is kept only while the fence it was taken under still holds, so a run is
+// continuous across one epoch and one launch-dispatch generation or it starts again.
+func (q *Queries) RecordPoolClearanceRun(ctx context.Context, arg RecordPoolClearanceRunParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, recordPoolClearanceRun,
+		arg.Epoch,
+		arg.Dispatch,
+		arg.Recorded,
+		arg.Asked,
+		arg.OrderID,
+		arg.Node,
+		arg.Generation,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const releasePoolOrderJoin = `-- name: ReleasePoolOrderJoin :execrows

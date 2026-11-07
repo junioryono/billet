@@ -468,7 +468,8 @@ func TestAContradictedDecommissionStaysContradicted(t *testing.T) {
 // A SEALED RELEASE THE LEDGER NO LONGER PROVES IS NOT RELEASED: a contradiction landing
 // after the seal, when the source's first release failed, refuses the release proof at
 // every ask after, across a later empty report and a control-plane start, and a person
-// closes the order.
+// closes the order. An arrival is not a contradiction of a seal, only of a release that
+// still waits.
 func TestASealedReleaseTheLedgerNoLongerProvesIsNotReleased(t *testing.T) {
 	t.Parallel()
 	for name, contradict := range contradictions {
@@ -490,6 +491,19 @@ func TestASealedReleaseTheLedgerNoLongerProvesIsNotReleased(t *testing.T) {
 			}
 
 			contradict(t, a, node)
+
+			// AN ARRIVAL AFTER THE SEAL CONTRADICTS NOTHING: the seal revoked the node's
+			// certificates, so a node that comes back is refused and can never be handed
+			// work, and one proved idle by its own answers is never stopped and will come
+			// back. Only compute listed contradicts a seal.
+			if name == "the node arriving to register" {
+				if _, err := a.PoolReleaseProof(ctx, "pa"); err != nil {
+					t.Fatalf("an arrival after the seal refused the proof: %v", err)
+				}
+
+				return
+			}
+
 			refused := func(why string) {
 				t.Helper()
 				if _, err := a.PoolReleaseProof(ctx, "pa"); !errors.Is(err, ErrPoolReleaseContradicted) {

@@ -169,6 +169,26 @@ func (q *Queries) ForgetEveryNode(ctx context.Context) error {
 	return err
 }
 
+const handOverPoolRetirement = `-- name: HandOverPoolRetirement :exec
+UPDATE nodes SET decommission_actor = $1
+ WHERE name = $2 AND decommission_actor = $3
+`
+
+type HandOverPoolRetirementParams struct {
+	ClosingActor string
+	Name         string
+	SealActor    string
+}
+
+// A closed order's node keeps the proved retirement its seal recorded, under the closing
+// actor (@closing_actor), so compute listed after the order closed can no longer undo
+// it: the order is terminal and runs no closing transaction again. Only the seal's own
+// (@seal_actor); a person's decommission stays as they recorded it.
+func (q *Queries) HandOverPoolRetirement(ctx context.Context, arg HandOverPoolRetirementParams) error {
+	_, err := q.db.ExecContext(ctx, handOverPoolRetirement, arg.ClosingActor, arg.Name, arg.SealActor)
+	return err
+}
+
 const listCodeBuildRegistrationPaths = `-- name: ListCodeBuildRegistrationPaths :many
 SELECT name, codebuild_region, codebuild_jit_path, decommissioned_at
   FROM nodes
@@ -865,7 +885,7 @@ func (q *Queries) ReadNodeRegistration(ctx context.Context, name string) (ReadNo
 }
 
 const readNodeReleaseFacts = `-- name: ReadNodeReleaseFacts :one
-SELECT n.epoch, n.decommission_proven, i.node_epoch, i.running
+SELECT n.epoch, n.dispatch_generation, n.decommission_proven, i.node_epoch, i.running
   FROM nodes n
   LEFT JOIN node_inventory i ON i.node = n.name
  WHERE n.name = $1
@@ -873,12 +893,14 @@ SELECT n.epoch, n.decommission_proven, i.node_epoch, i.running
 
 type ReadNodeReleaseFactsRow struct {
 	Epoch              int64
+	DispatchGeneration int64
 	DecommissionProven int64
 	NodeEpoch          sql.NullInt64
 	Running            sql.NullInt64
 }
 
-// What a pool host's release proof reads of its node: its current epoch, whether a person
+// What a pool host's release proof reads of its node: its current epoch and launch-dispatch
+// generation, which a clearance run must have been taken under, whether a person
 // decommissioned it on the compute barrier's proof, and its last inventory, which is null
 // when it never reported one; an inventory of the current epoch reporting compute
 // outweighs the decommission.
@@ -887,6 +909,7 @@ func (q *Queries) ReadNodeReleaseFacts(ctx context.Context, name string) (ReadNo
 	var i ReadNodeReleaseFactsRow
 	err := row.Scan(
 		&i.Epoch,
+		&i.DispatchGeneration,
 		&i.DecommissionProven,
 		&i.NodeEpoch,
 		&i.Running,
@@ -909,6 +932,28 @@ func (q *Queries) ReadNodeSize(ctx context.Context, name string) (ReadNodeSizeRo
 	var i ReadNodeSizeRow
 	err := row.Scan(&i.TotalVcpu, &i.TotalMemory)
 	return i, err
+}
+
+const undoPoolRetirement = `-- name: UndoPoolRetirement :execrows
+UPDATE nodes SET decommissioned_at = '', decommission_proven = 0, decommission_actor = ''
+ WHERE name = $1 AND decommission_actor = $2
+`
+
+type UndoPoolRetirementParams struct {
+	Name  string
+	Actor string
+}
+
+// A sealed pool host's node listed compute since its seal retired it (ADR-030): the
+// retirement the seal recorded is undone, so `billet drain` expects the node again and
+// waits on it rather than counting it proved idle. Only the seal's own (@actor); a
+// decommission a person recorded stays theirs.
+func (q *Queries) UndoPoolRetirement(ctx context.Context, arg UndoPoolRetirementParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, undoPoolRetirement, arg.Name, arg.Actor)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const upsertNodeRegistration = `-- name: UpsertNodeRegistration :one

@@ -8,15 +8,15 @@ import (
 
 // ledgerAt75 is a ledger migrated to 75 and no further, so the next open applies
 // migration 76 and every one after it. rewindNewest takes back the newest, which is
-// the pool release's 79, and then 78, 77 and 76 are undone.
+// the pool clearance's 80, and then 79, 78, 77 and 76 are undone.
 //
-// IT REFUSES A NEWER BINARY, as rewindNewest does: a migration 80 would be the one
-// rewindNewest took back, and 79 would stay behind on a ledger this test still calls 75.
+// IT REFUSES A NEWER BINARY, as rewindNewest does: a migration 81 would be the one
+// rewindNewest took back, and 80 would stay behind on a ledger this test still calls 75.
 func ledgerAt75(t *testing.T) string {
 	t.Helper()
 
-	if latest := LatestSchemaVersion(); latest != 79 {
-		t.Fatalf("this binary's newest migration is %d; ledgerAt75 undoes 79 through 76 and must be "+
+	if latest := LatestSchemaVersion(); latest != 80 {
+		t.Fatalf("this binary's newest migration is %d; ledgerAt75 undoes 80 through 76 and must be "+
 			"taught each migration after 75 before it can stand for a ledger at 75", latest)
 	}
 
@@ -31,6 +31,10 @@ func ledgerAt75(t *testing.T) string {
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			`ALTER TABLE pool_orders DROP COLUMN release_contradicted`,
+			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
+			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,
+			`DELETE FROM schema_migrations WHERE version = 79`,
 			`DROP INDEX job_history_running_idx`,
 			`DROP INDEX job_history_result_idx`,
 			`DROP INDEX alert_outbox_due_idx`,
