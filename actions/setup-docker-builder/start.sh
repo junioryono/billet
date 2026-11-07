@@ -46,7 +46,15 @@ cat > "$config" <<EOF
     keepBytes = 96636764160
 EOF
 
+# THE AUTHORITY A MIRROR'S CERTIFICATE CHAINS TO, for BuildKit in its own
+# container, which reads none of the guest's trust. Trusted for the mirrors alone.
+mirror_ca_mount=()
+mirror_ca_path=/etc/buildkit/billet-registry-mirrors-ca.pem
 registry_mirrors=${BILLET_REGISTRY_MIRRORS_JSON:-}
+mirror_ca=${BILLET_REGISTRY_MIRRORS_CA_FILE:-}
+if [[ -n "$mirror_ca" && -r "$mirror_ca" ]]; then
+  mirror_ca_mount=(--volume "$mirror_ca:$mirror_ca_path:ro")
+fi
 if [[ -n "$registry_mirrors" ]]; then
   if jq -e '
     def origin:
@@ -64,6 +72,12 @@ if [[ -n "$registry_mirrors" ]]; then
       {
         printf '\n[registry."%s"]\n' "$upstream"
         printf '  mirrors = ["%s"]\n' "$mirror"
+        # ONE TABLE PER HOST, and a mirror named like an upstream already has one; a
+        # public registry's certificate needs no authority of ours anyway.
+        if [[ ${#mirror_ca_mount[@]} -gt 0 && ! "$mirror" =~ ^(docker|ghcr|quay)\.io$ ]]; then
+          printf '\n[registry."%s"]\n' "$mirror"
+          printf '  ca = ["%s"]\n' "$mirror_ca_path"
+        fi
       } >> "$config"
     done
   else
@@ -76,6 +90,7 @@ docker run --detach --privileged \
   --volume "$state:/var/lib/buildkit" \
   --volume "$socket_dir:/run/buildkit" \
   --volume "$config:/etc/buildkit/buildkitd.toml:ro" \
+  ${mirror_ca_mount[@]+"${mirror_ca_mount[@]}"} \
   "$BILLET_BUILDKIT_IMAGE" \
   --config /etc/buildkit/buildkitd.toml \
   --addr unix:///run/buildkit/buildkitd.sock >/dev/null

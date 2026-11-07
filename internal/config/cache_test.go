@@ -365,6 +365,41 @@ func TestTheCanonicalOriginIsWhatAURLClientWouldAddress(t *testing.T) {
 	}
 }
 
+func TestARegistryMirrorAuthorityIsAnAbsolutePathBesideItsMirrors(t *testing.T) {
+	t.Parallel()
+
+	const mirrors = `  registry_mirrors:
+    docker.io: https://docker-cache.home.example
+    ghcr.io: https://ghcr-cache.home.example
+    quay.io: https://quay-cache.home.example
+`
+	load := func(block string) (*Config, error) {
+		return Load(writeConfig(t, strings.Replace(validConfig, "  provider: firecracker\n",
+			"  provider: firecracker\n"+block, 1)))
+	}
+
+	cfg, err := load(mirrors + "  registry_mirrors_ca: \"  /etc/billet-registry/ca.pem \"\n")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Node.RegistryMirrorsCA; got != "/etc/billet-registry/ca.pem" {
+		t.Errorf("registry_mirrors_ca = %q, want it trimmed", got)
+	}
+
+	if _, err := load(mirrors); err != nil {
+		t.Errorf("mirrors with no authority were refused: %v", err)
+	}
+
+	for name, tc := range map[string]struct{ block, want string }{
+		"relative":   {mirrors + "  registry_mirrors_ca: ca.pem\n", "absolute path"},
+		"no mirrors": {"  registry_mirrors_ca: /etc/billet-registry/ca.pem\n", "no node.registry_mirrors"},
+	} {
+		if _, err := load(tc.block); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error = %v, want %q", name, err, tc.want)
+		}
+	}
+}
+
 func TestRegistryMirrorsAreRefusedWhereNoManagedGuestConsumesThem(t *testing.T) {
 	t.Parallel()
 

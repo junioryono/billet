@@ -139,13 +139,17 @@ func (s *Source) Scope(ctx context.Context) (string, error) {
 }
 
 // Terms are on-demand EC2's: billed by the second, and a launch measured reaching its
-// first script within a minute. The lead time to a registered node is not measured.
+// first script within a minute. The lead time to a registered node is not measured. EC2
+// answers `terminated` for an instance it took back, which Gone reads as gone, so a
+// released order closes without a person.
 func (s *Source) Terms(shape string) (hostsource.Terms, error) {
 	if _, ok := s.shapes[shape]; !ok {
 		return hostsource.Terms{}, fmt.Errorf("awsmetal: %s is not a declared shape", shape)
 	}
 
-	return hostsource.Terms{LeadTime: time.Minute, BillingUnit: time.Second, IdempotentFor: clientTokenWindow}, nil
+	return hostsource.Terms{
+		LeadTime: time.Minute, BillingUnit: time.Second, IdempotentFor: clientTokenWindow, ConfirmsGone: true,
+	}, nil
 }
 
 // Order launches one host of a declared shape in this source's zone.

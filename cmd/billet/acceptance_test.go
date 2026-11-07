@@ -1176,8 +1176,13 @@ func TestOnlyJobsThisRunWaitedForCountTowardsIt(t *testing.T) {
 	t.Parallel()
 
 	before := []acceptanceJob{
-		{LeaseID: "old-1", Billet: "succeeded"},
-		{LeaseID: "old-2", Billet: "failed"},
+		{LeaseID: "old-1", Billet: "succeeded", RunID: 1, StartedAt: "2026-11-07T09:00:00Z"},
+		{LeaseID: "old-2", Billet: "failed", RunID: 1, GitHub: "failed"},
+	}
+
+	if got := newTerminalJobs(before, map[string]bool{}); len(got) != 2 {
+		t.Fatalf("the earlier jobs are not ones the wait would count without a baseline (%+v), "+
+			"so the baseline is proved by nothing", got)
 	}
 
 	baseline := map[string]bool{"old-1": true, "old-2": true}
@@ -1187,15 +1192,44 @@ func TestOnlyJobsThisRunWaitedForCountTowardsIt(t *testing.T) {
 	}
 
 	after := append(append([]acceptanceJob(nil), before...),
-		acceptanceJob{LeaseID: "new-1", Billet: "succeeded"},
+		acceptanceJob{LeaseID: "new-1", Billet: "succeeded", RunID: 2, StartedAt: "2026-11-07T10:00:00Z"},
 		// STILL RUNNING, so it does not count either: a job billet has not
 		// concluded is one whose compute may still be there.
-		acceptanceJob{LeaseID: "new-2"},
+		acceptanceJob{LeaseID: "new-2", RunID: 2, StartedAt: "2026-11-07T10:00:00Z"},
+		// A RUNNER GITHUB NEVER GAVE A JOB, ended: nothing of GitHub's on it, so it is
+		// no job of the run's (run 42386061079, 2026-11-07).
+		acceptanceJob{LeaseID: "new-3", Billet: "done"},
+		// A RUN BOUGHT IT AND NOTHING STARTED: a failed launch, or a runner another took
+		// the job from, while the job itself runs and counts elsewhere.
+		acceptanceJob{LeaseID: "new-4", Billet: "failed", RunID: 2, GitHubRunID: 3},
+		// AND ONE GITHUB ANSWERED FOR counts, started or not.
+		acceptanceJob{LeaseID: "new-5", Billet: "done", GitHub: "failed"},
 	)
 
 	got := newTerminalJobs(after, baseline)
-	if len(got) != 1 || got[0].LeaseID != "new-1" {
-		t.Errorf("the wait counted %+v; only the new, finished job should count", got)
+	var ids []string
+	for i := range got {
+		ids = append(ids, got[i].LeaseID)
+	}
+	if strings.Join(ids, ",") != "new-1,new-5" {
+		t.Errorf("the wait counted %v; only the new, finished jobs GitHub started or answered for should count", ids)
+	}
+}
+
+// A FULL HISTORY READ IS COULD-NOT-TELL, NOT A REASON TO KEEP WAITING. Rows that count
+// for nothing still take the bounded read's rows, so a read that comes back full may
+// hold the jobs waited for past its bound.
+func TestAFullHistoryReadIsCouldNotTell(t *testing.T) {
+	t.Parallel()
+
+	if err := historyMayHideJobs(acceptanceJobLimit, acceptanceJobLimit-2, acceptanceJobLimit); err == nil {
+		t.Error("a full read short of the count was taken as one that could still be waited on")
+	}
+	if err := historyMayHideJobs(acceptanceJobLimit-1, 3, 10); err != nil {
+		t.Errorf("a read short of the bound saw every row, and was refused: %v", err)
+	}
+	if err := historyMayHideJobs(acceptanceJobLimit, 10, 10); err != nil {
+		t.Errorf("a full read that already holds the count was refused: %v", err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -244,5 +245,197 @@ func TestAReplacedSessionDoesNotKeepTheOldDate(t *testing.T) {
 	if datedNone(afterReopen) {
 		t.Errorf("after the session was replaced the ledger still showed the failed session's dated none "+
 			"(%d at %q)", *afterReopen.Unstarted, afterReopen.UnstartedAt)
+	}
+}
+
+// AN ANSWERED POLL DATES THE REPORT WITH GITHUB'S ANSWER, which the pool reads before it
+// shrinks: a report republished from a stalled poll is stamped now, and only AnsweredAt
+// says when GitHub last answered. Before any poll is answered it is absent.
+func TestAnAnsweredPollDatesTheReport(t *testing.T) {
+	t.Parallel()
+
+	a, label, published, _ := workTier(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	var polls atomic.Int32
+
+	var beforeAnswer alloc.ListenerCapacity
+
+	session := &fakeSession{stats: &Statistics{}, onPoll: func(int) {
+		if polls.Add(1) >= 3 {
+			cancel()
+		}
+	}, onGet: func() (*Message, error) {
+		if polls.Load() == 1 {
+			beforeAnswer = published()
+		}
+
+		return nil, ErrNoMessage
+	}}
+
+	start := time.Now()
+
+	l := NewListener(a, label, session, WithLogger(slog.New(slog.DiscardHandler)),
+		WithRunner(&fakeRunner{}), WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if beforeAnswer.AnsweredAt != "" {
+		t.Errorf("a report published before any poll was answered says GitHub answered at %s", beforeAnswer.AnsweredAt)
+	}
+
+	answered, err := time.Parse(time.RFC3339Nano, published().AnsweredAt)
+	if err != nil {
+		t.Fatalf("an answered poll left no readable AnsweredAt: %v", err)
+	}
+
+	if answered.Before(start.Add(-time.Second)) || answered.After(time.Now().Add(time.Second)) {
+		t.Errorf("AnsweredAt %v is not when the poll was answered (between %v and now)", answered, start)
+	}
+}
+
+// ONLY AN EMPTY ANSWER IS DATED, WHERE ITS POLL RETURNED, in both of the loop's ways of
+// polling: with background launches the loop may consume the answer long after, inside a
+// reconciliation, and an answer dated then would date an old count as current. A
+// message carries work the count in hand has not seen, so it dates nothing, and nor does
+// a poll GitHub did not answer.
+func TestOnlyAnEmptyAnswerIsDatedWhenItsPollReturned(t *testing.T) {
+	t.Parallel()
+
+	reset := errors.New("the connection reset")
+	work := &Message{MessageID: 1, Statistics: &Statistics{TotalAssignedJobs: 1}}
+
+	for name, c := range map[string]struct {
+		background bool
+		msg        *Message
+		answer     error
+		dated      bool
+	}{
+		"inline, empty":         {answer: ErrNoMessage, dated: true},
+		"background, empty":     {background: true, answer: ErrNoMessage, dated: true},
+		"inline, a message":     {msg: work},
+		"background, a message": {background: true, msg: work},
+		"inline, failed":        {answer: reset},
+		"background, failed":    {background: true, answer: reset},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			a, label, _, _ := workTier(t)
+			returned := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+
+			var (
+				mu  sync.Mutex
+				now = returned.Add(-time.Hour)
+			)
+
+			session := &fakeSession{stats: &Statistics{}, onGet: func() (*Message, error) {
+				mu.Lock()
+				now = returned
+				mu.Unlock()
+
+				return c.msg, c.answer
+			}}
+
+			opts := []Option{WithLogger(slog.New(slog.DiscardHandler)), WithRunner(&fakeRunner{})}
+			if c.background {
+				opts = append(opts, WithBackgroundLaunches())
+			}
+
+			l := NewListener(a, label, session, opts...)
+			l.now = func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+
+				return now
+			}
+
+			answer := l.exchange(t.Context(), 1, false)
+
+			mu.Lock()
+			now = returned.Add(time.Hour)
+			mu.Unlock()
+
+			l.mu.Lock()
+			dated := l.answeredAt
+			l.mu.Unlock()
+
+			if !errors.Is(answer.err, c.answer) || answer.msg != c.msg {
+				t.Fatalf("the poll answered %v, %v; want %v, %v", answer.msg, answer.err, c.msg, c.answer)
+			}
+			if c.dated && !dated.Equal(returned) {
+				t.Fatalf("an empty answer was dated %v, want its poll's return at %v", dated, returned)
+			}
+			if !c.dated && !dated.IsZero() {
+				t.Fatalf("an answer that was not empty was dated %v", dated)
+			}
+		})
+	}
+}
+
+// AN ANSWER TAKEN LATE KEEPS ITS POLL'S DATE, and nothing dates it before the loop takes
+// it: the clock moves past the demand freshness after the poll returned and before the
+// loop receives its answer, as a long reconciliation would make it, and the date
+// recorded is still the poll's return, never the answer's receipt.
+func TestAnAnswerTakenLateKeepsItsPollsDate(t *testing.T) {
+	t.Parallel()
+
+	a, label, _, _ := workTier(t)
+	returned := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+
+	var (
+		mu  sync.Mutex
+		now = returned.Add(-time.Hour)
+	)
+
+	session := &fakeSession{stats: &Statistics{}, onGet: func() (*Message, error) {
+		mu.Lock()
+		now = returned
+		mu.Unlock()
+
+		return nil, ErrNoMessage
+	}}
+
+	l := NewListener(a, label, session, WithLogger(slog.New(slog.DiscardHandler)), WithRunner(&fakeRunner{}),
+		WithBackgroundLaunches())
+	l.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return now
+	}
+
+	var beforeTaken time.Time
+
+	// THE CLOCK MOVES between the poll's return and the loop's receipt of its answer.
+	l.afterPollDated = func() {
+		mu.Lock()
+		now = returned.Add(time.Hour)
+		mu.Unlock()
+	}
+	// AND NOTHING HAS DATED IT when the loop has it and has not taken it: the poll aside
+	// has finished by then, so a date it recorded would show here.
+	l.beforeAnswerTaken = func() {
+		l.mu.Lock()
+		beforeTaken = l.answeredAt
+		l.mu.Unlock()
+	}
+
+	if answer := l.exchange(t.Context(), 1, false); !errors.Is(answer.err, ErrNoMessage) {
+		t.Fatalf("the poll answered %v", answer.err)
+	}
+
+	l.mu.Lock()
+	dated := l.answeredAt
+	l.mu.Unlock()
+
+	if !beforeTaken.IsZero() {
+		t.Errorf("the answer was dated %v before the loop took it", beforeTaken)
+	}
+	if !dated.Equal(returned) {
+		t.Errorf("an answer taken an hour after its poll returned was dated %v, want %v", dated, returned)
 	}
 }

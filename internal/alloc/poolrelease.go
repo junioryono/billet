@@ -109,25 +109,34 @@ func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string
 			row.NodeName = PoolNodeName(order)
 		}
 
-		if n, err := q.RequestPoolOrderRelease(ctx, ledgerdb.RequestPoolOrderReleaseParams{
-			Now: ts(now), Reason: reason, OrderID: order,
-		}); err != nil {
-			return fmt.Errorf("alloc: ask for the release of pool order %s: %w", order, err)
-		} else if n != 1 {
-			return fmt.Errorf("%w: pool order %s moved while its release was asked for", ErrPoolOrderMoved, order)
-		}
-
-		if err := q.MarkNodeDrainedForRelease(ctx, row.NodeName); err != nil {
-			return fmt.Errorf("alloc: take %s out of placement: %w", row.NodeName, err)
-		}
-
-		return nil
+		return requestJoinedReleaseTx(ctx, q, order, row.NodeName, reason, now)
 	})
 	if err != nil {
 		return false, err
 	}
 
 	return sealed, nil
+}
+
+// requestJoinedReleaseTx records a joined host's release as asked for and takes its node
+// out of placement, the one way a release of a host a node joined from begins: on a
+// person's word or on the pool's, for a host idle past server.pool.idle_after.
+func requestJoinedReleaseTx(
+	ctx context.Context, q state.WriteOps, order, node, reason string, now time.Time,
+) error {
+	if n, err := q.RequestPoolOrderRelease(ctx, ledgerdb.RequestPoolOrderReleaseParams{
+		Now: ts(now), Reason: reason, OrderID: order,
+	}); err != nil {
+		return fmt.Errorf("alloc: ask for the release of pool order %s: %w", order, err)
+	} else if n != 1 {
+		return fmt.Errorf("%w: pool order %s moved while its release was asked for", ErrPoolOrderMoved, order)
+	}
+
+	if err := q.MarkNodeDrainedForRelease(ctx, node); err != nil {
+		return fmt.Errorf("alloc: take %s out of placement: %w", node, err)
+	}
+
+	return nil
 }
 
 // sealUnjoinedTx seals an order nothing was ever admitted for, on that proof, with its

@@ -1,4 +1,4 @@
--- migration 81: node_cache_stores
+-- migration 82: node_cache_stores
 --
 -- WHAT EACH NODE'S BREAKER LAST SAID ABOUT ITS SITE'S STORE (#531), which `billet
 -- status` says back. Telemetry like node_inventory (migration 33), and fenced the same
@@ -18,19 +18,18 @@
 -- sets are closed in Go by lease.CacheStoreReport.Validate.
 --
 -- Everything between the markers below is PUBLISHED BYTES; the prose is not.
--- Reformat one tab and every PostgreSQL ledger that applied this migration refuses to
--- open.
+-- Reformat one tab and every ledger that applied this migration refuses to open.
 
 -- +billet:statement
 CREATE TABLE node_cache_stores (
-			node        text NOT NULL,
-			store       text NOT NULL,
-			state       text NOT NULL,
-			since       text NOT NULL,
-			failures    bigint NOT NULL DEFAULT 0 CHECK (failures >= 0),
-			reason      text NOT NULL DEFAULT '',
-			node_epoch  bigint NOT NULL CHECK (node_epoch >= 0),
-			received_at text NOT NULL,
+			node        TEXT NOT NULL,
+			store       TEXT NOT NULL,
+			state       TEXT NOT NULL,
+			since       TEXT NOT NULL,
+			failures    INTEGER NOT NULL DEFAULT 0 CHECK (failures >= 0),
+			reason      TEXT NOT NULL DEFAULT '',
+			node_epoch  INTEGER NOT NULL CHECK (node_epoch >= 0),
+			received_at TEXT NOT NULL,
 			PRIMARY KEY (node, store)
-		);
+		) STRICT
 -- +billet:end

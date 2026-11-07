@@ -191,6 +191,9 @@ type Spec struct {
 	// RegistryMirrors are site-local public pull-through caches made available to
 	// a managed guest. The zero value sends the guest directly upstream.
 	RegistryMirrors config.RegistryMirrors
+	// RegistryMirrorsCA is the PEM authority the guest trusts for those mirrors
+	// alone. Empty means their certificates are publicly trusted.
+	RegistryMirrorsCA string
 
 	// Command starts the runner inside the instance.
 	//
