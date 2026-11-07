@@ -276,13 +276,16 @@ func TestBuilderCleanupReportsGrowthAndPrunesAnOversizedMount(t *testing.T) {
 func TestBuilderCleanupPublishesABuildWithNoCacheMount(t *testing.T) {
 	t.Parallel()
 
+	oversized := "[{\"id\":\"mount-1\",\"mutable\":true,\"inUse\":false,\"size\":3072,\"description\":\"cached mount /root/.cache from buildkit\",\"recordType\":\"exec.cachemount\"}]\n"
 	for name, c := range map[string]struct {
-		usage   string
-		publish bool
+		usage, remaining string
+		publish          bool
+		prunes           int
 	}{
-		"no cache mount":  {"null\n", true},
-		"an empty answer": {"", false},
-		"not a list":      {"{\"id\":\"mount-1\"}\n", false},
+		"no cache mount":                    {"null\n", "null\n", true, 0},
+		"an oversized mount pruned to none": {oversized, "null\n", true, 1},
+		"an empty answer":                   {"", "", false, 0},
+		"not a list":                        {"{\"id\":\"mount-1\"}\n", "{\"id\":\"mount-1\"}\n", false, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -293,10 +296,18 @@ func TestBuilderCleanupPublishesABuildWithNoCacheMount(t *testing.T) {
 				t.Fatalf("write publication guard: %v", err)
 			}
 
-			output, _ := runBuilderCleanupWith(t, statePath, discardMarker, c.usage, c.usage, false, false)
+			output, calls := runBuilderCleanupWith(t, statePath, discardMarker, c.usage, c.remaining, false, false)
 			_, err := os.Stat(discardMarker)
 			if published := os.IsNotExist(err); published != c.publish {
 				t.Fatalf("%s: published %v, want %v:\n%s", name, published, c.publish, output)
+			}
+			if got := strings.Count(calls, " prune "); got != c.prunes {
+				t.Errorf("%s: %d prune(s), want %d:\n%s", name, got, c.prunes, calls)
+			}
+			// THE CEILING IS READ AGAIN AFTER ANY PRUNE, and a publication rests on that
+			// second reading.
+			if c.publish && strings.Count(calls, " du ") != 2 {
+				t.Errorf("%s: usage read %d time(s), want 2:\n%s", name, strings.Count(calls, " du "), calls)
 			}
 		})
 	}
