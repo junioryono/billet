@@ -168,15 +168,15 @@ func waitForInstallationAt(ctx context.Context, client *http.Client, base string
 //
 // Results are sorted so the diagnostic is stable across runs — Go randomizes map
 // iteration, and an error message that reorders itself is one nobody can diff.
-func (i *Installation) PermissionMismatches(scope Scope, runEvidence bool) []string {
+func (i *Installation) PermissionMismatches(scope Scope, actions ActionsAccess) []string {
 	var problems []string
 
-	permissions := permissionsFor(scope, runEvidence)
+	permissions := permissionsFor(scope, actions)
 
 	for name, want := range permissions {
 		got, ok := i.Permissions[name]
 		if !ok {
-			problems = append(problems, fmt.Sprintf("%s: want %s, not granted", name, want))
+			problems = append(problems, fmt.Sprintf("%s: want %s, not granted%s", name, want, actionsHint(name)))
 			continue
 		}
 
@@ -185,7 +185,7 @@ func (i *Installation) PermissionMismatches(scope Scope, runEvidence bool) []str
 		// falsifies the credential-isolation claim exactly the way an extra
 		// permission does. (It used to be accepted as "write implies read".)
 		if got != want {
-			problems = append(problems, fmt.Sprintf("%s: want %s, granted %s", name, want, got))
+			problems = append(problems, fmt.Sprintf("%s: want %s, granted %s%s", name, want, got, actionsHint(name)))
 		}
 	}
 
@@ -195,17 +195,30 @@ func (i *Installation) PermissionMismatches(scope Scope, runEvidence bool) []str
 		}
 		// `actions: read` IS WHAT billet REQUESTS BY DEFAULT, so an App that
 		// holds it is one billet made, not one edited behind its back; it is
-		// required only where a tier publishes from a default branch.
-		if runEvidencePermission[name] == got {
+		// required only where a tier publishes from a default branch. Write is
+		// never a default, so an App holding it where no tier re-runs a job is
+		// refused like any other permission billet did not ask for.
+		if name == actionsPermission && got == actionsReadLevel {
 			continue
 		}
 		problems = append(problems,
-			fmt.Sprintf("%s: granted %s, but billet never requested it", name, got))
+			fmt.Sprintf("%s: granted %s, but billet never requested it%s", name, got, actionsHint(name)))
 	}
 
 	sort.Strings(problems)
 
 	return problems
+}
+
+// actionsHint says what asks for each level of `actions`, which is the one permission
+// a config, rather than the target's scope, decides.
+func actionsHint(name string) string {
+	if name != actionsPermission {
+		return ""
+	}
+
+	return " (billet asks for read where a tier publishes caches from a default branch or an alert rule " +
+		"names a branch or a step, and write where a tier sets retry.disrupted)"
 }
 
 // ErrAppUnverifiable wraps failures that say NOTHING about the credential —
@@ -227,7 +240,7 @@ func Undecided(err error) bool {
 		return false
 	}
 
-	if errors.Is(err, ErrAppUnverifiable) || errors.Is(err, errNoAnswer) {
+	if errors.Is(err, ErrAppUnverifiable) || errors.Is(err, errNoAnswer) || errors.Is(err, ErrTokenUnavailable) {
 		return true
 	}
 
@@ -251,18 +264,18 @@ func Undecided(err error) bool {
 // a test fake or a GitHub Enterprise Server deployment passes its own.
 func VerifyAppAt(
 	ctx context.Context, client *http.Client, base string,
-	appID int64, privateKeyPEM []byte, target Target, installationID int64, runEvidence bool,
+	appID int64, privateKeyPEM []byte, target Target, installationID int64, actions ActionsAccess,
 ) (*Installation, error) {
 	if base == "" {
 		base = apiBase
 	}
 
-	return verifyAppAt(ctx, client, base, appID, privateKeyPEM, target, installationID, runEvidence)
+	return verifyAppAt(ctx, client, base, appID, privateKeyPEM, target, installationID, actions)
 }
 
 func verifyAppAt(
 	ctx context.Context, client *http.Client, base string,
-	appID int64, privateKeyPEM []byte, target Target, installationID int64, runEvidence bool,
+	appID int64, privateKeyPEM []byte, target Target, installationID int64, actions ActionsAccess,
 ) (*Installation, error) {
 	inst, err := getInstallationAt(ctx, client, base, appID, privateKeyPEM, target)
 	if err != nil {
@@ -278,12 +291,13 @@ func verifyAppAt(
 				return nil, fmt.Errorf("github: the App (id %d) is not installed on repository %q — "+
 					"open the App's settings page and install it on the repository's owner with "+
 					"access to that repository (or check that the target names the right "+
-					"repository; GitHub answers 404 for both)", appID, target)
+					"repository; GitHub answers 404 for both): %w", appID, target, ErrNotInstalled)
 			}
 
 			return nil, fmt.Errorf("github: the App (id %d) is not installed on %q — open the "+
 				"App's settings page and install it on the organization (or check that "+
-				"github.org names the right organization; GitHub answers 404 for both)", appID, target)
+				"github.org names the right organization; GitHub answers 404 for both): %w", appID, target,
+				ErrNotInstalled)
 		}
 
 		if api, ok := errors.AsType[*APIError](err); ok {
@@ -332,7 +346,7 @@ func verifyAppAt(
 			"`billet github-app create`, which fills it in)", target, inst.ID, installationID, inst.ID)
 	}
 
-	if problems := inst.PermissionMismatches(target.Scope(), runEvidence); len(problems) > 0 {
+	if problems := inst.PermissionMismatches(target.Scope(), actions); len(problems) > 0 {
 		// THE OWNER'S KIND COMES FROM THE ANSWER. The installation names the
 		// account it is on, so the review page is the right one for a user's
 		// repository as well as an organization's.

@@ -24,6 +24,8 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **One target, one connection, so the connection is health-checked.**
 - **A poll that fails past the client's retries is one tier's trouble, and the listener reopens its session rather than stopping the deployment (#207).**
 - **The policy client owns its HTTP client, and no request it makes is unbounded.**
+- **When a job message arrives is not when it happened: measure a job with the times the messages carry (#559).**
+- **A background reader of GitHub's REST records takes a few reads a pass through each installation and never its reserve.**
 
 ### Targets, trust, onboarding and cache authority: [references/targets-and-trust.md](references/targets-and-trust.md)
 
@@ -31,6 +33,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A target is an organization or a repository, and its GitHub path is its identity.**
 - **Scale sets are billet's to remove.**
 - **Onboarding is the App Manifest flow, so every deployment ends up with provably identical minimal permissions for its scope.**
+- **A deployment on a broker has a third way to authenticate, and the vendored client is told nothing about it (#557, ADR-025).**
 - **Two issuers.**
 - **billet is not actions-runner-controller without Kubernetes.**
 - **Two compatibility caveats are permanent until GitHub moves.**

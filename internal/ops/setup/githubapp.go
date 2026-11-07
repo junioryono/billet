@@ -86,6 +86,10 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 		"request `actions: read`, which default-branch cache publication (the default for an "+
 			"untrusted tier with a repository) needs to prove a job's branch from GitHub's record "+
 			"of its run; --actions-read=false leaves it out")
+	actionsWrite := fs.Bool("actions-write", false,
+		"request `actions: write`, which a tier with retry.disrupted needs to re-run a job billet "+
+			"disrupted; it includes read, and GitHub's grant also covers dispatching workflows and "+
+			"deleting logs, artifacts and caches, none of which billet does")
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -109,6 +113,19 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 		}
 	}
 
+	if *actionsWrite && !*actionsRead {
+		return errors.New("--actions-write includes read, so it cannot go with --actions-read=false")
+	}
+
+	actions := github.ActionsNone
+
+	switch {
+	case *actionsWrite:
+		actions = github.ActionsWrite
+	case *actionsRead:
+		actions = github.ActionsRead
+	}
+
 	if *targetName == "" {
 		return errors.New("--target must name a target; the github block is named " + config.DefaultTargetName)
 	}
@@ -130,6 +147,14 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 	plan, err := planConfigEdit(*cfgPath, identity)
 	if err != nil {
 		return err
+	}
+
+	// A DEPLOYMENT ON A BROKER HOLDS NO KEY, and creating an App here spends its one
+	// key on a host told not to have it. Refused before anything else is, for that
+	// reason.
+	if config.PeekTokenBroker(plan.body) {
+		return fmt.Errorf("%s has server.token_broker, so this host holds no App key. Create the App where the "+
+			"broker's keys are, and register its installation there", *cfgPath)
 	}
 
 	// THE RESOLVED PATH, so a symlinked --config defaults its key beside the file
@@ -192,7 +217,7 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 
 	fmt.Fprintf(env.Stdout, "billet requests exactly these permissions for a %s:\n", target.Scope())
 
-	perms := github.Permissions(target.Scope(), *actionsRead)
+	perms := github.Permissions(target.Scope(), actions)
 
 	names := make([]string, 0, len(perms))
 	for name := range perms {
@@ -217,11 +242,18 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 			"repository's settings, collaborators or branch protection.\n")
 	}
 
+	if actions == github.ActionsWrite {
+		// THE WIDER GRANT IS SAID OUT LOUD, as the repository one is above.
+		fmt.Fprintf(env.Stdout, "Actions write is the ONLY permission GitHub offers for re-running a job. It also\n"+
+			"covers dispatching workflows and deleting logs, artifacts and caches. billet uses\n"+
+			"it for the two re-run requests and nothing else (ADR-029).\n")
+	}
+
 	fmt.Fprintf(env.Stdout, "GitHub allows one hour to finish; if it lapses, just run this again.\n\n")
 
 	result, err := Onboard(ctx, github.OnboardOptions{
 		Target:      target,
-		RunEvidence: *actionsRead,
+		Actions:     actions,
 		Name:        *name,
 		Port:        *port,
 		OpenBrowser: open,

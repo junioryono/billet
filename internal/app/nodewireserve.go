@@ -39,6 +39,12 @@ type IdentityAccess func(ctx context.Context, dir string) (release func() error,
 // written: an operator naming the addresses their fleet uses is answering this
 // question themselves, and the bootstrap name has to be among them.
 func nodeTLSHosts(cfg *config.Config) ([]string, error) {
+	// BEHIND A ROUTER THE LISTENERS ARE NOT WHAT A NODE DIALS. A certificate naming
+	// the loopback address it listens on is one every node would refuse.
+	if hosts := cfg.Server.RouterHosts(); len(hosts) > 0 {
+		return hosts, nil
+	}
+
 	if len(cfg.Server.NodeTLSHosts) > 0 {
 		return cfg.Server.NodeTLSHosts, nil
 	}
@@ -94,6 +100,18 @@ type wireSettings struct {
 	operational, bootstrap int
 	handshake              time.Duration
 	resizer                nodeplane.Resizer
+	poolJoins              nodeplane.PoolJoins
+	logs                   nodeplane.LogIndexer
+}
+
+// withPoolJoins lets a pool's hosts join on their source's word (nodeplane.WithPoolJoins).
+func withPoolJoins(p nodeplane.PoolJoins) wireOption {
+	return func(s *wireSettings) { s.poolJoins = p }
+}
+
+// withLogIndex takes chunks of jobs' logs with x (nodeplane.WithLogIndex).
+func withLogIndex(x nodeplane.LogIndexer) wireOption {
+	return func(s *wireSettings) { s.logs = x }
 }
 
 // withResizer answers the resize route with r (nodeplane.WithResizer).
@@ -215,7 +233,11 @@ func ServeNodeWire(
 	}
 
 	addr := cfg.Server.Listen
-	loopback := nodeplane.LoopbackOnly(addr)
+
+	// A ROUTER IS BETWEEN THIS LISTENER AND THE FLEET, so loopback here says nothing
+	// about who connects: the certificates still have to reach the deployment that
+	// issued them, and a passthrough router would carry a TLS client to a plain listener.
+	loopback := !cfg.Server.WireServesTLS()
 
 	// THE ACCESS AGAIN, AFTER PROMOTION: the authority load below reads (and
 	// on first use creates) the CA, and a retirement of this host cannot be
@@ -268,6 +290,11 @@ func ServeNodeWire(
 		Enrollments: enrollments,
 		CachePolicy: cachePolicy,
 		Resizer:     limits.resizer,
+		PoolJoins:   limits.poolJoins,
+		// A ROUTER IN FRONT OF THE LISTENERS IS EVERY ENROLLMENT'S PEER, so the peer
+		// is not the host's own address there.
+		SeesHostAddress: seesHostAddress(cfg),
+		Logs:            limits.logs,
 	})
 	if err := errors.Join(err, release()); err != nil {
 		return nil, err

@@ -125,11 +125,19 @@ type Client struct {
 	// at all (nodeapi.VersionImageAcceptance); both under regMu.
 	imagesAccept        []string
 	imagesAcceptCarried bool
+	// logIndexID is the index the last accepted registration named, empty where the
+	// control plane holds none or its wire carries none.
+	logIndexID string
+	// macOSLimit is the node's macOS limit as the last accepted registration's answer
+	// said it, and nil when its wire does not carry one; under regMu.
+	macOSLimit *int
 
 	// guestUnsent is set the first time a guest report is not sent because the
 	// negotiated wire does not carry one, so that is said once and not once a
 	// job.
 	guestUnsent atomic.Bool
+	// egressUnsent is the same, for an egress report.
+	egressUnsent atomic.Bool
 }
 
 // Options configures a Client.
@@ -836,6 +844,17 @@ func (c *Client) registerWith(ctx context.Context, at int, reg Registration) err
 	c.wire.Store(int64(res.Version))
 	c.imagesAccept = slices.Clone(res.ImagesAccept)
 	c.imagesAcceptCarried = res.Version >= nodeapi.VersionImageAcceptance
+	c.logIndexID = ""
+	if res.Version >= nodeapi.VersionJobLogs {
+		c.logIndexID = res.LogIndexID
+	}
+
+	c.macOSLimit = nil
+
+	if res.Version >= nodeapi.VersionTartVerified {
+		c.macOSLimit = res.MacOSVMLimit
+	}
+
 	c.regMu.Unlock()
 
 	return nil
@@ -853,6 +872,19 @@ func (c *Client) ImageAcceptance() ([]string, bool) {
 	}
 
 	return slices.Clone(c.imagesAccept), true
+}
+
+// MacOSLimit is how many macOS guests the last accepted registration said this node
+// may run, and false when its control plane does not say, which is not a limit of zero.
+func (c *Client) MacOSLimit() (int, bool) {
+	c.regMu.Lock()
+	defer c.regMu.Unlock()
+
+	if c.macOSLimit == nil {
+		return 0, false
+	}
+
+	return *c.macOSLimit, true
 }
 
 // WireVersion is the protocol version this node's registration settled on.
@@ -1238,6 +1270,32 @@ func (c *Client) RecordGuestReport(ctx context.Context, leaseID string, epoch in
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/guest"),
 		nodeapi.GuestReportRequest{Epoch: epoch, Report: report}, nil)
+}
+
+// RecordLeaseEgress tells the control plane what the host saw of a lease's network.
+//
+// CHECKED WHERE IT IS EMITTED, for RecordGuestReport's reasons: below VersionEgress
+// the plane has no route for it, and what the pairing loses is the report, never a
+// job, so it is dropped as success and said once. With no wire negotiated the
+// version cannot be told, which is ErrUnregistered.
+func (c *Client) RecordLeaseEgress(ctx context.Context, leaseID string, epoch int64, report alloc.JobEgress) error {
+	wire := c.WireVersion()
+	if wire == 0 {
+		return fmt.Errorf("%w: no wire is negotiated, so whether it carries an egress report "+
+			"cannot be told", ErrUnregistered)
+	}
+
+	if wire < nodeapi.VersionEgress {
+		if !c.egressUnsent.Swap(true) {
+			slog.Default().Info("the control plane's wire does not carry egress reports, so none is sent",
+				"negotiated", wire, "needs", nodeapi.VersionEgress)
+		}
+
+		return nil
+	}
+
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/egress"),
+		nodeapi.EgressReportRequest{Epoch: epoch, Report: report}, nil)
 }
 
 // beforeSeriesClock is the series a plane older than VersionSeriesClock can
@@ -1769,4 +1827,22 @@ func (c *Client) Renew(ctx context.Context, name string) ([]byte, []byte, []byte
 	// THE AUTHORITY TRAVELS WITH THE CERTIFICATE, which is what lets a CA
 	// rotation reach a node: during an overlap this is a bundle holding both.
 	return []byte(res.CertPEM), key, []byte(res.CAPEM), nil
+}
+
+// LogIndexID names the index the control plane holds, false when it holds none or this
+// pairing's wire carries none.
+func (c *Client) LogIndexID() (string, bool) {
+	c.regMu.Lock()
+	defer c.regMu.Unlock()
+
+	return c.logIndexID, c.logIndexID != ""
+}
+
+// ShipLogChunk sends one kept chunk of a job's log to be indexed. A refusal is permanent;
+// any other error is could-not-tell and worth another try.
+func (c *Client) ShipLogChunk(ctx context.Context, leaseID string, firstLine int64, data []byte) (bool, error) {
+	err := c.do(ctx, http.MethodPost, c.nodePath("/logs"),
+		nodeapi.LogChunkRequest{Lease: leaseID, FirstLine: firstLine, Data: data}, nil)
+
+	return errors.Is(err, ErrRefused), err
 }

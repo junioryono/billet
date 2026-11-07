@@ -52,6 +52,7 @@ import (
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // A registered host in these tests is deliberately larger than any budget they
@@ -90,6 +91,17 @@ type plane struct {
 	// tier is the label this service's one scale set carries, so a second
 	// fake can stand in for a second target with a tier of its own.
 	tier string
+
+	// rest answers GitHub's REST record of workflow runs, for a test about one.
+	rest http.HandlerFunc
+}
+
+// setREST names what answers GitHub's REST record of workflow runs.
+func (p *plane) setREST(handler http.HandlerFunc) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.rest = handler
 }
 
 const (
@@ -129,7 +141,24 @@ func newPlaneFor(t *testing.T, tier string, setID int) *plane {
 func (p *plane) route(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
+	p.mu.Lock()
+	rest := p.rest
+	p.mu.Unlock()
+
+	if rest != nil && (strings.Contains(path, "/actions/runs/") || strings.Contains(path, "/actions/jobs/")) {
+		rest(w, r)
+
+		return
+	}
+
 	switch {
+	// WHAT A BROKER ASKS BEFORE IT MINTS: the App's installation on the target.
+	case strings.HasSuffix(path, "/orgs/acme/installation"):
+		fakeactions.WriteJSON(p.t, w, map[string]any{
+			"id": 67890, "account": map[string]string{"login": "acme", "type": "Organization"},
+			"permissions": map[string]string{"metadata": "read", "organization_self_hosted_runners": "write"},
+		})
+
 	case strings.Contains(path, "runnergroups"):
 		fakeactions.WriteJSON(p.t, w, fakeactions.ListJSON(
 			map[string]any{"id": 1, "name": testGroup, "isDefaultGroup": false}))
@@ -335,6 +364,9 @@ func (p *plane) acquiredIDs() []int64 {
 
 // stack is billet, assembled the way cmd/billet assembles it.
 type stack struct {
+	// assembled is the control plane this stack runs, its served wire included.
+	assembled *assembled
+
 	// dir is the state directory, so a restart can be built over it.
 	dir string
 
@@ -494,6 +526,14 @@ type stackOpt func(*stackConfig)
 type stackConfig struct {
 	wire      bool
 	untrusted bool
+	// noFirstNode starts no node for a wire stack: its first node is the test's to
+	// start, through whatever is in front of the wire.
+	noFirstNode bool
+	// configure adjusts the control plane's config before it is assembled.
+	configure func(*config.Config)
+	// tokens, when set, gives the deployment a token source in place of the App key,
+	// built over the stack's own identity directory and plane.
+	tokens func(t *testing.T, dir string, p *plane) billetgithub.TokenSource
 	// tiers, when set, replaces the harness's built-in catalogue. It is how a
 	// test drives a config it did NOT hand-write — a `billet init` generation —
 	// through the real stack, to prove the trust/runner-group/workflow policy it
@@ -518,6 +558,9 @@ type stackConfig struct {
 	// before a second backend existed keeps measuring.
 	kind    config.ProviderKind
 	backend func(t *testing.T, deployment string) provider.Provider
+	// retryDisrupted, when set, gives the stack's tier retry.disrupted, and the
+	// loop a pace a test can wait out.
+	retryDisrupted int
 	// nodeDrainTimeout is the node's `drain_timeout`, which decides when a drain
 	// starts SAYING it is long and nothing else.
 	//
@@ -592,6 +635,11 @@ func (d directRunner) KeepAlive(ctx context.Context)   { d.runner.KeepAlive(ctx)
 // overTheWire puts a real node wire between the control plane and the runner.
 func overTheWire(c *stackConfig) { c.wire = true }
 
+// withTokens gives the deployment a token source and no App key.
+func withTokens(build func(t *testing.T, dir string, p *plane) billetgithub.TokenSource) stackOpt {
+	return func(c *stackConfig) { c.tokens = build }
+}
+
 // withTiers drives the stack from a supplied catalogue instead of the built-in
 // one, so a test can prove a generated config's tiers launch.
 func withTiers(ts []config.Tier) stackOpt {
@@ -601,6 +649,16 @@ func withTiers(ts []config.Tier) stackOpt {
 // withPlane steers the node plane, after the assembly's own options.
 func withPlane(opts ...nodeplane.Option) stackOpt {
 	return func(c *stackConfig) { c.plane = append(c.plane, opts...) }
+}
+
+// withConfigure adjusts the control plane's config before it is assembled.
+func withConfigure(fn func(*config.Config)) stackOpt {
+	return func(c *stackConfig) { c.configure = fn }
+}
+
+// withRetryDisrupted sets retry.disrupted on every tier.
+func withRetryDisrupted(n int) stackOpt {
+	return func(c *stackConfig) { c.retryDisrupted = n }
 }
 
 // withReapInterval replaces the harness's reaper tick.
@@ -662,7 +720,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		}
 	}
 
-	client, err := scaleset.New(scaleset.Config{
+	clientCfg := scaleset.Config{
 		Target:         billetgithub.OrganizationTarget("acme"),
 		GitHubURL:      p.URL,
 		ClientID:       "12345",
@@ -670,7 +728,13 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		PrivateKey:     p.PrivateKeyPEM(),
 		AppID:          12345,
 		APIURL:         p.URL + "/api/v3",
-	}, nil)
+	}
+	if sc.tokens != nil {
+		clientCfg.ClientID, clientCfg.PrivateKey = "", ""
+		clientCfg.Tokens = sc.tokens(t, dir, p)
+	}
+
+	client, err := scaleset.New(clientCfg, nil)
 	if err != nil {
 		t.Fatalf("scaleset.New: %v", err)
 	}
@@ -715,6 +779,9 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	if sc.untrusted {
 		tiers[0].Trust = config.WorkloadUntrusted
 		tiers[0].Workflows = nil
+	}
+	if sc.retryDisrupted > 0 {
+		tiers[0].Retry = &config.TierRetry{Disrupted: sc.retryDisrupted}
 	}
 
 	// THE TARGETS, ASSEMBLED THE WAY THE CLI ASSEMBLES THEM: a client per
@@ -784,13 +851,23 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 			// short so these scenarios exercise the overrun REPORT rather than
 			// sitting silent, which is all it decides now.
 			server.WithDrainTimeout(200 * time.Millisecond),
+			// A PACE THE RE-RUN TESTS CAN WAIT OUT. The loop runs in every scenario, and
+			// only a tier with retry.disrupted gives it a job to decide.
+			server.WithRerunPacing(100*time.Millisecond, time.Millisecond),
+			// AND ONE THE ALERT TESTS CAN: the loops start only for a config with rules.
+			server.WithAlertPacing(100*time.Millisecond, 50*time.Millisecond, 10*time.Millisecond),
 		},
 	}
 	if sc.now != nil {
 		steering.Allocator = append(steering.Allocator, alloc.WithClock(sc.now))
 	}
 
-	c := openAssembled(t, harnessConfig(dir, 8, 16*config.GiB, tiers), targets, steering)
+	assembledCfg := harnessConfig(dir, 8, 16*config.GiB, tiers)
+	if sc.configure != nil {
+		sc.configure(assembledCfg)
+	}
+
+	c := openAssembled(t, assembledCfg, targets, steering)
 	a := c.ctl.Allocator()
 
 	// A per-test deployment identity, so two of these running concurrently do not
@@ -855,14 +932,17 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		guestCache *node.CacheService
 	)
 
-	if sc.wire {
+	switch {
+	case sc.wire && sc.noFirstNode:
+		wire, wireAddr = c.wire.Plane(), c.wire.Addr
+	case sc.wire:
 		first := startFirstNode(t, log, c, nodeProcess{
 			host: host, deployment: deployment, provider: prov, kind: kind,
 			hurry: hurry, drainTimeout: sc.nodeDrainTimeout, guestReports: sc.guestReports,
 		})
 		runner, stopNode, guestCache = first.runner, first.stop, first.guestCache
 		wire, wireAddr = c.wire.Plane(), c.wire.Addr
-	} else {
+	default:
 		// PRE-REGISTERED ONLY FOR THE IN-PROCESS STACK, and after the fleet was
 		// forgotten, as a registration over the wire would be. Over the wire the
 		// plane's own registration must write this row, so doing it there would
@@ -890,6 +970,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		runner: runner, scheduler: scheduler, provider: prov, kind: kind, backend: sc.backend,
 		node: host, tiers: tiers,
 		wire: wire, stopNode: stopNode, wireAddr: wireAddr, guestCache: guestCache,
+		assembled: c,
 	}
 }
 
@@ -925,6 +1006,10 @@ type nodeProcess struct {
 	// guestReports gives the node a guest cache service that takes its guests'
 	// own reports; see stackConfig.guestReports.
 	guestReports bool
+	// identity is the certificate a node dialling over mutual TLS presents, loaded as
+	// `billet node` loads it, whose addr then says https itself. Nil is the plain wire
+	// of a loopback control plane.
+	identity *wirecert.Rotating
 	// controllers, when set, are every control-plane address the node dials
 	// (node.server_addrs), in place of the one startNodeLoop is given.
 	controllers []string
@@ -952,15 +1037,21 @@ type nodeLoop struct {
 func startNodeLoop(t *testing.T, log *slog.Logger, addr string, np nodeProcess) *nodeLoop {
 	t.Helper()
 
-	nodeCfg := &config.NodeConfig{Name: np.host, ServerAddr: "http://" + addr}
+	// A TLS NODE'S ADDRESS SAYS https ITSELF; a plain one is given its scheme here.
+	scheme := "http://"
+	if np.identity != nil {
+		scheme = ""
+	}
+
+	nodeCfg := &config.NodeConfig{Name: np.host, ServerAddr: scheme + addr}
 	if np.controllers != nil {
 		nodeCfg.ServerAddr = ""
 		for _, a := range np.controllers {
-			nodeCfg.ServerAddrs = append(nodeCfg.ServerAddrs, "http://"+a)
+			nodeCfg.ServerAddrs = append(nodeCfg.ServerAddrs, scheme+a)
 		}
 	}
 
-	nc, err := app.NewNodeClient(&config.Config{Node: nodeCfg}, nil)
+	nc, err := app.NewNodeClient(&config.Config{Node: nodeCfg}, np.identity)
 	if err != nil {
 		t.Fatalf("app.NewNodeClient: %v", err)
 	}

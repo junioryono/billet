@@ -8,6 +8,7 @@
   "github_job_id": "52000000001",
   "run_id": 18000000001,
   "github_run_id": 0,
+  "run_attempt": 0,
   "request_id": 9001,
   "job_name": "cpu",
   "repository": "acme/bench",
@@ -34,6 +35,9 @@
   "failure_reason": "",
   "disruption": "",
   "disrupted_at": "",
+  "rerun_decision": "",
+  "rerun_decided_at": "",
+  "rerun_attempt": 0,
   "cache": {
     "image": "",
     "image_generation": "",
@@ -90,7 +94,9 @@
     "energy_active_uj": 0,
     "energy_idle_uj": 0
   },
+  "prediction": null,
   "guest": null,
+  "egress": null,
   "tests": {
     "notice": "Reported by the job's own VM. The job runs as root there and can change any of it; billet does not act on it.",
     "results": null

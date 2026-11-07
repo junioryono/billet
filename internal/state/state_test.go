@@ -1131,6 +1131,32 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	// data. The declarations themselves are checked structurally elsewhere.
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			`DROP INDEX job_history_running_idx`,
+			`DROP INDEX job_history_result_idx`,
+			`DROP TABLE alert_outbox`,
+			`DROP TABLE alert_streaks`,
+			`DROP TABLE alert_marks`,
+			`DROP TABLE alert_rules`,
+			`ALTER TABLE node_enrollments DROP COLUMN pool_order`,
+			`DROP INDEX join_tokens_pool_order_idx`,
+			`ALTER TABLE join_tokens DROP COLUMN pool_order`,
+			`DROP INDEX pool_orders_state_idx`,
+			`DROP TABLE pool_orders`,
+			`DROP INDEX job_history_rerun_decided_idx`,
+			`ALTER TABLE job_history DROP COLUMN rerun_decision`,
+			`ALTER TABLE job_history DROP COLUMN rerun_decided_at`,
+			`ALTER TABLE job_history DROP COLUMN rerun_attempt`,
+			`DROP TABLE job_reruns`,
+			`DROP TABLE rerun_tiers`,
+			`DROP INDEX job_history_usage_seq`,
+			`DROP INDEX job_history_usage_unnumbered`,
+			`ALTER TABLE job_history DROP COLUMN usage_mark`,
+			`ALTER TABLE job_history DROP COLUMN github_finished_at`,
+			`ALTER TABLE pending_completions DROP COLUMN job_runner_assigned_at`,
+			`ALTER TABLE pending_completions DROP COLUMN job_finished_at`,
+			`DROP TABLE usage_sequence`,
+			`ALTER TABLE job_history DROP COLUMN usage_seq`,
+			`ALTER TABLE job_history DROP COLUMN github_target`,
 			`ALTER TABLE nodes DROP COLUMN architectures`,
 			`ALTER TABLE leases DROP COLUMN npm_cache`,
 			`ALTER TABLE job_history DROP COLUMN npm_cache`,
@@ -1155,6 +1181,8 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 			`ALTER TABLE job_history DROP COLUMN github_scale_set_assigned_at`,
 			`ALTER TABLE job_history DROP COLUMN github_runner_assigned_at`,
 			`ALTER TABLE job_history DROP COLUMN bought_at`,
+			`DROP TABLE lease_holds`,
+			`DROP TABLE job_egress`,
 			`DROP TABLE job_test_results`,
 			`ALTER TABLE job_history DROP COLUMN head_sha`,
 			`ALTER TABLE job_history DROP COLUMN head_branch`,
@@ -1273,8 +1301,15 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	requireIndex(t, upgraded, "job_history_disrupted_idx")
 	requireIndex(t, upgraded, "pending_completions_lease_idx")
 	requireIndex(t, upgraded, "job_guest_reports_recorded_at")
+	requireIndex(t, upgraded, "job_egress_recorded_at")
 	requireIndex(t, upgraded, "job_test_results_recorded_at")
+	requireIndex(t, upgraded, "lease_holds_holding")
 	requireIndex(t, upgraded, "job_history_started_idx")
+	requireIndex(t, upgraded, "job_history_rerun_decided_idx")
+	requireIndex(t, upgraded, "job_history_running_idx")
+	requireIndex(t, upgraded, "job_history_result_idx")
+	requireIndex(t, upgraded, "alert_outbox_due_idx")
+	requireIndex(t, upgraded, "alert_marks_decided_idx")
 	requireIndex(t, upgraded, "job_history_github_run_idx")
 	requireIndex(t, upgraded, "job_history_run_idx")
 
@@ -1512,6 +1547,15 @@ func TestAPendingCompletionWrittenAtVersion25SurvivesVersion26(t *testing.T) {
 			`ALTER TABLE pool_runners DROP COLUMN job_workflow_ref`,
 			`ALTER TABLE pool_runners DROP COLUMN job_event`,
 			`DELETE FROM schema_migrations WHERE version = 53`,
+			// And 71, which adds two more.
+			`DROP INDEX job_history_usage_seq`,
+			`DROP INDEX job_history_usage_unnumbered`,
+			`DROP TABLE usage_sequence`,
+			`ALTER TABLE job_history DROP COLUMN usage_seq`,
+			`ALTER TABLE job_history DROP COLUMN usage_mark`,
+			`ALTER TABLE job_history DROP COLUMN github_finished_at`,
+			`ALTER TABLE job_history DROP COLUMN github_target`,
+			`DELETE FROM schema_migrations WHERE version = 72`,
 			`INSERT INTO pending_completions
 			 (tier, request_id, run_id, result, lease_id, lease_epoch, outcome,
 			  release_only, lease_node, message_id, retired, acknowledged)

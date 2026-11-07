@@ -198,14 +198,18 @@ func (p *protocolProbe) finish() {
 		}
 	}
 
-	runs, err := p.dispatch.dispatchedRuns(ctx, p.start)
-	if err != nil {
-		p.cleanup(fmt.Sprintf("finding the runs to cancel (those already known are cancelled): %v", err))
-	}
+	// A MEASUREMENT WHOSE JOBS SOMEBODY ELSE QUEUES HAS NO DISPATCHER, and no run
+	// of its own to cancel.
+	if p.dispatch != nil {
+		runs, err := p.dispatch.dispatchedRuns(ctx, p.start)
+		if err != nil {
+			p.cleanup(fmt.Sprintf("finding the runs to cancel (those already known are cancelled): %v", err))
+		}
 
-	for _, run := range runs {
-		if err := p.dispatch.cancel(ctx, run); err != nil {
-			p.cleanup(fmt.Sprintf("cancelling run %d: %v", run, err))
+		for _, run := range runs {
+			if err := p.dispatch.cancel(ctx, run); err != nil {
+				p.cleanup(fmt.Sprintf("cancelling run %d: %v", run, err))
+			}
 		}
 	}
 
@@ -899,8 +903,8 @@ func sleepSeconds() int {
 }
 
 // dispatcher queues jobs by dispatching a workflow, reads their statuses and
-// cancels their runs, over GitHub's REST API with a token of its own: the App
-// billet runs with holds no actions permission, and must not.
+// cancels their runs, over GitHub's REST API with a token of its own: dispatching
+// is `actions: write`, and the App under test holds what billet asks of it.
 type dispatcher struct {
 	repo, workflow, ref, token string
 	// label is the scale set's label every job this measurement queues runs on.

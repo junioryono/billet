@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -223,5 +224,298 @@ func TestTheStateBlockRefusesWhatItCannotHonour(t *testing.T) {
 				t.Errorf("want a refusal naming %q, got: %v", tc.want, err)
 			}
 		})
+	}
+}
+
+// THE BUDGET IS THE ARITHMETIC THE ERROR STATES: the writer, the claim and at
+// least one reader, with the pool getting what those leave and never more than
+// the default it always had.
+func TestAPostgresConnectionBudgetSizesTheReaderPool(t *testing.T) {
+	block := func(budget string) string {
+		return serverWith("  identity_dir: /srv/billet\n  state:\n    backend: postgres\n" +
+			"    postgres:\n      dsn_env: BILLET_STATE_DSN\n" + budget)
+	}
+
+	for name, tc := range map[string]struct {
+		budget       string
+		readers, all int
+	}{
+		"no budget keeps the default": {"", DefaultLedgerReaderConnections, 6},
+		"the smallest budget":         {"      max_connections: 3\n", 1, 3},
+		"a budget inside the default": {"      max_connections: 4\n", 2, 4},
+		"exactly the default":         {"      max_connections: 6\n", 4, 6},
+		"more than a plane can use":   {"      max_connections: 50\n", 4, 6},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := loadServer(t, block(tc.budget))
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+
+			if got := cfg.Server.LedgerReaderConnections(); got != tc.readers {
+				t.Errorf("readers = %d, want %d", got, tc.readers)
+			}
+
+			if got := cfg.Server.LedgerConnections(); got != tc.all {
+				t.Errorf("connections = %d, want %d", got, tc.all)
+			}
+		})
+	}
+
+	for _, budget := range []string{"0", "2", "1", "-1"} {
+		t.Run("refuses "+budget, func(t *testing.T) {
+			_, err := loadServer(t, block("      max_connections: "+budget+"\n"))
+			if err == nil || !strings.Contains(err.Error(), "needs at least 3: the writer, the controller "+
+				"claim's session and one reader") {
+				t.Fatalf("max_connections %s answered %v, want the arithmetic", budget, err)
+			}
+		})
+	}
+}
+
+// A SQLITE LEDGER IS A FILE: it has no connections to budget, and no block to put
+// a budget in.
+func TestASQLiteLedgerCountsNoServerConnections(t *testing.T) {
+	cfg, err := loadServer(t, serverWith("  state_dir: "+t.TempDir()+"\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if got := cfg.Server.LedgerConnections(); got != 0 {
+		t.Errorf("connections = %d on a SQLite ledger, want 0", got)
+	}
+
+	if got := cfg.Server.LedgerReaderConnections(); got != DefaultLedgerReaderConnections {
+		t.Errorf("readers = %d, want the default", got)
+	}
+}
+
+// BOTH DIRECTIONS OF THE BROKER'S BLOCK: with it a target names no key and the file
+// loads; a key beside it is a key this host was told it does not hold.
+func TestAConfigOnABrokerNamesNoKey(t *testing.T) {
+	base := func(key, block string) string {
+		return "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n" + key + "server:\n" +
+			"  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n" + block
+	}
+
+	const broker = "  token_broker:\n    url: https://broker.internal:8443\n" +
+		"    client_key_path: /etc/billet/broker-client.key\n"
+
+	cfg, err := loadServer(t, base("", broker))
+	if err != nil {
+		t.Fatalf("a deployment on a broker with no key: %v", err)
+	}
+	if cfg.Server.TokenBroker == nil || cfg.Server.TokenBroker.URL != "https://broker.internal:8443" {
+		t.Fatalf("the block did not reach the config: %+v", cfg.Server.TokenBroker)
+	}
+
+	if _, err := loadServer(t, base("  private_key_path: /tmp/key.pem\n", broker)); err == nil ||
+		!strings.Contains(err.Error(), "holds no App key") {
+		t.Fatalf("a key beside a broker answered %v", err)
+	}
+
+	if _, err := loadServer(t, base("", "")); err == nil || !strings.Contains(err.Error(), "private_key_path is required") {
+		t.Fatalf("no key and no broker answered %v", err)
+	}
+
+	for name, tc := range map[string]struct{ block, want string }{
+		"no url": {"  token_broker:\n    client_key_path: /etc/k\n", "url is required"},
+		"http":   {"  token_broker:\n    url: http://broker\n    client_key_path: /etc/k\n", "must be https"},
+		"credentials in the url": {
+			"  token_broker:\n    url: https://u:p@broker\n    client_key_path: /etc/k\n", "only a scheme and a host",
+		},
+		"a path in the url": {
+			"  token_broker:\n    url: https://broker/v1\n    client_key_path: /etc/k\n", "only a scheme and a host",
+		},
+		"no key path": {"  token_broker:\n    url: https://broker\n", "client_key_path is required"},
+		"a relative key": {
+			"  token_broker:\n    url: https://broker\n    client_key_path: k\n", "must be absolute",
+		},
+		"inside the identity directory": {
+			"  token_broker:\n    url: https://broker\n    client_key_path: /srv/billet/k\n", "inside identity_dir",
+		},
+		"a relative ca": {
+			"  token_broker:\n    url: https://broker\n    client_key_path: /etc/k\n    ca_file: ca.pem\n",
+			"ca_file",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadServer(t, base("", tc.block)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A DEPLOYMENT BEHIND A ROUTER LISTENS ON LOOPBACK AND SERVES TLS, which nothing else
+// does, and the names it is reached by have to be ones a client sends as SNI.
+func TestATLSRouterMakesALoopbackWireServeTLS(t *testing.T) {
+	base := func(listen, block string) string {
+		return "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n  private_key_path: /tmp/key.pem\n" +
+			"server:\n  listen: " + listen + "\n  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n" + block
+	}
+
+	const router = "  tls_router:\n    node_addr: a.nodes.example.com:443\n    enroll_addr: a.enroll.example.com:443\n" +
+		"  bootstrap_listen: 127.0.0.1:7718\n"
+
+	cfg, err := loadServer(t, base("127.0.0.1:7717", router))
+	if err != nil {
+		t.Fatalf("a deployment behind a router: %v", err)
+	}
+
+	if !cfg.Server.WireServesTLS() {
+		t.Error("a loopback wire behind a router does not serve TLS")
+	}
+
+	if got := strings.Join(cfg.Server.RouterHosts(), ","); got != "a.nodes.example.com,a.enroll.example.com" {
+		t.Errorf("its certificate would name %q", got)
+	}
+
+	// A SINGLE LABEL IS A NAME: crypto/tls sends it as SNI.
+	if _, err := loadServer(t, base("127.0.0.1:7717", "  tls_router:\n    node_addr: router:443\n")); err != nil {
+		t.Errorf("a single-label name: %v", err)
+	}
+
+	plain, err := loadServer(t, base("127.0.0.1:7717", ""))
+	if err != nil {
+		t.Fatalf("a loopback deployment: %v", err)
+	}
+
+	if plain.Server.WireServesTLS() {
+		t.Error("a plain loopback wire claims to serve TLS")
+	}
+
+	if _, err := loadServer(t, base("127.0.0.1:7717", "  bootstrap_listen: 127.0.0.1:7718\n")); err == nil ||
+		!strings.Contains(err.Error(), "nothing for a node to enroll into") {
+		t.Errorf("enrollment on a plain loopback wire answered %v; a router is the only thing that changes that", err)
+	}
+
+	for name, tc := range map[string]struct{ listen, block, want string }{
+		"no node address": {"127.0.0.1:7717", "  tls_router:\n    enroll_addr: a.b.example.com:443\n", "node_addr"},
+		"an IP": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: 10.0.0.1:443\n", "no SNI",
+		},
+		"an empty label":            {"127.0.0.1:7717", "  tls_router:\n    node_addr: a..example.com:443\n", "must name a DNS name"},
+		"a trailing dot":            {"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com.:443\n", "must name a DNS name"},
+		"a leading hyphen":          {"127.0.0.1:7717", "  tls_router:\n    node_addr: -a.example.com:443\n", "must name a DNS name"},
+		"an underscore":             {"127.0.0.1:7717", "  tls_router:\n    node_addr: a_b.example.com:443\n", "must name a DNS name"},
+		"a number for a last label": {"127.0.0.1:7717", "  tls_router:\n    node_addr: 10.0.1:443\n", "must name a DNS name"},
+		"no host":                   {"127.0.0.1:7717", "  tls_router:\n    node_addr: :443\n", "must name a DNS name"},
+		"no port":                   {"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com\n", "host:port"},
+		"enrollment with no name": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n  bootstrap_listen: 127.0.0.1:7718\n",
+			"enroll_addr is required",
+		},
+		"a name for no listener": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: b.example.com:443\n",
+			"nothing to send it to",
+		},
+		"one name for both": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: a.example.com:443\n" +
+				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
+		},
+		"one name in two cases": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: A.Example.com:443\n" +
+				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
+		},
+		"one name on two ports": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: a.example.com:8443\n" +
+				"  bootstrap_listen: 127.0.0.1:7718\n", "tells the two listeners apart",
+		},
+		"a wire off loopback": {"10.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n", "listens on loopback"},
+		"enrollment off loopback": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n    enroll_addr: b.example.com:443\n" +
+				"  bootstrap_listen: 10.0.0.1:7718\n", "listens on loopback",
+		},
+		"two spellings of the names": {
+			"127.0.0.1:7717", "  tls_router:\n    node_addr: a.example.com:443\n  node_tls_hosts: [a.example.com]\n",
+			"node_tls_hosts is set",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadServer(t, base(tc.listen, tc.block)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A NODE IN A ROUTED CONTROL PLANE'S FILE DIALS THE ROUTER, because the certificate
+// names only the router's names and the wire demands one: loopback plain HTTP reaches
+// nothing, and a certificate alone would fail on the address it dials.
+func TestANodeBesideARoutedControlPlaneDialsTheRouter(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"node.crt", "node.key", "ca.crt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tls := "  tls:\n    cert: " + filepath.Join(dir, "node.crt") + "\n    key: " + filepath.Join(dir, "node.key") +
+		"\n    ca: " + filepath.Join(dir, "ca.crt") + "\n"
+
+	body := func(node string) string {
+		return "github:\n  org: acme\n  app_id: 1\n  installation_id: 2\n  private_key_path: /tmp/key.pem\n" +
+			"server:\n  listen: 127.0.0.1:7717\n  state_dir: /srv/billet\n  max_vcpu: 4\n  max_memory: 8GiB\n" +
+			"  tls_router:\n    node_addr: a.nodes.example.com:443\n" +
+			"node:\n  name: n\n  provider: docker\n  state_dir: /srv/billet-node\n" + node
+	}
+
+	cfg, err := loadServer(t, body(tls))
+	if err != nil {
+		t.Fatalf("a node with a certificate and no server_addr: %v", err)
+	}
+	if cfg.Node.ServerAddr != "a.nodes.example.com:443" {
+		t.Errorf("node.server_addr defaulted to %q, want the router's address", cfg.Node.ServerAddr)
+	}
+
+	withEnrollment := strings.Replace(body(tls), "    node_addr: a.nodes.example.com:443\n",
+		"    node_addr: a.nodes.example.com:443\n    enroll_addr: a.enroll.example.com:443\n", 1)
+	withEnrollment = strings.Replace(withEnrollment, "  max_memory: 8GiB\n",
+		"  max_memory: 8GiB\n  bootstrap_listen: 127.0.0.1:7718\n", 1)
+
+	enrolling, err := loadServer(t, withEnrollment)
+	if err != nil {
+		t.Fatalf("a node beside a router with enrollment: %v", err)
+	}
+	if enrolling.Node.BootstrapAddr != "a.enroll.example.com:443" {
+		t.Errorf("node.bootstrap_addr defaulted to %q, want the router's enrollment address", enrolling.Node.BootstrapAddr)
+	}
+
+	if _, err := loadServer(t, body("  server_addr: A.Nodes.Example.com:443\n"+tls)); err != nil {
+		t.Errorf("another spelling of the router's address: %v", err)
+	}
+
+	for name, tc := range map[string]struct{ node, want string }{
+		"no certificate":                  {"", "node.tls is not set"},
+		"loopback with no certificate":    {"  server_addr: 127.0.0.1:7717\n", "is not server.tls_router.node_addr"},
+		"loopback with a certificate":     {"  server_addr: 127.0.0.1:7717\n" + tls, "is not server.tls_router.node_addr"},
+		"another name with a certificate": {"  server_addr: b.nodes.example.com:443\n" + tls, "is not server.tls_router.node_addr"},
+		"a list naming another":           {"  server_addrs: [a.nodes.example.com:443, 127.0.0.1:7717]\n" + tls, "is not server.tls_router.node_addr"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadServer(t, body(tc.node)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want it to say %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A BROKER BLOCK STOPS THE APP'S CREATION WHETHER OR NOT IT IS COMPLETE: a half-written
+// one still says this host is not to hold a key, and the spend cannot be taken back.
+func TestAnyBrokerBlockIsSeenBeforeAnAppIsCreated(t *testing.T) {
+	t.Parallel()
+
+	for body, want := range map[string]bool{
+		"server:\n  token_broker:\n    url: https://broker\n":     true,
+		"server:\n  token_broker:\n    client_key_path: /etc/k\n": true,
+		"server:\n  token_broker: {}\n":                           true,
+		"server:\n  listen: 127.0.0.1:7717\n":                     false,
+		"github:\n  org: acme\n":                                  false,
+		"not yaml: [":                                             false,
+	} {
+		if got := PeekTokenBroker([]byte(body)); got != want {
+			t.Errorf("PeekTokenBroker(%q) = %v, want %v", body, got, want)
+		}
 	}
 }

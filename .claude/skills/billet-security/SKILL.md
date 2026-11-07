@@ -15,9 +15,11 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 ### Privilege, trust and destruction: [references/privilege-and-trust.md](references/privilege-and-trust.md)
 
+- **A terminal in a job's VM is offered only on a trusted tier, and whatever passes through it is the guest's.**
 - **The server is unprivileged; the node is a root custodian.**
 - **Trust belongs to a pool, not to the assignment that scaled it up.**
 - **Untrusted work needs a real boundary and a network of its own, and each backend answers differently.**
+- **A guest's network policy is keyed by its interface and its own resolver socket, never by anything it wrote.**
 - **A registration proves who you are; only a command proves what you may do.**
 - **Destruction is scoped by deployment identity.**
 - **Never signal a pid you have not proved is still yours.**
@@ -31,6 +33,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **The JIT registration is never in argv and never in a log.**
 - **Nothing the guest wrote is ever quoted into a billet error.**
+- **A deployment on a token broker holds no App key, and every path that wanted one says so (#557, ADR-025).**
 - **Every type that holds a credential redacts itself, on a value receiver, and the table proves it by mutation.**
 - **The ledger's connection string and the App key are types of their own, and an unparsable DSN's error quotes nothing pgx wrote.**
 - **A failed fetch names the URL it was on, and after a redirect that URL is signed.**
@@ -39,6 +42,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The converge action's credentials land in files or the environment, never argv, and its cleanup removes only what the run created.**
 - **The metrics endpoint is loopback unless asked for, and the profiler is loopback only.**
 - **A flight-recorder snapshot is the service account's alone, and the recorder removes only names it writes.**
+- **An alert destination's address is a credential: the config names where to read it, and nothing billet writes quotes it or the destination's answer (#537).**
 
 ### Cache credentials: [references/cache-credentials.md](references/cache-credentials.md)
 

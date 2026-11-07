@@ -142,7 +142,7 @@ const acceptanceRecordVersion = 1
 
 func cmdAcceptance(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("billet acceptance needs a subcommand: up, run, evidence, down or sweep")
+		return errors.New("billet acceptance needs a subcommand: up, run, evidence, matrix, stopped, down or sweep")
 	}
 
 	switch args[0] {
@@ -152,13 +152,17 @@ func cmdAcceptance(ctx context.Context, env cli.Env, args []string) error {
 		return cmdAcceptanceRun(ctx, env, args[1:])
 	case "evidence":
 		return cmdAcceptanceEvidence(ctx, env, args[1:])
+	case "matrix":
+		return cmdAcceptanceMatrix(env, args[1:])
 	case "down":
 		return cmdAcceptanceDown(ctx, env, args[1:])
+	case "stopped":
+		return cmdAcceptanceStopped(env, args[1:])
 	case "sweep":
 		return cmdAcceptanceSweep(ctx, env, args[1:])
 	default:
 		return fmt.Errorf("billet acceptance %s: unknown subcommand; it is up, run, evidence, "+
-			"down or sweep", args[0])
+			"matrix, stopped, down or sweep", args[0])
 	}
 }
 

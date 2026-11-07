@@ -68,6 +68,8 @@ On AWS, `terraform/modules/billet/modules/state-rds-postgres` provisions the dat
 
 ### What billet needs from the database
 
+- **Up to six connections per process**, or fewer if `server.state.postgres.max_connections` says so, and a server's own `max_connections` is shared between every deployment on it. [Many deployments on one host](many-deployments.md) has the arithmetic.
+
 - **A schema of its own.** billet's catalogue questions are scoped to `current_schema()`, and two billet deployments sharing one PostgreSQL need two schemas (or two databases). Point the DSN's `search_path` at it.
 - **`synchronous_commit` not `off`.** With it off, PostgreSQL acknowledges a commit before the record is on disk, so a crash can lose scheduling decisions billet has already acted on. billet checks this at startup and refuses.
 - **A role that can create tables** in that schema, because billet migrates it.

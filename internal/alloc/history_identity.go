@@ -27,6 +27,8 @@ type HistoryJob struct {
 	QueuedAt           time.Time
 	ScaleSetAssignedAt time.Time
 	RunnerAssignedAt   time.Time
+	// FinishedAt is GitHub's time for the job's end. Only a completion gives it.
+	FinishedAt time.Time
 	// RunID is the workflow run of the job that started, which for a pooled
 	// runner may differ from the run its lease was assigned; zero is unknown.
 	// Only a JobStarted gives it.
@@ -80,6 +82,7 @@ func (a *Allocator) RecordJobIdentity(ctx context.Context, leaseID string, job H
 			GithubQueuedAt:           stamp(job.QueuedAt),
 			GithubScaleSetAssignedAt: stamp(job.ScaleSetAssignedAt),
 			GithubRunnerAssignedAt:   stamp(job.RunnerAssignedAt),
+			GithubFinishedAt:         stamp(job.FinishedAt),
 			GithubRunID:              max(job.RunID, 0),
 			HeadSha:                  job.HeadSHA,
 			HeadBranch:               job.HeadBranch,
@@ -136,6 +139,7 @@ type JobRecord struct {
 	GitHubQueuedAt           string
 	GitHubScaleSetAssignedAt string
 	GitHubRunnerAssignedAt   string
+	GitHubFinishedAt         string
 	BoughtAt                 string
 	// DetailRetiredAt is when the job's series, destinations and guest report
 	// were deleted past their retention, empty while they are kept or for a job
@@ -163,6 +167,25 @@ type JobRecord struct {
 	// HolderIncarnation the one that held the compute when the lease ended.
 	LaunchIncarnation string
 	HolderIncarnation string
+	// RerunDecision is what became of the job's chance of a re-run, RerunDecidedAt
+	// when, and RerunAttempt the attempt it was decided against; empty and zero
+	// until decided, and for a tier that does not ask for one.
+	RerunDecision  RerunDecision
+	RerunDecidedAt string
+	RerunAttempt   int64
+	// Predicted is what a controller refreshing hourly would have predicted the
+	// job's runtime to be when it started (PredictJob). Never read from the row:
+	// nil unless a reader asked, and for a job that never started.
+	Predicted *RuntimeEstimate
+	// NotPredicted is why a reader that asked got no prediction, when the
+	// history could not be read; empty otherwise.
+	NotPredicted string
+}
+
+// Runtime is how long the job held its lease, from its start to the lease's
+// archive, and false while either is not recorded.
+func (r JobRecord) Runtime() (time.Duration, bool) {
+	return between(parseStamp(r.StartedAt), parseStamp(r.FinishedAt))
 }
 
 // Job reads one lease's history row. A lease that was never assigned a job is
@@ -189,7 +212,8 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			ChosenProvider: row.ChosenProvider, InstanceType: row.InstanceType,
 			VCPU: row.Vcpu, Memory: row.Memory, Site: row.Site,
 			GitHubQueuedAt: row.GithubQueuedAt, GitHubScaleSetAssignedAt: row.GithubScaleSetAssignedAt,
-			GitHubRunnerAssignedAt: row.GithubRunnerAssignedAt, BoughtAt: row.BoughtAt,
+			GitHubRunnerAssignedAt: row.GithubRunnerAssignedAt, GitHubFinishedAt: row.GithubFinishedAt,
+			BoughtAt:        row.BoughtAt,
 			DetailRetiredAt: row.DetailRetiredAt,
 			GitHubRunID:     row.GithubRunID, DisruptedAt: row.DisruptedAt,
 			Caches: CacheObservation{
@@ -201,6 +225,8 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			LaunchedAt: row.LaunchedAt, RegisteredAt: row.RegisteredAt, RunnerID: row.RunnerID,
 			CustodyAt: row.CustodyAt, TeardownAt: row.TeardownAt, QuarantinedAt: row.QuarantinedAt,
 			LaunchIncarnation: row.LaunchIncarnation, HolderIncarnation: row.HolderIncarnation,
+			RerunDecision: RerunDecision(row.RerunDecision), RerunDecidedAt: row.RerunDecidedAt,
+			RerunAttempt: row.RerunAttempt,
 		}
 		return nil
 	})

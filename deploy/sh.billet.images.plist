@@ -8,8 +8,9 @@
   tart node pulls every image the tiers name that is not yet in tart's store —
   and only those: a tart tier names an OCI image by tag, and re-pulling tens of
   gigabytes on a schedule for a tag that may not have moved is a decision a
-  person makes. With `release: {automatic: false}` in billet.yaml it exits
-  saying so.
+  person makes. A tier naming `@verified` is that decision made, so a tag that
+  moved is verified. With `release: {automatic: false}` in billet.yaml it exits
+  saying so, having asked about each recorded runner's window.
 
   A LAUNCH AGENT as the operator, because tart's image store is per-user and
   root has none of the images the node boots.

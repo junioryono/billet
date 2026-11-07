@@ -13,10 +13,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/initconfig"
+	"github.com/junioryono/billet/internal/joinconsole"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/ops/fleetops"
 	opsimages "github.com/junioryono/billet/internal/ops/images"
@@ -54,9 +56,12 @@ var (
 	joinPullImages = func(ctx context.Context, env cli.Env, cfg *config.Config) error {
 		return opsimages.PullTartImages(ctx, env, cfg, "")
 	}
-	joinUp      = runLocalUp
-	joinGOARCH  = runtime.GOARCH
-	joinGeteuid = os.Geteuid
+	joinUp = runLocalUp
+	// joinRetryEvery is how long a pool host waits before asking again for an authority
+	// whose answer did not arrive.
+	joinRetryEvery = 5 * time.Second
+	joinGOARCH     = runtime.GOARCH
+	joinGeteuid    = os.Geteuid
 )
 
 // joinAuthority is the control plane a join confirmed: its deployment, and
@@ -68,11 +73,11 @@ type joinAuthority struct {
 
 // joinRequest is what `billet join` was asked for.
 type joinRequest struct {
-	server, fingerprint, token, nodeName, bootstrapAddr string
-	provider, org, repository, runnerGroup, image       string
-	workflows, guestOS                                  []string
-	cfgPath                                             string
-	force, skipPrerequisites, hardenSSH, dryRun         bool
+	server, fingerprint, token, nodeName, bootstrapAddr, poolOrder string
+	provider, org, repository, runnerGroup, image                  string
+	workflows, guestOS                                             []string
+	cfgPath                                                        string
+	force, skipPrerequisites, hardenSSH, dryRun                    bool
 	// initArgs are the flags after `--`, handed to `billet init` as they are:
 	// a backend's own (firecracker's kernel and Ceph identity) are init's.
 	initArgs []string
@@ -100,7 +105,7 @@ type joinRequest struct {
 //     operator to approve it;
 //  6. on a Mac the tier images, which a node refuses to pull inside a launch;
 //  7. `billet local up`.
-func joinNode(ctx context.Context, env cli.Env, args []string) error {
+func joinNode(ctx context.Context, env cli.Env, args []string) (err error) {
 	req, err := parseJoin(env, args)
 	if err != nil {
 		return err
@@ -110,12 +115,44 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	// A POOL HOST'S OUTPUT REACHES ITS CONSOLE, which its source reads for the one line
+	// naming its key, so nothing it prints may stand for that line.
+	if req.poolOrder != "" {
+		stdout, stderr := joinconsole.NewGuard(env.Stdout), joinconsole.NewGuard(env.Stderr)
+		env.Stdout, env.Stderr = stdout, stderr
+
+		// THE ANSWER TOO, which the caller prints past the guard.
+		defer func() {
+			_ = stdout.Flush()
+			_ = stderr.Flush()
+			err = joinconsole.GuardError(err)
+		}()
+	}
+
 	base := "https://" + req.server
 	if req.bootstrapAddr != "" {
 		base = "https://" + req.bootstrapAddr
 	}
 
 	authority, err := joinFetchAuthority(ctx, base, req.fingerprint)
+	// A POOL HOST ASKS AGAIN for an authority whose answer did not arrive: its boot runs
+	// this once, and nobody is watching to run it again.
+	for req.poolOrder != "" && errors.Is(err, nodeclient.ErrUnreachable) && ctx.Err() == nil {
+		fmt.Fprintf(env.Stderr, "join     the control plane's authority did not arrive; asking again: %v\n", err)
+
+		wait := time.NewTimer(joinRetryEvery)
+
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+
+			return ctx.Err()
+		case <-wait.C:
+		}
+
+		authority, err = joinFetchAuthority(ctx, base, req.fingerprint)
+	}
+
 	if err != nil {
 		return fmt.Errorf("billet join: the control plane's authority at %s: %w (nothing on this machine "+
 			"was changed)", base, err)
@@ -179,7 +216,7 @@ func joinNode(ctx context.Context, env cli.Env, args []string) error {
 		fmt.Fprintf(env.Stdout, "join     already enrolled: %s is node %s's in deployment %s\n",
 			cfg.Node.TLS.CertPath, req.nodeName, authority.deployment)
 	default:
-		if err := joinEnroll(ctx, env, cfg, base, req.fingerprint, req.token); err != nil {
+		if err := joinEnroll(ctx, env, cfg, base, req.fingerprint, req.token, req.poolOrder); err != nil {
 			return err
 		}
 	}
@@ -209,6 +246,9 @@ func parseJoin(env cli.Env, args []string) (joinRequest, error) {
 		"`billet ca show` or `billet ca token` (required)")
 	flags.StringVar(&req.token, "token", "", "a join token from `billet ca token` (required)")
 	flags.StringVar(&req.nodeName, "node-name", "", "this machine's node name (required)")
+	flags.StringVar(&req.poolOrder, "pool-order", "", "the pool order this host was booted for, which a pool's "+
+		"boot passes: the host says its fingerprint on the console and sends what its platform signed, so the "+
+		"order's source may vouch for it (ADR-030)")
 	flags.StringVar(&req.bootstrapAddr, "bootstrap-addr", "", "the control plane's enrollment address, when it "+
 		"serves one apart from the node wire (`billet ca token` prints it)")
 	flags.StringVar(&req.provider, "provider", defaultJoinProvider(), "this machine's backend")
@@ -266,6 +306,12 @@ func parseJoin(env cli.Env, args []string) (joinRequest, error) {
 
 // refuseJoin is every refusal the flags and the platform decide.
 func refuseJoin(req joinRequest) error {
+	// A POOL'S NAME IS ITS ORDER'S: the control plane refuses any other token under it.
+	if req.poolOrder == "" && alloc.IsPoolNodeName(req.nodeName) {
+		return fmt.Errorf("billet join: %s begins pool-, which is reserved for the hosts a pool orders; choose "+
+			"another --node-name", req.nodeName)
+	}
+
 	switch cli.HostOS {
 	case "darwin":
 		if joinGeteuid() == 0 {

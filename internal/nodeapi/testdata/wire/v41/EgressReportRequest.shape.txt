@@ -1,0 +1,23 @@
+EgressReportRequest.epoch int64
+EgressReportRequest.report.listed bool
+EgressReportRequest.report.queries int64
+EgressReportRequest.report.refused_queries int64
+EgressReportRequest.report.refused_names tag omitempty
+EgressReportRequest.report.refused_names slice
+EgressReportRequest.report.refused_names[].name string
+EgressReportRequest.report.refused_names[].count int64
+EgressReportRequest.report.names tag omitempty
+EgressReportRequest.report.names slice
+EgressReportRequest.report.names[].addr string
+EgressReportRequest.report.names[].names slice
+EgressReportRequest.report.names[].names[] string
+EgressReportRequest.report.denied_packets int64
+EgressReportRequest.report.outside_resolver_packets int64
+EgressReportRequest.report.ipv6_packets int64
+EgressReportRequest.report.denied tag omitempty
+EgressReportRequest.report.denied slice
+EgressReportRequest.report.denied[].addr string
+EgressReportRequest.report.denied[].protocol string
+EgressReportRequest.report.denied[].port int
+EgressReportRequest.report.denied[].packets int64
+EgressReportRequest.report.incomplete bool

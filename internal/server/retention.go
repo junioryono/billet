@@ -48,6 +48,8 @@ func (s *Server) retireJobDetailOnce(ctx context.Context, now time.Time) {
 
 	// ONE READ A PASS lists what is past the retention, and the writes then take
 	// it a batch at a time, so the reading never holds the writer slot.
+	var egress int
+
 	ids, err := s.alloc.JobsWithRetirableDetail(ctx, before, retentionBatchJobs*retentionBatches)
 	if err != nil {
 		s.log.Warn("could not list job detail past its retention; trying again", "error", err)
@@ -66,9 +68,73 @@ func (s *Server) retireJobDetailOnce(ctx context.Context, now time.Time) {
 		}
 		jobs, series, destinations, guest = jobs+batch.Jobs, series+batch.Series,
 			destinations+batch.Destinations, guest+batch.GuestReports
+		egress += batch.Egress
 	}
 	if jobs > 0 {
 		s.log.Info("deleted job detail past its retention", "jobs", jobs, "series", series,
-			"destinations", destinations, "guest_reports", guest, "retention", retention)
+			"destinations", destinations, "guest_reports", guest, "egress_reports", egress,
+			"retention", retention)
+	}
+}
+
+const (
+	// usageNumberBatch is how many finished leases one transaction numbers, and
+	// usageNumberBatches how many of those a pass takes, so the writer slot is held
+	// for one batch at a time and a long history is worked through over many passes:
+	// at this rate a million leases take a little over three hours.
+	usageNumberBatch   = 500
+	usageNumberBatches = 100
+)
+
+// numberUsage gives the leases that finished before there were usage numbers their
+// numbers, until ctx ends. Migration 72 says why this is not the migration's to do. It
+// decides nothing: a pass that fails is logged and the next one tries again.
+func (s *Server) numberUsage(ctx context.Context) {
+	tick := time.NewTicker(retentionEvery)
+	defer tick.Stop()
+
+	for {
+		s.numberUsageOnce(ctx)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+// numberUsageOnce is one pass.
+func (s *Server) numberUsageOnce(ctx context.Context) {
+	total := 0
+
+	for range usageNumberBatches {
+		if ctx.Err() != nil {
+			return
+		}
+
+		ids, err := s.alloc.UnnumberedUsage(ctx, usageNumberBatch)
+		if err != nil {
+			s.log.Warn("could not list leases waiting for a usage number; trying again", "error", err)
+
+			break
+		}
+
+		if len(ids) == 0 {
+			break
+		}
+
+		numbered, err := s.alloc.NumberUsage(ctx, ids)
+		if err != nil {
+			s.log.Warn("could not number leases' usage; trying again", "error", err)
+
+			break
+		}
+
+		total += numbered
+	}
+
+	if total > 0 {
+		s.log.Info("numbered finished leases for the usage export", "leases", total)
 	}
 }

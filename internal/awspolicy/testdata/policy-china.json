@@ -20,9 +20,31 @@
       "Action": [
         "ec2:RunInstances"
       ],
-      "Resource": [
-        "*"
+      "NotResource": [
+        "arn:aws-cn:ec2:*:*:instance/*",
+        "arn:aws-cn:ec2:*:*:volume/*"
       ]
+    },
+    {
+      "Sid": "BilletRuntimeLaunchOwned",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws-cn:ec2:*:*:instance/*",
+        "arn:aws-cn:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "aws:TagKeys": [
+            "sh.billet.owner"
+          ]
+        },
+        "Null": {
+          "aws:RequestTag/sh.billet.owner": "false"
+        }
+      }
     },
     {
       "Sid": "BilletRuntimeDenyForeignSnapshot",
@@ -204,6 +226,32 @@
           ]
         }
       }
+    },
+    {
+      "Sid": "BilletCacheObjectsEvict",
+      "Effect": "Allow",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": [
+        "arn:aws-cn:s3:::billet-cache-cn/production/owners/*/archives/*",
+        "arn:aws-cn:s3:::billet-cache-cn/production/owners/*/archive-used/*",
+        "arn:aws-cn:s3:::billet-cache-cn/production/owners/*/stage/*",
+        "arn:aws-cn:s3:::billet-cache-cn/production/owners/*/blobs/*",
+        "arn:aws-cn:s3:::billet-cache-cn/production/owners/*/blob-uses/*"
+      ]
+    },
+    {
+      "Sid": "BilletCacheUploads",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Resource": [
+        "arn:aws-cn:s3:::billet-cache-cn"
+      ]
     },
     {
       "Sid": "BilletCacheKMSUse",

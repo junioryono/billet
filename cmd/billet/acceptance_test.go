@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/store/ebss3"
 
 	"gopkg.in/yaml.v3"
 )
@@ -658,6 +660,9 @@ server:
   bootstrap_listen: 10.0.0.5:7718
   node_tls_hosts:
     - billet.internal
+  tls_router:
+    node_addr: a.nodes.example.com:443
+    enroll_addr: a.enroll.example.com:443
 node:
   name: box-one
   server_addr: 10.0.0.5:7717
@@ -687,6 +692,7 @@ tiers:
 	}{
 		{mappingValue(root, "server"), "bootstrap_listen"},
 		{mappingValue(root, "server"), "node_tls_hosts"},
+		{mappingValue(root, "server"), "tls_router"},
 		{mappingValue(root, "node"), "tls"},
 	} {
 		if mappingValue(present.section, present.key) == nil {
@@ -712,6 +718,8 @@ tiers:
 				"have presented nothing"},
 		{server, "node_tls_hosts",
 			"a certificate minted for names this loopback run never serves"},
+		{server, "tls_router",
+			"mutual TLS on a loopback wire, which the plain node this run derives could not reach"},
 		{node, "tls",
 			"mTLS against a loopback listener, which billet refuses at load"},
 	} {
@@ -880,6 +888,51 @@ func TestTheSweepSeparatesResidueFromNotHavingLooked(t *testing.T) {
 		})
 	}
 }
+
+// A CLEAN DRY RUN IS NOT A CLEAN SWEEP UNTIL THE CACHE IS ASKED. A run whose purge
+// was refused part-way left six state objects while every instance was gone, and the
+// sweep said nothing remained (2026-11-07). What the cache holds is residue, and a
+// cache that could not be read establishes nothing.
+func TestTheSweepCountsWhatTheCacheStillHolds(t *testing.T) {
+	t.Parallel()
+
+	ws := acceptanceWorkspace{ConfigPath: "/run/ws/billet.yaml", DeploymentID: "d1"}
+	errUnread := errors.New("node.ebs_s3: S3 LIST returned AccessDenied")
+
+	for name, tc := range map[string]struct {
+		residue ebss3.Residue
+		err     error
+		want    func(error) bool
+	}{
+		"nothing left":       {want: func(err error) bool { return err == nil }},
+		"state objects left": {residue: ebss3.Residue{StateObjects: 6}, want: isResidue},
+		"a snapshot left":    {residue: ebss3.Residue{Snapshots: 1}, want: isResidue},
+		"cache objects left": {residue: ebss3.Residue{CacheObjects: 2}, want: isResidue},
+		"the cache unreadable": {err: errUnread, want: func(err error) bool {
+			return errors.Is(err, errUnread) && !isResidue(err)
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var asked string
+			err := sweepVerdict(t.Context(), processEnv(), ws, false, nil,
+				func(_ context.Context, path string) (ebss3.Residue, error) {
+					asked = path
+
+					return tc.residue, tc.err
+				})
+			if asked != ws.ConfigPath {
+				t.Fatalf("the cache was asked about %q, want the workspace's config", asked)
+			}
+			if !tc.want(err) {
+				t.Fatalf("sweep = %v", err)
+			}
+		})
+	}
+}
+
+func isResidue(err error) bool { return errors.Is(err, errAcceptanceResidue) }
 
 // AND A RESIDUE FAILURE IS MATCHABLE, so a caller can tell the two apart without
 // reading the sentence — which is what a sentinel is for.

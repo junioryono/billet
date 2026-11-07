@@ -146,6 +146,10 @@ type CacheSetting struct {
 // It is what travels to a node, so a node needs no copy of the rules.
 type CacheSpec struct {
 	Publish CachePublish `json:"publish"`
+	// KeepLogs says the node keeps this tier's jobs' step logs (tiers[].logs.keep). It
+	// travels here because this is what a node is told of what it serves a tier's guests,
+	// and an older node ignoring it keeps none, which is doing less.
+	KeepLogs bool `json:"keep_logs,omitempty"`
 	// Owner and Repository are the canonical scope of a default-branch
 	// namespace: the tier's cache_scope, or its repository target. Empty
 	// under trusted-only, whose keys are scoped by the deployment and site
@@ -283,17 +287,31 @@ func (t Tier) EffectiveCache() CacheSpec {
 	if spec.Publish == CachePublishDefaultBranch && t.CacheScope != nil {
 		spec.Owner, spec.Repository = t.CacheScope.Owner, t.CacheScope.Repository
 	}
+	spec.KeepLogs = t.Logs != nil && t.Logs.Keep
 
 	return spec
 }
 
 // servesGuestCaches reports whether the node controls this tier's guest the way
-// the Git, Bazel, Go and Actions caches need: a Linux Firecracker guest and no
-// other backend.
+// the Git, Bazel, Go and Actions caches need: a Linux Firecracker or EC2 guest and
+// no other backend.
 func (t Tier) servesGuestCaches() bool {
 	providers := t.AcceptableProviders()
 
-	return len(providers) == 1 && providers[0] == ProviderFirecracker && t.GuestOS == GuestLinux
+	return len(providers) == 1 && serveGuestCaches(providers[0]) && t.GuestOS == GuestLinux
+}
+
+// WithoutGuestCaches is this spec with what the node serves to a guest it controls
+// turned off, for a node too old to give it to the guest it launches: doing less.
+func (s CacheSpec) WithoutGuestCaches() CacheSpec {
+	s.Actions.Enabled = false
+	s.Git.Enabled = false
+	s.Bazel.Enabled = false
+	s.Go.Enabled = false
+	s.GoTestResults = false
+	s.Npm = false
+
+	return s
 }
 
 // defaultPublish is the tier's publication rule, its own or the default by
@@ -416,10 +434,25 @@ func (c *Config) TargetNeedsRunEvidence(name string) bool {
 	return false
 }
 
-// needsGuestCacheServices reports whether a tier enables a cache that is
+// TargetNeedsActionsWrite reports whether a tier of the named target re-runs a
+// job billet disrupted, which is what asks that target's GitHub App for
+// `actions: write`. PER TARGET for TargetNeedsRunEvidence's reason, and it is a
+// wider grant than that one, so a target with no such tier refuses it.
+func (c *Config) TargetNeedsActionsWrite(name string) bool {
+	for i := range c.Tiers {
+		target, ok := c.TierTarget(&c.Tiers[i])
+		if ok && target.Name == name && c.Tiers[i].DisruptedReruns() > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// NeedsGuestCacheServices reports whether a tier enables a cache that is
 // served by the node for a guest the node controls: the Actions cache, the Git
 // proxy, the Bazel and Go caches and the npm registry cache.
-func (s CacheSpec) needsGuestCacheServices() bool {
+func (s CacheSpec) NeedsGuestCacheServices() bool {
 	return s.Actions.Enabled || s.Git.Enabled || s.Bazel.Enabled || s.Go.Enabled || s.Npm
 }
 
@@ -429,7 +462,9 @@ func (s CacheSpec) needsGuestCacheServices() bool {
 func (c *Config) materializeCacheScope() {
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
-		if t.CacheScope != nil {
+		// A WINDOWS GUEST HAS NO CLIENT FOR ANY CACHE, and a scope nobody wrote would be
+		// refused as though they had (windowsTierErrors).
+		if t.CacheScope != nil || t.GuestOS == GuestWindows {
 			continue
 		}
 		publish := CachePublish("")

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -139,6 +141,15 @@ type Server struct {
 	starter *rollout.Starter
 	// startEvery paces the starter. Zero selects the starter's default.
 	startEvery time.Duration
+
+	// rerunEvery and rerunSettle pace the re-run loop; see WithRerunPacing.
+	rerunEvery, rerunSettle time.Duration
+
+	// alerts is `server.alerts`, or nil where it names no rule; see WithAlerts.
+	alerts *Alerts
+	// alertEvaluateEvery, alertDeliverEvery and alertRetryFirst pace the alert loops;
+	// see WithAlertPacing. Zero selects each default.
+	alertEvaluateEvery, alertDeliverEvery, alertRetryFirst time.Duration
 }
 
 // ControlPlaneOption configures a Server.
@@ -267,6 +278,16 @@ func WithDrainTimeout(d time.Duration) ControlPlaneOption {
 // deletes a job's detail past it.
 func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.detailRetention = d }
+}
+
+// WithRerunPacing sets how often the re-run loop looks for jobs to decide about,
+// and how long after a job's result its run waits, which is also when a run found
+// unfinished is read again.
+//
+// Exposed for WithCleanupRetry's reason: the defaults are minutes, and a scenario
+// about a request that settles on a later pass would otherwise wait them out.
+func WithRerunPacing(every, settle time.Duration) ControlPlaneOption {
+	return func(s *Server) { s.rerunEvery, s.rerunSettle = every, settle }
 }
 
 // WithTestResultsRetention is server.test_results_retention and
@@ -499,9 +520,38 @@ func (s *Server) Run(ctx context.Context) error {
 		s.fillQueueTimes(ctx, targets)
 	})
 
+	// AND A JOB BILLET ENDED IS RE-RUN WHERE A TIER ASKS, under the same rule: GitHub
+	// slow, refusing or gone costs the re-run and never a job waiting to start.
+	limits := s.rerunLimits()
+	group.Background("disrupted job re-runs", func(ctx context.Context) {
+		s.rerunDisrupted(ctx, targets, limits)
+	})
+
+	// AND A JOB IS TOLD ABOUT WHERE A RULE ASKS, under the same rule, with one loop
+	// per destination, so a destination that hangs delays only its own notices. A
+	// destination is delivered to while it is configured, rule or no rule, and what is
+	// owed to one no longer configured is given up on once, here, even with no
+	// server.alerts left at all.
+	group.Background("alert notices of removed destinations", s.settleRemovedDestinations)
+	if s.alerts != nil {
+		if len(s.alerts.Rules) > 0 {
+			group.Background("alert evaluation", func(ctx context.Context) {
+				s.evaluateAlerts(ctx, targets)
+			})
+		}
+
+		for _, name := range slices.Sorted(maps.Keys(s.alerts.Destinations)) {
+			sender := s.alerts.Destinations[name].Sender
+			group.Background("alert delivery to "+name, func(ctx context.Context) {
+				s.deliverAlerts(ctx, name, sender)
+			})
+		}
+	}
+
 	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.
 	group.Background("job detail retention", s.retireJobDetail)
 	group.Background("test results retention", s.retireTestResults)
+	group.Background("usage numbering", s.numberUsage)
 
 	// Cancelled together. One listener failing takes the others down rather than
 	// leaving a control plane that is advertising for some tiers and silent for
@@ -726,7 +776,7 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 		WithSessionReopen(func(ctx context.Context) (Session, error) {
 			return s.openSession(ctx, t, set, prov)
 		}),
-		WithPoolLaunchBatch(poolLaunchBatchFor(t)))
+		WithPoolLaunchBatch(poolLaunchBatchFor(t)), WithHoldOnFailure(t.HoldDuration()))
 	if !s.foregroundLaunches {
 		opts = append(opts, WithBackgroundLaunches())
 	}

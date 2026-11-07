@@ -185,7 +185,9 @@ func provisionerBlocks(t *testing.T, template string) []provisionerBlock {
 		inString := false
 		for i := match[1]; i < len(template) && end < 0; i++ {
 			switch c := template[i]; {
-			case c == '"' && template[i-1] != '\\':
+			// A QUOTE IS ESCAPED BY AN ODD RUN OF BACKSLASHES: the Windows template's
+			// `"${var.image_folder}\\\\"` ends a string with an escaped backslash.
+			case c == '"' && !escapedAt(template, i):
 				inString = !inString
 			case inString:
 			case c == '{':
@@ -207,6 +209,16 @@ func provisionerBlocks(t *testing.T, template string) []provisionerBlock {
 	}
 
 	return blocks
+}
+
+// escapedAt reports whether an odd run of backslashes stands before position i.
+func escapedAt(s string, i int) bool {
+	run := 0
+	for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+		run++
+	}
+
+	return run%2 == 1
 }
 
 type attributes map[string][]string
@@ -309,12 +321,19 @@ var templateRef = regexp.MustCompile(`\$\{(var\.[a-z_]+|path\.root)\}`)
 func expand(t *testing.T, s string) string {
 	t.Helper()
 
+	return expandWith(t, templateVars, s)
+}
+
+// expandWith is expand with one template's variables.
+func expandWith(t *testing.T, vars map[string]string, s string) string {
+	t.Helper()
+
 	return templateRef.ReplaceAllStringFunc(s, func(ref string) string {
 		name := strings.TrimSuffix(strings.TrimPrefix(ref, "${"), "}")
 		if name == "path.root" {
 			return "@root@"
 		}
-		value, ok := templateVars[strings.TrimPrefix(name, "var.")]
+		value, ok := vars[strings.TrimPrefix(name, "var.")]
 		if !ok {
 			t.Fatalf("the template names %s, which billet does not set", ref)
 		}
@@ -328,11 +347,18 @@ func expand(t *testing.T, s string) string {
 func repoPath(t *testing.T, s string) string {
 	t.Helper()
 
+	return repoPathUnder(t, "images/ubuntu/templates", s)
+}
+
+// repoPathUnder is repoPath for a template in another directory of the tree.
+func repoPathUnder(t *testing.T, templates, s string) string {
+	t.Helper()
+
 	rest, ok := strings.CutPrefix(s, "@root@/")
 	if !ok {
 		return s
 	}
-	clean := path.Clean(path.Join("images/ubuntu/templates", rest))
+	clean := path.Clean(path.Join(templates, rest))
 	if strings.HasPrefix(clean, "..") {
 		t.Fatalf("%s leaves the vendored tree", s)
 	}

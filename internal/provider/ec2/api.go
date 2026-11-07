@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -207,13 +209,27 @@ func capacityRefusal(code string) bool {
 
 // call issues one action and unmarshals the response into out.
 func (c *client) call(ctx context.Context, params url.Values, out any) error {
+	return c.callUpTo(ctx, params, out, maxAttempts)
+}
+
+// callOnce issues one action exactly once. A pool launch is sent this way: a retry here
+// could carry a refusal back from a second attempt whose first launched a host, and the
+// pool, which reads the order back, is what tries again. ITS BODY CANNOT BE REWOUND, so
+// the transport cannot resend it either: Go's HTTP/2 client replays a request whose
+// GetBody is set after some stream errors from the peer, inside one Do (go1.26.0's
+// h2_bundle.go, by its source, not probed against AWS).
+func (c *client) callOnce(ctx context.Context, params url.Values, out any) error {
+	return c.callUpTo(ctx, params, out, 1)
+}
+
+func (c *client) callUpTo(ctx context.Context, params url.Values, out any, attempts int) error {
 	params.Set("Version", apiVersion)
 
 	body := params.Encode()
 
 	var lastErr error
 
-	for attempt := range maxAttempts {
+	for attempt := range attempts {
 		if attempt > 0 {
 			// EXPONENTIAL, AND CANCELLABLE. A fixed pause is either useless
 			// against a throttle or wasteful against a blip, and a sleep that
@@ -228,7 +244,7 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 		// REBUILT EVERY ATTEMPT. A signature covers a timestamp and the
 		// credentials, both of which can change between attempts, and the body
 		// reader is consumed by the one before.
-		payload, err := c.attempt(ctx, body)
+		payload, err := c.attempt(ctx, body, attempts > 1)
 		if err == nil {
 			if out == nil {
 				return nil
@@ -251,7 +267,9 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 				return nil
 			}
 
-			err = fmt.Errorf("ec2: parse the api response: %w", err)
+			// NOT QUOTED: an XML syntax error repeats part of the answer, and an
+			// answer can carry the request back.
+			err = errUnparsable
 		}
 
 		lastErr = err
@@ -262,7 +280,7 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 	}
 
 	return fmt.Errorf("ec2: %s failed after %d attempts: %w",
-		params.Get("Action"), maxAttempts, lastErr)
+		params.Get("Action"), attempts, lastErr)
 }
 
 func (c *client) wait(ctx context.Context, d time.Duration) error {
@@ -285,10 +303,13 @@ func (c *client) wait(ctx context.Context, d time.Duration) error {
 
 // attempt issues one request and returns its body, leaving the decode to the
 // caller so that a failed attempt cannot contaminate the next one's target.
-func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
+func (c *client) attempt(ctx context.Context, body string, rewindable bool) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, strings.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("ec2: build request: %w", err)
+	}
+	if !rewindable {
+		req.GetBody = nil
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
@@ -332,16 +353,24 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 			return nil, err
 		}
 
-		return nil, fmt.Errorf("ec2: call the api: %w", err)
+		return nil, fmt.Errorf("ec2: call the api: %w", transportFailure(err))
 	}
 
 	defer func() { _ = resp.Body.Close() }()
+
+	// A REDIRECT HANDED BACK UNFOLLOWED IS STILL A REDIRECT. net/http follows a 307 or
+	// 308 only for a body it can rewind, and returns one it cannot (a pool launch's)
+	// without asking CheckRedirect, so it would otherwise read as an unrecognised
+	// refusal.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, fmt.Errorf("%w (a %d, not followed)", errRedirected, resp.StatusCode)
+	}
 
 	// BOUNDED. A DescribeInstances page is large but not unbounded, and an
 	// unbounded read is an allocation sized by whatever answered.
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, fmt.Errorf("ec2: read the api response: %w", err)
+		return nil, fmt.Errorf("ec2: read the api response: %w", transportFailure(err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -349,6 +378,41 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 	}
 
 	return payload, nil
+}
+
+// errUnparsable is an answer that would not parse. Its text is not kept.
+var errUnparsable = errors.New("ec2: parse the api response: the answer would not parse, and is not quoted")
+
+// errAnswerWithheld is a failure made of what answered (a Location that would not
+// parse, a body or trailer that would not read), whose text is not kept.
+var errAnswerWithheld = errors.New("the answer could not be read, and is not quoted")
+
+// transportFailure keeps what the network said and drops what the answer said. A
+// dial, a reset or a DNS failure names only the configured endpoint; an error built
+// from the answer (net/http quotes an unparsable Location before any redirect policy
+// runs, and a malformed trailer line) can carry the request, and its session token,
+// back. A cancelled or expired context stays itself.
+//
+// A NETWORK ERROR IS KEPT ONLY WHEN ITS CAUSE IS THE SYSTEM'S: a syscall that failed
+// (refused, reset, unreachable) or a timeout. net.OpError also wraps a TLS failure
+// through an HTTPS proxy, whose x509 error renders names a certificate chose.
+func transportFailure(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	}
+	// A DNS FAILURE NAMES ONLY THE CONFIGURED HOST, and arrives inside an OpError that
+	// is neither a syscall nor a timeout, so it is asked for first.
+	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
+		return dnsErr
+	}
+	if opErr, ok := errors.AsType[*net.OpError](err); ok {
+		if sysErr, sys := errors.AsType[*os.SyscallError](opErr.Err); (sys && sysErr.Err != nil) || opErr.Timeout() {
+			return opErr
+		}
+	}
+
+	return errAnswerWithheld
 }
 
 // errorResponse is the shape the query API uses for a refusal.
@@ -381,7 +445,12 @@ func parseAPIError(payload []byte, status int) error {
 
 // instanceItem is one instance as the API describes it.
 type instanceItem struct {
-	InstanceID string `xml:"instanceId"`
+	InstanceID   string `xml:"instanceId"`
+	InstanceType string `xml:"instanceType"`
+	PrivateIP    string `xml:"privateIpAddress"`
+	// LaunchTime is when EC2 launched the instance, which its identity document
+	// names as pendingTime (measured equal on 2026-11-06).
+	LaunchTime string `xml:"launchTime"`
 	State      struct {
 		Name string `xml:"name"`
 	} `xml:"instanceState"`
@@ -471,6 +540,8 @@ type describeImagesResponse struct {
 		// Mappings with no <ebs> child, and any with no device name, are not
 		// restated; the root is stated by setBlockDevices rather than from here.
 		BlockDevices []imageMapping `xml:"blockDeviceMapping>item"`
+		// Platform is "windows" on a Windows AMI and absent on every other.
+		Platform string `xml:"platform"`
 		// Tags carry provenance: which billet built the image, and which AMIContract
 		// it satisfies. An image built before billet stamped its output has neither,
 		// which is the pre-contract case rather than a passing one.

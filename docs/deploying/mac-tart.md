@@ -77,6 +77,48 @@ Both commands in that order, always: `chown` clears the setuid bit (measured), a
 
 softnet blocks the private address space, which includes the guest's DHCP resolver, so egress keeps working while name resolution dies and every job fails to clone. billet configures a public resolver in the guest before delivering the registration and proves resolution before the job starts; `node.tart.untrusted_dns` chooses the resolver.
 
+## Boot only what billet verified
+
+A Tart tier boots whatever reference it names, and nothing boots that image before a job does. Add `@verified` and the tier boots only a copy of what billet booted on that Mac ([ADR-021](../reference/decisions/adr-021-tart-images-verified-not-published.md)):
+
+```yaml
+image: ghcr.io/cirruslabs/macos-tahoe-xcode:26@verified   # a registry reference
+image: macos-26@verified                                  # or a VM you built on this Mac
+```
+
+```bash
+billet local up --config "$CFG"     # a verification needs the node's identity, and a macOS one its limit
+billet images verify ghcr.io/cirruslabs/macos-tahoe-xcode:26 --config "$CFG"
+```
+
+The tiers a launch uses are the control plane's, so on a Mac joined to a deployment elsewhere, write `@verified` in the control plane's file and verify on each Mac. From then on a Mac's refresh keeps verifying that image, whatever its own file names, for as long as a job launched it or you verified it in the last thirty days, which is all a Mac can tell of whether a control plane still wants it. If its file names no tier for the image, its first verification boots the probe as trusted work with the default command, and says so; pass `--untrusted` for an image a tier takes untrusted work with.
+
+A verification pulls a remote image by digest into a tart store of its own, so nothing in the store your other images live in moves. It keeps the result as a local VM named `billetbase-…`, which `tart list` shows and a job never runs, boots a clone of it with the network its tiers use, and asks the guest for its runner's version and for Docker, Buildx and Compose on Linux or `xcodebuild` on macOS. It records the base only when the guest answered and the clone is proved gone. A job then clones that base: locally, with no network, and with no fallback to the registry. Nothing the guest printed is quoted back, and the image's bytes stay on the Mac, two bases of each image, whatever happens to a tag.
+
+The daily refresh verifies a remote `@verified` reference again when its tag names a new digest, and asks GitHub about each recorded runner's window whatever `release.automatic` says. A job refuses to launch, naming the command that fixes it, when the base is gone or its runner is past GitHub's window, and when its files changed since it was probed, that one launch fails, the base is marked invalid and the next launch takes the image's other base, if there is one. `billet check` says which. A digest found wanting, whose bytes are not what was asked for, whose runner is past its window or whose guest did not answer for its toolchain, is left by the refresh for a week rather than pulled again each day; `billet images verify` tries it now. A failure of the host's own is tried again the next day. A VM you built yourself is verified again only when you ask. `billet images unpromote <image>@<base>` takes a base back: its digest stays withdrawn, so a tag that still names it does not bring it back, and `billet images verify <image> --digest <digest>` is how you clear that.
+
+Run `billet images verify` on the Mac as the node's account. A macOS guest needs the unlocked login keychain the automatic login above gives that account, and the refresh runs as an agent in that session. It needs `node.state_dir` on the same filesystem as `TART_HOME`, and room for one more copy of the image while its private store exists. An image published with a stacked disk is refused, since its layers would stay behind in the store that is deleted. A `@verified` launch's clone runs with tart's automatic pruning off, so a full disk fails the launch rather than evicting another tier's cached image.
+
+`billet local uninstall` leaves bases in tart's store, and `billet check` lists them: remove one with `billet images unpromote <image>@<base>`, or `tart delete` once its record is gone.
+
+What billet asserts is what it can prove from inside a booted guest: the runner, its window, and the toolchain entry points a job uses. It does not assert parity with GitHub's own images. A reference without `@verified` keeps working, and `billet check` names every tier that boots an image nobody verified. How many stopped copies of macOS a Mac may hold is your own position under the macOS licence, whose section 2B(iii) speaks of installing as well as running copies: a verified macOS image means two bases, a private copy while a verification runs, and a clone per running job. If you read it as counting stopped copies, do not name a macOS image `@verified`.
+
+### macOS slots
+
+Apple's grant allows two macOS guests per Mac. Every macOS guest billet starts, a job's or a probe's, holds one of `nodes[].macos_vm_limit` slots for exactly as long as its process lives, through billet's own death or restart, and no elapsed time releases one. Every Linux guest billet starts carries a token instead. A start also counts each running `tart run` and `tart create --from-ipsw` that holds neither as a macOS guest, an operator's Linux VM included, and refuses past the limit or when it cannot read the host's processes. A Linux guest started by a billet from before this change carries no token, so expect it to count as macOS until its job ends after you upgrade.
+
+A job that needs a slot a probe holds asks the probe to yield and waits about a minute, and the verification ends as "yielded to a job"; the next refresh, or you, runs it again, and it boots the base it already pulled rather than pull tens of gigabytes again. A probe whose verifier died is removed by the next job that needs its slot, and `billet check` names it until then. A probe cannot start until the node has registered, because the control plane is what tells it the limit, nor while the limit is used up; a tier saying `guest_os: macos`, or a local VM, finds that out before the pull.
+
+If a Mac's slots are always busy, a probe may yield every time, and `billet check` reports an image that keeps yielding beside its runner's deadline. The path that always finishes is to stop every node on that store, run `billet images verify <image> --no-yield`, and start them again:
+
+```bash
+billet local down --node --config "$CFG"     # drains this node's jobs and exits; admission is untouched
+billet images verify <image> --no-yield --config "$CFG"
+billet local up --config "$CFG"
+```
+
+Not a plain `billet local down`, which on a Mac that also runs the control plane stops both roles and seals the deployment, and not `billet drain`, which seals the whole deployment. Deployments sharing a store must name one limit, and `billet check` says which does not. The slots cover one store, which is how billet installs a Mac node: a VM another account starts on the same Mac holds none, and is invisible to `macos_vm_limit`, but a start counts its `tart run` all the same.
+
 ## What the agents are
 
 `billet local up` writes `sh.billet.node.plist` and `sh.billet.server.plist` as launch agents, clears any disabled override, bootstraps them and proves each held its process. Two settings inside them were measured: a launch agent does not inherit your shell's `PATH` (launchd's default has no Homebrew prefix, so an agent without it registers and then refuses all work with `exec: "tart": executable file not found`), and launchd's default `ExitTimeOut` is five seconds, not the twenty the man page says, so the plists set 88200 to match the Linux unit, because the node answers SIGTERM by draining for as long as its jobs run. Never set it to zero; launchd reads zero as infinity.
@@ -112,6 +154,8 @@ A Mac updates itself the way a Linux host does, with launchd's vocabulary. `bill
 The transaction is the one [Upgrading billet](../operating/upgrades.md) describes, with a bootout where Linux has a stop (the node drains for as long as its jobs take, and every pid launchd named is proved gone), a bootstrap where Linux has a start (the same pid proved to survive a settle window, which is all launchd can prove), the two plists preserved and restored beside the config, and the binary at `/usr/local/bin/billet`. The ledger steps run only when this Mac holds a control plane. `billet local status` reports both scheduled agents; `billet local uninstall` boots them out and removes them with the rest.
 
 ## The config
+
+`images.accept` does not apply to a Mac. It names the licensed components billet installs into the Linux image it builds from GitHub's template, and billet publishes no macOS image: the tart image is the one you give it.
 
 ```yaml
 node:

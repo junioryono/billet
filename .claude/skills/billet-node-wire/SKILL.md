@@ -7,7 +7,7 @@ description: "Load when adding a route, a command kind or a field to a wire type
 
 ## What this area is
 
-A node dials out and never listens. `internal/nodeapi` declares the request and response types, the command kinds (`CommandLaunch`, `CommandDestroy`, `CommandSweep`, `CommandTend`, `CommandUpgrade`, `CommandInventory`) and the version range. `internal/nodeclient` is the node side (`Register`, `Poll`, `Report`, `Withdraw`, the lease calls, `Renew`, enrollment; `loop.go` drives `Poll → execute → Report` one command at a time). `internal/nodeplane` is the plane side: `Handler` (mTLS routes under `/v1/register` and `/v1/nodes/{node}/…`), `BootstrapHandler` (`/v1/ca` and `/v1/enroll`, no client certificate), `Plane` (dispatch, registrations, the barrier loop), and `Runner`, which implements `dispatch.Runner` so the listener cannot tell whether compute is a goroutine away or a continent away. `internal/app`'s `ServeNodeWire` serves it, and its `handshakelistener.go` bounds connections on the real wire.
+A node dials out and never listens. `internal/nodeapi` declares the request and response types, the command kinds (`CommandLaunch`, `CommandDestroy`, `CommandSweep`, `CommandTend`, `CommandUpgrade`, `CommandInventory`) and the version range. `CommandReadLog` asks a node for lines of a job's log it keeps. `internal/nodeclient` is the node side (`Register`, `Poll`, `Report`, `Withdraw`, the lease calls, `Renew`, enrollment; `loop.go` drives `Poll → execute → Report` one command at a time). `internal/nodeplane` is the plane side: `Handler` (mTLS routes under `/v1/register` and `/v1/nodes/{node}/…`), `BootstrapHandler` (`/v1/ca` and `/v1/enroll`, no client certificate), `Plane` (dispatch, registrations, the barrier loop), and `Runner`, which implements `dispatch.Runner` so the listener cannot tell whether compute is a goroutine away or a continent away. `internal/app`'s `ServeNodeWire` serves it, and its `handshakelistener.go` bounds connections on the real wire.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -32,6 +32,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A withdrawn process's leases move to the node's next process when it adopts them (#374).**
 - **Commands are a queue with a ten-minute timeout that starts when queued, and only launches run beside each other.**
 - **Placement reads do not hold the shared plane mutex.**
+- **A stream is a connection a node dials back on a command's single-use token, and neither end of the wire reads it (ADR-032).**
 
 ### Listeners, enrollment and renewal: [references/listeners-and-enrollment.md](references/listeners-and-enrollment.md)
 
@@ -41,6 +42,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Renewal is authenticated by the certificate being replaced, and the subject comes from the identity.**
 - **A loopback wire has no certificates.**
 - **A node that names several controllers gives up the one it polls only on silence, and registers again from it.**
+- **Behind a router a loopback wire serves mutual TLS (#558).**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

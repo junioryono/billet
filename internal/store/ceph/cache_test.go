@@ -1766,13 +1766,19 @@ func TestPublishCASRefusesAStaleExpectedGenerationAndFence(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
-	if err := c.publishCASAt(t.Context(), key, "generation-that-was-never-current",
-		candidate, lease, fence, now); !errors.Is(err, storecontract.ErrConflict) {
-		t.Fatalf("stale expected generation returned %v, want ErrConflict", err)
+	err = c.publishCASAt(t.Context(), key, "generation-that-was-never-current", candidate, lease, fence, now)
+	moved, ok := errors.AsType[*storecontract.PointerMovedError](err)
+	if !errors.Is(err, storecontract.ErrConflict) || !ok || moved.Expected != "generation-that-was-never-current" {
+		t.Fatalf("stale expected generation returned %v, want a PointerMovedError", err)
 	}
 
-	if err := c.publishCASAt(t.Context(), key, "", candidate, lease, fence+1, now); !errors.Is(err, storecontract.ErrConflict) {
+	err = c.publishCASAt(t.Context(), key, "", candidate, lease, fence+1, now)
+	if !errors.Is(err, storecontract.ErrConflict) {
 		t.Fatalf("unissued fence returned %v, want ErrConflict", err)
+	}
+	// AN UNISSUED FENCE IS NOT A MOVED POINTER, though both are conflicts.
+	if moved, ok := errors.AsType[*storecontract.PointerMovedError](err); ok {
+		t.Fatalf("an unissued fence's refusal reads as a moved pointer: %v", moved)
 	}
 
 	if _, err := c.Clone(t.Context(), key, ""); !errors.Is(err, storecontract.ErrMiss) {

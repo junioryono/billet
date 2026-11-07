@@ -130,6 +130,12 @@ type Tier struct {
 	VCPU   int      `yaml:"vcpu"`
 	Memory ByteSize `yaml:"memory"`
 
+	// MinuteWeight is what one minute of this tier counts as in `billet usage
+	// export`, in minutes of a 2 vCPU Linux runner. Absent, it is the vCPU charged
+	// over two. It reports and decides nothing: no scheduling code reads it, and
+	// TestNoSchedulerReadsAMinuteWeight holds that.
+	MinuteWeight MinuteWeight `yaml:"minute_weight,omitempty"`
+
 	// Sizes expands this entry into one tier per vCPU count, most operators'
 	// single largest source of hand-written YAML.
 	//
@@ -178,6 +184,14 @@ type Tier struct {
 	// Cache configures every cache the tier's jobs get: whose writes publish,
 	// which caches are on, and how large each may grow. See TierCache.
 	Cache *TierCache `yaml:"cache,omitempty"`
+	// Logs keeps this tier's jobs' step logs on the node that ran them and indexes them
+	// so `billet logs search` finds them. Absent means none is kept. See logs.go.
+	Logs *TierLogs `yaml:"logs,omitempty"`
+	// Debug lets an operator into this tier's jobs' VMs, and keeps a failed job's for a
+	// while. Absent means neither. See debug.go.
+	Debug *TierDebug `yaml:"debug,omitempty"`
+	// Network is what the tier asks of its guests' network; see TierEgress.
+	Network *TierNetwork `yaml:"network,omitempty"`
 
 	// MaxConcurrent caps simultaneous instances of this tier, counting warm ones.
 	// Zero means "no per-tier cap" and is only legal for non-macOS tiers.
@@ -196,6 +210,33 @@ type Tier struct {
 	// unmet reserved slot away from competing tiers. Reserve for tiers that need a hard
 	// guarantee under contention. Zero is the default.
 	Reserved int `yaml:"reserved,omitempty"`
+
+	// Retry says what billet does about a job of this tier it ended itself.
+	// Absent, nothing: a job that went red stays red until a person re-runs it.
+	Retry *TierRetry `yaml:"retry,omitempty"`
+}
+
+// MaxDisruptedReruns is the most re-runs retry.disrupted may ask for. Billet's
+// own bound, not GitHub's: a run its infrastructure keeps ending is a fleet
+// problem, and more attempts would hide it.
+const MaxDisruptedReruns = 5
+
+// TierRetry is the re-run policy of one tier.
+type TierRetry struct {
+	// Disrupted is how many times billet asks GitHub to re-run a workflow run whose
+	// job on this tier it proved its own infrastructure ended, counted across the
+	// run's attempts. Zero, the default, is never. ADR-029 holds what counts as that
+	// proof, and the App must hold `actions: write` for a tier that sets it.
+	Disrupted int `yaml:"disrupted"`
+}
+
+// DisruptedReruns is how many re-runs the tier allows, zero when it says nothing.
+func (t Tier) DisruptedReruns() int {
+	if t.Retry == nil {
+		return 0
+	}
+
+	return t.Retry.Disrupted
 }
 
 // WorkloadTrust is the launch authority shared by a tier's runner pool.
@@ -372,6 +413,10 @@ const DefaultMacOSVMLimit = 2
 // it could only guess.
 const MinMacOSGuestMemory ByteSize = 4 * GiB
 
+// WindowsRunnerCommand is what starts the runner on a Windows AMI `billet ami build`
+// made, and the path that build installs it at (ADR-026).
+const WindowsRunnerCommand = `C:\billet\billet-runner.ps1`
+
 const (
 	// DefaultBuildKitCacheMountLimit bounds one BuildKit cache mount when a tier
 	// does not choose a tighter policy.
@@ -391,6 +436,9 @@ const (
 // is a rule with a second entry point that does not.
 func (t Tier) ProviderErrors(where string) []error {
 	var errs []error
+
+	errs = append(errs, t.validateLogs(where)...)
+	errs = append(errs, t.validateDebug(where)...)
 
 	// BOTH SPELLINGS IS AN ERROR, not a merge. Guessing which one an operator
 	// meant is not a kindness when the answer decides where untrusted code runs.
@@ -452,18 +500,31 @@ func (t Tier) ReservationErrors(where string) []error {
 	return errs
 }
 
-// InterceptionErrors reports tiers that could reach a backend without the local
-// storage and guest control the transparent Actions cache requires.
+// RetryErrors reports everything wrong with a tier's re-run policy.
+//
+// EXPORTED BECAUSE alloc.New CANNOT ASSUME its catalogue came through Load, and
+// a negative count would read as no limit to anything comparing against it.
+func (t Tier) RetryErrors(where string) []error {
+	if n := t.DisruptedReruns(); n < 0 || n > MaxDisruptedReruns {
+		return []error{fmt.Errorf("%s: retry.disrupted %d is not between 0 and %d",
+			where, n, MaxDisruptedReruns)}
+	}
+
+	return nil
+}
+
+// InterceptionErrors reports tiers that could reach a backend without the site
+// store and guest control the transparent Actions cache requires.
 //
 // Exported because alloc.New cannot assume its catalogue came through Load.
 //
-// THE SAME RULE HOLDS FOR EVERY CACHE THE NODE SERVES TO A GUEST IT CONTROLS:
-// the Actions cache, the Git proxy and the Bazel and Go caches each mount a
-// site-store volume on the host, which only a firecracker node has.
+// THE SAME RULE HOLDS FOR EVERY CACHE THE NODE SERVES TO A GUEST IT CONTROLS: the
+// Actions cache, the Git proxy and the Bazel and Go caches. Each backend's answer and
+// its reason are ADR-024.
 func (t Tier) InterceptionErrors(where string) []error {
 	cache := t.EffectiveCache()
 	explicit := t.explicitGuestCaches()
-	if !cache.needsGuestCacheServices() || len(explicit) == 0 {
+	if !cache.NeedsGuestCacheServices() || len(explicit) == 0 {
 		return nil
 	}
 
@@ -474,15 +535,39 @@ func (t Tier) InterceptionErrors(where string) []error {
 	what := "the " + strings.Join(enabled, ", ") + " cache"
 
 	providers := t.AcceptableProviders()
-	if len(providers) != 1 || providers[0] != ProviderFirecracker {
-		return []error{fmt.Errorf("%s: %s requires only the firecracker provider; "+
-			"remote and fallback providers cannot reach this node's site-local store", where, what)}
+	if len(providers) != 1 {
+		return []error{fmt.Errorf("%s: %s requires one provider, firecracker or ec2; a job placed on "+
+			"a fallback provider cannot reach the first one's site store", where, what)}
+	}
+	if !serveGuestCaches(providers[0]) {
+		return []error{fmt.Errorf("%s: %s requires the firecracker or ec2 provider, and %s cannot "+
+			"have it: %s", where, what, providers[0], guestCacheRefusal(providers[0]))}
 	}
 	if t.GuestOS != GuestLinux {
 		return []error{fmt.Errorf("%s: %s currently requires a Linux guest", where, what)}
 	}
 
 	return nil
+}
+
+// serveGuestCaches reports whether a backend's guest can be served the node's caches
+// (ADR-024).
+func serveGuestCaches(p ProviderKind) bool {
+	return p == ProviderFirecracker || p == ProviderEC2
+}
+
+// guestCacheRefusal says why a backend's guest cannot be, in ADR-024's terms.
+func guestCacheRefusal(p ProviderKind) string {
+	switch p {
+	case ProviderCodeBuild:
+		return "the build host is not billet's, and a reserved fleet's is not scrubbed between builds"
+	case ProviderTart:
+		return "no site store exists for a Mac yet"
+	case ProviderDocker:
+		return "the docker backend is for trials, and its containers share the host's kernel"
+	default:
+		return "nothing serves that backend"
+	}
 }
 
 // ReservedVCPU is the vCPU a tier's floor holds back from other tiers.
@@ -511,16 +596,23 @@ func (t Tier) GuestOSProviderErrors(where string) []error {
 		case t.GuestOS == GuestWindows && p == ProviderTart:
 			errs = append(errs, fmt.Errorf("%s: the tart provider cannot run Windows guests", where))
 
-		// BILLET SHIPS NO WINDOWS RUNNER, and CodeBuild does offer Windows
-		// environments — so without this a Windows tier on codebuild passes every
-		// check here and is then refused by node.codebuild.environment_type on the
-		// one machine that could serve it, which reports the problem in the wrong
-		// file. Named separately from tart's clause because the reasons differ:
-		// tart cannot run Windows at all, and billet cannot start a runner in it.
+		// CodeBuild does offer Windows environments, so without this a Windows tier
+		// on codebuild passes every check here and is then refused by
+		// node.codebuild.environment_type on the one machine that could serve it,
+		// which reports the problem in the wrong file. Named separately from tart's
+		// clause because the reasons differ: tart cannot run Windows at all, and
+		// billet cannot start a runner in it.
 		case t.GuestOS == GuestWindows && p == ProviderCodeBuild:
-			errs = append(errs, fmt.Errorf("%s: billet ships no Windows runner image or runner "+
-				"entrypoint, so a codebuild Windows tier would start a build that registers "+
+			errs = append(errs, fmt.Errorf("%s: billet builds a Windows runner image only as an "+
+				"EC2 AMI, so a codebuild Windows tier would start a build that registers "+
 				"nothing", where))
+
+		// EC2 IS THE ONE BACKEND WITH A WINDOWS RUNNER (ADR-026). Firecracker boots no
+		// Windows guest and docker's are Linux containers, so a tier that could land
+		// on either would bind there and start something that never registers.
+		case t.GuestOS == GuestWindows && p != ProviderEC2:
+			errs = append(errs, fmt.Errorf("%s: guest_os windows runs only on the ec2 provider "+
+				"(ADR-026), and this tier also accepts %q", where, p))
 		}
 	}
 
@@ -635,7 +727,22 @@ func (t Tier) ImageOptionErrors(where string) []error {
 		}
 	}
 
-	return errs
+	return append(errs, t.tartImageErrors(where)...)
+}
+
+// tartImageErrors refuses a `@verified` the image Tart would boot cannot mean: on another
+// backend the spelling is a generation, whose image is never read here. Load and
+// alloc.New both apply it, the second for a catalogue built in code.
+func (t Tier) tartImageErrors(where string) []error {
+	if _, named := t.Launch[ProviderTart]; !named && !t.AcceptsProvider(ProviderTart) {
+		return nil
+	}
+
+	if err := checkTartVerifiedImage(t.ImageFor(ProviderTart)); err != nil {
+		return []error{fmt.Errorf("%s: tart's image %w", where, err)}
+	}
+
+	return nil
 }
 
 // imageNotAnOption refuses an image a backend's command line would read as an
@@ -675,6 +782,10 @@ func (t Tier) RunnerCommandFor(provider ProviderKind) []string {
 		return []string{"./billet-runner-service"}
 	}
 	if provider == ProviderEC2 {
+		if t.GuestOS == GuestWindows {
+			return []string{WindowsRunnerCommand}
+		}
+
 		return []string{"/usr/local/bin/billet-runner"}
 	}
 
@@ -805,12 +916,17 @@ func (c *Config) validateTiers() []error {
 
 		errs = append(errs, t.ProviderErrors(where)...)
 		errs = append(errs, t.InterceptionErrors(where)...)
+		errs = append(errs, t.EgressErrors(where)...)
 		errs = append(errs, t.ReservationErrors(where)...)
+		errs = append(errs, t.RetryErrors(where)...)
 		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
 		}
 		if t.VCPU <= 0 {
 			errs = append(errs, fmt.Errorf("%s: vcpu must be positive", where))
+		}
+		if t.MinuteWeight < 0 {
+			errs = append(errs, fmt.Errorf("%s: minute_weight must be positive", where))
 		}
 		if t.Memory <= 0 {
 			errs = append(errs, fmt.Errorf("%s: memory must be positive", where))
@@ -827,6 +943,7 @@ func (c *Config) validateTiers() []error {
 				"and no larger than 100GiB", where))
 		}
 		errs = append(errs, t.LaunchErrors(where)...)
+		errs = append(errs, t.tartImageErrors(where)...)
 		if t.WarmPool < 0 {
 			errs = append(errs, fmt.Errorf("%s: warm_pool must not be negative", where))
 		} else if t.WarmPool > 0 {
@@ -1081,7 +1198,31 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 		}
 	case GuestWindows:
 		errs = append(errs, t.GuestOSProviderErrors(where)...)
+		errs = append(errs, t.windowsTierErrors(where)...)
 	}
+	return errs
+}
+
+// windowsTierErrors refuses what a Windows tier could ask for and not get.
+//
+// EVERY CACHE billet serves a guest has its client in a Linux guest: the Docker image
+// store, the sticky disks, the proxies. A cache block on a Windows tier would validate,
+// advertise and do nothing, so it is refused rather than left to read as working.
+func (t Tier) windowsTierErrors(where string) []error {
+	var errs []error
+
+	// GitHub publishes the windows-2025 declaration for x64 alone.
+	if t.Arch != "" && t.Arch != ArchX64 {
+		errs = append(errs, fmt.Errorf("%s: guest_os windows runs on x64, and this tier names %s",
+			where, t.Arch))
+	}
+
+	if t.Cache != nil || t.Intercept || t.CacheScope != nil {
+		errs = append(errs, fmt.Errorf("%s: a Windows guest has no client for billet's caches "+
+			"(ADR-026), so cache, intercept and cache_scope would do nothing here; remove them",
+			where))
+	}
+
 	return errs
 }
 

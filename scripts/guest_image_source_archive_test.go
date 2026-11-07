@@ -79,6 +79,23 @@ func (s *sourceServer) debianSource(dir, dsc string, files map[string]string) {
 	}
 }
 
+// serve and forget change what the server holds UNDER ITS LOCK. The handler reads
+// files on the goroutine httptest serves the fetcher's request on, and the only
+// thing between a test's write and that read is a socket, which the race detector
+// does not count as an ordering: an unlocked write raced the read (CI run
+// 42131056084).
+func (s *sourceServer) serve(path, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.files[path] = body
+}
+
+func (s *sourceServer) forget(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.files, path)
+}
+
 func (s *sourceServer) requested(path string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -137,9 +154,9 @@ func newSourceFixture(t *testing.T) *sourceFixture {
 		"/adoptium/temurin8-binaries/releases/download/jdk8u504-b01/OpenJDK8U-jdk-sources_8u504b01.tar.gz":         "jdk8",
 		"/linux-6.1.155.tar.xz": "linux",
 	} {
-		srv.files[path] = body
+		srv.serve(path, body)
 		if strings.HasSuffix(path, ".tar.gz") {
-			srv.files[path+".sha256.txt"] = digest(body) + "  " + filepath.Base(path) + "\n"
+			srv.serve(path+".sha256.txt", digest(body)+"  "+filepath.Base(path)+"\n")
 		}
 	}
 
@@ -294,7 +311,7 @@ func TestTheSourceArchiveRefusesWhatItCannotVerify(t *testing.T) {
 			stage: func(t *testing.T, fx *sourceFixture) {
 				t.Helper()
 
-				fx.srv.files["/ubuntu/+archive/primary/+sourcefiles/hello/2.10-3/hello_2.10.orig.tar.gz"] = "tampered"
+				fx.srv.serve("/ubuntu/+archive/primary/+sourcefiles/hello/2.10-3/hello_2.10.orig.tar.gz", "tampered")
 			},
 			want:   "hello 2.10-3: hello_2.10.orig.tar.gz: sha256",
 			absent: "hello_2.10-3/hello_2.10.orig.tar.gz",
@@ -304,7 +321,7 @@ func TestTheSourceArchiveRefusesWhatItCannotVerify(t *testing.T) {
 			stage: func(t *testing.T, fx *sourceFixture) {
 				t.Helper()
 
-				delete(fx.srv.files, "/~git-core/+archive/ubuntu/ppa/+sourcefiles/git/1:2.55.0-0ppa1~ubuntu24.04.2/git_2.55.0-0ppa1~ubuntu24.04.2.dsc")
+				fx.srv.forget("/~git-core/+archive/ubuntu/ppa/+sourcefiles/git/1:2.55.0-0ppa1~ubuntu24.04.2/git_2.55.0-0ppa1~ubuntu24.04.2.dsc")
 			},
 			want: "git 1:2.55.0-0ppa1~ubuntu24.04.2: ",
 		},
@@ -313,7 +330,7 @@ func TestTheSourceArchiveRefusesWhatItCannotVerify(t *testing.T) {
 			stage: func(t *testing.T, fx *sourceFixture) {
 				t.Helper()
 
-				fx.srv.files["/adoptium/temurin8-binaries/releases/download/jdk8u504-b01/OpenJDK8U-jdk-sources_8u504b01.tar.gz"] = "other"
+				fx.srv.serve("/adoptium/temurin8-binaries/releases/download/jdk8u504-b01/OpenJDK8U-jdk-sources_8u504b01.tar.gz", "other")
 			},
 			want:   "temurin-8-jdk 8.0.504.0.0+1-0: OpenJDK8U-jdk-sources_8u504b01.tar.gz: sha256",
 			absent: "temurin-8-jdk_8.0.504.0.0+1-0/OpenJDK8U-jdk-sources_8u504b01.tar.gz",
@@ -328,7 +345,7 @@ func TestTheSourceArchiveRefusesWhatItCannotVerify(t *testing.T) {
 			stage: func(t *testing.T, fx *sourceFixture) {
 				t.Helper()
 
-				fx.srv.files["/linux-6.1.155.tar.xz"] = "not linux"
+				fx.srv.serve("/linux-6.1.155.tar.xz", "not linux")
 			},
 			want:   "linux 6.1.155: linux-6.1.155.tar.xz: sha256",
 			absent: "guest-kernel_6.1.155/linux-6.1.155.tar.xz",

@@ -293,5 +293,7 @@ func (p *Provider) deleteProvenOurs(ctx context.Context, id string) error {
 		return fmt.Errorf("delete %s: %w", id, err)
 	}
 
+	p.removeRunLog(id)
+
 	return nil
 }

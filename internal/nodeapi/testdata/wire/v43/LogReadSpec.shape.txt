@@ -1,0 +1,5 @@
+LogReadSpec.lease string
+LogReadSpec.ranges slice
+LogReadSpec.ranges[].first int64
+LogReadSpec.ranges[].last int64
+LogReadSpec.max_bytes int

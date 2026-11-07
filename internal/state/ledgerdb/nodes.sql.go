@@ -36,6 +36,30 @@ func (q *Queries) CountLiveWorkOnNode(ctx context.Context, arg CountLiveWorkOnNo
 	return column_1, err
 }
 
+const countNodeHoldings = `-- name: CountNodeHoldings :one
+SELECT CAST(COUNT(*) AS BIGINT) AS outstanding,
+       CAST(COALESCE(SUM(CASE WHEN phase = 'quarantine' THEN 1 ELSE 0 END), 0) AS BIGINT) AS quarantine,
+       CAST(COALESCE(SUM(CASE WHEN phase = 'custody' THEN 1 ELSE 0 END), 0) AS BIGINT) AS custody
+  FROM leases
+ WHERE COALESCE(node, target_node) = CAST($1 AS TEXT) AND phase NOT IN ('done','failed')
+`
+
+type CountNodeHoldingsRow struct {
+	Outstanding int64
+	Quarantine  int64
+	Custody     int64
+}
+
+// What still holds a host, by lease phase: every outstanding lease, and of them the
+// quarantined ones and those in custody. COALESCE(node, target_node), as everywhere
+// here: an escrow aimed at a host has committed its room.
+func (q *Queries) CountNodeHoldings(ctx context.Context, node string) (CountNodeHoldingsRow, error) {
+	row := q.db.QueryRowContext(ctx, countNodeHoldings, node)
+	var i CountNodeHoldingsRow
+	err := row.Scan(&i.Outstanding, &i.Quarantine, &i.Custody)
+	return i, err
+}
+
 const countOutstandingLeasesOnNode = `-- name: CountOutstandingLeasesOnNode :one
 SELECT CAST(COUNT(*) AS BIGINT) FROM leases
  WHERE COALESCE(node, target_node) = CAST($1 AS TEXT) AND phase NOT IN ('done','failed')
@@ -142,6 +166,26 @@ UPDATE nodes SET live = 0
 // the host is gone.
 func (q *Queries) ForgetEveryNode(ctx context.Context) error {
 	_, err := q.db.ExecContext(ctx, forgetEveryNode)
+	return err
+}
+
+const handOverPoolRetirement = `-- name: HandOverPoolRetirement :exec
+UPDATE nodes SET decommission_actor = $1
+ WHERE name = $2 AND decommission_actor = $3
+`
+
+type HandOverPoolRetirementParams struct {
+	ClosingActor string
+	Name         string
+	SealActor    string
+}
+
+// A closed order's node keeps the proved retirement its seal recorded, under the closing
+// actor (@closing_actor), so compute listed after the order closed can no longer undo
+// it: the order is terminal and runs no closing transaction again. Only the seal's own
+// (@seal_actor); a person's decommission stays as they recorded it.
+func (q *Queries) HandOverPoolRetirement(ctx context.Context, arg HandOverPoolRetirementParams) error {
+	_, err := q.db.ExecContext(ctx, handOverPoolRetirement, arg.ClosingActor, arg.Name, arg.SealActor)
 	return err
 }
 
@@ -604,6 +648,18 @@ func (q *Queries) ListRemoteCostNodes(ctx context.Context) ([]ListRemoteCostNode
 	return items, nil
 }
 
+const markNodeDrainedForRelease = `-- name: MarkNodeDrainedForRelease :exec
+UPDATE nodes SET drained = 1 WHERE name = $1
+`
+
+// Take a pool host out of placement for its release: unfenced, because the decision is
+// the control plane's and holds for every incarnation, which the registration upsert
+// keeps while the release stands.
+func (q *Queries) MarkNodeDrainedForRelease(ctx context.Context, name string) error {
+	_, err := q.db.ExecContext(ctx, markNodeDrainedForRelease, name)
+	return err
+}
+
 const markNodeDraining = `-- name: MarkNodeDraining :execrows
 UPDATE nodes SET drained = 1
  WHERE name = $1 AND epoch = $2 AND incarnation = $3
@@ -651,6 +707,24 @@ type MarkNodeNotLiveParams struct {
 func (q *Queries) MarkNodeNotLive(ctx context.Context, arg MarkNodeNotLiveParams) error {
 	_, err := q.db.ExecContext(ctx, markNodeNotLive, arg.Name, arg.Epoch)
 	return err
+}
+
+const poolHostReleased = `-- name: PoolHostReleased :one
+SELECT EXISTS(SELECT 1 FROM pool_orders p
+               WHERE (p.node_name = $1 OR 'pool-' || p.order_id = $1)
+                 AND p.state IN ('sealed', 'released', 'gone'))
+`
+
+// Whether a node's pool order is sealed, released or gone (ADR-030): its host is being
+// taken back or was, and a registration under it is refused in the registration's own
+// transaction, so one in flight when the seal or a forced close committed cannot put the
+// node back into the fleet. Its derived name counts, linked or not. A host whose release
+// is only asked for still registers, held out of placement, so it can be drained.
+func (q *Queries) PoolHostReleased(ctx context.Context, name string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, poolHostReleased, name)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const readLeaseTargetSize = `-- name: ReadLeaseTargetSize :one
@@ -810,6 +884,39 @@ func (q *Queries) ReadNodeRegistration(ctx context.Context, name string) (ReadNo
 	return i, err
 }
 
+const readNodeReleaseFacts = `-- name: ReadNodeReleaseFacts :one
+SELECT n.epoch, n.dispatch_generation, n.decommission_proven, i.node_epoch, i.running
+  FROM nodes n
+  LEFT JOIN node_inventory i ON i.node = n.name
+ WHERE n.name = $1
+`
+
+type ReadNodeReleaseFactsRow struct {
+	Epoch              int64
+	DispatchGeneration int64
+	DecommissionProven int64
+	NodeEpoch          sql.NullInt64
+	Running            sql.NullInt64
+}
+
+// What a pool host's release proof reads of its node: its current epoch and launch-dispatch
+// generation, which a clearance run must have been taken under, whether a person
+// decommissioned it on the compute barrier's proof, and its last inventory, which is null
+// when it never reported one; an inventory of the current epoch reporting compute
+// outweighs the decommission.
+func (q *Queries) ReadNodeReleaseFacts(ctx context.Context, name string) (ReadNodeReleaseFactsRow, error) {
+	row := q.db.QueryRowContext(ctx, readNodeReleaseFacts, name)
+	var i ReadNodeReleaseFactsRow
+	err := row.Scan(
+		&i.Epoch,
+		&i.DispatchGeneration,
+		&i.DecommissionProven,
+		&i.NodeEpoch,
+		&i.Running,
+	)
+	return i, err
+}
+
 const readNodeSize = `-- name: ReadNodeSize :one
 SELECT total_vcpu, total_memory FROM nodes WHERE name = $1
 `
@@ -827,15 +934,41 @@ func (q *Queries) ReadNodeSize(ctx context.Context, name string) (ReadNodeSizeRo
 	return i, err
 }
 
+const undoPoolRetirement = `-- name: UndoPoolRetirement :execrows
+UPDATE nodes SET decommissioned_at = '', decommission_proven = 0, decommission_actor = ''
+ WHERE name = $1 AND decommission_actor = $2
+`
+
+type UndoPoolRetirementParams struct {
+	Name  string
+	Actor string
+}
+
+// A sealed pool host's node listed compute since its seal retired it (ADR-030): the
+// retirement the seal recorded is undone, so `billet drain` expects the node again and
+// waits on it rather than counting it proved idle. Only the seal's own (@actor); a
+// decommission a person recorded stays theirs.
+func (q *Queries) UndoPoolRetirement(ctx context.Context, arg UndoPoolRetirementParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, undoPoolRetirement, arg.Name, arg.Actor)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const upsertNodeRegistration = `-- name: UpsertNodeRegistration :one
 INSERT INTO nodes
    (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live,
     node_release, wire_min, wire_max, wire_version, node_digest, codebuild_fleet,
-    codebuild_jit_path, codebuild_region, incarnation, highest_release, architectures, epoch)
+    codebuild_jit_path, codebuild_region, incarnation, highest_release, architectures, epoch, drained)
 VALUES ($1, $2, $3, $4, $5, $6, $7, 1,
         $8, $9, $10, $11, $12,
         $13, $14, $15, $16,
-        $17, $18, 1)
+        $17, $18, 1,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM pool_orders p
+             WHERE (p.node_name = $1 OR 'pool-' || p.order_id = $1)
+               AND (p.release_requested_at != '' OR p.state IN ('sealed', 'released', 'gone'))) THEN 1 ELSE 0 END)
 ON CONFLICT (name) DO UPDATE SET
    provider     = excluded.provider,
    site         = excluded.site,
@@ -859,7 +992,10 @@ ON CONFLICT (name) DO UPDATE SET
    decommissioned_at   = '',
    decommission_proven = 0,
    decommission_actor  = '',
-   drained             = 0
+   drained             = CASE WHEN EXISTS (
+       SELECT 1 FROM pool_orders p
+        WHERE (p.node_name = excluded.name OR 'pool-' || p.order_id = excluded.name)
+          AND (p.release_requested_at != '' OR p.state IN ('sealed', 'released', 'gone'))) THEN 1 ELSE 0 END
 RETURNING epoch
 `
 
@@ -895,6 +1031,11 @@ type UpsertNodeRegistrationParams struct {
 // by the machine itself, and an exclusion nobody remembers would hide a live host
 // from every later drain forever. `drained` is cleared with it, because that is
 // the column placement and the floor arithmetic read.
+//
+// EXCEPT A POOL HOST BEING RELEASED (ADR-030): a release asked for, or sealed, is the
+// control plane's own one-way decision, not an assertion the machine can contradict,
+// and a registration that was in flight when the seal committed would otherwise put
+// a host the source is about to take back into placement.
 func (q *Queries) UpsertNodeRegistration(ctx context.Context, arg UpsertNodeRegistrationParams) (int64, error) {
 	row := q.db.QueryRowContext(ctx, upsertNodeRegistration,
 		arg.Name,

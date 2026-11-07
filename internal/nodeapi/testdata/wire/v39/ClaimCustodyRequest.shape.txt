@@ -1,2 +1,0 @@
-ClaimCustodyRequest.lease_ids slice
-ClaimCustodyRequest.lease_ids[] string

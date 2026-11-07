@@ -167,7 +167,7 @@ const identityWriteLimit = 2 * time.Second
 func historyJob(j dispatch.Job) alloc.HistoryJob {
 	return alloc.HistoryJob{JobID: j.JobID, Owner: j.Owner, Repository: j.Repository,
 		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event, QueuedAt: j.QueuedAt,
-		ScaleSetAssignedAt: j.ScaleSetAssignedAt, RunnerAssignedAt: j.RunnerAssignedAt}
+		ScaleSetAssignedAt: j.ScaleSetAssignedAt, RunnerAssignedAt: j.RunnerAssignedAt, FinishedAt: j.FinishedAt}
 }
 
 // Statistics is GitHub's own view of the scale set.
@@ -187,6 +187,9 @@ type Statistics struct {
 
 // Listener runs one tier's scale set.
 type Listener struct {
+	// holdOnFailure is how long a failed job's VM is kept, zero for not at all.
+	holdOnFailure time.Duration
+
 	alloc   *alloc.Allocator
 	tier    string
 	session Session

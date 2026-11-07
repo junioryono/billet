@@ -106,6 +106,13 @@ type CacheService struct {
 	// casFill is casFillDefault, a field so a test is not decided by the fill
 	// of the disk it runs on.
 	casFill float64
+	// casCacheFill is the package's constant, a field for the same reason.
+	casCacheFill float64
+	// casPolicyEvery is how often an upload asks the kill switch, and closedSessionRetry
+	// how often a pass tries again what it has not finished, fields so a test does not
+	// wait on them.
+	casPolicyEvery     time.Duration
+	closedSessionRetry time.Duration
 	// npmSettleWait is defaultNpmSettleWait, a field so a test can reach its
 	// bound without waiting it out.
 	npmSettleWait time.Duration
@@ -118,6 +125,10 @@ type CacheService struct {
 	// start it; guestDecode bounds the batches the node decodes at once.
 	guestMonitoring bool
 	guestDecode     chan struct{}
+	logDecode       chan struct{}
+	// jobLogs keeps the step logs of a job whose tier asks, nil where this node keeps
+	// none.
+	jobLogs *JobLogStore
 }
 
 type cacheSession struct {
@@ -367,10 +378,14 @@ func NewCacheService(
 		closed:     make(chan struct{}, 1),
 
 		guestDecode: make(chan struct{}, guestDecodeSlots),
+		logDecode:   make(chan struct{}, jobLogDecodeSlots),
 	}
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
 	service.git = newGitProxy(filepath.Join(stateDir, gitMirrorsDirectory))
 	service.casFill = casFillDefault
+	service.casCacheFill = casCacheFill
+	service.casPolicyEvery = casPolicyAge
+	service.closedSessionRetry = time.Minute
 	service.npmSettleWait = defaultNpmSettleWait
 	service.answerCloseWait = defaultAnswerCloseWait
 	if err := service.loadSessions(); err != nil {
@@ -961,6 +976,10 @@ func (s *CacheService) signalClosed() {
 
 // RetryClosed releases cache volumes whose earlier cleanup was interrupted.
 func (s *CacheService) RetryClosed(ctx context.Context) error {
+	if s.blobStore() != nil {
+		return s.retryClosedSideBySide(ctx)
+	}
+
 	s.mu.Lock()
 	sessions := make([]*cacheSession, 0, len(s.byToken))
 	for _, session := range s.byToken {
@@ -1196,6 +1215,18 @@ func (s *CacheService) cleanupSession(
 			s.log.Warn("an Actions cache save was reserved and never finalized; nothing was published",
 				"instance", session.instance, "key", archive.CacheKey, "version", archive.Version)
 		}
+		if archive.Upload != "" {
+			s.releaseStagedBlocks(ctx, session, archive.Upload)
+		}
+		if archive.objectBacked() {
+			archive.mu.Unlock()
+			delete(session.actions, id)
+			if err := s.persistSession(session); err != nil {
+				return fmt.Errorf("node: record released Actions cache of %s: %w", session.instance, err)
+			}
+
+			continue
+		}
 		if !archive.Unmounted {
 			if err := s.actionIO.Unmount(ctx, s.actionsMountPath(session, archive)); err != nil {
 				failures = append(failures, fmt.Errorf("actions cache %s unmount: %w", id, err))
@@ -1215,6 +1246,13 @@ func (s *CacheService) cleanupSession(
 		if err := s.persistSession(session); err != nil {
 			return fmt.Errorf("node: record discarded Actions cache of %s: %w",
 				session.instance, err)
+		}
+	}
+	// A FINALIZATION THAT NEVER COMPLETED LEFT ITS BLOCKS, its archive having become
+	// this receipt.
+	for _, receipt := range session.receipts {
+		if receipt.Upload != "" && !receipt.Complete {
+			s.releaseStagedBlocks(ctx, session, receipt.Upload)
 		}
 	}
 
@@ -1983,6 +2021,25 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	candidate, step, err := s.publishAcquired(ctx, session, slot, attachment, lease, fence)
+	// AND A GENERATION THERE: a pointer that is gone is the store's word that the key
+	// holds nothing, which is no generation for cas to keep.
+	if moved, ok := errors.AsType[*storecontract.PointerMovedError](err); ok && moved.Current != "" &&
+		step == stepPublish && attachment.Publication == publicationCAS {
+		// A CAS LOSS IS AN ANSWER, NOT AN OUTAGE: the key holds a generation this disk
+		// was not cloned from, and cas keeps it. Said by name, because "cache
+		// unavailable" sends an operator looking for a fault that is not there; and
+		// only on the store's own word, decided under its lock, that the pointer is
+		// not the clone's, because every other conflict (this writer's authority
+		// lost, a store that could not get its write through) is an outage.
+		s.log.Info("a sticky-disk update was superseded; cas keeps the generation published since its clone",
+			"instance", session.instance, "key", attachment.Volume.Key, "current", moved.Current,
+			"cloned_from", moved.Expected, "error", err)
+		writeCacheJSON(w, http.StatusOK, map[string]any{
+			"published": false, "reason": supersededReason,
+		})
+
+		return
+	}
 	if err != nil {
 		s.nonFatalCommit(w, session, commitOperation(step), err)
 
@@ -1993,6 +2050,11 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		"published": true, "generation": candidate.Generation,
 	})
 }
+
+// supersededReason is what a cas commit answers when the store says the key's pointer
+// is not the generation this disk was cloned from: another job published it since, or
+// the disk started cold beside one too large to clone.
+const supersededReason = "superseded: the key holds a generation this disk was not cloned from, and cas keeps it"
 
 // publishStep names the step of publishAcquired that failed, for the caller's
 // own diagnostic.

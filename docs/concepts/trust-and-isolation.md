@@ -20,6 +20,8 @@ A trusted tier exists only under an **organization** target. A repository has no
 | `ec2` | one instance per job, destroyed with it | admitted only with `node.ec2.untrusted_security_group_ids` |
 | `codebuild` | a build on AWS-managed hosts | **refused**: reserved fleets keep instances alive between builds and share cached data across projects by design, and even on-demand builds expose the service role to the job |
 
+Where a job may connect is a separate question, and a Firecracker tier can answer it on the host with `network.egress`: an allowlist of names and addresses a guest cannot alter, since nothing about it runs in the guest. See [naming and restricting where jobs connect](../operating/egress.md).
+
 A boundary is the kernel, not the network. A guest on your ordinary bridge reaches whatever that bridge reaches, which on the reference host includes the Ceph cluster and the control plane. So the absence of the separate network setting is the refusal, and billet never rewrites host networking for you: the Ansible host role creates the separate bridges and blocks their access to the host, private networks, link-local and cloud metadata by default, and if you do not use it, that policy is yours to write before enabling untrusted work.
 
 ## What a job can reach

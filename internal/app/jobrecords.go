@@ -31,6 +31,16 @@ func OpenJobRecords(ctx context.Context, cfgPath, tier, repository string) (gith
 	if err != nil {
 		return nil, err
 	}
+	if cfg.Server != nil && cfg.Server.TokenBroker != nil {
+		broker, err := NewBrokerClient(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("target %s: %w", target.Name, err)
+		}
+
+		return github.NewJobRecordsWith(GitHubAPIBase, GitHubTargetOf(target), target.AppID,
+			target.InstallationID, TargetTokens(broker, target)), nil
+	}
+
 	key, err := ResolveAppKey(ctx, cfg, target)
 	if err != nil {
 		return nil, fmt.Errorf("target %s: %w", target.Name, err)

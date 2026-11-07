@@ -8,20 +8,35 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 
 | Key | Required | Meaning |
 |---|---|---|
-| `listen` | yes | the address nodes dial. A loopback address serves plain HTTP with no certificates; anything else requires mTLS |
-| `bootstrap_listen` | no | a second address serving only `/v1/ca` and `/v1/enroll`, for a machine that has no certificate yet. Absent means no network enrollment (`billet ca issue` is the way in). Refused against a loopback `listen` |
+| `listen` | yes | the address nodes dial. A loopback address serves plain HTTP with no certificates, unless `tls_router` says a router fronts it; anything else requires mTLS |
+| `bootstrap_listen` | no | a second address serving only `/v1/ca` and `/v1/enroll`, for a machine that has no certificate yet. Absent means no network enrollment (`billet ca issue` is the way in). Refused against a loopback `listen`, unless `tls_router` says a router fronts it |
 | `node_tls_hosts` | when `listen` is a wildcard | every name and address a node will dial, including the one it dials `bootstrap_listen` by; both listeners present one certificate |
 | `state_dir` | one of `state_dir` or `identity_dir`+`state` | shorthand for `identity_dir: <dir>` plus `state: {backend: sqlite}`; must be local storage |
 | `identity_dir` | with `state` | the deployment identity, the node-wire CA and its rotation state, the process lock and the maintenance fence |
 | `state.backend` | with `identity_dir` | `sqlite` or `postgres` |
 | `state.postgres.dsn_env` | for `postgres` | the name of the environment variable holding the DSN, never the DSN |
+| `state.postgres.max_connections` | no | the most connections one process of this deployment holds: the writer, the controller claim's session, and readers, which get what those two leave, up to 4. At least 3; absent, 6. A transaction-mode pooler cannot carry them ([Many deployments on one host](../deploying/many-deployments.md)) |
 | `controllers` | no | `single` (default) or `active-passive`; refused on SQLite |
+| `tls_router.node_addr` | behind a router | the `host:port` nodes dial through a TLS-passthrough router, a DNS name because a client sends no SNI for an IP. With it, `listen` stays on loopback and serves mutual TLS, and `node_tls_hosts` is refused ([Many deployments on one host](../deploying/many-deployments.md)) |
+| `tls_router.enroll_addr` | with `bootstrap_listen` behind a router | the `host:port` an enrolling machine dials, by a name of its own |
+| `token_broker.url` | with a broker | where this deployment takes its installation tokens from, https only, naming only a scheme and a host. With it, no target names a `private_key_path` and this host holds no App key ([ADR-025](decisions/adr-025-installation-tokens-from-a-broker.md)) |
+| `token_broker.client_key_path` | with a broker | the key this host proves its deployment with, absolute and outside `identity_dir`; `billet broker client-key` creates it |
+| `token_broker.ca_file` | no | the PEM bundle the broker's certificate is verified against; absent, the system's roots |
+| `pool` | no | a pool of rented bare metal the controller orders Firecracker hosts from, ahead of demand ([ADR-030](decisions/adr-030-rented-bare-metal-pool.md), [the pool](../operating/bare-metal-pool.md)) |
+| `pool.join_server` | with a pool | the node-wire `host:port` an ordered host dials to join, as that host reaches it |
+| `pool.bootstrap_addr` | no | the enrollment listener an ordered host dials; by default `tls_router.enroll_addr`, else `bootstrap_listen` when it names a host. A pool needs `bootstrap_listen`, and a wildcard or loopback one needs this, which may be neither |
+| `pool.boot_prelude` | with a pool | an absolute path to the script an ordered host runs on its first boot before `billet join`: it installs billet and what a Firecracker node needs. The prelude, the join and its token must fit EC2's 16384 bytes of user data |
+| `pool.interval`, `pool.refusal_backoff` | no | how often the pool looks at its orders and the demand (default `30s`), and how long a choice a source refused is passed over (default `10m`); Go durations |
+| `pool.architectures.<arch>` | with a pool | per architecture: `floor` (hosts kept whatever the demand), `max` (at least 1, not below the floor) and `order`, the choices hosts come from, first first: each a `source` (`aws-metal` or `phoenixnap`), a `shape` that source declares for this architecture, and a `location` (the subnet's zone for `aws-metal`, which it may leave out; required for `phoenixnap`, whose stock is per location) |
+| `pool.aws_metal` | for `aws-metal` | `region`, `subnet_id`, `availability_zone`, `security_group_ids`, `instance_profile` (the role a host runs under, for the site's store), `images` (the AMI per architecture) and `shapes` (each a `type` and its `arch`) |
+| `pool.phoenixnap` | for `phoenixnap` | `client_id_env` and `client_secret_env`, the environment variables the API client's id and secret are read from (never the values), and `shapes` (each a `type` and its `arch`) |
 | `identity.backend` | no | `file` (default) or `aws-ssm` |
 | `identity.aws_ssm` | for `aws-ssm` | `region`, `prefix` (isolates one deployment in an account), `kms_key_id` |
 | `max_vcpu`, `max_memory` | yes, positive | the deployment ceiling across every tier |
-| `placement` | no | `pack` (default) or `spread` |
-| `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
+| `placement` | no | `pack` (default), `spread` or `tightest` (the host left with the least free room, whatever the tier) |
+| `admission_order` | no | `fair` (default), `fill` or `hold`; which waiting tier takes the room a finished job leaves. [Admission orders on replay](records/replay-policies.md) measures all three |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
+| `logs.retention`, `logs.max_bytes` | no | how long this control plane's index of what jobs wrote keeps a day (default `336h`, at least `1h`) and how much of it stays on disk (a byte size, default `32GiB`, at least `64MiB`), the oldest days removed whole; a file of its own a day under `identity_dir`, not in the ledger, and absent unless a tier sets `logs.keep` ([ADR-031](decisions/adr-031-job-logs.md)) |
 | `test_results_retention` | no | how long the ledger keeps a job's test suites and cases, which `billet tests stats` ranks and `billet jobs show` prints (default `336h`, at least `1h`); they are kept apart from the guest report and past it |
 | `test_results_max_bytes` | no | how much of them the ledger keeps in all, the oldest deleted first (a byte size, default `128MiB`, at least `1MiB`); the control plane reads the whole ledger at every start, and this bounds what they add to that |
 | `job_detail_retention` | no | how long the ledger keeps a finished job's per-sample series, destinations and guest report (default `72h`, at least `1h`); past it they are deleted and `billet jobs show` says the job's detail was retired. The usage summary is kept |
@@ -29,6 +44,8 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `metrics.allow_remote` | no | admits a non-loopback `metrics.listen`; the endpoint has no authentication |
 | `metrics.pprof` | no | also serves Go's profiler under `/debug/pprof/`; refused on any `listen` that is not a literal loopback address, `allow_remote` or not, because a profile carries memory |
 | `flight_recorder` | no | `true` keeps the last two minutes of the controller's execution trace in memory and writes them under `identity_dir/flight-recorder` when a heartbeat pass overruns or the claim is lost; off by default. See [Metrics](../operating/metrics.md#the-flight-recorder) |
+| `alerts.destinations[]` | no | where a rule's notices go: `name` (a letter or digit, then at most 63 of letters, digits, `.`, `_` and `-`; unique), `kind` (`webhook` or `slack`), and exactly one of `url_env`, the name of an environment variable holding the address, and `url_file`, an absolute path to a file holding it, readable only by its owner. The address is a credential and is never written here; it must be `https`, or plain `http` to a literal loopback host. See [Alerts](../operating/alerts.md) |
+| `alerts.rules[]` | no | what to tell them about: `name` (as a destination's, unique), `match` (`repository`, `workflow`, `job`, `tier`, `branch`, `step`, each a pattern with `*` and `?`; `branch` and `step` are read from GitHub and need `actions: read`, and `step` takes only `failed` and `cancelled`), `on` (at least one of `failed`, `cancelled`, `disrupted`, `running_longer_than` and `waited_longer_than`, the last two positive durations), `in_a_row` (1 to 100, default 1), `cooldown` (a duration, default `1h`, `0s` for none), and `notify` (destination names, at least one) |
 
 ## `github`
 
@@ -43,6 +60,7 @@ The first GitHub **target**: the owner whose runners this deployment serves, and
 | `installation_id` | yes | creating an App does not install it |
 | `private_key_path` | yes | the key GitHub issued once |
 | `max_vcpu`, `max_memory` | no | this target's share: the most its tiers may hold at once between them, inside `server.max_vcpu`/`max_memory`; see [A target's share](#a-targets-share) |
+| `weight` | no | this target's claim on contended room, from 1 to 1000; see [A target's weight](#a-targets-weight) |
 
 A repository target is **untrusted-only**: a repository has no runner groups, so nothing on GitHub's side can restrict a pool there, and `trust: trusted`, `runner_group` and `workflows` are refused on a tier under one. Its repository becomes the cache scope of each of its tiers, which therefore publish from its default branch by default. Its App holds `administration: write` on that repository, the only permission GitHub offers for registering a repository's runners ([ADR-011](decisions/adr-011-targets-and-repository-scope.md)).
 
@@ -53,13 +71,19 @@ Further targets, each an organization or a repository with its own App, served b
 | Key | Required | Meaning |
 |---|---|---|
 | `name` | yes | the target's name, in the tier-label grammar, unique; what `tiers[].target`, `github-app create --target`, the archive and the host role refer to it by |
-| `org` or `repository`, `app_id`, `client_id`, `installation_id`, `private_key_path`, `max_vcpu`, `max_memory` | as for `github` | the target and its credential; with a file-backed identity every target needs its own `private_key_path`, with a store-backed one none may set it |
+| `org` or `repository`, `app_id`, `client_id`, `installation_id`, `private_key_path`, `max_vcpu`, `max_memory`, `weight` | as for `github` | the target and its credential; with a file-backed identity every target needs its own `private_key_path`, with a store-backed one none may set it |
 
 The target's GitHub path (`owner` or `owner/name`) is its identity on the wire and in the ledger; the name is a label for the operator.
 
 ### A target's share
 
 Every target's tiers buy from the one deployment ceiling, so a burst of one target's CI can take every host another target's jobs need. `max_vcpu` and `max_memory` on a target's block cap what that target's tiers hold at once between them, charged the way the deployment ceiling is (a remote backend at the shape it buys). A zero or absent dimension is bounded by the deployment ceiling alone. Capping one target leaves the rest for the others: with `server.max_vcpu: 120` and `max_vcpu: 80` on a repository target, that repository's jobs never hold more than 80, so the other target always has at least 40. A tier held back by its own target's share also stops holding its place in `server.admission_order` against other targets' tiers, because room they free could never reach it. A share is refused when it is above the deployment ceiling, below one of its tiers' shapes, or below what its tiers' `reserved` floors hold between them.
+
+### A target's weight
+
+A share is a hard cap, so it strands room while the capped target is idle and another is queueing. `weight` divides contended room instead, and only while it is contended. When waiters from two or more targets compete for the same room, the one whose target holds least per unit of weight buys first: what a target holds is the larger of its share of `server.max_vcpu` and of `server.max_memory`, so a target holding little vCPU and much memory is not treated as holding little. Two saturating targets of weight 2 and 1 converge to about 2:1 ([the record](records/target-weights.md)). Within one target, and between targets level with each other, the longest waiter still goes first. A target with nothing waiting claims nothing, so its room goes to whoever is asking. A target that writes no weight weighs 1, and with no weight written anywhere the order is exactly the longest waiter first, as it always was; writing `weight: 1` on every target does turn the ranking on, and they then divide contended room evenly. With one target a weight has nothing to divide.
+
+A weight only chooses who buys next, and it never takes the line from a waiter that already holds it. A tier below its `reserved` floor goes first, because that room is held for it from everyone else. A waiter that was first when it was refused keeps the line until it buys, so a wide shape can still accumulate the room it needs. A tier that has gone 15 minutes without buying stands above every rank, so a weight cannot starve a tier of a target holding more than its share. A tier whose launch just failed steps aside for three minutes, as one whose listener makes no progress does, and may then accumulate the room to try again. Floors, shares, the ceiling and each host's room still bound every purchase, and what a tier advertises does not change. A weight must be from 1 to 1000 (zero or absent is none written), and one under `admission_order: fill` is refused, because `fill` ranks no waiters. Under GitHub Enterprise Server's offers no tier is recorded as waiting, so the order has nobody to rank and a weight does nothing until #686 is fixed.
 
 ## `node`
 
@@ -72,7 +96,7 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `provider` | yes | `docker`, `firecracker`, `tart`, `ec2`, `codebuild`; `simulated` is billet's own test-only backend and is refused anywhere in a configuration |
 | `site` | no | one of the control plane's `sites`; required with `ebs_s3`; refused on `codebuild` |
 | `max_vcpu`, `max_memory` | for `ec2` and `codebuild` | what this host contributes; detected on a host backend when unset |
-| `tls.cert`, `tls.key`, `tls.ca` | for any non-loopback controller address | from `billet ca issue` or enrollment; refused against a loopback server |
+| `tls.cert`, `tls.key`, `tls.ca` | for any non-loopback controller address | from `billet ca issue` or enrollment; refused against a loopback server, unless `tls_router` says a router fronts it |
 | `lock_dir`, `allow_unlocked_deployment` | no | the host-wide deployment lock; a shared directory must be setgid; failing to place the lock is an error unless opted out |
 | `state_dir` | yes | generation pointers, image cache, the node's identity |
 | `max_custody` | no | a bound on compute billet is holding without a completion; empty means none, and a job killed by it is archived failed |
@@ -81,6 +105,7 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `stop` | no | what a SIGTERM does while the node holds compute: `drain` (the default) waits for it; `handoff` (Firecracker nodes only) leaves it running for the next node process to adopt, for a host restarted to be upgraded or converged. A host leaving for good is drained or decommissioned, since nothing comes back to adopt what a handoff leaves |
 | `cache.listen` | for interception and EC2 caches | one literal non-loopback address; `tls_cert`/`tls_key` required for EC2 and refused on the Firecracker bridge |
 | `registry_mirrors` | no | `docker.io`, `ghcr.io`, `quay.io` origins |
+| `logs.retention`, `logs.max_bytes`, `logs.max_job_bytes` | no | how long this node keeps a job's step logs (default `336h`, at least `1h`), how much in all (default `64GiB`, at least `64MiB`), and how much of one job (default `64MiB`, at least `1MiB`, no more than `max_bytes`), compressed, the oldest jobs evicted whole. Only a node with `monitoring.guest` receives any, and only for a tier with `logs.keep` |
 | `monitoring` | no | measure each job from the host; absent means off; firecracker, docker and tart only, and `perf` and `guest` firecracker only (see below) |
 | `power` | no | lower the CPU's ceiling while the node is idle and restore it before a launch; absent means off; firecracker and docker on Linux only (see below) |
 
@@ -128,7 +153,7 @@ The per-sample series a node reports with each job records the wall time of its 
 
 ### `node.ebs_s3` (for an EC2 site's cache)
 
-`region`, `availability_zone` (must match the subnet's), `bucket`, `prefix`, `kms_key_id`. It exists only to back `node.cache`: without that listener nothing reads it, so `billet check` refuses the pairing rather than letting every job run cold on the instance's root volume.
+`region`, `availability_zone` (must match the subnet's), `bucket`, `prefix`, `kms_key_id`. It exists only to back `node.cache`: without that listener nothing reads it, so `billet check` refuses the pairing rather than letting every job run cold on the instance's root volume. Sticky disks and the Docker image store are EBS volumes under `kms_key_id`, and the Actions, Go and Bazel caches are objects in the bucket under `prefix`, encrypted with S3's own key ([ADR-024](decisions/adr-024-caches-off-firecracker.md)).
 
 ## `tiers`
 
@@ -143,19 +168,37 @@ The per-sample series a node reports with each job records the wall time of its 
 | `workflows` | the exact allowlist the group must carry, with refs |
 | `provider` or `providers` | one backend, or an ordered preference list; never both |
 | `launch.<provider>` | per-backend `image` and `command` for a multi-provider tier |
-| `guest_os` | `linux` (default), `macos`, `windows` |
+| `guest_os` | `linux` (default), `macos`, `windows`. `windows` runs only on the `ec2` provider, on an AMI `billet ami build --os windows` made, and refuses `arch: arm64`, `cache`, `intercept` and `cache_scope` ([ADR-026](decisions/adr-026-windows-on-ec2.md)); its default `command` is `C:\billet\billet-runner.ps1` |
 | `arch` | `x64` or `arm64` ([ADR-022](decisions/adr-022-every-linux-image-from-githubs-template.md)), or absent to place on a node of any architecture, as a tier always did. Named on every tier or on none, so the first one is a migration of the whole catalogue, and a macOS tier is `arm64`. A tier naming one is placed only on nodes that report it at registration (a node from before the wire that carries it reports none), and an EC2 node buys it only a shape declared with it. A billet from before it refuses a file that carries it, so `billet check` refuses it while any registered host predates it; upgrade every host and controller first |
 | `node`, `site` | pins; a single-backend macOS tier pins a node |
 | `vcpu`, `memory` | the request; or `sizes` with `memory_per_vcpu` to expand a template into several tiers |
+| `minute_weight` | what one minute of this tier counts as in [`billet usage export`](usage-export.md), in minutes of a 2 vCPU Linux runner; a decimal above 0 and at most 1000, with at most three places, refused beside `sizes`. Absent, the vCPU charged over two. It reports and decides nothing |
 | `disk` | usable root capacity on Firecracker and EC2; ignored by Docker |
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
-| `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference; never one beginning with `-`, which a backend's command line would read as an option |
+| `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference or local VM name, either of which may end `@verified` to boot only a copy of what `billet images verify` booted on that node ([ADR-021](decisions/adr-021-tart-images-verified-not-published.md), never beside a digest, and `billet check` refuses it while a registered host predates wire 41); never one beginning with `-`, which a backend's command line would read as an option |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
+| `logs.keep` | keep this tier's jobs' step logs on the node that ran them and index them for `billet logs search` (default false). Linux Firecracker only, with no other backend: that guest runs the agent that reads them, and a tier that asks elsewhere is refused. A log is as sensitive as its workflow makes it, so this is off unless a tier says ([ADR-031](decisions/adr-031-job-logs.md)) |
+| `debug.attach` | let an operator open a terminal in this tier's jobs' VMs with `billet jobs attach` (default false). Trusted tiers only, since an untrusted tier's jobs are outside work on a machine they control, and Linux Firecracker only, with no other backend. See [ADR-032](decisions/adr-032-job-attach.md) |
+| `debug.hold_on_failure` | keep a failed job's VM this long, or until a session's shell has exited and the last session has closed, its capacity charged: a Go duration above zero and at most `1h`, needing `debug.attach`. Absent, a failed job's VM is destroyed as any other's. A job that passed or was cancelled is never held, and the bound is fixed when the hold opens |
 | `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
 | `intercept` | the deprecated spelling of `cache.actions.enabled`; refused beside `cache.actions` |
+| `network` | what the tier asks of its guests' network; see [`tiers[].network`](#tiersnetwork). Without it the tier is open, as a tier always was |
 | `max_concurrent`, `reserved` | a ceiling and a floor; a macOS tier's ceiling defaults to what its hosts permit between them |
+| `retry` | `disrupted`, 0 to 5, default 0: how many times billet asks GitHub to re-run a workflow run whose job on this tier it proved its own infrastructure ended. The App must hold `actions: write`. See [Re-running a job billet ended](../operating/status-and-leases.md#re-running-a-job-billet-ended) |
 | `warm_pool` | refused when non-zero; no backend implements it |
+
+### `tiers[].network`
+
+```yaml
+network:
+  egress:
+    allow: [example.com, "*.npmjs.org", 203.0.113.0/24]
+```
+
+| Key | Meaning |
+|---|---|
+| `egress.allow` | where the tier's guests may connect, enforced on the host ([ADR-028](decisions/adr-028-host-enforced-egress.md), and [the operator page](../operating/egress.md)). `example.com` allows that name alone, `*.example.com` every name below it and not the name itself, `203.0.113.0/24` or `203.0.113.7` those addresses. At most 256 entries, and `allow: []` allows only what every list includes: GitHub's runner endpoints and the node's own services. IPv6 entries are refused, because the host refuses every IPv6 packet a listed guest sends. Only a tier whose every provider is `firecracker` may have one |
 
 ### `tiers[].cache`
 
@@ -167,13 +210,13 @@ Everything here is optional; [Build caches](../operating/build-caches.md) explai
 | `docker.enabled`, `docker.max_size` | `true`, `100GiB` | the guest's Docker image store and its ceiling |
 | `sticky_disks.enabled`, `sticky_disks.max_size` | `true`, `100GiB` | `actions/stickydisk` volumes; a larger request is clamped |
 | `actions.enabled`, `actions.max_archive` | on where the scope already holds, `10GiB` | the transparent Actions cache; an untrusted tier needs `default-branch`, a trusted `trusted-only` one a `cache_scope.workflow_ref` in its `workflows` |
-| `git.enabled`, `git.max_size` | `true` on Linux Firecracker, `50GiB` | the Git mirror for `github.com` fetches; a repository above the ceiling is not mirrored |
-| `bazel.enabled`, `bazel.max_size` | `true` on Linux Firecracker where the tier can publish it (trusted under `trusted-only`, or `default-branch`), `50GiB` | Bazel's HTTP cache and the Remote Execution API for Bazel and Buck2 |
-| `go.enabled`, `go.max_size` | `true` on Linux Firecracker where the tier can publish it, as for Bazel, `20GiB` | the Go build cache through `GOCACHEPROG` |
+| `git.enabled`, `git.max_size` | `true` on Linux Firecracker or EC2, `50GiB` | the Git mirror for `github.com` fetches; a repository above the ceiling is not mirrored |
+| `bazel.enabled`, `bazel.max_size` | `true` on Linux Firecracker or EC2 where the tier can publish it (trusted under `trusted-only`, or `default-branch`), `50GiB` | Bazel's HTTP cache and the Remote Execution API for Bazel and Buck2 |
+| `go.enabled`, `go.max_size` | `true` on Linux Firecracker or EC2 where the tier can publish it, as for Bazel, `20GiB` | the Go build cache through `GOCACHEPROG` |
 | `go.test_results` | `false` | also cache `go test` results; off, the guest sets `GOFLAGS=-count=1` |
-| `npm.enabled` | `true` on a firecracker Linux tier, as every cache is; `false` turns it off for a tier whose jobs run a client the node's authority does not reach | the node serves `registry.npmjs.org` to the tier's guests from a store of its own, answering only anonymous reads and splicing everything else to the registry ([ADR-020](decisions/adr-020-npm-registry-interception.md)); Linux Firecracker only. It has no `max_size`: the store is the node's, shared by every tier on it |
+| `npm.enabled` | `true` on a firecracker or EC2 Linux tier, as every cache is; `false` turns it off for a tier whose jobs run a client the node's authority does not reach | the node serves `registry.npmjs.org` to the tier's guests from a store of its own, answering only anonymous reads and splicing everything else to the registry ([ADR-020](decisions/adr-020-npm-registry-interception.md)); Linux Firecracker only. It has no `max_size`: the store is the node's, shared by every tier on it |
 
-A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. A tier an older node would exceed is placed only on a node at protocol 23 or later: every `default-branch` tier (an older node would read the pool's wider pre-#226 keys), a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, and an Actions archive held below `10GiB`.
+A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. On EC2, where the Go and Bazel caches are objects rather than a volume, it bounds what one job adds. A tier an older node would exceed is placed only on a node at protocol 23 or later: every `default-branch` tier (an older node would read the pool's wider pre-#226 keys), a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, and an Actions archive held below `10GiB`.
 
 ## `nodes`
 
@@ -193,7 +236,7 @@ Per-host policy, not a roster: `name`, `provider` (decides only whether an unpin
 
 `accept` names the components of GitHub's runner image whose licenses this deployment accepts: `android-sdk`, `codeql`, `firefox`, `google-chrome` and `microsoft-edge`. A name that is not one of the five, or a name written twice, is refused. Empty is the default, and nothing is ever accepted on the operator's behalf. Written in the control plane's file, it is accepted for every node: the control plane sends it to each node when the node registers, the node records it as `image-acceptance.json` in `node.state_dir`, and a node installs what either its own `accept` or its control plane's names. A node takes up a change at its next registration, which restarting `billet server` causes on every node; a node whose control plane is older than this release uses its own list alone. Until a node has registered once it cannot tell what its deployment accepts, so a pull installs the image's kernel, which the node needs to start, and imports no generation, and `billet images verify --record` and `promote` refuse; once the node has registered, the refresh timer or a pull imports, completes and promotes it. A pull whose deployment's list changes while it completes an image imports nothing, and the next refresh completes it again. The component names travel between the control plane and the nodes, so accept a component a newer billet adds only once every node runs that billet; an older node refuses its image commands, naming it, until it is upgraded. `billet init` writes it empty on a Firecracker host, with each name and a link to its license above it, and `billet check` reports what each tier's image left out that is not accepted ([Components the image leaves out](../operating/guest-images.md#components-the-image-leaves-out), which also lists the vendor hosts a firewalled node must reach).
 
-The five components' licenses forbid billet redistributing them, so billet's published guest image is to leave them out (#584). A pull of an image that leaves components out installs each accepted one into it before importing it. The install runs in a completion microVM on the node, booted from the newest verified generation of the image whose kernel is on the node, with the new image attached as its second disk. Without one, the pull first imports the image as published as a completion root, a snapshot no tier can boot and no command treats as a generation, boots that, and removes it afterwards whatever the completion came to. GitHub's own installer and tests run for each component, inside the guest. The image is imported only if every accepted component installed and its filesystem then checked clean. Otherwise nothing is imported and every tier keeps the generation it has. Each generation records what its image left out and the version installed of each accepted component. `billet images refresh` pulls the image again while its newest generation lacks a component the deployment accepts or carries one it no longer accepts, so accepting a component later completes the next generation, and `billet images verify` and `promote` refuse to mark a generation that lacks one. billet's build leaves them out of every image it publishes, and proves before publishing that each completes, by completing a copy of the image with each one on the builder. An image built before that carries all five and declares none, so a pull of it installs nothing.
+The five components' licenses forbid billet redistributing them, so billet's published guest image is to leave them out (#584): all five on x64, and Firefox on arm64, the one of them GitHub's arm64 template installs, so accepting another there brings nothing, and `billet check` says so. A pull of an image that leaves components out installs each accepted one into it before importing it. The install runs in a completion microVM on the node, booted from the newest verified generation of the image whose kernel is on the node, with the new image attached as its second disk. Without one, the pull first imports the image as published as a completion root, a snapshot no tier can boot and no command treats as a generation, boots that, and removes it afterwards whatever the completion came to. GitHub's own installer and tests run for each component, inside the guest. The image is imported only if every accepted component installed and its filesystem then checked clean. Otherwise nothing is imported and every tier keeps the generation it has. Each generation records what its image left out and the version installed of each accepted component. `billet images refresh` pulls the image again while its newest generation lacks a component the deployment accepts or carries one it no longer accepts, so accepting a component later completes the next generation, and `billet images verify` and `promote` refuse to mark a generation that lacks one. billet's build leaves them out of every image it publishes, and proves before publishing that each completes, by completing a copy of the image with each one on the builder. An image built before that carries all five and declares none, so a pull of it installs nothing.
 
 ## `release`
 
@@ -207,3 +250,32 @@ The five components' licenses forbid billet redistributing them, so billet's pub
 - The mirror of those — a store with no `node.cache` to serve it — is a `billet check` verdict rather than a load refusal, because `billet decommission` and `billet init iam` both read a store block on a config that has lost its listener. `node.ebs_s3` without a listener FAILS the check; `node.ceph` without one is reported, since `image_pool` still boots every guest and `cache_pool` is a required field.
 - `billet init` writes a whole file and refuses to replace one it cannot prove is its own output (it writes `<path>.new` instead; `--force` overrides); `billet github-app create --config` edits five scalars under `github:` (or, with `--target NAME`, under the named `targets:` entry, created when absent) in place and preserves everything else.
 - `--config` is never defaulted to the working directory; `billet check -h` prints the per-user default, and the packaged services use `/etc/billet/billet.yaml` (Linux) or `/usr/local/etc/billet/billet.yaml` (macOS).
+
+## The token broker's file
+
+`billet broker serve --config` reads a file of its own, never a `billet.yaml`: the process holding the App keys holds nothing else. A key this schema does not know stops the load.
+
+```yaml
+listen: :8443
+cert_file: /etc/billet-broker/broker.crt
+key_file: /etc/billet-broker/broker.key
+apps:
+  - app_id: 12345
+    private_key_path: /etc/billet-broker/app-12345.pem
+deployments:
+  - id: 0123456789abcdef0123456789abcdef
+    clients: ["SHA256:..."]
+    installations:
+      - {app_id: 12345, installation_id: 67890, target: acme}
+```
+
+| Key | Required | Meaning |
+|---|---|---|
+| `listen`, `cert_file`, `key_file` | yes | where control planes dial, and the certificate they verify |
+| `apps[].app_id`, `apps[].private_key_path` | yes | an App this broker holds; the key is read under the rules `private_key_path` has in a `billet.yaml`, and the path is absolute |
+| `apps[].api_url` | no | the REST base, for GitHub Enterprise Server; absent, the real GitHub |
+| `deployments[].id` | yes | the deployment's identity, as `billet broker client-key` printed it |
+| `deployments[].clients` | yes | the fingerprints of the keys that prove this deployment, one per host. A key proves one deployment |
+| `deployments[].installations[]` | no | the only tokens this deployment may ask for: `app_id`, `installation_id`, `target` (`owner`, or `owner/name` for one repository), and `actions_read`, which lets its tokens read GitHub's job records: without it every job keeps an unknown queue time, and a tier publishing caches from a default branch is refused. `actions_write` grants write, which includes read, for a deployment whose tier sets `retry.disrupted`, and the installation must hold it too. `billet broker client-key` prints the one each target needs |
+
+An owner registered as a whole organization belongs to one deployment, under any App, because its token reaches every repository; two deployments may share an owner by repository, whose tokens are scoped to the repository, and a repository belongs to one deployment.

@@ -57,6 +57,7 @@ fi
 CHECK_CONFIG_SH="${CHECK_CONFIG_SH:-$REPO_ROOT/scripts/kernel/check-config.sh}"
 CHECK_CONFIG_PIN="${CHECK_CONFIG_PIN:-$REPO_ROOT/scripts/kernel/check-config.pin}"
 REQUIRED_BUILTINS="${REQUIRED_BUILTINS:-$REPO_ROOT/scripts/kernel/required-builtins.txt}"
+REQUIRED_BUILTINS_AARCH64="${REQUIRED_BUILTINS_AARCH64:-$REPO_ROOT/scripts/kernel/required-builtins-aarch64.txt}"
 
 # sha256 of a file, printed bare, on either of the two platforms this runs on.
 file_sha256() {
@@ -134,43 +135,77 @@ echo "kernel checker: moby $pinned_commit, digest verified"
 
 # ------------------------------------------------- billet's own, stricter rule
 
-if [ ! -r "$REQUIRED_BUILTINS" ]; then
-	echo "cannot read $REQUIRED_BUILTINS, which lists what this kernel must carry." >&2
-	exit 1
-fi
+# THE MACHINE IS THE CONFIG'S, never this host's. The kernel may come from a cache,
+# and this gate is run on whatever holds its config; what the kernel must carry is
+# decided by what it was built for. A config that names neither machine is one this
+# cannot hold to the right list, so it is refused rather than held to the shorter.
+machine_lists=()
+for machine_option in CONFIG_ARM64 CONFIG_X86_64; do
+	machine_status=0
+	grep -qxF "$machine_option=y" "$CONFIG" || machine_status=$?
+
+	case "$machine_option:$machine_status" in
+	CONFIG_ARM64:0)
+		machine_lists=("$REQUIRED_BUILTINS_AARCH64")
+		break
+		;;
+	CONFIG_X86_64:0) break ;;
+	*:1)
+		[ "$machine_option" = CONFIG_ARM64 ] && continue
+
+		echo "$CONFIG names neither CONFIG_X86_64 nor CONFIG_ARM64, so this cannot tell which" >&2
+		echo "machine's list of required options to hold it to." >&2
+		exit 1
+		;;
+	*)
+		echo "could not read $CONFIG to tell which machine it builds for (grep exited $machine_status)." >&2
+		exit 1
+		;;
+	esac
+done
 
 missing=""
-required_count=0
 
-# READ WITH A REDIRECT AND CHECKED WITH A FILE ARGUMENT, never through a pipe.
-# `grep -q` on a pipeline returns the WRITER's SIGPIPE under pipefail, which reads
-# as "not found" for a value that IS present -- intermittently. Given a filename
-# there is no writer to signal.
-while IFS= read -r line || [ -n "$line" ]; do
-	case "$line" in
-	'' | '#'*) continue ;;
-	esac
-
-	option=$(printf '%s' "$line" | tr -d '[:space:]')
-	[ -n "$option" ] || continue
-
-	required_count=$((required_count + 1))
-
-	# THE SAME THREE-VALUED STATUS, AND HERE THE COLLAPSE IS THE SAFE DIRECTION: a
-	# read that could not be performed is counted as "not present", which refuses the
-	# kernel and names the option. The module check below cannot do that, because
-	# there the answer that costs nothing is the one that publishes.
-	if grep -qxF "CONFIG_$option=y" "$CONFIG"; then
-		continue
+# EACH LIST COUNTS ON ITS OWN: the common one empty on arm64 would otherwise pass on the
+# strength of arm64's, which is every option a container needs gone unchecked.
+for required_list in "$REQUIRED_BUILTINS" ${machine_lists[@]+"${machine_lists[@]}"}; do
+	if [ ! -r "$required_list" ]; then
+		echo "cannot read $required_list, which lists what this kernel must carry." >&2
+		exit 1
 	fi
 
-	missing="$missing $option"
-done <"$REQUIRED_BUILTINS"
+	required_count=0
 
-if [ "$required_count" -eq 0 ]; then
-	echo "$REQUIRED_BUILTINS lists no options, so this proved nothing about the kernel." >&2
-	exit 1
-fi
+	# READ WITH A REDIRECT AND CHECKED WITH A FILE ARGUMENT, never through a pipe.
+	# `grep -q` on a pipeline returns the WRITER's SIGPIPE under pipefail, which reads
+	# as "not found" for a value that IS present -- intermittently. Given a filename
+	# there is no writer to signal.
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in
+		'' | '#'*) continue ;;
+		esac
+
+		option=$(printf '%s' "$line" | tr -d '[:space:]')
+		[ -n "$option" ] || continue
+
+		required_count=$((required_count + 1))
+
+		# THE SAME THREE-VALUED STATUS, AND HERE THE COLLAPSE IS THE SAFE DIRECTION: a
+		# read that could not be performed is counted as "not present", which refuses the
+		# kernel and names the option. The module check below cannot do that, because
+		# there the answer that costs nothing is the one that publishes.
+		if grep -qxF "CONFIG_$option=y" "$CONFIG"; then
+			continue
+		fi
+
+		missing="$missing $option"
+	done <"$required_list"
+
+	if [ "$required_count" -eq 0 ]; then
+		echo "$required_list lists no options, so this proved nothing about the kernel." >&2
+		exit 1
+	fi
+done
 
 if [ -n "$missing" ]; then
 	echo "" >&2
@@ -229,7 +264,7 @@ if [ "$modules" -eq 0 ]; then
 	exit 1
 fi
 
-echo "required built-ins: $required_count present, no modules"
+echo "required built-ins present, no modules"
 
 # ---------------------------------------------------- and then moby's checker
 
