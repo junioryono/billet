@@ -139,8 +139,11 @@ UPDATE pool_orders
 
 -- name: EndPoolClearanceRun :exec
 -- An answer that was not empty, or not an answer, or not taken where the run could stand:
--- the run is over.
-UPDATE pool_orders SET clear_since = '', clear_observed_at = '' WHERE order_id = @order_id;
+-- the run is over. Only while the order waits on its node: a sealed order's run is what
+-- its proof is read from, and an answer that arrives after the seal does not end it (a
+-- contradiction still does, through ContradictPoolRelease).
+UPDATE pool_orders SET clear_since = '', clear_observed_at = ''
+ WHERE order_id = @order_id AND state = 'placed';
 
 -- name: ClearPoolReleaseContradiction :exec
 -- A fresh decommission on the compute barrier's proof, in its own transaction: what the

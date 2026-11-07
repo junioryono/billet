@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -112,9 +113,13 @@ type Plane struct {
 	barriers BarrierStore
 	// barrierPace replaces the loop's own waits between rounds when set.
 	barrierPace time.Duration
-	// poolAskedAt is when the barrier loop last asked the nodes pool releases wait on;
-	// only that loop reads or writes it.
+	// poolAskedAt is when the barrier loop last started a round asking the nodes pool
+	// releases wait on; only that loop reads or writes it. poolRound is that round, run
+	// beside the loop so a slow node delays neither the deployment's barrier nor the next
+	// pass, and poolAsking says it has not finished, so rounds never overlap.
 	poolAskedAt time.Time
+	poolRound   sync.WaitGroup
+	poolAsking  atomic.Bool
 
 	// deployment is the identity this control plane belongs to. A node carrying a
 	// different one is refused: it would label its compute with an identity this

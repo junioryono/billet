@@ -15,9 +15,16 @@ func answerClearance(t *testing.T, a *Allocator, node string, empty bool) {
 	answerClearanceAt(t, a, node, fenceOf(t, a, node), empty)
 }
 
-// answerClearanceAt records one answer taken against fence.
+// answerClearanceAt records one answer taken against fence. An empty one reaches the
+// node's inventory first, as the plane's ask does (inventoryOf); a non-empty one is
+// recorded alone, so what ends the run is the clearance's own reading of it.
 func answerClearanceAt(t *testing.T, a *Allocator, node string, fence NodeFence, empty bool) {
 	t.Helper()
+	if empty {
+		if _, err := a.ResolveQuarantineFor(t.Context(), node, nil, fence.Epoch); err != nil {
+			t.Fatalf("record the empty inventory: %v", err)
+		}
+	}
 	if err := a.RecordPoolClearance(t.Context(), PoolClearanceObservation{
 		Order: "pa", Node: node, Fence: fence, Empty: empty,
 	}); err != nil {
@@ -35,6 +42,9 @@ func drainingPoolNode(t *testing.T, a *Allocator) string {
 	}
 	if sealed, err := a.RequestPoolRelease(t.Context(), "pa", "the pool shrinks"); err != nil || sealed {
 		t.Fatalf("ask for the release: sealed %v, %v", sealed, err)
+	}
+	if !readOrder(t, a, "pa").ReleaseContradicted {
+		t.Fatal("the node's arrival did not contradict the release, which every registration does")
 	}
 
 	return node
@@ -58,11 +68,20 @@ func TestAPoolHostDrainingAloneIsSealedOnTwoAnswers(t *testing.T) {
 	}
 
 	answerClearance(t, a, node, true)
+	first := now
+	if o := readOrder(t, a, "pa"); !o.ClearanceSince.Equal(first) || !o.ClearanceObserved.Equal(first) {
+		t.Fatalf("the run after one answer: since %v, observed %v, want both %v", o.ClearanceSince,
+			o.ClearanceObserved, first)
+	}
 	waitsUnsealed(t, a, "0a", "one empty answer")
 	now = now.Add(time.Hour)
 	waitsUnsealed(t, a, "0a", "one empty answer and an hour")
 
 	answerClearance(t, a, node, true)
+	if o := readOrder(t, a, "pa"); !o.ClearanceSince.Equal(first) || !o.ClearanceObserved.Equal(now) {
+		t.Fatalf("the run after two answers: since %v, observed %v, want %v and %v", o.ClearanceSince,
+			o.ClearanceObserved, first, now)
+	}
 	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
 		t.Fatalf("sealing on two empty answers spanning the grace: %v", err)
 	}
@@ -75,8 +94,64 @@ func TestAPoolHostDrainingAloneIsSealedOnTwoAnswers(t *testing.T) {
 	if targets, err := a.PoolClearanceTargets(ctx); err != nil || len(targets) != 0 {
 		t.Fatalf("a sealed order is still asked: %v, %v", targets, err)
 	}
+
+	// THE NODE LEAVES THE FLEET PROVED, so a later drain does not wait on a host its
+	// source takes back.
+	c := clearance(t, a)
+	if !slices.ContainsFunc(c.Excluded, func(e Exclusion) bool { return e.Node == node && e.Proven }) {
+		t.Fatalf("the sealed host's node is not excluded from the fleet as proved: %+v", c.Excluded)
+	}
+
+	// AN ANSWER ARRIVING AFTER THE SEAL does not end the run the proof is read from.
+	answerClearance(t, a, node, false)
 	if _, err := a.PoolReleaseProof(ctx, "pa"); err != nil {
-		t.Fatalf("the sealed order's proof: %v", err)
+		t.Fatalf("the sealed order's proof after a late answer: %v", err)
+	}
+}
+
+// A CURRENT INVENTORY REPORTING COMPUTE OUTWEIGHS A PROVED RUN, read in the same
+// transaction: on PostgreSQL a read sees each statement's own snapshot, so a contradiction
+// committed between reading the run and reading the node is seen only as the inventory.
+// Staged here by writing the inventory alone, as that read would see it.
+func TestACurrentInventoryOutweighsAProvedClearance(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := drainingPoolNode(t, a)
+	answerClearance(t, a, node, true)
+	now = now.Add(computeAbsenceGrace)
+	answerClearance(t, a, node, true)
+
+	reportCompute := func(running int) {
+		t.Helper()
+		epoch := fenceOf(t, a, node).Epoch
+		if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `INSERT INTO node_inventory (node, node_epoch, received_at, running)
+				VALUES ($1, $2, 'x', $3) ON CONFLICT(node) DO UPDATE SET node_epoch = excluded.node_epoch,
+				running = excluded.running`, node, epoch, running)
+
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reportCompute(1)
+	waitsUnsealed(t, a, "0a", "a proved run beside an inventory reporting compute")
+	reportCompute(0)
+	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+		t.Fatalf("sealing once the inventory is empty: %v", err)
+	}
+	if refused, err := a.PoolReleaseRefused(ctx, "pa"); err != nil || refused {
+		t.Fatalf("a proved seal reads as refused: %v, %v", refused, err)
+	}
+	reportCompute(1)
+	if _, err := a.PoolReleaseProof(ctx, "pa"); !errors.Is(err, ErrPoolReleaseContradicted) {
+		t.Fatalf("the proof beside an inventory reporting compute answered %v", err)
+	}
+	if refused, err := a.PoolReleaseRefused(ctx, "pa"); err != nil || !refused {
+		t.Fatalf("PoolReleaseRefused: %v, %v", refused, err)
 	}
 }
 
@@ -132,7 +207,9 @@ func TestAnAnswerTheClearanceCannotStandOnEndsTheRun(t *testing.T) {
 			answerClearance(t, a, node, true)
 			now = now.Add(computeAbsenceGrace / 2)
 			interrupt(t, a, node, leases[0].ID)
-			now = now.Add(computeAbsenceGrace / 2)
+			// A FULL GRACE AFTER THE INTERRUPTION, so an interruption recorded as an answer
+			// would make this run proved, and only its end keeps the release waiting.
+			now = now.Add(computeAbsenceGrace)
 			answerClearance(t, a, node, true)
 			waitsUnsealed(t, a, "0a", name)
 
@@ -268,12 +345,21 @@ func TestOnlyADrainingOrdersIdleNodeIsAsked(t *testing.T) {
 		t.Fatalf("a node holding a lease is asked: %v, %v", targets, err)
 	}
 
+	// AN ANSWER UNDER ANOTHER NODE'S NAME neither begins nor ends this order's run.
+	if err := a.Release(ctx, leases[0].ID, leases[0].Epoch, PhaseDone); err != nil {
+		t.Fatal(err)
+	}
+	answerClearance(t, a, node, true)
+	standing := readOrder(t, a, "pa").ClearanceSince
+	if standing.IsZero() {
+		t.Fatal("the order's own node's answer began no run")
+	}
 	if err := a.RecordPoolClearance(ctx, PoolClearanceObservation{
-		Order: "pa", Node: "someone-else", Fence: fenceOf(t, a, node), Empty: true,
+		Order: "pa", Node: "someone-else", Fence: fenceOf(t, a, node), Empty: false,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if o := readOrder(t, a, "pa"); o.ClearanceSince != (time.Time{}) {
-		t.Fatalf("an answer from another node began the run: %+v", o)
+	if o := readOrder(t, a, "pa"); !o.ClearanceSince.Equal(standing) {
+		t.Fatalf("an answer from another node moved the run: %+v", o)
 	}
 }

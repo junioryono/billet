@@ -90,11 +90,14 @@ func (q *Queries) CountPoolOrderAdmissions(ctx context.Context, arg CountPoolOrd
 }
 
 const endPoolClearanceRun = `-- name: EndPoolClearanceRun :exec
-UPDATE pool_orders SET clear_since = '', clear_observed_at = '' WHERE order_id = $1
+UPDATE pool_orders SET clear_since = '', clear_observed_at = ''
+ WHERE order_id = $1 AND state = 'placed'
 `
 
 // An answer that was not empty, or not an answer, or not taken where the run could stand:
-// the run is over.
+// the run is over. Only while the order waits on its node: a sealed order's run is what
+// its proof is read from, and an answer that arrives after the seal does not end it (a
+// contradiction still does, through ContradictPoolRelease).
 func (q *Queries) EndPoolClearanceRun(ctx context.Context, orderID string) error {
 	_, err := q.db.ExecContext(ctx, endPoolClearanceRun, orderID)
 	return err

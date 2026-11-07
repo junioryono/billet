@@ -209,6 +209,10 @@ func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releasep
 			return fmt.Errorf("alloc: take %s out of placement: %w", row.NodeName, err)
 		}
 
+		if err := retireReleasedNodeTx(ctx, q, row.NodeName, now); err != nil {
+			return err
+		}
+
 		if err := sealPoolOrderTx(ctx, q, order, row.NodeName, row.ReleaseRequestedAt, row.ReleaseReason,
 			ts(now)); err != nil {
 			return err
@@ -253,7 +257,7 @@ func releaseHoldingsTx(
 		holdings.Inventory = 0
 	case err != nil:
 		return releaseproof.Holdings{}, fmt.Errorf("alloc: read %s's release facts: %w", node, err)
-	case poolClearanceProved(row, &facts):
+	case poolClearanceProved(row, &facts) && !reportsCompute(&facts):
 		// PROVED BY THE NODE ITSELF, while out of placement and holding nothing: a run
 		// that reached proved began after every contradiction, which ends it, so the
 		// contradiction flag does not outweigh it (ContradictPoolRelease).
@@ -412,11 +416,48 @@ func releaseInventory(f *ledgerdb.ReadNodeReleaseFactsRow) int {
 		return -1
 	}
 
-	if f.NodeEpoch.Valid && f.NodeEpoch.Int64 == f.Epoch && f.Running.Valid && f.Running.Int64 > 0 {
+	if reportsCompute(f) {
 		return int(f.Running.Int64)
 	}
 
 	return 0
+}
+
+// reportsCompute says the node's last inventory, of its current registration, reported
+// compute.
+func reportsCompute(f *ledgerdb.ReadNodeReleaseFactsRow) bool {
+	return f.NodeEpoch.Valid && f.NodeEpoch.Int64 == f.Epoch && f.Running.Valid && f.Running.Int64 > 0
+}
+
+// retireReleasedNodeTx takes a sealed host's node out of the fleet, recorded as proved: the
+// seal is the proof that it runs nothing, and a node whose host the source takes back
+// never answers again, so a later `billet drain --wait` that still expected it would wait
+// for ever. A node a person already decommissioned on proof keeps that record, and a
+// node that never registered has no row to retire.
+func retireReleasedNodeTx(ctx context.Context, q state.WriteOps, node string, now time.Time) error {
+	facts, err := q.ReadNodeReleaseFacts(ctx, node)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("alloc: read %s's release facts: %w", node, err)
+	case facts.DecommissionProven == 1:
+		return nil
+	}
+
+	if err := q.DecommissionNode(ctx, ledgerdb.DecommissionNodeParams{
+		DecommissionedAt: ts(now), DecommissionProven: 1, DecommissionActor: "billet pool release",
+		Name: node,
+	}); err != nil {
+		return fmt.Errorf("alloc: take %s out of the fleet: %w", node, err)
+	}
+
+	if err := q.DeleteBarrierRun(ctx, node); err != nil {
+		return fmt.Errorf("alloc: clear the barrier run of node %s: %w", node, err)
+	}
+
+	return nil
 }
 
 func sealPoolOrderTx(ctx context.Context, q state.WriteOps, order, node, requested, reason, now string) error {
@@ -443,11 +484,45 @@ func sealPoolOrderTx(ctx context.Context, q state.WriteOps, order, node, request
 // after it, and a node arriving contradicts its release. Both are durable in the order's
 // release_contradicted, so a contradicted seal answers ErrPoolReleaseContradicted at every
 // ask until a person takes the host back and closes the order.
+//
+// IN A WRITE TRANSACTION, though it writes nothing: on PostgreSQL a read is READ COMMITTED,
+// so a contradiction could commit between reading the order's run and reading its node,
+// and every write holds the writer lock, so here none can.
 func (a *Allocator) PoolReleaseProof(ctx context.Context, order string) (releaseproof.Proof, error) {
 	var proof releaseproof.Proof
 
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		proof, err = poolReleaseProofTx(ctx, state.WriteQueries(tx), order)
+
+		return err
+	})
+
+	return proof, err
+}
+
+// PoolReleaseRefused reports whether a sealed order's release proof would be refused now,
+// for a person reading `billet pool`; the release itself asks PoolReleaseProof.
+func (a *Allocator) PoolReleaseRefused(ctx context.Context, order string) (bool, error) {
+	var refused bool
+
 	err := a.db.View(ctx, func(tx querier) error {
-		q := state.ReadQueries(tx)
+		_, err := poolReleaseProofTx(ctx, state.ReadQueries(tx), order)
+		refused = errors.Is(err, ErrPoolReleaseContradicted)
+		if refused {
+			return nil
+		}
+
+		return err
+	})
+
+	return refused, err
+}
+
+func poolReleaseProofTx(ctx context.Context, q state.ReadOps, order string) (releaseproof.Proof, error) {
+	var proof releaseproof.Proof
+
+	err := func() error {
 		row, err := q.ReadPoolOrder(ctx, order)
 
 		switch {
@@ -478,7 +553,7 @@ func (a *Allocator) PoolReleaseProof(ctx context.Context, order string) (release
 		proof, err = releaseproof.Sealed(row.HostID, sealed)
 
 		return err
-	})
+	}()
 
 	return proof, err
 }

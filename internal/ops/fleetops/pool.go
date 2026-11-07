@@ -57,11 +57,22 @@ func Pool(ctx context.Context, env cli.Env, args []string) error {
 
 		return nil
 	}
+	// WHAT THE RELEASE WOULD BE REFUSED ON NOW, never the contradiction flag alone: every
+	// registration sets the flag, and a host its node proved idle since is released
+	// though it reads set.
+	refused := map[string]bool{}
+	for i := range orders {
+		if o := &orders[i]; o.State == alloc.PoolSealed && o.ReleaseContradicted {
+			if refused[o.ID], err = a.PoolReleaseRefused(ctx, o.ID); err != nil {
+				return err
+			}
+		}
+	}
 
-	return printPoolOrders(env, orders)
+	return printPoolOrders(env, orders, refused)
 }
 
-func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
+func printPoolOrders(env cli.Env, orders []alloc.PoolOrder, refused map[string]bool) error {
 	w := tabwriter.NewWriter(env.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "ORDER\tARCH\tSOURCE\tSCOPE\tSHAPE\tLOCATION\tSTATE\tHOST\tNODE\tFIRST ATTEMPT\tREASON")
 	uncertain := 0
@@ -101,7 +112,7 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 					o.ClearanceSince.UTC().Format(time.RFC3339), o.ClearanceObserved.UTC().Format(time.RFC3339))
 			case o.State == alloc.PoolPlaced:
 				st = "draining"
-			case o.State == alloc.PoolSealed && o.ReleaseContradicted:
+			case refused[o.ID]:
 				// ITS NODE SAID IT IS BACK AFTER THE SEAL, so its source is never asked.
 				st = "sealed, contradicted since: take it back by hand and `billet pool close` it"
 			}
@@ -233,8 +244,8 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "Released %s from placement. The control plane asks its node what it runs; once nothing "+
 		"holds the host and the node has answered empty twice across five minutes, the pool seals it, revokes its "+
 		"node's certificates and asks its source to take it back, or `billet pool release %s` (no reason) seals it. "+
-		"A node that cannot answer is decommissioned on proof instead (`billet nodes decommission %s`); `billet pool` "+
-		"shows where it is.\n", order, order, alloc.PoolNodeName(order))
+		"Or drain the deployment and decommission it on proof (`billet nodes decommission %s`); a node that cannot "+
+		"answer proves neither. `billet pool` shows where it is.\n", order, order, alloc.PoolNodeName(order))
 
 	return nil
 }

@@ -102,6 +102,9 @@ func (p *Plane) BarrierLoop(ctx context.Context) {
 		return
 	}
 
+	// A POOL ROUND IS JOINED BEFORE THE LOOP RETURNS, as every loop's goroutines are.
+	defer p.poolRound.Wait()
+
 	// A STEERED PACE COMES BEFORE THE FIRST ROUND TOO, or the round the loop
 	// starts with could land among a harness's own.
 	wait := p.barrierPace
@@ -134,9 +137,16 @@ func (p *Plane) BarrierLoop(ctx context.Context) {
 func (p *Plane) barrierPass(ctx context.Context) time.Duration {
 	wait := p.deploymentBarrierPass(ctx)
 
-	if p.poolAskedAt.IsZero() || time.Since(p.poolAskedAt) >= barrierRound {
+	if (p.poolAskedAt.IsZero() || time.Since(p.poolAskedAt) >= barrierRound) && p.poolAsking.CompareAndSwap(false, true) {
 		p.poolAskedAt = time.Now()
-		p.askPoolClearances(ctx)
+		p.poolRound.Add(1)
+
+		go func() {
+			defer p.poolRound.Done()
+			defer p.poolAsking.Store(false)
+
+			p.askPoolClearances(ctx)
+		}()
 	}
 
 	return wait
@@ -257,9 +267,7 @@ func (p *Plane) barrierTargets() []*node {
 	out := make([]*node, 0, len(p.nodes))
 
 	for _, n := range p.nodes {
-		// A wire of zero is a registration this build did not negotiate — an
-		// in-process or test wiring — and is asked, because it is this build.
-		if n.wireVersion > 0 && n.wireVersion < nodeapi.VersionComputeBarrier {
+		if !answersInventory(n) {
 			continue
 		}
 
@@ -267,6 +275,13 @@ func (p *Plane) barrierTargets() []*node {
 	}
 
 	return out
+}
+
+// answersInventory says a host's wire has the inventory command. A wire of zero is a
+// registration this build did not negotiate — an in-process or test wiring — and is asked,
+// because it is this build.
+func answersInventory(n *node) bool {
+	return n.wireVersion == 0 || n.wireVersion >= nodeapi.VersionComputeBarrier
 }
 
 // askNode asks one host what it is running and records the answer against the
@@ -305,22 +320,50 @@ func (p *Plane) askPoolClearances(ctx context.Context) {
 		return
 	}
 
+	// AT MOST barrierFanOut AT ONCE, each on its own, so one node slow to answer holds up
+	// only its own release.
+	var (
+		wg   sync.WaitGroup
+		slot = make(chan struct{}, barrierFanOut)
+	)
+
 	for _, target := range targets {
 		n := p.poolClearanceNode(target.Node)
 		if n == nil {
 			continue
 		}
 
-		fence, empty, asked := p.inventoryOf(ctx, n, poolClearanceID(target.Order))
-		if !asked {
-			continue
-		}
+		wg.Add(1)
 
-		obs := alloc.PoolClearanceObservation{Order: target.Order, Node: target.Node, Fence: fence, Empty: empty}
-		if err := p.barriers.RecordPoolClearance(ctx, obs); err != nil && ctx.Err() == nil {
-			p.log.Warn("could not record what a pool host leaving said it is running",
-				"order", target.Order, "node", target.Node, "error", err)
-		}
+		go func() {
+			defer wg.Done()
+
+			select {
+			case slot <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+
+			defer func() { <-slot }()
+
+			p.askPoolClearance(ctx, n, target)
+		}()
+	}
+
+	wg.Wait()
+}
+
+// askPoolClearance asks one release's node what it runs and records the answer.
+func (p *Plane) askPoolClearance(ctx context.Context, n *node, target alloc.PoolClearanceTarget) {
+	fence, empty, asked := p.inventoryOf(ctx, n, poolClearanceID(target.Order))
+	if !asked {
+		return
+	}
+
+	obs := alloc.PoolClearanceObservation{Order: target.Order, Node: target.Node, Fence: fence, Empty: empty}
+	if err := p.barriers.RecordPoolClearance(ctx, obs); err != nil && ctx.Err() == nil {
+		p.log.Warn("could not record what a pool host leaving said it is running",
+			"order", target.Order, "node", target.Node, "error", err)
 	}
 }
 
@@ -336,7 +379,7 @@ func (p *Plane) poolClearanceNode(name string) *node {
 	p.expireStaleLocked()
 
 	n, ok := p.nodes[name]
-	if !ok || (n.wireVersion > 0 && n.wireVersion < nodeapi.VersionComputeBarrier) {
+	if !ok || !answersInventory(n) {
 		return nil
 	}
 
