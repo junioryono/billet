@@ -64,6 +64,9 @@ type PoolOrder struct {
 	// the clearance run its release waits on, zero with no run (migration 80).
 	ClearanceSince    time.Time
 	ClearanceObserved time.Time
+	// ClearanceGeneration counts the release's contradictions; an answer is recorded only
+	// under the one read before it was asked.
+	ClearanceGeneration int64
 }
 
 // RecordPoolOrder commits an order before its source is asked, so an order whose
@@ -148,6 +151,7 @@ func poolOrderFrom(r *ledgerdb.PoolOrder) (PoolOrder, error) {
 		ReleaseRequested: requested, ReleaseReason: r.ReleaseReason,
 		ReleaseContradicted: r.ReleaseContradicted == 1,
 		ClearanceSince:      clearSince, ClearanceObserved: clearObserved,
+		ClearanceGeneration: r.ClearGeneration,
 	}, nil
 }
 

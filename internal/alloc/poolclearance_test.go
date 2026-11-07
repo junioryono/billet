@@ -27,6 +27,7 @@ func answerClearanceAt(t *testing.T, a *Allocator, node string, fence NodeFence,
 	}
 	if err := a.RecordPoolClearance(t.Context(), PoolClearanceObservation{
 		Order: "pa", Node: node, Fence: fence, Empty: empty, AskedAt: a.now(),
+		Generation: readOrder(t, a, "pa").ClearanceGeneration,
 	}); err != nil {
 		t.Fatalf("record a clearance answer: %v", err)
 	}
@@ -63,7 +64,7 @@ func TestAPoolHostDrainingAloneIsSealedOnTwoAnswers(t *testing.T) {
 	node := drainingPoolNode(t, a)
 
 	if targets, err := a.PoolClearanceTargets(ctx); err != nil ||
-		!slices.Equal(targets, []PoolClearanceTarget{{Order: "pa", Node: node}}) {
+		!slices.Equal(targets, []PoolClearanceTarget{{Order: "pa", Node: node, Generation: 1}}) {
 		t.Fatalf("the nodes releases wait on: %v, %v", targets, err)
 	}
 
@@ -308,8 +309,9 @@ func TestAContradictionEndsTheClearanceRun(t *testing.T) {
 				t.Fatalf("sealing on a run after the contradiction: %v", err)
 			}
 			contradict(t, a, node)
-			if _, err := a.PoolReleaseProof(ctx, "pa"); !errors.Is(err, ErrPoolReleaseContradicted) {
-				t.Fatalf("the proof after a contradiction since the seal answered %v", err)
+			_, err := a.PoolReleaseProof(ctx, "pa")
+			if want := name != "the node arriving to register"; errors.Is(err, ErrPoolReleaseContradicted) != want {
+				t.Fatalf("the proof after %s since the seal answered %v; refused should be %v", name, err, want)
 			}
 		})
 	}
@@ -379,6 +381,7 @@ func TestAnAnswerRecordedLateSpansOnlyWhenItWasAsked(t *testing.T) {
 	now = start.Add(computeAbsenceGrace + time.Minute)
 	if err := a.RecordPoolClearance(ctx, PoolClearanceObservation{
 		Order: "pa", Node: node, Fence: fenceOf(t, a, node), Empty: true, AskedAt: start.Add(30 * time.Second),
+		Generation: readOrder(t, a, "pa").ClearanceGeneration,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -388,6 +391,68 @@ func TestAnAnswerRecordedLateSpansOnlyWhenItWasAsked(t *testing.T) {
 	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
 		t.Fatalf("sealing on an answer asked after the grace: %v", err)
 	}
+}
+
+// A FIRST ANSWER DELAYED IN THE NODE'S QUEUE STARTS THE RUN WHEN IT IS RECORDED: asked at
+// the start and recorded ten seconds before the grace, it is no evidence about the node
+// before then, so an answer asked at the grace spans ten seconds, not five minutes.
+func TestADelayedFirstAnswerStartsTheRunWhenRecorded(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := drainingPoolNode(t, a)
+	start := now
+
+	now = start.Add(computeAbsenceGrace - 10*time.Second)
+	if err := a.RecordPoolClearance(ctx, PoolClearanceObservation{
+		Order: "pa", Node: node, Fence: fenceOf(t, a, node), Empty: true, AskedAt: start,
+		Generation: readOrder(t, a, "pa").ClearanceGeneration,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now = start.Add(computeAbsenceGrace)
+	answerClearance(t, a, node, true)
+	waitsUnsealed(t, a, "0a", "a first answer asked at the start and recorded ten seconds before the grace")
+
+	now = now.Add(computeAbsenceGrace)
+	answerClearance(t, a, node, true)
+	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+		t.Fatalf("sealing on an answer asked a grace after the first was recorded: %v", err)
+	}
+}
+
+// AN ANSWER IN FLIGHT ACROSS A CONTRADICTION RESUMES NOTHING: asked before compute was
+// listed and recorded after, it is refused under the generation it was asked under, so
+// the run after the contradiction starts with the first answer asked after it.
+func TestAnAnswerInFlightAcrossAContradictionResumesNothing(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	node := drainingPoolNode(t, a)
+
+	asked := PoolClearanceObservation{
+		Order: "pa", Node: node, Fence: fenceOf(t, a, node), Empty: true, AskedAt: now,
+		Generation: readOrder(t, a, "pa").ClearanceGeneration,
+	}
+	if _, err := a.Reconcile(ctx, node, []string{"some-instance"}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(computeAbsenceGrace / 2)
+	if _, err := a.ResolveQuarantineFor(ctx, node, nil, asked.Fence.Epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RecordPoolClearance(ctx, asked); err != nil {
+		t.Fatal(err)
+	}
+	if o := readOrder(t, a, "pa"); !o.ClearanceSince.IsZero() {
+		t.Fatalf("an answer asked before the contradiction began a run: %+v", o)
+	}
+
+	now = now.Add(computeAbsenceGrace / 2)
+	answerClearance(t, a, node, true)
+	waitsUnsealed(t, a, "0a", "one answer after the contradiction")
 }
 
 // AN ANSWER THAT DOES NOT SAY WHEN IT WAS ASKED IS NO ANSWER, and ends the run.
@@ -402,6 +467,7 @@ func TestAnAnswerWithNoAskedTimeEndsTheRun(t *testing.T) {
 	}
 	if err := a.RecordPoolClearance(t.Context(), PoolClearanceObservation{
 		Order: "pa", Node: node, Fence: fenceOf(t, a, node), Empty: true,
+		Generation: readOrder(t, a, "pa").ClearanceGeneration,
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -72,7 +72,7 @@ func TestAPoolReleaseAsksItsNodeWithoutTheDeploymentsBarrier(t *testing.T) {
 	store := newBarrierStore()
 	store.hasBarrier = false
 	store.poolTargets = []alloc.PoolClearanceTarget{
-		{Order: "o1", Node: barrierHostName}, {Order: "o2", Node: "not-connected"},
+		{Order: "o1", Node: barrierHostName, Generation: 4}, {Order: "o2", Node: "not-connected"},
 	}
 	p, reg := barrierPlane(t, store)
 
@@ -85,7 +85,7 @@ func TestAPoolReleaseAsksItsNodeWithoutTheDeploymentsBarrier(t *testing.T) {
 		t.Fatalf("want one clearance answer recorded, got %+v", observed)
 	}
 	if obs := observed[0]; obs.Order != "o1" || obs.Node != barrierHostName || !obs.Empty || obs.Running ||
-		obs.Fence.Epoch != reg.current() || obs.Fence.Dispatch != 9 {
+		obs.Fence.Epoch != reg.current() || obs.Fence.Dispatch != 9 || obs.Generation != 4 || obs.AskedAt.IsZero() {
 		t.Fatalf("the answer was recorded as %+v, want o1's empty answer under the fence read before it", obs)
 	}
 	if got := store.observations(); len(got) != 0 {

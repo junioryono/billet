@@ -25,3 +25,7 @@ ALTER TABLE pool_orders ADD COLUMN clear_since text NOT NULL DEFAULT '';
 -- +billet:statement
 ALTER TABLE pool_orders ADD COLUMN clear_observed_at text NOT NULL DEFAULT '';
 -- +billet:end
+
+-- +billet:statement
+ALTER TABLE pool_orders ADD COLUMN clear_generation bigint NOT NULL DEFAULT 0 CHECK (clear_generation >= 0);
+-- +billet:end

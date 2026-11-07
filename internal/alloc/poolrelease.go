@@ -295,10 +295,11 @@ func poolClearanceProved(row *ledgerdb.PoolOrder, facts *ledgerdb.ReadNodeReleas
 }
 
 // PoolClearanceTarget is a node the control plane asks what it runs, for the release of
-// the order it joined from.
+// the order it joined from, and the order's contradiction generation when it was listed.
 type PoolClearanceTarget struct {
-	Order string
-	Node  string
+	Order      string
+	Node       string
+	Generation int64
 }
 
 // PoolClearanceTargets lists the nodes a release waits on the clearance of: each order
@@ -315,7 +316,7 @@ func (a *Allocator) PoolClearanceTargets(ctx context.Context) ([]PoolClearanceTa
 
 		out = make([]PoolClearanceTarget, 0, len(rows))
 		for _, r := range rows {
-			out = append(out, PoolClearanceTarget{Order: r.OrderID, Node: r.NodeName})
+			out = append(out, PoolClearanceTarget{Order: r.OrderID, Node: r.NodeName, Generation: r.ClearGeneration})
 		}
 
 		return nil
@@ -337,10 +338,15 @@ type PoolClearanceObservation struct {
 	// but a contradiction of the release, which is recorded as one whatever the order
 	// has become since it was asked.
 	Running bool
-	// AskedAt is when the question was put, read before it was dispatched. The run is
-	// measured between the times its answers were ASKED, never when they were recorded,
-	// so an early answer recorded late cannot span the grace; zero is no answer.
-	AskedAt time.Time
+	// AskedAt is when the question was put, read before it was dispatched, and Generation
+	// the order's contradiction generation read then. A run is measured from when its
+	// first answer was RECORDED (the node listed nothing no later) to when its latest was
+	// ASKED (the node listed nothing no earlier), so neither a first answer delayed in the
+	// node's queue nor a later one delayed in the ledger can span the grace; zero is no
+	// answer. An answer is recorded only under the generation it was asked under, so one
+	// in flight across a contradiction never resumes a run.
+	AskedAt    time.Time
+	Generation int64
 }
 
 // poolReleaseActor is who a seal records as decommissioning its node, which a
@@ -406,12 +412,13 @@ func (a *Allocator) RecordPoolClearance(ctx context.Context, obs PoolClearanceOb
 		case err != nil:
 			return fmt.Errorf("alloc: read the fence of node %s: %w", obs.Node, err)
 		case fence.Epoch != obs.Fence.Epoch || fence.DispatchGeneration != obs.Fence.Dispatch || !obs.Empty ||
-			obs.AskedAt.IsZero():
+			obs.AskedAt.IsZero() || row.ClearGeneration != obs.Generation:
 			return end()
 		}
 
 		if _, err := q.RecordPoolClearanceRun(ctx, ledgerdb.RecordPoolClearanceRunParams{
-			Epoch: fence.Epoch, Dispatch: fence.DispatchGeneration, Now: ts(obs.AskedAt.UTC()),
+			Epoch: fence.Epoch, Dispatch: fence.DispatchGeneration, Recorded: ts(a.now().UTC()),
+			Asked: ts(obs.AskedAt.UTC()), Generation: obs.Generation,
 			OrderID: obs.Order, Node: obs.Node,
 		}); err != nil {
 			return fmt.Errorf("alloc: record pool order %s's clearance: %w", obs.Order, err)

@@ -429,7 +429,8 @@ func (p *Plane) askPoolClearance(ctx context.Context, n *node, target alloc.Pool
 
 	obs := alloc.PoolClearanceObservation{
 		Order: target.Order, Node: target.Node, Fence: fence,
-		Empty: listed == listedNothing, Running: listed == listedCompute, AskedAt: askedAt,
+		Empty: listed == listedNothing, Running: listed == listedCompute,
+		AskedAt: askedAt, Generation: target.Generation,
 	}
 	if err := p.barriers.RecordPoolClearance(ctx, obs); err != nil && ctx.Err() == nil {
 		p.log.Warn("could not record what a pool host leaving said it is running",

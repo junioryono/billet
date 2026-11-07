@@ -201,6 +201,7 @@ type PoolOrder struct {
 	ClearDispatch       int64
 	ClearSince          string
 	ClearObservedAt     string
+	ClearGeneration     int64
 }
 
 type PoolRunner struct {
