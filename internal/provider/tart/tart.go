@@ -1638,15 +1638,20 @@ func (p *Provider) removeAbsentVMRunLog(ctx context.Context, name string) {
 		p.beforeRunLogLock()
 	}
 
-	// A CANCELLED CONTEXT IS ONE ATTEMPT: lockStore tries the flock before it looks at
-	// any deadline.
+	// A CANCELLED CONTEXT ENDS THE WAIT AT ONCE: lockStore tries the flock before it looks
+	// at any deadline, and then sees this one already done (a retry the scheduler lets
+	// in first is a moment, never the lock's window).
 	once, cancel := context.WithCancel(ctx)
 	cancel()
 
 	unlock, err := p.lockStore(once, "remove the run log of "+name)
 	if err != nil {
-		p.log.Warn("left a deleted VM's run log, since the store lock was not free",
-			"vm", name, "error", err)
+		reason := "the store lock could not be taken"
+		if errors.Is(err, errStoreLockBusy) {
+			reason = "another billet held the store lock"
+		}
+
+		p.log.Warn("left a deleted VM's run log, since "+reason, "vm", name, "error", err)
 
 		return
 	}
