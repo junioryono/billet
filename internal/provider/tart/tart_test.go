@@ -1925,6 +1925,59 @@ func TestADestroyOfAnAbsentVMTakesItsLeftoverRunLog(t *testing.T) {
 	}
 }
 
+// AN ABSENT VM'S LOG IS REMOVED ONLY UNDER THE STORE LOCK, AND ONLY WHILE IT IS STILL
+// ABSENT, because another billet sharing the store publishes a VM under that lock and
+// then opens its log: removing it on this process's own word would take a live run's.
+func TestAnAbsentVMsLogWaitsForTheStoreAndSparesAVMThatAppeared(t *testing.T) {
+	s := newStub(t)
+	p := newProvider(t, s)
+	p.storeLockWindow = 50 * time.Millisecond
+
+	seed := func(name string) string {
+		t.Helper()
+
+		path := p.runLogPath(name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+
+		if err := os.WriteFile(path, []byte("a run\n"), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		return path
+	}
+
+	held := seed("billet-gone")
+	other := newLockProvider(t, s.home)
+
+	unlock, err := other.lockStore(t.Context(), "stand in for another billet")
+	if err != nil {
+		t.Fatalf("could not stage a competing holder: %v", err)
+	}
+
+	got, err := p.Destroy(t.Context(), "billet-gone")
+	unlock()
+
+	if err != nil || got != provider.TeardownStopped {
+		t.Fatalf("Destroy of an absent VM = %v, %v; want stopped, since the VM is gone", got, err)
+	}
+
+	if _, err := os.Stat(held); err != nil {
+		t.Errorf("the log was removed although another billet held the store: %v", err)
+	}
+
+	// UNDER THE LOCK THE VM IS THERE AGAIN, so its log is a live run's.
+	s.vm(t, "billet-back", "running", testOwner)
+	back := seed("billet-back")
+
+	p.removeAbsentVMRunLog(t.Context(), "billet-back")
+
+	if _, err := os.Stat(back); err != nil {
+		t.Errorf("the log of a VM present under the store lock was removed: %v", err)
+	}
+}
+
 // A probe or a base removed by name goes with its run log too, since a probe's name is
 // its image's and every verification of that image runs one.
 func TestADeletedProbeTakesItsRunLog(t *testing.T) {

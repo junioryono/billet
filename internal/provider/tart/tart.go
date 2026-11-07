@@ -1615,6 +1615,31 @@ func (p *Provider) removeRunLog(name string) {
 	}
 }
 
+// removeAbsentVMRunLog removes the run log of a VM found absent, under the store lock
+// and only while the VM is still absent there.
+//
+// THE STORE LOCK, NOT THE NAME'S MUTEX: that mutex is this process's, and another billet
+// sharing the store publishes a VM under the store lock, then opens its log. So the
+// absence is asked again under the lock, and a VM that appeared keeps its log. A lock
+// that cannot be taken leaves the log; the VM is gone either way.
+func (p *Provider) removeAbsentVMRunLog(ctx context.Context, name string) {
+	unlock, err := p.lockStore(ctx, "remove the run log of "+name)
+	if err != nil {
+		p.log.Warn("left a deleted VM's run log, since the store lock could not be taken",
+			"vm", name, "error", err)
+
+		return
+	}
+
+	defer unlock()
+
+	if _, err := os.Stat(p.vmDir(name)); !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+
+	p.removeRunLog(name)
+}
+
 // launchStatus reports what BILLET's launcher recorded about this launch, in
 // billet's own words.
 //
@@ -2057,9 +2082,8 @@ func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, e
 		}
 
 		// A DELETE INTERRUPTED BEFORE ITS LOG WENT, or a VM an operator removed, leaves
-		// the log nothing else would find: the name is this deployment's lease and is
-		// never reused.
-		p.removeRunLog(id)
+		// the log nothing else would find.
+		p.removeAbsentVMRunLog(ctx, id)
 
 		return provider.TeardownStopped, nil
 	} else if err != nil {
