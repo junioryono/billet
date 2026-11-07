@@ -1815,6 +1815,94 @@ func TestAVMThatNeverStartsReportsWhy(t *testing.T) {
 	}
 }
 
+// THE RUN LOG IS NEVER WRITTEN INTO THE VM'S BUNDLE. Written there, a macOS guest on an
+// ASIF disk failed to start under billet most of the time (tart 2.41.1, macOS 27.2,
+// 2026-11-07), so where it lives is the fix, and so is that it starts empty for a name
+// used before and goes when its VM does.
+func TestTheRunLogLivesOutsideTheBundleStartsEmptyAndGoesWithItsVM(t *testing.T) {
+	s := newStub(t)
+	p := newProvider(t, s)
+
+	const name = "billet-lease1"
+
+	logPath := p.runLogPath(name)
+	if rel, err := filepath.Rel(p.vmDir(name), logPath); err != nil || !strings.HasPrefix(rel, "..") {
+		t.Fatalf("the run log %s is inside the VM's bundle %s", logPath, p.vmDir(name))
+	}
+
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	if err := os.WriteFile(logPath, []byte("an earlier run's reason\n"), 0o600); err != nil {
+		t.Fatalf("seed an earlier run's log: %v", err)
+	}
+
+	if _, err := p.Launch(t.Context(), validSpec(name)); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("the started VM has no run log at %s: %v", logPath, err)
+	}
+
+	if strings.Contains(string(got), "an earlier run's reason") {
+		t.Errorf("the run log kept an earlier run's output: %q", got)
+	}
+
+	entries, err := os.ReadDir(p.vmDir(name))
+	if err != nil {
+		t.Fatalf("read the bundle: %v", err)
+	}
+
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".log") {
+			t.Errorf("the VM's bundle holds %s; nothing billet writes during a run belongs there", e.Name())
+		}
+	}
+
+	if _, err := p.Destroy(t.Context(), name); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the run log outlived its VM: %v", err)
+	}
+}
+
+// A probe or a base removed by name goes with its run log too, since a probe's name is
+// its image's and every verification of that image runs one.
+func TestADeletedProbeTakesItsRunLog(t *testing.T) {
+	s := newStub(t)
+	p := newProvider(t, s)
+
+	const name = "billetprobe-test"
+
+	s.vm(t, name, "stopped", testOwner)
+
+	logPath := p.runLogPath(name)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	if err := os.WriteFile(logPath, []byte("a probe's run\n"), 0o600); err != nil {
+		t.Fatalf("seed the probe's log: %v", err)
+	}
+
+	if err := p.deleteOwnedVM(t.Context(), name); err != nil {
+		t.Fatalf("deleteOwnedVM: %v", err)
+	}
+
+	if s.dirExists(name) {
+		t.Fatal("the probe survived its delete, so this says nothing about its log")
+	}
+
+	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the probe's run log outlived it: %v", err)
+	}
+}
+
 // A pid proves a NUMBER is in use, not that it is still this runner. Guest
 // kernels reuse pids, so without a birth token a recycled number reports a
 // healthy runner where there is none — and billet would adopt a VM whose runner

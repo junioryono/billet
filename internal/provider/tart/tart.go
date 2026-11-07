@@ -12,7 +12,8 @@
 // rather than its documentation (the firecracker backend's history is why):
 //
 //   - `tart run` has no daemon mode: the process IS the VM. It is therefore
-//     started detached, in its own session with its output in the VM directory,
+//     started detached, in its own session with its output under billet's own
+//     directory (never the VM's bundle; see runLogDir),
 //     so a billet restart or upgrade does not kill every guest on the host —
 //     billet's promise is that running jobs keep running — MEASURED against a
 //     real GitHub Actions job on this backend, both ways: a node SIGKILLed
@@ -86,9 +87,15 @@ type Instance = provider.Instance
 // live jobs. See state.DeploymentID.
 const ownerMarker = "billet-owner"
 
-// runLog is where the detached `tart run` process writes its output, inside the
-// VM directory so it is removed with the VM and cannot collide across guests.
-const runLog = "billet-run.log"
+// runLogDir holds what each detached `tart run` writes, one file a VM, under billet's
+// own directory in tart's store.
+//
+// NEVER INSIDE THE VM'S BUNDLE. It was, and a macOS guest on an ASIF disk then failed
+// to start under billet most of the time with Virtualization's "Internal Virtualization
+// error" while every hand launch booted it (tart 2.41.1, macOS 27.2, 2026-11-07): the
+// full billet start failed 3 of 4, and with only the log moved out of the bundle it
+// booted 3 of 3. A raw-disk guest was never affected.
+const runLogDir = "run-logs"
 
 // stagingSuffix marks a clone that has not yet been renamed to its lease name.
 // A staging name never equals a lease's instance name, so a crash between clone
@@ -1087,9 +1094,16 @@ func (p *Provider) startDetached(name string, netFlags ...string) error {
 // startDetachedHolding is startDetached passing open files to the VM's process, which
 // inherits them, and so holds any lock on them for as long as it or a child of it lives.
 func (p *Provider) startDetachedHolding(name string, held []*os.File, netFlags ...string) error {
-	logPath := filepath.Join(p.vmDir(name), runLog)
+	logPath := p.runLogPath(name)
 
-	out, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return fmt.Errorf("prepare the run log directory: %w", err)
+	}
+
+	// TRUNCATED, because a probe's name is reused by every verification of its image,
+	// and the tail of an earlier run would read as this one's reason. O_NOFOLLOW: the
+	// name must be the log itself, not a link to a file the node would then write.
+	out, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return fmt.Errorf("open run log: %w", err)
 	}
@@ -1570,7 +1584,7 @@ func (p *Provider) proveStarted(ctx context.Context, name string) error {
 // runLogTail returns the last of what the detached `tart run` wrote, which is
 // where the reason a VM refused to start actually appears.
 func (p *Provider) runLogTail(name string) string {
-	b, err := os.ReadFile(filepath.Join(p.vmDir(name), runLog))
+	b, err := os.ReadFile(p.runLogPath(name))
 	if err != nil {
 		return "no reason recorded (" + err.Error() + ")"
 	}
@@ -1586,6 +1600,19 @@ func (p *Provider) runLogTail(name string) string {
 	}
 
 	return tail
+}
+
+// runLogPath is where the detached `tart run` of a VM writes.
+func (p *Provider) runLogPath(name string) string {
+	return filepath.Join(p.home, storeStateDir, runLogDir, name+".log")
+}
+
+// removeRunLog drops a deleted VM's run log. The VM is gone either way, so a log that
+// cannot be removed is reported and fails nothing.
+func (p *Provider) removeRunLog(name string) {
+	if err := os.Remove(p.runLogPath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		p.log.Warn("could not remove a deleted VM's run log", "vm", name, "error", err)
+	}
 }
 
 // launchStatus reports what BILLET's launcher recorded about this launch, in
