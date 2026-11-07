@@ -90,6 +90,30 @@ tiers:
 
 Everything above is what that tier gets with no `cache` block at all. [Configuration](../reference/configuration.md) has every field.
 
+## Registry mirrors
+
+Without a mirror, every guest pulls from the registry over the site's public address. Docker Hub limits an unauthenticated address, per IPv4 address or IPv6 /64. Its documentation said 100 pulls in 6 hours when read on 2026-11-04, and a multi-architecture image counts one pull for each architecture ([Docker's documentation](https://docs.docker.com/docker-hub/usage/pulls/)). Its own answer to an EC2 address on 2026-11-05 was `ratelimit-limit: 100;w=3600`, which is 100 an hour, and reading one image's index and one platform's manifest used two of them. A layer is not counted. GitHub-hosted runners are exempt, and self-hosted runners are not, so a busy site behind one NAT address starts failing pulls. The Docker image store absorbs repeat pulls of images already in its generation, but not the first pull of a new tag, or a pull from a service container built at run time.
+
+**What runs.** The host role runs three [Distribution](https://github.com/distribution/distribution) pull-through mirrors on every Firecracker host, one per upstream because a proxy accepts one upstream, and writes `node.registry_mirrors` into that node's configuration:
+
+| Upstream | Unit | Port on the first guest bridge |
+|---|---|---|
+| Docker Hub | `billet-registry@docker-io` | 7740 |
+| GHCR | `billet-registry@ghcr-io` | 7741 |
+| Quay | `billet-registry@quay-io` | 7742 |
+
+They serve public content with no upstream credential, to every guest on the host, trusted or not: a credential there would hand what it can read to every job. A proxy refuses a push, so one job cannot put anything in front of another. Each host runs its own, because a guest may not reach a private address across the site, so a site of several hosts pulls a new image once per host.
+
+**What reaches them.** BuildKit under `setup-docker-builder` uses all three. Docker Engine has a mirror setting for Docker Hub alone, so `docker pull`, a service container and a plain `docker build` use that one, and their GHCR and Quay pulls go to the registry. A `docker-container` builder a workflow creates itself runs on its own configuration and uses none. A private image is not served: the mirror holds no credential, and the client goes on to the registry with its own.
+
+**How a guest trusts them.** The role makes an authority on each host, under `/etc/billet-registry`, and a certificate naming every bridge's address. The authority's key stays root's on that host. The node reads the authority's certificate at each launch and hands it to the guest, which trusts it for the mirrors alone (Docker's `certs.d`, BuildKit's `ca`), never in its system store. **This takes a guest image that knows the `registry-mirrors-ca-pem` metadata key.** An older image cannot verify the mirror and pulls from the registry, as if there were none: measured on 2026-11-04, dockerd under the guest's own configuration and BuildKit each moved on to the registry in about a second.
+
+**Their disk.** Each mirror keeps what it pulled under `/var/lib/billet-registry` for `billet_registry_mirror_ttl` after pulling it, 168 hours unless changed. Distribution has no size limit, and any job on the host can ask for any public image, so `billet-registry-guard.timer` asks every ten seconds how full that filesystem is, and at `billet_registry_mirror_disk_limit_percent` (85) it stops the mirrors, discards everything they pulled and starts them again, which it says in its journal. It leaves them alone when they hold less than `billet_registry_mirror_discard_floor_mb` (1024), because then something else is filling the disk and a discard would free nothing. A controller retirement renders each node's file as an ordinary converge would, mirrors included, on that node's own evidence that the role installed them, which is the authority at `/etc/billet-registry/ca.pem`. A node whose file names the role's mirrors with that file gone is refused, and an ordinary converge of it settles it. The next pull comes from the registry and fills them again. This is a watch and not a quota: what a host can pull in ten seconds has to fit in what is left past the limit. A host whose disk is small beside its line, or that hits the guard often, shortens the time, lowers the limit or gives that directory a disk of its own.
+
+**How to tell the limit was hit.** A pull fails with `toomanyrequests` and `You have reached your pull rate limit`, in the job's log and in the Docker Engine's, and a mirror logs the same `429` in `journalctl -u billet-registry@docker-io` when it is the one that met it. What an address has left is in the `ratelimit-remaining` header of a `HEAD` of a manifest, which does not count as a pull; Docker's page above has the two commands. A mirror's own pulls count too, once per image rather than once per job. `billet check` says whether each mirror answers, or `NO DOCKER HUB MIRROR` when the site has none.
+
+**How to turn it off.** Set `billet_registry_mirrors: false` and converge. The role stops and removes the mirrors, their authority and the firewall ports, and takes `node.registry_mirrors` out of the node's configuration, which drains the node once, as adding it did. What they pulled stays, unless `billet_registry_mirrors_purge` is true. To use your own mirrors, name them in `node.registry_mirrors` in the inventory, with `node.registry_mirrors_ca` if no public authority signs them, and the role runs none.
+
 ## Seeing and stopping a cache
 
 ```bash

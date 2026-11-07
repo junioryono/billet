@@ -1003,6 +1003,9 @@ func checkSpec(spec provider.Spec) error {
 				spec.Name, errors.Join(errs...))
 		}
 	}
+	if strings.ContainsRune(spec.RegistryMirrorsCA, 0) {
+		return fmt.Errorf("firecracker: %s has a registry mirror authority containing a NUL", spec.Name)
+	}
 
 	return nil
 }
@@ -1220,6 +1223,13 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 			return nil, fmt.Errorf("firecracker: encode registry mirrors for %s: %w", spec.Name, err)
 		}
 		billet["registry-mirrors"] = string(mirrors)
+		// AN OPTIONAL KEY, so not a contract change: an agent that predates it
+		// reads no such key, cannot verify a mirror this authority signed, and
+		// pulls from the registry instead (measured, Docker 29.9 and BuildKit,
+		// 2026-11-04: both go on to the upstream on the failed handshake).
+		if spec.RegistryMirrorsCA != "" {
+			billet["registry-mirrors-ca-pem"] = spec.RegistryMirrorsCA
+		}
 	}
 
 	return result, nil

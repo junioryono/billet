@@ -375,7 +375,8 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		runnerOpts = append(runnerOpts, node.WithCacheService(cacheService))
 	}
 	if cfg.Node.RegistryMirrors != nil {
-		runnerOpts = append(runnerOpts, node.WithRegistryMirrors(*cfg.Node.RegistryMirrors))
+		runnerOpts = append(runnerOpts, node.WithRegistryMirrors(*cfg.Node.RegistryMirrors,
+			func() (string, error) { return NodeRegistryMirrorsCA(cfg.Node) }))
 	}
 
 	// AND THE ABILITY TO REPLACE ITSELF, which is what makes a rollout reach a

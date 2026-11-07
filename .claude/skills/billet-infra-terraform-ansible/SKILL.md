@@ -35,6 +35,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A node is drained for a configuration change only when billet says the node reads it (`billet node config-change`, #183).**
 - **Every node stop the role performs is proved by the node's ending, and every node start is admitted.**
 - **The role's variables that must be supplied, never guessed.**
+- **The role runs the site's registry mirrors on every Firecracker host, and names them in the node's configuration (#543).**
 - **The host role migrates a node's endpoint through billet's own commands, and infers nothing from the configurations.**
 - **The scenario tests are scripts/gates/scenario.sh NAME, each one converging the role in a specific state.**
 - **The collection's `galaxy.yml` carries the release version.**

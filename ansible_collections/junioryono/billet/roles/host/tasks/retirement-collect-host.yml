@@ -111,11 +111,44 @@
           - billet_retirement_collect_vars.billet_config.node | default(none) is mapping
         fail_msg: "Retirement collection: node {{ billet_retirement_collect_host }} has no complete desired rendering."
 
+    # THE MIRRORS AN ORDINARY CONVERGE GAVE THAT NODE ARE IN ITS FILE, so the rendering
+    # names them as that converge did (role_registry_mirrors), on that host's evidence.
+    - name: Inspect this node's registry mirror authority
+      ansible.builtin.stat:
+        path: "{{ billet_registry_mirror_dir }}/ca.pem"
+      register: billet_retirement_collect_mirror_authority
+      check_mode: false
+      failed_when: false
+      ignore_unreachable: true
+      delegate_to: "{{ billet_retirement_collect_host }}"
+      become: "{{ not billet_retirement_collect_darwin | bool }}"
+
+    - name: Require an answered registry mirror authority observation
+      ansible.builtin.assert:
+        that:
+          - not billet_retirement_collect_mirror_authority.unreachable | default(false) | bool
+          - not billet_retirement_collect_mirror_authority.failed | default(false) | bool
+          - billet_retirement_collect_mirror_authority.stat.exists | default(none) is boolean
+        fail_msg: "Retirement collection: {{ billet_retirement_collect_host }} could not say whether it holds a registry mirror authority."
+
+    # WHAT THAT NODE'S INVENTORY LEAVES UNSAID IS THE ROLE'S DEFAULT, never this host's:
+    # a retiring host that turned its own mirrors off, or renumbered its own bridges,
+    # says nothing about another node.
+    - name: Read the role's own defaults for what a node's inventory leaves unsaid
+      ansible.builtin.set_fact:
+        billet_retirement_collect_role_defaults: "{{ lookup('ansible.builtin.file', role_path ~ '/defaults/main.yml') | from_yaml }}"
+
     - name: Render this node in its own inventory context
       ansible.builtin.set_fact:
         billet_retirement_collect_rendering: >-
           {{ lookup('ansible.builtin.template', 'billet.yaml.j2',
-                    template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config}) }}
+                    template_vars={'billet_config_document': billet_retirement_collect_vars.billet_config
+                      | junioryono.billet.role_registry_mirrors(
+                          billet_retirement_collect_vars.billet_registry_mirrors
+                            | default(billet_retirement_collect_role_defaults.billet_registry_mirrors) | bool,
+                          billet_retirement_collect_vars.billet_networks
+                            | default(billet_retirement_collect_role_defaults.billet_networks),
+                          billet_registry_mirror_instances, billet_retirement_collect_mirror_authority.stat.exists)}) }}
       no_log: true
 
     - name: Ask this node for its desired endpoint
