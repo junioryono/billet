@@ -336,6 +336,14 @@ type Provider struct {
 	// nothing sets it outside tests, which publish a VM there to prove the absence is
 	// asked again under the lock.
 	beforeRunLogLock func()
+	// startGate keeps this provider's own `tart list` out of the window between a VM's
+	// `tart run` and Virtualization.framework holding its disk: each start holds it
+	// shared, and a listing exclusively. See bootVM.
+	startGate sync.RWMutex
+	// diskAttached answers whether a Virtualization.framework process holds the VM's
+	// disk open. Nil is the real answer, through lsof and processPath; a test whose
+	// stub runs no VM stands in for it.
+	diskAttached func(ctx context.Context, name string) (bool, error)
 	// installer installs the records. Its zero value is the real one, and a test fails a
 	// step of it.
 	installer durablefile.Installer
@@ -836,13 +844,17 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
 	}
 
-	if err := p.startDetachedHolding(spec.Name, claim.files, netFlags...); err != nil {
-		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
-	}
+	// THE SLOT GOES WITH THE START, whatever bootVM answers: the guest's process holds
+	// its own copy from the moment it is started.
+	bootErr := p.bootVM(ctx, spec.Name, claim.files, netFlags...)
 
 	// Released now rather than at return, which is minutes away: only the guest's process
 	// holds a slot, so that a billet that dies here does not matter to it.
 	claim.release()
+
+	if bootErr != nil {
+		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, bootErr)
+	}
 
 	if err := p.proveStarted(ctx, spec.Name); err != nil {
 		return nil, fmt.Errorf("tart: launch %s: %w", spec.Name, err)
@@ -1098,10 +1110,149 @@ func (p *Provider) startDetached(name string, netFlags ...string) error {
 // startDetachedHolding is startDetached passing open files to the VM's process, which
 // inherits them, and so holds any lock on them for as long as it or a child of it lives.
 func (p *Provider) startDetachedHolding(name string, held []*os.File, netFlags ...string) error {
+	_, err := p.startRun(name, held, netFlags...)
+
+	return err
+}
+
+// bootVM starts the VM's `tart run` and returns once Virtualization.framework holds its
+// disk open, or says why it never did.
+//
+// NO `tart list` RUNS IN THIS WINDOW, from this provider. `tart list` and `tart get` size
+// every VM they show, and an ASIF disk is sized by running `diskutil image info` on it
+// (tart 2.41.1: List.swift, VMDirectory.diskSizeBytes, Diskutil.imageInfo), while `tart
+// run` takes the lock that makes `tart list` say running before it asks the framework to
+// start the VM and attach that disk (Run.swift). A `diskutil` read landing on the attach
+// failed the start with "Internal Virtualization error" every time it was tried on
+// purpose (a fleet Mac, macOS 27.2, 2026-11-07: a loop of `diskutil image info` every
+// 0.3 s from the start of a hand-run `tart run` failed it 2 of 2, none booted 2 of 2), and
+// billet's own polling of `tart list` from the first instant failed most launches of an
+// ASIF macOS guest. So the start holds startGate shared until the disk is attached, and
+// every listing this provider makes takes it exclusively. A raw disk is only stat'ed, but
+// the same order costs it nothing. Another process running `tart list` meanwhile (another
+// deployment, an operator, `billet check`) is outside what this can hold.
+func (p *Provider) bootVM(ctx context.Context, name string, held []*os.File, netFlags ...string) error {
+	p.startGate.RLock()
+	defer p.startGate.RUnlock()
+
+	exited, err := p.startRun(name, held, netFlags...)
+	if err != nil {
+		return err
+	}
+
+	deadline := time.Now().Add(p.startWindow)
+
+	retry := time.NewTimer(p.proveRetry)
+	defer retry.Stop()
+
+	var lastErr error
+
+	for {
+		attached, err := p.vmHoldsDisk(ctx, name)
+		if err == nil && attached {
+			return nil
+		}
+
+		if err != nil {
+			lastErr = err
+		}
+
+		select {
+		case <-exited:
+			// ASKED ONCE MORE, because the run may have attached and ended between the
+			// question and this answer; a `tart run` that has ended is a VM that has.
+			if attached, err := p.vmHoldsDisk(ctx, name); err == nil && attached {
+				return nil
+			}
+
+			return fmt.Errorf("the VM never started: %s", p.runLogTail(name))
+		default:
+		}
+
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return fmt.Errorf("the VM never started: %s (and whether its disk was attached could "+
+					"not be read: %w)", p.runLogTail(name), lastErr)
+			}
+
+			return fmt.Errorf("the VM never started: %s", p.runLogTail(name))
+		}
+
+		retry.Reset(p.proveRetry)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for %s to attach its disk: %w", name, ctx.Err())
+		case <-exited:
+		case <-retry.C:
+		}
+	}
+}
+
+// vmHoldsDisk answers whether a Virtualization.framework process holds the VM's disk
+// open, which lsof reads without opening the disk.
+func (p *Provider) vmHoldsDisk(ctx context.Context, name string) (bool, error) {
+	if p.diskAttached != nil {
+		return p.diskAttached(ctx, name)
+	}
+
+	disk := filepath.Join(p.vmDir(name), "disk.img")
+
+	pids, err := p.openers(ctx, disk)
+	if err != nil {
+		return false, err
+	}
+
+	for _, pid := range pids {
+		path, err := p.processPath(pid)
+		if errors.Is(err, syscall.ESRCH) {
+			continue
+		}
+
+		if err != nil {
+			return false, fmt.Errorf("could not tell what process %d holding %s is: %w", pid, disk, err)
+		}
+
+		if path == vmService {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// withoutStarts runs fn while no VM this provider started is between its `tart run` and
+// its disk being attached, waiting for one at most the start window. See bootVM.
+func (p *Provider) withoutStarts(ctx context.Context, fn func() error) error {
+	deadline := time.Now().Add(p.startWindow)
+
+	for !p.startGate.TryLock() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("tart: a VM this node started was still attaching its disk after %s, "+
+				"and listing VMs then sizes that disk under the attach", p.startWindow)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("tart: waiting for a VM's start to attach its disk before listing: %w", ctx.Err())
+		case <-time.After(startGatePoll):
+		}
+	}
+
+	defer p.startGate.Unlock()
+
+	return fn()
+}
+
+// startGatePoll is how often a listing asks again whether a start has attached its disk.
+const startGatePoll = 50 * time.Millisecond
+
+// startRun starts `tart run` detached, and returns a channel closed when it exits.
+func (p *Provider) startRun(name string, held []*os.File, netFlags ...string) (<-chan struct{}, error) {
 	logPath := p.runLogPath(name)
 
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-		return fmt.Errorf("prepare the run log directory: %w", err)
+		return nil, fmt.Errorf("prepare the run log directory: %w", err)
 	}
 
 	// TRUNCATED, because a probe's name is reused by every verification of its image,
@@ -1109,7 +1260,7 @@ func (p *Provider) startDetachedHolding(name string, held []*os.File, netFlags .
 	// name must be the log itself, not a link to a file the node would then write.
 	out, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return fmt.Errorf("open run log: %w", err)
+		return nil, fmt.Errorf("open run log: %w", err)
 	}
 
 	defer func() {
@@ -1135,23 +1286,27 @@ func (p *Provider) startDetachedHolding(name string, held []*os.File, netFlags .
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start tart run: %w", err)
+		return nil, fmt.Errorf("start tart run: %w", err)
 	}
+
+	exited := make(chan struct{})
 
 	// Reaped, never believed: Setsid detaches the session, not the parenthood,
 	// so an exited child stays a zombie until someone waits on it — one per
-	// finished VM, for as long as this node runs. The Wait exists solely to
-	// reap; its result is logged and nothing more, because the exit status of
-	// this process proves nothing about the VM (the jailer lesson) and List
-	// reads tart's own state instead.
+	// finished VM, for as long as this node runs. Its result is logged and
+	// nothing more, because the exit status of this process proves nothing about
+	// the VM (the jailer lesson) and List reads tart's own state instead; that it
+	// ended is the one thing bootVM takes from it.
 	go func() {
+		defer close(exited)
+
 		if err := cmd.Wait(); err != nil {
 			p.log.Debug("the detached tart run process exited with an error; the VM's "+
 				"state is read from tart, not from this", "runner", name, "error", err)
 		}
 	}()
 
-	return nil
+	return exited, nil
 }
 
 // resolverScript configures the guest's resolvers and proves the result, or
@@ -2416,17 +2571,25 @@ type listedVM struct {
 // between appears as a directory without a row and fails toward the error side;
 // reconciliation retries, and a transient refusal is the safe direction.
 func (p *Provider) list(ctx context.Context) ([]listedVM, error) {
-	vms, err := p.listRows(ctx)
+	var vms []listedVM
+
+	// THE CROSS-CHECK'S `tart get` SIZES A DISK TOO, so it runs inside the same gate.
+	err := p.withoutStarts(ctx, func() error {
+		var err error
+
+		vms, err = p.listRowsNow(ctx)
+		if err != nil {
+			return err
+		}
+
+		seen := make(map[string]bool, len(vms))
+		for _, vm := range vms {
+			seen[vm.Name] = true
+		}
+
+		return p.crossCheckStore(ctx, seen)
+	})
 	if err != nil {
-		return nil, err
-	}
-
-	seen := make(map[string]bool, len(vms))
-	for _, vm := range vms {
-		seen[vm.Name] = true
-	}
-
-	if err := p.crossCheckStore(ctx, seen); err != nil {
 		return nil, err
 	}
 
@@ -2434,8 +2597,24 @@ func (p *Provider) list(ctx context.Context) ([]listedVM, error) {
 }
 
 // listRows is tart's own answer, each row readable and named once, which vouches for the
-// rows it holds and says nothing about the ones it does not.
+// rows it holds and says nothing about the ones it does not. It waits out any start in
+// its disk's window, as list does.
 func (p *Provider) listRows(ctx context.Context) ([]listedVM, error) {
+	var vms []listedVM
+
+	err := p.withoutStarts(ctx, func() error {
+		var err error
+
+		vms, err = p.listRowsNow(ctx)
+
+		return err
+	})
+
+	return vms, err
+}
+
+// listRowsNow is listRows for a caller already holding the start gate.
+func (p *Provider) listRowsNow(ctx context.Context) ([]listedVM, error) {
 	out, err := p.run(ctx, "list", "--format", "json", "--source", "local")
 	if err != nil {
 		return nil, fmt.Errorf("tart: list VMs: %w", err)

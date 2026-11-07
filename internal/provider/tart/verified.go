@@ -705,15 +705,17 @@ func (p *Provider) bootProbe(
 		return "", err
 	}
 
-	if err := p.startDetachedHolding(probe, slices.Concat(claim.files, []*os.File{custody}), netFlags...); err != nil {
-		return "", err
-	}
+	bootErr := p.bootVM(probeCtx, probe, slices.Concat(claim.files, []*os.File{custody}), netFlags...)
 
 	// THE GUEST'S PROCESS NOW HOLDS THEM: billet's copies go, so the kernel releases the
 	// slot when that process ends and not when this one does.
 	claim.release()
 
 	_ = custody.Close()
+
+	if bootErr != nil {
+		return "", probeCause(probeCtx, bootErr)
+	}
 
 	if err := p.proveStarted(probeCtx, probe); err != nil {
 		return "", probeCause(probeCtx, err)
