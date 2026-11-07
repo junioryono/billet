@@ -100,6 +100,34 @@ func installationError(err, throttled, refused error) error {
 	}
 }
 
+var _ server.RunJobSteps = (*Client)(nil)
+
+// RunJobSteps reads every job of a run with its steps, by runner name, for an alert
+// rule that names a step, through the target's App client, in one read of the run.
+func (c *Client) RunJobSteps(ctx context.Context, owner, repository string, runID int64,
+) (map[string]server.RunnerSteps, error) {
+	records, ok := c.policy.(billetgithub.RunJobRecords)
+	if c.policy == nil || !ok {
+		return nil, billetgithub.ErrRunEvidenceUnavailable
+	}
+
+	jobs, err := records.RunnerJobs(ctx, owner, repository, runID)
+	if err != nil {
+		return nil, fmt.Errorf("scaleset: %w", err)
+	}
+
+	out := make(map[string]server.RunnerSteps, len(jobs))
+	for runner, job := range jobs {
+		record := server.RunnerSteps{Completed: job.Status == billetgithub.RunStatusCompleted}
+		for _, step := range job.Steps {
+			record.Steps = append(record.Steps, server.JobStep{Name: step.Name, Conclusion: step.Conclusion})
+		}
+		out[runner] = record
+	}
+
+	return out, nil
+}
+
 var _ server.RunReruns = (*Client)(nil)
 
 // LatestAttempt reads the attempt a run is on through the target's App client and,

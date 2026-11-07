@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -142,6 +144,12 @@ type Server struct {
 
 	// rerunEvery and rerunSettle pace the re-run loop; see WithRerunPacing.
 	rerunEvery, rerunSettle time.Duration
+
+	// alerts is `server.alerts`, or nil where it names no rule; see WithAlerts.
+	alerts *Alerts
+	// alertEvaluateEvery, alertDeliverEvery and alertRetryFirst pace the alert loops;
+	// see WithAlertPacing. Zero selects each default.
+	alertEvaluateEvery, alertDeliverEvery, alertRetryFirst time.Duration
 }
 
 // ControlPlaneOption configures a Server.
@@ -518,6 +526,27 @@ func (s *Server) Run(ctx context.Context) error {
 	group.Background("disrupted job re-runs", func(ctx context.Context) {
 		s.rerunDisrupted(ctx, targets, limits)
 	})
+
+	// AND A JOB IS TOLD ABOUT WHERE A RULE ASKS, under the same rule, with one loop
+	// per destination, so a destination that hangs delays only its own notices. A
+	// destination is delivered to while it is configured, rule or no rule, and what is
+	// owed to one no longer configured is given up on once, here, even with no
+	// server.alerts left at all.
+	group.Background("alert notices of removed destinations", s.settleRemovedDestinations)
+	if s.alerts != nil {
+		if len(s.alerts.Rules) > 0 {
+			group.Background("alert evaluation", func(ctx context.Context) {
+				s.evaluateAlerts(ctx, targets)
+			})
+		}
+
+		for _, name := range slices.Sorted(maps.Keys(s.alerts.Destinations)) {
+			sender := s.alerts.Destinations[name].Sender
+			group.Background("alert delivery to "+name, func(ctx context.Context) {
+				s.deliverAlerts(ctx, name, sender)
+			})
+		}
+	}
 
 	// AND A JOB'S DETAIL IS DELETED PAST ITS RETENTION, under the same rule.
 	group.Background("job detail retention", s.retireJobDetail)

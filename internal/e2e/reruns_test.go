@@ -110,9 +110,11 @@ func (g *githubRuns) serve(w http.ResponseWriter, r *http.Request) {
 // redJob is one job a test takes to GitHub's red completion. record, when set, is
 // what GitHub holds about its run by the time it completes, called with its runner:
 // the run is finished before its last job's completion reaches billet, so a pass
-// never reads a run GitHub has no record of. disrupt runs while the job does.
+// never reads a run GitHub has no record of. disrupt runs while the job does. name
+// is the job's display name, the scripted plane's own when empty.
 type redJob struct {
 	request, run int64
+	name         string
 	record       func(runner string)
 	disrupt      func(lease string)
 }
@@ -124,7 +126,7 @@ func runJobToItsEnd(t *testing.T, s *stack, job redJob) string {
 
 	request, run, disrupt := job.request, job.run, job.disrupt
 
-	fields := fakeactions.JobFields{RunID: run}
+	fields := fakeactions.JobFields{RunID: run, Name: job.name}
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fields.Apply(fakeactions.JobJSON("JobAvailable", request, "push", simulatedTier)))
 
@@ -146,7 +148,7 @@ func runJobToItsEnd(t *testing.T, s *stack, job redJob) string {
 		t.Fatalf("instance %q does not carry a lease", names[0])
 	}
 
-	started := fakeactions.JobFields{RunID: run, RunnerID: 99, RunnerName: names[0]}
+	started := fakeactions.JobFields{RunID: run, Name: job.name, RunnerID: 99, RunnerName: names[0]}
 	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
 		started.Apply(fakeactions.JobJSON("JobStarted", request, "push", simulatedTier)))
 
@@ -170,7 +172,8 @@ func runJobToItsEnd(t *testing.T, s *stack, job redJob) string {
 		job.record(names[0])
 	}
 
-	completed := fakeactions.JobFields{RunID: run, RunnerID: 99, RunnerName: names[0], Result: "failed"}
+	completed := fakeactions.JobFields{RunID: run, Name: job.name, RunnerID: 99, RunnerName: names[0],
+		Result: "failed"}
 	s.plane.queue(fakeactions.StatisticsJSON(0, 0),
 		completed.Apply(fakeactions.JobJSON("JobCompleted", request, "push", simulatedTier)))
 
@@ -207,6 +210,21 @@ func reclaim(t *testing.T, s *stack) func(string) {
 	}
 }
 
+// askedBeforeItsJobs records that the stack's tier asks for re-runs before any of its
+// jobs ends, as a loop that had already passed once would have. The loop's first pass
+// records the same through the same method, which keeps the earlier time, and passes
+// over a job that ended before its tier asked. Under CI's load that pass came after
+// the first job's result, which then was never decided (2026-11-06,
+// TestTheLimitOfRerunsHolds on main): an order a test must establish, not leave to
+// the scheduler.
+func askedBeforeItsJobs(t *testing.T, s *stack) {
+	t.Helper()
+
+	if _, err := s.alloc.AskReruns(t.Context(), []string{simulatedTier}); err != nil {
+		t.Fatalf("AskReruns: %v", err)
+	}
+}
+
 // awaitRerunDecision waits for the loop to decide a job, on its real ticker.
 func awaitRerunDecision(t *testing.T, s *stack, lease string, want alloc.RerunDecision) {
 	t.Helper()
@@ -235,6 +253,7 @@ func TestADisruptedJobIsRerunOnceAndOneThatFailedOnItsOwnIsLeftAlone(t *testing.
 	s, _, _ := simulatedStack(t, overTheWire, withRetryDisrupted(1))
 	runs := newGitHubRuns(t)
 	s.plane.setREST(runs.serve)
+	askedBeforeItsJobs(t, s)
 
 	stop := s.run(t)
 	defer stop()
@@ -296,6 +315,7 @@ func TestTheLimitOfRerunsHolds(t *testing.T) {
 	s, _, _ := simulatedStack(t, overTheWire, withRetryDisrupted(1))
 	runs := newGitHubRuns(t)
 	s.plane.setREST(runs.serve)
+	askedBeforeItsJobs(t, s)
 
 	stop := s.run(t)
 	defer stop()

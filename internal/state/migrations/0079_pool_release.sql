@@ -1,4 +1,4 @@
--- migration 78: pool_release
+-- migration 79: pool_release
 --
 -- A POOL HOST IS RELEASED ONLY ON PROOF (ADR-030, #553), and the proof waits for the
 -- host to drain: a person asks for the release, the host is taken out of placement at

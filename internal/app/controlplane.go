@@ -214,6 +214,14 @@ func OpenControlPlane(
 		return nil, errors.Join(err, db.UnclaimedMove(), db.Close())
 	}
 
+	// THE ALERT DESTINATIONS' ADDRESSES ARE READ HERE TOO, and one that cannot be read
+	// is logged and stops nothing: BuildAlerts says why.
+	alerts, err := BuildAlerts(cfg, slog.Default())
+	if err != nil {
+		return nil, errors.Join(err, db.UnclaimedMove(), db.Close())
+	}
+	serverOpts = append(serverOpts, server.WithAlerts(alerts))
+
 	cp := &ControlPlane{
 		listenerTimings: &server.ListenerTimings{},
 

@@ -651,11 +651,17 @@ func withPlane(opts ...nodeplane.Option) stackOpt {
 	return func(c *stackConfig) { c.plane = append(c.plane, opts...) }
 }
 
-// withReapInterval replaces the harness's reaper tick.
+// withConfigure adjusts the control plane's config before it is assembled.
+func withConfigure(fn func(*config.Config)) stackOpt {
+	return func(c *stackConfig) { c.configure = fn }
+}
+
+// withRetryDisrupted sets retry.disrupted on every tier.
 func withRetryDisrupted(n int) stackOpt {
 	return func(c *stackConfig) { c.retryDisrupted = n }
 }
 
+// withReapInterval replaces the harness's reaper tick.
 func withReapInterval(d time.Duration) stackOpt {
 	return func(c *stackConfig) { c.reapEvery = d }
 }
@@ -845,9 +851,11 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 			// short so these scenarios exercise the overrun REPORT rather than
 			// sitting silent, which is all it decides now.
 			server.WithDrainTimeout(200 * time.Millisecond),
-			// A PACE THE RE-RUN TESTS CAN WAIT OUT. Only a tier with retry.disrupted
-			// starts the loop, so the rest of these scenarios never see it.
+			// A PACE THE RE-RUN TESTS CAN WAIT OUT. The loop runs in every scenario, and
+			// only a tier with retry.disrupted gives it a job to decide.
 			server.WithRerunPacing(100*time.Millisecond, time.Millisecond),
+			// AND ONE THE ALERT TESTS CAN: the loops start only for a config with rules.
+			server.WithAlertPacing(100*time.Millisecond, 50*time.Millisecond, 10*time.Millisecond),
 		},
 	}
 	if sc.now != nil {

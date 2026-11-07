@@ -18,6 +18,13 @@ type Admission struct {
 	ChangedAt  string
 }
 
+type AlertRule struct {
+	Name        string
+	FirstSeenAt string
+	MutedUntil  string
+	MutedBy     string
+}
+
 type CacheBlock struct {
 	Kind       string
 	ScopeType  string

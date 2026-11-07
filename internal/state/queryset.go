@@ -95,6 +95,17 @@ type ReadOps interface {
 	ListRerunTiers(ctx context.Context) ([]ledgerdb.RerunTier, error)
 	ReadRerunOfAttempt(ctx context.Context, arg ledgerdb.ReadRerunOfAttemptParams) (ledgerdb.ReadRerunOfAttemptRow, error)
 	CountRunReruns(ctx context.Context, arg ledgerdb.CountRunRerunsParams) (int64, error)
+	ListRunningJobsForAlerts(ctx context.Context, arg ledgerdb.ListRunningJobsForAlertsParams) ([]ledgerdb.ListRunningJobsForAlertsRow, error)
+	ListEndedJobsForAlerts(ctx context.Context, arg ledgerdb.ListEndedJobsForAlertsParams) ([]ledgerdb.ListEndedJobsForAlertsRow, error)
+	ListAlertRules(ctx context.Context) ([]ledgerdb.AlertRule, error)
+	ReadAlertRuleMute(ctx context.Context, name string) (string, error)
+	ListAlertMarks(ctx context.Context, since string) ([]ledgerdb.ListAlertMarksRow, error)
+	ReadAlertStreak(ctx context.Context, arg ledgerdb.ReadAlertStreakParams) (ledgerdb.ReadAlertStreakRow, error)
+	ListAlertStreaks(ctx context.Context, maxRows int64) ([]ledgerdb.ListAlertStreaksRow, error)
+	ListDueAlertNotices(ctx context.Context, arg ledgerdb.ListDueAlertNoticesParams) ([]ledgerdb.ListDueAlertNoticesRow, error)
+	CountAlertNotices(ctx context.Context) ([]ledgerdb.CountAlertNoticesRow, error)
+	ListFailedAlertNotices(ctx context.Context, maxRows int64) ([]ledgerdb.ListFailedAlertNoticesRow, error)
+	ListPendingAlertDestinations(ctx context.Context) ([]string, error)
 	ListBarrierRuns(ctx context.Context, barrierID string) ([]ledgerdb.ListBarrierRunsRow, error)
 	ListCacheBlocks(ctx context.Context) ([]ledgerdb.CacheBlock, error)
 	ListCodeBuildRegistrationPaths(ctx context.Context, provider string) ([]ledgerdb.ListCodeBuildRegistrationPathsRow, error)
@@ -335,6 +346,18 @@ type WriteOps interface {
 	BindJobToRerun(ctx context.Context, arg ledgerdb.BindJobToRerunParams) error
 	SettleJobsOfRerun(ctx context.Context, arg ledgerdb.SettleJobsOfRerunParams) error
 	RecordJobRerunDecision(ctx context.Context, arg ledgerdb.RecordJobRerunDecisionParams) error
+	InsertAlertRule(ctx context.Context, arg ledgerdb.InsertAlertRuleParams) error
+	MuteAlertRule(ctx context.Context, arg ledgerdb.MuteAlertRuleParams) error
+	UnmuteAlertRule(ctx context.Context, name string) (int64, error)
+	InsertAlertMark(ctx context.Context, arg ledgerdb.InsertAlertMarkParams) (int64, error)
+	WriteAlertStreak(ctx context.Context, arg ledgerdb.WriteAlertStreakParams) error
+	InsertAlertNotice(ctx context.Context, arg ledgerdb.InsertAlertNoticeParams) error
+	RetryAlertNotice(ctx context.Context, arg ledgerdb.RetryAlertNoticeParams) error
+	SettleAlertNotice(ctx context.Context, arg ledgerdb.SettleAlertNoticeParams) error
+	PruneAlertMarks(ctx context.Context, before string) error
+	PruneAlertNotices(ctx context.Context, before string) error
+	PruneAlertStreaks(ctx context.Context, arg ledgerdb.PruneAlertStreaksParams) error
+	FailPendingAlertNotices(ctx context.Context, arg ledgerdb.FailPendingAlertNoticesParams) (int64, error)
 	RecordJobRunnerID(ctx context.Context, arg ledgerdb.RecordJobRunnerIDParams) error
 	RecordJobUsage(ctx context.Context, arg ledgerdb.RecordJobUsageParams) (int64, error)
 	RecordJobSeries(ctx context.Context, arg ledgerdb.RecordJobSeriesParams) error

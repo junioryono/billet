@@ -293,6 +293,10 @@ type ServerConfig struct {
 	// trace in memory and writes them under identity_dir/flight-recorder when a
 	// heartbeat pass overruns or the controller claim is lost. Off by default.
 	FlightRecorder bool `yaml:"flight_recorder,omitempty"`
+	// Alerts tells a webhook or a Slack channel about a job that failed, was
+	// cancelled, ran or waited past a duration, or was disrupted. Absent, nothing is
+	// sent. See alerts.go.
+	Alerts *AlertsConfig `yaml:"alerts,omitempty"`
 }
 
 // MetricsConfig is one role's Prometheus endpoint: /metrics, and the Go

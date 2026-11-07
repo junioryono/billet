@@ -7,8 +7,8 @@ import (
 )
 
 // ledgerAt75 is a ledger migrated to 75 and no further, so the next open applies
-// migration 76 and every one after it. 78 and 77 go first, newest first, since
-// rewindNewest takes back only the newest.
+// migration 76 and every one after it. rewindNewest takes back the newest, which is
+// the pool release's 79, and then 78, 77 and 76 are undone.
 func ledgerAt75(t *testing.T) string {
 	t.Helper()
 
@@ -19,11 +19,18 @@ func ledgerAt75(t *testing.T) string {
 		t.Fatalf("Open: %v", err)
 	}
 
+	rewindNewest(t, db)
+
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
-			`ALTER TABLE pool_orders DROP COLUMN release_contradicted`,
-			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
-			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,
+			`DROP INDEX job_history_running_idx`,
+			`DROP INDEX job_history_result_idx`,
+			`DROP INDEX alert_outbox_due_idx`,
+			`DROP INDEX alert_marks_decided_idx`,
+			`DROP TABLE alert_outbox`,
+			`DROP TABLE alert_streaks`,
+			`DROP TABLE alert_marks`,
+			`DROP TABLE alert_rules`,
 			`DELETE FROM schema_migrations WHERE version = 78`,
 			`DROP TABLE lease_holds`,
 			`DELETE FROM schema_migrations WHERE version = 77`,

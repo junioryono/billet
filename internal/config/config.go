@@ -493,6 +493,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateTargetWeights()...)
 	errs = append(errs, c.validateNode()...)
 	errs = append(errs, c.validateMetrics()...)
+	errs = append(errs, c.validateAlerts()...)
 	errs = append(errs, c.validateNoTestOnlyBackend()...)
 	errs = append(errs, c.validateNodes()...)
 	errs = append(errs, c.validateSites()...)

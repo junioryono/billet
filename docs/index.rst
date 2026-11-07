@@ -46,6 +46,7 @@
 
    operating/status-and-leases
    operating/metrics
+   operating/alerts
    operating/measurement-validation
    operating/nodes
    operating/bare-metal-pool

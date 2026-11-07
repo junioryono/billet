@@ -1,6 +1,6 @@
--- migration 78: pool_release, for PostgreSQL
+-- migration 79: pool_release, for PostgreSQL
 --
--- The twin of migrations/0078_pool_release.sql.
+-- The twin of migrations/0079_pool_release.sql.
 --
 -- It carries that file's statements with SQLite's spellings translated and
 -- nothing else changed, so the two read side by side. The reasoning lives

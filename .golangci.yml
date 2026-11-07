@@ -507,6 +507,19 @@ linters:
             - github.com/junioryono/billet/internal/durablefile$
             - github.com/junioryono/billet/internal/regularfile$
 
+        # AN ALERT'S RULES, NOTICE AND SENDER ARE A LEAF. The sender holds a
+        # destination's address, a credential, and makes requests to it, so what
+        # it imports is what can reach that address: the standard library and the
+        # config it reads a rule from. What a rule decided is the ledger's, written
+        # by alloc and driven by the server's loops, never by this package.
+        alerts:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/alerts/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+
         # THE ASSEMBLY IS IMPORTED BY WHAT INVOKES IT, AND NOTHING IT ASSEMBLES.
         # internal/app builds the control plane and the node from a config, so a
         # package below it that imported it would import every role; the binary

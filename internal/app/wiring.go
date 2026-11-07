@@ -131,6 +131,7 @@ var (
 	_ server.QueueTimes      = Provisioner{}
 	_ server.RESTHeadroom    = Provisioner{}
 	_ server.RunReruns       = Provisioner{}
+	_ server.RunJobSteps     = Provisioner{}
 )
 
 // LatestAttempt reads the attempt a run is on, and its jobs once it is completed.
@@ -166,6 +167,13 @@ func (p Provisioner) RunJobs(ctx context.Context, owner, repository string, runI
 func (p Provisioner) WorkflowRun(ctx context.Context, owner, repository string, runID int64,
 ) (server.WorkflowRun, error) {
 	return p.Client.WorkflowRun(ctx, owner, repository, runID)
+}
+
+// RunJobSteps reads every job of a run with its steps, for an alert rule naming a
+// step.
+func (p Provisioner) RunJobSteps(ctx context.Context, owner, repository string, runID int64,
+) (map[string]server.RunnerSteps, error) {
+	return p.Client.RunJobSteps(ctx, owner, repository, runID)
 }
 
 // DefaultBranch reads a repository's default branch, for a cache authority.
