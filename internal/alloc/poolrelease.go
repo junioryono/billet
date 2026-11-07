@@ -210,7 +210,11 @@ func nodeHoldingsTx(ctx context.Context, q state.WriteOps, node string, stopped 
 	}
 
 	received, err := time.Parse(timestampFormat, facts.ReceivedAt.String)
-	if err != nil || !received.After(stopped) {
+	if err != nil {
+		return h, fmt.Errorf("alloc: %s's inventory was received at %q: %w", node, facts.ReceivedAt.String, err)
+	}
+
+	if !received.After(stopped) {
 		return h, nil
 	}
 
