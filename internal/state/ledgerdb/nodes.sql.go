@@ -847,38 +847,31 @@ func (q *Queries) ReadNodeRegistration(ctx context.Context, name string) (ReadNo
 }
 
 const readNodeReleaseFacts = `-- name: ReadNodeReleaseFacts :one
-SELECT n.live, n.epoch, n.dispatch_generation, n.decommission_proven, i.node_epoch, i.running, i.received_at
+SELECT n.epoch, n.decommission_proven, i.node_epoch, i.running
   FROM nodes n
   LEFT JOIN node_inventory i ON i.node = n.name
  WHERE n.name = $1
 `
 
 type ReadNodeReleaseFactsRow struct {
-	Live               int64
 	Epoch              int64
-	DispatchGeneration int64
 	DecommissionProven int64
 	NodeEpoch          sql.NullInt64
 	Running            sql.NullInt64
-	ReceivedAt         sql.NullString
 }
 
-// What a pool host's release proof reads of its node: whether it is live, its current
-// epoch, its launch-dispatch generation, whether a person decommissioned it on the
-// compute barrier's proof, and its last inventory, which is null when it never reported
-// one. The caller trusts the inventory only from the current epoch and received after
-// placement stopped.
+// What a pool host's release proof reads of its node: its current epoch, whether a person
+// decommissioned it on the compute barrier's proof, and its last inventory, which is null
+// when it never reported one; an inventory of the current epoch reporting compute
+// outweighs the decommission.
 func (q *Queries) ReadNodeReleaseFacts(ctx context.Context, name string) (ReadNodeReleaseFactsRow, error) {
 	row := q.db.QueryRowContext(ctx, readNodeReleaseFacts, name)
 	var i ReadNodeReleaseFactsRow
 	err := row.Scan(
-		&i.Live,
 		&i.Epoch,
-		&i.DispatchGeneration,
 		&i.DecommissionProven,
 		&i.NodeEpoch,
 		&i.Running,
-		&i.ReceivedAt,
 	)
 	return i, err
 }
@@ -911,7 +904,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, 1,
         $17, $18, 1,
         CASE WHEN EXISTS (
             SELECT 1 FROM pool_orders p
-             WHERE p.node_name = $1
+             WHERE (p.node_name = $1 OR 'pool-' || p.order_id = $1)
                AND (p.release_requested_at != '' OR p.state IN ('sealed', 'released', 'gone'))) THEN 1 ELSE 0 END)
 ON CONFLICT (name) DO UPDATE SET
    provider     = excluded.provider,
@@ -938,7 +931,7 @@ ON CONFLICT (name) DO UPDATE SET
    decommission_actor  = '',
    drained             = CASE WHEN EXISTS (
        SELECT 1 FROM pool_orders p
-        WHERE p.node_name = excluded.name
+        WHERE (p.node_name = excluded.name OR 'pool-' || p.order_id = excluded.name)
           AND (p.release_requested_at != '' OR p.state IN ('sealed', 'released', 'gone'))) THEN 1 ELSE 0 END
 RETURNING epoch
 `

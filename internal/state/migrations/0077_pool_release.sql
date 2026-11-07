@@ -13,15 +13,6 @@
 --
 -- release_reason is what the person who asked gave, for `billet pool` and the log.
 --
--- release_dispatch is the node's launch-dispatch generation when the release was asked
--- for: a launch dispatched to the host since restarts the proof.
---
--- release_report_at is when the first inventory counted towards the proof arrived. An
--- inventory is stamped when it ARRIVES, not when the node listed its compute, so one
--- report after the request can still describe the host before it; the node lists its
--- next report only after the previous one arrived, so a later report is one listed
--- after this moment, and that is the one the proof reads.
---
 -- The states this uses (sealed, released, gone) were listed by migration 75.
 
 -- +billet:statement
@@ -30,12 +21,4 @@ ALTER TABLE pool_orders ADD COLUMN release_requested_at TEXT NOT NULL DEFAULT ''
 
 -- +billet:statement
 ALTER TABLE pool_orders ADD COLUMN release_reason TEXT NOT NULL DEFAULT ''
--- +billet:end
-
--- +billet:statement
-ALTER TABLE pool_orders ADD COLUMN release_dispatch INTEGER NOT NULL DEFAULT 0
--- +billet:end
-
--- +billet:statement
-ALTER TABLE pool_orders ADD COLUMN release_report_at TEXT NOT NULL DEFAULT ''
 -- +billet:end

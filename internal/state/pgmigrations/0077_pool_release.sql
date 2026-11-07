@@ -17,11 +17,3 @@ ALTER TABLE pool_orders ADD COLUMN release_requested_at text NOT NULL DEFAULT ''
 -- +billet:statement
 ALTER TABLE pool_orders ADD COLUMN release_reason text NOT NULL DEFAULT '';
 -- +billet:end
-
--- +billet:statement
-ALTER TABLE pool_orders ADD COLUMN release_dispatch bigint NOT NULL DEFAULT 0;
--- +billet:end
-
--- +billet:statement
-ALTER TABLE pool_orders ADD COLUMN release_report_at text NOT NULL DEFAULT '';
--- +billet:end

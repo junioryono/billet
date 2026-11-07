@@ -180,8 +180,6 @@ type PoolOrder struct {
 	JoinHold           string
 	ReleaseRequestedAt string
 	ReleaseReason      string
-	ReleaseDispatch    int64
-	ReleaseReportAt    string
 }
 
 type PoolRunner struct {

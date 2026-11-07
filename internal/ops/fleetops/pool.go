@@ -207,10 +207,11 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 	return nil
 }
 
-// poolClose closes a released order on a person's word, after they have looked at the
-// source themselves: how a release closes on a source that never says gone of a host it
-// took back (phoenixNAP), or one no longer configured or ordering elsewhere. The order
-// stops counting against the maximum, and its reason records that a person closed it.
+// poolClose closes a sealed or released order on a person's word, after they have looked
+// at the source themselves: how a release closes on a source that never says gone of a
+// host it took back (phoenixNAP), on one no longer configured or ordering elsewhere, and
+// on a sealed host a person took back by hand. The order stops counting against the
+// maximum, and its reason records that a person closed it.
 func poolClose(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet pool close", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
@@ -229,8 +230,8 @@ func poolClose(ctx context.Context, env cli.Env, args []string) error {
 	defer closeDB()
 	if err := a.ClosePoolOrder(ctx, order, oneLine(*reason)); err != nil {
 		if errors.Is(err, alloc.ErrPoolOrderMoved) {
-			return fmt.Errorf("billet pool close: %s is not released; only a host its source took back is closed by "+
-				"hand", order)
+			return fmt.Errorf("billet pool close: %s is neither sealed nor released; only a host whose release is "+
+				"proved is closed by hand", order)
 		}
 
 		return err

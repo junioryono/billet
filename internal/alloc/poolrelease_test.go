@@ -102,24 +102,31 @@ func TestAHostACertificateWasIssuedForIsNotUnjoined(t *testing.T) {
 	}
 }
 
-// A JOINED HOST LEAVES PLACEMENT WHEN ITS RELEASE IS ASKED FOR, AND IS SEALED ONLY ONCE
-// THE LEDGER PROVES IT HOLDS NOTHING: no lease, and, once the quiet period has passed,
-// a second inventory from its current registration, listed after the first counted one
-// arrived, that reports nothing running. The seal revokes its certificate first, and a
+// decommissionedOnProof marks a node as `billet nodes decommission` does on the compute
+// barrier's proof that it runs nothing.
+func decommissionedOnProof(t *testing.T, a *Allocator, node string) {
+	t.Helper()
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
+			`UPDATE nodes SET decommission_proven = 1, live = 0, drained = 1 WHERE name = $1`, node)
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A JOINED HOST LEAVES PLACEMENT WHEN ITS RELEASE IS ASKED FOR, AND IS SEALED ONLY ON
+// PROOF IT RUNS NOTHING: no lease, and a decommission on the compute barrier's proof
+// that no inventory of its current registration since contradicts. An inventory alone,
+// however empty, is never that proof. The seal revokes its certificate first, and a
 // registration after it does not put the host back into placement.
-func TestAJoinedHostIsSealedOnlyOnceItHoldsNothing(t *testing.T) {
+func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
 	a := poolAllocator(t, &now)
 	ctx := t.Context()
 	node := joinedOrder(t, a, "pa", "0a")
-	report := func(running ...string) {
-		t.Helper()
-		now = now.Add(time.Second)
-		if _, err := a.Reconcile(ctx, node, running); err != nil {
-			t.Fatal(err)
-		}
-	}
 	register := func() {
 		t.Helper()
 		if _, err := a.RegisterNode(ctx, NodeRegistration{Name: node, Provider: config.ProviderFirecracker, VCPU: 8,
@@ -160,23 +167,29 @@ func TestAJoinedHostIsSealedOnlyOnceItHoldsNothing(t *testing.T) {
 		t.Fatal("a registration put a host whose release was asked for back into placement")
 	}
 
-	now = now.Add(poolReleaseQuiet)
-	report()
-	report()
-	waits("a lease still outstanding")
 	for _, l := range leases {
 		if err := a.Release(ctx, l.ID, l.Epoch, PhaseDone); err != nil {
 			t.Fatalf("release lease %s: %v", l.ID, err)
 		}
 	}
-	// THE REPORT THE LAST SEAL COUNTED FIRST IS NOT THE ONE THAT PROVES: a report the
-	// node listed after it arrived is.
-	waits("only the report the last attempt counted first")
-	report()
+	now = now.Add(time.Hour)
+	if _, err := a.Reconcile(ctx, node, nil); err != nil {
+		t.Fatal(err)
+	}
+	waits("an empty inventory and nothing else")
+
+	decommissionedOnProof(t, a, node)
+	if _, err := a.Reconcile(ctx, node, []string{"some-instance"}); err != nil {
+		t.Fatal(err)
+	}
+	waits("a decommission an inventory since contradicts")
+	if _, err := a.Reconcile(ctx, node, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	proof, err := a.SealPoolRelease(ctx, "pa")
 	if err != nil || proof.For("i-pa") != nil {
-		t.Fatalf("sealing a host that holds nothing: %v", err)
+		t.Fatalf("sealing a host proved to run nothing: %v", err)
 	}
 	if o := readOrder(t, a, "pa"); o.State != PoolSealed {
 		t.Fatalf("the order is %s, want sealed", o.State)
@@ -198,9 +211,6 @@ func TestAJoinedHostIsSealedOnlyOnceItHoldsNothing(t *testing.T) {
 	if err := a.PoolOrderReleased(ctx, "pa"); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.ClosePoolOrder(ctx, "pa", ""); err == nil {
-		t.Fatal("a closure without a reason was taken")
-	}
 	if err := a.PoolOrderGone(ctx, "pa"); err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +219,56 @@ func TestAJoinedHostIsSealedOnlyOnceItHoldsNothing(t *testing.T) {
 	}
 }
 
-// A RELEASED ORDER A PERSON CLOSES SAYS SO, and only a released order is closed by hand.
+// A HOST ADMITTED BUT WHOSE NODE NEVER REGISTERED WAS NEVER PLACEABLE, so it is sealed
+// as soon as nothing holds it, its credentials revoked; a first registration after the
+// seal is not placeable.
+func TestAnAdmittedHostThatNeverRegisteredIsSealed(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	tok := placedOrder(t, a, "pa")
+	if _, err := a.AdmitPoolEnrollment(ctx, admission(t, a, "pa", "SHA256:pa", tok, "0a")); err != nil {
+		t.Fatal(err)
+	}
+	if sealed, err := a.RequestPoolRelease(ctx, "pa", "it never came up"); err != nil || sealed {
+		t.Fatalf("releasing an admitted host: %v, %v", sealed, err)
+	}
+	proof, err := a.SealPoolRelease(ctx, "pa")
+	if err != nil || proof.For("i-pa") != nil {
+		t.Fatalf("sealing a host that never registered: %v", err)
+	}
+	if revoked, err := a.CertRevoked(ctx, "0a"); err != nil || !revoked {
+		t.Fatalf("its certificate was not revoked: %v, %v", revoked, err)
+	}
+	registerArchNode(t, a, PoolNodeName("pa"), config.ArchX64)
+	if placeableHosts(t, a) != 0 {
+		t.Fatal("a first registration after the seal is placeable")
+	}
+}
+
+// AN UNJOINED ORDER'S SEAL FENCES ITS NAME: a node registering under the name the order
+// would have given it is not placeable, though nothing linked it.
+func TestASealedUnjoinedOrderFencesItsName(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	a := poolAllocator(t, &now)
+	ctx := t.Context()
+	placedOrder(t, a, "pa")
+	if sealed, err := a.RequestPoolRelease(ctx, "pa", "it never booted"); err != nil || !sealed {
+		t.Fatalf("seal: %v, %v", sealed, err)
+	}
+	registerArchNode(t, a, PoolNodeName("pa"), config.ArchX64)
+	if placeableHosts(t, a) != 0 {
+		t.Fatal("a node under a sealed order's name is placeable")
+	}
+	registerArchNode(t, a, PoolNodeName("pa"), config.ArchX64)
+	if placeableHosts(t, a) != 0 {
+		t.Fatal("a node registering again under a sealed order's name is placeable")
+	}
+}
+
+// A SEALED OR RELEASED ORDER A PERSON CLOSES SAYS SO, and no other is closed by hand.
 func TestAReleasedOrderAPersonClosesSaysSo(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
@@ -220,9 +279,6 @@ func TestAReleasedOrderAPersonClosesSaysSo(t *testing.T) {
 		t.Fatalf("closing a placed order answered %v", err)
 	}
 	if _, err := a.RequestPoolRelease(ctx, "pa", "never booted"); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.PoolOrderReleased(ctx, "pa"); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.ClosePoolOrder(ctx, "pa", "the console lists no such server"); err != nil {
@@ -256,73 +312,36 @@ func TestAFirstRegistrationAfterTheReleaseIsNotPlaceable(t *testing.T) {
 	}
 }
 
-// WHAT A NODE'S INVENTORY PROVES FOR ITS RELEASE: nothing until the quiet period has
-// passed, nothing from a node that is not live or a registration before the current
-// one, and only the second report counted, which was listed after the first arrived;
-// a launch dispatched since starts the proof again, and a decommission on the compute
-// barrier's proof is proof it runs nothing.
-func TestWhatANodesInventoryProvesForItsRelease(t *testing.T) {
+// WHAT A REGISTERED NODE IS PROVED TO RUN FOR ITS RELEASE: nothing only on a
+// decommission on the compute barrier's proof, and then not if an inventory of its
+// current registration reports compute; an inventory alone proves nothing.
+func TestWhatARegisteredNodeIsProvedToRun(t *testing.T) {
 	t.Parallel()
-	requested := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
-	at := func(d time.Duration) string { return ts(requested.Add(poolReleaseQuiet + d)) }
-	first := at(time.Second)
-	cases := map[string]struct {
-		order     ledgerdb.PoolOrder
-		facts     ledgerdb.ReadNodeReleaseFactsRow
-		inventory int
-		dispatch  int64
-		reportAt  string
-	}{
-		"decommissioned on proof": {
-			facts: ledgerdb.ReadNodeReleaseFactsRow{DecommissionProven: 1}, inventory: 0,
-		},
-		"a launch dispatched since": {
-			order: ledgerdb.PoolOrder{ReleaseDispatch: 3, ReleaseReportAt: first},
-			facts: reportingNode(4, at(time.Hour), 0), inventory: -1, dispatch: 4,
-		},
-		"not live": {
-			facts:     func() ledgerdb.ReadNodeReleaseFactsRow { f := reportingNode(0, at(time.Hour), 0); f.Live = 0; return f }(),
-			inventory: -1,
-		},
-		"an earlier registration's": {
-			facts: func() ledgerdb.ReadNodeReleaseFactsRow {
-				f := reportingNode(0, at(time.Hour), 0)
-				f.Epoch = 9
-				return f
-			}(),
-			inventory: -1,
-		},
-		"within the quiet period":  {facts: reportingNode(0, ts(requested.Add(poolReleaseQuiet)), 0), inventory: -1},
-		"the first counted report": {facts: reportingNode(0, first, 0), inventory: -1, reportAt: first},
-		"the first counted report again": {
-			order: ledgerdb.PoolOrder{ReleaseReportAt: first}, facts: reportingNode(0, first, 0), inventory: -1, reportAt: first,
-		},
-		"a second report, empty": {
-			order: ledgerdb.PoolOrder{ReleaseReportAt: first}, facts: reportingNode(0, at(time.Minute), 0),
-			inventory: 0, reportAt: first,
-		},
-		"a second report, running": {
-			order: ledgerdb.PoolOrder{ReleaseReportAt: first}, facts: reportingNode(0, at(time.Minute), 2),
-			inventory: 2, reportAt: first,
-		},
-	}
-	for name, c := range cases {
-		inventory, dispatch, reportAt, err := releaseInventory(&c.order, &c.facts, requested)
-		if err != nil || inventory != c.inventory || dispatch != c.dispatch || reportAt != c.reportAt {
-			t.Errorf("%s: %d, %d, %q, %v; want %d, %d, %q", name, inventory, dispatch, reportAt, err,
-				c.inventory, c.dispatch, c.reportAt)
+	inventory := func(epoch, running int64) ledgerdb.ReadNodeReleaseFactsRow {
+		return ledgerdb.ReadNodeReleaseFactsRow{
+			Epoch:     2,
+			NodeEpoch: sql.NullInt64{Int64: epoch, Valid: true},
+			Running:   sql.NullInt64{Int64: running, Valid: true},
 		}
 	}
-}
+	proven := func(f ledgerdb.ReadNodeReleaseFactsRow) ledgerdb.ReadNodeReleaseFactsRow {
+		f.DecommissionProven = 1
 
-// reportingNode is a live node at epoch 1 whose current inventory arrived at received with
-// running instances, and dispatch launches dispatched to it.
-func reportingNode(dispatch int64, received string, running int64) ledgerdb.ReadNodeReleaseFactsRow {
-	return ledgerdb.ReadNodeReleaseFactsRow{
-		Live: 1, Epoch: 1, DispatchGeneration: dispatch,
-		NodeEpoch:  sql.NullInt64{Int64: 1, Valid: true},
-		Running:    sql.NullInt64{Int64: running, Valid: true},
-		ReceivedAt: sql.NullString{String: received, Valid: true},
+		return f
+	}
+	for name, c := range map[string]struct {
+		facts ledgerdb.ReadNodeReleaseFactsRow
+		want  int
+	}{
+		"an empty inventory alone":                   {inventory(2, 0), -1},
+		"decommissioned on proof":                    {proven(ledgerdb.ReadNodeReleaseFactsRow{Epoch: 2}), 0},
+		"decommissioned, reporting nothing":          {proven(inventory(2, 0)), 0},
+		"decommissioned, reporting compute":          {proven(inventory(2, 3)), 3},
+		"decommissioned, an old registration's word": {proven(inventory(1, 3)), 0},
+	} {
+		if got := releaseInventory(&c.facts); got != c.want {
+			t.Errorf("%s: %d, want %d", name, got, c.want)
+		}
 	}
 }
 
