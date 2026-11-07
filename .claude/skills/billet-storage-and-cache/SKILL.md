@@ -32,6 +32,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **An intact orphan volume is reclaimed by an operator, on proof, through the trash (#301).**
 - **A kernel mapping no job accounts for is unmapped on proof, never forced, and counted (#494).**
 - **A golden's system disk is the builder's clone, renamed in place, and nothing that sweeps the cache pool takes it (#508).**
+- **A breaker per node and store stops jobs asking a store that has stopped answering, and decides nothing else (#531).**
 
 ### A store of whole objects, on EC2: [references/objects.md](references/objects.md)
 

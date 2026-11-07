@@ -212,6 +212,10 @@ type LoopOptions struct {
 	// say, after every accepted registration (internal/imageaccept), and its macOS
 	// limit (internal/macoslimit); empty records neither.
 	ImageAcceptanceDir string
+	// Registered is told of every accepted registration, for what the node reports
+	// once per registration because the ledger keeps it only under the one in force.
+	// Nil tells nobody.
+	Registered func()
 	// Now is the clock the record's registered_at is read from. Nil is the
 	// wall clock.
 	Now func() time.Time
@@ -577,6 +581,10 @@ var drainServingDone func()
 // recordRegistration publishes the record for an accepted registration, or
 // logs why it could not, with the path and the operation, on every failure.
 func recordRegistration(c *Client, log *slog.Logger, opts LoopOptions) {
+	if opts.Registered != nil {
+		opts.Registered()
+	}
+
 	if err := publishRegistration(c, opts); err != nil {
 		log.Error("could not record this registration; the node keeps serving and tries "+
 			"again at its next registration", "path", opts.RegistrationRecordPath, "error", err)

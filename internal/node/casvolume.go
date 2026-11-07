@@ -178,9 +178,13 @@ func (s *CacheService) casVolume(
 
 		return hv, err
 	}
-	volume, cold, err := s.cloneWithin(ctx, key, ceiling)
-	if cold {
-		volume, err = s.store.Create(ctx, key, ceiling)
+	volume, cold, err := s.acquireVolume(ctx, session, cacheWorkLimit,
+		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
+			return s.cloneOrCreate(acquireCtx, session.instance, key, ceiling, ceiling)
+		})
+	// Nothing was asked, so there is nothing to back off from when the store comes back.
+	if errors.Is(err, errStoreOpen) {
+		return nil, err
 	}
 	if err != nil {
 		backOff()
@@ -274,7 +278,14 @@ func (s *CacheService) startFresh(
 	if err := s.store.Discard(ctx, hv.Volume); err != nil {
 		return fmt.Errorf("discard the full %s cache: %w", hv.Kind, err)
 	}
-	fresh, err := s.store.Create(ctx, key, ceiling)
+	fresh, _, err := s.acquireVolume(ctx, session, cacheWorkLimit,
+		func(acquireCtx context.Context) (storecontract.Volume, bool, error) {
+			created, err := s.handOver(session.instance, "a fresh volume", func() (storecontract.Volume, error) {
+				return s.store.Create(acquireCtx, key, ceiling)
+			})
+
+			return created, false, err
+		})
 	if err != nil {
 		return err
 	}
@@ -455,8 +466,24 @@ func (s *CacheService) openCASHandle(
 
 		return nil, reapi.ErrEnded
 	}
-	hv, err := s.casVolume(ctx, session, kind)
 	enabled := sessionSetting(session, kind).Enabled
+	// A STORE THAT HAS STOPPED ANSWERING IS NOT READ EITHER, whether or not this
+	// session has its volume yet: a read of a volume whose OSDs are gone waits in the
+	// kernel, so nothing here could end it, and the guest's helper reads this as a miss.
+	// On probation one still to get its volume goes on, to casVolume's own admission,
+	// as one that has it would decide nothing by reading it.
+	refused := s.breaker.isOpen()
+	if session.hosts[kind] != nil {
+		refused = !s.breaker.allow()
+	}
+	if enabled && refused {
+		noteBuildCache(session, kind, alloc.BuildCacheBypassed)
+		session.mu.Unlock()
+		admitted()
+
+		return nil, errStoreOpen
+	}
+	hv, err := s.casVolume(ctx, session, kind)
 	if err == nil && s.now().Sub(hv.allowedAt) >= casPolicyAge {
 		// THE KILL SWITCH IS ASKED AGAIN WHILE THE VOLUME IS IN USE, not only
 		// when it is attached, so disabling a cache stops a running job's use of
@@ -475,6 +502,8 @@ func (s *CacheService) openCASHandle(
 	switch {
 	case errors.Is(err, errCacheOff) && enabled:
 		noteBuildCache(session, kind, alloc.BuildCacheDisabled)
+	case errors.Is(err, errStoreOpen):
+		noteBuildCache(session, kind, alloc.BuildCacheBypassed)
 	case err != nil && !errors.Is(err, errCacheOff):
 		noteBuildCache(session, kind, alloc.BuildCacheUnavailable)
 	}
@@ -531,21 +560,40 @@ func (h *casHandle) Open(table reapi.Table, digest string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// THE OPEN AND ITS FIRST BYTE ARE WHAT THE BREAKER HEARS OF A READ, which it counts
+	// as a timeout from casReadLimit on if the kernel is still waiting on the store.
+	// What is not there is the store answering.
+	done := h.s.breaker.watch(storeCall{op: "a content-addressed read", who: h.session.instance}, casReadLimit)
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if h.hv.Objects {
+			done(nil)
+
 			return h.openBlob(table, digest)
 		}
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) {
+			err = nil
+		}
+		done(err)
 
 		return nil, fs.ErrNotExist
 	}
 	file := os.NewFile(uintptr(fd), path)
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
+		done(err)
 		_ = file.Close()
 
 		return nil, fs.ErrNotExist
 	}
+	var first [1]byte
+	if _, err := file.ReadAt(first[:], 0); err != nil && !errors.Is(err, io.EOF) {
+		done(err)
+		_ = file.Close()
+
+		return nil, fs.ErrNotExist
+	}
+	done(nil)
 	h.hv.hit.Store(true)
 
 	return file, nil
@@ -820,6 +868,11 @@ func (s *CacheService) releaseCASVolume(
 	if !s.sessionKindAllowed(ctx, session, hv.Kind) {
 		return abandon("the cache is disabled for this repository")
 	}
+	// A STORE THAT HAS STOPPED ANSWERING IS ASKED AGAIN NEXT PASS, inside the window. On
+	// probation it may be the only thing that could settle it.
+	if !s.breaker.admit() {
+		return false, nil
+	}
 
 	journal.Phase = phaseSnapshotting
 	if err := s.persistSession(session); err != nil {
@@ -914,6 +967,7 @@ func (s *CacheService) mergeCASVolume(
 	key := hv.Volume.Key
 	lease, fence, err := s.store.AcquireWriter(ctx, key, session.instance+"/"+string(hv.Kind),
 		cacheWriterTTL)
+	s.countedPublication(session.instance, "a cache writer", err)
 	if held, ok := errors.AsType[*storecontract.WriterHeldError](err); ok {
 		return "", false, fmt.Errorf("acquire writer: %w: %w", errWriterHeld, held)
 	}
@@ -927,19 +981,30 @@ func (s *CacheService) mergeCASVolume(
 		if !s.sessionKindAllowed(ctx, session, hv.Kind) {
 			return release(errors.New("the cache was disabled before its publication"))
 		}
-		if err := s.store.PublishCAS(ctx, key, current, candidate, lease, fence); err != nil {
+		err := s.store.PublishCAS(ctx, key, current, candidate, lease, fence)
+		s.countedPublish(session.instance, err)
+		if err != nil {
 			return release(fmt.Errorf("publish: %w", err))
 		}
 
 		return nil
 	}
 
+	// snapshot is one step of the publication, counted as every other is.
+	snapshot := func(volume storecontract.Volume) (storecontract.Candidate, error) {
+		candidate, err := s.store.Snapshot(ctx, volume)
+		s.countedPublication(session.instance, "a cache snapshot", err)
+
+		return candidate, err
+	}
+
 	current, currentErr := s.store.Current(ctx, key)
+	s.countedPublication(session.instance, "a cache lookup", currentErr)
 	if currentErr != nil && !errors.Is(currentErr, storecontract.ErrMiss) {
 		return "", false, release(currentErr)
 	}
 	if current == hv.Volume.Generation || (hv.Supersedes != "" && current == hv.Supersedes) {
-		candidate, err := s.store.Snapshot(ctx, hv.Volume)
+		candidate, err := snapshot(hv.Volume)
 		if err != nil {
 			return "", false, release(fmt.Errorf("snapshot: %w", err))
 		}
@@ -956,7 +1021,10 @@ func (s *CacheService) mergeCASVolume(
 	if err != nil {
 		return "", false, release(err)
 	}
-	latest, err := s.store.Clone(ctx, key, current)
+	// A CLONE HANDED OVER IS THE STORE DOING WHAT A JOB NEEDS, as a job's own is.
+	latest, err := s.handOver(session.instance, "a clone to merge into", func() (storecontract.Volume, error) {
+		return s.store.Clone(ctx, key, current)
+	})
 	if err != nil {
 		return "", false, release(fmt.Errorf("clone the newest generation: %w", err))
 	}
@@ -990,7 +1058,7 @@ func (s *CacheService) mergeCASVolume(
 		if err := s.persistSession(session); err != nil {
 			return "", false, release(err)
 		}
-		candidate, err := s.store.Snapshot(ctx, hv.Volume)
+		candidate, err := snapshot(hv.Volume)
 		if err != nil {
 			return "", false, release(fmt.Errorf("snapshot: %w", err))
 		}
@@ -1006,7 +1074,7 @@ func (s *CacheService) mergeCASVolume(
 	if err := errors.Join(s.actionIO.Unmount(ctx, source), s.actionIO.Unmount(ctx, target)); err != nil {
 		return "", false, release(err)
 	}
-	candidate, err := s.store.Snapshot(ctx, latest)
+	candidate, err := snapshot(latest)
 	if err != nil {
 		// %v: THE CLONE IS RECORDED AND MERGED INTO, so this ends the publication
 		// whatever the reason, and is not asked again from the top.

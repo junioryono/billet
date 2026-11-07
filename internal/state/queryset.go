@@ -125,6 +125,7 @@ type ReadOps interface {
 	ListLeaseIDsOnNode(ctx context.Context, arg ledgerdb.ListLeaseIDsOnNodeParams) ([]string, error)
 	ListLiveNodeNames(ctx context.Context) ([]string, error)
 	ListNodeInventories(ctx context.Context) ([]ledgerdb.ListNodeInventoriesRow, error)
+	ListNodeCacheStores(ctx context.Context) ([]ledgerdb.ListNodeCacheStoresRow, error)
 	ListNodeRegistrations(ctx context.Context) ([]ledgerdb.ListNodeRegistrationsRow, error)
 	ListNodeWireVersions(ctx context.Context) ([]ledgerdb.ListNodeWireVersionsRow, error)
 	ListOutstandingLeases(ctx context.Context) ([]ledgerdb.ListOutstandingLeasesRow, error)
@@ -415,6 +416,7 @@ type WriteOps interface {
 	EndPoolClearanceRun(ctx context.Context, orderID string) error
 	ForceClosePoolOrder(ctx context.Context, arg ledgerdb.ForceClosePoolOrderParams) (int64, error)
 	ClearPoolReleaseContradiction(ctx context.Context, node string) error
+	UpsertNodeCacheStore(ctx context.Context, arg ledgerdb.UpsertNodeCacheStoreParams) (int64, error)
 	UpsertNodeRegistration(ctx context.Context, arg ledgerdb.UpsertNodeRegistrationParams) (int64, error)
 	UpsertPendingCompletion(ctx context.Context, arg ledgerdb.UpsertPendingCompletionParams) error
 	UpsertScaleSet(ctx context.Context, arg ledgerdb.UpsertScaleSetParams) error

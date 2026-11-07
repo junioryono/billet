@@ -13,7 +13,13 @@ import (
 )
 
 // newestMigration is the version rewindNewest takes back off a ledger.
-const newestMigration = 81
+const newestMigration = 82
+
+// undoJobHistoryNode is what migration 81 added, taken back with its record.
+var undoJobHistoryNode = []string{
+	`DROP INDEX job_history_node_finished_idx`,
+	`DELETE FROM schema_migrations WHERE version = 81`,
+}
 
 // undoPoolClearance is what migration 80 added, taken back with its record.
 var undoPoolClearance = []string{
@@ -29,7 +35,7 @@ var undoPoolClearance = []string{
 // next migration has exactly one version to apply.
 //
 // IT KNOWS THAT MIGRATION'S STATEMENTS, the way the version tests beside it do:
-// the index migration 81 added, and its record. It refuses
+// the table migration 82 added, and its record. It refuses
 // to run once a newer one exists, so the ledger it leaves is always the schema
 // just before this binary's newest and, when a move is reported, its endpoints
 // are {newest-1, newest}; rewinding 61 under a 62 would leave a ledger at 62 with
@@ -44,8 +50,8 @@ func rewindNewest(t *testing.T, db *DB) {
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
-			`DROP INDEX job_history_node_finished_idx`,
-			`DELETE FROM schema_migrations WHERE version = 81`,
+			`DROP TABLE node_cache_stores`,
+			`DELETE FROM schema_migrations WHERE version = 82`,
 		} {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
@@ -73,7 +79,7 @@ func ledgerAt78(t *testing.T) string {
 	rewindNewest(t, db)
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		for _, stmt := range append(slices.Clone(undoPoolClearance),
+		for _, stmt := range append(slices.Concat(undoJobHistoryNode, undoPoolClearance),
 			`ALTER TABLE pool_orders DROP COLUMN release_contradicted`,
 			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
 			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,

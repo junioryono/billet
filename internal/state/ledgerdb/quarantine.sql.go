@@ -166,6 +166,58 @@ func (q *Queries) ListHeldLeases(ctx context.Context, arg ListHeldLeasesParams) 
 	return items, nil
 }
 
+const listNodeCacheStores = `-- name: ListNodeCacheStores :many
+SELECT n.name, n.live, s.store, s.state, s.since, s.failures, s.reason, s.received_at
+  FROM node_cache_stores s
+  JOIN nodes n ON n.name = s.node AND n.epoch = s.node_epoch
+ ORDER BY n.name, s.store
+`
+
+type ListNodeCacheStoresRow struct {
+	Name       string
+	Live       int64
+	Store      string
+	State      string
+	Since      string
+	Failures   int64
+	Reason     string
+	ReceivedAt string
+}
+
+// What every host last said about its store, under the registration in force: a report
+// from before a host reconnected is not its current word.
+func (q *Queries) ListNodeCacheStores(ctx context.Context) ([]ListNodeCacheStoresRow, error) {
+	rows, err := q.db.QueryContext(ctx, listNodeCacheStores)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListNodeCacheStoresRow
+	for rows.Next() {
+		var i ListNodeCacheStoresRow
+		if err := rows.Scan(
+			&i.Name,
+			&i.Live,
+			&i.Store,
+			&i.State,
+			&i.Since,
+			&i.Failures,
+			&i.Reason,
+			&i.ReceivedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listNodeInventories = `-- name: ListNodeInventories :many
 SELECT n.name, n.live, n.epoch, i.node_epoch, i.running, i.received_at
   FROM nodes n
@@ -478,6 +530,50 @@ type TerminalizeQuarantinedLeaseWithReasonParams struct {
 func (q *Queries) TerminalizeQuarantinedLeaseWithReason(ctx context.Context, arg TerminalizeQuarantinedLeaseWithReasonParams) error {
 	_, err := q.db.ExecContext(ctx, terminalizeQuarantinedLeaseWithReason, arg.FailureReason, arg.ID)
 	return err
+}
+
+const upsertNodeCacheStore = `-- name: UpsertNodeCacheStore :execrows
+INSERT INTO node_cache_stores (node, store, state, since, failures, reason, node_epoch, received_at)
+SELECT name, $1, $2, $3, $4, $5, epoch, $6
+  FROM nodes WHERE name = $7 AND incarnation = $8
+ON CONFLICT(node, store) DO UPDATE SET
+     state = excluded.state,
+     since = excluded.since,
+     failures = excluded.failures,
+     reason = excluded.reason,
+     node_epoch = excluded.node_epoch,
+     received_at = excluded.received_at
+`
+
+type UpsertNodeCacheStoreParams struct {
+	Store       string
+	State       string
+	Since       string
+	Failures    int64
+	Reason      string
+	ReceivedAt  string
+	Node        string
+	Incarnation string
+}
+
+// Record what a node's breaker says about its site's store, under the node's epoch
+// now, for the process registered now. A node with no such row writes nothing, which
+// is what the count says.
+func (q *Queries) UpsertNodeCacheStore(ctx context.Context, arg UpsertNodeCacheStoreParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, upsertNodeCacheStore,
+		arg.Store,
+		arg.State,
+		arg.Since,
+		arg.Failures,
+		arg.Reason,
+		arg.ReceivedAt,
+		arg.Node,
+		arg.Incarnation,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const upsertNodeInventory = `-- name: UpsertNodeInventory :exec

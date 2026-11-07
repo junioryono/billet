@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 45
+	Version = 46
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -604,6 +604,18 @@ const (
 	// and starts a guest with no terminal, which an attach then says, and which costs the job
 	// nothing.
 	VersionJobAttach = 45
+
+	// VersionCacheBreaker is the version from which a cache observation may say
+	// `bypassed`, what a job got when its node's breaker had stopped asking the site's
+	// store (#531), and from which a node may report what the breaker is doing
+	// (POST /v1/nodes/{node}/cache-store), which `billet status` says back.
+	//
+	// DIAGNOSTICS, reported rather than refused. CHECKED WHERE THEY ARE SENT, because
+	// an older plane validates an observation's words and would refuse the whole of
+	// one over this, and has no such route: below it the node says `unavailable`,
+	// which is true as far as it goes, and sends no report. CHECKED WHERE THE WORD IS
+	// READ too, so a pairing below it that sends one anyway is kept as `unavailable`.
+	VersionCacheBreaker = 46
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

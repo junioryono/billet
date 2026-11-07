@@ -1,0 +1,5 @@
+{
+  "lease": "AttachSpec.lease",
+  "stream": "AttachSpec.stream",
+  "token": "AttachSpec.token"
+}

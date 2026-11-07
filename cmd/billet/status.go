@@ -145,6 +145,7 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	host.PrintCredentialSweeps(ctx, env, a, db)
 
 	printReportedInventory(ctx, env, a)
+	printCacheStores(ctx, env, a, now)
 	printComputeBarrier(ctx, env, a)
 	printWireWindow(ctx, env, a)
 	printCacheAwareWaits(ctx, env, a, cfg.Tiers)
@@ -301,6 +302,51 @@ func printReportedInventory(ctx context.Context, env cli.Env, a *alloc.Allocator
 		}
 
 		fmt.Fprintln(env.Stdout)
+	}
+}
+
+// printCacheStores says which hosts' jobs are skipping their site's store, which is why
+// a job there started cold with nothing else looking wrong.
+//
+// A LINE PER HOST NOT USING ITS STORE, AND ONE FOR ALL THE REST: a fleet of healthy
+// stores is one fact. THE HOST'S OWN LAST WORD, like what it says it is running, and it
+// never fails the command.
+func printCacheStores(ctx context.Context, env cli.Env, a *alloc.Allocator, now time.Time) {
+	stores, err := a.NodeCacheStores(ctx)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "cache     unavailable: %v\n", err)
+
+		return
+	}
+
+	closed := 0
+	for i := range stores {
+		store := &stores[i]
+		// A HOST'S CLOCK IS ITS OWN, and one ahead of this one has not been open for less
+		// than nothing.
+		held := max(now.Sub(store.Since), 0).Round(time.Second)
+		switch store.State {
+		case alloc.CacheStoreOpen:
+			fmt.Fprintf(env.Stdout, "cache     %s: %s breaker OPEN for %s (%d %s failures); its new jobs start cold\n",
+				store.Node, store.Store, held, store.Failures, store.Reason)
+		case alloc.CacheStoreProbation:
+			fmt.Fprintf(env.Stdout, "cache     %s: %s breaker on probation for %s; it answered a probe, and "+
+				"the next job's cache decides\n", store.Node, store.Store, held)
+		case alloc.CacheStoreClosed:
+			// A HOST THIS DEPLOYMENT CANNOT REACH IS USING NOTHING AS FAR AS ANYONE HERE KNOWS.
+			if store.Live {
+				closed++
+			}
+		default:
+			// A WORD THIS BINARY DOES NOT KNOW IS A NEWER BINARY'S, shown rather than dropped.
+			fmt.Fprintf(env.Stdout, "cache     %s: %s breaker says %q\n", store.Node, store.Store, store.State)
+		}
+		if store.State != alloc.CacheStoreClosed && !store.Live {
+			fmt.Fprintf(env.Stdout, "          %s: this deployment cannot reach it, so that is its last word\n", store.Node)
+		}
+	}
+	if closed > 0 {
+		fmt.Fprintf(env.Stdout, "cache     %d host(s) using their site's store\n", closed)
 	}
 }
 
