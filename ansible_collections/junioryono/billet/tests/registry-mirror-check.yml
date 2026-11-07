@@ -1,0 +1,54 @@
+---
+# The registry mirrors' own tasks against a real systemd and a real Distribution.
+# registry-mirror-check.sh drives it: what is asserted is in that script, from what
+# this leaves behind.
+- name: Converge the registry mirrors the way the host role does
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    billet_retirement_node_ordinary: "{{ gate_retained | default(false) }}"
+    billet_networks:
+      - {name: "{{ gate_bridge_a }}", address: "{{ gate_address_a }}", prefix: 32, netmask: 255.255.255.255, dhcp_start: "", dhcp_end: ""}
+      - {name: "{{ gate_bridge_b }}", address: "{{ gate_address_b }}", prefix: 32, netmask: 255.255.255.255, dhcp_start: "", dhcp_end: ""}
+    billet_guest_host_tcp_ports: [53, 7718]
+    billet_guest_host_udp_ports: [53, 67]
+    billet_guest_denied_ipv4: [10.0.0.0/8]
+    billet_guest_denied_ipv6: [fc00::/7]
+    billet_image_verify_port: 7719
+    gate_node:
+      name: mirror-check
+      provider: "{{ gate_provider | default('firecracker') }}"
+      firecracker: {bridge: "{{ gate_bridge_a }}"}
+  tasks:
+    - name: Start from the configuration an inventory would give
+      ansible.builtin.set_fact:
+        billet_effective_config: >-
+          {{ {'node': gate_node | combine(gate_own_mirrors | default({}))} }}
+
+    - name: Decide the mirrors the configuration names
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: registry-mirrors-config.yml
+
+    - name: Fetch the registry mirrors' release
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: registry-mirrors-fetch.yml
+
+    - name: Run or remove the registry mirrors
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: registry-mirrors.yml
+
+    - name: Say what the node would be told
+      ansible.builtin.copy:
+        content: "{{ billet_effective_config | to_nice_json }}\n"
+        dest: "{{ gate_output }}/config.json"
+        mode: "0644"
+
+    - name: Render the firewall a guest bridge gets
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../roles/host/templates/network.nft.j2"
+        dest: "{{ gate_output }}/network.nft"
+        mode: "0644"

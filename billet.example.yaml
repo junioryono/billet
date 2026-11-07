@@ -839,6 +839,18 @@ node:
   #   docker.io: https://docker-cache.home.example
   #   ghcr.io: https://ghcr-cache.home.example
   #   quay.io: https://quay-cache.home.example
+  #
+  # The PEM authority a mirror's certificate chains to, for mirrors no public
+  # authority signs. Each guest is handed it and trusts it for those mirrors alone,
+  # never in its system store; an image older than this key cannot verify such a
+  # mirror and pulls from the registry. The file is read at each launch.
+  #
+  # The host role runs three mirrors on every Firecracker host and writes only
+  # registry_mirrors, unless this file names its own or billet_registry_mirrors is
+  # false; their authority is /etc/billet-registry/ca.pem, which a node reads when
+  # this key names no other. Do not keep your own there: that directory is the role's.
+  #
+  # registry_mirrors_ca: /etc/billet/my-mirrors-ca.pem
 
   # THE CLOUD BACKEND, for `provider: ec2`. One instance per job, in one subnet.
   #

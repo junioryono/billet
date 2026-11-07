@@ -1,0 +1,92 @@
+---
+# THE MIRRORS' RELEASE, FETCHED AND VERIFIED BEFORE ANYTHING THIS CONVERGE STOPS:
+# a guest network change drains the node and only services.yml starts it again,
+# so a download failing after that would leave the host with nothing running
+# until somebody came. Its directories and the rest of the mirrors are
+# registry-mirrors.yml's, after the bridges they listen on.
+- name: Select the mirror's release architecture
+  ansible.builtin.set_fact:
+    billet_registry_mirror_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(ansible_facts['architecture'], '') }}"
+
+- name: Fetch the registry mirrors' release
+  when: billet_registry_mirrors_active | bool
+  block:
+    - name: Refuse an unsupported registry mirror architecture
+      ansible.builtin.assert:
+        that: billet_registry_mirror_arch | length > 0
+        fail_msg: >-
+          The registry mirrors are supported here only on x86_64 and aarch64, not
+          {{ ansible_facts['architecture'] }}. Set billet_registry_mirrors to false.
+
+    - name: Create the registry mirrors' release directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ '0700' if item == billet_registry_mirror_stage else '0755' }}"
+      loop:
+        - "{{ billet_registry_mirror_install_dir }}"
+        - "{{ billet_registry_mirror_stage }}"
+      become: true
+
+    - name: Check the exact registry mirror binary
+      ansible.builtin.stat:
+        path: "{{ billet_registry_mirror_binary }}"
+      register: billet_registry_mirror_binary_state
+      check_mode: false
+      become: true
+
+    - name: Report that a dry run does not install the registry mirror
+      ansible.builtin.debug:
+        msg: >-
+          This is a check run, so Distribution {{ billet_registry_mirror_version }} was
+          NOT downloaded or installed. A real converge fetches it for
+          {{ billet_registry_mirror_arch }} and verifies it against the hash this
+          collection pins.
+      when:
+        - not billet_registry_mirror_binary_state.stat.exists
+        - ansible_check_mode
+
+    - name: Download the verified registry mirror release
+      ansible.builtin.get_url:
+        url: "https://github.com/distribution/distribution/releases/download/{{ billet_registry_mirror_version }}/registry_{{ billet_registry_mirror_version | regex_replace('^v', '') }}_linux_{{ billet_registry_mirror_arch }}.tar.gz"
+        dest: "{{ billet_registry_mirror_stage }}/registry-{{ billet_registry_mirror_version }}.tar.gz"
+        checksum: "sha256:{{ billet_registry_mirror_checksums[billet_registry_mirror_arch] }}"
+        timeout: "{{ billet_fetch_timeout }}"
+        owner: root
+        group: root
+        mode: "0600"
+      register: billet_registry_mirror_download
+      until: billet_registry_mirror_download is succeeded
+      retries: "{{ billet_fetch_retries }}"
+      delay: "{{ billet_fetch_retry_delay }}"
+      become: true
+      when:
+        - not billet_registry_mirror_binary_state.stat.exists
+        - not ansible_check_mode
+
+    - name: Unpack the registry mirror
+      ansible.builtin.unarchive:
+        src: "{{ billet_registry_mirror_stage }}/registry-{{ billet_registry_mirror_version }}.tar.gz"
+        dest: "{{ billet_registry_mirror_stage }}"
+        remote_src: true
+        include: [registry]
+      become: true
+      when:
+        - not billet_registry_mirror_binary_state.stat.exists
+        - not ansible_check_mode
+
+    - name: Install the versioned registry mirror binary
+      ansible.builtin.copy:
+        src: "{{ billet_registry_mirror_stage }}/registry"
+        dest: "{{ billet_registry_mirror_binary }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      register: billet_registry_mirror_install
+      become: true
+      when:
+        - not billet_registry_mirror_binary_state.stat.exists
+        - not ansible_check_mode
