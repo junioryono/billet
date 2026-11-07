@@ -15,7 +15,8 @@ import (
 const poolUsage = "usage: billet pool [--config PATH]\n" +
 	"       billet pool abandon [--config PATH] --reason TEXT <order>\n" +
 	"       billet pool unhold [--config PATH] <order>\n" +
-	"       billet pool release [--config PATH] --reason TEXT <order>"
+	"       billet pool release [--config PATH] --reason TEXT <order>\n" +
+	"       billet pool close [--config PATH] --reason TEXT <order>"
 
 // Pool is `billet pool`: what the pool of rented bare metal ordered and what became of
 // each order (ADR-030), closing an uncertain order, releasing a held join, and
@@ -29,6 +30,9 @@ func Pool(ctx context.Context, env cli.Env, args []string) error {
 	}
 	if len(args) > 0 && args[0] == "release" {
 		return poolRelease(ctx, env, args[1:])
+	}
+	if len(args) > 0 && args[0] == "close" {
+		return poolClose(ctx, env, args[1:])
 	}
 	fs := cli.NewFlagSet("billet pool", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
@@ -199,6 +203,39 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "Released %s from placement. Once the ledger shows its host holds nothing, the pool seals "+
 		"it, revokes its node's certificates and asks its source to take it back; `billet pool` shows where it is.\n",
 		order)
+
+	return nil
+}
+
+// poolClose closes a released order on a person's word, after they have looked at the
+// source themselves: how a release closes on a source that never says gone of a host it
+// took back (phoenixNAP), or one no longer configured or ordering elsewhere. The order
+// stops counting against the maximum, and its reason records that a person closed it.
+func poolClose(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet pool close", env.Stdout)
+	cfgPath := cli.AddConfigFlag(fs)
+	reason := fs.String("reason", "", "what you checked in the source's console, recorded on the order")
+	order, err := cli.ParseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+	if order == "" || strings.TrimSpace(*reason) == "" {
+		return errors.New(poolUsage)
+	}
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
+	if err := a.ClosePoolOrder(ctx, order, oneLine(*reason)); err != nil {
+		if errors.Is(err, alloc.ErrPoolOrderMoved) {
+			return fmt.Errorf("billet pool close: %s is not released; only a host its source took back is closed by "+
+				"hand", order)
+		}
+
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "Closed %s.\n", order)
 
 	return nil
 }

@@ -117,6 +117,10 @@ type LeaseStore interface {
 
 // Runner starts and stops the compute for assigned leases.
 type Runner struct {
+	// sweeping makes sweeps serial, whoever asked for one (the node's own loop or a
+	// command): a pool host's release reads a report as listed after the report before
+	// it arrived, which two sweeps listing and reporting across each other would break.
+	sweeping sync.Mutex
 	// purging is set while a background purge of discarded storage runs, so a
 	// sweep starts at most one.
 	purging atomic.Bool
@@ -1677,6 +1681,9 @@ func (r *Runner) purgeDiscarded(ctx context.Context) {
 // has not yet been written. It cannot race a starting job either — the list is
 // taken first, so anything in it predates the query that judges it.
 func (r *Runner) Sweep(ctx context.Context) error {
+	r.sweeping.Lock()
+	defer r.sweeping.Unlock()
+
 	instances, err := r.provider.List(ctx)
 	if err != nil {
 		return fmt.Errorf("node: list running instances: %w", err)

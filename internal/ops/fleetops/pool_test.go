@@ -189,4 +189,30 @@ func TestThePoolCommandReleasesAHost(t *testing.T) {
 	if r := rows["p-idle"]; len(r) < 7 || r[6] != "sealed" {
 		t.Fatalf("the p-idle row = %q\n%s", r, out)
 	}
+
+	// A RELEASED ORDER IS CLOSED BY HAND, with a reason, and only a released one.
+	if err := Pool(ctx, env, []string{"close", "--config", cfg, "--reason", "looked", "p-idle"}); err == nil ||
+		!strings.Contains(err.Error(), "not released") {
+		t.Fatalf("closing a sealed order answered %v", err)
+	}
+	a, closeDB, err = ControlPlaneAllocator(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.PoolOrderReleased(ctx, "p-idle"); err != nil {
+		t.Fatal(err)
+	}
+	closeDB()
+	if err := Pool(ctx, env, []string{"close", "--config", cfg, "p-idle"}); err == nil || !strings.Contains(err.Error(), "usage:") {
+		t.Fatalf("a closure without a reason answered %v", err)
+	}
+	env, out = poolEnv()
+	if err := Pool(ctx, env, []string{"close", "--config", cfg, "--reason", "the console lists no such server", "p-idle"}); err != nil ||
+		!strings.Contains(out.String(), "Closed p-idle") {
+		t.Fatalf("close: %v\n%s", err, out)
+	}
+	env, out = poolEnv()
+	if err := Pool(ctx, env, []string{"--config", cfg}); err != nil || !strings.Contains(out.String(), "closed by a person") {
+		t.Fatalf("the listing after a closure: %v\n%s", err, out)
+	}
 }

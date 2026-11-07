@@ -185,7 +185,8 @@ func (q *Queries) LinkPoolOrderNode(ctx context.Context, arg LinkPoolOrderNodePa
 
 const listPoolOrders = `-- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_dispatch,
+       release_report_at
 FROM pool_orders
 ORDER BY first_attempt_at, order_id
 `
@@ -217,6 +218,8 @@ func (q *Queries) ListPoolOrders(ctx context.Context) ([]PoolOrder, error) {
 			&i.JoinHold,
 			&i.ReleaseRequestedAt,
 			&i.ReleaseReason,
+			&i.ReleaseDispatch,
+			&i.ReleaseReportAt,
 		); err != nil {
 			return nil, err
 		}
@@ -251,18 +254,20 @@ func (q *Queries) MarkPoolOrderAbandoned(ctx context.Context, arg MarkPoolOrderA
 }
 
 const markPoolOrderGone = `-- name: MarkPoolOrderGone :execrows
-UPDATE pool_orders SET state = 'gone', updated_at = $1
- WHERE order_id = $2 AND state = 'released'
+UPDATE pool_orders SET state = 'gone', reason = $1, updated_at = $2
+ WHERE order_id = $3 AND state = 'released'
 `
 
 type MarkPoolOrderGoneParams struct {
+	Reason    string
 	UpdatedAt string
 	OrderID   string
 }
 
-// The source said, in its own terminal answer, that the released host is gone.
+// The source said, in its own terminal answer, that the released host is gone; or a
+// person closed a released order on their word, which the reason records.
 func (q *Queries) MarkPoolOrderGone(ctx context.Context, arg MarkPoolOrderGoneParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, markPoolOrderGone, arg.UpdatedAt, arg.OrderID)
+	result, err := q.db.ExecContext(ctx, markPoolOrderGone, arg.Reason, arg.UpdatedAt, arg.OrderID)
 	if err != nil {
 		return 0, err
 	}
@@ -364,9 +369,31 @@ func (q *Queries) MarkUncertainPoolOrderFound(ctx context.Context, arg MarkUncer
 	return result.RowsAffected()
 }
 
+const notePoolReleaseReport = `-- name: NotePoolReleaseReport :execrows
+UPDATE pool_orders SET release_dispatch = $1, release_report_at = $2
+ WHERE order_id = $3 AND state = 'placed' AND release_requested_at != ''
+`
+
+type NotePoolReleaseReportParams struct {
+	Dispatch int64
+	ReportAt string
+	OrderID  string
+}
+
+// Where a release's proof stands: the dispatch generation it is measured from and the
+// first inventory counted towards it. Only while the release waits for its seal.
+func (q *Queries) NotePoolReleaseReport(ctx context.Context, arg NotePoolReleaseReportParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, notePoolReleaseReport, arg.Dispatch, arg.ReportAt, arg.OrderID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const readPoolOrder = `-- name: ReadPoolOrder :one
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_dispatch,
+       release_report_at
 FROM pool_orders
 WHERE order_id = $1
 `
@@ -392,6 +419,8 @@ func (q *Queries) ReadPoolOrder(ctx context.Context, orderID string) (PoolOrder,
 		&i.JoinHold,
 		&i.ReleaseRequestedAt,
 		&i.ReleaseReason,
+		&i.ReleaseDispatch,
+		&i.ReleaseReportAt,
 	)
 	return i, err
 }
@@ -416,20 +445,28 @@ func (q *Queries) ReleasePoolOrderJoin(ctx context.Context, arg ReleasePoolOrder
 }
 
 const requestPoolOrderRelease = `-- name: RequestPoolOrderRelease :execrows
-UPDATE pool_orders SET release_requested_at = $1, release_reason = $2, updated_at = $1
- WHERE order_id = $3 AND state = 'placed' AND release_requested_at = ''
+UPDATE pool_orders
+   SET release_requested_at = $1, release_reason = $2, release_dispatch = $3, updated_at = $1
+ WHERE order_id = $4 AND state = 'placed' AND release_requested_at = ''
 `
 
 type RequestPoolOrderReleaseParams struct {
-	Now     string
-	Reason  string
-	OrderID string
+	Now      string
+	Reason   string
+	Dispatch int64
+	OrderID  string
 }
 
 // A person asks for a joined host's release: the moment placement stops, which an
-// inventory reported after it is measured against. Once, and only of a placed order.
+// inventory reported after it is measured against, and the node's launch-dispatch
+// generation then. Once, and only of a placed order.
 func (q *Queries) RequestPoolOrderRelease(ctx context.Context, arg RequestPoolOrderReleaseParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, requestPoolOrderRelease, arg.Now, arg.Reason, arg.OrderID)
+	result, err := q.db.ExecContext(ctx, requestPoolOrderRelease,
+		arg.Now,
+		arg.Reason,
+		arg.Dispatch,
+		arg.OrderID,
+	)
 	if err != nil {
 		return 0, err
 	}

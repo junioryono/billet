@@ -1430,6 +1430,13 @@ type fakeProvider struct {
 	// enteredLaunch receives once Launch has begun waiting, so a test can act
 	// while the provider is genuinely mid-launch rather than sleeping and hoping.
 	enteredLaunch chan struct{}
+
+	// listGate, when set, holds every List open until it is closed, after sending on
+	// enteredList; listing and listPeak count the Lists in flight and the most at once.
+	listGate    chan struct{}
+	enteredList chan struct{}
+	listing     atomic.Int32
+	listPeak    atomic.Int32
 }
 
 type interruptingProvider struct {
@@ -1548,6 +1555,15 @@ func (f *fakeProvider) Find(ctx context.Context, name string) (*provider.Instanc
 func (f *fakeProvider) List(ctx context.Context) ([]*provider.Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+
+	if f.listGate != nil {
+		n := f.listing.Add(1)
+		defer f.listing.Add(-1)
+		for peak := f.listPeak.Load(); n > peak && !f.listPeak.CompareAndSwap(peak, n); peak = f.listPeak.Load() {
+		}
+		f.enteredList <- struct{}{}
+		<-f.listGate
 	}
 
 	if f.listErr != nil {
@@ -3346,5 +3362,34 @@ func TestALaunchCarriesItsTiersArchitecture(t *testing.T) {
 
 	if len(p.launched) != 1 || p.launched[0].Arch != config.ArchARM64 {
 		t.Fatalf("launched %+v, want one launch of arm64", p.launched)
+	}
+}
+
+// SWEEPS ARE SERIAL, whoever asks for one: a pool host's release reads a report as
+// listed after the report before it arrived, so a sweep asked for while another is
+// listing waits for it to report rather than listing alongside it.
+func TestSweepsAreSerial(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker, listGate: make(chan struct{}), enteredList: make(chan struct{}, 2)}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	done := make(chan error, 2)
+	go func() { done <- r.Sweep(t.Context()) }()
+	<-p.enteredList
+	go func() { done <- r.Sweep(t.Context()) }()
+
+	// THE SECOND SWEEP'S CHANCE TO LIST ALONGSIDE THE FIRST, which it takes at once
+	// when nothing makes it wait.
+	time.Sleep(100 * time.Millisecond)
+	close(p.listGate)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+	}
+	if peak := p.listPeak.Load(); peak != 1 {
+		t.Fatalf("%d sweeps listed at once, want one", peak)
 	}
 }

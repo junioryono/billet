@@ -70,10 +70,18 @@ Enrollment today is a key fingerprint a person compares. A pool host is admitted
 - **Release revokes first.** The certificate recorded on the order is revoked before the source is asked to take the host back: the node's certificates, by serial and by a cutoff for any billet cannot name, are revoked in the transaction that seals the order.
 - **Built (2026-11-07): release on a person's word.** `billet pool release` asks for it.
   - **A joined host's** node is taken out of placement at once, and its registration keeps it out while the release stands, or after it is sealed: a registration in flight when the seal commits cannot put back a host the source is about to take.
-  - **The seal** is written in the transaction that reads its proof. The proof is that the node is live, holds no lease, quarantine or custody, and reported an empty inventory from its current registration after placement stopped. An inventory alone is evidence, not proof; one received after nothing could be placed is what makes it say what the host runs now.
+  - **The seal** is written in the transaction that reads its proof, which has four parts:
+    - the host holds no lease, quarantine or custody;
+    - no launch was dispatched to it since the release was asked for, by its launch-dispatch generation, recorded then;
+    - its node, live and at its current registration, reported nothing running in a report listed after the quiet period;
+    - the quiet period is fifteen minutes from the request, longer than a node's command queue keeps a launch.
+  - **Why an inventory alone is not enough.** An inventory is stamped when it arrives, not when the node listed it, so one report after the request can still describe the host before it. The seal records the first report it counts and reads only a later one. A node's sweeps are serial (the node runtime holds one lock across listing and reporting), so that later report was listed after the first one arrived. A launch dispatched since starts the proof again.
+  - **A node that no longer reports** is proved idle by a decommission on the compute barrier's proof, which the seal accepts.
   - **An unjoined host** is sealed in the asking's own transaction, on the ledger's word that nothing was ever admitted for the order (no approved request under its name, no certificate ever issued for it), with its tokens retired.
   - **The proof** (`internal/releaseproof`, a leaf, because the ledger may not import a source) is built in the sealing transaction. A seal stands for it after that transaction, so a release asked again after a failure or a restart is the same release.
   - **Counting.** A sealed or released host counts against the maximum until it is gone, and towards neither the floor nor demand.
+  - **Gone, or closed by a person.** An order is gone on its source's own terminal answer, asked only where it was placed. A source that never gives one (phoenixNAP), or that is no longer configured or now orders elsewhere, leaves a released order for a person to close with `billet pool close`. Its reason says a person closed it.
+  - **A refused approval records nothing.** A person's approval records the certificate it issues in the approval's own transaction, so an approval the ledger refuses (a mistyped fingerprint) leaves no certificate that would read as a node admitted.
   - **Still owed:** automatic shrink, which needs a measure of how long a host has been idle so a host ordered for demand is not released the step after.
 
 The rules of `billet-identity-and-ca` and `billet-security` apply in full: the token is a request to enroll, never an identity, and the certificate a node then holds is what proves it afterwards.

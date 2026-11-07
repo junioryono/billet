@@ -7,13 +7,15 @@ VALUES (@order_id, @source, @scope, @shape, @location, @arch, 'ordering', @first
 
 -- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_dispatch,
+       release_report_at
 FROM pool_orders
 ORDER BY first_attempt_at, order_id;
 
 -- name: ReadPoolOrder :one
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
-       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason
+       node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_dispatch,
+       release_report_at
 FROM pool_orders
 WHERE order_id = @order_id;
 
@@ -83,9 +85,17 @@ UPDATE pool_orders SET join_hold = @join_hold, updated_at = @updated_at
 
 -- name: RequestPoolOrderRelease :execrows
 -- A person asks for a joined host's release: the moment placement stops, which an
--- inventory reported after it is measured against. Once, and only of a placed order.
-UPDATE pool_orders SET release_requested_at = @now, release_reason = @reason, updated_at = @now
+-- inventory reported after it is measured against, and the node's launch-dispatch
+-- generation then. Once, and only of a placed order.
+UPDATE pool_orders
+   SET release_requested_at = @now, release_reason = @reason, release_dispatch = @dispatch, updated_at = @now
  WHERE order_id = @order_id AND state = 'placed' AND release_requested_at = '';
+
+-- name: NotePoolReleaseReport :execrows
+-- Where a release's proof stands: the dispatch generation it is measured from and the
+-- first inventory counted towards it. Only while the release waits for its seal.
+UPDATE pool_orders SET release_dispatch = @dispatch, release_report_at = @report_at
+ WHERE order_id = @order_id AND state = 'placed' AND release_requested_at != '';
 
 -- name: SealPoolOrder :execrows
 -- The release's seal, written in the transaction that read its proof: nothing joins
@@ -103,8 +113,9 @@ UPDATE pool_orders SET state = 'released', updated_at = @updated_at
  WHERE order_id = @order_id AND state = 'sealed';
 
 -- name: MarkPoolOrderGone :execrows
--- The source said, in its own terminal answer, that the released host is gone.
-UPDATE pool_orders SET state = 'gone', updated_at = @updated_at
+-- The source said, in its own terminal answer, that the released host is gone; or a
+-- person closed a released order on their word, which the reason records.
+UPDATE pool_orders SET state = 'gone', reason = @reason, updated_at = @updated_at
  WHERE order_id = @order_id AND state = 'released';
 
 -- name: CountPoolOrderAdmissions :one

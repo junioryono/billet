@@ -1133,3 +1133,22 @@ func TestAHostLeavingCountsAgainstTheMaximumNotTheFloor(t *testing.T) {
 		t.Fatalf("the maximum while a host leaves: %v, want nothing ordered", got)
 	}
 }
+
+// A RELEASED HOST IS ASKED ABOUT ONLY WHERE IT WAS PLACED: a source now ordering
+// somewhere else is not asked, the order stays released, and a person closes it.
+func TestWhetherAHostIsGoneIsAskedOnlyWhereItWasPlaced(t *testing.T) {
+	t.Parallel()
+	r := newRig(t, Policy{Floor: 0, Max: 2})
+	r.joined("o-9", "i-9", true)
+	step(t, r)
+	r.first.mu.Lock()
+	r.first.scope, r.first.presence = "first:eu-west-1", hostsource.PresenceGone
+	asked := len(r.first.goneAsked)
+	r.first.mu.Unlock()
+	if err := r.pool.Step(t.Context()); err == nil || !strings.Contains(err.Error(), "billet pool close") {
+		t.Fatalf("a source ordering elsewhere answered %v", err)
+	}
+	if got := r.ledger.states()["o-9"]; got != alloc.PoolReleased || len(r.first.goneAsked) != asked {
+		t.Fatalf("a source ordering elsewhere: %s, asked %v", got, r.first.goneAsked)
+	}
+}

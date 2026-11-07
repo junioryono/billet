@@ -297,6 +297,7 @@ type WriteOps interface {
 	MarkPoolOrderUncertain(ctx context.Context, arg ledgerdb.MarkPoolOrderUncertainParams) (int64, error)
 	MarkUncertainPoolOrderFound(ctx context.Context, arg ledgerdb.MarkUncertainPoolOrderFoundParams) (int64, error)
 	RequestPoolOrderRelease(ctx context.Context, arg ledgerdb.RequestPoolOrderReleaseParams) (int64, error)
+	NotePoolReleaseReport(ctx context.Context, arg ledgerdb.NotePoolReleaseReportParams) (int64, error)
 	SealPoolOrder(ctx context.Context, arg ledgerdb.SealPoolOrderParams) (int64, error)
 	MarkPoolOrderReleased(ctx context.Context, arg ledgerdb.MarkPoolOrderReleasedParams) (int64, error)
 	MarkPoolOrderGone(ctx context.Context, arg ledgerdb.MarkPoolOrderGoneParams) (int64, error)

@@ -540,7 +540,18 @@ func (p *Pool) releaseWith(ctx context.Context, o alloc.PoolOrder, proof release
 func (p *Pool) gone(ctx context.Context, o alloc.PoolOrder) error {
 	src := p.cfg.Sources[o.Source]
 	if src == nil {
-		return nil
+		return fmt.Errorf("pool: order %s is released, and its source %s is no longer configured to say it is gone; "+
+			"a person closes it (`billet pool close`)", o.ID, o.Source)
+	}
+	// ONLY WHERE IT WAS PLACED: a source ordering somewhere else would be asked about
+	// a host id it never had, and its answer is about nothing of this order's.
+	scope, err := src.Scope(ctx)
+	if err != nil {
+		return fmt.Errorf("pool: where released order %s's source orders now: %w", o.ID, err)
+	}
+	if scope != o.Scope {
+		return fmt.Errorf("pool: order %s was released in %s and its source now orders in %s; a person closes it "+
+			"(`billet pool close`)", o.ID, o.Scope, scope)
 	}
 	presence, err := src.Gone(ctx, o.HostID)
 	if err != nil {

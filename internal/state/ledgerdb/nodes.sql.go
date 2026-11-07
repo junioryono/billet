@@ -847,30 +847,35 @@ func (q *Queries) ReadNodeRegistration(ctx context.Context, name string) (ReadNo
 }
 
 const readNodeReleaseFacts = `-- name: ReadNodeReleaseFacts :one
-SELECT n.live, n.epoch, i.node_epoch, i.running, i.received_at
+SELECT n.live, n.epoch, n.dispatch_generation, n.decommission_proven, i.node_epoch, i.running, i.received_at
   FROM nodes n
   LEFT JOIN node_inventory i ON i.node = n.name
  WHERE n.name = $1
 `
 
 type ReadNodeReleaseFactsRow struct {
-	Live       int64
-	Epoch      int64
-	NodeEpoch  sql.NullInt64
-	Running    sql.NullInt64
-	ReceivedAt sql.NullString
+	Live               int64
+	Epoch              int64
+	DispatchGeneration int64
+	DecommissionProven int64
+	NodeEpoch          sql.NullInt64
+	Running            sql.NullInt64
+	ReceivedAt         sql.NullString
 }
 
 // What a pool host's release proof reads of its node: whether it is live, its current
-// epoch, and its last inventory, which is null when it never reported one. The caller
-// trusts the inventory only from the current epoch and received after placement
-// stopped.
+// epoch, its launch-dispatch generation, whether a person decommissioned it on the
+// compute barrier's proof, and its last inventory, which is null when it never reported
+// one. The caller trusts the inventory only from the current epoch and received after
+// placement stopped.
 func (q *Queries) ReadNodeReleaseFacts(ctx context.Context, name string) (ReadNodeReleaseFactsRow, error) {
 	row := q.db.QueryRowContext(ctx, readNodeReleaseFacts, name)
 	var i ReadNodeReleaseFactsRow
 	err := row.Scan(
 		&i.Live,
 		&i.Epoch,
+		&i.DispatchGeneration,
+		&i.DecommissionProven,
 		&i.NodeEpoch,
 		&i.Running,
 		&i.ReceivedAt,
@@ -899,11 +904,15 @@ const upsertNodeRegistration = `-- name: UpsertNodeRegistration :one
 INSERT INTO nodes
    (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live,
     node_release, wire_min, wire_max, wire_version, node_digest, codebuild_fleet,
-    codebuild_jit_path, codebuild_region, incarnation, highest_release, architectures, epoch)
+    codebuild_jit_path, codebuild_region, incarnation, highest_release, architectures, epoch, drained)
 VALUES ($1, $2, $3, $4, $5, $6, $7, 1,
         $8, $9, $10, $11, $12,
         $13, $14, $15, $16,
-        $17, $18, 1)
+        $17, $18, 1,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM pool_orders p
+             WHERE p.node_name = $1
+               AND (p.release_requested_at != '' OR p.state IN ('sealed', 'released', 'gone'))) THEN 1 ELSE 0 END)
 ON CONFLICT (name) DO UPDATE SET
    provider     = excluded.provider,
    site         = excluded.site,

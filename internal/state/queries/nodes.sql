@@ -303,11 +303,15 @@ SELECT name FROM nodes
 INSERT INTO nodes
    (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live,
     node_release, wire_min, wire_max, wire_version, node_digest, codebuild_fleet,
-    codebuild_jit_path, codebuild_region, incarnation, highest_release, architectures, epoch)
+    codebuild_jit_path, codebuild_region, incarnation, highest_release, architectures, epoch, drained)
 VALUES (@name, @provider, @site, @total_vcpu, @total_memory, @ec2_shapes, @last_seen_at, 1,
         @node_release, @wire_min, @wire_max, @wire_version, @node_digest,
         @codebuild_fleet, @codebuild_jit_path, @codebuild_region, @incarnation,
-        @highest_release, @architectures, 1)
+        @highest_release, @architectures, 1,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM pool_orders p
+             WHERE p.node_name = @name
+               AND (p.release_requested_at != '' OR p.state IN ('sealed', 'released', 'gone'))) THEN 1 ELSE 0 END)
 ON CONFLICT (name) DO UPDATE SET
    provider     = excluded.provider,
    site         = excluded.site,
@@ -386,10 +390,11 @@ UPDATE nodes SET drained = 1 WHERE name = @name;
 
 -- name: ReadNodeReleaseFacts :one
 -- What a pool host's release proof reads of its node: whether it is live, its current
--- epoch, and its last inventory, which is null when it never reported one. The caller
--- trusts the inventory only from the current epoch and received after placement
--- stopped.
-SELECT n.live, n.epoch, i.node_epoch, i.running, i.received_at
+-- epoch, its launch-dispatch generation, whether a person decommissioned it on the
+-- compute barrier's proof, and its last inventory, which is null when it never reported
+-- one. The caller trusts the inventory only from the current epoch and received after
+-- placement stopped.
+SELECT n.live, n.epoch, n.dispatch_generation, n.decommission_proven, i.node_epoch, i.running, i.received_at
   FROM nodes n
   LEFT JOIN node_inventory i ON i.node = n.name
  WHERE n.name = @name;

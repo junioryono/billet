@@ -55,8 +55,20 @@ func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string
 		}
 
 		if row.NodeName != "" {
+			// THE LAUNCHES DISPATCHED SO FAR, so one dispatched since restarts the proof.
+			// A node that never registered has dispatched nothing.
+			var dispatched int64
+
+			switch fence, err := q.ReadNodeFence(ctx, row.NodeName); {
+			case errors.Is(err, sql.ErrNoRows):
+			case err != nil:
+				return fmt.Errorf("alloc: read %s's dispatch fence: %w", row.NodeName, err)
+			default:
+				dispatched = fence.DispatchGeneration
+			}
+
 			if n, err := q.RequestPoolOrderRelease(ctx, ledgerdb.RequestPoolOrderReleaseParams{
-				Now: ts(now), Reason: reason, OrderID: order,
+				Now: ts(now), Reason: reason, Dispatch: dispatched, OrderID: order,
 			}); err != nil {
 				return fmt.Errorf("alloc: ask for the release of pool order %s: %w", order, err)
 			} else if n != 1 {
@@ -102,20 +114,29 @@ func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string
 	return sealed, nil
 }
 
-// SealPoolRelease seals a joined host whose release was asked for, once the ledger shows
-// it holds nothing, and returns the proof its source is asked with (ADR-030).
+// poolReleaseQuiet is how long after a release is asked for before its node's
+// inventory counts towards the proof: longer than the ten minutes a node's command
+// queue keeps a launch (internal/nodeplane), so a launch queued before the release has
+// run, and shows in what the node lists, or been dropped by then.
+const poolReleaseQuiet = 15 * time.Minute
+
+// SealPoolRelease seals a joined host whose release was asked for, once the ledger
+// proves it holds nothing, and returns the proof its source is asked with (ADR-030).
 //
-// ONE TRANSACTION, so nothing is placed between the reading and the seal: the node is
-// live, it holds no lease, no quarantine and no custody, and its last inventory, from
-// its current registration and received after placement stopped, reported nothing
-// running. Then its certificates are revoked, first, as the release requires, and the
-// order is sealed against everything. A proof that does not hold writes nothing and
-// answers ErrPoolReleaseWaits.
+// ONE TRANSACTION, so nothing is placed between the reading and the seal: the node
+// holds no lease, quarantine or custody, no launch was dispatched to it since the
+// release was asked for, and its inventory proves it runs nothing (releaseInventory).
+// Then its certificates are revoked, first, as the release requires, and the order is
+// sealed against everything. A proof that does not hold seals nothing and answers
+// ErrPoolReleaseWaits, after recording where the proof stands.
 func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releaseproof.Proof, error) {
-	var proof releaseproof.Proof
+	var (
+		proof releaseproof.Proof
+		waits error
+	)
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		proof = releaseproof.Proof{}
+		proof, waits = releaseproof.Proof{}, nil
 		q := state.WriteQueries(tx)
 		now := a.now().UTC()
 
@@ -136,16 +157,42 @@ func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releasep
 			return fmt.Errorf("alloc: pool order %s: release asked for at %q: %w", order, row.ReleaseRequestedAt, err)
 		}
 
-		holdings, err := nodeHoldingsTx(ctx, q, row.NodeName, requested)
+		counts, err := q.CountNodeHoldings(ctx, row.NodeName)
 		if err != nil {
-			return err
+			return fmt.Errorf("alloc: count what %s holds: %w", row.NodeName, err)
 		}
 
-		holdings.Host = row.HostID
+		holdings := releaseproof.Holdings{
+			Host: row.HostID, Sealed: requested, Leases: int(counts.Outstanding),
+			Quarantine: int(counts.Quarantine), Custody: int(counts.Custody), Inventory: -1,
+		}
+
+		switch facts, err := q.ReadNodeReleaseFacts(ctx, row.NodeName); {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return fmt.Errorf("alloc: read %s's inventory: %w", row.NodeName, err)
+		default:
+			inventory, dispatch, reportAt, err := releaseInventory(&row, &facts, requested)
+			if err != nil {
+				return fmt.Errorf("alloc: %s's release proof: %w", row.NodeName, err)
+			}
+
+			holdings.Inventory = inventory
+
+			if dispatch != row.ReleaseDispatch || reportAt != row.ReleaseReportAt {
+				if _, err := q.NotePoolReleaseReport(ctx, ledgerdb.NotePoolReleaseReportParams{
+					Dispatch: dispatch, ReportAt: reportAt, OrderID: order,
+				}); err != nil {
+					return fmt.Errorf("alloc: record where pool order %s's release stands: %w", order, err)
+				}
+			}
+		}
 
 		p, err := releaseproof.NewDrained(holdings)
 		if err != nil {
-			return fmt.Errorf("%w: %w", ErrPoolReleaseWaits, err)
+			waits = fmt.Errorf("%w: %w", ErrPoolReleaseWaits, err)
+
+			return nil
 		}
 
 		// THE CERTIFICATES BEFORE THE SOURCE: once this commits, nothing the host holds
@@ -169,58 +216,72 @@ func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releasep
 
 		return nil
 	})
-	if err != nil {
+
+	switch {
+	case err != nil:
 		return releaseproof.Proof{}, err
+	case waits != nil:
+		return releaseproof.Proof{}, waits
 	}
 
 	return proof, nil
 }
 
-// nodeHoldingsTx reads what a node holds for its release proof. An inventory that is
-// not from its current registration, or arrived before placement stopped, or a node
-// that is not live, cannot say what the host runs now, so it reads as unreadable.
-func nodeHoldingsTx(ctx context.Context, q state.WriteOps, node string, stopped time.Time) (releaseproof.Holdings,
-	error,
+// releaseInventory says what a joined host's node proves it runs for its release (-1 is
+// could-not-tell), and where the proof stands after this reading: the launch-dispatch
+// generation it is measured from, and when the first inventory counted towards it
+// arrived.
+//
+// AN INVENTORY IS EVIDENCE, NOT PROOF, on its own: it is stamped when it ARRIVES, and the
+// node listed its compute before that. So it counts only from the node's current
+// registration while it is live, only once it arrived after the quiet period that lets
+// a launch queued before the release run or be dropped, and only the SECOND such report
+// is read: a node lists its next report only after its previous one arrived (its
+// sweeps are serial), so the second was listed after the first arrived, which was after
+// the quiet period. A launch dispatched since the release was asked for starts the
+// proof again.
+//
+// A NODE A PERSON DECOMMISSIONED ON THE COMPUTE BARRIER'S PROOF runs nothing, which is
+// what that proof is, and is how a host that stopped reporting is released: a
+// registration clears the mark.
+func releaseInventory(row *ledgerdb.PoolOrder, f *ledgerdb.ReadNodeReleaseFactsRow, requested time.Time) (int, int64,
+	string, error,
 ) {
-	h := releaseproof.Holdings{Sealed: stopped}
-
-	counts, err := q.CountNodeHoldings(ctx, node)
-	if err != nil {
-		return h, fmt.Errorf("alloc: count what %s holds: %w", node, err)
-	}
-
-	h.Leases, h.Quarantine, h.Custody = int(counts.Outstanding), int(counts.Quarantine), int(counts.Custody)
-
-	facts, err := q.ReadNodeReleaseFacts(ctx, node)
+	dispatch, reportAt := row.ReleaseDispatch, row.ReleaseReportAt
 
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		h.Inventory = -1
-
-		return h, nil
-	case err != nil:
-		return h, fmt.Errorf("alloc: read %s's inventory: %w", node, err)
+	case f.DecommissionProven == 1:
+		return 0, dispatch, reportAt, nil
+	case f.DispatchGeneration != dispatch:
+		return -1, f.DispatchGeneration, "", nil
+	case f.Live != 1 || !f.NodeEpoch.Valid || f.NodeEpoch.Int64 != f.Epoch || !f.Running.Valid || !f.ReceivedAt.Valid:
+		return -1, dispatch, reportAt, nil
 	}
 
-	h.Inventory = -1
-
-	if facts.Live != 1 || !facts.NodeEpoch.Valid || facts.NodeEpoch.Int64 != facts.Epoch ||
-		!facts.Running.Valid || !facts.ReceivedAt.Valid {
-		return h, nil
-	}
-
-	received, err := time.Parse(timestampFormat, facts.ReceivedAt.String)
+	received, err := time.Parse(timestampFormat, f.ReceivedAt.String)
 	if err != nil {
-		return h, fmt.Errorf("alloc: %s's inventory was received at %q: %w", node, facts.ReceivedAt.String, err)
+		return -1, dispatch, reportAt, fmt.Errorf("its inventory was received at %q: %w", f.ReceivedAt.String, err)
 	}
 
-	if !received.After(stopped) {
-		return h, nil
+	if !received.After(requested.Add(poolReleaseQuiet)) {
+		return -1, dispatch, reportAt, nil
 	}
 
-	h.Inventory = int(facts.Running.Int64)
+	// THE FIRST REPORT COUNTED is this one when none was, and proves nothing on its own.
+	if reportAt == "" {
+		reportAt = f.ReceivedAt.String
+	}
 
-	return h, nil
+	first, err := time.Parse(timestampFormat, reportAt)
+	if err != nil {
+		return -1, dispatch, reportAt, fmt.Errorf("its first counted inventory arrived at %q: %w", reportAt, err)
+	}
+
+	if !received.After(first) {
+		return -1, dispatch, reportAt, nil
+	}
+
+	return int(f.Running.Int64), dispatch, reportAt, nil
 }
 
 func sealPoolOrderTx(ctx context.Context, q state.WriteOps, order, node, requested, reason, now string) error {
@@ -279,6 +340,24 @@ func (a *Allocator) PoolOrderReleased(ctx context.Context, id string) error {
 // PoolOrderGone records the source's own terminal answer that a released host is gone.
 func (a *Allocator) PoolOrderGone(ctx context.Context, id string) error {
 	return a.movePoolOrder(ctx, id, PoolReleased, func(w state.WriteOps, now string) (int64, error) {
-		return w.MarkPoolOrderGone(ctx, ledgerdb.MarkPoolOrderGoneParams{OrderID: id, UpdatedAt: now})
+		return w.MarkPoolOrderGone(ctx, ledgerdb.MarkPoolOrderGoneParams{
+			Reason: "its source said the host is gone", OrderID: id, UpdatedAt: now,
+		})
+	})
+}
+
+// ClosePoolOrder closes a released order on a person's word, after they have looked at
+// the source themselves: the way a release closes on a source that never says gone of a
+// host it took back (phoenixNAP), and on one no longer configured. The reason records
+// that it was a person, not the source.
+func (a *Allocator) ClosePoolOrder(ctx context.Context, id, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("alloc: closing pool order %s needs the reason a person gave", id)
+	}
+
+	return a.movePoolOrder(ctx, id, PoolReleased, func(w state.WriteOps, now string) (int64, error) {
+		return w.MarkPoolOrderGone(ctx, ledgerdb.MarkPoolOrderGoneParams{
+			Reason: "closed by a person: " + reason, OrderID: id, UpdatedAt: now,
+		})
 	})
 }

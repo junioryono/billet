@@ -33,6 +33,8 @@ func rewindNewest(t *testing.T, db *DB) {
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			`ALTER TABLE pool_orders DROP COLUMN release_report_at`,
+			`ALTER TABLE pool_orders DROP COLUMN release_dispatch`,
 			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
 			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,
 			`DELETE FROM schema_migrations WHERE version = 77`,
