@@ -2056,6 +2056,11 @@ func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, e
 			}
 		}
 
+		// A DELETE INTERRUPTED BEFORE ITS LOG WENT, or a VM an operator removed, leaves
+		// the log nothing else would find: the name is this deployment's lease and is
+		// never reused.
+		p.removeRunLog(id)
+
 		return provider.TeardownStopped, nil
 	} else if err != nil {
 		return provider.TeardownRequested, fmt.Errorf("tart: inspect %s: %w", id, err)
