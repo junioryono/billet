@@ -1131,6 +1131,8 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	// data. The declarations themselves are checked structurally elsewhere.
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			`DROP INDEX pool_orders_state_idx`,
+			`DROP TABLE pool_orders`,
 			`DROP INDEX job_history_rerun_decided_idx`,
 			`ALTER TABLE job_history DROP COLUMN rerun_decision`,
 			`ALTER TABLE job_history DROP COLUMN rerun_decided_at`,

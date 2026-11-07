@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -61,6 +62,8 @@ func (f *fakeHosts) Describe(context.Context, string) (ec2.HostRecord, error) {
 	return f.record, f.describe
 }
 
+func (f *fakeHosts) Scope() string { return "aws:us-west-2:subnet-0abc" }
+
 func (f *fakeHosts) Terminate(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -71,10 +74,16 @@ func (f *fakeHosts) Terminate(_ context.Context, id string) error {
 
 func newTestSource(t *testing.T, f *fakeHosts) *Source {
 	t.Helper()
+
+	return newTestSourceIn(t, f, func(context.Context) (string, error) { return "111122223333", nil })
+}
+
+func newTestSourceIn(t *testing.T, f *fakeHosts, account func(context.Context) (string, error)) *Source {
+	t.Helper()
 	s, err := newSource(f, "us-west-2a", []Shape{
 		{Type: "m7gd.metal", Arch: config.ArchARM64, Image: "ami-arm"},
 		{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"},
-	})
+	}, account)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -110,7 +119,7 @@ func TestAnOrderOutsideTheDeclaredShapesIsRefused(t *testing.T) {
 		"another zone":       {Order: "o-1", Shape: "m7gd.metal", Location: "us-west-2b"},
 	} {
 		f := &fakeHosts{}
-		if _, err := newTestSource(t, f).Order(t.Context(), req); err == nil {
+		if _, err := newTestSource(t, f).Order(t.Context(), req); !errors.Is(err, hostsource.ErrNotSent) {
 			t.Errorf("%s: ordered", name)
 		}
 		if len(f.launched) != 0 {
@@ -225,5 +234,56 @@ func TestTermsGiveTheClientTokenWindow(t *testing.T) {
 	}
 	if _, err := s.Terms("c7i.metal-24xl"); err == nil {
 		t.Fatal("an undeclared shape has terms")
+	}
+}
+
+// A LAUNCH THE PROVIDER REFUSED BEFORE RUNINSTANCES SENT NOTHING, so the source says
+// so, and the pool records it as refused rather than reading it back.
+func TestALaunchRefusedLocallyIsNotSent(t *testing.T) {
+	t.Parallel()
+	f := &fakeHosts{launchErr: fmt.Errorf("%w: too long", ec2.ErrLaunchNotSent)}
+	_, err := newTestSource(t, f).Order(t.Context(), hostsource.Request{Order: "o-1", Shape: "m7gd.metal"})
+	if !errors.Is(err, hostsource.ErrNotSent) {
+		t.Fatalf("order = %v", err)
+	}
+}
+
+// THE SCOPE IS WHERE AN ORDER WAS PLACED: the credentials' account, the provider's
+// region and subnet, and this source's zone, so a changed config or credentials in
+// another account sharing the subnet are never mistaken for the same place. The account
+// is asked every time, so credentials that rotate into another account change the scope;
+// a failed or empty answer is could-not-tell.
+func TestTheScopeNamesAccountRegionSubnetAndZone(t *testing.T) {
+	t.Parallel()
+	asked := 0
+	answers := []struct {
+		id  string
+		err error
+	}{{"", errors.New("sts: throttled")}, {"", nil}, {"111122223333", nil}, {"444455556666", nil}}
+	s := newTestSourceIn(t, &fakeHosts{}, func(context.Context) (string, error) {
+		a := answers[asked]
+		asked++
+
+		return a.id, a.err
+	})
+	if _, err := s.Scope(t.Context()); err == nil || !strings.Contains(err.Error(), "throttled") {
+		t.Fatalf("a failed account read answered %v", err)
+	}
+	if _, err := s.Scope(t.Context()); err == nil || !strings.Contains(err.Error(), "no account") {
+		t.Fatalf("an empty account answered %v", err)
+	}
+	if got, err := s.Scope(t.Context()); err != nil || got != "aws:111122223333:us-west-2:subnet-0abc:us-west-2a" {
+		t.Fatalf("scope = %q, %v", got, err)
+	}
+	if got, err := s.Scope(t.Context()); err != nil || got != "aws:444455556666:us-west-2:subnet-0abc:us-west-2a" {
+		t.Fatalf("after the credentials moved account, scope = %q, %v", got, err)
+	}
+}
+
+func TestASourceWithoutAnAccountIsRefused(t *testing.T) {
+	t.Parallel()
+	if _, err := newSource(&fakeHosts{}, "us-west-2a", []Shape{{Type: "z1d.metal", Arch: config.ArchX64, Image: "ami-x64"}}, nil); err == nil ||
+		!strings.Contains(err.Error(), "account") {
+		t.Fatalf("a source that cannot name its account answered %v", err)
 	}
 }

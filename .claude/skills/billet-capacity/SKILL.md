@@ -57,6 +57,13 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A restart waits for its own message session, and so does a failover.**
 - **A tier whose session fails keeps everything it holds while it reopens (#207).**
 
+### The pool of rented bare metal: [references/pool.md](references/pool.md)
+
+- **A pool order is committed before its source is asked, and read back before anything else is done about it (ADR-030).**
+- **A lost answer is sent again only inside the source's deduplication window; past it, the order is uncertain and a person decides.**
+- **Nothing is ordered on an architecture while an order there is unknown, and demand grows the pool one host at a time while any placed host has not joined.**
+- **An order records its source's scope and is read back only there; a resend the source refuses is uncertain, not refused.**
+
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 
 ## Checklists

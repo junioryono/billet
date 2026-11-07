@@ -34,6 +34,10 @@ var poolOrderPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,47}$`)
 // instance is gone: DescribeInstances is eventually consistent.
 var ErrHostNotFound = errors.New("ec2: no such instance")
 
+// ErrLaunchNotSent is a pool launch refused before RunInstances was called, so no
+// instance can exist for it.
+var ErrLaunchNotSent = errors.New("ec2: the pool launch was not sent")
+
 // ErrNotAPoolHost is an instance that does not carry this deployment's pool tag, which
 // a pool source neither describes nor terminates.
 var ErrNotAPoolHost = errors.New("ec2: the instance is not one of this deployment's pool hosts")
@@ -51,6 +55,9 @@ type Hosts struct{ p *Provider }
 
 // Hosts is the provider's pool-host surface.
 func (p *Provider) Hosts() *Hosts { return &Hosts{p: p} }
+
+// Scope is the region and subnet this provider launches pool hosts in.
+func (h *Hosts) Scope() string { return "aws:" + h.p.cfg.Region + ":" + h.p.cfg.SubnetID }
 
 // HostLaunch is one pool host to start.
 type HostLaunch struct {
@@ -98,11 +105,13 @@ func (h *Hosts) Launch(ctx context.Context, l HostLaunch) (HostRecord, error) {
 	p := h.p
 	switch {
 	case !poolOrderPattern.MatchString(l.Order):
-		return HostRecord{}, fmt.Errorf("ec2: pool order %q is not 1 to 48 lowercase letters, digits and dashes", l.Order)
+		return HostRecord{}, fmt.Errorf("%w: pool order %q is not 1 to 48 lowercase letters, digits and dashes",
+			ErrLaunchNotSent, l.Order)
 	case l.InstanceType == "" || l.Image == "":
-		return HostRecord{}, errors.New("ec2: a pool host needs an instance type and an image")
+		return HostRecord{}, fmt.Errorf("%w: a pool host needs an instance type and an image", ErrLaunchNotSent)
 	case len(l.UserData) > maxUserData:
-		return HostRecord{}, fmt.Errorf("ec2: a pool host's boot script is %d bytes and ec2 accepts %d", len(l.UserData), maxUserData)
+		return HostRecord{}, fmt.Errorf("%w: a pool host's boot script is %d bytes and ec2 accepts %d",
+			ErrLaunchNotSent, len(l.UserData), maxUserData)
 	}
 
 	params := url.Values{}
@@ -134,7 +143,7 @@ func (h *Hosts) Launch(ctx context.Context, l HostLaunch) (HostRecord, error) {
 	params.Set("UserData", base64.StdEncoding.EncodeToString(l.UserData))
 
 	var out runInstancesResponse
-	if err := p.api.call(ctx, params, &out); err != nil {
+	if err := p.api.callOnce(ctx, params, &out); err != nil {
 		return HostRecord{}, fmt.Errorf("ec2: launch pool host %s on %s: %w", l.Order, l.InstanceType, withoutMessage(err))
 	}
 	if len(out.Instances) == 0 || out.Instances[0].InstanceID == "" {

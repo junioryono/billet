@@ -106,6 +106,98 @@ func TestWhyNoRoomNamesTheLimitThatBinds(t *testing.T) {
 		}
 	})
 
+	// A SPENT POT IS NAMED BESIDE FULL HOSTS OR NONE, because a refusal naming hosts
+	// alone reads to a pool as a shortage more hosts would fill (ADR-030).
+	t.Run("hosts full and the ceiling spent", func(t *testing.T) {
+		a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 128 * config.GiB},
+			[]config.Tier{tier("work", 8, 8*config.GiB)})
+		mustRegister(t, a, NodeRegistration{
+			Name: "host", Provider: config.ProviderFirecracker, VCPU: 8, Memory: 128 * config.GiB,
+		})
+
+		reserve(t, a, "work")
+
+		got := whyNoRoom(t, a, "work")
+		if !slices.Equal(got.HostsFull, []string{"host"}) || !got.CeilingBound || got.ShareBound || got.HostOnly() {
+			t.Errorf("a full host under a spent ceiling reports %+v, want both named and no host shortage", got)
+		}
+	})
+
+	t.Run("no host and the ceiling spent", func(t *testing.T) {
+		pinned := tier("pinned", 4, 8*config.GiB)
+		pinned.Node = "gone"
+		a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 128 * config.GiB},
+			[]config.Tier{pinned, tier("half", 4, 120*config.GiB), tier("other", 1, 1*config.GiB)})
+		mustRegister(t, a, NodeRegistration{
+			Name: "here", Provider: config.ProviderFirecracker, VCPU: 64, Memory: 128 * config.GiB,
+		})
+
+		if got := whyNoRoom(t, a, "pinned"); !got.NoHost || got.CeilingBound || !got.HostOnly() {
+			t.Fatalf("no host under a roomy ceiling reports %+v, want no host alone", got)
+		}
+
+		// ROOM FOR EXACTLY ONE MORE on both axes (4 vCPU and 8 GiB left) is room.
+		reserve(t, a, "half")
+
+		if got := whyNoRoom(t, a, "pinned"); !got.NoHost || got.CeilingBound || !got.HostOnly() {
+			t.Fatalf("no host under a ceiling with room for exactly one reports %+v, want no host alone", got)
+		}
+
+		reserve(t, a, "other")
+
+		if got := whyNoRoom(t, a, "pinned"); !got.NoHost || !got.CeilingBound || got.HostOnly() {
+			t.Errorf("no host under a spent ceiling reports %+v, want both named and no host shortage", got)
+		}
+	})
+
+	t.Run("no host and the share spent", func(t *testing.T) {
+		pinned := targetTier("repo-8", "repo", 8, 16*config.GiB)
+		pinned.Node = "gone"
+		a := newBareAllocator(t, Limits{
+			MaxVCPU: 64, MaxMemory: 256 * config.GiB,
+			Shares: map[string]config.TargetShare{"repo": {VCPU: 16}},
+		}, []config.Tier{pinned, targetTier("repo-16", "repo", 16, 32*config.GiB)})
+		mustRegister(t, a, NodeRegistration{
+			Name: "here", Provider: config.ProviderFirecracker, VCPU: 64, Memory: 256 * config.GiB,
+		})
+
+		reserve(t, a, "repo-16")
+
+		if got := whyNoRoom(t, a, "repo-8"); !got.NoHost || !got.ShareBound || got.CeilingBound || got.HostOnly() {
+			t.Errorf("no host under a spent share reports %+v, want both named and no host shortage", got)
+		}
+	})
+
+	t.Run("hosts full and the ceiling's memory spent", func(t *testing.T) {
+		a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 16 * config.GiB},
+			[]config.Tier{tier("work", 2, 16*config.GiB)})
+		mustRegister(t, a, NodeRegistration{
+			Name: "host", Provider: config.ProviderFirecracker, VCPU: 2, Memory: 128 * config.GiB,
+		})
+
+		reserve(t, a, "work")
+
+		got := whyNoRoom(t, a, "work")
+		if !slices.Equal(got.HostsFull, []string{"host"}) || !got.CeilingBound || got.HostOnly() {
+			t.Errorf("a full host under a ceiling whose memory is spent reports %+v, want both named", got)
+		}
+	})
+
+	t.Run("no host and the ceiling held by another tier's floor", func(t *testing.T) {
+		pinned := tier("pinned", 4, 8*config.GiB)
+		pinned.Node = "gone"
+		floored := tier("floored", 8, 8*config.GiB)
+		floored.Reserved = 1
+		a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 128 * config.GiB}, []config.Tier{pinned, floored})
+		mustRegister(t, a, NodeRegistration{
+			Name: "here", Provider: config.ProviderFirecracker, VCPU: 64, Memory: 128 * config.GiB,
+		})
+
+		if got := whyNoRoom(t, a, "pinned"); !got.NoHost || !got.CeilingBound || got.HostOnly() {
+			t.Errorf("no host under a ceiling another tier's floor holds reports %+v, want both named", got)
+		}
+	})
+
 	t.Run("no host", func(t *testing.T) {
 		pinned := tier("pinned", 4, 8*config.GiB)
 		pinned.Node = "gone"
@@ -226,4 +318,31 @@ func TestWhyNoRoomNamesTheLimitThatBinds(t *testing.T) {
 			t.Errorf("a sealed deployment reports %+v (%q), want the seal named", got, got)
 		}
 	})
+}
+
+// HOSTS, AND NOTHING ELSE: a refusal is a host shortage only when no live host can place
+// the shape, or those that can are full, and no seal, cap, share, ceiling or budget binds
+// too, because more hosts would not buy a tier held by any of those (ADR-030).
+func TestHostOnlyIsHostsAndNothingElse(t *testing.T) {
+	t.Parallel()
+	full := []string{"h1"}
+	for name, c := range map[string]struct {
+		r    RoomRefusal
+		want bool
+	}{
+		"no host":           {RoomRefusal{NoHost: true}, true},
+		"hosts full":        {RoomRefusal{HostsFull: full}, true},
+		"nothing binds":     {RoomRefusal{}, false},
+		"sealed":            {RoomRefusal{HostsFull: full, Sealed: true}, false},
+		"at its cap":        {RoomRefusal{HostsFull: full, AtCap: 2}, false},
+		"its share":         {RoomRefusal{HostsFull: full, ShareBound: true}, false},
+		"the ceiling":       {RoomRefusal{HostsFull: full, CeilingBound: true}, false},
+		"the budgets":       {RoomRefusal{HostsFull: full, Budgets: true}, false},
+		"no host and a cap": {RoomRefusal{NoHost: true, AtCap: 1}, false},
+		"a cap alone":       {RoomRefusal{AtCap: 1}, false},
+	} {
+		if got := c.r.HostOnly(); got != c.want {
+			t.Errorf("%s: HostOnly = %t, want %t", name, got, c.want)
+		}
+	}
 }

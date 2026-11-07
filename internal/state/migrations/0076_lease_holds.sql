@@ -1,4 +1,4 @@
--- migration 75: lease_holds
+-- migration 76: lease_holds
 --
 -- A FAILED JOB'S VM KEPT FOR SOMEONE TO LOOK AT (#533). A row says the destroy GitHub's
 -- completion already asked for is being delayed, until when, and how that ended.

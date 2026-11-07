@@ -209,13 +209,27 @@ func capacityRefusal(code string) bool {
 
 // call issues one action and unmarshals the response into out.
 func (c *client) call(ctx context.Context, params url.Values, out any) error {
+	return c.callUpTo(ctx, params, out, maxAttempts)
+}
+
+// callOnce issues one action exactly once. A pool launch is sent this way: a retry here
+// could carry a refusal back from a second attempt whose first launched a host, and the
+// pool, which reads the order back, is what tries again. ITS BODY CANNOT BE REWOUND, so
+// the transport cannot resend it either: Go's HTTP/2 client replays a request whose
+// GetBody is set after some stream errors from the peer, inside one Do (go1.26.0's
+// h2_bundle.go, by its source, not probed against AWS).
+func (c *client) callOnce(ctx context.Context, params url.Values, out any) error {
+	return c.callUpTo(ctx, params, out, 1)
+}
+
+func (c *client) callUpTo(ctx context.Context, params url.Values, out any, attempts int) error {
 	params.Set("Version", apiVersion)
 
 	body := params.Encode()
 
 	var lastErr error
 
-	for attempt := range maxAttempts {
+	for attempt := range attempts {
 		if attempt > 0 {
 			// EXPONENTIAL, AND CANCELLABLE. A fixed pause is either useless
 			// against a throttle or wasteful against a blip, and a sleep that
@@ -230,7 +244,7 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 		// REBUILT EVERY ATTEMPT. A signature covers a timestamp and the
 		// credentials, both of which can change between attempts, and the body
 		// reader is consumed by the one before.
-		payload, err := c.attempt(ctx, body)
+		payload, err := c.attempt(ctx, body, attempts > 1)
 		if err == nil {
 			if out == nil {
 				return nil
@@ -266,7 +280,7 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 	}
 
 	return fmt.Errorf("ec2: %s failed after %d attempts: %w",
-		params.Get("Action"), maxAttempts, lastErr)
+		params.Get("Action"), attempts, lastErr)
 }
 
 func (c *client) wait(ctx context.Context, d time.Duration) error {
@@ -289,10 +303,13 @@ func (c *client) wait(ctx context.Context, d time.Duration) error {
 
 // attempt issues one request and returns its body, leaving the decode to the
 // caller so that a failed attempt cannot contaminate the next one's target.
-func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
+func (c *client) attempt(ctx context.Context, body string, rewindable bool) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, strings.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("ec2: build request: %w", err)
+	}
+	if !rewindable {
+		req.GetBody = nil
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
@@ -340,6 +357,14 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 	}
 
 	defer func() { _ = resp.Body.Close() }()
+
+	// A REDIRECT HANDED BACK UNFOLLOWED IS STILL A REDIRECT. net/http follows a 307 or
+	// 308 only for a body it can rewind, and returns one it cannot (a pool launch's)
+	// without asking CheckRedirect, so it would otherwise read as an unrecognised
+	// refusal.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, fmt.Errorf("%w (a %d, not followed)", errRedirected, resp.StatusCode)
+	}
 
 	// BOUNDED. A DescribeInstances page is large but not unbounded, and an
 	// unbounded read is an allocation sized by whatever answered.
