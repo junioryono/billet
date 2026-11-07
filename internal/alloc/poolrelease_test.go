@@ -99,10 +99,11 @@ func registerPoolNode(t *testing.T, a *Allocator, node string) {
 	}
 }
 
-// joinedPoolNode places an order, admits a node from it with certificate serial, and
+// joinedPoolNode places order pa, admits a node from it with certificate serial 0a, and
 // registers that node.
-func joinedPoolNode(t *testing.T, a *Allocator, id, serial string) string {
+func joinedPoolNode(t *testing.T, a *Allocator) string {
 	t.Helper()
+	const id, serial = "pa", "0a"
 	tok := placedOrder(t, a, id)
 	if _, err := a.AdmitPoolEnrollment(t.Context(), admission(t, a, id, "SHA256:"+id, tok, serial)); err != nil {
 		t.Fatalf("admit %s: %v", id, err)
@@ -155,7 +156,7 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
 	a := poolAllocator(t, &now)
 	ctx := t.Context()
-	node := joinedPoolNode(t, a, "pa", "0a")
+	node := joinedPoolNode(t, a)
 
 	leases, err := a.Escrow(ctx, "intel", 1)
 	if err != nil || len(leases) != 1 {
@@ -203,11 +204,6 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	if revoked, err := a.CertRevoked(ctx, "0a"); err != nil || !revoked {
 		t.Fatalf("the host's certificate was not revoked: %v, %v", revoked, err)
 	}
-	registerPoolNode(t, a, node)
-	if placeableHosts(t, a) != 0 {
-		t.Fatal("a registration put a sealed host back into placement")
-	}
-
 	if _, err := a.PoolReleaseProof(ctx, "pa"); err != nil {
 		t.Fatalf("the sealed order's proof: %v", err)
 	}
@@ -223,40 +219,121 @@ func TestAJoinedHostIsSealedOnlyOnProofItRunsNothing(t *testing.T) {
 	if o := readOrder(t, a, "pa"); o.State != PoolGone || o.Reason != "its source said the host is gone" {
 		t.Fatalf("the order: %+v, want gone on its source's word", o)
 	}
+	registerPoolNode(t, a, node)
+	if placeableHosts(t, a) != 0 {
+		t.Fatal("a registration put a released host back into placement")
+	}
 }
 
-// A DECOMMISSION AN INVENTORY CONTRADICTS STAYS CONTRADICTED: neither a later empty report
-// nor a control-plane start, which forgets every inventory, makes it proof again; only a
-// fresh decommission on the barrier's proof does.
-func TestADecommissionAnInventoryContradictedStaysContradicted(t *testing.T) {
+// contradictions are what withdraws a decommission's proof of a pool host: an inventory of
+// its node's current registration reporting compute, and the node arriving to register,
+// which the registration handler reports before it decides anything, so a refused
+// registration contradicts it too, as does a loopback arrival that names no host.
+var contradictions = map[string]func(t *testing.T, a *Allocator, node string){
+	"an inventory reporting compute": func(t *testing.T, a *Allocator, node string) {
+		t.Helper()
+		if _, err := a.Reconcile(t.Context(), node, []string{"some-instance"}); err != nil {
+			t.Fatal(err)
+		}
+	},
+	"the node arriving to register": func(t *testing.T, a *Allocator, node string) {
+		t.Helper()
+		if err := a.InvalidateBarrierRun(t.Context(), node); err != nil {
+			t.Fatal(err)
+		}
+	},
+	"an arrival that names no host": func(t *testing.T, a *Allocator, _ string) {
+		t.Helper()
+		if err := a.InvalidateEveryBarrierRun(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	},
+}
+
+// A CONTRADICTED DECOMMISSION STAYS CONTRADICTED: neither a later empty report nor a
+// control-plane start, which forgets every inventory, makes it proof again; only a fresh
+// decommission on the barrier's proof does. The arrival is contradicted with no barrier
+// run left to discard, as Decommission leaves it.
+func TestAContradictedDecommissionStaysContradicted(t *testing.T) {
 	t.Parallel()
-	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
-	a := poolAllocator(t, &now)
-	ctx := t.Context()
-	node := joinedPoolNode(t, a, "pa", "0a")
-	if _, err := a.RequestPoolRelease(ctx, "pa", "the pool shrinks"); err != nil {
-		t.Fatal(err)
-	}
-	barrier := requestBarrier(t, a)
-	decommissionOnProof(t, a, &now, barrier, node)
+	for name, contradict := range contradictions {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+			a := poolAllocator(t, &now)
+			ctx := t.Context()
+			node := joinedPoolNode(t, a)
+			if _, err := a.RequestPoolRelease(ctx, "pa", "the pool shrinks"); err != nil {
+				t.Fatal(err)
+			}
+			barrier := requestBarrier(t, a)
+			decommissionOnProof(t, a, &now, barrier, node)
 
-	if _, err := a.Reconcile(ctx, node, []string{"some-instance"}); err != nil {
-		t.Fatal(err)
-	}
-	waitsUnsealed(t, a, "a decommission an inventory since contradicts")
-	if _, err := a.Reconcile(ctx, node, nil); err != nil {
-		t.Fatal(err)
-	}
-	waitsUnsealed(t, a, "an empty inventory after the contradiction")
-	if err := a.ForgetEveryNode(ctx); err != nil {
-		t.Fatal(err)
-	}
-	waitsUnsealed(t, a, "a control-plane start after the contradiction")
+			contradict(t, a, node)
+			waitsUnsealed(t, a, "a decommission contradicted since")
+			if _, err := a.Reconcile(ctx, node, nil); err != nil {
+				t.Fatal(err)
+			}
+			waitsUnsealed(t, a, "an empty inventory after the contradiction")
+			if err := a.ForgetEveryNode(ctx); err != nil {
+				t.Fatal(err)
+			}
+			waitsUnsealed(t, a, "a control-plane start after the contradiction")
 
-	registerPoolNode(t, a, node)
-	decommissionOnProof(t, a, &now, barrier, node)
-	if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
-		t.Fatalf("sealing on a fresh decommission: %v", err)
+			registerPoolNode(t, a, node)
+			decommissionOnProof(t, a, &now, barrier, node)
+			if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+				t.Fatalf("sealing on a fresh decommission: %v", err)
+			}
+		})
+	}
+}
+
+// A SEALED RELEASE THE LEDGER NO LONGER PROVES IS NOT RELEASED: a contradiction landing
+// after the seal, when the source's first release failed, refuses the release proof at
+// every ask after, across a later empty report and a control-plane start, and a person
+// closes the order.
+func TestASealedReleaseTheLedgerNoLongerProvesIsNotReleased(t *testing.T) {
+	t.Parallel()
+	for name, contradict := range contradictions {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+			a := poolAllocator(t, &now)
+			ctx := t.Context()
+			node := joinedPoolNode(t, a)
+			if _, err := a.RequestPoolRelease(ctx, "pa", "the pool shrinks"); err != nil {
+				t.Fatal(err)
+			}
+			decommissionOnProof(t, a, &now, requestBarrier(t, a), node)
+			if _, err := a.SealPoolRelease(ctx, "pa"); err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			if _, err := a.PoolReleaseProof(ctx, "pa"); err != nil {
+				t.Fatalf("the proof before any contradiction: %v", err)
+			}
+
+			contradict(t, a, node)
+			refused := func(why string) {
+				t.Helper()
+				if _, err := a.PoolReleaseProof(ctx, "pa"); !errors.Is(err, ErrPoolReleaseContradicted) {
+					t.Fatalf("%s: the release proof answered %v", why, err)
+				}
+			}
+			refused("a contradiction after the seal")
+			if _, err := a.Reconcile(ctx, node, nil); err != nil {
+				t.Fatal(err)
+			}
+			refused("an empty inventory after the contradiction")
+			if err := a.ForgetEveryNode(ctx); err != nil {
+				t.Fatal(err)
+			}
+			refused("a control-plane start after the contradiction")
+
+			if err := a.ClosePoolOrder(ctx, "pa", "took it back by hand"); err != nil {
+				t.Fatalf("a person closing a contradicted seal: %v", err)
+			}
+		})
 	}
 }
 
@@ -277,7 +354,7 @@ func TestAnythingHoldingAHostKeepsItsReleaseUnsealed(t *testing.T) {
 			now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
 			a := poolAllocator(t, &now)
 			ctx := t.Context()
-			node := joinedPoolNode(t, a, "pa", "0a")
+			node := joinedPoolNode(t, a)
 			leases, err := a.Escrow(ctx, "intel", 1)
 			if err != nil || len(leases) != 1 {
 				t.Fatalf("a lease on the host: %v, %v", leases, err)

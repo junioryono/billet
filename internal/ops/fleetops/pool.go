@@ -16,6 +16,7 @@ const poolUsage = "usage: billet pool [--config PATH]\n" +
 	"       billet pool abandon [--config PATH] --reason TEXT <order>\n" +
 	"       billet pool unhold [--config PATH] <order>\n" +
 	"       billet pool release [--config PATH] --reason TEXT <order>\n" +
+	"       billet pool release [--config PATH] <order>   (seal a release already asked for)\n" +
 	"       billet pool close [--config PATH] --reason TEXT <order>"
 
 // Pool is `billet pool`: what the pool of rented bare metal ordered and what became of
@@ -80,15 +81,23 @@ func printPoolOrders(env cli.Env, orders []alloc.PoolOrder) error {
 	if err := w.Flush(); err != nil {
 		return err
 	}
-	draining := false
+	// WHY A HOST WAS RELEASED OUTLIVES ITS DRAINING: the REASON column is the order's own
+	// ending (refused, gone, closed by a person), so the person's release reason is listed
+	// for every order it was asked of, whatever the order has become since.
+	releases := false
 	for i := range orders {
-		if o := &orders[i]; o.State == alloc.PoolPlaced && !o.ReleaseRequested.IsZero() {
-			if !draining {
-				fmt.Fprintf(env.Stdout, "\nDraining for release (ADR-030): out of placement, and sealed, revoked and released "+
-					"once nothing holds the host and its node is decommissioned on proof (docs/operating/bare-metal-pool.md).\n")
-				draining = true
+		if o := &orders[i]; !o.ReleaseRequested.IsZero() {
+			if !releases {
+				fmt.Fprintf(env.Stdout, "\nReleased by a person (ADR-030). A draining host is out of placement, and is "+
+					"sealed, revoked and released once nothing holds it and its node is decommissioned on proof "+
+					"(docs/operating/bare-metal-pool.md).\n")
+				releases = true
 			}
-			fmt.Fprintf(env.Stdout, "  %s since %s: %s\n", o.ID, o.ReleaseRequested.UTC().Format(time.RFC3339),
+			st := o.State
+			if o.State == alloc.PoolPlaced {
+				st = "draining"
+			}
+			fmt.Fprintf(env.Stdout, "  %s (%s) since %s: %s\n", o.ID, st, o.ReleaseRequested.UTC().Format(time.RFC3339),
 				oneLine(o.ReleaseReason))
 		}
 	}
@@ -182,7 +191,7 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	if order == "" || strings.TrimSpace(*reason) == "" {
+	if order == "" {
 		return errors.New(poolUsage)
 	}
 	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
@@ -190,6 +199,16 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 	defer closeDB()
+	// NO REASON IS THE SECOND ASK: a release asked for already is sealed on its own reason.
+	if strings.TrimSpace(*reason) == "" {
+		err := sealPoolRelease(ctx, env, a, order)
+		if errors.Is(err, alloc.ErrPoolOrderMoved) {
+			return fmt.Errorf("billet pool release: %s has no release of a joined host waiting to be sealed; "+
+				"`billet pool release --reason TEXT %s` asks for one: %w", order, order, err)
+		}
+
+		return err
+	}
 	sealed, err := a.RequestPoolRelease(ctx, order, oneLine(*reason))
 	if errors.Is(err, alloc.ErrPoolReleaseAsked) {
 		return sealPoolRelease(ctx, env, a, order)
@@ -205,7 +224,7 @@ func poolRelease(ctx context.Context, env cli.Env, args []string) error {
 	}
 	fmt.Fprintf(env.Stdout, "Released %s from placement. Once nothing holds its host and its node is decommissioned "+
 		"on proof (`billet nodes decommission %s`), the pool seals it, revokes its node's certificates and asks its "+
-		"source to take it back, or `billet pool release %s` again seals it; `billet pool` shows where it is.\n",
+		"source to take it back, or `billet pool release %s` (no reason) seals it; `billet pool` shows where it is.\n",
 		order, alloc.PoolNodeName(order), order)
 
 	return nil

@@ -82,19 +82,35 @@ DELETE FROM compute_barrier_nodes;
 -- Discard one host's continuous-empty run.
 DELETE FROM compute_barrier_nodes WHERE node = @node;
 
--- name: BarrierRunExists :one
--- Whether one host has a run at all.
+-- name: ArrivalHasProof :one
+-- Whether one host has anything an arrival discards: a continuous-empty run, or a
+-- decommission recorded as proved.
 --
 -- READ BEFORE THE WRITE, and that is not a micro-optimisation: the invalidation
 -- runs on EVERY registration, ahead of the revocation check, so a credential an
 -- operator has taken back can call it as fast as it can open connections. An
 -- unconditional write transaction would let it reserve SQLite's single writer
 -- slot over and over and starve every scheduling decision in the process.
-SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = @node);
+SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = @node
+              UNION ALL
+              SELECT 1 FROM nodes WHERE name = @node AND decommission_proven = 1);
 
--- name: AnyBarrierRunExists :one
--- Whether the fleet has any run at all, for the same reason.
-SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes);
+-- name: AnyArrivalProof :one
+-- Whether the fleet has anything an unattributed arrival discards, for the same reason.
+SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes
+              UNION ALL
+              SELECT 1 FROM nodes WHERE decommission_proven = 1);
+
+-- name: WithdrawDecommissionProof :exec
+-- A host arriving to register contradicts a decommission's proof that it is gone
+-- (ADR-030), whether or not the registration is then refused: a refused one never
+-- reaches the upsert that clears the decommission, and the proof must not outlive the
+-- machine's own word. decommissioned_at stays, as `--force` records it.
+UPDATE nodes SET decommission_proven = 0 WHERE name = @name AND decommission_proven = 1;
+
+-- name: WithdrawEveryDecommissionProof :exec
+-- The same for an arrival that names no host.
+UPDATE nodes SET decommission_proven = 0 WHERE decommission_proven = 1;
 
 -- name: RecordBarrierRun :exec
 -- Extend one host's continuous-empty run, or start a new one.

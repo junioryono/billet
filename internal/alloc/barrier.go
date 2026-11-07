@@ -378,7 +378,9 @@ func (a *Allocator) RecordBarrierObservation(ctx context.Context, obs BarrierObs
 	})
 }
 
-// InvalidateBarrierRun discards a host's continuous-empty run.
+// InvalidateBarrierRun discards a host's continuous-empty run, and withdraws the proof
+// of its decommission: the machine arriving contradicts a person's word that it is gone,
+// whether or not its registration is then refused (ADR-030).
 //
 // CALLED WHEN A REGISTRATION BEGINS, not when it commits. The ledger's epoch —
 // which is what fences a run — does not move until the registration's write
@@ -409,7 +411,7 @@ func (a *Allocator) InvalidateBarrierRun(ctx context.Context, node string) error
 
 	if err := a.db.View(ctx, func(q querier) error {
 		var err error
-		found, err = state.ReadQueries(q).BarrierRunExists(ctx, node)
+		found, err = state.ReadQueries(q).ArrivalHasProof(ctx, node)
 
 		return err
 	}); err != nil {
@@ -421,8 +423,14 @@ func (a *Allocator) InvalidateBarrierRun(ctx context.Context, node string) error
 	}
 
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
-		if err := state.WriteQueries(tx).DeleteBarrierRun(ctx, node); err != nil {
+		q := state.WriteQueries(tx)
+
+		if err := q.DeleteBarrierRun(ctx, node); err != nil {
 			return fmt.Errorf("alloc: discard node %s's idle run: %w", node, err)
+		}
+
+		if err := q.WithdrawDecommissionProof(ctx, node); err != nil {
+			return fmt.Errorf("alloc: withdraw the proof of node %s's decommission: %w", node, err)
 		}
 
 		return nil
@@ -446,7 +454,7 @@ func (a *Allocator) InvalidateEveryBarrierRun(ctx context.Context) error {
 
 	if err := a.db.View(ctx, func(q querier) error {
 		var err error
-		found, err = state.ReadQueries(q).AnyBarrierRunExists(ctx)
+		found, err = state.ReadQueries(q).AnyArrivalProof(ctx)
 
 		return err
 	}); err != nil {
@@ -458,8 +466,14 @@ func (a *Allocator) InvalidateEveryBarrierRun(ctx context.Context) error {
 	}
 
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
-		if err := state.WriteQueries(tx).DeleteEveryBarrierRun(ctx); err != nil {
+		q := state.WriteQueries(tx)
+
+		if err := q.DeleteEveryBarrierRun(ctx); err != nil {
 			return fmt.Errorf("alloc: discard the fleet's idle runs: %w", err)
+		}
+
+		if err := q.WithdrawEveryDecommissionProof(ctx); err != nil {
+			return fmt.Errorf("alloc: withdraw the proof of every decommission: %w", err)
 		}
 
 		return nil

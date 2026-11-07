@@ -166,8 +166,8 @@ func TestThePoolCommandReleasesAHost(t *testing.T) {
 
 	env, out := poolEnv()
 	if err := Pool(ctx, env, []string{"release", "--config", cfg, "p-idle"}); err == nil ||
-		!strings.Contains(err.Error(), "usage:") {
-		t.Fatalf("a release without a reason answered %v", err)
+		!strings.Contains(err.Error(), "no release of a joined host waiting to be sealed") {
+		t.Fatalf("a release without a reason of an order nothing was asked of answered %v", err)
 	}
 	if err := Pool(ctx, env, []string{"release", "--config", cfg, "--reason", "it never\nbooted", "p-idle"}); err != nil ||
 		!strings.Contains(out.String(), "Sealed p-idle") {
@@ -182,7 +182,7 @@ func TestThePoolCommandReleasesAHost(t *testing.T) {
 	}
 	rows := map[string][]string{}
 	for _, line := range strings.Split(out.String(), "\n") {
-		if f := strings.Fields(line); len(f) > 0 {
+		if f := strings.Fields(line); len(f) > 0 && rows[f[0]] == nil {
 			rows[f[0]] = f
 		}
 	}
@@ -275,11 +275,15 @@ func TestASecondReleaseSealsWhatTheLedgerProves(t *testing.T) {
 		}
 	}
 	env, out := poolEnv()
-	if err := Pool(ctx, env, []string{"release", "--config", cfg, "--reason", "again", "p-quiet"}); err != nil ||
+	if err := Pool(ctx, env, []string{"release", "--config", cfg, "p-quiet"}); err != nil ||
 		!strings.Contains(out.String(), "Sealed p-quiet: its host was proved to run nothing") {
 		t.Fatalf("the second release of a host whose node never registered: %v\n%s", err, out)
 	}
 	err = Pool(ctx, env, []string{"release", "--config", cfg, "--reason", "again", "p-live"})
+	if err == nil || !strings.Contains(err.Error(), "cannot be sealed yet") {
+		t.Fatalf("a second release with a reason of a registered host never decommissioned answered %v", err)
+	}
+	err = Pool(ctx, env, []string{"release", "--config", cfg, "p-live"})
 	if err == nil || !strings.Contains(err.Error(), "cannot be sealed yet") ||
 		!strings.Contains(err.Error(), "billet nodes decommission pool-p-live") {
 		t.Fatalf("the second release of a registered host never decommissioned answered %v", err)
@@ -300,5 +304,10 @@ func TestASecondReleaseSealsWhatTheLedgerProves(t *testing.T) {
 	}
 	if r := rows["p-live"]; len(r) < 7 || r[6] != "draining" {
 		t.Fatalf("the p-live row = %q\n%s", r, out)
+	}
+	for _, want := range []string{"p-quiet (sealed) since", "p-live (draining) since"} {
+		if !strings.Contains(out.String(), want) || !strings.Contains(out.String(), ": the pool shrinks") {
+			t.Fatalf("the listing does not say why %q was released:\n%s", want, out)
+		}
 	}
 }

@@ -9,31 +9,36 @@ import (
 	"context"
 )
 
-const anyBarrierRunExists = `-- name: AnyBarrierRunExists :one
-SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes)
+const anyArrivalProof = `-- name: AnyArrivalProof :one
+SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes
+              UNION ALL
+              SELECT 1 FROM nodes WHERE decommission_proven = 1)
 `
 
-// Whether the fleet has any run at all, for the same reason.
-func (q *Queries) AnyBarrierRunExists(ctx context.Context) (bool, error) {
-	row := q.db.QueryRowContext(ctx, anyBarrierRunExists)
+// Whether the fleet has anything an unattributed arrival discards, for the same reason.
+func (q *Queries) AnyArrivalProof(ctx context.Context) (bool, error) {
+	row := q.db.QueryRowContext(ctx, anyArrivalProof)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
 }
 
-const barrierRunExists = `-- name: BarrierRunExists :one
-SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = $1)
+const arrivalHasProof = `-- name: ArrivalHasProof :one
+SELECT EXISTS(SELECT 1 FROM compute_barrier_nodes WHERE node = $1
+              UNION ALL
+              SELECT 1 FROM nodes WHERE name = $1 AND decommission_proven = 1)
 `
 
-// Whether one host has a run at all.
+// Whether one host has anything an arrival discards: a continuous-empty run, or a
+// decommission recorded as proved.
 //
 // READ BEFORE THE WRITE, and that is not a micro-optimisation: the invalidation
 // runs on EVERY registration, ahead of the revocation check, so a credential an
 // operator has taken back can call it as fast as it can open connections. An
 // unconditional write transaction would let it reserve SQLite's single writer
 // slot over and over and starve every scheduling decision in the process.
-func (q *Queries) BarrierRunExists(ctx context.Context, node string) (bool, error) {
-	row := q.db.QueryRowContext(ctx, barrierRunExists, node)
+func (q *Queries) ArrivalHasProof(ctx context.Context, node string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, arrivalHasProof, node)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -443,5 +448,28 @@ func (q *Queries) UpsertComputeBarrier(ctx context.Context, arg UpsertComputeBar
 		arg.RequestedAt,
 		arg.RequestedBy,
 	)
+	return err
+}
+
+const withdrawDecommissionProof = `-- name: WithdrawDecommissionProof :exec
+UPDATE nodes SET decommission_proven = 0 WHERE name = $1 AND decommission_proven = 1
+`
+
+// A host arriving to register contradicts a decommission's proof that it is gone
+// (ADR-030), whether or not the registration is then refused: a refused one never
+// reaches the upsert that clears the decommission, and the proof must not outlive the
+// machine's own word. decommissioned_at stays, as `--force` records it.
+func (q *Queries) WithdrawDecommissionProof(ctx context.Context, name string) error {
+	_, err := q.db.ExecContext(ctx, withdrawDecommissionProof, name)
+	return err
+}
+
+const withdrawEveryDecommissionProof = `-- name: WithdrawEveryDecommissionProof :exec
+UPDATE nodes SET decommission_proven = 0 WHERE decommission_proven = 1
+`
+
+// The same for an arrival that names no host.
+func (q *Queries) WithdrawEveryDecommissionProof(ctx context.Context) error {
+	_, err := q.db.ExecContext(ctx, withdrawEveryDecommissionProof)
 	return err
 }

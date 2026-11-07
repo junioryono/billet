@@ -17,6 +17,12 @@ import (
 // nothing was written, and the pool asks again at its next step.
 var ErrPoolReleaseWaits = errors.New("alloc: the pool host's release waits for its proof")
 
+// ErrPoolReleaseContradicted is a sealed release whose host the ledger no longer proves
+// runs nothing: an inventory reported compute after the seal, or its node arrived. Its
+// source is not asked; a person looks at the host, takes it back by hand and closes the
+// order (`billet pool close`).
+var ErrPoolReleaseContradicted = errors.New("alloc: the pool host's sealed release is contradicted")
+
 // ErrPoolReleaseAsked is a release asked for again of a joined host already out of
 // placement. It wraps ErrPoolOrderMoved; the caller may try the seal itself
 // (SealPoolRelease), which is how a person seals a release with no pool configured.
@@ -140,26 +146,9 @@ func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releasep
 			return fmt.Errorf("alloc: pool order %s: release asked for at %q: %w", order, row.ReleaseRequestedAt, err)
 		}
 
-		counts, err := q.CountNodeHoldings(ctx, row.NodeName)
+		holdings, err := releaseHoldingsTx(ctx, q, row.NodeName, row.HostID, requested)
 		if err != nil {
-			return fmt.Errorf("alloc: count what %s holds: %w", row.NodeName, err)
-		}
-
-		holdings := releaseproof.Holdings{
-			Host: row.HostID, Sealed: requested, Leases: int(counts.Outstanding),
-			Quarantine: int(counts.Quarantine), Custody: int(counts.Custody), Inventory: -1,
-		}
-
-		switch facts, err := q.ReadNodeReleaseFacts(ctx, row.NodeName); {
-		case errors.Is(err, sql.ErrNoRows):
-			// NEVER REGISTERED, SO NEVER PLACEABLE: placement reads the node table, and a
-			// first registration now is held out of placement by the release and refused by
-			// the certificates revoked below.
-			holdings.Inventory = 0
-		case err != nil:
-			return fmt.Errorf("alloc: read %s's release facts: %w", row.NodeName, err)
-		default:
-			holdings.Inventory = releaseInventory(&facts)
+			return err
 		}
 
 		p, err := releaseproof.NewDrained(holdings)
@@ -193,6 +182,36 @@ func (a *Allocator) SealPoolRelease(ctx context.Context, order string) (releasep
 	}
 
 	return proof, nil
+}
+
+// releaseHoldingsTx reads what still holds a joined pool host for its release: its
+// leases, quarantine and custody, and what it is proved to run.
+func releaseHoldingsTx(
+	ctx context.Context, q state.ReadOps, node, host string, sealed time.Time,
+) (releaseproof.Holdings, error) {
+	counts, err := q.CountNodeHoldings(ctx, node)
+	if err != nil {
+		return releaseproof.Holdings{}, fmt.Errorf("alloc: count what %s holds: %w", node, err)
+	}
+
+	holdings := releaseproof.Holdings{
+		Host: host, Sealed: sealed, Leases: int(counts.Outstanding),
+		Quarantine: int(counts.Quarantine), Custody: int(counts.Custody), Inventory: -1,
+	}
+
+	switch facts, err := q.ReadNodeReleaseFacts(ctx, node); {
+	case errors.Is(err, sql.ErrNoRows):
+		// NEVER REGISTERED, SO NEVER PLACEABLE: placement reads the node table, and a first
+		// registration is held out of placement by the release and, once sealed, refused by
+		// the certificates the seal revokes.
+		holdings.Inventory = 0
+	case err != nil:
+		return releaseproof.Holdings{}, fmt.Errorf("alloc: read %s's release facts: %w", node, err)
+	default:
+		holdings.Inventory = releaseInventory(&facts)
+	}
+
+	return holdings, nil
 }
 
 // releaseInventory is what a registered node is proved to run for its release: nothing
@@ -236,11 +255,18 @@ func sealPoolOrderTx(ctx context.Context, q state.WriteOps, order, node, request
 // PoolReleaseProof is the proof a sealed order's host is released on, from the seal the
 // ledger recorded: a release asked again, after a failed attempt or a restart, is the
 // release the seal proved.
+//
+// AND STILL PROVES (Codex, 2026-11-07): a joined host's holdings are read again at every
+// ask, because an inventory already in flight when the seal committed can report compute
+// after it, and a node arriving withdraws its decommission's proof. Both are durable in
+// decommission_proven, so a contradicted seal answers ErrPoolReleaseContradicted at every
+// ask until a person takes the host back and closes the order.
 func (a *Allocator) PoolReleaseProof(ctx context.Context, order string) (releaseproof.Proof, error) {
 	var proof releaseproof.Proof
 
-	err := a.db.View(ctx, func(q querier) error {
-		row, err := state.ReadQueries(q).ReadPoolOrder(ctx, order)
+	err := a.db.View(ctx, func(tx querier) error {
+		q := state.ReadQueries(tx)
+		row, err := q.ReadPoolOrder(ctx, order)
 
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
@@ -254,6 +280,17 @@ func (a *Allocator) PoolReleaseProof(ctx context.Context, order string) (release
 		sealed, err := time.Parse(timestampFormat, row.UpdatedAt)
 		if err != nil {
 			return fmt.Errorf("alloc: pool order %s: sealed at %q: %w", order, row.UpdatedAt, err)
+		}
+
+		if row.NodeName != "" {
+			holdings, err := releaseHoldingsTx(ctx, q, row.NodeName, row.HostID, sealed)
+			if err != nil {
+				return err
+			}
+
+			if _, err := releaseproof.NewDrained(holdings); err != nil {
+				return fmt.Errorf("%w: pool order %s: %w", ErrPoolReleaseContradicted, order, err)
+			}
 		}
 
 		proof, err = releaseproof.Sealed(row.HostID, sealed)

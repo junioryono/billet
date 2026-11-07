@@ -61,8 +61,8 @@ var errReadOnlyHandle = errors.New(
 // mutation in the wrong one is caught by
 // TestReadOpsHoldsExactlyTheQueriesThatOnlyRead rather than by review.
 type ReadOps interface {
-	AnyBarrierRunExists(ctx context.Context) (bool, error)
-	BarrierRunExists(ctx context.Context, node string) (bool, error)
+	AnyArrivalProof(ctx context.Context) (bool, error)
+	ArrivalHasProof(ctx context.Context, node string) (bool, error)
 	CertRevocation(ctx context.Context, serial string) (int64, error)
 	CountActiveRunnerLeases(ctx context.Context, tier string) (int64, error)
 	CountActiveRunnersAt(ctx context.Context, tier string) (ledgerdb.CountActiveRunnersAtRow, error)
@@ -254,6 +254,8 @@ type WriteOps interface {
 	DecommissionNode(ctx context.Context, arg ledgerdb.DecommissionNodeParams) error
 	DeleteAcknowledgedCompletion(ctx context.Context, arg ledgerdb.DeleteAcknowledgedCompletionParams) error
 	DeleteBarrierRun(ctx context.Context, node string) error
+	WithdrawDecommissionProof(ctx context.Context, name string) error
+	WithdrawEveryDecommissionProof(ctx context.Context) error
 	DeleteCacheBlock(ctx context.Context, arg ledgerdb.DeleteCacheBlockParams) error
 	DeleteComputeBarrier(ctx context.Context) error
 	DeleteEveryBarrierRun(ctx context.Context) error
