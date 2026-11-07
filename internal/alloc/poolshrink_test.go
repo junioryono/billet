@@ -148,6 +148,54 @@ func TestAnUnregisteredHostHoldsNoFloor(t *testing.T) {
 	}
 }
 
+// A HOST PLACEMENT WOULD NOT USE HOLDS NO FLOOR: another host drained (a decommission or
+// a drain keeps its row with drained set) or not live (a control-plane start marks every
+// node so until it reconnects) is not serving, so releasing the one host that is, at a
+// floor of one, is refused and writes nothing, and releasing the one that is not takes
+// nothing from the floor.
+func TestAHostPlacementWouldNotUseHoldsNoFloor(t *testing.T) {
+	t.Parallel()
+	for name, set := range map[string]string{
+		"drained":  `UPDATE nodes SET drained = 1 WHERE name = $1`,
+		"not live": `UPDATE nodes SET live = 0 WHERE name = $1`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+			a := poolAllocator(t, &now)
+			ctx := t.Context()
+			joinedPoolHost(t, a, "pa", "0a")
+			joinedPoolHost(t, a, "pb", "0b")
+			exec := func(stmt string) {
+				t.Helper()
+				if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+					_, err := tx.ExecContext(ctx, stmt, PoolNodeName("pb"))
+
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec(set)
+			if serving, err := a.PoolServingHosts(ctx); err != nil || serving[config.ArchX64] != 1 {
+				t.Fatalf("serving = %v, %v; want only the host placement would use", serving, err)
+			}
+			now = now.Add(time.Hour)
+			cutoff := now.Add(-20 * time.Minute)
+			if err := a.ReleaseIdlePoolHost(ctx, "pa", cutoff, 1, "idle"); !errors.Is(err, ErrPoolAtFloor) {
+				t.Fatalf("releasing the floor's only serving host answered %v", err)
+			}
+			if o := readOrder(t, a, "pa"); !o.ReleaseRequested.IsZero() {
+				t.Fatal("a release refused at the floor was recorded")
+			}
+			// AND ITS OWN RELEASE TAKES NOTHING FROM THE FLOOR.
+			if err := a.ReleaseIdlePoolHost(ctx, "pb", cutoff, 1, "idle"); err != nil {
+				t.Fatalf("releasing the host that serves nothing, at the floor: %v", err)
+			}
+		})
+	}
+}
+
 // AN UNREADABLE TIME IN THE LEDGER IS NEVER IDLE: a host whose newest job's end the
 // ledger holds in a form this binary cannot parse is not listed, and its release is
 // refused, writing nothing.

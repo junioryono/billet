@@ -95,10 +95,10 @@ func (a *Allocator) ReleaseIdlePoolHost(
 		if err != nil {
 			return err
 		}
-		// A HOST WHOSE NODE NEVER REGISTERED SERVES NOTHING, so its release leaves the
-		// floor as it was.
+		// A HOST THAT SERVES NOTHING (its node never registered, or is drained, or is not
+		// live) leaves the floor as it was by its release.
 		left := serving[config.Arch(row.Arch)]
-		if row.Registered == 1 {
+		if row.Serving == 1 {
 			left--
 		}
 		if left < floor {
@@ -110,9 +110,10 @@ func (a *Allocator) ReleaseIdlePoolHost(
 	})
 }
 
-// PoolServingHosts counts each architecture's pool hosts that can take work: placed, a
-// node joined from it and registered, no release asked for. A host whose node was
-// admitted but never registered is not one, though its order names the node.
+// PoolServingHosts counts each architecture's pool hosts that can take work: placed, no
+// release asked for, and a node joined from it that placement would use now, live and
+// not drained. A host whose node was admitted but never registered is not one, though its
+// order names the node, and nor is one drained or decommissioned.
 func (a *Allocator) PoolServingHosts(ctx context.Context) (map[config.Arch]int, error) {
 	var out map[config.Arch]int
 

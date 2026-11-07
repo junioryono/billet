@@ -297,13 +297,22 @@ func TestAnAnsweredPollDatesTheReport(t *testing.T) {
 	}
 }
 
-// AN ANSWER IS DATED WHERE THE POLL RETURNED, in both of the loop's ways of polling: with
-// background launches the loop may consume the answer long after, inside a
-// reconciliation, and an answer dated then would date an old count as current.
+// AN ANSWER IS DATED WHERE THE POLL RETURNED, in both of the loop's ways of polling, by
+// the poll itself: with background launches the loop may consume the answer long after,
+// inside a reconciliation, and an answer dated then would date an old count as current.
+// A poll GitHub did not answer dates nothing.
 func TestAnAnswerIsDatedWhenItsPollReturned(t *testing.T) {
 	t.Parallel()
 
-	for name, background := range map[string]bool{"inline": false, "background": true} {
+	for name, c := range map[string]struct {
+		background bool
+		answer     error
+	}{
+		"inline":             {answer: ErrNoMessage},
+		"background":         {background: true, answer: ErrNoMessage},
+		"inline, failed":     {answer: errors.New("the connection reset")},
+		"background, failed": {background: true, answer: errors.New("the connection reset")},
+	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -320,11 +329,11 @@ func TestAnAnswerIsDatedWhenItsPollReturned(t *testing.T) {
 				now = returned
 				mu.Unlock()
 
-				return nil, ErrNoMessage
+				return nil, c.answer
 			}}
 
 			opts := []Option{WithLogger(slog.New(slog.DiscardHandler)), WithRunner(&fakeRunner{})}
-			if background {
+			if c.background {
 				opts = append(opts, WithBackgroundLaunches())
 			}
 
@@ -342,8 +351,18 @@ func TestAnAnswerIsDatedWhenItsPollReturned(t *testing.T) {
 			now = returned.Add(time.Hour)
 			mu.Unlock()
 
-			if !errors.Is(answer.err, ErrNoMessage) || !answer.at.Equal(returned) {
-				t.Fatalf("answer %v dated %v, want the poll's return at %v", answer.err, answer.at, returned)
+			l.mu.Lock()
+			dated := l.answeredAt
+			l.mu.Unlock()
+
+			if !errors.Is(answer.err, c.answer) {
+				t.Fatalf("the poll answered %v, want %v", answer.err, c.answer)
+			}
+			if errors.Is(c.answer, ErrNoMessage) && !dated.Equal(returned) {
+				t.Fatalf("an answered poll was dated %v, want its return at %v", dated, returned)
+			}
+			if !errors.Is(c.answer, ErrNoMessage) && !dated.IsZero() {
+				t.Fatalf("a poll GitHub did not answer was dated %v", dated)
 			}
 		})
 	}

@@ -386,10 +386,6 @@ func (l *Listener) joinLaunches(ctx context.Context) {
 type exchanged struct {
 	msg *Message
 	err error
-	// at is when the poll returned, taken where it returned: with background launches
-	// the loop may consume the answer long after, inside a reconciliation, and an
-	// answer dated at its consumption would date an old count as current.
-	at time.Time
 	// beside is a failure of the reconciliation an ended launch woke while the poll
 	// was out, for the loop to treat as it treats its own reconciliation's. The
 	// answer in hand is not handled then, and GitHub delivers it again.
@@ -413,7 +409,7 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 	if !l.backgroundLaunches {
 		msg, err := l.timedPoll(ctx, l.session, l.lastMessageID, advertised)
 
-		return exchanged{msg: msg, err: err, at: l.clock()}
+		return exchanged{msg: msg, err: err}
 	}
 
 	var (
@@ -428,7 +424,6 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 		defer close(answered)
 
 		answer.msg, answer.err = l.timedPoll(ctx, session, lastMessageID, advertised)
-		answer.at = l.clock()
 	})
 
 	var beside error
@@ -454,13 +449,23 @@ func (l *Listener) exchange(ctx context.Context, advertised int, reconcile bool)
 
 // timedPoll polls GitHub and reports how long an answered poll took. One that failed is
 // left out: its time is the client's retries, and it says nothing of GitHub's long poll.
+//
+// AND IT DATES THE ANSWER HERE, where the poll returned, with a message or with none: the
+// statistics in hand are as current as that answer, which a pool reads before it shrinks
+// (AnsweredAt), and with background launches the loop may consume the answer long after,
+// inside a reconciliation, where a date taken then would date an old count as current.
 func (l *Listener) timedPoll(ctx context.Context, session Session, lastMessageID int64, advertised int,
 ) (*Message, error) {
 	began := time.Now()
 
 	msg, err := session.GetMessage(ctx, lastMessageID, advertised)
 	if err == nil || errors.Is(err, ErrNoMessage) {
+		answered := l.clock()
+
 		l.timings.pollTook(l.tier, time.Since(began))
+		l.mu.Lock()
+		l.answeredAt = answered
+		l.mu.Unlock()
 	}
 
 	return msg, err
