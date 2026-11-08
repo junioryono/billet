@@ -43,6 +43,30 @@ One t3.micro (a Nitro instance; `GetConsoleOutput --latest` needs one) in us-wes
 - **The document matches `DescribeInstances`.** Its `pendingTime` was the instance's `LaunchTime` (`2026-11-06T14:26:45Z`) and its `privateIp` the instance's private address.
 - **AWS's certificates differ by region.** Its page of certificates for identity document signatures listed an RSA certificate for 39 regions, one shared by the two China regions and every other distinct; us-west-2's was issued 2024-04-29 and lapses 2029-04-28.
 
+## The pool's IAM, asked of EC2, 2026-11-08
+
+**How.** `billet init iam --pool --deployment <a test id>` rendered the control plane's grant for a pool in the acceptance VPC (its subnet and security group, `z1d.metal` from the x64 acceptance image and `m7gd.metal` from the arm64 one). A throwaway role held that document and nothing else, and each request below was sent under it with `--dry-run`, which answers the authorization question and starts nothing. A `t4g.nano` carrying this deployment's pool tags, launched as the administrator, stood in for a pool host, and the stopped acceptance host for an instance without them. The role and the instance were deleted at the end.
+
+| Request | EC2's answer |
+|---|---|
+| billet's own pool launch, arm64 and x64: IMDSv2 required, hop limit 1, the three pool tags on the instance and its volumes | allowed |
+| the same with another deployment's pool owner | denied |
+| the same with the job instances' owner tag (`sh.billet.owner`) added | denied |
+| the pool owner's key spelled `sh.billet.Pool-Owner` | denied |
+| no tags | denied |
+| an image the pool does not name | denied |
+| a subnet and group the pool does not name | denied |
+| another image's snapshot in a block-device mapping | denied |
+| an existing network interface in another subnet | denied |
+| an existing network interface in the pool's subnet with a group the pool does not name | denied |
+| the launched image's own backing snapshot in a mapping | allowed |
+| terminate, and read the console of, the instance carrying the pool owner | allowed |
+| terminate, and read the console of, the instance without it | denied |
+| describe instances | allowed |
+| stop the pool host, or tag it after its launch | denied |
+
+The grant names every resource a pool launch touches, so a snapshot in a mapping is refused by omission, without the Deny the node's launch carries, and holds the network interface a launch creates or names to the pool's subnet (`ec2:Subnet`); an existing interface in that subnet carrying a group the pool does not name was refused as well, so EC2 evaluates an existing interface's groups too. A customer-managed key's grant (`--kms-key-arn`) is the cache's shape, which the 2026-09-04 simulation measured, and a dry run does not exercise it. The one snapshot it lets through is the launched image's own, which the 2026-09-04 dry runs found EC2 does not evaluate, and which exposes nothing the pool does not already boot.
+
 ## Still to measure
 
 - A no-stock and a quota refusal from each source, read as the scaler will read them.
