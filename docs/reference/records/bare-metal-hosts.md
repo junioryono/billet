@@ -67,6 +67,36 @@ One t3.micro (a Nitro instance; `GetConsoleOutput --latest` needs one) in us-wes
 
 The grant names every resource a pool launch touches, so a snapshot in a mapping is refused by omission, without the Deny the node's launch carries, and holds the network interface a launch creates or names to the pool's subnet (`ec2:Subnet`); an existing interface in that subnet carrying a group the pool does not name was refused as well, so EC2 evaluates an existing interface's groups too. A customer-managed key's grant (`--kms-key-arn`) is the cache's shape, which the 2026-09-04 simulation measured, and a dry run does not exercise it. The one snapshot it lets through is the launched image's own, which the 2026-09-04 dry runs found EC2 does not evaluate, and which exposes nothing the pool does not already boot.
 
+## The pool on replay, 2026-11-08
+
+**How.** `internal/replay` drove each trace through the real control plane at compressed time, as it does every replay, with a pool beside the fleet (`PoolFleet`, `internal/replay/pool_test.go`): the real scaler (`internal/pool`) ordered from a source the harness played, each order became a node of the stack a lead time later in simulated time, and every job ran on a host the pool ordered. GitHub's protocol was GitHub.com's, direct assignment, since a tier's shortage is read from the work GitHub assigned it. The source and the join are played: a host's order is admitted as the source's word would admit it, without a key or a certificate, because the replay's wire is the loopback one. A release is proved by its node's clearance over five minutes of wall time, so a replay records the pool asking for a release and not the release; the real runs prove that. The scaler stepped every simulated minute, every tier polled at each step as a live listener's long poll answers, each host joined exactly its lead time after its order (the tests assert it), and the floor was joined before the first job, as a running deployment keeps it. Pool hosts count as room only from their join, so utilization is not understated by hosts not yet ordered. One x64 tier, 16-vcpu pool hosts, a lead time of three minutes from order to joined node.
+
+| Trace | Pool | Queue wait p50 | p90 | p99 |
+|---|---|---|---|---|
+| `Burst`, 24 four-vcpu jobs in ten seconds, a few minutes each | floor 0, max 3 | 9 min 24 s | 12 min 21 s | 13 min 44 s |
+| the same | floor 3, max 3 | 30 s | 6 min 33 s | 8 min 14 s |
+| `WideShapeMix`, 40 jobs of 2 to 32 vcpu at the load four hosts carry | floor 1, max 4, 64-vcpu hosts | 1 min 43 s | 3 min 28 s | 6 min 14 s |
+
+- **The pool grows one host at a time while one is on its way** (ADR-030), so a burst arriving at a floor of none waits out a lead time for every host it needs: each host was ordered at the step the one before joined at, three minutes apart, and the burst's p99 was five and a half minutes longer than with the same three hosts kept as the floor. The tail at the floor of three is the second wave of jobs behind the twelve slots, not the pool.
+- **Every job ran, on no more hosts than the maximum**, and the wide-shape mix filled all four. Two architectures, each with a floor, replayed the same twice: the same orders under the same identifiers, and every job on the same host, since the scaler now walks its architectures in one order.
+- **Once quiet for `idle_after` (ten minutes), the pool asked to release its hosts one a step down to its floor**: all three from a floor of none, three of four from a floor of one, and all five of a pool filled by twenty hour-long jobs that ended together.
+
+## A build's outbound traffic, for the limits a provider polices, 2026-11-08
+
+**How.** One build's traffic on the shared Linux test host, inside a privileged `ubuntu:24.04` container so that nothing of the host's own was counted or changed: an nftables output chain in the container's namespace counted every packet leaving it (loopback aside), its bytes, and every new connection, and a sampler read the counters once a second while each phase ran. A guest's traffic is the same traffic; Firecracker carries it, it does not shape it.
+
+| Phase | Peak packets/s out | Peak new connections/s | Peak bytes/s out | Total new connections |
+|---|---|---|---|---|
+| `apt-get install` git, nodejs, npm, golang, build-essential | 1018 | 3 | 54001 | 10 |
+| `git clone --depth 1` of TypeScript | 226 | 0 | 11951 | 0 |
+| `npm install` of express, webpack, typescript, eslint, jest, react, next, babel | 1734 | 14 | 285610 | 17 |
+| `go mod download` of billet's module graph | 5505 | 18 | 441560 | 27 |
+| `pip install` of numpy, pandas, scipy, requests, boto3, django, flask, sqlalchemy, pytest, black | 1518 | 6 | 92445 | 6 |
+
+A build's outbound load is small and bursty: its heaviest second was 5505 packets and 441 KB, from a download fetching modules in parallel, and it opened at most 18 connections in a second. The host role's limits (`billet_guest_refuse_smtp`, `billet_guest_new_connections_per_second`, `billet_guest_packets_per_second`, `billet_guest_egress_bytes_per_second`) cap what every guest on a host sends off it through the host's forwarding, together, and are off unless set. For a pool host the settings this gives, against 32 guests each at its measured peak in the same second (576 connection attempts, 176160 packets, 14129920 bytes), are SMTP refused, 1000 connection attempts a second (1.7 times), 400000 packets a second (2.3 times) and 125000000 bytes a second (a gigabit, 8.8 times, below the port a provider's server has).
+
+What they do not cover, said plainly. They are a budget for the whole host, so a flooding job is cut off with its neighbours rather than alone; a cap per guest needs ADR-028's per-interface chain and is not built. The connection limit counts every packet conntrack calls new, a first SYN and its retransmissions and each packet of a one-way UDP flow, not each flow once, so one guest sending a one-way UDP stream spends it for every guest. The packet limit counts what the host forwards before a guest's TCP segmentation offload is undone: a flood of small packets, the scanner's kind a provider polices, is counted packet for packet, while a bulk transfer's large buffers count once each and are bounded by the byte limit, so the packets on the uplink can exceed the packet setting while a guest sends something large. And a guest's requests to the host's own services, its DNS and the registry mirrors, end at the host, whose own upstream traffic leaves through its output and is not counted here: a provider sees it, and these limits do not cap it.
+
 ## Still to measure
 
 - A no-stock and a quota refusal from each source, read as the scaler will read them.

@@ -88,6 +88,8 @@ type Record struct {
 // Report is what one replay recorded.
 type Report struct {
 	Fleet Fleet
+	// Pool is what the fleet's pool did, nil for a fleet with none.
+	Pool *PoolReport
 	// Records are the jobs the ledger knows about, in sequence order.
 	Records []Record
 	// Missing are trace jobs with no ledger row: gaps in the recording, reported
