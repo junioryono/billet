@@ -16,7 +16,10 @@ func poolInputs() Inputs {
 			Region: "us-west-2", SubnetID: "subnet-0abc", SecurityGroupIDs: []string{"sg-0abc", "sg-0def"},
 			Images:                 []string{"ami-0a1b", "ami-0c2d"},
 			InstanceProfileRoleARN: "arn:aws:iam::123456789012:role/billet-pool-host",
-			KMSKeyARN:              "arn:aws:kms:us-west-2:123456789012:key/abcd",
+			KMSKeyARNs: []string{
+				"arn:aws:kms:us-west-2:123456789012:key/abcd", "arn:aws:kms:us-west-2:123456789012:key/ef01",
+				"arn:aws:kms:us-west-2:123456789012:key/abcd",
+			},
 		},
 	}
 }
@@ -27,9 +30,12 @@ func poolInputs() Inputs {
 const wantPoolPolicy = `{"Version":"2012-10-17","Statement":[
 {"Sid":"BilletPoolRead","Effect":"Allow","Action":["ec2:DescribeInstances"],"Resource":["*"]},
 {"Sid":"BilletPoolLaunchFrom","Effect":"Allow","Action":["ec2:RunInstances"],"Resource":[
- "arn:aws:ec2:us-west-2:*:subnet/subnet-0abc","arn:aws:ec2:us-west-2:*:network-interface/*",
+ "arn:aws:ec2:us-west-2:*:subnet/subnet-0abc",
  "arn:aws:ec2:us-west-2:*:security-group/sg-0abc","arn:aws:ec2:us-west-2:*:security-group/sg-0def",
  "arn:aws:ec2:us-west-2::image/ami-0a1b","arn:aws:ec2:us-west-2::image/ami-0c2d"]},
+{"Sid":"BilletPoolLaunchInterface","Effect":"Allow","Action":["ec2:RunInstances"],
+ "Resource":["arn:aws:ec2:us-west-2:*:network-interface/*"],
+ "Condition":{"ArnLike":{"ec2:Subnet":"arn:aws:ec2:us-west-2:*:subnet/subnet-0abc"}}},
 {"Sid":"BilletPoolLaunchHost","Effect":"Allow","Action":["ec2:RunInstances"],
  "Resource":["arn:aws:ec2:us-west-2:*:instance/*","arn:aws:ec2:us-west-2:*:volume/*"],
  "Condition":{REQUEST,
@@ -49,11 +55,12 @@ const wantPoolPolicy = `{"Version":"2012-10-17","Statement":[
  "Condition":{"StringEquals":{"iam:PassedToService":"ec2.amazonaws.com"}}},
 {"Sid":"BilletPoolKMSUse","Effect":"Allow",
  "Action":["kms:DescribeKey","kms:GenerateDataKeyWithoutPlaintext","kms:ReEncrypt*","kms:Decrypt"],
- "Resource":["arn:aws:kms:us-west-2:123456789012:key/abcd"],
+ "Resource":["arn:aws:kms:us-west-2:123456789012:key/abcd","arn:aws:kms:us-west-2:123456789012:key/ef01"],
  "Condition":{"StringEquals":{"kms:ViaService":"ec2.us-west-2.amazonaws.com"}}},
 {"Sid":"BilletPoolKMSGrant","Effect":"Allow","Action":["kms:CreateGrant"],
- "Resource":["arn:aws:kms:us-west-2:123456789012:key/abcd"],
- "Condition":{"Bool":{"kms:GrantIsForAWSResource":"true"}}}]}`
+ "Resource":["arn:aws:kms:us-west-2:123456789012:key/abcd","arn:aws:kms:us-west-2:123456789012:key/ef01"],
+ "Condition":{"StringEquals":{"kms:ViaService":"ec2.us-west-2.amazonaws.com"},
+  "Bool":{"kms:GrantIsForAWSResource":"true"}}}]}`
 
 func samePolicy(t *testing.T, mode string, p Policy, want string) {
 	t.Helper()
@@ -119,10 +126,10 @@ func TestThePoolGrantRefusesWhatWouldWidenIt(t *testing.T) {
 		"no group":                 func(p *Pool) { p.SecurityGroupIDs = nil },
 		"no image":                 func(p *Pool) { p.Images = nil },
 		"a role that is not":       func(p *Pool) { p.InstanceProfileRoleARN = "arn:aws:iam::123456789012:user/x" },
-		"a key in another region":  func(p *Pool) { p.KMSKeyARN = "arn:aws:kms:us-east-1:123456789012:key/abcd" },
-		"a key that is an alias":   func(p *Pool) { p.KMSKeyARN = "arn:aws:kms:us-west-2:123456789012:alias/x" },
-		"a key with a wildcard":    func(p *Pool) { p.KMSKeyARN = "arn:aws:kms:us-west-2:123456789012:key/*" },
-		"a key that is not an arn": func(p *Pool) { p.KMSKeyARN = "abcd" },
+		"a key in another region":  func(p *Pool) { p.KMSKeyARNs = []string{"arn:aws:kms:us-east-1:123456789012:key/abcd"} },
+		"a key that is an alias":   func(p *Pool) { p.KMSKeyARNs = []string{"arn:aws:kms:us-west-2:123456789012:alias/x"} },
+		"a key with a wildcard":    func(p *Pool) { p.KMSKeyARNs = []string{"arn:aws:kms:us-west-2:123456789012:key/*"} },
+		"a key that is not an arn": func(p *Pool) { p.KMSKeyARNs = []string{"abcd"} },
 	} {
 		in := poolInputs()
 		pool := *in.Pool

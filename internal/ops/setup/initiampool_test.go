@@ -68,20 +68,24 @@ func TestInitIAMPoolPrintsTheControlPlanesPoolGrant(t *testing.T) {
 		err = Init(t.Context(), processEnv(), []string{
 			"iam", "--config", path, "--pool", "--deployment", testDeployID,
 			"--role-arn", "arn:aws:iam::123456789012:role/billet-pool-host",
+			"--kms-key-arn", "arn:aws:kms:us-west-2:123456789012:key/x64",
+			"--kms-key-arn", "arn:aws:kms:us-west-2:123456789012:key/arm",
 		})
 	})
 	if err != nil {
 		t.Fatalf("init iam --pool: %v", err)
 	}
 	got := parsePolicy(t, out)
-	want := []string{"BilletPoolRead", "BilletPoolLaunchFrom", "BilletPoolLaunchHost", "BilletPoolTag",
-		"BilletPoolTerminate", "BilletPoolConsole", "BilletPoolPassRole"}
+	want := []string{"BilletPoolRead", "BilletPoolLaunchFrom", "BilletPoolLaunchInterface", "BilletPoolLaunchHost",
+		"BilletPoolTag", "BilletPoolTerminate", "BilletPoolConsole", "BilletPoolPassRole", "BilletPoolKMSUse",
+		"BilletPoolKMSGrant"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("init iam --pool printed %v, want %v", got, want)
 	}
 	for _, need := range []string{
 		"arn:aws:ec2:us-west-2:*:subnet/subnet-0abc", "arn:aws:ec2:us-west-2:*:security-group/sg-0abc",
 		"arn:aws:ec2:us-west-2::image/ami-0a1b", "arn:aws:ec2:us-west-2::image/ami-0c2d", testDeployID,
+		"arn:aws:kms:us-west-2:123456789012:key/x64", "arn:aws:kms:us-west-2:123456789012:key/arm",
 	} {
 		if !strings.Contains(out, need) {
 			t.Errorf("the pool grant does not name %s:\n%s", need, out)
@@ -106,6 +110,10 @@ func TestInitIAMPoolRefusesWhatItCannotScope(t *testing.T) {
 		"a role with no profile":            {"--config", plain, "--pool", "--deployment", testDeployID, "--role-arn", "arn:aws:iam::123456789012:role/x"},
 		"a node's flag":                     {"--config", plain, "--pool", "--deployment", testDeployID, "--builder"},
 		"no deployment and no account-wide": {"--config", plain, "--pool"},
+		"two keys for a node": {"--config", ec2NodeConfig(t), "--deployment", testDeployID,
+			"--role-arn", "arn:aws:iam::123456789012:role/billet-node",
+			"--kms-key-arn", "arn:aws:kms:us-west-2:123456789012:key/abcd",
+			"--kms-key-arn", "arn:aws:kms:us-west-2:123456789012:key/ef01"},
 	} {
 		var err error
 		capture(t, func() { err = Init(t.Context(), processEnv(), append([]string{"iam"}, args...)) })

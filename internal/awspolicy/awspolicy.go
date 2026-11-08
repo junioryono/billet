@@ -177,6 +177,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/junioryono/billet/internal/archivestore"
@@ -366,10 +367,10 @@ type Pool struct {
 	// InstanceProfileRoleARN, when set, is the role inside the hosts' instance
 	// profile, which a launch passes.
 	InstanceProfileRoleARN string
-	// KMSKeyARN, when set, is a customer-managed key the hosts' volumes are encrypted
-	// under (an image's, or the account's EBS default), which EBS uses on the launching
+	// KMSKeyARNs are the customer-managed keys the hosts' volumes are encrypted under
+	// (each image's, or the account's EBS default), which EBS uses on the launching
 	// principal's behalf. The AWS-managed aws/ebs key needs no grant.
-	KMSKeyARN string
+	KMSKeyARNs []string
 }
 
 // Network names the subnets and security groups an ec2 node launches into. When
@@ -1659,7 +1660,8 @@ func launchStatements(partition string, in Inputs) []Statement {
 // (docs/reference/records/bare-metal-hosts.md): billet's own pool launch is allowed
 // on both architectures; another deployment's pool owner, the job owner tag beside the
 // pool's, the owner key in another case, no tags, an unnamed image, subnet or group,
-// and another image's snapshot in a mapping are each denied; terminate and the console
+// another image's snapshot in a mapping, and an existing interface in another subnet,
+// or in the pool's carrying an unnamed group, are each denied; terminate and the console
 // read reach the pool-tagged instance and not an untagged one. The launched image's own
 // backing snapshot named in a mapping is allowed, as 2026-09-04 found for the node.
 func poolStatements(partition, suffix, owner string, pool Pool) ([]Statement, error) {
@@ -1680,7 +1682,8 @@ func poolStatements(partition, suffix, owner string, pool Pool) ([]Statement, er
 	}
 
 	arn := func(kind string) string { return "arn:" + partition + ":ec2:" + pool.Region + ":*:" + kind }
-	from := []string{arn("subnet/" + pool.SubnetID), arn("network-interface/*")}
+	subnet := arn("subnet/" + pool.SubnetID)
+	from := []string{subnet}
 	for _, g := range pool.SecurityGroupIDs {
 		if !securityGroupIDPattern.MatchString(g) {
 			return nil, fmt.Errorf("awspolicy: the pool's security group %q is not a security group id", g)
@@ -1719,6 +1722,14 @@ func poolStatements(partition, suffix, owner string, pool Pool) ([]Statement, er
 	out := []Statement{
 		{Sid: "BilletPoolRead", Effect: "Allow", Action: ec2.PoolReadIAMActions(), Resource: []string{"*"}},
 		{Sid: "BilletPoolLaunchFrom", Effect: "Allow", Action: ec2.PoolLaunchIAMActions(), Resource: from},
+		// THE INTERFACE ONLY IN THE POOL'S SUBNET. A launch may name an interface that
+		// already exists, which brings its own subnet and groups, so the interface a
+		// launch creates or names is held to the pool's subnet by the key EC2 gives it.
+		{
+			Sid: "BilletPoolLaunchInterface", Effect: "Allow",
+			Action: ec2.PoolLaunchIAMActions(), Resource: []string{arn("network-interface/*")},
+			Condition: map[string]any{"ArnLike": map[string]any{"ec2:Subnet": subnet}},
+		},
 		{
 			Sid: "BilletPoolLaunchHost", Effect: "Allow",
 			Action: ec2.PoolLaunchIAMActions(), Resource: created, Condition: requestTags,
@@ -1747,22 +1758,32 @@ func poolStatements(partition, suffix, owner string, pool Pool) ([]Statement, er
 	// THE CACHE'S KMS SHAPE, which iam:SimulateCustomPolicy measured (package comment):
 	// the key is used only through EC2 in the pool's region, and granted only to an AWS
 	// resource, so the role can neither call it directly nor delegate it away.
-	if pool.KMSKeyARN != "" {
-		if err := requireARN(pool.KMSKeyARN, "kms", "key/", partition, pool.Region); err != nil {
-			return nil, fmt.Errorf("the pool's KMS key: %w", err)
+	if len(pool.KMSKeyARNs) > 0 {
+		var keys []string
+		for _, key := range pool.KMSKeyARNs {
+			if err := requireARN(key, "kms", "key/", partition, pool.Region); err != nil {
+				return nil, fmt.Errorf("the pool's KMS key: %w", err)
+			}
+			if !slices.Contains(keys, key) {
+				keys = append(keys, key)
+			}
 		}
+		viaEC2 := map[string]any{"kms:ViaService": "ec2." + pool.Region + "." + suffix}
 		out = append(out,
 			Statement{
 				Sid: "BilletPoolKMSUse", Effect: "Allow",
-				Action: ebss3.KMSCryptoIAMActions(), Resource: []string{pool.KMSKeyARN},
-				Condition: map[string]any{
-					"StringEquals": map[string]any{"kms:ViaService": "ec2." + pool.Region + "." + suffix},
-				},
+				Action: ebss3.KMSCryptoIAMActions(), Resource: keys,
+				Condition: map[string]any{"StringEquals": viaEC2},
 			},
+			// AND THE GRANT THROUGH EC2 ALONE, so a controller that may call another
+			// service cannot have it grant the key on its behalf.
 			Statement{
 				Sid: "BilletPoolKMSGrant", Effect: "Allow",
-				Action: ebss3.KMSGrantIAMActions(), Resource: []string{pool.KMSKeyARN},
-				Condition: map[string]any{"Bool": map[string]any{"kms:GrantIsForAWSResource": "true"}},
+				Action: ebss3.KMSGrantIAMActions(), Resource: keys,
+				Condition: map[string]any{
+					"StringEquals": viaEC2,
+					"Bool":         map[string]any{"kms:GrantIsForAWSResource": "true"},
+				},
 			},
 		)
 	}

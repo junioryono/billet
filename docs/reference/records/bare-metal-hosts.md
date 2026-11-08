@@ -57,13 +57,15 @@ One t3.micro (a Nitro instance; `GetConsoleOutput --latest` needs one) in us-wes
 | an image the pool does not name | denied |
 | a subnet and group the pool does not name | denied |
 | another image's snapshot in a block-device mapping | denied |
+| an existing network interface in another subnet | denied |
+| an existing network interface in the pool's subnet with a group the pool does not name | denied |
 | the launched image's own backing snapshot in a mapping | allowed |
 | terminate, and read the console of, the instance carrying the pool owner | allowed |
 | terminate, and read the console of, the instance without it | denied |
 | describe instances | allowed |
 | stop the pool host, or tag it after its launch | denied |
 
-The grant names every resource a pool launch touches, so a snapshot in a mapping is refused by omission, without the Deny the node's launch carries. The one snapshot it lets through is the launched image's own, which the 2026-09-04 dry runs found EC2 does not evaluate, and which exposes nothing the pool does not already boot.
+The grant names every resource a pool launch touches, so a snapshot in a mapping is refused by omission, without the Deny the node's launch carries, and holds the network interface a launch creates or names to the pool's subnet (`ec2:Subnet`); an existing interface in that subnet carrying a group the pool does not name was refused as well, so EC2 evaluates an existing interface's groups too. A customer-managed key's grant (`--kms-key-arn`) is the cache's shape, which the 2026-09-04 simulation measured, and a dry run does not exercise it. The one snapshot it lets through is the launched image's own, which the 2026-09-04 dry runs found EC2 does not evaluate, and which exposes nothing the pool does not already boot.
 
 ## Still to measure
 

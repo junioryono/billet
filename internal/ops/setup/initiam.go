@@ -54,10 +54,12 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 			"of node.ec2's (requires --builder); the launch grant names it beside them")
 	roleARN := fs.String("role-arn", "",
 		"the IAM role ARN the instance_profile contains, for iam:PassRole scoping")
-	kmsKeyARN := fs.String("kms-key-arn", "",
+	var kmsKeys keyARNs
+	fs.Var(&kmsKeys, "kms-key-arn",
 		"the full KMS key ARN, when the configured key is a bare id or alias — "+
 			"node.ebs_s3.kms_key_id for an ec2 node, node.codebuild.jit_kms_key_id for a "+
-			"codebuild one")
+			"codebuild one; with --pool, a customer-managed key the pool's hosts' volumes are "+
+			"encrypted under, repeated for each")
 	deployment := fs.String("deployment", "",
 		"this deployment's identity, scoping the policy to only its own resources "+
 			"(defaults to the id in the config's state directory)")
@@ -99,7 +101,15 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 				"--kms-key-arn, --deployment and --account-wide, and no flag of a node's or a builder's")
 		}
 
-		return printPoolIAM(env, cfg, *roleARN, *kmsKeyARN, *deployment, *accountWide)
+		return printPoolIAM(env, cfg, *roleARN, kmsKeys, *deployment, *accountWide)
+	}
+
+	if len(kmsKeys) > 1 {
+		return errors.New("--kms-key-arn names one key for a node; it is repeated only with --pool")
+	}
+	kmsKeyARN := new(string)
+	if len(kmsKeys) == 1 {
+		*kmsKeyARN = kmsKeys[0]
 	}
 
 	if cfg.Node == nil {
@@ -179,7 +189,9 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 // A CUSTOMER-MANAGED KEY IS NOT IN THE CONFIG: the hosts' volumes are encrypted under
 // their image's key or the account's EBS default, so --kms-key-arn names it when it is
 // not AWS's own aws/ebs, which needs no grant.
-func printPoolIAM(env cli.Env, cfg *config.Config, roleARN, kmsKeyARN, deployment string, accountWide bool) error {
+func printPoolIAM(env cli.Env, cfg *config.Config, roleARN string, kmsKeys []string, deployment string,
+	accountWide bool,
+) error {
 	var metal *config.PoolAWSMetal
 	if cfg.Server != nil && cfg.Server.Pool != nil {
 		metal = cfg.Server.Pool.AWSMetal
@@ -217,7 +229,7 @@ func printPoolIAM(env cli.Env, cfg *config.Config, roleARN, kmsKeyARN, deploymen
 		NoCompute: true,
 		Pool: &awspolicy.Pool{
 			Region: metal.Region, SubnetID: metal.SubnetID, SecurityGroupIDs: metal.SecurityGroupIDs,
-			Images: images, InstanceProfileRoleARN: roleARN, KMSKeyARN: kmsKeyARN,
+			Images: images, InstanceProfileRoleARN: roleARN, KMSKeyARNs: kmsKeys,
 		},
 	}
 
@@ -232,6 +244,17 @@ func printPoolIAM(env cli.Env, cfg *config.Config, roleARN, kmsKeyARN, deploymen
 	}
 
 	fmt.Fprintln(env.Stdout, string(body))
+
+	return nil
+}
+
+// keyARNs is a flag that may be repeated, each value one key's ARN.
+type keyARNs []string
+
+func (k *keyARNs) String() string { return strings.Join(*k, ",") }
+
+func (k *keyARNs) Set(v string) error {
+	*k = append(*k, v)
 
 	return nil
 }
