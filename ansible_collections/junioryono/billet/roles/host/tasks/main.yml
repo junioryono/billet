@@ -43,7 +43,7 @@
     # it (ADR-030). A node started here would have neither.
     billet_node_should_run: >-
       {{ billet_enable_node and not (billet_server_prepare_only | default(false))
-         and not (billet_node_prepare_only | default(false)) }}
+         and not (billet_node_prepare_only | default(false) | bool) }}
 
 # Missing installation input must refuse before an absent classifier can hold.
 # Config shape and key presence remain behind retirement's ordinary boundary.
@@ -108,8 +108,8 @@
           - >-
             not (billet_server_prepare_only | default(false)) or
             billet_ledger_volume_id | default('') | length > 0
-          - not (billet_node_prepare_only | default(false)) or billet_enable_node
-          - not (billet_node_prepare_only | default(false)) or not billet_enable_server
+          - not (billet_node_prepare_only | default(false) | bool) or billet_enable_node
+          - not (billet_node_prepare_only | default(false) | bool) or not billet_enable_server
         fail_msg: >-
           billet_server_prepare_only prepares a control-plane host without starting
           it, so it requires billet_enable_server (this host is the control plane; it

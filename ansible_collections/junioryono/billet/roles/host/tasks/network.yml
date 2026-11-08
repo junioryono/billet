@@ -367,4 +367,3 @@
     - billet_network_requires_drain
     - billet_node_unit_load_state.stdout | trim != 'not-found'
     - not ansible_check_mode
-    - not billet_node_prepare_only | default(false) | bool or billet_node_drain_requested_here | default(false) | bool

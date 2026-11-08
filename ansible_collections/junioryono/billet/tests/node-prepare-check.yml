@@ -347,6 +347,31 @@
           ansible.builtin.set_fact:
             billet_prepare_refused_version: "{{ ansible_failed_result.msg | default('') }}"
 
+    - name: Inspect whether the refused converges staged a candidate
+      ansible.builtin.find:
+        paths: /var/lib/billet/upgrades
+        patterns: billet.candidate
+        recurse: true
+      register: billet_prepare_refused_staged
+
+    - name: Inspect the config path after the binary refusals
+      ansible.builtin.stat:
+        path: /etc/billet/billet.yaml
+      register: billet_prepare_refused_config
+
+    - name: Require each binary source refused by the mode's own refusal, with nothing staged or written
+      ansible.builtin.assert:
+        that:
+          - "'billet_node_prepare_only leaves the node' in billet_prepare_refused_src"
+          - "'billet_node_prepare_only leaves the node' in billet_prepare_refused_version"
+          - billet_prepare_refused_staged.matched == 0
+          - not billet_prepare_refused_config.stat.exists
+        fail_msg: >-
+          supplied binary: {{ billet_prepare_refused_src or 'not refused' }};
+          pinned version: {{ billet_prepare_refused_version or 'not refused' }};
+          {{ billet_prepare_refused_staged.matched }} candidates staged;
+          config {{ 'written' if billet_prepare_refused_config.stat.exists else 'absent' }}.
+
     - name: Make the package's template directory
       ansible.builtin.file:
         path: /usr/share/billet
@@ -409,27 +434,3 @@
         path: "{{ item }}"
         state: absent
       loop: [/etc/billet/billet.yaml, /usr/share/billet]
-
-    - name: Inspect whether anything was written or staged
-      ansible.builtin.find:
-        paths: /var/lib/billet/upgrades
-        patterns: billet.candidate
-        recurse: true
-      register: billet_prepare_refused_staged
-
-    - name: Inspect the config path after the refusals
-      ansible.builtin.stat:
-        path: /etc/billet/billet.yaml
-      register: billet_prepare_refused_config
-
-    - name: Require each refused by the mode's own refusal, with nothing staged or written
-      ansible.builtin.assert:
-        that:
-          - "'billet_node_prepare_only leaves the node' in billet_prepare_refused_src"
-          - "'billet_node_prepare_only leaves the node' in billet_prepare_refused_version"
-          - billet_prepare_refused_staged.matched == 0
-          - not billet_prepare_refused_config.stat.exists
-        fail_msg: >-
-          supplied binary: {{ billet_prepare_refused_src or 'not refused' }};
-          pinned version: {{ billet_prepare_refused_version or 'not refused' }};
-          {{ billet_prepare_refused_staged.matched }} candidates staged.
