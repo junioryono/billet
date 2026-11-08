@@ -98,6 +98,13 @@ func TestAPoolMayHandInitItsKernelAndCephIdentity(t *testing.T) {
 	if got := cfg.Server.Pool.InitArgs; len(got) != 5 || got[1] != "/var/lib/billet/vmlinux" {
 		t.Errorf("init_args read as %q", got)
 	}
+	// A VALUE THAT LOOKS LIKE A FLAG IS ITS FLAG'S: `--ceph-user --force`, the sequence
+	// internal/ops/host's tests carry through init as a Ceph user named --force, loads (its
+	// test proves it forces nothing).
+	block = strings.Replace(poolBlock, "    boot_prelude:", "    init_args: ['--ceph-user', '--force']\n    boot_prelude:", 1)
+	if _, err := loadServer(t, poolConfig(block)); err != nil {
+		t.Errorf("a Ceph user that looks like a flag was refused: %v", err)
+	}
 }
 
 func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
@@ -134,6 +141,10 @@ func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
 		"init's provider":         {"    boot_prelude:", "    init_args: ['--provider=docker']\n    boot_prelude:", "is not one of"},
 		"a kernel twice":          {"    boot_prelude:", "    init_args: ['--kernel-image', /a, '--kernel-image=/b']\n    boot_prelude:", "twice"},
 		"three dashes":            {"    boot_prelude:", "    init_args: ['---kernel-image=/a']\n    boot_prelude:", "is not one of"},
+		"an admin ceph user":      {"    boot_prelude:", "    init_args: ['--ceph-user=admin']\n    boot_prelude:", "administrator"},
+		"a client. ceph user":     {"    boot_prelude:", "    init_args: ['--ceph-user', client.billet]\n    boot_prelude:", "client."},
+		"a relative keyring":      {"    boot_prelude:", "    init_args: ['--ceph-keyring', ceph.keyring]\n    boot_prelude:", "keyring_path"},
+		"a relative kernel":       {"    boot_prelude:", "    init_args: ['--kernel-image=vmlinux']\n    boot_prelude:", "absolute path"},
 		"a flag with no value":    {"    boot_prelude:", "    init_args: ['--ceph-keyring']\n    boot_prelude:", "no value"},
 		"a bare word":             {"    boot_prelude:", "    init_args: [kernel]\n    boot_prelude:", "is not one of"},
 		"an ipv6 wildcard join":   {"join_server: 10.77.0.10:7717", "join_server: '[::]:7717'", "join_server"},

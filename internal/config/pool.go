@@ -39,9 +39,13 @@ var PoolInitFlags = []string{"kernel-image", "ceph-user", "ceph-keyring"}
 // join's line. A value is the flag's whatever it starts with: init's parser takes the
 // word after a string flag as its value, so `--ceph-user --force` names a user and
 // forces nothing.
+//
+// AND EACH VALUE IS ONE THE NODE'S CONFIG WILL TAKE, by the node's own rules, because
+// a value only the host's init refuses is a host rented that cannot join.
 func checkPoolInitArgs(args []string) []error {
 	var errs []error
 	seen := map[string]bool{}
+	values := map[string]string{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "" || strings.ContainsAny(a, "\x00\n\r") {
@@ -50,7 +54,7 @@ func checkPoolInitArgs(args []string) []error {
 
 			continue
 		}
-		name, _, inline := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
+		name, value, inline := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
 		if !strings.HasPrefix(a, "-") || strings.HasPrefix(a, "---") || !slices.Contains(PoolInitFlags, name) {
 			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q is not one of %v: every other flag of "+
 				"billet init is the join's to decide", i, a, PoolInitFlags))
@@ -68,10 +72,31 @@ func checkPoolInitArgs(args []string) []error {
 				break
 			}
 			i++
-			if value := args[i]; value == "" || strings.ContainsAny(value, "\x00\n\r") {
+			value = args[i]
+			if value == "" || strings.ContainsAny(value, "\x00\n\r") {
 				errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word with no "+
 					"NUL or line break", i, value))
+
+				continue
 			}
+		}
+		values[name] = value
+	}
+
+	if kernel, ok := values["kernel-image"]; ok && (!filepath.IsAbs(kernel) || kernel != strings.TrimSpace(kernel)) {
+		errs = append(errs, fmt.Errorf("server.pool.init_args' --kernel-image %q must be an absolute path, as "+
+			"node.firecracker.kernel_image must", kernel))
+	}
+	if _, user := values["ceph-user"]; user || values["ceph-keyring"] != "" {
+		ceph := CephConfig{
+			User: values["ceph-user"], KeyringPath: values["ceph-keyring"], ImagePool: "billet-images",
+			CachePool: "billet-cache",
+		}
+		if !user {
+			ceph.User = DefaultCephUser
+		}
+		for _, err := range CheckCeph(ceph) {
+			errs = append(errs, fmt.Errorf("server.pool.init_args: %w", err))
 		}
 	}
 
