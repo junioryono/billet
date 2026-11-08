@@ -146,7 +146,9 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 	// THE POOL STEPS FROM THE START, so its floor is ordered before the first job, and
 	// at its interval after that, in simulated time.
 	var hosts *poolDriver
-	var lastCompletion time.Time
+	// lastActivity is the latest event the trace delivered, a pool step aside, from the
+	// replay's first instant.
+	lastActivity := clock.Now()
 	if fleet.Pool != nil {
 		hosts = newPoolDriver(t, fleet, trace, tiers, st, clock)
 		actions.schedule(event{at: clock.Now(), kind: eventPoolTick})
@@ -194,20 +196,18 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 					actions.nudge(label)
 					settle("a poll for " + label + " at a pool step")
 				}
-				for _, due := range hosts.step(t.Context()) {
+				for _, due := range hosts.step(t.Context(), ev.at) {
 					actions.schedule(event{at: due.at, kind: eventPoolReady})
 				}
 				settle(describe(ev))
-				if hosts.ticksOn(actions, ev.at, lastCompletion) {
+				if hosts.ticksOn(actions, ev.at, lastActivity) {
 					actions.schedule(event{at: ev.at.Add(fleet.Pool.interval()), kind: eventPoolTick})
 				}
 			case eventPoolReady:
 				hosts.observe(t.Context())
 				settle(describe(ev))
 			default:
-				if ev.kind == eventCompleted {
-					lastCompletion = ev.at
-				}
+				lastActivity = ev.at
 				actions.deliver(ev)
 				settle(describe(ev))
 			}

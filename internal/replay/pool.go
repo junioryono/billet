@@ -94,6 +94,9 @@ type PoolReport struct {
 	// pool had not asked to release when the replay stopped: an observation cut
 	// short, never a pool that would not shrink.
 	StoppedAbove map[config.Arch]int
+	// Stalled is a replay whose pool stopped stepping because nothing else had
+	// happened for longer than any job could need.
+	Stalled bool
 }
 
 // PoolOrderRecord is one order's life in simulated time, each instant zero until it
@@ -244,8 +247,11 @@ type poolDriver struct {
 	report PoolReport
 	asked  map[string]bool
 	serial int
-	// horizon is the last instant the pool steps at.
-	horizon time.Time
+	// stall is how long the replay may go with nothing but the pool's steps before it
+	// stops them; tail is the fixed deadline of a quiet pool's shrink, zero until it
+	// went quiet.
+	stall time.Duration
+	tail  time.Time
 	// scheduled is every order whose join is scheduled; lastJoin the latest join.
 	scheduled map[string]bool
 	lastJoin  time.Time
@@ -293,31 +299,36 @@ func newPoolDriver(t *testing.T, fleet Fleet, trace Trace, tiers []config.Tier, 
 	return &poolDriver{
 		t: t, fleet: pf, alloc: st.alloc, nodes: st.nodes, plane: st.plane, clock: clock, pool: p, source: src,
 		report: PoolReport{MostJoined: map[config.Arch]int{}}, asked: map[string]bool{}, scheduled: map[string]bool{},
-		horizon: trace.Arrivals[len(trace.Arrivals)-1].At.Add(longestJob(trace) + pf.LeadTime + pf.IdleAfter +
-			6*time.Hour),
+		stall: longestJob(trace) + pf.LeadTime + pf.IdleAfter + 6*time.Hour,
 	}
 }
 
 // step is one of the scaler's steps; then every order the ledger now holds is
 // recorded, every host now running joins, and every host the source took back ends.
 // It returns the hosts the step ordered, each to join at its own lead time.
-func (d *poolDriver) step(ctx context.Context) []readyAt {
+//
+// AN ORDER IS DATED BY ITS STEP'S INSTANT, at, not by the clock, which the harness
+// moves a nanosecond past an instant another event already took: a host ordered at a
+// step joins exactly a lead time later, before the step at that instant, as one that
+// joined in the lead time would.
+func (d *poolDriver) step(ctx context.Context, at time.Time) []readyAt {
 	t := d.t
 	t.Helper()
 	if err := d.pool.Step(ctx); err != nil {
 		t.Logf("replay: the pool's step at %s: %v", d.clock.Now().Format(time.RFC3339), err)
 	}
-	d.observe(ctx)
 
 	d.source.mu.Lock()
 	var due []readyAt
 	for _, id := range d.source.order {
 		if h := d.source.hosts[id]; !d.scheduled[id] {
 			d.scheduled[id] = true
-			due = append(due, readyAt{order: id, at: h.ordered.Add(d.source.lead)})
+			h.ordered = at
+			due = append(due, readyAt{order: id, at: at.Add(d.source.lead)})
 		}
 	}
 	d.source.mu.Unlock()
+	d.observe(ctx)
 
 	return due
 }
@@ -343,7 +354,13 @@ func (d *poolDriver) observe(ctx context.Context) {
 		o := &orders[i]
 		byID[o.ID] = o
 		if d.recordOf(o.ID) == nil {
-			d.report.Ordered = append(d.report.Ordered, PoolOrderRecord{Order: o.ID, Arch: o.Arch, Ordered: o.FirstAttempt})
+			ordered := o.FirstAttempt
+			d.source.mu.Lock()
+			if h, ok := d.source.hosts[o.ID]; ok {
+				ordered = h.ordered
+			}
+			d.source.mu.Unlock()
+			d.report.Ordered = append(d.report.Ordered, PoolOrderRecord{Order: o.ID, Arch: o.Arch, Ordered: ordered})
 		}
 		if !o.ReleaseRequested.IsZero() && !d.asked[o.ID] {
 			d.asked[o.ID] = true
@@ -477,15 +494,24 @@ func (d *poolDriver) above() map[config.Arch]int {
 // until idle_after and a step for each of them, and two to spare, have passed since
 // the later of the last completion and the last join. A replay that stops with hosts
 // still beyond the floor says so in the report.
-func (d *poolDriver) ticksOn(actions *plane, now, lastCompletion time.Time) bool {
-	// A JOB THAT NEVER FINISHES WOULD TICK FOREVER, so the pool stops at a horizon the
-	// trace could not need, and the report names what was left.
-	if now.After(d.horizon) {
+func (d *poolDriver) ticksOn(actions *plane, now, lastActivity time.Time) bool {
+	last := lastActivity
+	if d.lastJoin.After(last) {
+		last = d.lastJoin
+	}
+	// A JOB THAT NEVER FINISHES WOULD TICK FOREVER, so the pool stops once nothing but
+	// its own steps has happened for longer than any job of the trace could need, and
+	// the report says the replay stalled; a workload still making progress is never cut
+	// short by it.
+	if now.Sub(last) > d.stall {
+		d.report.Stalled = true
 		d.report.StoppedAbove = d.above()
 
 		return false
 	}
 	if !actions.onlyTicksLeft() || !actions.everyJobCompleted() || !d.settled() {
+		d.tail = time.Time{}
+
 		return true
 	}
 	if d.fleet.IdleAfter == 0 {
@@ -499,11 +525,12 @@ func (d *poolDriver) ticksOn(actions *plane, now, lastCompletion time.Time) bool
 	if excess == 0 {
 		return false
 	}
-	last := lastCompletion
-	if d.lastJoin.After(last) {
-		last = d.lastJoin
+	// THE DEADLINE IS FIXED WHEN THE POOL GOES QUIET, from the hosts beyond its floor
+	// then, so a release each step does not shorten the time the rest have.
+	if d.tail.IsZero() {
+		d.tail = last.Add(d.fleet.IdleAfter + time.Duration(excess+2)*d.fleet.interval())
 	}
-	if now.Before(last.Add(d.fleet.IdleAfter + time.Duration(excess+2)*d.fleet.interval())) {
+	if now.Before(d.tail) {
 		return true
 	}
 	d.report.StoppedAbove = above

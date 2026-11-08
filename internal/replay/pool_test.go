@@ -37,8 +37,9 @@ func speaks(t *testing.T, report *Report) {
 	if report.Pool == nil {
 		t.Fatal("the report says nothing of the pool")
 	}
-	if len(report.Pool.StoppedAbove) > 0 {
-		t.Fatalf("the replay stopped with hosts above the floor not yet asked to leave: %v", report.Pool.StoppedAbove)
+	if report.Pool.Stalled || len(report.Pool.StoppedAbove) > 0 {
+		t.Fatalf("the replay's pool stopped stepping early (stalled %v) with hosts above the floor not yet asked "+
+			"to leave: %v", report.Pool.Stalled, report.Pool.StoppedAbove)
 	}
 }
 
@@ -71,10 +72,13 @@ func TestAPoolGrowsFromItsFloorForABurstAndAsksToShrink(t *testing.T) {
 			"jobs on 16-vcpu hosts wants its maximum, 3, of each", len(pr.Ordered), got)
 	}
 	joinsAtItsLeadTime(t, pr, lead)
+	// ONE HOST AT A TIME, AND NO LATER THAN THAT: each next order is placed at the step
+	// the one before joined at, so nothing of the harness's stands between them.
 	for i := 1; i < len(pr.Ordered); i++ {
-		if o, prev := pr.Ordered[i], pr.Ordered[i-1]; o.Ordered.Before(prev.Joined) {
-			t.Errorf("order %s was placed at %s, before order %s joined at %s: the pool grows one host "+
-				"at a time while one is on its way", o.Order, o.Ordered, prev.Order, prev.Joined)
+		o, prev := pr.Ordered[i], pr.Ordered[i-1]
+		if gap := o.Ordered.Sub(prev.Joined); gap < 0 || gap > time.Millisecond {
+			t.Errorf("order %s was placed at %s and order %s joined at %s: the pool orders its next host at "+
+				"the step the one on its way joins at", o.Order, o.Ordered, prev.Order, prev.Joined)
 		}
 	}
 	if got := slices.Sorted(slices.Values(pr.ReleasesAsked)); !slices.Equal(got, []string{"r001", "r002", "r003"}) {
@@ -104,10 +108,11 @@ func TestAPoolsFloorIsWhatABurstDoesNotWait(t *testing.T) {
 		t.Logf("burst of 24 four-vcpu jobs, pool floor %d of 3 16-vcpu hosts, lead %s: queue wait p50 %s "+
 			"p90 %s p99 %s", floor, lead, p.P50, p.P90, p.P99)
 	}
-	// Three lead times stand between the burst and the floor of none's third host.
-	if p99[0]-p99[3] < 2*lead {
+	// Three lead times stand between the burst and the floor of none's third host, and
+	// the tail job waits on growth a floor of three already holds.
+	if p99[0]-p99[3] < lead {
 		t.Errorf("queue wait p99 is %s from a floor of none and %s from a floor of three; the growth of "+
-			"three hosts one at a time should cost the first at least two lead times more", p99[0], p99[3])
+			"three hosts one at a time should cost the first at least a lead time more", p99[0], p99[3])
 	}
 }
 
@@ -151,6 +156,32 @@ func TestAPoolCarriesAWideShapeMixFromItsFloor(t *testing.T) {
 	p := report.QueueWaitBy(func(*Record) string { return "all" })["all"]
 	t.Logf("wide-shape mix on a pool of 1..4 64-vcpu hosts, lead %s: %d orders; queue wait p50 %s p90 %s "+
 		"p99 %s; releases asked %v", lead, len(pr.Ordered), p.P50, p.P90, p.P99, pr.ReleasesAsked)
+}
+
+// FIVE HOSTS GOING QUIET TOGETHER ARE EACH ASKED TO LEAVE. Twenty hour-long jobs fill a
+// pool of five 16-vcpu hosts and end within minutes of each other; the pool asks for one
+// release a step, and the replay steps until the fifth is asked, not until a deadline
+// that shortened with every release.
+func TestFiveHostsGoingQuietTogetherAreEachAskedToLeave(t *testing.T) {
+	t.Parallel()
+	var trace Trace
+	for i := range 20 {
+		trace.Arrivals = append(trace.Arrivals, Arrival{
+			At: DefaultStart.Add(time.Duration(i) * time.Second), Tier: "billet-4vcpu", Owner: DefaultOwner,
+			Repository: "web", WorkflowRef: DefaultOwner + "/web/.github/workflows/ci.yml@refs/heads/main",
+			RunID: int64(30000 + i), Duration: Duration(time.Hour), Result: ResultSucceeded,
+		})
+	}
+	trace.Normalize()
+	report := Run(t, poolOnlyFleet(0, 5, 3*time.Minute, 10*time.Minute), trace, Options{DirectAssignment: true})
+	speaks(t, report)
+	pr := report.Pool
+	if got := pr.MostJoined[config.ArchX64]; got != 5 {
+		t.Fatalf("the pool joined at most %d hosts; twenty four-vcpu jobs fill five", got)
+	}
+	if got := slices.Sorted(slices.Values(pr.ReleasesAsked)); !slices.Equal(got, []string{"r001", "r002", "r003", "r004", "r005"}) {
+		t.Errorf("the pool asked to release %v; want each of its five hosts once", pr.ReleasesAsked)
+	}
 }
 
 // TWO ARCHITECTURES REPLAY THE SAME TWICE. The scaler orders on each architecture in

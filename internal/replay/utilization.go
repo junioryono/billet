@@ -377,7 +377,10 @@ func (r *Report) waitsThatFit(h Host) []interval {
 	fits := func(tier string, vcpu int, memory config.ByteSize) bool {
 		shape, known := shapes[tier]
 
-		return (!known || shape.Node == "" || shape.Node == h.Name) && vcpu <= h.VCPU && memory <= h.Memory
+		// A HOST OF ANOTHER ARCHITECTURE could never have carried the job, so its idle
+		// time while the job waited is not room the job was denied (ADR-022).
+		return (!known || shape.Node == "" || shape.Node == h.Name) && vcpu <= h.VCPU && memory <= h.Memory &&
+			(!known || shape.Arch == "" || shape.Arch == h.Arch)
 	}
 
 	var waits []interval
