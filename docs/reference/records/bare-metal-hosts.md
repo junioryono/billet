@@ -49,13 +49,13 @@ One t3.micro (a Nitro instance; `GetConsoleOutput --latest` needs one) in us-wes
 
 | Trace | Pool | Queue wait p50 | p90 | p99 |
 |---|---|---|---|---|
-| `Burst`, 24 four-vcpu jobs in ten seconds, a few minutes each | floor 0, max 3 | 9 min 48 s | 13 min 10 s | 14 min 33 s |
+| `Burst`, 24 four-vcpu jobs in ten seconds, a few minutes each | floor 0, max 3 | 9 min 24 s | 12 min 21 s | 13 min 44 s |
 | the same | floor 3, max 3 | 30 s | 6 min 33 s | 8 min 14 s |
-| `WideShapeMix`, 40 jobs of 2 to 32 vcpu at the load four hosts carry | floor 1, max 4, 64-vcpu hosts | 1 min 54 s | 3 min 44 s | 6 min 35 s |
+| `WideShapeMix`, 40 jobs of 2 to 32 vcpu at the load four hosts carry | floor 1, max 4, 64-vcpu hosts | 1 min 43 s | 3 min 28 s | 6 min 14 s |
 
-- **The pool grows one host at a time while one is on its way** (ADR-030), so a burst arriving at a floor of none waits out a lead time for every host it needs: each host was ordered at the pool's first step after the one before joined, four minutes apart (the three-minute lead and the step's minute), and the burst's p99 was six minutes longer than with the same three hosts kept as the floor. The tail at the floor of three is the second wave of jobs behind the twelve slots, not the pool.
+- **The pool grows one host at a time while one is on its way** (ADR-030), so a burst arriving at a floor of none waits out a lead time for every host it needs: each host was ordered at the step the one before joined at, three minutes apart, and the burst's p99 was five and a half minutes longer than with the same three hosts kept as the floor. The tail at the floor of three is the second wave of jobs behind the twelve slots, not the pool.
 - **Every job ran, on no more hosts than the maximum**, and the wide-shape mix filled all four. Two architectures, each with a floor, replayed the same twice: the same orders under the same identifiers, and every job on the same host, since the scaler now walks its architectures in one order.
-- **Once quiet for `idle_after` (ten minutes), the pool asked to release its hosts one a step down to its floor**: all three from a floor of none, three of four from a floor of one.
+- **Once quiet for `idle_after` (ten minutes), the pool asked to release its hosts one a step down to its floor**: all three from a floor of none, three of four from a floor of one, and all five of a pool filled by twenty hour-long jobs that ended together.
 
 ## A build's outbound traffic, for the limits a provider polices, 2026-11-08
 
@@ -69,7 +69,9 @@ One t3.micro (a Nitro instance; `GetConsoleOutput --latest` needs one) in us-wes
 | `go mod download` of billet's module graph | 5505 | 18 | 441560 | 27 |
 | `pip install` of numpy, pandas, scipy, requests, boto3, django, flask, sqlalchemy, pytest, black | 1518 | 6 | 92445 | 6 |
 
-A build's outbound load is small and bursty: its heaviest second was 5505 packets and 441 KB, from a download fetching modules in parallel, and it opened at most 18 connections in a second. The host role's limits (`billet_guest_refuse_smtp`, `billet_guest_new_connections_per_second`, `billet_guest_packets_per_second`, `billet_guest_egress_bytes_per_second`) cap every guest on a host together, which is what a provider measures, and are off unless set. For a pool host the settings this gives are SMTP refused, 1000 new connections a second (every one of 32 guests at the measured peak at once is under 600), 200000 packets a second (32 at once is 176000) and 125000000 bytes a second, a gigabit, far above 32 builds' 14 MB/s and below the uplink a provider's port allows. They are a host-wide budget, so a flooding job is cut off with its neighbours rather than alone; a cap per guest needs the per-interface chain of ADR-028 and is not built.
+A build's outbound load is small and bursty: its heaviest second was 5505 packets and 441 KB, from a download fetching modules in parallel, and it opened at most 18 connections in a second. The host role's limits (`billet_guest_refuse_smtp`, `billet_guest_new_connections_per_second`, `billet_guest_packets_per_second`, `billet_guest_egress_bytes_per_second`) cap what every guest on a host sends off it through the host's forwarding, together, and are off unless set. For a pool host the settings this gives, against 32 guests each at its measured peak in the same second (576 connection attempts, 176160 packets, 14129920 bytes), are SMTP refused, 1000 connection attempts a second (1.7 times), 400000 packets a second (2.3 times) and 125000000 bytes a second (a gigabit, 8.8 times, below the port a provider's server has).
+
+What they do not cover, said plainly. They are a budget for the whole host, so a flooding job is cut off with its neighbours rather than alone; a cap per guest needs ADR-028's per-interface chain and is not built. The connection limit counts every packet conntrack calls new, a first SYN and its retransmissions and each packet of a one-way UDP flow, not each flow once, so one guest sending a one-way UDP stream spends it for every guest. And a guest's requests to the host's own services, its DNS and the registry mirrors, end at the host, whose own upstream traffic leaves through its output and is not counted here: a provider sees it, and these limits do not cap it.
 
 ## Still to measure
 

@@ -30,17 +30,17 @@ table inet billet_guard {
 
   chain forward {
     type filter hook forward priority filter; policy accept;
-{% if billet_guest_refuse_smtp | bool %}
+{% if billet_guest_refuse_smtp | default(false) %}
     iifname @guest_ifaces oifname != @guest_ifaces tcp dport 25 counter drop comment "billet guest smtp"
 {% endif %}
-{% if (billet_guest_new_connections_per_second | int) > 0 %}
-    iifname @guest_ifaces oifname != @guest_ifaces ct state new limit rate over {{ billet_guest_new_connections_per_second | int }}/second burst {{ (billet_guest_new_connections_per_second | int) * 2 }} packets counter drop comment "billet guests' new connections"
+{% if (billet_guest_new_connections_per_second | default(0)) > 0 %}
+    iifname @guest_ifaces oifname != @guest_ifaces ct state new limit rate over {{ billet_guest_new_connections_per_second }}/second burst {{ billet_guest_new_connections_per_second * 2 }} packets counter drop comment "billet guests' connection attempts"
 {% endif %}
-{% if (billet_guest_packets_per_second | int) > 0 %}
-    iifname @guest_ifaces oifname != @guest_ifaces limit rate over {{ billet_guest_packets_per_second | int }}/second burst {{ billet_guest_packets_per_second | int }} packets counter drop comment "billet guests' packets"
+{% if (billet_guest_packets_per_second | default(0)) > 0 %}
+    iifname @guest_ifaces oifname != @guest_ifaces limit rate over {{ billet_guest_packets_per_second }}/second burst {{ billet_guest_packets_per_second }} packets counter drop comment "billet guests' packets"
 {% endif %}
-{% if (billet_guest_egress_bytes_per_second | int) > 0 %}
-    iifname @guest_ifaces oifname != @guest_ifaces limit rate over {{ billet_guest_egress_bytes_per_second | int }} bytes/second burst {{ billet_guest_egress_bytes_per_second | int }} bytes counter drop comment "billet guests' egress"
+{% if (billet_guest_egress_bytes_per_second | default(0)) > 0 %}
+    iifname @guest_ifaces oifname != @guest_ifaces limit rate over {{ billet_guest_egress_bytes_per_second }} bytes/second burst {{ billet_guest_egress_bytes_per_second }} bytes counter drop comment "billet guests' egress"
 {% endif %}
     ct state established,related accept
     iifname @guest_ifaces ip daddr @internal_v4 counter drop comment "billet guest -> internal v4"

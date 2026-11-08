@@ -124,6 +124,30 @@
     fail_msg: billet_guest_host_tcp_ports, billet_guest_host_udp_ports and billet_image_verify_port must contain ports from 1 to 65535, port ranges or service names.
   loop: "{{ billet_guest_host_tcp_ports + billet_guest_host_udp_ports + [billet_image_verify_port] }}"
 
+# A LIMIT IS A NUMBER OR IT IS NOTHING: "1000pps" would coerce to 0 and drop the limit,
+# and true to 1 and choke every guest, so only a boolean and plain integers in range
+# are rendered.
+- name: Validate the guests' egress limits
+  ansible.builtin.assert:
+    that:
+      - billet_guest_refuse_smtp is boolean
+      - billet_guest_new_connections_per_second is integer
+      - billet_guest_new_connections_per_second is not boolean
+      - billet_guest_new_connections_per_second >= 0
+      - billet_guest_new_connections_per_second <= 10000000
+      - billet_guest_packets_per_second is integer
+      - billet_guest_packets_per_second is not boolean
+      - billet_guest_packets_per_second >= 0
+      - billet_guest_packets_per_second <= 100000000
+      - billet_guest_egress_bytes_per_second is integer
+      - billet_guest_egress_bytes_per_second is not boolean
+      - billet_guest_egress_bytes_per_second >= 0
+      - billet_guest_egress_bytes_per_second <= 100000000000
+    fail_msg: >-
+      billet_guest_refuse_smtp must be true or false, and billet_guest_new_connections_per_second,
+      billet_guest_packets_per_second and billet_guest_egress_bytes_per_second whole numbers from 0 (off) to
+      10000000, 100000000 and 100000000000.
+
 - name: Validate billet_firecracker_version for versioned destinations
   ansible.builtin.assert:
     that: billet_firecracker_version is match('^v[0-9]+\.[0-9]+\.[0-9]+\Z')
