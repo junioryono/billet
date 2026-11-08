@@ -35,6 +35,82 @@ type stack struct {
 	stopNodes func()
 	hurry     chan struct{}
 	hurryOnce sync.Once
+
+	// nodes starts one more node runtime while the replay runs, as a pool host's
+	// joining does.
+	nodes *nodeStarter
+}
+
+// nodeStarter runs node loops against the stack's wire, each on a context of its
+// own under its caller's, so one can be stopped alone, as a host the pool released
+// is, and every one is cancelled and joined at stopNodes.
+type nodeStarter struct {
+	t          *testing.T
+	mu         sync.Mutex
+	cancels    []context.CancelFunc
+	loops      *sync.WaitGroup
+	addr       string
+	deployment string
+	clock      *Clock
+	log        *slog.Logger
+	hurry      chan struct{}
+}
+
+// start runs one node loop for a host and returns what stops it alone.
+func (n *nodeStarter) start(parent context.Context, h Host) func() {
+	t := n.t
+	t.Helper()
+	nc, err := app.NewNodeClient(&config.Config{Node: &config.NodeConfig{
+		Name: h.Name, ServerAddr: "http://" + n.addr,
+	}}, nil)
+	if err != nil {
+		t.Fatalf("NewNodeClient(%s): %v", h.Name, err)
+	}
+	prov, err := simulated.New(n.deployment, simulated.WithClock(n.clock.Now), simulated.WithLogger(n.log))
+	if err != nil {
+		t.Fatalf("simulated.New(%s): %v", h.Name, err)
+	}
+	runner := app.NewNodeRunner(nc, h.Name, prov, n.log)
+	var archs []config.Arch
+	if h.Arch != "" {
+		archs = []config.Arch{h.Arch}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	n.mu.Lock()
+	n.cancels = append(n.cancels, cancel)
+	n.mu.Unlock()
+	done := make(chan struct{})
+	n.loops.Go(func() {
+		defer close(done)
+		err := app.RunNodeLoop(ctx, nc, runner, nodeclient.LoopOptions{
+			Provider:      config.ProviderSimulated,
+			Deployment:    n.deployment,
+			Site:          h.Site,
+			VCPU:          h.VCPU,
+			Memory:        h.Memory,
+			Architectures: archs,
+			Log:           n.log,
+			Backoff:       50 * time.Millisecond,
+			Hurry:         n.hurry,
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("node %s stopped for a reason other than shutdown: %v", h.Name, err)
+		}
+	})
+
+	return sync.OnceFunc(func() {
+		cancel()
+		<-done
+	})
+}
+
+// stopAll cancels every loop started, so the stack's join of them can return.
+func (n *nodeStarter) stopAll() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, cancel := range n.cancels {
+		cancel()
+	}
 }
 
 // Real-time bounds on the harness's own waits. None of them is a simulated
@@ -213,40 +289,17 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 
 	var loops sync.WaitGroup
 
+	nodes := &nodeStarter{
+		t: t, loops: &loops, addr: wire.Addr, deployment: ctl.Deployment(),
+		clock: clock, log: log, hurry: hurry,
+	}
 	for _, h := range fleet.Hosts {
-		nc, err := app.NewNodeClient(&config.Config{Node: &config.NodeConfig{
-			Name: h.Name, ServerAddr: "http://" + wire.Addr,
-		}}, nil)
-		if err != nil {
-			t.Fatalf("NewNodeClient(%s): %v", h.Name, err)
-		}
-
-		prov, err := simulated.New(ctl.Deployment(), simulated.WithClock(clock.Now), simulated.WithLogger(log))
-		if err != nil {
-			t.Fatalf("simulated.New(%s): %v", h.Name, err)
-		}
-
-		runner := app.NewNodeRunner(nc, h.Name, prov, log)
-
-		loops.Go(func() {
-			err := app.RunNodeLoop(nodeCtx, nc, runner, nodeclient.LoopOptions{
-				Provider:   config.ProviderSimulated,
-				Deployment: ctl.Deployment(),
-				Site:       h.Site,
-				VCPU:       h.VCPU,
-				Memory:     h.Memory,
-				Log:        log,
-				Backoff:    50 * time.Millisecond,
-				Hurry:      hurry,
-			})
-			if err != nil && !errors.Is(err, context.Canceled) {
-				t.Errorf("node %s stopped for a reason other than shutdown: %v", h.Name, err)
-			}
-		})
+		nodes.start(nodeCtx, h)
 	}
 
 	stopNodes := sync.OnceFunc(func() {
 		cancelNodes()
+		nodes.stopAll()
 		loops.Wait()
 	})
 	t.Cleanup(stopNodes)
@@ -276,7 +329,7 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 
 	return &stack{
 		db: ctl.Ledger(), alloc: ctl.Allocator(), plane: wire.Plane(), scheduler: scheduler,
-		closeDB: closeDB, stopNodes: stopNodes, hurry: hurry,
+		closeDB: closeDB, stopNodes: stopNodes, hurry: hurry, nodes: nodes,
 	}
 }
 

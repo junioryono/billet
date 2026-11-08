@@ -52,6 +52,52 @@ func (r *Report) span() (time.Time, time.Time, bool) {
 	return from, to, true
 }
 
+// windowed reports whether any host was there for part of the replay only, which
+// makes the room change over it.
+func (r *Report) windowed() bool {
+	for _, h := range r.Fleet.Hosts {
+		if !h.Joined.IsZero() || !h.Left.IsZero() {
+			return true
+		}
+	}
+
+	return false
+}
+
+// roomSeconds is the room integrated over [from, to): at each instant the
+// deployment ceiling, or what the hosts there then hold between them when that is
+// less, in vcpu-seconds and byte-seconds.
+func (r *Report) roomSeconds(from, to time.Time) (float64, float64) {
+	cuts := []time.Time{from, to}
+	for _, h := range r.Fleet.Hosts {
+		for _, t := range []time.Time{h.Joined, h.Left} {
+			if t.After(from) && t.Before(to) {
+				cuts = append(cuts, t)
+			}
+		}
+	}
+	slices.SortFunc(cuts, func(a, b time.Time) int { return a.Compare(b) })
+	var vcpuSec, memorySec float64
+	for i := 0; i+1 < len(cuts); i++ {
+		a, b := cuts[i], cuts[i+1]
+		if !b.After(a) {
+			continue
+		}
+		vcpu, memory := 0, int64(0)
+		for _, h := range r.Fleet.Hosts {
+			if _, _, ok := h.present(a, b); ok {
+				vcpu += h.VCPU
+				memory += int64(h.Memory)
+			}
+		}
+		d := b.Sub(a).Seconds()
+		vcpuSec += float64(min(vcpu, r.Fleet.MaxVCPU)) * d
+		memorySec += float64(min(memory, int64(r.Fleet.MaxMemory))) * d
+	}
+
+	return vcpuSec, memorySec
+}
+
 // room is the fleet's room: the deployment ceiling, or what the hosts hold
 // between them when that is less.
 func (r *Report) room() (float64, float64) {
@@ -199,6 +245,15 @@ func (r *Report) Utilization(bucket time.Duration) []UtilizationPoint {
 		start := from.Add(time.Duration(b) * bucket)
 		width := earlier(start.Add(bucket), to).Sub(start).Seconds()
 		out[b] = UtilizationPoint{From: start, VCPU: vcpu[b] / width / roomVCPU, Memory: memory[b] / width / roomMemory}
+		// A ROOM THAT CHANGED is integrated over the bucket, so a host a pool has not
+		// ordered yet is not room left idle.
+		if r.windowed() {
+			v, m := r.roomSeconds(start, earlier(start.Add(bucket), to))
+			out[b].VCPU, out[b].Memory = 0, 0
+			if v > 0 && m > 0 {
+				out[b].VCPU, out[b].Memory = vcpu[b]/v, memory[b]/m
+			}
+		}
 	}
 
 	return out
@@ -241,6 +296,15 @@ func (r *Report) MeanUtilization() (float64, float64) {
 		memory += float64(s.memory) * d
 	}
 
+	if r.windowed() {
+		v, m := r.roomSeconds(from, to)
+		if v <= 0 || m <= 0 {
+			return 0, 0
+		}
+
+		return vcpu / v, memory / m
+	}
+
 	span := to.Sub(from).Seconds()
 
 	return vcpu / span / roomVCPU, memory / span / roomMemory
@@ -262,8 +326,8 @@ func (r *Report) EmptyHostHours() float64 {
 
 	for _, h := range r.Fleet.Hosts {
 		for _, s := range steps {
-			if s.perNode[h.Name] == 0 {
-				empty += s.nextFrom.Sub(s.at)
+			if a, b, ok := h.present(s.at, s.nextFrom); ok && s.perNode[h.Name] == 0 {
+				empty += b.Sub(a)
 			}
 		}
 	}
@@ -289,8 +353,8 @@ func (r *Report) EmptyWhileQueuedHours() float64 {
 		waiting := r.waitsThatFit(h)
 
 		for _, s := range steps {
-			if s.perNode[h.Name] == 0 {
-				empty += overlap(waiting, s.at, s.nextFrom)
+			if a, b, ok := h.present(s.at, s.nextFrom); ok && s.perNode[h.Name] == 0 {
+				empty += overlap(waiting, a, b)
 			}
 		}
 	}
@@ -313,7 +377,10 @@ func (r *Report) waitsThatFit(h Host) []interval {
 	fits := func(tier string, vcpu int, memory config.ByteSize) bool {
 		shape, known := shapes[tier]
 
-		return (!known || shape.Node == "" || shape.Node == h.Name) && vcpu <= h.VCPU && memory <= h.Memory
+		// A HOST OF ANOTHER ARCHITECTURE could never have carried the job, so its idle
+		// time while the job waited is not room the job was denied (ADR-022).
+		return (!known || shape.Node == "" || shape.Node == h.Name) && vcpu <= h.VCPU && memory <= h.Memory &&
+			(!known || shape.Arch == "" || shape.Arch == h.Arch)
 	}
 
 	var waits []interval

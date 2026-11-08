@@ -301,6 +301,26 @@ billet_guest_denied_ipv4:
 billet_guest_denied_ipv6:
   - fc00::/7
   - fe80::/10
+# WHAT A HOSTING PROVIDER POLICES (ADR-030): a rented server that sends mail, opens
+# connections or packets at a scanner's rate, or saturates its uplink is locked, and
+# one job could cost the host that way. These cap what every guest on the host sends
+# off it TOGETHER through the host's forwarding, which is what the provider sees of
+# them; established flows count towards the packet and byte rates, and every packet
+# conntrack calls NEW (a first SYN, its retransmissions, a one-way UDP flow's
+# packets) towards the connection attempts. The packet rate counts what the host
+# forwards, before a guest's segmentation offload is undone: a flood of small packets,
+# a scanner's, is counted packet for packet, while a bulk transfer's large buffers
+# count once each and are bounded by the byte rate. What a guest asks the host's own
+# services for (its DNS, the registry mirrors) leaves through the host's output and
+# is not capped here. Each is off (false, 0) by default, because a limit on an owned
+# host's uplink is the operator's call. Measured 2026-11-08
+# (docs/reference/records/bare-metal-hosts.md), one build's outbound peaks were 5505
+# packets, 18 new connections and 441 KB a second; a pool host is converged with the
+# settings that record gives, sized for every guest it can hold at once.
+billet_guest_refuse_smtp: false
+billet_guest_new_connections_per_second: 0
+billet_guest_packets_per_second: 0
+billet_guest_egress_bytes_per_second: 0
 billet_guest_host_tcp_ports:
   - 53
   - 7718

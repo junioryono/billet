@@ -879,6 +879,14 @@ jobs:
         if: matrix.group == 'shape'
         run: scripts/gates/scenario.sh ledger-mount-render
 
+      # The limits a hosting provider polices (ADR-030), rendered off and on from the
+      # role's firewall template and checked by nft.
+      - name: Render the guests' egress limits
+        if: matrix.group == 'shape'
+        run: |
+          command -v nft >/dev/null || sudo apt-get install -y -qq nftables
+          scripts/gates/scenario.sh guest-limits-check
+
       # billet ships its units twice — the package installs deploy/*.service,
       # the role renders its own templates — and nothing compared them until
       # this. Hardening one and forgetting the other is the failure it catches.
