@@ -43,7 +43,10 @@
 # down requests a stop, waits up to MATRIX_DOWN_WAIT seconds (default 1800) for the run's
 # lock to be free (a reboot frees it; nothing else does while the run lives), then destroys whatever the run left (`billet acceptance down`, idempotent)
 # and removes the workspace; a run still live after that is said, and nothing is taken
-# down beside it. It is the step every path ends with.
+# down beside it. It is the step every path ends with. Before the workspace goes, the
+# services' logs are moved to <run-dir>/logs on this host, never to <run-dir>/out, which
+# the workflow uploads: they name the account's resources, and a cell that failed for a
+# reason only the node saw cannot be explained once they are gone (run 42406366812).
 set -uo pipefail
 
 usage() {
@@ -157,6 +160,9 @@ down)
 		echo "matrix: no workspace at $ws; nothing to take down"
 		exit 0
 	fi
+	# WHATEVER IT KEEPS, the teardown runs and answers: a log not kept is said, and costs
+	# only the log.
+	python3 -I "$supervise" keep-logs "$run_dir"
 	"$billet" acceptance down --workspace "$ws"
 	;;
 *)
