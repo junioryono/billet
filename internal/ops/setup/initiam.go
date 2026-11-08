@@ -80,7 +80,8 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 		"print the policy the CONTROL PLANE's role needs to order, read and release "+
 			"server.pool.aws_metal's hosts (launch, describe, console read and terminate, each "+
 			"scoped to the pool's own tag, subnet, groups and images) instead of a node's; "+
-			"--role-arn names the role inside aws_metal.instance_profile")
+			"--role-arn names the role inside aws_metal.instance_profile, and --kms-key-arn a "+
+			"customer-managed key the hosts' volumes are encrypted under")
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -92,13 +93,13 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 	}
 
 	if *pool {
-		if *builder || *payloadBucket != "" || *builderSubnet != "" || *builderGroup != "" || *kmsKeyARN != "" ||
+		if *builder || *payloadBucket != "" || *builderSubnet != "" || *builderGroup != "" ||
 			*account != "" || *buildRole || *controllerSweep {
 			return errors.New("--pool prints the control plane's pool grant alone; it takes --role-arn, " +
-				"--deployment and --account-wide, and no flag of a node's or a builder's")
+				"--kms-key-arn, --deployment and --account-wide, and no flag of a node's or a builder's")
 		}
 
-		return printPoolIAM(env, cfg, *roleARN, *deployment, *accountWide)
+		return printPoolIAM(env, cfg, *roleARN, *kmsKeyARN, *deployment, *accountWide)
 	}
 
 	if cfg.Node == nil {
@@ -174,7 +175,11 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 // printPoolIAM prints the control plane's grant over its AWS bare-metal pool
 // (ADR-030): a NoCompute policy carrying the pool statements and nothing else, scoped
 // to this deployment's pool-owner tag.
-func printPoolIAM(env cli.Env, cfg *config.Config, roleARN, deployment string, accountWide bool) error {
+//
+// A CUSTOMER-MANAGED KEY IS NOT IN THE CONFIG: the hosts' volumes are encrypted under
+// their image's key or the account's EBS default, so --kms-key-arn names it when it is
+// not AWS's own aws/ebs, which needs no grant.
+func printPoolIAM(env cli.Env, cfg *config.Config, roleARN, kmsKeyARN, deployment string, accountWide bool) error {
 	var metal *config.PoolAWSMetal
 	if cfg.Server != nil && cfg.Server.Pool != nil {
 		metal = cfg.Server.Pool.AWSMetal
@@ -212,7 +217,7 @@ func printPoolIAM(env cli.Env, cfg *config.Config, roleARN, deployment string, a
 		NoCompute: true,
 		Pool: &awspolicy.Pool{
 			Region: metal.Region, SubnetID: metal.SubnetID, SecurityGroupIDs: metal.SecurityGroupIDs,
-			Images: images, InstanceProfileRoleARN: roleARN,
+			Images: images, InstanceProfileRoleARN: roleARN, KMSKeyARN: kmsKeyARN,
 		},
 	}
 

@@ -366,6 +366,10 @@ type Pool struct {
 	// InstanceProfileRoleARN, when set, is the role inside the hosts' instance
 	// profile, which a launch passes.
 	InstanceProfileRoleARN string
+	// KMSKeyARN, when set, is a customer-managed key the hosts' volumes are encrypted
+	// under (an image's, or the account's EBS default), which EBS uses on the launching
+	// principal's behalf. The AWS-managed aws/ebs key needs no grant.
+	KMSKeyARN string
 }
 
 // Network names the subnets and security groups an ec2 node launches into. When
@@ -1739,6 +1743,28 @@ func poolStatements(partition, suffix, owner string, pool Pool) ([]Statement, er
 			Action: []string{"iam:PassRole"}, Resource: []string{pool.InstanceProfileRoleARN},
 			Condition: map[string]any{"StringEquals": map[string]any{"iam:PassedToService": "ec2." + suffix}},
 		})
+	}
+	// THE CACHE'S KMS SHAPE, which iam:SimulateCustomPolicy measured (package comment):
+	// the key is used only through EC2 in the pool's region, and granted only to an AWS
+	// resource, so the role can neither call it directly nor delegate it away.
+	if pool.KMSKeyARN != "" {
+		if err := requireARN(pool.KMSKeyARN, "kms", "key/", partition, pool.Region); err != nil {
+			return nil, fmt.Errorf("the pool's KMS key: %w", err)
+		}
+		out = append(out,
+			Statement{
+				Sid: "BilletPoolKMSUse", Effect: "Allow",
+				Action: ebss3.KMSCryptoIAMActions(), Resource: []string{pool.KMSKeyARN},
+				Condition: map[string]any{
+					"StringEquals": map[string]any{"kms:ViaService": "ec2." + pool.Region + "." + suffix},
+				},
+			},
+			Statement{
+				Sid: "BilletPoolKMSGrant", Effect: "Allow",
+				Action: ebss3.KMSGrantIAMActions(), Resource: []string{pool.KMSKeyARN},
+				Condition: map[string]any{"Bool": map[string]any{"kms:GrantIsForAWSResource": "true"}},
+			},
+		)
 	}
 
 	return out, nil
