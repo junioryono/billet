@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -84,7 +85,7 @@ func TestTheMatrixIsTheWholeCrossProduct(t *testing.T) {
 	seen := map[string]bool{}
 	for i := range cells {
 		c := &cells[i]
-		key := strings.Join([]string{string(c.Backend), string(c.Arch), c.Cache, c.Case}, "/")
+		key := strings.Join([]string{matrixBackendName(c), string(c.Arch), c.Cache, c.Case}, "/")
 		if seen[key] {
 			t.Errorf("%s is declared twice", key)
 		}
@@ -611,5 +612,68 @@ func TestMatrixTiersReadEveryProviderATierNames(t *testing.T) {
 	if !slices.Contains(got["one"].providers, config.ProviderEC2) || got["one"].arch != config.ArchX64 ||
 		!slices.Contains(got["many"].providers, config.ProviderEC2) || got["many"].arch != config.ArchARM64 {
 		t.Fatalf("%+v", got)
+	}
+}
+
+// A POOL'S CELLS ARE DECLARED, AND SAY WHY THEY ARE NOT RUN. Firecracker hosts rented from
+// either source (ADR-030), on both architectures, for every cache and case: each is a
+// cell billet will serve, not run until a pool site has a store and the pool has had its
+// real run, so the matrix says so rather than leaving the pool out.
+func TestAPoolsCellsAreDeclaredAndNotRun(t *testing.T) {
+	t.Parallel()
+	per := map[string]int{}
+	for _, c := range matrixCells() {
+		if c.Backend != config.ProviderFirecracker {
+			continue
+		}
+		per[c.Source+"/"+string(c.Arch)]++
+		if c.Run != nil || c.Unsupported || !strings.Contains(c.Why, "#553") {
+			t.Errorf("%s %s %s %s: %+v; want not run, saying it waits on #553", matrixBackendName(&c), c.Arch,
+				c.Cache, c.Case, c)
+		}
+	}
+	want := len(matrixCaches) * len(matrixCases)
+	for _, source := range []string{config.PoolSourceAWSMetal, config.PoolSourcePhoenixNAP} {
+		for _, arch := range matrixArchs {
+			if got := per[source+"/"+string(arch)]; got != want {
+				t.Errorf("%d cells for %s on %s; want every cache and case, %d", got, source, arch, want)
+			}
+		}
+	}
+	for _, line := range matrixTierLines(map[string]matrixTier{
+		"pool": {arch: config.ArchX64, providers: []config.ProviderKind{config.ProviderFirecracker}},
+	}) {
+		t.Errorf("a pool tier is dispatched to while its cells are not run: %s", line)
+	}
+}
+
+// NO POOL CELL IS EVER ONE THAT SHOULD HAVE RUN. Judged over a run that covered both
+// architectures and ran nothing at all, the "should have run" count is exactly the EC2
+// cells that are run, so a pool cell counted among them, which would fail every run of
+// the matrix, is caught by the number.
+func TestAPoolCellIsNeverOneThatShouldHaveRun(t *testing.T) {
+	t.Parallel()
+	cells := matrixCells()
+	runnable := 0
+	for i := range cells {
+		if cells[i].Run != nil {
+			runnable++
+			if cells[i].Backend != config.ProviderEC2 {
+				t.Errorf("%s %s %s %s is run", matrixBackendName(&cells[i]), cells[i].Arch, cells[i].Cache,
+					cells[i].Case)
+			}
+		}
+	}
+	doc := judgeMatrix(cells, acceptanceEvidenceDoc{DeploymentID: "d1"}, matrixScope{tiers: matrixTestTiers()})
+	err := matrixOutcome(doc, matrixArchs)
+	if want := strconv.Itoa(runnable) + " cell(s) that should have run did not"; err == nil || err.Error() != want {
+		t.Errorf("a run of both architectures that ran nothing answered %v; want %q", err, want)
+	}
+	for i := range doc.Results {
+		r := &doc.Results[i]
+		if r.Backend == config.ProviderFirecracker && r.Verdict != verdictNotRun {
+			t.Errorf("pool cell %s %s %s %s judged %s", matrixBackendName(&r.matrixCell), r.Arch, r.Cache, r.Case,
+				r.Verdict)
+		}
 	}
 }

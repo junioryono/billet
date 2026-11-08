@@ -1,0 +1,447 @@
+package nodeplane
+
+import (
+	"errors"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/nodeapi"
+)
+
+// A CONTROLLER THAT REPLACED ANOTHER KNOWS NOTHING OF WHO HOLDS WHAT (#685), so a
+// superseded process says, and the claim takes only what no process was given: an
+// adoption from the ledger by the current process gives way to the process that holds
+// the compute, whether or not the current one can see it too, and a delivery never
+// does.
+func TestACustodyClaimTakesOnlyWhatNoOtherProcessWasGiven(t *testing.T) {
+	t.Parallel()
+
+	const (
+		lease   = "l9"
+		request = int64(7)
+	)
+
+	claimant := leaseOwner{node: "n1", incarnation: "p1", requestID: request}
+	// ANOTHER REQUEST, so a delivery that a claim wrote over would show.
+	delivered := leaseOwner{node: "n1", incarnation: "p1", requestID: request - 1}
+
+	seed := func(p *Plane, owner leaseOwner) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		if p.owners == nil {
+			p.owners = make(map[string]leaseOwner)
+		}
+
+		p.owners[lease] = owner
+	}
+
+	for name, tc := range map[string]struct {
+		setup func(t *testing.T, p *Plane)
+		held  bool
+		added bool
+		owner leaseOwner
+	}{
+		"no owner": {
+			setup: func(*testing.T, *Plane) {},
+			held:  true, added: true, owner: claimant,
+		},
+		"delivered to the claimant": {
+			setup: func(_ *testing.T, p *Plane) { seed(p, delivered) },
+			held:  true, owner: delivered,
+		},
+		// A PROCESS THAT REACHED THE NEW CONTROLLER BEFORE IT LEARNED IT WAS SUPERSEDED
+		// adopted its own lease, with no request; a destroy then cannot find it.
+		"the claimant's by its own registration's adoption": {
+			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n1", incarnation: "p1"}) },
+			held:  true, owner: claimant,
+		},
+		// THE ONE THE ISSUE IS ABOUT: the registration filled the gap from the ledger,
+		// and the process it filled it for has no such compute.
+		"adopted by the current process, whose report leaves it out": {
+			setup: func(_ *testing.T, p *Plane) {
+				p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
+				p.AdoptOwnership("n1", "p2", []string{lease})
+			},
+			held: true, added: true, owner: claimant,
+		},
+		// A REPORT IS NOT AN ADOPTION: the current process may have seen a guest it has
+		// not taken on, so the process that holds the compute goes on holding it, as it
+		// did on the plane before.
+		"adopted by the current process, whose report names it": {
+			setup: func(_ *testing.T, p *Plane) {
+				p.AdoptOwnershipWithInventory("n1", "p2", []string{lease}, true)
+			},
+			held: true, added: true, owner: claimant,
+		},
+		"adopted by the current process, whose report is unknown": {
+			setup: func(_ *testing.T, p *Plane) { p.AdoptOwnership("n1", "p2", []string{lease}) },
+			held:  true, added: true, owner: claimant,
+		},
+		"delivered to the current process": {
+			setup: func(_ *testing.T, p *Plane) {
+				seed(p, leaseOwner{node: "n1", incarnation: "p2", requestID: request})
+			},
+			owner: leaseOwner{node: "n1", incarnation: "p2", requestID: request},
+		},
+		"delivered to a process that is no longer current": {
+			setup: func(_ *testing.T, p *Plane) {
+				seed(p, leaseOwner{node: "n1", incarnation: "p0", requestID: request})
+			},
+			owner: leaseOwner{node: "n1", incarnation: "p0", requestID: request},
+		},
+		// TWO SUPERSEDED PROCESSES DO NOT TAKE IT IN TURNS, refusing each the other's
+		// renewal on every claim.
+		"adopted by a process that is no longer current": {
+			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n1", incarnation: "p0"}) },
+			owner: leaseOwner{node: "n1", incarnation: "p0"},
+		},
+		"another host's": {
+			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n2", incarnation: "p9"}) },
+			owner: leaseOwner{node: "n2", incarnation: "p9"},
+		},
+		// THE NODE DECIDES, whatever the process is called: neither of these is this
+		// node's to take, though each incarnation matches one of its processes.
+		"another host's, under the claimant's incarnation": {
+			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n2", incarnation: "p1"}) },
+			owner: leaseOwner{node: "n2", incarnation: "p1"},
+		},
+		"another host's, under the current process's incarnation": {
+			setup: func(_ *testing.T, p *Plane) { seed(p, leaseOwner{node: "n2", incarnation: "p2"}) },
+			owner: leaseOwner{node: "n2", incarnation: "p2"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			p := testPlane(t, WithRegistrar(newLedger()))
+			registerAs(t, p, "p1")
+			registerAs(t, p, "p2")
+			tc.setup(t, p)
+
+			held, added := p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: lease, RequestID: request}})
+
+			if got := slices.Contains(held, lease); got != tc.held {
+				t.Errorf("held = %v, want the lease held: %v", held, tc.held)
+			}
+
+			if got := slices.Contains(added, lease); got != tc.added {
+				t.Errorf("added = %v, want the lease added: %v", added, tc.added)
+			}
+
+			if owner, ok := ownerOf(p, lease); !ok || owner != tc.owner {
+				t.Errorf("the owner is %+v (ok=%v), want %+v", owner, ok, tc.owner)
+			}
+
+			// WHAT THE ANSWER SAYS IS WHAT THE WIRE THEN DOES: a process told it
+			// holds a lease may renew it, and one not told so is refused.
+			byOwner, err := p.AuthorizeLease("n1", "p1", lease)
+			if tc.held && (err != nil || !byOwner) {
+				t.Errorf("a process that holds the lease is refused it: byOwner=%v err=%v", byOwner, err)
+			}
+
+			if !tc.held && !errors.Is(err, ErrSuperseded) {
+				t.Errorf("a process that does not hold the lease is admitted: byOwner=%v err=%v", byOwner, err)
+			}
+
+			// AND THE CURRENT PROCESS IS NOT LOCKED OUT: it may hold the compute too.
+			if tc.owner.node == "n1" {
+				if _, err := p.AuthorizeLease("n1", "p2", lease); err != nil {
+					t.Errorf("the current process is refused the lease: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// WITH NO CURRENT PROCESS NOTHING SAYS AN ADOPTION IS THE CURRENT ONE'S, so it stands.
+func TestAClaimOnANodeWithNoCurrentProcessTakesNoAdoption(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	registerAs(t, p, "p2")
+	p.AdoptOwnership("n1", "p2", []string{"l9"})
+	p.ForgetForTest("n1")
+
+	if held, _ := p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}}); len(held) != 0 {
+		t.Fatalf("held = %v", held)
+	}
+
+	if owner, ok := ownerOf(p, "l9"); !ok || owner.incarnation != "p2" {
+		t.Fatalf("the owner is %+v (ok=%v), want the adoption standing", owner, ok)
+	}
+}
+
+// THE REQUEST COMES WITH THE LEASE, so a completion's destroy finds the process that
+// holds the compute. Without it the plane's only other answer is to broadcast to the
+// current process, which truthfully has nothing to remove, and the lease is released
+// under the running job.
+func TestAClaimedLeaseAnswersForItsRequest(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	registerAs(t, p, "p1")
+	registerAs(t, p, "p2")
+
+	if _, known := p.OwnerOfRequest(7); known {
+		t.Fatal("a plane that launched nothing knows the request's owner")
+	}
+
+	p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}})
+
+	owner, known := p.OwnerOfRequest(7)
+	if !known || owner.Incarnation != "p1" || owner.Current {
+		t.Fatalf("the request's owner is %+v (known=%v), want p1, not current", owner, known)
+	}
+}
+
+// A REGISTRATION ONLY FILLS GAPS, so a claim made before the current process reaches
+// this controller stays with the claimant, as it does after.
+func TestAClaimSurvivesTheRegistrationThatFollowsIt(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+
+	p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}})
+
+	registerAs(t, p, "p2")
+	p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
+	p.AdoptOwnership("n1", "p2", []string{"l9"})
+
+	if owner, ok := ownerOf(p, "l9"); !ok || owner.incarnation != "p1" || owner.requestID != 7 {
+		t.Fatalf("the owner is %+v (ok=%v), want the claimant", owner, ok)
+	}
+}
+
+// awaitQueued waits until a bound destroy is queued for n1.
+func awaitQueued(t *testing.T, p *Plane) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for p.QueuedForTest("n1") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the destroy was never queued")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A COMPLETION RESTORED AT A NEW PLANE'S START REACHES A PROCESS BEFORE THE ONE THAT HOLDS
+// THE COMPUTE HAS CLAIMED IT. The process the ledger guessed at does not report the lease,
+// so it would answer truthfully that it has nothing to remove and the lease would be
+// released under the guest. Held back for the window, and asked as ever after it; a
+// process that does report the lease is asked at once.
+func TestARestoredCompletionWaitsForAClaimOnAProcessThatDoesNotReportTheLease(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		report     func(p *Plane)
+		sinceStart time.Duration
+		asked      bool
+	}{
+		{"not reported, inside the window", func(p *Plane) {
+			p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
+			p.AdoptOwnership("n1", "p2", []string{"l9"})
+		}, custodyClaimWindow - time.Second, false},
+		{"not reported, past the window", func(p *Plane) {
+			p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
+			p.AdoptOwnership("n1", "p2", []string{"l9"})
+		}, custodyClaimWindow, true},
+		// A DELIVERY IS NO GUESS: this plane sent the launch, so it asks that process.
+		{"delivered, not reported, inside the window", func(p *Plane) {
+			p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
+
+			p.mu.Lock()
+			defer p.mu.Unlock()
+
+			p.owners = map[string]leaseOwner{"l9": {node: "n1", incarnation: "p2", requestID: 7}}
+		}, 0, true},
+		{"reported, inside the window", func(p *Plane) {
+			p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
+		}, 0, true},
+		{"unknown, inside the window", func(p *Plane) {
+			p.AdoptOwnership("n1", "p2", []string{"l9"})
+		}, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				mu  sync.Mutex
+				now = time.Now()
+			)
+
+			p := testPlane(t, WithRegistrar(newLedger()), WithClock(func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+
+				return now
+			}))
+			p.SetPollWindowForTest(20 * time.Millisecond)
+			registerAs(t, p, "p2")
+			tc.report(p)
+
+			mu.Lock()
+			now = now.Add(tc.sinceStart)
+			mu.Unlock()
+
+			// REGISTERED AGAIN AT THE LATER CLOCK: the window is the plane's first
+			// registration's, and a later one does not open it again.
+			registerAs(t, p, "p2")
+			tc.report(p)
+
+			done := make(chan error, 1)
+			go func() {
+				done <- p.NewRunner().DestroyCompletedBound(
+					t.Context(), 7, "Succeeded", "l9", "n1", 1, alloc.PhaseDone, dispatch.CacheAuthority{})
+			}()
+
+			if !tc.asked {
+				if err := <-done; !errors.Is(err, dispatch.ErrHolderUnavailable) {
+					t.Fatalf("DestroyCompletedBound = %v, want the holder unavailable", err)
+				}
+
+				if n := p.QueuedForTest("n1"); n != 0 {
+					t.Fatalf("%d commands were queued for a process that was not to be asked", n)
+				}
+
+				return
+			}
+
+			awaitQueued(t, p)
+
+			cmd, took, err := p.Poll(t.Context(), "n1", "p2")
+			if err != nil || !took || cmd.Kind != nodeapi.CommandDestroy {
+				t.Fatalf("Poll = %+v, %v, %v, want the destroy", cmd, took, err)
+			}
+
+			if err := p.Result("n1", "p2", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+
+			if err := <-done; err != nil {
+				t.Fatalf("DestroyCompletedBound = %v", err)
+			}
+		})
+	}
+}
+
+// A CLAIM THAT LANDS WHILE A DESTROY IS OUT MAKES THE ANSWER WORTH NOTHING: the process
+// asked answers for itself, and the compute is the claimant's. The completion is told the
+// holder is unavailable, and the claimant's record stands.
+func TestAClaimLandingDuringADestroyStandsAndTheAnswerDoesNot(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	p.SetPollWindowForTest(20 * time.Millisecond)
+	registerAs(t, p, "p2")
+	p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.NewRunner().DestroyCompletedBound(
+			t.Context(), 7, "Succeeded", "l9", "n1", 1, alloc.PhaseDone, dispatch.CacheAuthority{})
+	}()
+
+	awaitQueued(t, p)
+
+	cmd, took, err := p.Poll(t.Context(), "n1", "p2")
+	if err != nil || !took {
+		t.Fatalf("Poll = %+v, %v, %v", cmd, took, err)
+	}
+
+	p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}})
+
+	if err := p.Result("n1", "p2", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+
+	if err := <-done; !errors.Is(err, dispatch.ErrHolderUnavailable) {
+		t.Fatalf("DestroyCompletedBound = %v, want the holder unavailable", err)
+	}
+
+	if owner, ok := ownerOf(p, "l9"); !ok || owner.incarnation != "p1" {
+		t.Fatalf("the owner is %+v (ok=%v), want the claimant still", owner, ok)
+	}
+}
+
+// THE RECORD A DESTROY MAY FORGET IS ITS OWN PROCESS'S: forgetting anything else would be
+// the claim removed by an answer that says nothing about it.
+func TestADestroyForgetsOnlyTheRecordOfTheProcessThatAnswered(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		owner *leaseOwner
+		clear bool
+		kept  bool
+	}{
+		{"the process that answered", &leaseOwner{node: "n1", incarnation: "p2"}, true, false},
+		{"another process's", &leaseOwner{node: "n1", incarnation: "p1", requestID: 7}, false, true},
+		{"another host's", &leaseOwner{node: "n2", incarnation: "p2"}, false, true},
+		{"no record", nil, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := testPlane(t)
+			p.owners = map[string]leaseOwner{}
+
+			if tc.owner != nil {
+				p.owners["l9"] = *tc.owner
+			}
+
+			if got := p.forgetOwnedBy("n1", "l9", "p2"); got != tc.clear {
+				t.Errorf("forgetOwnedBy = %v, want %v", got, tc.clear)
+			}
+
+			if _, kept := ownerOf(p, "l9"); kept != tc.kept {
+				t.Errorf("the record kept: %v, want %v", kept, tc.kept)
+			}
+		})
+	}
+}
+
+// WHICHEVER COMES FIRST, THE CLAIM STANDS. A destroy's answer forgets the process's own
+// record and a claim replaces it, so each order leaves the claimant owning the lease; a
+// comparison and a forgetting under two holds of the mutex let a claim land between them
+// and be the thing forgotten.
+func TestAClaimAndADestroysForgettingNeverLoseTheClaim(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	registerAs(t, p, "p2")
+
+	for attempt := range 20000 {
+		p.AdoptOwnership("n1", "p2", []string{"l9"})
+
+		start := make(chan struct{})
+
+		var racing sync.WaitGroup
+
+		racing.Go(func() {
+			<-start
+			p.forgetOwnedBy("n1", "l9", "p2")
+		})
+		racing.Go(func() {
+			<-start
+			p.ClaimCustody("n1", "p1", []CustodyClaim{{LeaseID: "l9", RequestID: 7}})
+		})
+
+		close(start)
+		racing.Wait()
+
+		owner, ok := ownerOf(p, "l9")
+		if !ok || owner.incarnation != "p1" {
+			t.Fatalf("attempt %d: the owner is %+v (ok=%v), want the claimant", attempt, owner, ok)
+		}
+
+		p.ForgetLease("n1", "l9")
+	}
+}

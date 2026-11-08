@@ -199,3 +199,36 @@ func BuilderPayloadIAMActions() []string {
 func SpotIAMActions() []string {
 	return []string{IAMSQSReceiveMessage, IAMSQSDeleteMessage, IAMSQSGetQueueAttributes}
 }
+
+// PoolOwnerTagKey and PoolOrderTagKey are the tags a pool host carries in place of
+// OwnerTagKey (hosts.go): the deployment identity, and the order that launched it.
+// NameTagKey is the third tag every launch writes.
+const (
+	PoolOwnerTagKey = poolOwnerTag
+	PoolOrderTagKey = poolOrderTag
+	NameTagKey      = nameTag
+)
+
+// The pool-host surface's permissions (Hosts in hosts.go), which the CONTROL PLANE
+// holds when server.pool names aws_metal: it launches, reads, reads the console of
+// and terminates the pool's hosts, and nothing else of EC2's. A bundled policy
+// scopes the launch and its create-time tags to the pool-owner tag and the three
+// keys a pool launch writes, and the terminate and console read to the pool-owner
+// tag on the instance.
+
+// PoolReadIAMActions is the describe Find, Describe, Terminate and Console all
+// make, which acts on "*".
+func PoolReadIAMActions() []string { return []string{IAMDescribeInstances} }
+
+// PoolLaunchIAMActions is Launch's RunInstances.
+func PoolLaunchIAMActions() []string { return []string{IAMRunInstances} }
+
+// PoolTagIAMActions is the create-time tagging Launch's TagSpecification needs.
+func PoolTagIAMActions() []string { return []string{IAMCreateTags} }
+
+// PoolTerminateIAMActions is Terminate's TerminateInstances.
+func PoolTerminateIAMActions() []string { return []string{IAMTerminateInstances} }
+
+// PoolConsoleIAMActions is Console's GetConsoleOutput, where a joining host's key
+// fingerprint is read (ADR-030).
+func PoolConsoleIAMActions() []string { return []string{IAMGetConsoleOutput} }

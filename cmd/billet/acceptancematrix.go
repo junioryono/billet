@@ -52,11 +52,22 @@ const (
 	verdictUnsupported matrixVerdict = "unsupported"
 )
 
+// matrixBackend is a backend and, for a pool's Firecracker hosts, the source that rents
+// them (ADR-030); per-job EC2 has none.
+type matrixBackend struct {
+	kind   config.ProviderKind
+	source string
+}
+
 // The axes. Every combination of them is a cell.
 var (
-	matrixBackends = []config.ProviderKind{config.ProviderEC2}
-	matrixArchs    = []config.Arch{config.ArchX64, config.ArchARM64}
-	matrixCaches   = []string{
+	matrixBackends = []matrixBackend{
+		{kind: config.ProviderEC2},
+		{kind: config.ProviderFirecracker, source: config.PoolSourceAWSMetal},
+		{kind: config.ProviderFirecracker, source: config.PoolSourcePhoenixNAP},
+	}
+	matrixArchs  = []config.Arch{config.ArchX64, config.ArchARM64}
+	matrixCaches = []string{
 		"docker-images", "sticky-disks", "docker-builder", "actions", "git", "go", "bazel", "buck2", "npm",
 	}
 	matrixCases = []string{
@@ -67,9 +78,12 @@ var (
 // matrixCell is one backend, architecture, cache and case, and how it is run.
 type matrixCell struct {
 	Backend config.ProviderKind `json:"backend"`
-	Arch    config.Arch         `json:"arch"`
-	Cache   string              `json:"cache"`
-	Case    string              `json:"case"`
+	// Source is the pool source a Firecracker cell's hosts are rented from, empty for
+	// per-job EC2.
+	Source string      `json:"source,omitempty"`
+	Arch   config.Arch `json:"arch"`
+	Cache  string      `json:"cache"`
+	Case   string      `json:"case"`
 	// Run is how the cell is run; nil when it is not.
 	Run *matrixRun `json:"run,omitempty"`
 	// Unsupported says billet does not offer this cell at all, and Why says why; a
@@ -103,7 +117,10 @@ func matrixCells() []matrixCell {
 			for _, c := range matrixCaches {
 				for _, k := range matrixCases {
 					cell := matrixCellFor(c, k)
-					cell.Backend, cell.Arch, cell.Cache, cell.Case = b, a, c, k
+					if b.source != "" {
+						cell = poolCell
+					}
+					cell.Backend, cell.Source, cell.Arch, cell.Cache, cell.Case = b.kind, b.source, a, c, k
 					out = append(out, cell)
 				}
 			}
@@ -111,6 +128,21 @@ func matrixCells() []matrixCell {
 	}
 
 	return out
+}
+
+// poolCell is every cell of a pool's Firecracker hosts, on either source: supported,
+// and not run, until a pool site has a store and the pool has had its real run (#553).
+var poolCell = matrixCell{Why: "a pool's Firecracker hosts run with every cache off until a pool site has a " +
+	"store (#553's plan change of 2026-11-08), and the pool's cells run after its real growth and drain run"}
+
+// matrixBackendName is a cell's backend as the tables print it: the source beside a
+// pool's.
+func matrixBackendName(c *matrixCell) string {
+	if c.Source != "" {
+		return string(c.Backend) + "/" + c.Source
+	}
+
+	return string(c.Backend)
 }
 
 // matrixObservation is the observation each cache is judged by: the Docker builder's
@@ -562,15 +594,19 @@ func cmdMatrixTiers(env cli.Env, args []string) error {
 func matrixTierLines(tiers map[string]matrixTier) []string {
 	var out []string
 	for _, b := range matrixBackends {
+		// A POOL'S CELLS ARE NOT RUN, so no pool tier is dispatched to.
+		if b.source != "" {
+			continue
+		}
 		for _, a := range matrixArchs {
 			var labels []string
 			for label, t := range tiers {
-				if t.arch == a && slices.Contains(t.providers, b) && len(t.providers) == 1 {
+				if t.arch == a && slices.Contains(t.providers, b.kind) && len(t.providers) == 1 {
 					labels = append(labels, label)
 				}
 			}
 			if len(labels) == 1 {
-				out = append(out, fmt.Sprintf("%s %s %s", b, a, labels[0]))
+				out = append(out, fmt.Sprintf("%s %s %s", b.kind, a, labels[0]))
 			}
 		}
 	}
@@ -600,7 +636,8 @@ func cmdMatrixCells(env cli.Env, args []string) error {
 		case c.Unsupported:
 			run = "unsupported"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.Backend, c.Arch, c.Cache, c.Case, run, want, dashIfEmpty(c.Why))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", matrixBackendName(c), c.Arch, c.Cache, c.Case, run, want,
+			dashIfEmpty(c.Why))
 	}
 
 	return w.Flush()
@@ -766,7 +803,7 @@ func printMatrix(w io.Writer, d matrixDoc) {
 			ran = fmt.Sprintf("%.0fs", r.RunSeconds)
 			cost = fmt.Sprintf("$%.4f", r.CostUSD)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", r.Backend, r.Arch, r.Cache, r.Case, r.Verdict,
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", matrixBackendName(&r.matrixCell), r.Arch, r.Cache, r.Case, r.Verdict,
 			observed, wait, ran, cost, dashIfEmpty(oneLineReason(r.Reason)))
 	}
 	_ = tw.Flush()

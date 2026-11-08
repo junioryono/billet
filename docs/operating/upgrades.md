@@ -408,6 +408,8 @@ billet host-upgrade --resume
 
 This is the same transaction a rollout drives, run directly. `--resume` continues or unwinds whatever is already on the machine, which is how an interrupted upgrade recovers — including one interrupted by the machine losing power.
 
+Before it stops anything, the transaction asks for the room it will fill: free space under `/var/lib/billet/upgrades` of the ledger's size plus 512 MiB, which holds the ledger's snapshot, the candidate and the preserved binary. A host short of it refuses, the rollout asks again later, and nothing on the host changes; free room on that filesystem (older local backups the bucket holds are the usual candidate) and the next attempt proceeds. An upgrade that did run out of room is cordoned, with its services stopped and the installed binary moved into the recovery directory's `preserved/`. Free the room and run `preserved/billet host-upgrade --resume` from that directory as root.
+
 It is a separate program on purpose. A control plane cannot install its own successor: the moment it stops, whatever was going to finish the job has stopped too.
 
 ## Ending a running job on purpose

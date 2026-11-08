@@ -1114,6 +1114,76 @@ func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) err
 		nodeapi.HeartbeatRequest{Epoch: epoch}, nil)
 }
 
+// ClaimCustody says, for a superseded process, which leases it holds, to the
+// controller that serves, and answers those it holds there now.
+// It tries every controller from the one it has; the first that answers is where
+// this process's lease calls go from now on, WITHOUT A REGISTRATION: only a
+// registration takes the name, and this process has lost it. The wire moves with
+// the controller, as a registration moves them, and comes back if an "unregistered"
+// answer cleared it. An answer other than success is that controller's word, and
+// leaves the current one where it is.
+//
+// NOT GATED ON THE WIRE, which is the last controller's: a process superseded below
+// this version is exactly one whose controller may since have been upgraded, and it
+// cannot register to learn so. An older plane answers a bare 404, which changes nothing.
+func (c *Client) ClaimCustody(ctx context.Context, leaseIDs []string) ([]string, error) {
+	var (
+		held []string
+		errs []error
+	)
+
+	// IN BATCHES THE ROUTE TAKES: refused whole, a process holding more would never
+	// reach a new controller, and renew through the one that has gone.
+	for batch := range slices.Chunk(leaseIDs, nodeapi.MaxCustodyClaim) {
+		got, err := c.claimCustodyBatch(ctx, batch)
+		if err != nil {
+			errs = append(errs, err)
+
+			continue
+		}
+
+		held = append(held, got...)
+	}
+
+	return held, errors.Join(errs...)
+}
+
+// claimCustodyBatch is one claim, from the controller this process has.
+func (c *Client) claimCustodyBatch(ctx context.Context, leaseIDs []string) ([]string, error) {
+	start := int(c.current.Load())
+
+	var errs []error
+
+	for i := range c.targets {
+		at := (start + i) % len(c.targets)
+
+		var res nodeapi.ClaimCustodyResponse
+
+		err := c.doAt(ctx, c.targets[at], http.MethodPost, c.nodePath("/custody"),
+			nodeapi.ClaimCustodyRequest{LeaseIDs: leaseIDs}, &res)
+		if err == nil {
+			c.regMu.Lock()
+			c.current.Store(int64(at))
+
+			if res.Version > 0 {
+				c.wire.Store(int64(min(res.Version, nodeapi.Version)))
+			}
+
+			c.regMu.Unlock()
+
+			return res.Held, nil
+		}
+
+		if !errors.Is(err, errNoAnswer) {
+			return nil, err
+		}
+
+		errs = append(errs, err)
+	}
+
+	return nil, errors.Join(errs...)
+}
+
 // RecordLeaseUsage tells the control plane what the host measured a lease's
 // job do.
 //
