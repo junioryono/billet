@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,13 +16,25 @@ import (
 )
 
 // keepLocalArchives is how many archives the packaged backup directory keeps
-// on the host, the one just written among them.
+// on the host, the one just written among them, when the disk has the room.
 const keepLocalArchives = 7
 
+// localArchiveRoom is how many of the newest archive's size the backup
+// directory's filesystem keeps free, pruning older archives the bucket holds to
+// do it: room for the next backup and for an upgrade's snapshot of the ledger,
+// each about one archive.
+const localArchiveRoom = 2
+
 // pruneLocalArchives removes archives in the packaged backup directory beyond
-// the newest keepLocalArchives, once this run's upload has finished. It runs
-// only when current is a child of localBackupDir: a directory an operator
-// named with --out is theirs.
+// the newest keepLocalArchives, and older ones still while the filesystem has
+// less than localArchiveRoom of the newest archive's size free, once this run's
+// upload has finished; the newest is always kept. It runs only when current is a
+// child of localBackupDir: a directory an operator named with --out is theirs.
+//
+// A COUNT IS NOT A SIZE. Seven archives were 1.2 GB when an archive was about
+// 170 MB; by 2026-11-08 the ledger was 988 MB, seven archives held 6 GB of a 15
+// GiB root, and with three recovery directories beside them an upgrade's snapshot
+// of the ledger had no room left and the control plane went down (#802).
 //
 // THE BUCKET IS THE PROOF. The daily timer writes about 170 MB a day on a
 // controller and nothing removed any of it, and 61 archives held most of a
@@ -39,9 +52,10 @@ func pruneLocalArchives(ctx context.Context, env cli.Env, store archiveStore, de
 
 	removed, err := pruneArchivesIn(ctx, store, deployment, localBackupDir)
 	if len(removed) > 0 {
-		fmt.Fprintf(env.Stdout, "\nprune    removed %d older local archives that the bucket holds; the newest %d\n",
-			len(removed), keepLocalArchives)
-		fmt.Fprintf(env.Stdout, "         are kept in %s\n", localBackupDir)
+		fmt.Fprintf(env.Stdout, "\nprune    removed %d older local archives that the bucket holds; %s keeps at most\n",
+			len(removed), localBackupDir)
+		fmt.Fprintf(env.Stdout, "         the newest %d, fewer while its disk lacks room for two more, and always the newest\n",
+			keepLocalArchives)
 	}
 
 	if err != nil {
@@ -118,7 +132,7 @@ func pruneArchivesIn(ctx context.Context, store archiveStore, deployment, parent
 		archives = append(archives, local{name: e.Name(), id: id, judged: judged})
 	}
 
-	if len(archives) <= keepLocalArchives {
+	if len(archives) <= 1 {
 		return nil, nil
 	}
 
@@ -129,7 +143,43 @@ func pruneArchivesIn(ctx context.Context, store archiveStore, deployment, parent
 		errs    []error
 	)
 
-	for _, l := range archives[keepLocalArchives:] {
+	// THE ROOM IS THE NEWEST MANIFEST'S DECLARATION, which nothing has checked
+	// against its files, so one that cannot be a size keeps every archive inside
+	// the count and says so.
+	newest, sized := archives[0].id.Size()
+	if sized && newest > math.MaxInt64/localArchiveRoom {
+		sized = false
+	}
+
+	room := localArchiveRoom * newest
+
+	// OLDEST FIRST, AND NEVER THE NEWEST. Past the count every archive the bucket
+	// holds goes; inside it one goes only while the disk is short, asked again
+	// after every removal, and a reading that fails keeps the rest.
+	for i := len(archives) - 1; i >= 1; i-- {
+		l := archives[i]
+
+		if i < keepLocalArchives {
+			if !sized {
+				errs = append(errs, fmt.Errorf("the newest archive, %s, declares no usable size, so the "+
+					"newest %d archives are kept", archives[0].name, i+1))
+
+				break
+			}
+
+			free, err := freeBytes(parent)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("could not read how much room %s has, so the newest %d "+
+					"archives are kept: %w", parent, i+1, err))
+
+				break
+			}
+
+			if free >= room {
+				break
+			}
+		}
+
 		if !listed[l.id.Name] {
 			continue
 		}

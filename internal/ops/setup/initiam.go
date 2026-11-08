@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"regexp"
 	"slices"
@@ -53,10 +54,12 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 			"of node.ec2's (requires --builder); the launch grant names it beside them")
 	roleARN := fs.String("role-arn", "",
 		"the IAM role ARN the instance_profile contains, for iam:PassRole scoping")
-	kmsKeyARN := fs.String("kms-key-arn", "",
+	var kmsKeys keyARNs
+	fs.Var(&kmsKeys, "kms-key-arn",
 		"the full KMS key ARN, when the configured key is a bare id or alias — "+
 			"node.ebs_s3.kms_key_id for an ec2 node, node.codebuild.jit_kms_key_id for a "+
-			"codebuild one")
+			"codebuild one; with --pool, a customer-managed key the pool's hosts' volumes are "+
+			"encrypted under, repeated for each")
 	deployment := fs.String("deployment", "",
 		"this deployment's identity, scoping the policy to only its own resources "+
 			"(defaults to the id in the config's state directory)")
@@ -75,6 +78,13 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 			"registrations a dead node left under this node's parameter path (codebuild "+
 			"only) — list and delete under the path, nothing else")
 
+	pool := fs.Bool("pool", false,
+		"print the policy the CONTROL PLANE's role needs to order, read and release "+
+			"server.pool.aws_metal's hosts (launch, describe, console read and terminate, each "+
+			"scoped to the pool's own tag, subnet, groups and images) instead of a node's; "+
+			"--role-arn names the role inside aws_metal.instance_profile, and --kms-key-arn a "+
+			"customer-managed key the hosts' volumes are encrypted under")
+
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -82,6 +92,24 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return fmt.Errorf("load %s: %w", *cfgPath, err)
+	}
+
+	if *pool {
+		if *builder || *payloadBucket != "" || *builderSubnet != "" || *builderGroup != "" ||
+			*account != "" || *buildRole || *controllerSweep {
+			return errors.New("--pool prints the control plane's pool grant alone; it takes --role-arn, " +
+				"--kms-key-arn, --deployment and --account-wide, and no flag of a node's or a builder's")
+		}
+
+		return printPoolIAM(env, cfg, *roleARN, kmsKeys, *deployment, *accountWide)
+	}
+
+	if len(kmsKeys) > 1 {
+		return errors.New("--kms-key-arn names one key for a node; it is repeated only with --pool")
+	}
+	kmsKeyARN := new(string)
+	if len(kmsKeys) == 1 {
+		*kmsKeyARN = kmsKeys[0]
 	}
 
 	if cfg.Node == nil {
@@ -150,6 +178,83 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 	}
 
 	fmt.Fprintln(env.Stdout, string(body))
+
+	return nil
+}
+
+// printPoolIAM prints the control plane's grant over its AWS bare-metal pool
+// (ADR-030): a NoCompute policy carrying the pool statements and nothing else, scoped
+// to this deployment's pool-owner tag.
+//
+// A CUSTOMER-MANAGED KEY IS NOT IN THE CONFIG: the hosts' volumes are encrypted under
+// their image's key or the account's EBS default, so --kms-key-arn names it when it is
+// not AWS's own aws/ebs, which needs no grant.
+func printPoolIAM(env cli.Env, cfg *config.Config, roleARN string, kmsKeys []string, deployment string,
+	accountWide bool,
+) error {
+	var metal *config.PoolAWSMetal
+	if cfg.Server != nil && cfg.Server.Pool != nil {
+		metal = cfg.Server.Pool.AWSMetal
+	}
+	if metal == nil {
+		return errors.New("--pool describes the grant over server.pool.aws_metal's hosts, and this config " +
+			"names no server.pool.aws_metal")
+	}
+
+	switch {
+	case metal.InstanceProfile != "" && roleARN == "":
+		return fmt.Errorf("server.pool.aws_metal.instance_profile is %q, an instance-profile name, not the "+
+			"IAM role ARN iam:PassRole must be scoped to; pass --role-arn arn:aws:iam::<account>:role/<role> "+
+			"(the role that instance profile contains)", metal.InstanceProfile)
+	case metal.InstanceProfile == "" && roleARN != "":
+		return errors.New("--role-arn is only meaningful when server.pool.aws_metal names an " +
+			"instance_profile; this config does not, so no iam:PassRole is needed")
+	}
+
+	owner, err := resolveDeploymentOwner(cfg, deployment, accountWide)
+	if err != nil {
+		return err
+	}
+
+	images := make([]string, 0, len(metal.Images))
+	for _, arch := range slices.Sorted(maps.Keys(metal.Images)) {
+		if !slices.Contains(images, metal.Images[arch]) {
+			images = append(images, metal.Images[arch])
+		}
+	}
+
+	in := awspolicy.Inputs{
+		Owner:     owner,
+		Partition: awspolicy.PartitionForRegion(metal.Region),
+		NoCompute: true,
+		Pool: &awspolicy.Pool{
+			Region: metal.Region, SubnetID: metal.SubnetID, SecurityGroupIDs: metal.SecurityGroupIDs,
+			Images: images, InstanceProfileRoleARN: roleARN, KMSKeyARNs: kmsKeys,
+		},
+	}
+
+	policy, err := in.Build()
+	if err != nil {
+		return err
+	}
+
+	body, err := policy.JSON()
+	if err != nil {
+		return fmt.Errorf("render the policy: %w", err)
+	}
+
+	fmt.Fprintln(env.Stdout, string(body))
+
+	return nil
+}
+
+// keyARNs is a flag that may be repeated, each value one key's ARN.
+type keyARNs []string
+
+func (k *keyARNs) String() string { return strings.Join(*k, ",") }
+
+func (k *keyARNs) Set(v string) error {
+	*k = append(*k, v)
 
 	return nil
 }
