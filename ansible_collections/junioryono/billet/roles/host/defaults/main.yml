@@ -307,7 +307,10 @@ billet_guest_denied_ipv6:
 # off it TOGETHER through the host's forwarding, which is what the provider sees of
 # them; established flows count towards the packet and byte rates, and every packet
 # conntrack calls NEW (a first SYN, its retransmissions, a one-way UDP flow's
-# packets) towards the connection attempts. What a guest asks the host's own
+# packets) towards the connection attempts. The packet rate counts what the host
+# forwards, before a guest's segmentation offload is undone: a flood of small packets,
+# a scanner's, is counted packet for packet, while a bulk transfer's large buffers
+# count once each and are bounded by the byte rate. What a guest asks the host's own
 # services for (its DNS, the registry mirrors) leaves through the host's output and
 # is not capped here. Each is off (false, 0) by default, because a limit on an owned
 # host's uplink is the operator's call. Measured 2026-11-08

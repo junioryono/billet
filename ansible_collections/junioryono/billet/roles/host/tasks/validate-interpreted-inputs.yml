@@ -142,11 +142,11 @@
       - billet_guest_egress_bytes_per_second is integer
       - billet_guest_egress_bytes_per_second is not boolean
       - billet_guest_egress_bytes_per_second >= 0
-      - billet_guest_egress_bytes_per_second <= 100000000000
+      - billet_guest_egress_bytes_per_second <= 4000000000
     fail_msg: >-
       billet_guest_refuse_smtp must be true or false, and billet_guest_new_connections_per_second,
       billet_guest_packets_per_second and billet_guest_egress_bytes_per_second whole numbers from 0 (off) to
-      10000000, 100000000 and 100000000000.
+      10000000, 100000000 and 4000000000 (the byte rate is also its burst, which nft holds in 32 bits).
 
 - name: Validate billet_firecracker_version for versioned destinations
   ansible.builtin.assert:

@@ -505,24 +505,26 @@ func (d *poolDriver) ticksOn(actions *plane, now, lastActivity time.Time) bool {
 	if d.lastJoin.After(last) {
 		last = d.lastJoin
 	}
-	// WHILE THE TRACE HAS MORE TO DELIVER, the pool steps: a quiet night between two
-	// jobs is not a stall, and the next job may need a host only a step can order.
+	// WHILE THE TRACE OR A HOST HAS MORE TO DELIVER, the pool steps: a quiet night
+	// between two jobs is not a stall, a host on its way joins at its own event, and the
+	// next job may need a host only a step can order.
 	if !actions.onlyTicksLeft() {
 		d.tail = time.Time{}
 
 		return true
 	}
-	// A JOB THAT NEVER FINISHES WOULD TICK FOREVER, so with nothing left to deliver the
-	// pool stops once nothing but its own steps has happened for longer than any job of
-	// the trace could need, and the report says the replay stalled.
-	if now.Sub(last) > d.stall {
-		d.report.Stalled = true
-		d.report.StoppedAbove = d.above()
-
-		return false
-	}
+	// A JOB THAT NEVER FINISHES WOULD TICK FOREVER, so with work unfinished and nothing
+	// left to deliver the pool stops once nothing but its own steps has happened for
+	// longer than any job could need and a step besides, and the report says the replay
+	// stalled. A replay whose work is done never stalls, however far apart its steps.
 	if !actions.everyJobCompleted() || !d.settled() {
 		d.tail = time.Time{}
+		if now.Sub(last) > d.stall+d.fleet.interval() {
+			d.report.Stalled = true
+			d.report.StoppedAbove = d.above()
+
+			return false
+		}
 
 		return true
 	}

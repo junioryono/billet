@@ -261,6 +261,23 @@ func TestAPoolStepsThroughAQuietNight(t *testing.T) {
 	}
 }
 
+// A FINISHED REPLAY IS NOT A STALL, HOWEVER FAR APART ITS STEPS. One five-minute job on a
+// pool that keeps a host and steps every eight hours: the job runs on the floor's host,
+// and the replay ends done, not stalled, though its next step would come after the
+// stall bound.
+func TestAPoolWhoseStepsAreFarApartFinishesWithoutStalling(t *testing.T) {
+	t.Parallel()
+	fleet := poolOnlyFleet(1, 1, 3*time.Minute, 0)
+	fleet.Pool.Interval = 8 * time.Hour
+	trace := Trace{Arrivals: []Arrival{{
+		At: DefaultStart, Tier: "billet-4vcpu", Owner: DefaultOwner, Repository: "web",
+		WorkflowRef: DefaultOwner + "/web/.github/workflows/ci.yml@refs/heads/main", RunID: 50000,
+		Duration: Duration(5 * time.Minute), Result: ResultSucceeded,
+	}}}
+	trace.Normalize()
+	speaks(t, Run(t, fleet, trace, Options{DirectAssignment: true}))
+}
+
 // TWO ARCHITECTURES REPLAY THE SAME TWICE. The scaler orders on each architecture in
 // one order every step, so the identifiers its orders draw, the node each host joins
 // as and where every job ran are the same in two replays of one trace.

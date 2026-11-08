@@ -1185,13 +1185,14 @@ func (p *plane) deliveredJobs() (map[int64]bool, map[int64]bool) {
 }
 
 // everyJobCompleted says whether GitHub has told billet every job in the trace finished.
-// onlyTicksLeft reports whether every event still to come is a pool tick.
+// onlyTicksLeft reports whether every event still to come is a pool tick: a host
+// becoming ready is progress, as a job's event is.
 func (p *plane) onlyTicksLeft() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for _, ev := range p.events {
-		if ev.kind != eventPoolTick && ev.kind != eventPoolReady {
+		if ev.kind != eventPoolTick {
 			return false
 		}
 	}
