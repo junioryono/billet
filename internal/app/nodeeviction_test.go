@@ -65,16 +65,77 @@ func TestTheNodeSweepsSupersededGenerationsBetweenFullPasses(t *testing.T) {
 // really runs; a store that lost the method would otherwise be swept never.
 var _ supersededEvictor = (*ceph.Client)(nil)
 
-// sweeperStore is a store with the superseded sweep, which answers err.
+// A PASS AND A SWEEP NEVER OVERLAP, AND A STOP ENDS THE LOOP AT AN IN-FLIGHT SWEEP:
+// a sweep due while the first pass runs waits for it, and once the context ends
+// the loop returns as soon as the sweep in hand does, starting nothing more.
+func TestTheEvictionLoopSerialisesAndStopsAtAnInFlightSweep(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+
+		releasePass := make(chan struct{})
+		sweepEntered := make(chan struct{})
+
+		var passes, sweeps int
+
+		evict := func() {
+			passes++
+			if passes == 1 {
+				<-releasePass
+			}
+		}
+		sweep := func() {
+			sweeps++
+			if sweeps == 1 {
+				close(sweepEntered)
+				<-ctx.Done()
+			}
+		}
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			runEviction(ctx, cacheEvictionEvery, supersededSweepEvery, evict, sweep)
+		}()
+
+		// THE FIRST PASS HOLDS PAST TWO SWEEP TICKS, and no sweep enters.
+		time.Sleep(2*supersededSweepEvery + time.Minute)
+		synctest.Wait()
+
+		if sweeps != 0 {
+			t.Fatalf("%d sweep(s) ran while the first pass held", sweeps)
+		}
+
+		close(releasePass)
+		<-sweepEntered
+
+		// A STOP WHILE THE SWEEP IS IN HAND: the loop returns once it does.
+		cancel()
+		<-done
+
+		if sweeps != 1 {
+			t.Errorf("the loop ran %d sweep(s), want the one in hand and none after the stop", sweeps)
+		}
+		if passes != 1 {
+			t.Errorf("the loop ran %d pass(es), want the first only", passes)
+		}
+	})
+}
+
+// sweeperStore is a store with the superseded sweep, which answers err and
+// records the context it was given.
 type sweeperStore struct {
 	sweeps int
 	err    error
+	ctx    context.Context
 }
 
 func (s *sweeperStore) Evict(context.Context, time.Duration) error { return nil }
 
-func (s *sweeperStore) EvictSuperseded(context.Context) error {
+func (s *sweeperStore) EvictSuperseded(ctx context.Context) error {
 	s.sweeps++
+	s.ctx = ctx
 
 	return s.err
 }
@@ -93,10 +154,20 @@ func TestTheSweepAsksOnlyAStoreThatHasOne(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(&logged, nil))
 
 	store := &sweeperStore{err: errors.New("ceph: the cache lock was held 31s")}
-	sweepSuperseded(t.Context(), store, log)
+
+	given, stop := context.WithCancel(t.Context())
+	defer stop()
+
+	sweepSuperseded(given, store, log)
 
 	if store.sweeps != 1 {
 		t.Errorf("the store was swept %d times, want once", store.sweeps)
+	}
+
+	stop()
+
+	if store.ctx == nil || store.ctx.Err() == nil {
+		t.Error("cancelling the sweep's context did not reach the store's, so a stop would not reach it")
 	}
 	if !strings.Contains(logged.String(), "could not sweep superseded cache generations") ||
 		!strings.Contains(logged.String(), "held 31s") {

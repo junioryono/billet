@@ -941,6 +941,66 @@ func TestTheSupersededSweepTakesOnlySupersededGenerations(t *testing.T) {
 	}
 }
 
+// A SWEEP CUT SHORT RESUMES WHERE IT STOPPED, on a resume point of its own:
+// superseded generations that fail slowly at the front of its order would
+// otherwise spend every sweep's budget, and the one behind them would wait for the
+// full pass.
+func TestASweepCutShortResumesWhereItStopped(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	twoHours := now.Add(-2 * time.Hour)
+
+	const key = "acme/api/go"
+	current := expiredGeneration(now, 'a')
+	stuck := []string{expiredGeneration(twoHours, '1'), expiredGeneration(twoHours.Add(time.Second), '2')}
+	behind := expiredGeneration(twoHours.Add(2*time.Second), '3')
+
+	f := newCacheFake()
+	clock := time.Now()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "rm") && (slices.Contains(args, stuck[0]) || slices.Contains(args, stuck[1])) {
+			f.calls = append(f.calls, slices.Clone(args))
+			clock = clock.Add(supersededSweepBudget / 2)
+
+			return nil, errors.New("signal: killed")
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	c.clock = func() time.Time { return clock }
+	c.evictResume = "cache-g-0-resume"
+
+	record := func(handle string, usedAt time.Time) cachePointer {
+		return cachePointer{Key: key, Generation: "gen-" + handle, Handle: handle, UsedAt: usedAt,
+			RetentionHours: 7 * 24}
+	}
+	f.addVolume(current)
+	setIndexRecord(t, f, c, pointerKey(key), record(current, now))
+	for _, handle := range append(slices.Clone(stuck), behind) {
+		f.addVolume(handle)
+		f.metadata[handle] = map[string]string{cacheMetaPrefix + "used_at": twoHours.Format(time.RFC3339Nano)}
+		setIndexRecord(t, f, c, generationKey(key, "gen-"+handle), record(handle, twoHours))
+	}
+
+	for sweep := range 2 {
+		if err := c.EvictSuperseded(t.Context()); err == nil {
+			t.Fatalf("sweep %d reported no failure although two removals failed", sweep+1)
+		}
+	}
+
+	if f.images[behind] {
+		t.Error("two sweeps never reached the superseded generation behind the ones that spent the budget")
+	}
+	if !f.images[stuck[0]] || !f.images[stuck[1]] {
+		t.Error("a generation whose removal failed was not kept")
+	}
+	if c.evictResume != "cache-g-0-resume" {
+		t.Errorf("the sweep moved the full pass's resume point to %q", c.evictResume)
+	}
+}
+
 // THE SWEEP UNWINDS A LINEAGE A COMPACTION CUT OFF, as the full pass does, purging
 // the trash between its rounds and never under the lock.
 func TestTheSupersededSweepUnwindsALineage(t *testing.T) {

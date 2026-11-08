@@ -1810,14 +1810,16 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 // published about thirteen an hour: the pool grew by 1.2 TiB in twelve hours.
 // Which generations are superseded is read from the index alone, so the sweep asks
 // rbd only about those, does none of the index bookkeeping the full pass does, and
-// leaves the full pass's resume point alone.
+// keeps a resume point of its own, so slow failures at the front of its order
+// cannot spend every sweep's budget.
 func (c *Client) EvictSuperseded(ctx context.Context) error {
 	return c.evictInRounds(ctx, supersededGrace, supersededSweepBudget, true)
 }
 
-// supersededSweepBudget is how long one superseded sweep holds the cache lock, its
-// rounds together. A removal takes a few seconds, so this is several removals a
-// sweep, and a writer waits at most this long behind it.
+// supersededSweepBudget is how long one superseded sweep starts new work under the
+// cache lock, its rounds together. As in the full pass, the removal in hand when it
+// is spent finishes under the command bound, so a writer waits this long plus at
+// most one removal; a removal takes a few seconds, so this is several a sweep.
 const supersededSweepBudget = 30 * time.Second
 
 // evictInRounds alternates the trash purge, outside the cache lock, with rounds of
@@ -2086,14 +2088,16 @@ func (c *Client) evictGenerations(
 
 	// A PASS CUT SHORT IS RESUMED WHERE IT STOPPED, so generations that fail
 	// slowly at the front of the order cannot spend every pass's budget ahead of
-	// the ones behind them. The sweep keeps no resume point: what it reaches is few,
-	// and the full pass's must not move under it.
-	resume := ""
-	if !supersededOnly {
-		c.evictMu.Lock()
-		resume = c.evictResume
-		c.evictMu.Unlock()
+	// the ones behind them. The sweep keeps a resume point of its own, so neither
+	// moves the other's.
+	cursor := &c.evictResume
+	if supersededOnly {
+		cursor = &c.sweepResume
 	}
+
+	c.evictMu.Lock()
+	resume := *cursor
+	c.evictMu.Unlock()
 
 	first := 0
 	if resume != "" {
@@ -2111,9 +2115,9 @@ func (c *Client) evictGenerations(
 		}
 
 		if err := overBudget(fmt.Sprintf("%d generation(s) from %s on", len(order)-i, name)); err != nil {
-			if i > 0 && !supersededOnly {
+			if i > 0 {
 				c.evictMu.Lock()
-				c.evictResume = order[i-1]
+				*cursor = order[i-1]
 				c.evictMu.Unlock()
 			}
 
@@ -2139,11 +2143,9 @@ func (c *Client) evictGenerations(
 		}
 	}
 
-	if !supersededOnly {
-		c.evictMu.Lock()
-		c.evictResume = ""
-		c.evictMu.Unlock()
-	}
+	c.evictMu.Lock()
+	*cursor = ""
+	c.evictMu.Unlock()
 
 	// A ROUND WHOSE LAST GENERATION SPENT THE BUDGET charges it to the pass, which
 	// then runs no further round (Evict).
