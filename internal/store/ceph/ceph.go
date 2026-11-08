@@ -136,9 +136,11 @@ type Client struct {
 	mapSightings   map[string]time.Time
 
 	// evictResume is the last generation an eviction pass cut short by its lock
-	// budget reached, so the next pass begins after it.
+	// budget reached, so the next pass begins after it; sweepResume is the same for
+	// the superseded sweep, kept apart so neither moves the other's.
 	evictMu     sync.Mutex
 	evictResume string
+	sweepResume string
 
 	// lockImages holds the advisory-lock images a `lock add` has proved exist, so a
 	// retry skips the `rbd create` that could only fail.
