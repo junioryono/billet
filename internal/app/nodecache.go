@@ -297,7 +297,7 @@ func startNodeCache(
 		retryClosed()
 		renewActive()
 
-		go runEviction(evictCtx, cacheEvictionEvery, supersededSweepEvery, evict, func() {
+		go runEviction(evictCtx, evict, func() {
 			sweepSuperseded(evictCtx, storage, slog.Default())
 		})
 
@@ -450,14 +450,14 @@ const cacheEvictionEvery = 6 * time.Hour
 // once a day, while the pool grew by 1.2 TiB in twelve hours.
 const supersededSweepEvery = 10 * time.Minute
 
-// runEviction runs evict at once and every fullEvery, and sweep every sweepEvery,
-// one at a time, until ctx ends. A sweep due while a pass runs waits for it, and
-// ticks missed meanwhile collapse into one, as a ticker's do.
-func runEviction(ctx context.Context, fullEvery, sweepEvery time.Duration, evict, sweep func()) {
-	full := time.NewTicker(fullEvery)
+// runEviction runs evict at once and every cacheEvictionEvery, and sweep every
+// supersededSweepEvery, one at a time, until ctx ends. A sweep due while a pass runs
+// waits for it, and ticks missed meanwhile collapse into one, as a ticker's do.
+func runEviction(ctx context.Context, evict, sweep func()) {
+	full := time.NewTicker(cacheEvictionEvery)
 	defer full.Stop()
 
-	quick := time.NewTicker(sweepEvery)
+	quick := time.NewTicker(supersededSweepEvery)
 	defer quick.Stop()
 
 	evict()
@@ -467,9 +467,18 @@ func runEviction(ctx context.Context, fullEvery, sweepEvery time.Duration, evict
 		case <-ctx.Done():
 			return
 		case <-full.C:
-			evict()
 		case <-quick.C:
-			sweep()
+			// A TICK THAT CAME DUE DURING A SWEEP IS READY BESIDE A STOP, and select
+			// picks between ready cases at random, so a stop is asked first.
+			if ctx.Err() == nil {
+				sweep()
+			}
+
+			continue
+		}
+
+		if ctx.Err() == nil {
+			evict()
 		}
 	}
 }

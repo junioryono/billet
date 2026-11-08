@@ -444,7 +444,7 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 					isIdent(call.Args[0], "ctx")
 			}
 		case *ast.CallExpr:
-			if isIdent(node.Fun, "runEviction") && len(node.Args) == 5 && isIdent(node.Args[0], "evictCtx") {
+			if isIdent(node.Fun, "runEviction") && len(node.Args) == 3 && isIdent(node.Args[0], "evictCtx") {
 				loopEnds = true
 			}
 		}

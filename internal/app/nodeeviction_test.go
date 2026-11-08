@@ -39,7 +39,7 @@ func TestTheNodeSweepsSupersededGenerationsBetweenFullPasses(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			runEviction(ctx, cacheEvictionEvery, supersededSweepEvery, track(&passes), track(&sweeps))
+			runEviction(ctx, track(&passes), track(&sweeps))
 		}()
 
 		time.Sleep(cacheEvictionEvery + time.Minute)
@@ -96,7 +96,7 @@ func TestTheEvictionLoopSerialisesAndStopsAtAnInFlightSweep(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			runEviction(ctx, cacheEvictionEvery, supersededSweepEvery, evict, sweep)
+			runEviction(ctx, evict, sweep)
 		}()
 
 		// THE FIRST PASS HOLDS PAST TWO SWEEP TICKS, and no sweep enters.
@@ -121,6 +121,53 @@ func TestTheEvictionLoopSerialisesAndStopsAtAnInFlightSweep(t *testing.T) {
 			t.Errorf("the loop ran %d pass(es), want the first only", passes)
 		}
 	})
+}
+
+// A TICK THAT CAME DUE DURING A SWEEP STARTS NOTHING AFTER A STOP. It is ready
+// beside the stop, and select picks between ready cases at random, so the case is
+// staged many times: a loop that dispatched the tick unasked would start a second
+// sweep in about half of them.
+func TestATickPendingAtAStopStartsNoSweep(t *testing.T) {
+	t.Parallel()
+
+	for attempt := range 32 {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+
+			release := make(chan struct{})
+			entered := make(chan struct{})
+
+			var passes, sweeps int
+
+			sweep := func() {
+				sweeps++
+				if sweeps == 1 {
+					close(entered)
+					<-release
+				}
+			}
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				runEviction(ctx, func() { passes++ }, sweep)
+			}()
+
+			<-entered
+
+			// THE SWEEP SPANS ANOTHER TICK, then the stop comes, then the sweep ends.
+			time.Sleep(supersededSweepEvery + time.Minute)
+			synctest.Wait()
+			cancel()
+			close(release)
+			<-done
+
+			if sweeps != 1 || passes != 1 {
+				t.Fatalf("attempt %d: after the stop the loop ran %d sweep(s) and %d pass(es), want 1 and 1",
+					attempt, sweeps, passes)
+			}
+		})
+	}
 }
 
 // sweeperStore is a store with the superseded sweep, which answers err and
