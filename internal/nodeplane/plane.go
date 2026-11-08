@@ -56,6 +56,16 @@ var ErrTakeCustody = errors.New("nodeplane: this launch's lease is now the node'
 // unknown and the lease is kept — see Runner.Launch.
 const defaultCommandTimeout = 10 * time.Minute
 
+// custodyClaimWindow is how long after a plane's first registration a completion's
+// destroy is held back from a process that holds a lease only by adoption and has not
+// reported it. A superseded process running that compute may not have reached this plane
+// yet, and its claim comes every 10 s; the process asked here would answer truthfully
+// that it has nothing to remove, and the lease would be released under the guest.
+//
+// IT HOLDS A DESTROY BACK AND AUTHORISES NOTHING: past it the answer is what it always
+// was, and the completion is retried on its own pacing.
+const custodyClaimWindow = 30 * time.Second
+
 // defaultPollTimeout bounds a command long-poll.
 //
 // Short enough that a node notices a dead connection promptly, long enough that
@@ -88,6 +98,10 @@ type Plane struct {
 	// commandTimeout bounds a caller's wait, NOT the node's work. Expiring it
 	// says the outcome is unknown, never that nothing happened.
 	commandTimeout time.Duration
+
+	// firstRegistered is when this plane first accepted a registration, from which
+	// custodyClaimWindow runs. Guarded by mu.
+	firstRegistered time.Time
 
 	mu    sync.Mutex
 	nodes map[string]*node
@@ -1394,6 +1408,10 @@ func (p *Plane) register(
 	}
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
+	if p.firstRegistered.IsZero() {
+		p.firstRegistered = p.now()
+	}
+
 	n.lastSeen = p.now()
 
 	// NEVER BACKWARDS. Expiry presents this token to its fenced ledger write, so
@@ -1723,6 +1741,28 @@ func (p *Plane) forgetForRequestLocked(requestID int64) {
 	}
 }
 
+// forgetOwnedBy drops a lease's record if it still names this process, and reports
+// whether nothing else holds it: false when a claim landed while a destroy was out, whose
+// answer then says nothing about the claimant's compute. ONE HOLD OF THE MUTEX, because a
+// claim landing between a comparison and a forgetting would be the record removed.
+func (p *Plane) forgetOwnedBy(node, leaseID, incarnation string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	owner, owned := p.owners[leaseID]
+	if !owned {
+		return true
+	}
+
+	if owner.node != node || owner.incarnation != incarnation {
+		return false
+	}
+
+	delete(p.owners, leaseID)
+
+	return true
+}
+
 // tookCommand reports which process was handed this command.
 func (p *Plane) tookCommand(pend *pending) string {
 	p.mu.Lock()
@@ -1943,6 +1983,76 @@ func (p *Plane) adoptOwnershipLocked(
 	}
 
 	p.pruneWithdrawnLocked()
+}
+
+// CustodyClaim is a lease a superseded process says it holds, which the ledger
+// places on its node, and the request the ledger says it was launched under.
+type CustodyClaim struct {
+	LeaseID   string
+	RequestID int64
+}
+
+// ClaimCustody records that a superseded process holds these leases, restoring on
+// this plane what the plane that gave them to it knew (#685). OWNERSHIP DOES NOT
+// SURVIVE A CONTROLLER: a promoted or restarted plane either has no owner for a
+// lease, or has as its owner the node's current process, adopted from the ledger's
+// launched set at its registration, and would refuse the process that runs the
+// compute its own lease. An adoption is a guess from the ledger, and the claim is the
+// word of a process that holds the compute, so the claim wins; the current process
+// may hold the compute too, on a shared machine or a remote backend, and goes on
+// being admitted to it as the node's current process, which is the state a
+// supersession on the plane before left them in.
+//
+// A claim takes nothing another process was given. A launch this plane delivered
+// stays with the process it went to, an earlier claim or adoption by a process that
+// is not current stays with it, and another host's lease stays that host's. Each is
+// not granted, and asked again.
+//
+// It answers what the claimant now holds, and which of those this call recorded.
+func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) ([]string, []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.owners == nil {
+		p.owners = make(map[string]leaseOwner, len(claims))
+	}
+
+	current := p.nodes[node]
+
+	held := make([]string, 0, len(claims))
+	added := make([]string, 0, len(claims))
+
+	for _, claim := range claims {
+		id := claim.LeaseID
+		owner, taken := p.owners[id]
+
+		switch {
+		case !taken:
+		case owner.node != node:
+			continue
+		case owner.incarnation == incarnation:
+			// ITS OWN ADOPTION CARRIES NO REQUEST, from a registration it made before it
+			// learned it was superseded, and a destroy cannot find it without one.
+			if owner.requestID == 0 {
+				owner.requestID = claim.RequestID
+				p.owners[id] = owner
+			}
+
+			held = append(held, id)
+
+			continue
+		case owner.requestID != 0:
+			continue
+		case current == nil || current.incarnation != owner.incarnation:
+			continue
+		}
+
+		p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: claim.RequestID}
+		held = append(held, id)
+		added = append(added, id)
+	}
+
+	return held, added
 }
 
 // MayMutateLease reports whether this process may change a lease's fate.

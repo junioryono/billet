@@ -165,6 +165,28 @@ type ReconcileResponse struct {
 	Freed int `json:"freed"`
 }
 
+// MaxCustodyClaim bounds one claim: more leases than a fleet at its target holds. A
+// process holding more names them over several.
+const MaxCustodyClaim = 4096
+
+// ClaimCustodyRequest is a superseded process saying which leases it holds compute
+// for, from VersionCustodyClaim. It grants the process nothing another was given;
+// see nodeplane.Plane.ClaimCustody.
+type ClaimCustodyRequest struct {
+	LeaseIDs []string `json:"lease_ids"`
+}
+
+// ClaimCustodyResponse is what the claim established: the leases this process holds
+// on this controller now. A lease it does not name is asked about again.
+//
+// Version is the newest wire this controller speaks. The process reached it without
+// registering, so this is the only negotiation the two have: what it sends here from
+// now on is held to the lower of the two, as a registration would have.
+type ClaimCustodyResponse struct {
+	Version int      `json:"version"`
+	Held    []string `json:"held,omitempty"`
+}
+
 // ErrorResponse is how a refusal crosses the wire.
 //
 // Code is a STABLE STRING the node may branch on; Message is for a human. The

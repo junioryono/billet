@@ -149,18 +149,18 @@ func (c *assembled) schedule(t *testing.T, opts app.ScheduleOptions) *app.Schedu
 	return scheduler
 }
 
-// awaitRegistered waits until n nodes are registered over the wire.
+// awaitRegistered waits until a node is registered over the wire.
 //
 // REGISTERED BEFORE THE CONTROL PLANE HAS ANYTHING TO GIVE THEM. Otherwise the
 // first launch legitimately finds no node and the test measures startup order
 // rather than the wire.
-func (c *assembled) awaitRegistered(t *testing.T, n int) {
+func (c *assembled) awaitRegistered(t *testing.T) {
 	t.Helper()
 
 	deadline := time.Now().Add(30 * time.Second)
-	for len(c.wire.Plane().Nodes()) < n {
+	for len(c.wire.Plane().Nodes()) == 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("only %d of %d nodes registered over the wire", len(c.wire.Plane().Nodes()), n)
+			t.Fatal("no node registered over the wire")
 		}
 
 		time.Sleep(20 * time.Millisecond)

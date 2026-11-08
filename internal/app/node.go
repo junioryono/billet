@@ -301,6 +301,10 @@ func (n *Node) Close() error {
 // drifted would compile and keep nothing for the next process (#384).
 var _ nodeclient.HandingOver = (*node.Runner)(nil)
 
+// AND ITS CUSTODY, so a signature that drifted would leave a superseded process
+// refused its own leases by a controller that replaced the one it knew (#685).
+var _ nodeclient.CustodyFollower = (*node.Runner)(nil)
+
 // NodeHost is what the node takes from this process and machine.
 type NodeHost struct {
 	// Ready tells the service manager this process is serving.
