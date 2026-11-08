@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -140,15 +141,20 @@ func ReadIdentity(dir string) (Identity, error) {
 }
 
 // Size is how many bytes the archive's declared entries hold, as its manifest
-// records them.
-func (id Identity) Size() int64 {
+// records them, and false when a declaration is negative or the total overflows:
+// nothing here has checked the manifest against the files.
+func (id Identity) Size() (int64, bool) {
 	var n int64
 
 	for _, rec := range id.files {
+		if rec.Size < 0 || n > math.MaxInt64-rec.Size {
+			return 0, false
+		}
+
 		n += rec.Size
 	}
 
-	return n
+	return n, true
 }
 
 // VerifyRemainder proves that everything still in the archive at dir is what

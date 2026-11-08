@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -51,9 +52,10 @@ func pruneLocalArchives(ctx context.Context, env cli.Env, store archiveStore, de
 
 	removed, err := pruneArchivesIn(ctx, store, deployment, localBackupDir)
 	if len(removed) > 0 {
-		fmt.Fprintf(env.Stdout, "\nprune    removed %d older local archives that the bucket holds; the newest %d\n",
-			len(removed), keepLocalArchives)
-		fmt.Fprintf(env.Stdout, "         are kept in %s\n", localBackupDir)
+		fmt.Fprintf(env.Stdout, "\nprune    removed %d older local archives that the bucket holds; %s keeps at most\n",
+			len(removed), localBackupDir)
+		fmt.Fprintf(env.Stdout, "         the newest %d, fewer while its disk lacks room for two more, and always the newest\n",
+			keepLocalArchives)
 	}
 
 	if err != nil {
@@ -141,7 +143,15 @@ func pruneArchivesIn(ctx context.Context, store archiveStore, deployment, parent
 		errs    []error
 	)
 
-	room := localArchiveRoom * archives[0].id.Size()
+	// THE ROOM IS THE NEWEST MANIFEST'S DECLARATION, which nothing has checked
+	// against its files, so one that cannot be a size keeps every archive inside
+	// the count and says so.
+	newest, sized := archives[0].id.Size()
+	if sized && newest > math.MaxInt64/localArchiveRoom {
+		sized = false
+	}
+
+	room := localArchiveRoom * newest
 
 	// OLDEST FIRST, AND NEVER THE NEWEST. Past the count every archive the bucket
 	// holds goes; inside it one goes only while the disk is short, asked again
@@ -150,6 +160,13 @@ func pruneArchivesIn(ctx context.Context, store archiveStore, deployment, parent
 		l := archives[i]
 
 		if i < keepLocalArchives {
+			if !sized {
+				errs = append(errs, fmt.Errorf("the newest archive, %s, declares no usable size, so the "+
+					"newest %d archives are kept", archives[0].name, i+1))
+
+				break
+			}
+
 			free, err := freeBytes(parent)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("could not read how much room %s has, so the newest %d "+

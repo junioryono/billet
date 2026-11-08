@@ -1,6 +1,7 @@
 package host
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -153,9 +154,9 @@ func TestAShortDiskPrunesOlderArchivesUntilTheRoomIsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	size := id.Size()
-	if size <= 0 {
-		t.Fatalf("the seed archive declares %d bytes, so the room proves nothing", size)
+	size, ok := id.Size()
+	if !ok || size <= 0 {
+		t.Fatalf("the seed archive declares %d bytes (usable %v), so the room proves nothing", size, ok)
 	}
 
 	// Five archives, under the count. day-b never finished uploading.
@@ -175,11 +176,23 @@ func TestAShortDiskPrunesOlderArchivesUntilTheRoomIsBack(t *testing.T) {
 	}
 
 	// The room comes back once three archives are left: two archives' worth free.
-	withFreeBytes(t, func(string) (int64, error) { return int64(5-archivesLeft()) * size, nil })
+	var elsewhere []string
+
+	withFreeBytes(t, func(path string) (int64, error) {
+		if path != dir {
+			elsewhere = append(elsewhere, path)
+		}
+
+		return int64(5-archivesLeft()) * size, nil
+	})
 
 	removed, err := pruneArchivesIn(t.Context(), store, f.deployment, dir)
 	if err != nil {
 		t.Fatalf("prune: %v", err)
+	}
+
+	if len(elsewhere) > 0 {
+		t.Errorf("the room was read on %v, want only the backup directory %s", elsewhere, dir)
 	}
 
 	slices.Sort(removed)
@@ -201,6 +214,66 @@ func TestAShortDiskPrunesOlderArchivesUntilTheRoomIsBack(t *testing.T) {
 
 	if want := []string{"day-b", "day-e"}; !slices.Equal(entriesOf(t, dir), want) {
 		t.Fatalf("the directory holds %v, want the newest and the one the bucket lacks", entriesOf(t, dir))
+	}
+}
+
+// A NEWEST ARCHIVE THAT DECLARES NO USABLE SIZE PRUNES ONLY PAST THE COUNT, and
+// says so: its manifest has not been checked against its files, and a total that
+// overflows would make the room negative and the pruning stop on a full disk.
+func TestANewestArchiveWithNoUsableSizePrunesOnlyPastTheCount(t *testing.T) {
+	store := withArchiveStore(t, newFakeArchiveStore())
+	f := newBackupFixture(t, true)
+	seed := seedArchive(t, f)
+	dir := useBackupDir(t)
+	base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+
+	for i := range keepLocalArchives + 1 {
+		stageArchive(t, store, f.deployment, seed, "day-"+string(rune('a'+i)), base.AddDate(0, 0, i), true)
+	}
+
+	newest := filepath.Join(dir, "day-"+string(rune('a'+keepLocalArchives)), deployarchive.EntryManifest)
+
+	raw, err := os.ReadFile(newest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+
+	files, ok := m["files"].([]any)
+	if !ok || len(files) < 2 {
+		t.Fatalf("the manifest declares %v, want at least two files to overflow", m["files"])
+	}
+
+	for _, rec := range files[:2] {
+		entry, ok := rec.(map[string]any)
+		if !ok {
+			t.Fatalf("a file record is %T", rec)
+		}
+
+		entry["size"] = int64(1) << 62
+	}
+
+	if raw, err = json.Marshal(m); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(newest, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	withFreeBytes(t, func(string) (int64, error) { return 0, nil })
+
+	removed, err := pruneArchivesIn(t.Context(), store, f.deployment, dir)
+	if err == nil || !strings.Contains(err.Error(), "declares no usable size") {
+		t.Errorf("prune = %v, want the newest archive's size refused and said", err)
+	}
+
+	if !slices.Equal(removed, []string{"day-a"}) {
+		t.Errorf("removed %v, want only day-a, the one past the count, on a disk reading empty", removed)
 	}
 }
 
