@@ -110,6 +110,10 @@ billet_enable_server: true
 #
 # The host is commissioned by converging again with this false.
 billet_server_prepare_only: false
+# A NODE'S HOST PREPARED FOR `billet join` TO FINISH: Firecracker, its network and its
+# Ceph converged, and neither billet.yaml written nor the node started, because the
+# join writes the one and starts the other. A pool host's first boot (ADR-030).
+billet_node_prepare_only: false
 billet_enable_node: true
 
 billet_firecracker_enabled: true

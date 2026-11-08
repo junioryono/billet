@@ -38,3 +38,34 @@
           state_dir: /var/lib/billet/server
           max_vcpu: 2
           max_memory: 4GiB
+
+# A NODE'S HOST PREPARED FOR `billet join` TO FINISH (billet_node_prepare_only, ADR-030):
+# the same fresh host, converged as a node in check mode, must neither write billet.yaml,
+# which the join generates and would otherwise leave alone and stop, nor start the node,
+# which has no certificate until the join enrolls it.
+- name: Check-mode converge of a fresh node prepared for billet join
+  hosts: all
+  become: true
+  roles:
+    - role: junioryono.billet.host
+      billet_binary_src: "{{ billet_fresh_check_binary_src }}"
+      billet_enable_server: false
+      billet_enable_node: true
+      billet_node_prepare_only: true
+      billet_firecracker_enabled: false
+      billet_ceph_enabled: false
+      billet_config:
+        node:
+          name: pool-p01
+          provider: docker
+          server_addr: 10.77.0.10:7717
+          state_dir: /var/lib/billet/node
+  post_tasks:
+    - name: Require the node prepared, its config and its start left to the join
+      ansible.builtin.assert:
+        that:
+          - billet_config_install is skipped
+          - not (billet_node_should_run | bool)
+        fail_msg: >-
+          billet_node_prepare_only wrote billet.yaml or would start the node
+          (billet_node_should_run={{ billet_node_should_run }}).

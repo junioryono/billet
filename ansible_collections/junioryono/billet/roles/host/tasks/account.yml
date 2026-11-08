@@ -592,7 +592,11 @@
     mode: "0640"
   register: billet_config_install
   become: true
-  when: not billet_binary_upgrade | default(false)
+  # A NODE PREPARED FOR `billet join` HAS NO CONFIG OF THE ROLE'S: the join generates it,
+  # and leaves one it did not write alone (it writes beside it and stops).
+  when:
+    - not billet_binary_upgrade | default(false)
+    - not billet_node_prepare_only | default(false)
 
 # THE CONTROL PLANE'S ENVIRONMENT, and what it exists for is the PostgreSQL
 # ledger: `server.state.postgres.dsn_env` names a variable rather than carrying a
