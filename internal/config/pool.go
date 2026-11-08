@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -26,6 +27,59 @@ const (
 	MinPoolIdleAfter = 5 * time.Minute
 )
 
+// PoolInitFlags are the only `billet init` flags a pool host's join may be handed: what
+// a Firecracker node's config needs and the join cannot know. Every other flag init
+// takes is the join's to decide (its config path, its node name, its provider, --force),
+// and init takes a flag's last value, so one more here would override it.
+var PoolInitFlags = []string{"kernel-image", "ceph-user", "ceph-keyring"}
+
+// checkPoolInitArgs refuses init_args that are not PoolInitFlags, each at most once,
+// as `--flag value` or `--flag=value`, every word one word of the boot: a NUL bash
+// drops and a line break would end the join's line.
+func checkPoolInitArgs(args []string) []error {
+	var errs []error
+	seen := map[string]bool{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "" || strings.ContainsAny(a, "\x00\n\r") {
+			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word with no NUL "+
+				"or line break", i, a))
+
+			continue
+		}
+		name, value, inline := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if !strings.HasPrefix(a, "-") || !slices.Contains(PoolInitFlags, name) {
+			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q is not one of %v: every other flag of "+
+				"billet init is the join's to decide", i, a, PoolInitFlags))
+
+			continue
+		}
+		if seen[name] {
+			errs = append(errs, fmt.Errorf("server.pool.init_args names --%s twice", name))
+		}
+		seen[name] = true
+		if !inline {
+			if i+1 >= len(args) {
+				errs = append(errs, fmt.Errorf("server.pool.init_args ends with --%s and no value", name))
+
+				break
+			}
+			i++
+			value = args[i]
+			if value == "" || strings.ContainsAny(value, "\x00\n\r") {
+				errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word with no "+
+					"NUL or line break", i, value))
+			}
+		}
+		if strings.HasPrefix(value, "-") {
+			errs = append(errs, fmt.Errorf("server.pool.init_args gives --%s the value %q, which reads as a flag",
+				name, value))
+		}
+	}
+
+	return errs
+}
+
 // PoolConfig is server.pool: a pool of rented bare metal the control plane orders
 // Firecracker hosts from, ahead of demand (ADR-030).
 type PoolConfig struct {
@@ -40,7 +94,7 @@ type PoolConfig struct {
 	BootPrelude string `yaml:"boot_prelude"`
 	// InitArgs are the arguments an ordered host's `billet join` hands to `billet init`
 	// after `--`: a Firecracker node's kernel image and Ceph identity, at the paths the
-	// prelude prepared, which the node's generated config needs.
+	// prelude prepared, which the node's generated config needs. Only PoolInitFlags.
 	InitArgs []string `yaml:"init_args,omitempty"`
 	// Interval is how often the pool looks at demand and its orders, a Go duration.
 	Interval string `yaml:"interval,omitempty"`
@@ -225,14 +279,7 @@ func (s *ServerConfig) validatePool() []error {
 		errs = append(errs, fmt.Errorf("server.pool.boot_prelude %q must be an absolute path to the script a "+
 			"host runs before it joins", p.BootPrelude))
 	}
-	// EACH ONE WORD OF THE BOOT, quoted as it is: a NUL bash drops and a line break would
-	// end the join's line, so either would make what runs not what was configured.
-	for i, a := range p.InitArgs {
-		if a == "" || strings.ContainsAny(a, "\x00\n\r") {
-			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word with no NUL "+
-				"or line break", i, a))
-		}
-	}
+	errs = append(errs, checkPoolInitArgs(p.InitArgs)...)
 	for field, v := range map[string]string{"interval": p.Interval, "refusal_backoff": p.RefusalBackoff} {
 		if v == "" {
 			continue

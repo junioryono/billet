@@ -86,6 +86,20 @@ func TestAPoolBlockLoads(t *testing.T) {
 
 // EACH REFUSAL IS ONE CHANGE TO A VALID BLOCK, so a refusal that fires for another
 // reason does not pass for this one.
+// A POOL HOST'S INIT IS HANDED ITS KERNEL AND CEPH IDENTITY, in either spelling.
+func TestAPoolMayHandInitItsKernelAndCephIdentity(t *testing.T) {
+	t.Parallel()
+	block := strings.Replace(poolBlock, "    boot_prelude:", "    init_args: ['--kernel-image', /var/lib/billet/vmlinux, "+
+		"'--ceph-user=billet', '--ceph-keyring', /etc/ceph/ceph.client.billet.keyring]\n    boot_prelude:", 1)
+	cfg, err := loadServer(t, poolConfig(block))
+	if err != nil {
+		t.Fatalf("a pool handing init its kernel and Ceph identity was refused: %v", err)
+	}
+	if got := cfg.Server.Pool.InitArgs; len(got) != 5 || got[1] != "/var/lib/billet/vmlinux" {
+		t.Errorf("init_args read as %q", got)
+	}
+}
+
 func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
 	t.Parallel()
 	for name, c := range map[string]struct{ from, to, want string }{
@@ -114,6 +128,14 @@ func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
 		"a bad bootstrap addr":    {"    boot_prelude:", "    bootstrap_addr: nowhere\n    boot_prelude:", "bootstrap_addr"},
 		"an init arg over lines":  {"    boot_prelude:", "    init_args: ['--kernel-image', \"a\\nb\"]\n    boot_prelude:", "init_args[1]"},
 		"an empty init arg":       {"    boot_prelude:", "    init_args: ['']\n    boot_prelude:", "init_args[0]"},
+		"init's config path":      {"    boot_prelude:", "    init_args: ['--config', /etc/billet/other.yaml]\n    boot_prelude:", "is not one of"},
+		"init's force":            {"    boot_prelude:", "    init_args: ['--force']\n    boot_prelude:", "is not one of"},
+		"a single-dash node name": {"    boot_prelude:", "    init_args: ['-node-name=x']\n    boot_prelude:", "is not one of"},
+		"init's provider":         {"    boot_prelude:", "    init_args: ['--provider=docker']\n    boot_prelude:", "is not one of"},
+		"a kernel twice":          {"    boot_prelude:", "    init_args: ['--kernel-image', /a, '--kernel-image=/b']\n    boot_prelude:", "twice"},
+		"a value that is a flag":  {"    boot_prelude:", "    init_args: ['--ceph-user', '--force']\n    boot_prelude:", "reads as a flag"},
+		"a flag with no value":    {"    boot_prelude:", "    init_args: ['--ceph-keyring']\n    boot_prelude:", "no value"},
+		"a bare word":             {"    boot_prelude:", "    init_args: [kernel]\n    boot_prelude:", "is not one of"},
 		"an ipv6 wildcard join":   {"join_server: 10.77.0.10:7717", "join_server: '[::]:7717'", "join_server"},
 		"an empty shape type":     {"{type: s2.c2.small, arch: x64}", "{type: '', arch: x64}", "type is required"},
 		"an empty order":          {"        order:\n          - {source: aws-metal, shape: m7gd.metal, location: us-west-2a}", "        order: []", "order is empty"},

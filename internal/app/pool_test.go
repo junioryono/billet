@@ -61,7 +61,9 @@ func runBoot(t *testing.T, boot []byte, env ...string) (args []string, stderr st
 func TestAPoolHostsJoinHandsInitItsArguments(t *testing.T) {
 	t.Parallel()
 	cfg := poolBootConfig()
-	cfg.Server.Pool.InitArgs = []string{"--kernel-image", "/var/lib/billet/kernel/vmlinux", "--ceph-user", "billet node", "it's"}
+	cfg.Server.Pool.InitArgs = []string{
+		"--kernel-image", "/var/lib/billet/kernel/vmlinux", "--ceph-user=billet", "--ceph-keyring", "/etc/ceph/it's a keyring",
+	}
 	boot, err := PoolBoot(cfg, "true\n", "SHA256:ab", "p01", "tok")
 	if err != nil {
 		t.Fatalf("PoolBoot: %v", err)
