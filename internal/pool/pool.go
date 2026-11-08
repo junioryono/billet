@@ -32,6 +32,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -210,7 +212,8 @@ func (p *Pool) Step(ctx context.Context) error {
 		// still kept, and growth for demand waits for a reading.
 		errs = append(errs, err)
 	}
-	for arch, a := range p.cfg.Archs {
+	for _, arch := range p.archs() {
+		a := p.cfg.Archs[arch]
 		c := count(orders, arch)
 		if c.unknown > 0 {
 			continue
@@ -268,7 +271,8 @@ func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, quiet map[c
 	cutoff := p.now().Add(-p.cfg.IdleAfter)
 	releasable := p.releasableBy(ctx)
 	var errs []error
-	for arch, a := range p.cfg.Archs {
+	for _, arch := range p.archs() {
+		a := p.cfg.Archs[arch]
 		c := count(orders, arch)
 		if c.unknown > 0 || c.onItsWay > 0 || !quiet[arch] || serving[arch] <= a.Floor {
 			continue
@@ -342,6 +346,10 @@ func (p *Pool) releasableBy(ctx context.Context) func(o *alloc.PoolOrder) bool {
 		return scope == o.Scope
 	}
 }
+
+// archs are the architectures the pool keeps, in one order every step, so the orders
+// a step places, and the identifiers they are drawn under, do not depend on a map's.
+func (p *Pool) archs() []config.Arch { return slices.Sorted(maps.Keys(p.cfg.Archs)) }
 
 // IdleAfter is how long a joined host must have held nothing before the pool asks for
 // its release, zero when the pool never shrinks itself.
