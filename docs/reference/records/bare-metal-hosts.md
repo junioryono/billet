@@ -57,6 +57,20 @@ One t3.micro (a Nitro instance; `GetConsoleOutput --latest` needs one) in us-wes
 - **Every job ran, on no more hosts than the maximum**, and the wide-shape mix filled all four. Two architectures, each with a floor, replayed the same twice: the same orders under the same identifiers, and every job on the same host, since the scaler now walks its architectures in one order.
 - **Once quiet for `idle_after` (ten minutes), the pool asked to release its hosts one a step down to its floor**: all three from a floor of none, three of four from a floor of one.
 
+## A build's outbound traffic, for the limits a provider polices, 2026-11-08
+
+**How.** One build's traffic on the shared Linux test host, inside a privileged `ubuntu:24.04` container so that nothing of the host's own was counted or changed: an nftables output chain in the container's namespace counted every packet leaving it (loopback aside), its bytes, and every new connection, and a sampler read the counters once a second while each phase ran. A guest's traffic is the same traffic; Firecracker carries it, it does not shape it.
+
+| Phase | Peak packets/s out | Peak new connections/s | Peak bytes/s out | Total new connections |
+|---|---|---|---|---|
+| `apt-get install` git, nodejs, npm, golang, build-essential | 1018 | 3 | 54001 | 10 |
+| `git clone --depth 1` of TypeScript | 226 | 0 | 11951 | 0 |
+| `npm install` of express, webpack, typescript, eslint, jest, react, next, babel | 1734 | 14 | 285610 | 17 |
+| `go mod download` of billet's module graph | 5505 | 18 | 441560 | 27 |
+| `pip install` of numpy, pandas, scipy, requests, boto3, django, flask, sqlalchemy, pytest, black | 1518 | 6 | 92445 | 6 |
+
+A build's outbound load is small and bursty: its heaviest second was 5505 packets and 441 KB, from a download fetching modules in parallel, and it opened at most 18 connections in a second. The host role's limits (`billet_guest_refuse_smtp`, `billet_guest_new_connections_per_second`, `billet_guest_packets_per_second`, `billet_guest_egress_bytes_per_second`) cap every guest on a host together, which is what a provider measures, and are off unless set. For a pool host the settings this gives are SMTP refused, 1000 new connections a second (every one of 32 guests at the measured peak at once is under 600), 200000 packets a second (32 at once is 176000) and 125000000 bytes a second, a gigabit, far above 32 builds' 14 MB/s and below the uplink a provider's port allows. They are a host-wide budget, so a flooding job is cut off with its neighbours rather than alone; a cap per guest needs the per-interface chain of ADR-028 and is not built.
+
 ## Still to measure
 
 - A no-stock and a quota refusal from each source, read as the scaler will read them.

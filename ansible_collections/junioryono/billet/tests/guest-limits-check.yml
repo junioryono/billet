@@ -1,0 +1,75 @@
+---
+# The guests' egress limits a hosting provider polices (ADR-030), rendered from the
+# role's own firewall template: off, the guard holds none of them; on, each is one
+# rule ahead of the established flows, counted, for traffic leaving the guests'
+# bridges. Where nft and root are at hand, the rendering is also what nft accepts.
+- name: The guests' egress limits are rendered only when asked for
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_role: "{{ playbook_dir }}/../roles/host"
+    billet_networks:
+      - {name: billetgate0, address: 192.0.2.1, prefix: 24}
+    billet_guest_denied_ipv4: [10.0.0.0/8, 169.254.0.0/16]
+    billet_guest_denied_ipv6: [fc00::/7]
+    billet_guest_host_tcp_ports: [53, 7718]
+    billet_guest_host_udp_ports: [53, 67]
+    billet_image_verify_port: 7719
+    billet_effective_config: {node: {firecracker: {bridge: billetgate0}}}
+    billet_gate_off: {}
+    billet_gate_on:
+      billet_guest_refuse_smtp: true
+      billet_guest_new_connections_per_second: 1000
+      billet_guest_packets_per_second: 200000
+      billet_guest_egress_bytes_per_second: 125000000
+  tasks:
+    - name: Render the firewall with every limit off, and with each on
+      ansible.builtin.set_fact:
+        billet_gate_firewall_off: >-
+          {{ lookup('ansible.builtin.template', billet_gate_role + '/templates/network.nft.j2',
+             template_vars={'billet_guest_refuse_smtp': false, 'billet_guest_new_connections_per_second': 0,
+                            'billet_guest_packets_per_second': 0, 'billet_guest_egress_bytes_per_second': 0}) }}
+        billet_gate_firewall_on: >-
+          {{ lookup('ansible.builtin.template', billet_gate_role + '/templates/network.nft.j2',
+             template_vars=billet_gate_on) }}
+
+    - name: Require no limit at all when none is asked for
+      ansible.builtin.assert:
+        that:
+          - "'billet guest smtp' not in billet_gate_firewall_off"
+          - "'limit rate' not in billet_gate_firewall_off"
+
+    - name: Require each limit as one counted rule ahead of the established flows
+      ansible.builtin.assert:
+        that:
+          - "'iifname @guest_ifaces oifname != @guest_ifaces tcp dport 25 counter drop' in billet_gate_firewall_on"
+          - "'ct state new limit rate over 1000/second burst 2000 packets counter drop' in billet_gate_firewall_on"
+          - "'limit rate over 200000/second burst 200000 packets counter drop' in billet_gate_firewall_on"
+          - "'limit rate over 125000000 bytes/second burst 125000000 bytes counter drop' in billet_gate_firewall_on"
+          - >-
+            billet_gate_firewall_on.index('bytes/second burst') <
+            billet_gate_firewall_on.index('ct state established,related accept')
+
+    - name: Find nft
+      ansible.builtin.stat:
+        path: /usr/sbin/nft
+      register: billet_gate_nft
+
+    - name: Write both renderings for nft
+      ansible.builtin.copy:
+        content: "{{ item.body }}\n"
+        dest: "{{ lookup('ansible.builtin.env', 'TMPDIR') | default('/tmp', true) }}/billet-guest-limits-{{ item.name }}.nft"
+        mode: "0600"
+      loop:
+        - {name: "off", body: "{{ billet_gate_firewall_off }}"}
+        - {name: "on", body: "{{ billet_gate_firewall_on }}"}
+      when: billet_gate_nft.stat.exists
+
+    - name: Require nft to accept both renderings
+      ansible.builtin.command:
+        argv: [/usr/sbin/nft, -c, -f, "{{ lookup('ansible.builtin.env', 'TMPDIR') | default('/tmp', true) }}/billet-guest-limits-{{ item }}.nft"]
+      loop: ["off", "on"]
+      become: true
+      changed_when: false
+      when: billet_gate_nft.stat.exists
