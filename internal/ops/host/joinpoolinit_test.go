@@ -69,6 +69,43 @@ func TestAPoolHostsBootGeneratesAFirecrackerNodeWithItsKernelAndCeph(t *testing.
 	}
 }
 
+// WHAT THE CONFIG TAKES, INIT TAKES THE SAME WAY. An empty Ceph user and padded paths,
+// which the pool's config accepts as init normalizes them, reach init through the boot's
+// join and generate a node with billet's own user and the paths trimmed.
+func TestAPoolHostsInitNormalizesAsTheConfigDid(t *testing.T) {
+	t.Parallel()
+	pool := &config.Config{
+		GitHub: &config.GitHubConfig{Org: "acme"},
+		Server: &config.ServerConfig{Pool: &config.PoolConfig{
+			JoinServer: "10.77.0.10:7717", BootstrapAddr: "10.77.0.10:7718",
+			InitArgs: []string{"--ceph-user=", "--kernel-image", " /var/lib/billet/vmlinux ", "--ceph-keyring", " /etc/ceph/k "},
+		}},
+	}
+	boot, err := app.PoolBoot(pool, "true\n", "SHA256:"+strings.Repeat("a", 64), "p01", "tok")
+	if err != nil {
+		t.Fatalf("PoolBoot: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(boot), "\n"), "\n")
+	words := singleQuotedWords(t, lines[len(lines)-1])
+	req, err := parseJoin(processEnv(), words[2:])
+	if err != nil {
+		t.Fatalf("parseJoin: %v", err)
+	}
+	req.cfgPath = filepath.Join(t.TempDir(), "billet.yaml")
+	if err := joinGenerate(t.Context(), processEnv(), joinInitArgs(req, testJoinDeployment)); err != nil {
+		t.Fatalf("billet init refused what the config accepted: %v", err)
+	}
+	cfg, err := config.Load(req.cfgPath)
+	if err != nil {
+		t.Fatalf("the generated config does not load: %v", err)
+	}
+	if n := cfg.Node; n.Firecracker.KernelImage != "/var/lib/billet/vmlinux" || n.Ceph.User != config.DefaultCephUser ||
+		n.Ceph.KeyringPath != "/etc/ceph/k" {
+		t.Errorf("the node holds kernel %q, Ceph user %q and keyring %q; want them trimmed and billet's own user",
+			n.Firecracker.KernelImage, n.Ceph.User, n.Ceph.KeyringPath)
+	}
+}
+
 // A VALUE THAT LOOKS LIKE A FLAG IS ITS FLAG'S VALUE. init_args that a config accepts,
 // `--ceph-user --force`, reach init as a Ceph user named --force and force nothing: the
 // join's existing config is not replaced.

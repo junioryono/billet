@@ -105,6 +105,13 @@ func TestAPoolMayHandInitItsKernelAndCephIdentity(t *testing.T) {
 	if _, err := loadServer(t, poolConfig(block)); err != nil {
 		t.Errorf("a Ceph user that looks like a flag was refused: %v", err)
 	}
+	// AND WHAT INIT NORMALIZES IS TAKEN AS INIT TAKES IT: an empty user is billet's own, and
+	// padding is trimmed (internal/ops/host's test carries both through init).
+	block = strings.Replace(poolBlock, "    boot_prelude:", "    init_args: ['--ceph-user=', '--kernel-image', ' /var/lib/billet/vmlinux ', "+
+		"'--ceph-keyring', ' /etc/ceph/k ']\n    boot_prelude:", 1)
+	if _, err := loadServer(t, poolConfig(block)); err != nil {
+		t.Errorf("init_args init would take were refused: %v", err)
+	}
 }
 
 func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
@@ -145,6 +152,7 @@ func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
 		"a client. ceph user":     {"    boot_prelude:", "    init_args: ['--ceph-user', client.billet]\n    boot_prelude:", "client."},
 		"a relative keyring":      {"    boot_prelude:", "    init_args: ['--ceph-keyring', ceph.keyring]\n    boot_prelude:", "keyring_path"},
 		"a relative kernel":       {"    boot_prelude:", "    init_args: ['--kernel-image=vmlinux']\n    boot_prelude:", "absolute path"},
+		"a word not utf-8":        {"    boot_prelude:", "    init_args: ['--ceph-user', !!binary kJCQkA==]\n    boot_prelude:", "UTF-8"},
 		"a flag with no value":    {"    boot_prelude:", "    init_args: ['--ceph-keyring']\n    boot_prelude:", "no value"},
 		"a bare word":             {"    boot_prelude:", "    init_args: [kernel]\n    boot_prelude:", "is not one of"},
 		"an ipv6 wildcard join":   {"join_server: 10.77.0.10:7717", "join_server: '[::]:7717'", "join_server"},

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Pool host sources a config may name.
@@ -48,9 +49,9 @@ func checkPoolInitArgs(args []string) []error {
 	values := map[string]string{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if a == "" || strings.ContainsAny(a, "\x00\n\r") {
-			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word with no NUL "+
-				"or line break", i, a))
+		if a == "" || strings.ContainsAny(a, "\x00\n\r") || !utf8.ValidString(a) {
+			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word of UTF-8 with "+
+				"no NUL or line break", i, a))
 
 			continue
 		}
@@ -73,9 +74,9 @@ func checkPoolInitArgs(args []string) []error {
 			}
 			i++
 			value = args[i]
-			if value == "" || strings.ContainsAny(value, "\x00\n\r") {
-				errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word with no "+
-					"NUL or line break", i, value))
+			if value == "" || strings.ContainsAny(value, "\x00\n\r") || !utf8.ValidString(value) {
+				errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word of UTF-8 "+
+					"with no NUL or line break", i, value))
 
 				continue
 			}
@@ -83,16 +84,18 @@ func checkPoolInitArgs(args []string) []error {
 		values[name] = value
 	}
 
-	if kernel, ok := values["kernel-image"]; ok && (!filepath.IsAbs(kernel) || kernel != strings.TrimSpace(kernel)) {
+	// AS THE NODE'S CONFIG WILL HOLD THEM: trimmed, as loading it trims, and an empty
+	// Ceph user given billet's own, as init and loading both give it.
+	if kernel, ok := values["kernel-image"]; ok && !filepath.IsAbs(strings.TrimSpace(kernel)) {
 		errs = append(errs, fmt.Errorf("server.pool.init_args' --kernel-image %q must be an absolute path, as "+
 			"node.firecracker.kernel_image must", kernel))
 	}
 	if _, user := values["ceph-user"]; user || values["ceph-keyring"] != "" {
 		ceph := CephConfig{
-			User: values["ceph-user"], KeyringPath: values["ceph-keyring"], ImagePool: "billet-images",
-			CachePool: "billet-cache",
+			User: strings.TrimSpace(values["ceph-user"]), KeyringPath: strings.TrimSpace(values["ceph-keyring"]),
+			ImagePool: "billet-images", CachePool: "billet-cache",
 		}
-		if !user {
+		if ceph.User == "" {
 			ceph.User = DefaultCephUser
 		}
 		for _, err := range CheckCeph(ceph) {
