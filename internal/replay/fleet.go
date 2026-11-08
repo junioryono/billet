@@ -39,6 +39,9 @@ type Host struct {
 	// harness's input, like the trace: an owned box's rate is not a fact billet
 	// records. Zero means unpriced.
 	RatePerHour float64
+	// Arch is the architecture the host's node reports, or empty for none, which
+	// serves only tiers naming none (ADR-022).
+	Arch config.Arch
 }
 
 // TierShape is one runs-on label and what a job on it is charged.
@@ -54,6 +57,9 @@ type TierShape struct {
 	Target string
 	// Reserved is the tier's `reserved` floor.
 	Reserved int
+	// Arch is the tier's `arch`, or empty for none. A pool grows only for a tier
+	// naming one.
+	Arch config.Arch
 }
 
 // TargetShape is one GitHub target of the fleet.
@@ -83,6 +89,9 @@ type Fleet struct {
 	// Boot is the modelled time between a mint and the runner taking a job. Zero
 	// means DefaultBoot.
 	Boot time.Duration
+	// Pool, when set, is a pool of rented hosts the real scaler orders from while
+	// the trace runs (ADR-030), beside the fixed Hosts.
+	Pool *PoolFleet
 }
 
 // ownerOf is the GitHub organization a target of the fleet serves.
@@ -134,8 +143,11 @@ func pinByBackend(t jobtrace.Tier, declared []jobtrace.Host, kept []Host) (strin
 func (f Fleet) validate(trace Trace) error {
 	var errs []error
 
-	if len(f.Hosts) == 0 {
-		errs = append(errs, errors.New("replay: the fleet has no hosts"))
+	if len(f.Hosts) == 0 && f.Pool == nil {
+		errs = append(errs, errors.New("replay: the fleet has no hosts and no pool"))
+	}
+	if f.Pool != nil {
+		errs = append(errs, f.Pool.validate()...)
 	}
 
 	seen := map[string]bool{}
@@ -250,6 +262,7 @@ func (f Fleet) tiers(trace Trace) []config.Tier {
 			Node:        shape.Node,
 			Target:      shape.Target,
 			Reserved:    shape.Reserved,
+			Arch:        shape.Arch,
 		})
 	}
 

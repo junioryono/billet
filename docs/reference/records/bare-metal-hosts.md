@@ -43,6 +43,20 @@ One t3.micro (a Nitro instance; `GetConsoleOutput --latest` needs one) in us-wes
 - **The document matches `DescribeInstances`.** Its `pendingTime` was the instance's `LaunchTime` (`2026-11-06T14:26:45Z`) and its `privateIp` the instance's private address.
 - **AWS's certificates differ by region.** Its page of certificates for identity document signatures listed an RSA certificate for 39 regions, one shared by the two China regions and every other distinct; us-west-2's was issued 2024-04-29 and lapses 2029-04-28.
 
+## The pool on replay, 2026-11-08
+
+**How.** `internal/replay` drove each trace through the real control plane at compressed time, as it does every replay, with a pool beside the fleet (`PoolFleet`, `internal/replay/pool_test.go`): the real scaler (`internal/pool`) ordered from a source the harness played, each order became a node of the stack a lead time later in simulated time, and every job ran on a host the pool ordered. GitHub's protocol was GitHub.com's, direct assignment, since a tier's shortage is read from the work GitHub assigned it. The source and the join are played: a host's order is admitted as the source's word would admit it, without a key or a certificate, because the replay's wire is the loopback one. A release is proved by its node's clearance over five minutes of wall time, so a replay records the pool asking for a release and not the release; the real runs prove that. The scaler stepped every simulated minute, every tier polled at each step as a live listener's long poll answers, and the floor was joined before the first job, as a running deployment keeps it. One x64 tier, 16-vcpu pool hosts, a lead time of three minutes from order to joined node.
+
+| Trace | Pool | Queue wait p50 | p90 | p99 |
+|---|---|---|---|---|
+| `Burst`, 24 four-vcpu jobs in ten seconds, a few minutes each | floor 0, max 3 | 10 min 48 s | 14 min 10 s | 16 min 33 s |
+| the same | floor 3, max 3 | 30 s | 6 min 33 s | 8 min 14 s |
+| `WideShapeMix`, 40 jobs of 2 to 32 vcpu at the load four hosts carry | floor 1, max 4, 64-vcpu hosts | 1 min 43 s | 4 min 10 s | 8 min 14 s |
+
+- **The pool grows one host at a time while one is on its way** (ADR-030), so a burst arriving at a floor of none waits out a lead time for every host it needs: three hosts were ordered three minutes apart, each after the one before joined, and the burst's p99 was eight minutes longer than with the same three hosts kept as the floor. The tail at the floor of three is the second wave of jobs behind the twelve slots, not the pool.
+- **Every job ran, on no more hosts than the maximum**, and the wide-shape mix filled all four.
+- **Once quiet for `idle_after` (ten minutes), the pool asked to release its hosts one a step down to its floor**: all three from a floor of none, three of four from a floor of one.
+
 ## Still to measure
 
 - A no-stock and a quota refusal from each source, read as the scaler will read them.

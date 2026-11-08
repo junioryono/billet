@@ -23,6 +23,7 @@ package replay
 import (
 	"log/slog"
 	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -93,8 +94,10 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 	tiers := fleet.tiers(trace)
 
 	// Started a minute before the first arrival, so every discovery escrow is
-	// dated before any job and the ledger reads in order.
-	clock := NewClock(trace.Arrivals[0].At.Add(-time.Minute))
+	// dated before any job and the ledger reads in order. A POOL'S FLOOR IS JOINED
+	// BEFORE IT, as a deployment that has been running keeps it: the pool orders one
+	// floor host a step, each joining a lead time later.
+	clock := NewClock(trace.Arrivals[0].At.Add(-time.Minute - fleet.Pool.warmup()))
 
 	actions := newPlane(t, clock, fleet, trace)
 	actions.direct = opts.DirectAssignment
@@ -140,6 +143,15 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 		actions.schedule(event{at: a.At, kind: eventArrival, seq: a.Seq})
 	}
 
+	// THE POOL STEPS FROM THE START, so its floor is ordered before the first job, and
+	// at its interval after that, in simulated time.
+	var hosts *poolDriver
+	var lastCompletion time.Time
+	if fleet.Pool != nil {
+		hosts = newPoolDriver(t, fleet, trace, tiers, st, clock)
+		actions.schedule(event{at: clock.Now(), kind: eventPoolTick})
+	}
+
 	// AN EMPTY EVENT LIST IS NOT THE END WITH LAUNCHES BESIDE THE LOOP. A job's start is
 	// scheduled when its runner registers, which is during its launch, so with the last
 	// launch still out there is nothing left to deliver and the job is not done. Waited
@@ -173,8 +185,26 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 			awaitingLaunches = time.Time{}
 
 			clock.Step(ev.at)
-			actions.deliver(ev)
-			settle(describe(ev))
+			if ev.kind == eventPoolTick {
+				// EVERY TIER POLLS AT A POOL STEP, as a live listener's long poll answers
+				// at least every minute: a quiet replay delivers nothing to a tier, and the
+				// pool reads only a report its tier wrote within five minutes.
+				for _, label := range actions.order {
+					actions.nudge(label)
+					settle("a poll for " + label + " at a pool step")
+				}
+				hosts.step(t.Context())
+				settle(describe(ev))
+				if hosts.ticksOn(actions, ev.at, lastCompletion) {
+					actions.schedule(event{at: ev.at.Add(fleet.Pool.interval()), kind: eventPoolTick})
+				}
+			} else {
+				if ev.kind == eventCompleted {
+					lastCompletion = ev.at
+				}
+				actions.deliver(ev)
+				settle(describe(ev))
+			}
 		}
 
 		// EVERY TIER POLLS WHEN ANY WORK WAITS, in the fleet's order, so which
@@ -214,10 +244,19 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 
 	startsSent, completionsSent := actions.deliveredJobs()
 
-	report, err := readReport(t.Context(), st.db, fleet, trace, opts.DirectAssignment, opts.BackgroundLaunches,
+	read := fleet
+	if hosts != nil {
+		read.Hosts = append(slices.Clone(fleet.Hosts), hosts.joinedHosts()...)
+	}
+
+	report, err := readReport(t.Context(), st.db, read, trace, opts.DirectAssignment, opts.BackgroundLaunches,
 		opts.Until, actions.waitingJobs(), startsSent)
 	if err != nil {
 		t.Fatalf("replay: read the ledger back: %v", err)
+	}
+
+	if hosts != nil {
+		report.Pool = &hosts.report
 	}
 
 	actions.mu.Lock()
@@ -240,6 +279,8 @@ func describe(ev event) string {
 		return "the start of job " + itoa(ev.seq)
 	case eventCompleted:
 		return "the completion of job " + itoa(ev.seq)
+	case eventPoolTick:
+		return "a pool step at " + ev.at.Format(time.RFC3339)
 	default:
 		return "an event"
 	}
