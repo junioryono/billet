@@ -54,6 +54,35 @@ func runBoot(t *testing.T, boot []byte, env ...string) (args []string, stderr st
 	return strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n"), errs.String()
 }
 
+// WHAT INIT NEEDS REACHES IT AFTER `--`, WORD FOR WORD. A Firecracker node's generated
+// config names its kernel image and Ceph identity, which the join cannot know; the
+// boot hands server.pool.init_args to billet init through the join's `--`, each one
+// word however it is spelled, and a pool with none hands nothing.
+func TestAPoolHostsJoinHandsInitItsArguments(t *testing.T) {
+	t.Parallel()
+	cfg := poolBootConfig()
+	cfg.Server.Pool.InitArgs = []string{
+		"--kernel-image", "/var/lib/billet/kernel/vmlinux", "--ceph-user=billet", "--ceph-keyring", "/etc/ceph/it's a keyring",
+	}
+	boot, err := PoolBoot(cfg, "true\n", "SHA256:ab", "p01", "tok")
+	if err != nil {
+		t.Fatalf("PoolBoot: %v", err)
+	}
+	args, _ := runBoot(t, boot)
+	i := slices.Index(args, "--")
+	if i < 0 || !slices.Equal(args[i+1:], cfg.Server.Pool.InitArgs) {
+		t.Fatalf("the join was run with %q; want the init arguments, each one word, after its --", args)
+	}
+
+	boot, err = PoolBoot(poolBootConfig(), "true\n", "SHA256:ab", "p01", "tok")
+	if err != nil {
+		t.Fatalf("PoolBoot: %v", err)
+	}
+	if args, _ := runBoot(t, boot); slices.Contains(args, "--") {
+		t.Errorf("a pool with no init arguments ran the join with %q", args)
+	}
+}
+
 // A PRELUDE THAT FAILS STOPS THE BOOT BEFORE THE JOIN: it runs under errexit, nounset
 // and pipefail of its own, so a failed command, an unset variable or a failed stage of a
 // pipeline ends it, the join never spends the token, and the prelude's file is removed.
