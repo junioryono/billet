@@ -78,6 +78,12 @@ func (p *PoolFleet) validate() []error {
 	if p.LeadTime < 0 || p.Interval < 0 || p.IdleAfter < 0 {
 		errs = append(errs, errors.New("replay: the pool's durations may not be negative"))
 	}
+	// A HOST JOINING AFTER ITS JOIN TOKEN LAPSED is held for a person, which a replay does
+	// not play; a lead time that long is not one the pool can be replayed at.
+	if p.LeadTime >= pool.DefaultTokenLife {
+		errs = append(errs, fmt.Errorf("replay: the pool's lead time %s is not under the join token's life, %s, "+
+			"past which an ordered host is held for a person", p.LeadTime, pool.DefaultTokenLife))
+	}
 
 	return errs
 }
@@ -388,7 +394,8 @@ func (d *poolDriver) observe(ctx context.Context) {
 	d.source.mu.Unlock()
 
 	for _, h := range ready {
-		if o, ok := byID[h.order]; ok && o.State == alloc.PoolPlaced {
+		// AN ORDER HELD FOR A PERSON admits nothing, as the plane's join would not.
+		if o, ok := byID[h.order]; ok && o.State == alloc.PoolPlaced && o.JoinHold == "" {
 			d.join(ctx, h, o)
 		}
 	}
@@ -550,6 +557,17 @@ func (d *poolDriver) ticksOn(actions *plane, now, lastActivity time.Time) bool {
 	d.report.StoppedAbove = above
 
 	return false
+}
+
+// finish records, when the replay ends however it ended, the hosts still beyond the
+// floor that the pool had not asked to leave, for a pool that shrinks itself: a horizon
+// cutting the shrink short is an observation cut short too.
+func (d *poolDriver) finish() {
+	if d.fleet.IdleAfter > 0 && len(d.report.StoppedAbove) == 0 {
+		if above := d.above(); len(above) > 0 {
+			d.report.StoppedAbove = above
+		}
+	}
 }
 
 // longestJob is the trace's longest job on any tier.

@@ -281,6 +281,31 @@ func TestAPoolWhoseStepsAreFarApartFinishesWithoutStalling(t *testing.T) {
 	speaks(t, Run(t, fleet, trace, Options{DirectAssignment: true}))
 }
 
+// A HORIZON THAT CUTS THE SHRINK SHORT SAYS SO. A burst replayed to a horizon after its
+// jobs end and before idle_after has passed: the hosts beyond the floor are still there,
+// and the report says the pool stopped above it rather than reading as one that shrank.
+func TestAHorizonCuttingAPoolsShrinkShortSaysSo(t *testing.T) {
+	t.Parallel()
+	trace := Burst(7, Params{Jobs: 8, Tiers: []string{"billet-4vcpu"}})
+	report := Run(t, poolOnlyFleet(0, 2, time.Hour), trace, Options{
+		DirectAssignment: true, Until: trace.Arrivals[0].At.Add(40 * time.Minute),
+	})
+	if len(report.Pool.StoppedAbove) == 0 || report.Pool.StoppedAbove[config.ArchX64] == 0 {
+		t.Errorf("a replay cut short of idle_after reports nothing above the floor: %+v", report.Pool)
+	}
+}
+
+// A LEAD TIME PAST THE JOIN TOKEN'S LIFE IS REFUSED: such a host is held for a person,
+// which a replay does not play.
+func TestAPoolFleetRefusesALeadTimePastTheJoinTokensLife(t *testing.T) {
+	t.Parallel()
+	fleet := poolOnlyFleet(0, 1, 0)
+	fleet.Pool.LeadTime = 3 * time.Hour
+	if errs := fleet.Pool.validate(); len(errs) == 0 {
+		t.Error("a lead time of three hours, past the two-hour join token, was accepted")
+	}
+}
+
 // TWO ARCHITECTURES REPLAY THE SAME TWICE. The scaler orders on each architecture in
 // one order every step, so the identifiers its orders draw, the node each host joins
 // as and where every job ran are the same in two replays of one trace.

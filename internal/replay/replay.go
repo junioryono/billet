@@ -262,6 +262,7 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 	}
 
 	if hosts != nil {
+		hosts.finish()
 		report.Pool = &hosts.report
 	}
 
