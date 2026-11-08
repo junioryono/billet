@@ -259,6 +259,18 @@ func (c *Client) withCacheLock(
 	now time.Time,
 	fn func(time.Time) error,
 ) error {
+	workErr, releaseErr := c.withCacheLockReleased(ctx, now, fn)
+
+	return errors.Join(workErr, releaseErr)
+}
+
+// withCacheLockReleased is withCacheLock answering the release's error apart, for
+// a caller that must not go on while the lock may still be held.
+func (c *Client) withCacheLockReleased(
+	ctx context.Context,
+	now time.Time,
+	fn func(time.Time) error,
+) (error, error) {
 	lockCtx, cancelLock := context.WithTimeout(ctx, cacheLockWaitLimit)
 	defer cancelLock()
 
@@ -275,14 +287,14 @@ func (c *Client) withCacheLock(
 	for {
 		cookie, err := publishCookie(attemptAt)
 		if err != nil {
-			return err
+			return err, nil
 		}
 		lock, err = c.takeLock(lockCtx, c.cacheIndex(), cookie, attemptAt, CacheLockStaleAfter)
 		if err == nil {
 			break
 		}
 		if !errors.Is(err, errLockContended) {
-			return fmt.Errorf("ceph: take the cache index lock: %w", err)
+			return fmt.Errorf("ceph: take the cache index lock: %w", err), nil
 		}
 
 		delay := cacheLockRetryDelay
@@ -294,7 +306,7 @@ func (c *Client) withCacheLock(
 		case <-lockCtx.Done():
 			timer.Stop()
 
-			return fmt.Errorf("ceph: wait for the cache index lock: %w", lockCtx.Err())
+			return fmt.Errorf("ceph: wait for the cache index lock: %w", lockCtx.Err()), nil
 		case <-timer.C:
 		}
 		attemptAt = now.Add(elapsed())
@@ -305,7 +317,7 @@ func (c *Client) withCacheLock(
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
 	defer cancel()
 
-	return errors.Join(workErr, lock.Release(releaseCtx))
+	return workErr, lock.Release(releaseCtx)
 }
 
 func (c *Client) metaGet(
@@ -1057,6 +1069,26 @@ func (c *Client) Clone(
 			return fmt.Errorf("%w: site has no generation for cache %q", storecontract.ErrMiss, key)
 		}
 
+		// THE GENERATION'S SNAPSHOT IS ASKED FOR FIRST, before anything is recorded. A
+		// record can outlive what it names: eviction purges a generation's snapshot
+		// before its `rbd rm`, which a child refuses, and can remove the image and then
+		// fail to remove the record. Either is a miss, not an error, and no active
+		// record or refreshed pointer should name it; found only by the clone below,
+		// after the lock, its cleanup must take the lock again, which an eviction round
+		// can hold past the cleanup's bound.
+		if _, err := c.rbdCmd(ctx, true, "info", pointer.Handle+"@"+pointer.Generation); err != nil {
+			if isNoSuchFile(err) {
+				return fmt.Errorf("%w: cache %q generation %s is gone", storecontract.ErrMiss, key,
+					bounded(pointer.Handle+"@"+pointer.Generation))
+			}
+
+			return fmt.Errorf("ceph: find cache %q generation: %w", key, err)
+		}
+		if err := c.metaSet(ctx, pointer.Handle, cacheMetaPrefix+"used_at",
+			now.UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+
 		value, found, err := c.metaGet(ctx, pointer.Handle, cacheMetaPrefix+"lineage")
 		if err != nil {
 			return err
@@ -1097,12 +1129,7 @@ func (c *Client) Clone(
 			Key: key, Handle: pointer.Handle, Generation: pointer.Generation,
 			Expires: now.Add(cacheVolumeTTL),
 		}
-		if err := c.writeJSON(ctx, activeKey(leaseID), active); err != nil {
-			return err
-		}
-
-		return c.metaSet(ctx, pointer.Handle, cacheMetaPrefix+"used_at",
-			now.UTC().Format(time.RFC3339Nano))
+		return c.writeJSON(ctx, activeKey(leaseID), active)
 	})
 	if err != nil {
 		return storecontract.Volume{}, err
@@ -1738,10 +1765,26 @@ func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
 // cannot remove or judge never holds every later one back to the next pass; the
 // generations' part stops only at evictionLockBudget.
 //
-// IT NEVER DELETES FROM THE TRASH. Under this lock every writer waits on it, and a
-// discarded volume takes minutes to delete, so PurgeTrash does that off the lock.
-// A generation parented through a retired writer is therefore reclaimed over
-// passes: a pass removes the child, the purge the writer, a later pass the parent.
+// IT NEVER DELETES FROM THE TRASH UNDER THE LOCK. Every writer waits on the lock,
+// and a discarded volume takes minutes to delete, so PurgeTrash does that off it.
+// A generation is parented through the retired writer it was published from, so a
+// lineage unwinds a writer and a generation at a time: the purge removes the
+// writer nothing is cloned from any more, the round its parent generation, the
+// next purge that generation's writer. Evict alternates the two, the lock released
+// between, purging first because the leaf of a lineage a compaction cut off is a
+// writer; it goes on while a round removes a generation (evictionRounds).
+//
+// THE LOCK BUDGET IS THE PASS'S, NOT EACH ROUND'S. A writer waits for the lock at
+// most cacheLockWaitLimit, and nothing queues it, so a writer whose retry is in
+// flight when a round releases the lock can miss every gap between rounds; the
+// rounds together hold the lock for at most evictionLockBudget, and the next pass
+// resumes where the budget stopped this one. Why a pass stopped early, a lock
+// whose release failed above all, is reported apart from the per-image failures,
+// whose number is capped.
+//
+// A SUPERSEDED GENERATION OUTLIVES ITS LAST USE BY supersededGrace, NOT THE KEY'S
+// RETENTION. Its key's pointer names a newer one, so no new job reads it, and a
+// job that does hold it holds an active record or a mapping, which keep it.
 func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 	if olderThan <= 0 {
 		return errors.New("ceph: cache eviction needs a positive inactivity age")
@@ -1750,21 +1793,123 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 	// A GENERATION MAPPING A CRASH LEFT BEHIND GOES FIRST, because eviction
 	// keeps every image this host maps.
 	sweep := c.sweepGenerationMaps(ctx, c.cfg.CachePool)
-	generations := c.withCacheLock(ctx, time.Now(), func(now time.Time) error {
-		return c.evictGenerations(ctx, olderThan, now)
-	})
 
-	return errors.Join(sweep, generations, c.evictVolumes(ctx, olderThan))
+	// EVERY ROUND'S FAILURES ARE KEPT, once each: a later round that succeeds has not
+	// retried what an earlier one could not finish.
+	var failures evictionFailures
+	seen := map[string]bool{}
+	keep := func(err error) {
+		if err != nil && !seen[err.Error()] {
+			seen[err.Error()] = true
+			failures.add(err)
+		}
+	}
+
+	var stopped error
+	remaining := evictionLockBudget
+
+	for round := range evictionRounds {
+		// A WRITER WAITING ON THE LOCK USUALLY TAKES IT BETWEEN ROUNDS: a purge that
+		// finds nothing to delete would otherwise hand it straight back to eviction.
+		// The pass's budget, not this gap, is what bounds the writer's wait.
+		if round > 0 && !sleepFor(ctx, evictionRoundGap(c.cacheLockRetry)) {
+			stopped = ctx.Err()
+
+			break
+		}
+
+		if _, err := c.PurgeTrash(ctx); err != nil {
+			keep(fmt.Errorf("ceph: purge the trash between eviction rounds: %w", err))
+		}
+
+		var r evictionRound
+		var held time.Time
+
+		taken, release := c.withCacheLockReleased(ctx, time.Now(), func(now time.Time) error {
+			held = c.now()
+			r = c.evictGenerations(ctx, olderThan, now, remaining)
+
+			return nil
+		})
+		for _, err := range r.failures {
+			keep(err)
+		}
+		// FROM THE MOMENT THE LOCK WAS HELD TO THE RETURN OF ITS RELEASE, which still
+		// holds it while it removes the heartbeat and the lock. Release is not
+		// reserved for: what a writer waits, cacheLockWaitLimit, is more than twice
+		// the budget.
+		if !held.IsZero() {
+			remaining -= c.now().Sub(held)
+		}
+
+		// A LOCK WHOSE RELEASE FAILED MAY STILL BE HELD, and every writer waits on it,
+		// so no further round runs; the lock's stale age recovers it.
+		if release != nil {
+			stopped = errors.Join(r.stop, fmt.Errorf("ceph: eviction stopped, the cache lock may "+
+				"still be held: %w", release))
+
+			break
+		}
+		if taken != nil || r.stop != nil {
+			stopped = errors.Join(taken, r.stop)
+
+			break
+		}
+		if r.removed == 0 || remaining <= 0 || ctx.Err() != nil {
+			break
+		}
+	}
+
+	return errors.Join(sweep, stopped, failures.err(), c.evictVolumes(ctx, olderThan))
 }
 
-func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, now time.Time) error {
+// evictionRound is what one round of eviction did under the cache lock.
+type evictionRound struct {
+	removed int
+	// stop is why the round ended before its last generation, nil when it did not.
+	stop error
+	// failures are the generations the round could not remove or judge.
+	failures []error
+}
+
+// evictionRoundGap is how long eviction leaves the cache lock free between rounds:
+// several of a waiting writer's retries.
+func evictionRoundGap(retry time.Duration) time.Duration {
+	if retry <= 0 {
+		retry = cacheLockRetryDelay
+	}
+
+	return 4 * retry
+}
+
+// evictionRounds bounds how many times one eviction pass alternates removing
+// generations and purging the writers they leave unparented. A lineage is
+// compacted at maxCacheCloneDepth levels, a writer and a generation per
+// publication, so a lineage a compaction cut off is at most half that many
+// generations deep, and each round unwinds one.
+const evictionRounds = maxCacheCloneDepth
+
+// supersededGrace is how long a generation its key's pointer has moved past is
+// kept after its last use. What it covers is a job that read the old pointer,
+// lock-free, and asks to clone that generation a moment later; one that loses
+// that race is answered with a miss. On the reference deployment on 2026-11-07 a
+// Go build cache published from every job held 845 generations under the
+// seven-day retention, 2.7 TiB, and the trashed writers between them 3.3 TiB more
+// (#799).
+const supersededGrace = time.Hour
+
+// evictGenerations is one round of a pass, under the cache lock, holding it for at
+// most budget, what the pass has left of evictionLockBudget.
+func (c *Client) evictGenerations(
+	ctx context.Context, olderThan time.Duration, now time.Time, budget time.Duration,
+) evictionRound {
 	// EVERY WRITER WAITS ON THIS LOCK, for at most cacheLockWaitLimit, and a
 	// removal that fails no longer ends the pass, so the pass bounds how long it
 	// holds the lock from the moment it has it and leaves the rest to the next.
 	started := c.now()
 	overBudget := func(what string) error {
 		held := c.now().Sub(started)
-		if held < evictionLockBudget {
+		if held < budget {
 			return nil
 		}
 
@@ -1772,9 +1917,16 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 			held.Round(time.Second), what)
 	}
 
+	var failures []error
+
+	removed := 0
+	done := func(stop error) evictionRound {
+		return evictionRound{removed: removed, stop: stop, failures: failures}
+	}
+
 	metadata, err := c.cacheIndexMetadata(ctx)
 	if err != nil {
-		return err
+		return done(err)
 	}
 
 	protected := map[string]bool{}
@@ -1788,10 +1940,10 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 		var active cacheActive
 		if json.Unmarshal([]byte(value), &active) != nil || !now.Before(active.Expires) {
 			if err := overBudget("expired index records and every generation"); err != nil {
-				return err
+				return done(err)
 			}
 			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-				return err
+				return done(err)
 			}
 
 			continue
@@ -1799,6 +1951,27 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 
 		protected[active.Handle] = true
 	}
+
+	// current is the generation each key's pointer names, read before any expired
+	// pointer is removed below: a generation older than an expired pointer's is
+	// superseded all the same.
+	current := map[string]string{}
+	generationKeys := map[string][]string{}
+	for key, value := range metadata {
+		switch {
+		case strings.HasPrefix(key, cacheMetaPrefix+"pointer."):
+			var pointer cachePointer
+			if json.Unmarshal([]byte(value), &pointer) == nil && pointer.Handle != "" && pointer.Key != "" {
+				current[pointer.Key] = pointer.Handle
+			}
+		case strings.HasPrefix(key, cacheMetaPrefix+"generation."):
+			var generation cachePointer
+			if json.Unmarshal([]byte(value), &generation) == nil && generation.Handle != "" {
+				generationKeys[generation.Handle] = append(generationKeys[generation.Handle], generation.Key)
+			}
+		}
+	}
+
 	for key, value := range metadata {
 		switch {
 		case strings.HasPrefix(key, cacheMetaPrefix+"pointer."):
@@ -1809,9 +1982,9 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 				if protected[pointer.Handle] || now.Sub(pointer.UsedAt) < age {
 					protected[pointer.Handle] = true
 				} else if err := overBudget("expired index records and every generation"); err != nil {
-					return err
+					return done(err)
 				} else if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-					return err
+					return done(err)
 				}
 			}
 		case strings.HasPrefix(key, cacheMetaPrefix+"generation."):
@@ -1823,9 +1996,25 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 		}
 	}
 
+	// SUPERSEDED ONLY ON A POSITIVE READING: every record naming the generation names
+	// its key, and every such key's pointer names another generation. A generation
+	// with no record, a record without a key or a key without a pointer is kept for
+	// the full retention, whichever order the records are read in.
+	superseded := func(handle string) bool {
+		keys := generationKeys[handle]
+		for _, key := range keys {
+			newest, ok := current[key]
+			if key == "" || !ok || newest == handle {
+				return false
+			}
+		}
+
+		return len(keys) > 0
+	}
+
 	images, err := c.cacheImages(ctx)
 	if err != nil {
-		return err
+		return done(err)
 	}
 	present := make(map[string]bool, len(images))
 	for _, name := range images {
@@ -1837,10 +2026,10 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 		}
 		for _, key := range keys {
 			if err := overBudget("expired index records and every generation"); err != nil {
-				return err
+				return done(err)
 			}
 			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-				return err
+				return done(err)
 			}
 		}
 	}
@@ -1868,12 +2057,10 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 
 	order := slices.Concat(generations[first:], generations[:first])
 
-	var failures evictionFailures
-
 	for i, name := range order {
 		// WHY THE PASS STOPPED is never one of the failures the cap counts away.
 		if err := ctx.Err(); err != nil {
-			return errors.Join(failures.err(), err)
+			return done(err)
 		}
 
 		if err := overBudget(fmt.Sprintf("%d generation(s) from %s on", len(order)-i, name)); err != nil {
@@ -1883,7 +2070,7 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 				c.evictMu.Unlock()
 			}
 
-			return errors.Join(failures.err(), err)
+			return done(err)
 		}
 
 		handle := c.cfg.CachePool + "/" + name
@@ -1891,9 +2078,17 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 			continue
 		}
 
-		if err := c.evictGeneration(ctx, name, handle, max(olderThan, retention[handle]), now,
-			generationMetadata[handle]); err != nil {
-			failures.add(fmt.Errorf("ceph: evict expired generation %s: %w", handle, err))
+		age := max(olderThan, retention[handle])
+		if superseded(handle) {
+			age = supersededGrace
+		}
+
+		gone, err := c.evictGeneration(ctx, name, handle, age, now, generationMetadata[handle])
+		if err != nil {
+			failures = append(failures, fmt.Errorf("ceph: evict expired generation %s: %w", handle, err))
+		}
+		if gone {
+			removed++
 		}
 	}
 
@@ -1901,17 +2096,19 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 	c.evictResume = ""
 	c.evictMu.Unlock()
 
-	return failures.err()
+	// A ROUND WHOSE LAST GENERATION SPENT THE BUDGET charges it to the pass, which
+	// then runs no further round (Evict).
+	return done(nil)
 }
 
 // evictGeneration removes one unprotected generation unused for age, keeping it
-// on any answer it cannot read.
+// on any answer it cannot read, and reports whether it removed the image.
 func (c *Client) evictGeneration(
 	ctx context.Context, name, handle string, age time.Duration, now time.Time, metadataKeys []string,
-) error {
+) (bool, error) {
 	usedAt, ok := cacheTimeFromName(name)
 	if value, found, err := c.metaGet(ctx, handle, cacheMetaPrefix+"used_at"); err != nil {
-		return err
+		return false, err
 	} else if found {
 		if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
 			usedAt, ok = parsed, true
@@ -1919,40 +2116,40 @@ func (c *Client) evictGeneration(
 	}
 
 	if !ok || now.Sub(usedAt) < age {
-		return nil
+		return false, nil
 	}
 
 	mapped, err := c.mappedDevices(ctx, name)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if len(mapped) != 0 {
-		return nil
+		return false, nil
 	}
 
 	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "purge", handle)...); err != nil && !isNoSuchFile(err) {
-		return fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
+		return false, fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
 	}
 
 	if err := c.removeCacheImage(ctx, handle); err != nil {
 		// A newer generation may still be a copy-on-write descendant. Keep this
-		// generation's metadata so a later pass can retry it once PurgeTrash has
+		// generation's metadata so a later round can retry it once PurgeTrash has
 		// deleted the retired writer between them.
 		if isImageNotEmpty(err) {
-			return nil
+			return false, nil
 		}
 
-		return err
+		return false, err
 	}
 
 	for _, key := range metadataKeys {
 		if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-			return err
+			return true, err
 		}
 	}
 
-	return nil
+	return true, nil
 }
 
 // evictionVolumeLimit bounds how many expired volumes one eviction pass moves to
