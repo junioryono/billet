@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -643,5 +644,36 @@ func TestAPoolsCellsAreDeclaredAndNotRun(t *testing.T) {
 		"pool": {arch: config.ArchX64, providers: []config.ProviderKind{config.ProviderFirecracker}},
 	}) {
 		t.Errorf("a pool tier is dispatched to while its cells are not run: %s", line)
+	}
+}
+
+// NO POOL CELL IS EVER ONE THAT SHOULD HAVE RUN. Judged over a run that covered both
+// architectures and ran nothing at all, the "should have run" count is exactly the EC2
+// cells that are run, so a pool cell counted among them, which would fail every run of
+// the matrix, is caught by the number.
+func TestAPoolCellIsNeverOneThatShouldHaveRun(t *testing.T) {
+	t.Parallel()
+	cells := matrixCells()
+	runnable := 0
+	for i := range cells {
+		if cells[i].Run != nil {
+			runnable++
+			if cells[i].Backend != config.ProviderEC2 {
+				t.Errorf("%s %s %s %s is run", matrixBackendName(&cells[i]), cells[i].Arch, cells[i].Cache,
+					cells[i].Case)
+			}
+		}
+	}
+	doc := judgeMatrix(cells, acceptanceEvidenceDoc{DeploymentID: "d1"}, matrixScope{tiers: matrixTestTiers()})
+	err := matrixOutcome(doc, matrixArchs)
+	if want := strconv.Itoa(runnable) + " cell(s) that should have run did not"; err == nil || err.Error() != want {
+		t.Errorf("a run of both architectures that ran nothing answered %v; want %q", err, want)
+	}
+	for i := range doc.Results {
+		r := &doc.Results[i]
+		if r.Backend == config.ProviderFirecracker && r.Verdict != verdictNotRun {
+			t.Errorf("pool cell %s %s %s %s judged %s", matrixBackendName(&r.matrixCell), r.Arch, r.Cache, r.Case,
+				r.Verdict)
+		}
 	}
 }
