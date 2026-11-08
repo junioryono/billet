@@ -133,7 +133,7 @@ func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
 		"a single-dash node name": {"    boot_prelude:", "    init_args: ['-node-name=x']\n    boot_prelude:", "is not one of"},
 		"init's provider":         {"    boot_prelude:", "    init_args: ['--provider=docker']\n    boot_prelude:", "is not one of"},
 		"a kernel twice":          {"    boot_prelude:", "    init_args: ['--kernel-image', /a, '--kernel-image=/b']\n    boot_prelude:", "twice"},
-		"a value that is a flag":  {"    boot_prelude:", "    init_args: ['--ceph-user', '--force']\n    boot_prelude:", "reads as a flag"},
+		"three dashes":            {"    boot_prelude:", "    init_args: ['---kernel-image=/a']\n    boot_prelude:", "is not one of"},
 		"a flag with no value":    {"    boot_prelude:", "    init_args: ['--ceph-keyring']\n    boot_prelude:", "no value"},
 		"a bare word":             {"    boot_prelude:", "    init_args: [kernel]\n    boot_prelude:", "is not one of"},
 		"an ipv6 wildcard join":   {"join_server: 10.77.0.10:7717", "join_server: '[::]:7717'", "join_server"},

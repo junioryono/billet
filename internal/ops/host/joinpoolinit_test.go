@@ -1,6 +1,7 @@
 package host
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -24,7 +25,7 @@ func TestAPoolHostsBootGeneratesAFirecrackerNodeWithItsKernelAndCeph(t *testing.
 		Server: &config.ServerConfig{Pool: &config.PoolConfig{
 			JoinServer: "10.77.0.10:7717", BootstrapAddr: "10.77.0.10:7718",
 			InitArgs: []string{
-				"--kernel-image", "/var/lib/billet/vmlinux", "--ceph-user=billet",
+				"--kernel-image", "/var/lib/billet/vmlinux", "--ceph-user=pool-worker",
 				"--ceph-keyring", "/etc/ceph/ceph.client.billet.keyring",
 			},
 		}},
@@ -63,8 +64,40 @@ func TestAPoolHostsBootGeneratesAFirecrackerNodeWithItsKernelAndCeph(t *testing.
 		t.Errorf("the node dials %q; want the join server", n.ServerAddr)
 	case n.Firecracker == nil || n.Firecracker.KernelImage != "/var/lib/billet/vmlinux":
 		t.Errorf("the node's kernel image is %+v; want init_args' /var/lib/billet/vmlinux", n.Firecracker)
-	case n.Ceph == nil || n.Ceph.User != "billet" || n.Ceph.KeyringPath != "/etc/ceph/ceph.client.billet.keyring":
-		t.Errorf("the node's Ceph identity is %+v; want init_args' billet and its keyring", n.Ceph)
+	case n.Ceph == nil || n.Ceph.User != "pool-worker" || n.Ceph.KeyringPath != "/etc/ceph/ceph.client.billet.keyring":
+		t.Errorf("the node's Ceph identity is %+v; want init_args' pool-worker and its keyring", n.Ceph)
+	}
+}
+
+// A VALUE THAT LOOKS LIKE A FLAG IS ITS FLAG'S VALUE. init_args that a config accepts,
+// `--ceph-user --force`, reach init as a Ceph user named --force and force nothing: the
+// join's existing config is not replaced.
+func TestAPoolInitArgThatLooksLikeAFlagIsAValue(t *testing.T) {
+	t.Parallel()
+	args := []string{"--kernel-image", "/var/lib/billet/vmlinux", "--ceph-user", "--force"}
+	req, err := parseJoin(processEnv(), append([]string{
+		"--server", "10.77.0.10:7717", "--ca-fingerprint", "SHA256:" + strings.Repeat("a", 64), "--token", "tok",
+		"--node-name", "pool-p01", "--pool-order", "p01", "--provider", "firecracker", "--org", "acme", "--",
+	}, args...))
+	if err != nil {
+		t.Fatalf("parseJoin: %v", err)
+	}
+	req.cfgPath = filepath.Join(t.TempDir(), "billet.yaml")
+	if err := os.WriteFile(req.cfgPath, []byte("# an operator's own config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := joinGenerate(t.Context(), processEnv(), joinInitArgs(req, testJoinDeployment)); err != nil {
+		t.Fatalf("billet init: %v", err)
+	}
+	if body, err := os.ReadFile(req.cfgPath); err != nil || string(body) != "# an operator's own config\n" {
+		t.Errorf("init replaced the existing config (%v): %q", err, body)
+	}
+	beside, err := config.Load(req.cfgPath + ".new")
+	if err != nil {
+		t.Fatalf("the config init wrote beside the existing one does not load: %v", err)
+	}
+	if beside.Node == nil || beside.Node.Ceph == nil || beside.Node.Ceph.User != "--force" {
+		t.Errorf("the Ceph user is %+v; want the word after --ceph-user, --force", beside.Node)
 	}
 }
 

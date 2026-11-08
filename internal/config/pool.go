@@ -34,8 +34,11 @@ const (
 var PoolInitFlags = []string{"kernel-image", "ceph-user", "ceph-keyring"}
 
 // checkPoolInitArgs refuses init_args that are not PoolInitFlags, each at most once,
-// as `--flag value` or `--flag=value`, every word one word of the boot: a NUL bash
-// drops and a line break would end the join's line.
+// as `--flag value` or `--flag=value` with one dash or two as init's parser reads them,
+// every word one word of the boot: a NUL bash drops and a line break would end the
+// join's line. A value is the flag's whatever it starts with: init's parser takes the
+// word after a string flag as its value, so `--ceph-user --force` names a user and
+// forces nothing.
 func checkPoolInitArgs(args []string) []error {
 	var errs []error
 	seen := map[string]bool{}
@@ -47,8 +50,8 @@ func checkPoolInitArgs(args []string) []error {
 
 			continue
 		}
-		name, value, inline := strings.Cut(strings.TrimLeft(a, "-"), "=")
-		if !strings.HasPrefix(a, "-") || !slices.Contains(PoolInitFlags, name) {
+		name, value, inline := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
+		if !strings.HasPrefix(a, "-") || strings.HasPrefix(a, "---") || !slices.Contains(PoolInitFlags, name) {
 			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q is not one of %v: every other flag of "+
 				"billet init is the join's to decide", i, a, PoolInitFlags))
 
@@ -70,10 +73,6 @@ func checkPoolInitArgs(args []string) []error {
 				errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word with no "+
 					"NUL or line break", i, value))
 			}
-		}
-		if strings.HasPrefix(value, "-") {
-			errs = append(errs, fmt.Errorf("server.pool.init_args gives --%s the value %q, which reads as a flag",
-				name, value))
 		}
 	}
 
