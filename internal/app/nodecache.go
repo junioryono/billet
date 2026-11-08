@@ -297,21 +297,9 @@ func startNodeCache(
 		retryClosed()
 		renewActive()
 
-		go func() {
-			evictionTicker := time.NewTicker(6 * time.Hour)
-			defer evictionTicker.Stop()
-
-			evict()
-
-			for {
-				select {
-				case <-evictCtx.Done():
-					return
-				case <-evictionTicker.C:
-					evict()
-				}
-			}
-		}()
+		go runEviction(evictCtx, cacheEvictionEvery, supersededSweepEvery, evict, func() {
+			sweepSuperseded(evictCtx, storage, slog.Default())
+		})
 
 		for {
 			select {
@@ -445,6 +433,58 @@ func reapReadCache(ctx context.Context, service *node.CacheService) {
 // cacheEvictor is the part of a site store an eviction pass runs.
 type cacheEvictor interface {
 	Evict(ctx context.Context, olderThan time.Duration) error
+}
+
+// supersededEvictor is a store that can sweep the generations a key has moved past
+// on their own, cheaply and often: the Ceph store.
+type supersededEvictor interface {
+	EvictSuperseded(ctx context.Context) error
+}
+
+// cacheEvictionEvery is how often the node runs a full eviction pass.
+const cacheEvictionEvery = 6 * time.Hour
+
+// supersededSweepEvery is how often the node sweeps superseded generations between
+// full passes. A key published from every job published about thirteen an hour on
+// the reference deployment on 2026-11-08, and the full pass reached them about
+// once a day, while the pool grew by 1.2 TiB in twelve hours.
+const supersededSweepEvery = 10 * time.Minute
+
+// runEviction runs evict at once and every fullEvery, and sweep every sweepEvery,
+// one at a time, until ctx ends. A sweep due while a pass runs waits for it, and
+// ticks missed meanwhile collapse into one, as a ticker's do.
+func runEviction(ctx context.Context, fullEvery, sweepEvery time.Duration, evict, sweep func()) {
+	full := time.NewTicker(fullEvery)
+	defer full.Stop()
+
+	quick := time.NewTicker(sweepEvery)
+	defer quick.Stop()
+
+	evict()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-full.C:
+			evict()
+		case <-quick.C:
+			sweep()
+		}
+	}
+}
+
+// sweepSuperseded runs the store's superseded sweep, when it has one, and logs a
+// failure for the next sweep to retry.
+func sweepSuperseded(ctx context.Context, storage cacheEvictor, log *slog.Logger) {
+	sweeper, ok := storage.(supersededEvictor)
+	if !ok {
+		return
+	}
+
+	if err := sweeper.EvictSuperseded(ctx); err != nil && ctx.Err() == nil {
+		log.Warn("could not sweep superseded cache generations; will retry", "error", err)
+	}
 }
 
 // kernelMappingSweeper is a store that maps volumes into this host's kernel and

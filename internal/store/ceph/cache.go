@@ -1794,6 +1794,39 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 	// keeps every image this host maps.
 	sweep := c.sweepGenerationMaps(ctx, c.cfg.CachePool)
 
+	return errors.Join(sweep, c.evictInRounds(ctx, olderThan, evictionLockBudget, false),
+		c.evictVolumes(ctx, olderThan))
+}
+
+// EvictSuperseded removes the superseded generations alone, under the same rounds
+// and purges as Evict and a lock budget of supersededSweepBudget: the frequent
+// sweep a key published from every job needs, beside the full pass.
+//
+// THE FULL PASS CANNOT KEEP UP WITH SUCH A KEY. It runs every six hours with five
+// minutes of the lock over every generation in the pool, and on the reference
+// deployment on 2026-11-08 the pool held about 4,300, nearly all one per Actions
+// cache key, so a pass reached about 1,100 of them before its budget ran out and
+// the Go build cache's superseded generations about once a day, while that key
+// published about thirteen an hour: the pool grew by 1.2 TiB in twelve hours.
+// Which generations are superseded is read from the index alone, so the sweep asks
+// rbd only about those, does none of the index bookkeeping the full pass does, and
+// leaves the full pass's resume point alone.
+func (c *Client) EvictSuperseded(ctx context.Context) error {
+	return c.evictInRounds(ctx, supersededGrace, supersededSweepBudget, true)
+}
+
+// supersededSweepBudget is how long one superseded sweep holds the cache lock, its
+// rounds together. A removal takes a few seconds, so this is several removals a
+// sweep, and a writer waits at most this long behind it.
+const supersededSweepBudget = 30 * time.Second
+
+// evictInRounds alternates the trash purge, outside the cache lock, with rounds of
+// evictGenerations under it, while a round removes a generation, the rounds holding
+// the lock for at most budget together; supersededOnly confines it to generations
+// whose key's pointer names another.
+func (c *Client) evictInRounds(
+	ctx context.Context, olderThan, budget time.Duration, supersededOnly bool,
+) error {
 	// EVERY ROUND'S FAILURES ARE KEPT, once each: a later round that succeeds has not
 	// retried what an earlier one could not finish.
 	var failures evictionFailures
@@ -1806,7 +1839,7 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 	}
 
 	var stopped error
-	remaining := evictionLockBudget
+	remaining := budget
 
 	for round := range evictionRounds {
 		// A WRITER WAITING ON THE LOCK USUALLY TAKES IT BETWEEN ROUNDS: a purge that
@@ -1827,7 +1860,7 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 
 		taken, release := c.withCacheLockReleased(ctx, time.Now(), func(now time.Time) error {
 			held = c.now()
-			r = c.evictGenerations(ctx, olderThan, now, remaining)
+			r = c.evictGenerations(ctx, olderThan, now, remaining, supersededOnly)
 
 			return nil
 		})
@@ -1860,7 +1893,7 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 		}
 	}
 
-	return errors.Join(sweep, stopped, failures.err(), c.evictVolumes(ctx, olderThan))
+	return errors.Join(stopped, failures.err())
 }
 
 // evictionRound is what one round of eviction did under the cache lock.
@@ -1899,9 +1932,11 @@ const evictionRounds = maxCacheCloneDepth
 const supersededGrace = time.Hour
 
 // evictGenerations is one round of a pass, under the cache lock, holding it for at
-// most budget, what the pass has left of evictionLockBudget.
+// most budget, what the pass has left of its own. supersededOnly confines it to the
+// superseded generations, without the index bookkeeping or the resume point.
 func (c *Client) evictGenerations(
 	ctx context.Context, olderThan time.Duration, now time.Time, budget time.Duration,
+	supersededOnly bool,
 ) evictionRound {
 	// EVERY WRITER WAITS ON THIS LOCK, for at most cacheLockWaitLimit, and a
 	// removal that fails no longer ends the pass, so the pass bounds how long it
@@ -1939,6 +1974,11 @@ func (c *Client) evictGenerations(
 
 		var active cacheActive
 		if json.Unmarshal([]byte(value), &active) != nil || !now.Before(active.Expires) {
+			// THE BOOKKEEPING IS THE FULL PASS'S: an expired record protects nothing
+			// either way, and removing it would spend the sweep's budget.
+			if supersededOnly {
+				continue
+			}
 			if err := overBudget("expired index records and every generation"); err != nil {
 				return done(err)
 			}
@@ -1981,6 +2021,8 @@ func (c *Client) evictGenerations(
 				retention[pointer.Handle] = age
 				if protected[pointer.Handle] || now.Sub(pointer.UsedAt) < age {
 					protected[pointer.Handle] = true
+				} else if supersededOnly {
+					continue
 				} else if err := overBudget("expired index records and every generation"); err != nil {
 					return done(err)
 				} else if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
@@ -2021,7 +2063,7 @@ func (c *Client) evictGenerations(
 		present[c.cfg.CachePool+"/"+name] = true
 	}
 	for handle, keys := range generationMetadata {
-		if present[handle] {
+		if present[handle] || supersededOnly {
 			continue
 		}
 		for _, key := range keys {
@@ -2036,17 +2078,22 @@ func (c *Client) evictGenerations(
 
 	generations := make([]string, 0, len(images))
 	for _, name := range images {
-		if kind, _, ok := cacheImageName(name); ok && kind == "g" {
+		if kind, _, ok := cacheImageName(name); ok && kind == "g" &&
+			(!supersededOnly || superseded(c.cfg.CachePool+"/"+name)) {
 			generations = append(generations, name)
 		}
 	}
 
 	// A PASS CUT SHORT IS RESUMED WHERE IT STOPPED, so generations that fail
 	// slowly at the front of the order cannot spend every pass's budget ahead of
-	// the ones behind them.
-	c.evictMu.Lock()
-	resume := c.evictResume
-	c.evictMu.Unlock()
+	// the ones behind them. The sweep keeps no resume point: what it reaches is few,
+	// and the full pass's must not move under it.
+	resume := ""
+	if !supersededOnly {
+		c.evictMu.Lock()
+		resume = c.evictResume
+		c.evictMu.Unlock()
+	}
 
 	first := 0
 	if resume != "" {
@@ -2064,7 +2111,7 @@ func (c *Client) evictGenerations(
 		}
 
 		if err := overBudget(fmt.Sprintf("%d generation(s) from %s on", len(order)-i, name)); err != nil {
-			if i > 0 {
+			if i > 0 && !supersededOnly {
 				c.evictMu.Lock()
 				c.evictResume = order[i-1]
 				c.evictMu.Unlock()
@@ -2092,9 +2139,11 @@ func (c *Client) evictGenerations(
 		}
 	}
 
-	c.evictMu.Lock()
-	c.evictResume = ""
-	c.evictMu.Unlock()
+	if !supersededOnly {
+		c.evictMu.Lock()
+		c.evictResume = ""
+		c.evictMu.Unlock()
+	}
 
 	// A ROUND WHOSE LAST GENERATION SPENT THE BUDGET charges it to the pass, which
 	// then runs no further round (Evict).
