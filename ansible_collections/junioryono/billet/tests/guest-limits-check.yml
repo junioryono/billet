@@ -3,7 +3,8 @@
 # role's own firewall template: with the role's own defaults, the guard holds none of
 # them; each switched on alone adds exactly its one rule, counted, scoped to traffic
 # leaving the guests' bridges, and ahead of the established flows; and nft accepts every
-# rendering. Run under CI, nft must be there to ask.
+# rendering, or, on a kernel without nft_limit, parses each limit rendering and refuses
+# only its limit. Run under CI, nft must be there to ask.
 - name: The guests' egress limits are rendered only when asked for
   hosts: localhost
   connection: local
@@ -114,12 +115,55 @@
           loop_control:
             label: "{{ item.key }}"
 
-        - name: Require nft to accept every rendering
+        # nft -c asks the kernel, and a kernel without nft_limit (the Firecracker guest
+        # CI's host-lifecycle groups run in has none; a host's distribution kernel does)
+        # refuses a limit rule nft has parsed with ENOENT. The probe says which kernel
+        # this is, from a ruleset holding one limit rule and nothing else.
+        - name: Write a ruleset that holds one limit rule
+          ansible.builtin.copy:
+            content: |
+              table inet billet_gate_probe {
+                chain forward {
+                  type filter hook forward priority 0; policy accept;
+                  limit rate over 1/second drop
+                }
+              }
+            dest: "{{ billet_gate_dir.path }}/probe.nft"
+            mode: "0600"
+
+        - name: Ask the kernel whether it has nft_limit
+          ansible.builtin.command:
+            argv: [/usr/sbin/nft, -c, -f, "{{ billet_gate_dir.path }}/probe.nft"]
+          become: true
+          changed_when: false
+          register: billet_gate_probe
+          failed_when: >-
+            billet_gate_probe.rc != 0 and
+            'Could not process rule: No such file or directory' not in billet_gate_probe.stderr
+
+        - name: Require nft to accept every rendering, and on a kernel without nft_limit refuse only the limit
           ansible.builtin.command:
             argv: [/usr/sbin/nft, -c, -f, "{{ billet_gate_dir.path }}/{{ item }}.nft"]
           loop: "{{ ['off'] + (billet_gate_cases | map(attribute='name') | list) }}"
           become: true
           changed_when: false
+          register: billet_gate_check
+          failed_when: >-
+            billet_gate_check.rc != 0 and not (
+              billet_gate_probe.rc != 0 and item in ['connections', 'packets', 'bytes'] and
+              billet_gate_check.stderr_lines | length == 3 and
+              'Could not process rule: No such file or directory' in billet_gate_check.stderr_lines[0] and
+              billet_gate_check.stderr_lines[1] | trim == (billet_gate_cases | selectattr('name', 'equalto', item) | first).rule and
+              billet_gate_check.stderr_lines[2] | trim | length > 0 and
+              billet_gate_check.stderr_lines[2] | trim | replace('^', '') == '' and
+              billet_gate_check.stderr_lines[1].index('limit rate over') == billet_gate_check.stderr_lines[2].index('^'))
+
+        - name: Say where the limit rules were only parsed
+          ansible.builtin.debug:
+            msg: >-
+              This kernel has no nft_limit, so nft parsed the three limit renderings and the kernel refused
+              only their limit; the renderings without a limit were accepted whole.
+          when: billet_gate_probe.rc != 0
       always:
         - name: Remove this run's directory
           ansible.builtin.file:
