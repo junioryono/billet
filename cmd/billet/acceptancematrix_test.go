@@ -84,7 +84,7 @@ func TestTheMatrixIsTheWholeCrossProduct(t *testing.T) {
 	seen := map[string]bool{}
 	for i := range cells {
 		c := &cells[i]
-		key := strings.Join([]string{string(c.Backend), string(c.Arch), c.Cache, c.Case}, "/")
+		key := strings.Join([]string{matrixBackendName(c), string(c.Arch), c.Cache, c.Case}, "/")
 		if seen[key] {
 			t.Errorf("%s is declared twice", key)
 		}
@@ -611,5 +611,37 @@ func TestMatrixTiersReadEveryProviderATierNames(t *testing.T) {
 	if !slices.Contains(got["one"].providers, config.ProviderEC2) || got["one"].arch != config.ArchX64 ||
 		!slices.Contains(got["many"].providers, config.ProviderEC2) || got["many"].arch != config.ArchARM64 {
 		t.Fatalf("%+v", got)
+	}
+}
+
+// A POOL'S CELLS ARE DECLARED, AND SAY WHY THEY ARE NOT RUN. Firecracker hosts rented from
+// either source (ADR-030), on both architectures, for every cache and case: each is a
+// cell billet will serve, not run until a pool site has a store and the pool has had its
+// real run, so the matrix says so rather than leaving the pool out.
+func TestAPoolsCellsAreDeclaredAndNotRun(t *testing.T) {
+	t.Parallel()
+	per := map[string]int{}
+	for _, c := range matrixCells() {
+		if c.Backend != config.ProviderFirecracker {
+			continue
+		}
+		per[c.Source+"/"+string(c.Arch)]++
+		if c.Run != nil || c.Unsupported || !strings.Contains(c.Why, "#553") {
+			t.Errorf("%s %s %s %s: %+v; want not run, saying it waits on #553", matrixBackendName(&c), c.Arch,
+				c.Cache, c.Case, c)
+		}
+	}
+	want := len(matrixCaches) * len(matrixCases)
+	for _, source := range []string{config.PoolSourceAWSMetal, config.PoolSourcePhoenixNAP} {
+		for _, arch := range matrixArchs {
+			if got := per[source+"/"+string(arch)]; got != want {
+				t.Errorf("%d cells for %s on %s; want every cache and case, %d", got, source, arch, want)
+			}
+		}
+	}
+	for _, line := range matrixTierLines(map[string]matrixTier{
+		"pool": {arch: config.ArchX64, providers: []config.ProviderKind{config.ProviderFirecracker}},
+	}) {
+		t.Errorf("a pool tier is dispatched to while its cells are not run: %s", line)
 	}
 }
