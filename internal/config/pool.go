@@ -81,11 +81,19 @@ func checkPoolInitArgs(args []string) []error {
 				continue
 			}
 		}
+		// AN EMPTY VALUE IS REFUSED IN EITHER SPELLING, one rule for `--flag=` and `--flag ''`:
+		// init would fill in its own default, which leaving the flag out says plainly.
+		if value == "" {
+			errs = append(errs, fmt.Errorf("server.pool.init_args gives --%s no value; leave the flag out for "+
+				"init's own default", name))
+
+			continue
+		}
 		values[name] = value
 	}
 
-	// AS THE NODE'S CONFIG WILL HOLD THEM: trimmed, as loading it trims, and an empty
-	// Ceph user given billet's own, as init and loading both give it.
+	// AS THE NODE'S CONFIG WILL HOLD THEM: trimmed, as loading it trims, and a user that
+	// trims to nothing given billet's own, as init and loading both give it.
 	if kernel, ok := values["kernel-image"]; ok && !filepath.IsAbs(strings.TrimSpace(kernel)) {
 		errs = append(errs, fmt.Errorf("server.pool.init_args' --kernel-image %q must be an absolute path, as "+
 			"node.firecracker.kernel_image must", kernel))

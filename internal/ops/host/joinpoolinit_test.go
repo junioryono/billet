@@ -69,16 +69,16 @@ func TestAPoolHostsBootGeneratesAFirecrackerNodeWithItsKernelAndCeph(t *testing.
 	}
 }
 
-// WHAT THE CONFIG TAKES, INIT TAKES THE SAME WAY. An empty Ceph user and padded paths,
-// which the pool's config accepts as init normalizes them, reach init through the boot's
-// join and generate a node with billet's own user and the paths trimmed.
+// WHAT THE CONFIG TAKES, INIT TAKES THE SAME WAY. Padded paths, which the pool's config
+// accepts as loading trims them, reach init through the boot's join and generate a node
+// with the paths trimmed, and with billet's own user where the arguments name none.
 func TestAPoolHostsInitNormalizesAsTheConfigDid(t *testing.T) {
 	t.Parallel()
 	pool := &config.Config{
 		GitHub: &config.GitHubConfig{Org: "acme"},
 		Server: &config.ServerConfig{Pool: &config.PoolConfig{
 			JoinServer: "10.77.0.10:7717", BootstrapAddr: "10.77.0.10:7718",
-			InitArgs: []string{"--ceph-user=", "--kernel-image", " /var/lib/billet/vmlinux ", "--ceph-keyring", " /etc/ceph/k "},
+			InitArgs: []string{"--kernel-image", " /var/lib/billet/vmlinux ", "--ceph-keyring", " /etc/ceph/k "},
 		}},
 	}
 	boot, err := app.PoolBoot(pool, "true\n", "SHA256:"+strings.Repeat("a", 64), "p01", "tok")
