@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Pool host sources a config may name.
@@ -26,6 +28,92 @@ const (
 	MinPoolIdleAfter = 5 * time.Minute
 )
 
+// PoolInitFlags are the only `billet init` flags a pool host's join may be handed: what
+// a Firecracker node's config needs and the join cannot know. Every other flag init
+// takes is the join's to decide (its config path, its node name, its provider, --force),
+// and init takes a flag's last value, so one more here would override it.
+var PoolInitFlags = []string{"kernel-image", "ceph-user", "ceph-keyring"}
+
+// checkPoolInitArgs refuses init_args that are not PoolInitFlags, each at most once,
+// as `--flag value` or `--flag=value` with one dash or two as init's parser reads them,
+// every word one word of the boot: a NUL bash drops and a line break would end the
+// join's line. A value is the flag's whatever it starts with: init's parser takes the
+// word after a string flag as its value, so `--ceph-user --force` names a user and
+// forces nothing.
+//
+// AND EACH VALUE IS ONE THE NODE'S CONFIG WILL TAKE, by the node's own rules, because
+// a value only the host's init refuses is a host rented that cannot join.
+func checkPoolInitArgs(args []string) []error {
+	var errs []error
+	seen := map[string]bool{}
+	values := map[string]string{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "" || strings.ContainsAny(a, "\x00\n\r") || !utf8.ValidString(a) {
+			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word of UTF-8 with "+
+				"no NUL or line break", i, a))
+
+			continue
+		}
+		name, value, inline := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
+		if !strings.HasPrefix(a, "-") || strings.HasPrefix(a, "---") || !slices.Contains(PoolInitFlags, name) {
+			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q is not one of %v: every other flag of "+
+				"billet init is the join's to decide", i, a, PoolInitFlags))
+
+			continue
+		}
+		if seen[name] {
+			errs = append(errs, fmt.Errorf("server.pool.init_args names --%s twice", name))
+		}
+		seen[name] = true
+		if !inline {
+			if i+1 >= len(args) {
+				errs = append(errs, fmt.Errorf("server.pool.init_args ends with --%s and no value", name))
+
+				break
+			}
+			i++
+			value = args[i]
+			if value == "" || strings.ContainsAny(value, "\x00\n\r") || !utf8.ValidString(value) {
+				errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word of UTF-8 "+
+					"with no NUL or line break", i, value))
+
+				continue
+			}
+		}
+		// AN EMPTY VALUE IS REFUSED IN EITHER SPELLING, one rule for `--flag=` and `--flag ''`:
+		// init would fill in its own default, which leaving the flag out says plainly.
+		if value == "" {
+			errs = append(errs, fmt.Errorf("server.pool.init_args gives --%s no value; leave the flag out for "+
+				"init's own default", name))
+
+			continue
+		}
+		values[name] = value
+	}
+
+	// AS THE NODE'S CONFIG WILL HOLD THEM: trimmed, as loading it trims, and a user that
+	// trims to nothing given billet's own, as init and loading both give it.
+	if kernel, ok := values["kernel-image"]; ok && !filepath.IsAbs(strings.TrimSpace(kernel)) {
+		errs = append(errs, fmt.Errorf("server.pool.init_args' --kernel-image %q must be an absolute path, as "+
+			"node.firecracker.kernel_image must", kernel))
+	}
+	if _, user := values["ceph-user"]; user || values["ceph-keyring"] != "" {
+		ceph := CephConfig{
+			User: strings.TrimSpace(values["ceph-user"]), KeyringPath: strings.TrimSpace(values["ceph-keyring"]),
+			ImagePool: "billet-images", CachePool: "billet-cache",
+		}
+		if ceph.User == "" {
+			ceph.User = DefaultCephUser
+		}
+		for _, err := range CheckCeph(ceph) {
+			errs = append(errs, fmt.Errorf("server.pool.init_args: %w", err))
+		}
+	}
+
+	return errs
+}
+
 // PoolConfig is server.pool: a pool of rented bare metal the control plane orders
 // Firecracker hosts from, ahead of demand (ADR-030).
 type PoolConfig struct {
@@ -38,6 +126,10 @@ type PoolConfig struct {
 	// BootPrelude is a script an ordered host runs on its first boot before `billet
 	// join`: it installs billet and what a Firecracker node needs. Absolute.
 	BootPrelude string `yaml:"boot_prelude"`
+	// InitArgs are the arguments an ordered host's `billet join` hands to `billet init`
+	// after `--`: a Firecracker node's kernel image and Ceph identity, at the paths the
+	// prelude prepared, which the node's generated config needs. Only PoolInitFlags.
+	InitArgs []string `yaml:"init_args,omitempty"`
 	// Interval is how often the pool looks at demand and its orders, a Go duration.
 	Interval string `yaml:"interval,omitempty"`
 	// RefusalBackoff is how long a choice a source refused (no stock, a quota) is
@@ -221,6 +313,7 @@ func (s *ServerConfig) validatePool() []error {
 		errs = append(errs, fmt.Errorf("server.pool.boot_prelude %q must be an absolute path to the script a "+
 			"host runs before it joins", p.BootPrelude))
 	}
+	errs = append(errs, checkPoolInitArgs(p.InitArgs)...)
 	for field, v := range map[string]string{"interval": p.Interval, "refusal_backoff": p.RefusalBackoff} {
 		if v == "" {
 			continue
