@@ -58,9 +58,9 @@ server:
 
 // `billet init iam --pool` PRINTS THE CONTROL PLANE'S POOL GRANT FROM THE CONFIG, with
 // no node block: the pool statements, scoped to the deployment, the pool's network and
-// both architectures' images, and nothing of a node's runtime.
+// both architectures' images, and nothing of a node's runtime. Not parallel, like every
+// init iam test: capture swaps the process's stdout, which processEnv reads.
 func TestInitIAMPoolPrintsTheControlPlanesPoolGrant(t *testing.T) {
-	t.Parallel()
 	path := poolServerConfig(t, "      instance_profile: billet-pool-host\n")
 
 	var err error
@@ -100,7 +100,6 @@ func TestInitIAMPoolPrintsTheControlPlanesPoolGrant(t *testing.T) {
 // --pool REFUSES WHAT IT CANNOT SCOPE: a config with no AWS pool, an instance profile
 // without the role it contains (or a role with no profile), and a node's flags.
 func TestInitIAMPoolRefusesWhatItCannotScope(t *testing.T) {
-	t.Parallel()
 	noPool := ec2NodeConfig(t)
 	withProfile := poolServerConfig(t, "      instance_profile: billet-pool-host\n")
 	plain := poolServerConfig(t, "")
