@@ -90,9 +90,14 @@ type PoolReport struct {
 	MostJoined map[config.Arch]int
 	// ReleasesAsked is the orders whose release the scaler asked for, each once.
 	ReleasesAsked []string
+	// StoppedAbove is, per architecture, how many joined hosts beyond the floor the
+	// pool had not asked to release when the replay stopped: an observation cut
+	// short, never a pool that would not shrink.
+	StoppedAbove map[config.Arch]int
 }
 
-// PoolOrderRecord is one order's life in simulated time.
+// PoolOrderRecord is one order's life in simulated time, each instant zero until it
+// happened.
 type PoolOrderRecord struct {
 	Order    string
 	Arch     config.Arch
@@ -241,6 +246,9 @@ type poolDriver struct {
 	serial int
 	// horizon is the last instant the pool steps at.
 	horizon time.Time
+	// scheduled is every order whose join is scheduled; lastJoin the latest join.
+	scheduled map[string]bool
+	lastJoin  time.Time
 }
 
 // newPoolDriver builds the scaler as internal/app builds it, over the played source.
@@ -284,20 +292,48 @@ func newPoolDriver(t *testing.T, fleet Fleet, trace Trace, tiers []config.Tier, 
 
 	return &poolDriver{
 		t: t, fleet: pf, alloc: st.alloc, nodes: st.nodes, plane: st.plane, clock: clock, pool: p, source: src,
-		report: PoolReport{MostJoined: map[config.Arch]int{}}, asked: map[string]bool{},
+		report: PoolReport{MostJoined: map[config.Arch]int{}}, asked: map[string]bool{}, scheduled: map[string]bool{},
 		horizon: trace.Arrivals[len(trace.Arrivals)-1].At.Add(longestJob(trace) + pf.LeadTime + pf.IdleAfter +
 			6*time.Hour),
 	}
 }
 
-// step is one of the scaler's steps, then the joins of every host now running and the
-// end of every host the source took back.
-func (d *poolDriver) step(ctx context.Context) {
+// step is one of the scaler's steps; then every order the ledger now holds is
+// recorded, every host now running joins, and every host the source took back ends.
+// It returns the hosts the step ordered, each to join at its own lead time.
+func (d *poolDriver) step(ctx context.Context) []readyAt {
 	t := d.t
 	t.Helper()
 	if err := d.pool.Step(ctx); err != nil {
 		t.Logf("replay: the pool's step at %s: %v", d.clock.Now().Format(time.RFC3339), err)
 	}
+	d.observe(ctx)
+
+	d.source.mu.Lock()
+	var due []readyAt
+	for _, id := range d.source.order {
+		if h := d.source.hosts[id]; !d.scheduled[id] {
+			d.scheduled[id] = true
+			due = append(due, readyAt{order: id, at: h.ordered.Add(d.source.lead)})
+		}
+	}
+	d.source.mu.Unlock()
+
+	return due
+}
+
+// readyAt is when an order's host is running and joins.
+type readyAt struct {
+	order string
+	at    time.Time
+}
+
+// observe records every order the ledger holds and every release it asked for, joins
+// every placed host whose lead time has passed, and ends every host the source took
+// back.
+func (d *poolDriver) observe(ctx context.Context) {
+	t := d.t
+	t.Helper()
 	orders, err := d.alloc.PoolOrders(ctx)
 	if err != nil {
 		t.Fatalf("replay: read the pool's orders: %v", err)
@@ -306,6 +342,9 @@ func (d *poolDriver) step(ctx context.Context) {
 	for i := range orders {
 		o := &orders[i]
 		byID[o.ID] = o
+		if d.recordOf(o.ID) == nil {
+			d.report.Ordered = append(d.report.Ordered, PoolOrderRecord{Order: o.ID, Arch: o.Arch, Ordered: o.FirstAttempt})
+		}
 		if !o.ReleaseRequested.IsZero() && !d.asked[o.ID] {
 			d.asked[o.ID] = true
 			d.report.ReleasesAsked = append(d.report.ReleasesAsked, o.ID)
@@ -326,16 +365,16 @@ func (d *poolDriver) step(ctx context.Context) {
 	d.source.mu.Unlock()
 
 	for _, h := range ready {
-		o, ok := byID[h.order]
-		if !ok || o.State != alloc.PoolPlaced {
-			continue
+		if o, ok := byID[h.order]; ok && o.State == alloc.PoolPlaced {
+			d.join(ctx, h, o)
 		}
-		d.join(ctx, h, o)
 	}
 	for _, h := range gone {
 		h.stop()
 		h.stop = nil
-		d.record(h.order, func(r *PoolOrderRecord) { r.Released = d.clock.Now() })
+		if r := d.recordOf(h.order); r != nil {
+			r.Released = d.clock.Now()
+		}
 	}
 
 	joined := map[config.Arch]int{}
@@ -378,24 +417,27 @@ func (d *poolDriver) join(ctx context.Context, h *replayHost, o *alloc.PoolOrder
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	now := d.clock.Now()
 	d.source.mu.Lock()
-	h.joined, h.stop = d.clock.Now(), stop
+	h.joined, h.stop = now, stop
 	d.source.mu.Unlock()
-	d.report.Ordered = append(d.report.Ordered, PoolOrderRecord{
-		Order: o.ID, Arch: h.arch, Ordered: h.ordered, Joined: d.clock.Now(),
-	})
+	if r := d.recordOf(o.ID); r != nil {
+		r.Joined = now
+	}
+	d.lastJoin = now
 }
 
-func (d *poolDriver) record(order string, f func(*PoolOrderRecord)) {
+func (d *poolDriver) recordOf(order string) *PoolOrderRecord {
 	for i := range d.report.Ordered {
 		if d.report.Ordered[i].Order == order {
-			f(&d.report.Ordered[i])
+			return &d.report.Ordered[i]
 		}
 	}
+
+	return nil
 }
 
-// settled reports whether the pool has nothing more to do that a step could move: no
-// host on its way to joining.
+// settled reports whether no host is on its way to joining.
 func (d *poolDriver) settled() bool {
 	d.source.mu.Lock()
 	defer d.source.mu.Unlock()
@@ -408,14 +450,39 @@ func (d *poolDriver) settled() bool {
 	return true
 }
 
+// above is, per architecture, how many joined hosts beyond its floor the pool has not
+// asked to release.
+func (d *poolDriver) above() map[config.Arch]int {
+	serving := map[config.Arch]int{}
+	d.source.mu.Lock()
+	for _, h := range d.source.hosts {
+		if !h.joined.IsZero() && !h.released && !d.asked[h.order] {
+			serving[h.arch]++
+		}
+	}
+	d.source.mu.Unlock()
+	out := map[config.Arch]int{}
+	for arch, n := range serving {
+		if excess := n - d.fleet.Archs[arch].Floor; excess > 0 {
+			out[arch] = excess
+		}
+	}
+
+	return out
+}
+
 // ticksOn reports whether the pool steps again after the one at now: while anything
-// but ticks is still to come, a job is unfinished or a host is on its way, and, for a
-// pool that shrinks itself, until two steps past idle_after from the last completion,
-// so the release it asks for is seen.
+// but ticks is still to come, a job is unfinished or a host is on its way; and, for a
+// pool that shrinks itself, while hosts beyond the floor are not yet asked to leave,
+// until idle_after and a step for each of them, and two to spare, have passed since
+// the later of the last completion and the last join. A replay that stops with hosts
+// still beyond the floor says so in the report.
 func (d *poolDriver) ticksOn(actions *plane, now, lastCompletion time.Time) bool {
 	// A JOB THAT NEVER FINISHES WOULD TICK FOREVER, so the pool stops at a horizon the
 	// trace could not need, and the report names what was left.
 	if now.After(d.horizon) {
+		d.report.StoppedAbove = d.above()
+
 		return false
 	}
 	if !actions.onlyTicksLeft() || !actions.everyJobCompleted() || !d.settled() {
@@ -424,8 +491,24 @@ func (d *poolDriver) ticksOn(actions *plane, now, lastCompletion time.Time) bool
 	if d.fleet.IdleAfter == 0 {
 		return false
 	}
+	above := d.above()
+	excess := 0
+	for _, n := range above {
+		excess = max(excess, n)
+	}
+	if excess == 0 {
+		return false
+	}
+	last := lastCompletion
+	if d.lastJoin.After(last) {
+		last = d.lastJoin
+	}
+	if now.Before(last.Add(d.fleet.IdleAfter + time.Duration(excess+2)*d.fleet.interval())) {
+		return true
+	}
+	d.report.StoppedAbove = above
 
-	return now.Before(lastCompletion.Add(d.fleet.IdleAfter + 2*d.fleet.interval()))
+	return false
 }
 
 // longestJob is the trace's longest job on any tier.
@@ -438,13 +521,18 @@ func longestJob(trace Trace) time.Duration {
 	return longest
 }
 
-// joinedHosts are the hosts the pool's orders joined as, for the report to charge a
-// lease to: every one that joined, released since or not.
+// joinedHosts are the hosts the pool's orders joined as, each there from its join to
+// its release, for the report to charge a lease to and to count as room only while it
+// was there.
 func (d *poolDriver) joinedHosts() []Host {
 	out := make([]Host, 0, len(d.report.Ordered))
 	for _, o := range d.report.Ordered {
+		if o.Joined.IsZero() {
+			continue
+		}
 		h := d.fleet.Host
 		h.Name, h.Arch = alloc.PoolNodeName(o.Order), o.Arch
+		h.Joined, h.Left = o.Joined, o.Released
 		out = append(out, h)
 	}
 

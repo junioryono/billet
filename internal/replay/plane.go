@@ -28,6 +28,9 @@ const (
 	eventArrival eventKind = iota
 	eventStarted
 	eventCompleted
+	// eventPoolReady is a host the pool ordered becoming a node, at its order's time
+	// and its lead time; before a tick at the same instant, so the step sees it.
+	eventPoolReady
 	// eventPoolTick is one of the pool's steps, which the run loop delivers to the
 	// scaler rather than to GitHub's queue, after everything else at its instant.
 	eventPoolTick
@@ -1188,7 +1191,7 @@ func (p *plane) onlyTicksLeft() bool {
 	defer p.mu.Unlock()
 
 	for _, ev := range p.events {
-		if ev.kind != eventPoolTick {
+		if ev.kind != eventPoolTick && ev.kind != eventPoolReady {
 			return false
 		}
 	}

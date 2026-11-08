@@ -185,7 +185,8 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 			awaitingLaunches = time.Time{}
 
 			clock.Step(ev.at)
-			if ev.kind == eventPoolTick {
+			switch ev.kind {
+			case eventPoolTick:
 				// EVERY TIER POLLS AT A POOL STEP, as a live listener's long poll answers
 				// at least every minute: a quiet replay delivers nothing to a tier, and the
 				// pool reads only a report its tier wrote within five minutes.
@@ -193,12 +194,17 @@ func Run(t *testing.T, fleet Fleet, trace Trace, opts Options) *Report {
 					actions.nudge(label)
 					settle("a poll for " + label + " at a pool step")
 				}
-				hosts.step(t.Context())
+				for _, due := range hosts.step(t.Context()) {
+					actions.schedule(event{at: due.at, kind: eventPoolReady})
+				}
 				settle(describe(ev))
 				if hosts.ticksOn(actions, ev.at, lastCompletion) {
 					actions.schedule(event{at: ev.at.Add(fleet.Pool.interval()), kind: eventPoolTick})
 				}
-			} else {
+			case eventPoolReady:
+				hosts.observe(t.Context())
+				settle(describe(ev))
+			default:
 				if ev.kind == eventCompleted {
 					lastCompletion = ev.at
 				}
@@ -281,6 +287,8 @@ func describe(ev event) string {
 		return "the completion of job " + itoa(ev.seq)
 	case eventPoolTick:
 		return "a pool step at " + ev.at.Format(time.RFC3339)
+	case eventPoolReady:
+		return "a pool host ready at " + ev.at.Format(time.RFC3339)
 	default:
 		return "an event"
 	}

@@ -42,6 +42,21 @@ type Host struct {
 	// Arch is the architecture the host's node reports, or empty for none, which
 	// serves only tiers naming none (ADR-022).
 	Arch config.Arch
+	// Joined and Left bound when the host was there, zero for the whole replay: a
+	// host a pool ordered joined part way through, and one it released left.
+	Joined, Left time.Time
+}
+
+// present is how much of [from, to) the host was there for.
+func (h Host) present(from, to time.Time) (time.Time, time.Time, bool) {
+	if !h.Joined.IsZero() && h.Joined.After(from) {
+		from = h.Joined
+	}
+	if !h.Left.IsZero() && h.Left.Before(to) {
+		to = h.Left
+	}
+
+	return from, to, to.After(from)
 }
 
 // TierShape is one runs-on label and what a job on it is charged.
