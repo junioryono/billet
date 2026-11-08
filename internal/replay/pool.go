@@ -102,11 +102,14 @@ type PoolReport struct {
 // PoolOrderRecord is one order's life in simulated time, each instant zero until it
 // happened.
 type PoolOrderRecord struct {
-	Order    string
-	Arch     config.Arch
-	Ordered  time.Time
-	Joined   time.Time
-	Released time.Time
+	Order   string
+	Arch    config.Arch
+	Ordered time.Time
+	Joined  time.Time
+	// ReleaseAsked is when the scaler asked for the host's release, the ledger's own
+	// record of it.
+	ReleaseAsked time.Time
+	Released     time.Time
 }
 
 // replayHost is one host the played source holds.
@@ -365,6 +368,9 @@ func (d *poolDriver) observe(ctx context.Context) {
 		if !o.ReleaseRequested.IsZero() && !d.asked[o.ID] {
 			d.asked[o.ID] = true
 			d.report.ReleasesAsked = append(d.report.ReleasesAsked, o.ID)
+			if r := d.recordOf(o.ID); r != nil {
+				r.ReleaseAsked = o.ReleaseRequested
+			}
 		}
 	}
 
@@ -499,17 +505,23 @@ func (d *poolDriver) ticksOn(actions *plane, now, lastActivity time.Time) bool {
 	if d.lastJoin.After(last) {
 		last = d.lastJoin
 	}
-	// A JOB THAT NEVER FINISHES WOULD TICK FOREVER, so the pool stops once nothing but
-	// its own steps has happened for longer than any job of the trace could need, and
-	// the report says the replay stalled; a workload still making progress is never cut
-	// short by it.
+	// WHILE THE TRACE HAS MORE TO DELIVER, the pool steps: a quiet night between two
+	// jobs is not a stall, and the next job may need a host only a step can order.
+	if !actions.onlyTicksLeft() {
+		d.tail = time.Time{}
+
+		return true
+	}
+	// A JOB THAT NEVER FINISHES WOULD TICK FOREVER, so with nothing left to deliver the
+	// pool stops once nothing but its own steps has happened for longer than any job of
+	// the trace could need, and the report says the replay stalled.
 	if now.Sub(last) > d.stall {
 		d.report.Stalled = true
 		d.report.StoppedAbove = d.above()
 
 		return false
 	}
-	if !actions.onlyTicksLeft() || !actions.everyJobCompleted() || !d.settled() {
+	if !actions.everyJobCompleted() || !d.settled() {
 		d.tail = time.Time{}
 
 		return true
@@ -553,7 +565,8 @@ func longestJob(trace Trace) time.Duration {
 // was there.
 func (d *poolDriver) joinedHosts() []Host {
 	out := make([]Host, 0, len(d.report.Ordered))
-	for _, o := range d.report.Ordered {
+	for i := range d.report.Ordered {
+		o := &d.report.Ordered[i]
 		if o.Joined.IsZero() {
 			continue
 		}
