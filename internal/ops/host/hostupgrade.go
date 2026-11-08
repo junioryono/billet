@@ -881,6 +881,13 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 		return err
 	}
 
+	// THE ROOM THE TRANSACTION WILL FILL, judged in the same place and for the same
+	// reason: once the services stop, a snapshot that runs out of disk leaves a host
+	// cordoned with nothing running (#802).
+	if err := refuseShortOfRoom(cfg); err != nil {
+		return err
+	}
+
 	dir, err := stageClaim()
 	if err != nil {
 		return err

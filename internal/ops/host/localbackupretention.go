@@ -15,13 +15,25 @@ import (
 )
 
 // keepLocalArchives is how many archives the packaged backup directory keeps
-// on the host, the one just written among them.
+// on the host, the one just written among them, when the disk has the room.
 const keepLocalArchives = 7
 
+// localArchiveRoom is how many of the newest archive's size the backup
+// directory's filesystem keeps free, pruning older archives the bucket holds to
+// do it: room for the next backup and for an upgrade's snapshot of the ledger,
+// each about one archive.
+const localArchiveRoom = 2
+
 // pruneLocalArchives removes archives in the packaged backup directory beyond
-// the newest keepLocalArchives, once this run's upload has finished. It runs
-// only when current is a child of localBackupDir: a directory an operator
-// named with --out is theirs.
+// the newest keepLocalArchives, and older ones still while the filesystem has
+// less than localArchiveRoom of the newest archive's size free, once this run's
+// upload has finished; the newest is always kept. It runs only when current is a
+// child of localBackupDir: a directory an operator named with --out is theirs.
+//
+// A COUNT IS NOT A SIZE. Seven archives were 1.2 GB when an archive was about
+// 170 MB; by 2026-11-08 the ledger was 988 MB, seven archives held 6 GB of a 15
+// GiB root, and with three recovery directories beside them an upgrade's snapshot
+// of the ledger had no room left and the control plane went down (#802).
 //
 // THE BUCKET IS THE PROOF. The daily timer writes about 170 MB a day on a
 // controller and nothing removed any of it, and 61 archives held most of a
@@ -118,7 +130,7 @@ func pruneArchivesIn(ctx context.Context, store archiveStore, deployment, parent
 		archives = append(archives, local{name: e.Name(), id: id, judged: judged})
 	}
 
-	if len(archives) <= keepLocalArchives {
+	if len(archives) <= 1 {
 		return nil, nil
 	}
 
@@ -129,7 +141,28 @@ func pruneArchivesIn(ctx context.Context, store archiveStore, deployment, parent
 		errs    []error
 	)
 
-	for _, l := range archives[keepLocalArchives:] {
+	room := localArchiveRoom * archives[0].id.Size()
+
+	// OLDEST FIRST, AND NEVER THE NEWEST. Past the count every archive the bucket
+	// holds goes; inside it one goes only while the disk is short, asked again
+	// after every removal, and a reading that fails keeps the rest.
+	for i := len(archives) - 1; i >= 1; i-- {
+		l := archives[i]
+
+		if i < keepLocalArchives {
+			free, err := freeBytes(parent)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("could not read how much room %s has, so the newest %d "+
+					"archives are kept: %w", parent, i+1, err))
+
+				break
+			}
+
+			if free >= room {
+				break
+			}
+		}
+
 		if !listed[l.id.Name] {
 			continue
 		}

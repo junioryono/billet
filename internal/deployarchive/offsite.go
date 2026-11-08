@@ -139,6 +139,18 @@ func ReadIdentity(dir string) (Identity, error) {
 	return Identity{Name: a.Name(), CreatedAt: created, digest: a.manifestSHA, files: m.Files}, nil
 }
 
+// Size is how many bytes the archive's declared entries hold, as its manifest
+// records them.
+func (id Identity) Size() int64 {
+	var n int64
+
+	for _, rec := range id.files {
+		n += rec.Size
+	}
+
+	return n
+}
+
 // VerifyRemainder proves that everything still in the archive at dir is what
 // its manifest declares: every file a declared entry of the declared size and
 // digest, and nothing a link, a device or anything else. A declared entry that

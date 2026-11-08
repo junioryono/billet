@@ -38,7 +38,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 ### The off-site hop and durable files: [references/offsite-and-durable-files.md](references/offsite-and-durable-files.md)
 
 - **An archive on the disk it protects is not a backup, and billet owns both ends of one narrow hop.**
-- **The packaged backup directory keeps seven archives, and an older one goes only when the bucket lists it complete.**
+- **The packaged backup directory keeps seven archives, and an older one goes only when the bucket lists it complete.** Fewer when the disk is short: room for two of the newest is kept free (#802).
 - **A remote record may not name a local file that is not durable yet.**
 - **A durable file is not a file nothing else will delete.**
 
