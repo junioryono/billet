@@ -111,8 +111,14 @@ billet_enable_server: true
 # The host is commissioned by converging again with this false.
 billet_server_prepare_only: false
 # A NODE'S HOST PREPARED FOR `billet join` TO FINISH: Firecracker, its network and its
-# Ceph converged, and neither billet.yaml written nor the node started, because the
-# join writes the one and starts the other. A pool host's first boot (ADR-030).
+# Ceph converged, and the node's config and lifecycle left to the join, which writes
+# the one and starts the other. A pool host's first boot (ADR-030). The role then
+# neither writes, stages nor checks /etc/billet/billet.yaml, never starts, stops,
+# enables, disables, restarts, drains or migrates the node, and never arms the guest
+# image refresh timer (`billet local up` arms it); a later converge of a joined host
+# in this mode leaves all of that as the join left it. billet comes from the package
+# or the image, already installed: a binary source is refused, because the role's
+# upgrade transaction installs a config with the binary and restarts the node.
 billet_node_prepare_only: false
 billet_enable_node: true
 

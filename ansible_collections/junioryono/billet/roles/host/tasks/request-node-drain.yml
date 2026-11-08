@@ -17,3 +17,10 @@
     mode: "0644"
   when: not ansible_check_mode
   become: true
+
+# THIS CONVERGE ASKED, so its release withdraws the request even where it would
+# otherwise leave one alone (a node prepared for `billet join`).
+- name: Note that this converge asked billet node stops to drain
+  ansible.builtin.set_fact:
+    billet_node_drain_requested_here: true
+  when: not ansible_check_mode

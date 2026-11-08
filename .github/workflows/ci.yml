@@ -1022,6 +1022,16 @@ jobs:
         if: matrix.group == 'roles'
         run: scripts/gates/scenario.sh fleet-playbook-check
 
+      # A pool host's first boot converges the role and leaves the node's config and
+      # start to `billet join` (ADR-030). Real converges, not dry runs: they install
+      # billet where the package does and leave the runner a billet host, so this is
+      # the group's last gate.
+      - name: Converge a node's host prepared for billet join
+        if: matrix.group == 'roles'
+        env:
+          BILLET_NODE_PREPARE_BINARY: ${{ runner.temp }}/gate-binaries/billet
+        run: scripts/gates/scenario.sh node-prepare-check
+
       - name: Prove the pinned-release fetch path
         if: matrix.group == 'policy'
         run: scripts/gates/scenario.sh release-fetch-check

@@ -1,0 +1,335 @@
+---
+# A NODE'S HOST PREPARED FOR `billet join` TO FINISH (billet_node_prepare_only,
+# ADR-030), converged for real on a machine with billet installed where the package
+# installs it and nothing else (node-prepare-check.sh). The join writes the node's
+# config and starts it, and leaves a config it did not write alone (it writes
+# `<path>.new` and stops), so the role must leave both to it, on the first converge
+# and on every later one:
+#
+#   1. The first converge writes no billet.yaml, runs no `billet check` against the
+#      config that is not there, and neither starts nor enables the node.
+#   2. A converge over a joined node (a config the role did not write, the node
+#      enabled, and a drain request that is not the role's) leaves the config's
+#      bytes, the node's enablement and the request as they were, and records no
+#      drain owed: the role neither validates, renders, drains nor disables it.
+#   3. The guest image refresh units are installed and the timer is left unarmed,
+#      where the same tasks arm it on an ordinary host: its service reads the
+#      config only the join writes, and `billet local up` arms it.
+#   4. A binary source is refused before anything is staged: the role's upgrade
+#      transaction installs a config with the binary and restarts the node.
+#
+# A docker node, so the converge needs neither KVM nor disks; the Firecracker, Ceph
+# and network preparation the mode exists for are the same tasks an ordinary node
+# runs.
+- name: Converge a fresh node's host prepared for billet join
+  hosts: all
+  become: true
+  vars:
+    billet_node_prepare_check_config: &prepare_config
+      node:
+        name: pool-p01
+        provider: docker
+        server_addr: 10.77.0.10:7717
+        state_dir: /var/lib/billet/node
+  pre_tasks:
+    - name: Prove the machine has billet installed and nothing else of it
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: [/usr/bin/billet, /etc/billet/billet.yaml]
+      register: billet_prepare_fresh
+
+    - name: Require only the package's binary
+      ansible.builtin.assert:
+        that:
+          - billet_prepare_fresh.results[0].stat.exists
+          - not billet_prepare_fresh.results[1].stat.exists
+  roles:
+    - role: junioryono.billet.host
+      billet_enable_server: false
+      billet_enable_node: true
+      billet_node_prepare_only: true
+      billet_firecracker_enabled: false
+      billet_ceph_enabled: false
+      billet_config: *prepare_config
+  post_tasks:
+    - name: Inspect what the first converge left
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/billet/billet.yaml
+        - /etc/systemd/system/billet-node.service
+        - /var/run/billet-node-drain
+        - /etc/billet/node-drain-owed
+      register: billet_prepare_first
+
+    - name: Ask systemd whether the node is enabled or up
+      ansible.builtin.command:
+        argv: [systemctl, "{{ item }}", billet-node.service]
+      loop: [is-enabled, is-active]
+      register: billet_prepare_first_node
+      changed_when: false
+      failed_when: false
+
+    - name: Require no config, no check of one, and the node neither started nor enabled
+      ansible.builtin.assert:
+        that:
+          - not billet_prepare_first.results[0].stat.exists
+          - billet_prepare_first.results[1].stat.exists
+          - not billet_prepare_first.results[2].stat.exists
+          - not billet_prepare_first.results[3].stat.exists
+          - billet_check is skipped
+          - billet_prepare_first_node.results[0].stdout | trim == 'disabled'
+          - billet_prepare_first_node.results[1].stdout | trim == 'inactive'
+        fail_msg: >-
+          The first prepare-only converge wrote billet.yaml, checked one, or
+          started or enabled the node: {{ billet_prepare_first.results | map(attribute='stat.exists') | list }},
+          check {{ 'skipped' if billet_check is skipped else 'ran' }},
+          node {{ billet_prepare_first_node.results | map(attribute='stdout') | list }}.
+
+- name: Converge the same host again once billet join has finished
+  hosts: all
+  become: true
+  vars:
+    billet_node_prepare_join_config: |
+      # Written by billet join, which this converge must leave alone.
+      node:
+        name: pool-p01
+        provider: docker
+        server_addr: 10.77.0.99:7717
+        state_dir: /var/lib/billet/node
+        tls:
+          ca: /var/lib/billet/node/tls/ca.crt
+          cert: /var/lib/billet/node/tls/node.crt
+          key: /var/lib/billet/node/tls/node.key
+  pre_tasks:
+    # A config `billet check` refuses (its certificates are not there), at an endpoint
+    # the inventory's does not name, so validating it fails the converge and
+    # previewing the inventory's over it records a drain owed.
+    - name: Leave the config billet join writes
+      ansible.builtin.copy:
+        content: "{{ billet_node_prepare_join_config }}"
+        dest: /etc/billet/billet.yaml
+        owner: root
+        group: billet
+        mode: "0640"
+
+    - name: Enable the node, as billet join's billet local up leaves it
+      ansible.builtin.command:
+        argv: [systemctl, enable, billet-node.service]
+      changed_when: true
+
+    - name: Leave a drain request this converge did not write
+      ansible.builtin.copy:
+        content: "someone else's drain\n"
+        dest: /var/run/billet-node-drain
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Read the joined config's digest before the converge
+      ansible.builtin.stat:
+        path: /etc/billet/billet.yaml
+        checksum_algorithm: sha256
+      register: billet_prepare_join_before
+  roles:
+    - role: junioryono.billet.host
+      billet_enable_server: false
+      billet_enable_node: true
+      billet_node_prepare_only: true
+      billet_firecracker_enabled: false
+      billet_ceph_enabled: false
+      billet_config:
+        node:
+          name: pool-p01
+          provider: docker
+          server_addr: 10.77.0.10:7717
+          state_dir: /var/lib/billet/node
+  post_tasks:
+    - name: Inspect what the converge over the joined node left
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop:
+        - /etc/billet/billet.yaml
+        - /etc/billet/billet.yaml.new
+        - /etc/billet/node-drain-owed
+      register: billet_prepare_join_after
+
+    - name: Read the drain request after the converge
+      ansible.builtin.slurp:
+        src: /var/run/billet-node-drain
+      register: billet_prepare_join_drain
+
+    - name: Ask systemd whether the joined node is still enabled, and not started by the role
+      ansible.builtin.command:
+        argv: [systemctl, "{{ item }}", billet-node.service]
+      loop: [is-enabled, is-active]
+      register: billet_prepare_join_node
+      changed_when: false
+      failed_when: false
+
+    - name: Require the joined node's config, enablement and drain request as the join left them
+      ansible.builtin.assert:
+        that:
+          - billet_prepare_join_after.results[0].stat.checksum == billet_prepare_join_before.stat.checksum
+          - not billet_prepare_join_after.results[1].stat.exists
+          - not billet_prepare_join_after.results[2].stat.exists
+          - billet_prepare_join_drain.content | b64decode == "someone else's drain\n"
+          - billet_check is skipped
+          - billet_prepare_join_node.results[0].stdout | trim == 'enabled'
+          - billet_prepare_join_node.results[1].stdout | trim == 'inactive'
+        fail_msg: >-
+          The converge over a joined node changed what the join owns: config
+          {{ 'kept' if billet_prepare_join_after.results[0].stat.checksum == billet_prepare_join_before.stat.checksum else 'changed' }},
+          {{ billet_prepare_join_after.results[1:] | map(attribute='stat.exists') | list }},
+          check {{ 'skipped' if billet_check is skipped else 'ran' }},
+          node {{ billet_prepare_join_node.results | map(attribute='stdout') | list }}.
+
+    - name: Put the node back as the first converge left it
+      ansible.builtin.command:
+        argv: [systemctl, disable, billet-node.service]
+      changed_when: true
+
+    - name: Remove what the join's stand-in left, the config and the drain request
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: [/etc/billet/billet.yaml, /var/run/billet-node-drain]
+
+- name: Install the guest image refresh timer and leave it unarmed
+  hosts: all
+  become: true
+  tasks:
+    - name: Converge the refresh units on a Firecracker node prepared for billet join
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: images-refresh.yml
+      vars:
+        billet_firecracker_enabled: true
+        billet_ceph_enabled: true
+        billet_node_prepare_only: true
+        billet_automatic_updates: true
+
+    - name: Ask systemd about the prepared node's refresh timer
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, billet-images-refresh.timer]
+      register: billet_prepare_timer
+      changed_when: false
+      failed_when: false
+
+    - name: Converge the same units on an ordinary node, which arms the timer
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: images-refresh.yml
+      vars:
+        billet_firecracker_enabled: true
+        billet_ceph_enabled: true
+        billet_node_prepare_only: false
+        billet_automatic_updates: true
+
+    - name: Ask systemd about the ordinary node's refresh timer
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, billet-images-refresh.timer]
+      register: billet_ordinary_timer
+      changed_when: false
+      failed_when: false
+
+    - name: Require the units installed and the timer armed only on the ordinary node
+      ansible.builtin.assert:
+        that:
+          - billet_prepare_timer.stdout | trim == 'disabled'
+          - billet_ordinary_timer.stdout | trim == 'enabled'
+        fail_msg: >-
+          The refresh timer was {{ billet_prepare_timer.stdout | trim }} on a node prepared
+          for billet join and {{ billet_ordinary_timer.stdout | trim }} on an ordinary one.
+
+    - name: Disarm the timer the ordinary converge armed
+      ansible.builtin.systemd_service:
+        name: billet-images-refresh.timer
+        enabled: false
+        state: stopped
+
+- name: Refuse a binary source on a node prepared for billet join
+  hosts: all
+  become: true
+  vars:
+    billet_prepare_refusal_role:
+      billet_enable_server: false
+      billet_enable_node: true
+      billet_node_prepare_only: true
+      billet_firecracker_enabled: false
+      billet_ceph_enabled: false
+      billet_config:
+        node:
+          name: pool-p01
+          provider: docker
+          server_addr: 10.77.0.10:7717
+          state_dir: /var/lib/billet/node
+  tasks:
+    - name: Converge with a supplied binary
+      block:
+        - name: Converge the role with billet_binary_src
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+          vars:
+            billet_enable_server: "{{ billet_prepare_refusal_role.billet_enable_server }}"
+            billet_enable_node: "{{ billet_prepare_refusal_role.billet_enable_node }}"
+            billet_node_prepare_only: "{{ billet_prepare_refusal_role.billet_node_prepare_only }}"
+            billet_firecracker_enabled: "{{ billet_prepare_refusal_role.billet_firecracker_enabled }}"
+            billet_ceph_enabled: "{{ billet_prepare_refusal_role.billet_ceph_enabled }}"
+            billet_config: "{{ billet_prepare_refusal_role.billet_config }}"
+            billet_binary_src: "{{ billet_node_prepare_check_src }}"
+
+        - name: Note that a supplied binary was not refused
+          ansible.builtin.set_fact:
+            billet_prepare_refused_src: ""
+      rescue:
+        - name: Note how the supplied binary was refused
+          ansible.builtin.set_fact:
+            billet_prepare_refused_src: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: Converge with a pinned version
+      block:
+        - name: Converge the role with billet_version
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+          vars:
+            billet_enable_server: "{{ billet_prepare_refusal_role.billet_enable_server }}"
+            billet_enable_node: "{{ billet_prepare_refusal_role.billet_enable_node }}"
+            billet_node_prepare_only: "{{ billet_prepare_refusal_role.billet_node_prepare_only }}"
+            billet_firecracker_enabled: "{{ billet_prepare_refusal_role.billet_firecracker_enabled }}"
+            billet_ceph_enabled: "{{ billet_prepare_refusal_role.billet_ceph_enabled }}"
+            billet_config: "{{ billet_prepare_refusal_role.billet_config }}"
+            billet_version: v0.34.0
+
+        - name: Note that a pinned version was not refused
+          ansible.builtin.set_fact:
+            billet_prepare_refused_version: ""
+      rescue:
+        - name: Note how the pinned version was refused
+          ansible.builtin.set_fact:
+            billet_prepare_refused_version: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: Inspect whether anything was written or staged
+      ansible.builtin.find:
+        paths: /var/lib/billet/upgrades
+        patterns: billet.candidate
+        recurse: true
+      register: billet_prepare_refused_staged
+
+    - name: Inspect the config path after the refusals
+      ansible.builtin.stat:
+        path: /etc/billet/billet.yaml
+      register: billet_prepare_refused_config
+
+    - name: Require each refused by the mode's own refusal, with nothing staged or written
+      ansible.builtin.assert:
+        that:
+          - "'billet_node_prepare_only leaves the node' in billet_prepare_refused_src"
+          - "'billet_node_prepare_only leaves the node' in billet_prepare_refused_version"
+          - billet_prepare_refused_staged.matched == 0
+          - not billet_prepare_refused_config.stat.exists
+        fail_msg: >-
+          supplied binary: {{ billet_prepare_refused_src or 'not refused' }};
+          pinned version: {{ billet_prepare_refused_version or 'not refused' }};
+          {{ billet_prepare_refused_staged.matched }} candidates staged.
