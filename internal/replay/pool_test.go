@@ -9,9 +9,12 @@ import (
 	"github.com/junioryono/billet/internal/config"
 )
 
+// poolLead is the lead time of the pools these tests replay, from order to joined node.
+const poolLead = 3 * time.Minute
+
 // poolOnlyFleet is a fleet whose every host the pool orders: none fixed, one x64 tier,
-// and a pool from floor to max of 16-vcpu hosts arriving a lead time after each order.
-func poolOnlyFleet(floor, maxHosts int, lead, idleAfter time.Duration) Fleet {
+// and a pool from floor to max of 16-vcpu hosts arriving poolLead after each order.
+func poolOnlyFleet(floor, maxHosts int, idleAfter time.Duration) Fleet {
 	return Fleet{
 		Tiers:     []TierShape{{Label: "billet-4vcpu", VCPU: 4, Memory: 16 * config.GiB, Arch: config.ArchX64}},
 		MaxVCPU:   1024,
@@ -19,7 +22,7 @@ func poolOnlyFleet(floor, maxHosts int, lead, idleAfter time.Duration) Fleet {
 		Pool: &PoolFleet{
 			Archs:     map[config.Arch]PoolArch{config.ArchX64: {Floor: floor, Max: maxHosts}},
 			Host:      Host{VCPU: 16, Memory: 64 * config.GiB},
-			LeadTime:  lead,
+			LeadTime:  poolLead,
 			Interval:  time.Minute,
 			IdleAfter: idleAfter,
 		},
@@ -103,7 +106,7 @@ func asksAfterIdle(t *testing.T, report *Report, idleAfter, step time.Duration) 
 func TestAPoolGrowsFromItsFloorForABurstAndAsksToShrink(t *testing.T) {
 	t.Parallel()
 	lead := 3 * time.Minute
-	report := Run(t, poolOnlyFleet(0, 3, lead, 10*time.Minute), Burst(7, Params{Jobs: 24, Tiers: []string{"billet-4vcpu"}}),
+	report := Run(t, poolOnlyFleet(0, 3, 10*time.Minute), Burst(7, Params{Jobs: 24, Tiers: []string{"billet-4vcpu"}}),
 		Options{DirectAssignment: true})
 	speaks(t, report)
 	pr := report.Pool
@@ -141,7 +144,7 @@ func TestAPoolsFloorIsWhatABurstDoesNotWait(t *testing.T) {
 	trace := Burst(7, Params{Jobs: 24, Tiers: []string{"billet-4vcpu"}})
 	p99 := map[int]time.Duration{}
 	for _, floor := range []int{0, 3} {
-		report := Run(t, poolOnlyFleet(floor, 3, lead, 0), trace, Options{DirectAssignment: true})
+		report := Run(t, poolOnlyFleet(floor, 3, 0), trace, Options{DirectAssignment: true})
 		speaks(t, report)
 		joinsAtItsLeadTime(t, report.Pool, lead)
 		p := report.QueueWaitBy(func(*Record) string { return "all" })["all"]
@@ -215,7 +218,7 @@ func TestFiveHostsGoingQuietTogetherAreEachAskedToLeave(t *testing.T) {
 		})
 	}
 	trace.Normalize()
-	report := Run(t, poolOnlyFleet(0, 5, 3*time.Minute, 10*time.Minute), trace, Options{DirectAssignment: true})
+	report := Run(t, poolOnlyFleet(0, 5, 10*time.Minute), trace, Options{DirectAssignment: true})
 	speaks(t, report)
 	pr := report.Pool
 	if got := pr.MostJoined[config.ArchX64]; got != 5 {
@@ -267,7 +270,7 @@ func TestAPoolStepsThroughAQuietNight(t *testing.T) {
 // stall bound.
 func TestAPoolWhoseStepsAreFarApartFinishesWithoutStalling(t *testing.T) {
 	t.Parallel()
-	fleet := poolOnlyFleet(1, 1, 3*time.Minute, 0)
+	fleet := poolOnlyFleet(1, 1, 0)
 	fleet.Pool.Interval = 8 * time.Hour
 	trace := Trace{Arrivals: []Arrival{{
 		At: DefaultStart, Tier: "billet-4vcpu", Owner: DefaultOwner, Repository: "web",
