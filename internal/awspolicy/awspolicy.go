@@ -352,6 +352,22 @@ type CodeBuildSweep struct {
 	Account string
 }
 
+// Pool is the AWS bare-metal pool a control plane orders from: where its hosts are
+// launched and from which images. Every id lands in a Resource ARN, so each is checked
+// against its shape before it does.
+type Pool struct {
+	// Region is server.pool.aws_metal.region, which the image ARNs are in.
+	Region string
+	// SubnetID and SecurityGroupIDs are where a pool host is launched, bare ids.
+	SubnetID         string
+	SecurityGroupIDs []string
+	// Images are the AMIs the pool's shapes launch, bare ids.
+	Images []string
+	// InstanceProfileRoleARN, when set, is the role inside the hosts' instance
+	// profile, which a launch passes.
+	InstanceProfileRoleARN string
+}
+
 // Network names the subnets and security groups an ec2 node launches into. When
 // set, the launch grant reaches exactly these and no other subnet or group in the
 // account.
@@ -419,6 +435,10 @@ type Inputs struct {
 	// and publish this deployment's identity material. Only a controller ever gets
 	// these: a node holds no App key and no certificate authority.
 	Identity *Identity
+	// Pool, when non-nil, adds what the CONTROL PLANE's pool scaler needs to order,
+	// read and release server.pool.aws_metal's hosts (ADR-030). A principal of its
+	// own again: the controller orders hosts, and a node never does.
+	Pool *Pool
 	// SpotQueueARN, when set, adds the interruption-queue statement scoped to it.
 	SpotQueueARN string
 	// InstanceProfileRoleARN, when set, adds an iam:PassRole scoped to that role.
@@ -607,6 +627,15 @@ func (in Inputs) Build() (Policy, error) {
 
 	if in.Identity != nil {
 		stmts, err := identityStatements(partition, suffix, in.Region, *in.Identity)
+		if err != nil {
+			return Policy{}, err
+		}
+
+		p.Statement = append(p.Statement, stmts...)
+	}
+
+	if in.Pool != nil {
+		stmts, err := poolStatements(partition, suffix, in.Owner, *in.Pool)
 		if err != nil {
 			return Policy{}, err
 		}
@@ -1510,6 +1539,8 @@ var (
 	partitionPattern       = regexp.MustCompile(`^[A-Za-z]+(-[A-Za-z]+)*$`)
 	subnetIDPattern        = regexp.MustCompile(`^subnet-[0-9a-z]+$`)
 	securityGroupIDPattern = regexp.MustCompile(`^sg-[0-9a-z]+$`)
+	imageIDPattern         = regexp.MustCompile(`^ami-[0-9a-f]+$`)
+	regionPattern          = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-\d+$`)
 )
 
 // check refuses a network that would grant nothing or more than it names. An id
@@ -1602,6 +1633,115 @@ func launchStatements(partition string, in Inputs) []Statement {
 	}
 
 	return out
+}
+
+// poolStatements are the control plane's grant over its pool hosts (ec2.Hosts).
+//
+// EVERY RESOURCE A POOL LAUNCH TOUCHES IS NAMED, rather than the node's NotResource
+// grant, because the pool's are all known: its subnet, its groups, its images, and the
+// instance, volumes and network interface the launch creates. A block-device mapping
+// naming a snapshot is then refused by omission, which is the guard the node's launch
+// needs a Deny for.
+//
+// THE POOL MAY WRITE THE THREE TAGS A POOL LAUNCH WRITES AND NO OTHER. A pool host
+// carrying the job instances' owner tag would sit in every ec2 node's owner-filtered
+// inventory as a job instance whose Name names no lease, which fails that inventory
+// whole (hosts.go); so the launch and its tags are allowed only when every tag key is
+// one of Name, the pool owner and the pool order, and the pool owner is among them
+// with this deployment's value. aws:TagKeys compares values case-sensitively, which the
+// key inside aws:RequestTag/ does not (launchTagCondition).
+//
+// ASKED OF EC2 WITH --dry-run, 2026-11-08, under a role holding exactly this grant
+// (docs/reference/records/bare-metal-hosts.md): billet's own pool launch is allowed
+// on both architectures; another deployment's pool owner, the job owner tag beside the
+// pool's, the owner key in another case, no tags, an unnamed image, subnet or group,
+// and another image's snapshot in a mapping are each denied; terminate and the console
+// read reach the pool-tagged instance and not an untagged one. The launched image's own
+// backing snapshot named in a mapping is allowed, as 2026-09-04 found for the node.
+func poolStatements(partition, suffix, owner string, pool Pool) ([]Statement, error) {
+	switch {
+	case !regionPattern.MatchString(pool.Region):
+		return nil, fmt.Errorf("awspolicy: the pool's region %q is not a region", pool.Region)
+	case !subnetIDPattern.MatchString(pool.SubnetID):
+		return nil, fmt.Errorf("awspolicy: the pool's subnet %q is not a subnet id", pool.SubnetID)
+	case len(pool.SecurityGroupIDs) == 0:
+		return nil, errors.New("awspolicy: the pool names no security group, so its launch could attach none")
+	case len(pool.Images) == 0:
+		return nil, errors.New("awspolicy: the pool names no image, so its launch could start nothing")
+	}
+	if pool.InstanceProfileRoleARN != "" {
+		if err := requireARN(pool.InstanceProfileRoleARN, "iam", "role/", partition, ""); err != nil {
+			return nil, fmt.Errorf("the pool's instance profile role: %w", err)
+		}
+	}
+
+	arn := func(kind string) string { return "arn:" + partition + ":ec2:" + pool.Region + ":*:" + kind }
+	from := []string{arn("subnet/" + pool.SubnetID), arn("network-interface/*")}
+	for _, g := range pool.SecurityGroupIDs {
+		if !securityGroupIDPattern.MatchString(g) {
+			return nil, fmt.Errorf("awspolicy: the pool's security group %q is not a security group id", g)
+		}
+		from = append(from, arn("security-group/"+g))
+	}
+	for _, image := range pool.Images {
+		if !imageIDPattern.MatchString(image) {
+			return nil, fmt.Errorf("awspolicy: the pool's image %q is not an image id", image)
+		}
+		// An AMI ARN has an empty account field.
+		from = append(from, "arn:"+partition+":ec2:"+pool.Region+"::image/"+image)
+	}
+
+	created := []string{arn("instance/*"), arn("volume/*")}
+	requestTags := ownerTagCondition("aws:RequestTag/"+ec2.PoolOwnerTagKey, owner)
+	requestTags["ForAllValues:StringEquals"] = map[string]any{
+		"aws:TagKeys": []string{ec2.NameTagKey, ec2.PoolOwnerTagKey, ec2.PoolOrderTagKey},
+	}
+	requestTags["ForAnyValue:StringEquals"] = map[string]any{"aws:TagKeys": []string{ec2.PoolOwnerTagKey}}
+	tagging := map[string]any{}
+	for op, kv := range requestTags {
+		tagging[op] = kv
+	}
+	if eq, ok := tagging["StringEquals"].(map[string]any); ok {
+		merged := map[string]any{"ec2:CreateAction": []string{"RunInstances"}}
+		for k, v := range eq {
+			merged[k] = v
+		}
+		tagging["StringEquals"] = merged
+	} else {
+		tagging["StringEquals"] = map[string]any{"ec2:CreateAction": []string{"RunInstances"}}
+	}
+	ownedHost := ownerTagCondition("aws:ResourceTag/"+ec2.PoolOwnerTagKey, owner)
+
+	out := []Statement{
+		{Sid: "BilletPoolRead", Effect: "Allow", Action: ec2.PoolReadIAMActions(), Resource: []string{"*"}},
+		{Sid: "BilletPoolLaunchFrom", Effect: "Allow", Action: ec2.PoolLaunchIAMActions(), Resource: from},
+		{
+			Sid: "BilletPoolLaunchHost", Effect: "Allow",
+			Action: ec2.PoolLaunchIAMActions(), Resource: created, Condition: requestTags,
+		},
+		{Sid: "BilletPoolTag", Effect: "Allow", Action: ec2.PoolTagIAMActions(), Resource: created, Condition: tagging},
+		{
+			Sid: "BilletPoolTerminate", Effect: "Allow",
+			Action: ec2.PoolTerminateIAMActions(), Resource: []string{arn("instance/*")}, Condition: ownedHost,
+		},
+		// The console is where a joining host writes its key's fingerprint, and on any
+		// other instance it is whatever that machine printed, so it is read only on a
+		// pool host. GetConsoleOutput scopes by instance and tag, simulated 2026-08-29
+		// for the builder's console statement.
+		{
+			Sid: "BilletPoolConsole", Effect: "Allow",
+			Action: ec2.PoolConsoleIAMActions(), Resource: []string{arn("instance/*")}, Condition: ownedHost,
+		},
+	}
+	if pool.InstanceProfileRoleARN != "" {
+		out = append(out, Statement{
+			Sid: "BilletPoolPassRole", Effect: "Allow",
+			Action: []string{"iam:PassRole"}, Resource: []string{pool.InstanceProfileRoleARN},
+			Condition: map[string]any{"StringEquals": map[string]any{"iam:PassedToService": "ec2." + suffix}},
+		})
+	}
+
+	return out, nil
 }
 
 // launchTagCondition is what a launch's instance and volumes must be tagged with:
