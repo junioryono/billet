@@ -90,12 +90,26 @@
       when: not billet_ceph_conf.stat.exists
 
 
+    # ASKED AGAIN UNTIL IT NAMES EVERY DEVICE, BOUNDED. On a cluster this converge just
+    # bootstrapped, cephadm has not yet inventoried the host's disks: on a fresh z1d.metal
+    # (2026-11-08) the first answer did not list the named NVMe, so no OSD was added and
+    # the pools' initialisation then waited on placement groups that had no OSD to land
+    # on. A device listed at all, available or already an OSD, ends the wait; a name the
+    # host never lists fails the converge here instead of being skipped.
     - name: Inspect Ceph's current device inventory
       ansible.builtin.command:
         argv: [ceph, orch, device, ls, --hostname, "{{ inventory_hostname }}", --format, json, --refresh]
       register: billet_ceph_device_inventory
       changed_when: false
       become: true
+      until: >-
+        billet_ceph_device_inventory.rc == 0 and
+        (billet_ceph_devices | difference(
+          (((billet_ceph_device_inventory.stdout | from_json) | selectattr('devices', 'defined') | map(attribute='devices') | flatten(levels=1))
+           + ((billet_ceph_device_inventory.stdout | from_json) | rejectattr('devices', 'defined') | list))
+          | selectattr('path', 'defined') | map(attribute='path') | list)) | length == 0
+      retries: 30
+      delay: 10
 
     # A LIST OF HOSTS, EACH WITH ITS devices (measured on Ceph 19.2.3, 2026-11-08:
     # `[{"addr", "devices": [{"path", "available", ...}], "labels", "name"}]`), so the
