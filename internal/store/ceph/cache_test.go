@@ -71,6 +71,9 @@ type cacheFake struct {
 	// removeLocked records, per metadata key, whether the cache index lock was
 	// held at the instant `image-meta remove` ran for it.
 	removeLocked map[string]bool
+	// trashRemovedLocked lists the `trash rm` calls that ran while the cache index
+	// lock was held.
+	trashRemovedLocked []string
 	// halfRemoved holds images an interrupted `rbd rm` left behind: `rbd ls`
 	// still lists them, nothing can open them, and `rbd rm` finishes them.
 	halfRemoved map[string]bool
@@ -199,6 +202,9 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 
 		return json.Marshal(entries)
 	case "rm":
+		if f.lockCookie != "" {
+			f.trashRemovedLocked = append(f.trashRemovedLocked, args[1])
+		}
 		if err, ok := f.trashFailures[args[1]]; ok {
 			return nil, err
 		}
@@ -2111,16 +2117,14 @@ func TestEvictionReclaimsTheRetiredWriterAfterItsGeneration(t *testing.T) {
 	if f.images[candidate.Handle] {
 		t.Fatal("eviction kept the expired generation")
 	}
-	// EVICTION NEVER DELETES FROM THE TRASH: it holds the lock every writer waits
-	// on, and a discarded volume takes minutes to delete. The purge does it.
-	if len(f.trash) != 1 {
-		t.Fatalf("eviction deleted from the trash under the cache lock: %d left", len(f.trash))
-	}
-	if _, err := c.PurgeTrash(t.Context()); err != nil {
-		t.Fatalf("PurgeTrash: %v", err)
-	}
+	// THE WRITER GOES IN THE SAME PASS, by the purge between eviction's rounds, and
+	// never under the lock every writer waits on: a discarded volume takes minutes
+	// to delete.
 	if len(f.trash) != 0 {
-		t.Fatalf("the purge left %d retired writers after their children were removed", len(f.trash))
+		t.Fatalf("the pass left %d retired writers after their children were removed", len(f.trash))
+	}
+	if call := trashDeletedUnderLock(f); call != "" {
+		t.Fatalf("eviction ran %q under the cache lock", call)
 	}
 }
 
@@ -2537,7 +2541,20 @@ func TestCleanupFailureDoesNotRemainClassifiedAsAColdMiss(t *testing.T) {
 	}
 	f.metadata[c.cacheIndex()] = map[string]string{pointerKey(key): string(encoded)}
 	f.metadata[source] = map[string]string{cacheMetaPrefix + "lineage": "0"}
+	f.images[source] = true
+	f.snapshots[source+"@g1"] = true
 	f.failRemove = true
+	// THE GENERATION GOES AFTER THE LOCK SAW IT, so the clone, not the check under
+	// the lock, finds it missing, and its cleanup runs.
+	c.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "clone") {
+			f.calls = append(f.calls, slices.Clone(args))
+
+			return nil, errors.New("rbd: error opening image cache-g-1-missing: (2) No such file or directory")
+		}
+
+		return f.run(ctx, bin, args)
+	}
 
 	_, err = c.Clone(t.Context(), key, "")
 	if err == nil {

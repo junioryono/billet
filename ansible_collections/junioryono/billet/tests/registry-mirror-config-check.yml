@@ -1,0 +1,27 @@
+---
+# Only the decision about the mirrors, which a retained converge reaches and their
+# tasks never do. registry-mirror-check.sh reads what this writes.
+- name: Decide the mirrors the way a retained converge does
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_retirement_node_ordinary: "{{ gate_retained | default(false) }}"
+    billet_networks:
+      - {name: "{{ gate_bridge_a }}", address: "{{ gate_address_a }}"}
+      - {name: "{{ gate_bridge_b }}", address: "{{ gate_address_b }}"}
+  tasks:
+    - name: Start from the configuration an inventory would give
+      ansible.builtin.set_fact:
+        billet_effective_config: {node: {name: mirror-check, provider: firecracker}}
+
+    - name: Decide the mirrors the configuration names
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: registry-mirrors-config.yml
+
+    - name: Say what the node would be told
+      ansible.builtin.copy:
+        content: "{{ billet_effective_config | to_nice_json }}\n"
+        dest: "{{ gate_output }}/config.json"
+        mode: "0644"

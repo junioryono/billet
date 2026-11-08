@@ -59,6 +59,7 @@ func NewPool(cfg *config.Config, ledger *alloc.Allocator, deployment string, log
 		Archs:          archs,
 		Sources:        sources,
 		RefusalBackoff: pc.PoolRefusalBackoff(),
+		IdleAfter:      idleAfter(pc),
 		Tiers:          cfg.Tiers,
 		Boot:           poolBootFor(cfg, string(prelude)),
 	}, pool.WithLogger(log))
@@ -67,6 +68,17 @@ func NewPool(cfg *config.Config, ledger *alloc.Allocator, deployment string, log
 	}
 
 	return p, pc.PoolInterval(), nil
+}
+
+// idleAfter is how long a joined host holds nothing before the pool asks for its
+// release, zero when the config does not have the pool shrink itself.
+func idleAfter(pc *config.PoolConfig) time.Duration {
+	d, ok := pc.PoolIdleAfter()
+	if !ok {
+		return 0
+	}
+
+	return d
 }
 
 // poolJoins is what the node wire asks of a pool host's enrollment: the ledger's half

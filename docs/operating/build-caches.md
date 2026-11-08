@@ -43,6 +43,12 @@ A sticky disk on a trusted pool under `trusted-only` is published by its commit,
 
 **Sticky disks.** `actions/stickydisk` attaches a volume by key; it is committed when the job ends and published under the tier's rule. Under `default-branch` the commit is deferred to the completion, which decides it. `cache.sticky_disks.max_size` clamps what a job may ask for.
 
+**Docker builds.** `setup-docker-builder` keeps a job's whole BuildKit state on a sticky disk, cache mounts included, so a build after a source edit or a lockfile bump reuses the compile's caches. Measured on 2026-11-05 for four projects ([What a Docker build's cache saves](../reference/records/docker-builder.md)):
+- **Unchanged builds:** 1 to 2 seconds with the persistent builder, and about 5 with a registry cache.
+- **After a source edit or a lockfile bump:** 2 to 28 seconds with the persistent builder. A registry or `type=gha` cache usually took most of a cold build, because those keep layers and not cache mounts. The exception was a Dockerfile that installs its dependencies before it copies its source.
+- **`type=gha` through billet's Actions cache** cost more than it saved: a cold build took 1.5 to 5 times as long as no cache.
+- **Keys:** give each Dockerfile its own `cache-key` when they build at the same time. One key shared by builds one at a time stayed warm for both. Two writing at once on one key was not settled.
+
 **Actions cache.** `actions/cache` and every toolkit cache client are served from the site's store with no workflow change; see [Transparent Actions cache](actions-cache.md). Under `default-branch` a job restores from its own ref, then its pull request's base branch, then the default branch, which is GitHub's order, and saves only under its own ref, only where GitHub would let it.
 
 **Git mirror.** The guest rewrites `https://github.com/` fetches to the node, which keeps a bare mirror per trust class and repository. Every fetch is authorised by GitHub with the job's own credentials before anything is served, and a job GitHub authorised is served whatever its repository's mirror holds, as GitHub would serve it ([ADR-018](../reference/decisions/adr-018-git-proxy-answers-as-github.md)). Fetches under `sudo` go through the node too, and a job that clones another private repository with its own token (a credential store, `gh auth setup-git`) has that token handed to the node, which asks GitHub with it, when checkout set no header of its own. Pushes and SSH go to GitHub directly, and a fetch the mirror cannot answer (an object it lacks, a mirror still being refreshed or whose refresh failed, a repository larger than `cache.git.max_size`, a refusal from the mirror's own `upload-pack`) goes to GitHub. A mirror belongs to the repository GitHub's API names, by its id: the node asks `GET /repos/{owner}/{repo}` with the job's own credentials, and a mirror of a name that has since passed to another repository is removed before anything of it is served. A job waits at most ten seconds for its mirror to be refreshed; the refresh goes on for the jobs after it. A git request through the node ends when no byte has moved for three minutes, and each one leaves a line in the node's log, `a git request`, saying where it was answered and why. A mirror is repacked after a refresh, off the request path: once a day into one pack with a bitmap, and between those whenever it holds eight packs; about once a week, when a refresh runs, objects found unreachable at least fourteen days before are pruned, during which the mirror's jobs fetch from GitHub. `billet cache git forget --repository <owner/repo>`, run on a node, stops that repository's mirrors being served at once, for an object GitHub has removed that must not be served again, and the node removes them at the next fetch or a cleanup, which it tries every six hours. Mirrors unused for seven days are reaped. The node needs `git`; `billet check` says when it has none.
@@ -90,6 +96,62 @@ tiers:
 
 Everything above is what that tier gets with no `cache` block at all. [Configuration](../reference/configuration.md) has every field.
 
+## When a store stops answering
+
+A cache beside the compute shares its failure domain, and a store that fails often hangs rather than refuses. Each node keeps a breaker for its site's store (Ceph or ebs-s3), so that when the store stops answering, jobs stop asking it.
+
+**What opens it.** Three different jobs failing within five minutes, with no volume handed over between them, on what a job waits on: a clone, a fresh volume, a lookup, a publication that times out, or the first byte of a content-addressed read. One job counts once, whatever it does, so no job can turn the cache off for the others. Past its own limit a call counts as a timeout while it is still waiting, so a store stuck where nothing can cancel the call counts all the same. A miss and a conflict are the store answering, and do not count. Neither does a discard, a renewal, eviction or the trash purge, which fail for reasons of their own while clones work. Nor does a publication the store refuses: a candidate whose filesystem is not clean is that job's problem and not the store's.
+
+**While it is open, nothing asks the store.**
+
+| Cache | What a job gets at once | Recorded as |
+|---|---|---|
+| Docker image store | a cold start on the guest's own disk | `bypassed` |
+| Sticky disk | the step goes on without the disk | `bypassed` |
+| Go and Bazel | a miss, so the build goes on with its local cache | `bypassed` |
+| Actions cache | a lookup or a save goes to GitHub, recorded `bypassed`; a save already reserved here fails, recorded `unavailable`, which the client reports as a warning | `bypassed` or `unavailable` |
+| Publication | a job's own commit answers that nothing was published, and what it wrote is discarded with its session; a publication deferred past the job waits for the next pass, inside its window | |
+
+The Git mirrors and the npm cache live on the node's own disk and go on as before.
+
+**The deadline.** A job waits at most 60 seconds on Ceph, or 30 on ebs-s3, for the store to hand over a volume. Past that it starts cold, which counts against the breaker, and the call goes on without it: a clone cut short can leave a volume behind, so the node holds what it comes back with in the session's durable record and discards it, off the job's path. So the first three jobs of an outage each wait a deadline, and the rest wait nothing.
+
+**How it comes back.** While it is open the node asks the store once every 30 seconds, bounded at 10. A store that answers is on probation, because what the probe reads is not everything a job needs: one job at a time asks it for a volume or publishes to it, a volume handed over or a publication made closes the breaker, and a failure opens it again at once. Every other job goes on cold meanwhile, and a job that goes away without an answer lets the next one try after a deadline. A site with no jobs and nothing to publish stays on probation until it has one, and the metric below reads 0.
+
+**What it does not do.** A breaker decides only whether a job uses a cache. It never touches capacity, custody or teardown, a timeout is never read as a volume being gone, and no published generation is lost. A writer lease that will not publish is released as it always is. Five things it cannot help with:
+
+- **A guest's mounted volume.** A job already using a volume whose OSDs have gone waits on its own disk's IO, in the guest's kernel.
+- **A pool that is gone.** A new job's root disk is an RBD clone in the cache pool, so with that pool's OSDs stopped, or no monitors at all, a Firecracker node launches nothing, cache or not, and the breaker is never asked: the launch fails, and its capacity comes back when the launch's own cleanup proves it. What the breaker covers is a store that answers launches and not caches, such as a cache index whose lock a holder has not let go of.
+- **A call already waiting.** A sticky disk or Go request that started before the breaker opened ends at its own limit, or at the deadline if it was asking for a volume.
+- **A store that fails for one job.** Fewer than three jobs failing in five minutes open nothing.
+- **A save that straddles the store's recovery.** A save that began at GitHub while the breaker was open and finishes after it closed fails, and the client reports a warning.
+
+`billet status` names each host whose breaker is open or on probation, and `billet_cache_breaker_open{store}` is the same fact for a dashboard. A restart closes the breaker, because a verdict kept across one could cost every job its cache until a probe ran.
+
+## Registry mirrors
+
+Without a mirror, every guest pulls from the registry over the site's public address. Docker Hub limits an unauthenticated address, per IPv4 address or IPv6 /64. Its documentation said 100 pulls in 6 hours when read on 2026-11-04, and a multi-architecture image counts one pull for each architecture ([Docker's documentation](https://docs.docker.com/docker-hub/usage/pulls/)). Its own answer to an EC2 address on 2026-11-05 was `ratelimit-limit: 100;w=3600`, which is 100 an hour, and reading one image's index and one platform's manifest used two of them. A layer is not counted. GitHub-hosted runners are exempt, and self-hosted runners are not, so a busy site behind one NAT address starts failing pulls. The Docker image store absorbs repeat pulls of images already in its generation, but not the first pull of a new tag, or a pull from a service container built at run time.
+
+**What runs.** The host role runs three [Distribution](https://github.com/distribution/distribution) pull-through mirrors on every Firecracker host, one per upstream because a proxy accepts one upstream, and writes `node.registry_mirrors` into that node's configuration:
+
+| Upstream | Unit | Port on the first guest bridge |
+|---|---|---|
+| Docker Hub | `billet-registry@docker-io` | 7740 |
+| GHCR | `billet-registry@ghcr-io` | 7741 |
+| Quay | `billet-registry@quay-io` | 7742 |
+
+They serve public content with no upstream credential, to every guest on the host, trusted or not: a credential there would hand what it can read to every job. A proxy refuses a push, so one job cannot put anything in front of another. Each host runs its own, because a guest may not reach a private address across the site, so a site of several hosts pulls a new image once per host.
+
+**What reaches them.** BuildKit under `setup-docker-builder` uses all three. Docker Engine has a mirror setting for Docker Hub alone, so `docker pull`, a service container and a plain `docker build` use that one, and their GHCR and Quay pulls go to the registry. A `docker-container` builder a workflow creates itself runs on its own configuration and uses none. A private image is not served: the mirror holds no credential, and the client goes on to the registry with its own.
+
+**How a guest trusts them.** The role makes an authority on each host, under `/etc/billet-registry`, and a certificate naming every bridge's address. The authority's key stays root's on that host. The node reads the authority's certificate at each launch and hands it to the guest, which trusts it for the mirrors alone (Docker's `certs.d`, BuildKit's `ca`), never in its system store. **This takes a guest image that knows the `registry-mirrors-ca-pem` metadata key.** An older image cannot verify the mirror and pulls from the registry, as if there were none: measured on 2026-11-04, dockerd under the guest's own configuration and BuildKit each moved on to the registry in about a second.
+
+**Their disk.** Each mirror keeps what it pulled under `/var/lib/billet-registry` for `billet_registry_mirror_ttl` after pulling it, 168 hours unless changed. Distribution has no size limit, and any job on the host can ask for any public image, so `billet-registry-guard.timer` asks every ten seconds how full that filesystem is, and at `billet_registry_mirror_disk_limit_percent` (85) it stops the mirrors, discards everything they pulled and starts them again, which it says in its journal. It leaves them alone when they hold less than `billet_registry_mirror_discard_floor_mb` (1024), because then something else is filling the disk and a discard would free nothing. A controller retirement renders each node's file as an ordinary converge would, mirrors included, on that node's own evidence that the role installed them, which is the authority at `/etc/billet-registry/ca.pem`. A node whose file names the role's mirrors with that file gone is refused, and an ordinary converge of it settles it. The next pull comes from the registry and fills them again. This is a watch and not a quota: what a host can pull in ten seconds has to fit in what is left past the limit. A host whose disk is small beside its line, or that hits the guard often, shortens the time, lowers the limit or gives that directory a disk of its own.
+
+**How to tell the limit was hit.** A pull fails with `toomanyrequests` and `You have reached your pull rate limit`, in the job's log and in the Docker Engine's, and a mirror logs the same `429` in `journalctl -u billet-registry@docker-io` when it is the one that met it. What an address has left is in the `ratelimit-remaining` header of a `HEAD` of a manifest, which does not count as a pull; Docker's page above has the two commands. A mirror's own pulls count too, once per image rather than once per job. `billet check` says whether each mirror answers, or `NO DOCKER HUB MIRROR` when the site has none.
+
+**How to turn it off.** Set `billet_registry_mirrors: false` and converge. The role stops and removes the mirrors, their authority and the firewall ports, and takes `node.registry_mirrors` out of the node's configuration, which drains the node once, as adding it did. What they pulled stays, unless `billet_registry_mirrors_purge` is true. To use your own mirrors, name them in `node.registry_mirrors` in the inventory, with `node.registry_mirrors_ca` if no public authority signs them, and the role runs none.
+
 ## Seeing and stopping a cache
 
 ```bash
@@ -101,7 +163,7 @@ billet cache enable  --repository acme/api --kind git
 
 A block covers one cache or all of them, for an organisation or a repository, and so reaches the tiers whose caches belong to a repository: a repository target's, or one with `cache_scope`. The node asks it before attaching a cache, again every 30 seconds while a content-addressed cache is in use, and again before a deferred publication moves the pointer. A tier with no repository scope is nothing a block can name, so turn its caches off in its own `cache` block. A block an older binary wrote covers the Actions cache, which is all it ever meant.
 
-Each job's history records what every cache did: `warm` (it already held something the job used), `cold` (the job used it and it held nothing the job used), `disabled`, `unavailable` (the store failed and the job went on without it) or `unused`. A job whose outcome was not observed is counted as such, never as a miss.
+Each job's history records what every cache did: `warm` (it already held something the job used), `cold` (the job used it and it held nothing the job used), `disabled`, `unavailable` (the store failed and the job went on without it), `bypassed` (the node had stopped asking the store, so the job went on without it being asked) or `unused`. A job whose outcome was not observed is counted as such, never as a miss.
 
 ## Older nodes
 

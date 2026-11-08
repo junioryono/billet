@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -58,17 +59,19 @@ func TestARestartWaitsForAnAbandonedSessionRatherThanFailing(t *testing.T) {
 	t.Cleanup(func() { sessionRetryFor = original })
 
 	held := &heldSessions{refusals: 3}
-	s := &Server{prov: held, log: slog.New(slog.DiscardHandler), owner: "billet"}
+	tiers := []config.Tier{tier("linux")}
+	s := &Server{prov: held, log: slog.New(slog.DiscardHandler), owner: "billet",
+		alloc: newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)}
 
 	// DRIVEN THROUGH runTier, WHICH IS THE BRANCH THAT HAS TO DO THE WAITING.
 	//
 	// Calling openSession here instead would assert that the waiting works and
 	// nothing about whether anything waits: putting `s.prov.Session` back in
 	// runTier — which is exactly the line this change replaced — would leave such a
-	// test green while every restart went back to failing. runTier returns before
-	// building a listener, because the fake's answer after the refusals is an
-	// error, so this reaches the real call site without needing a live listener.
-	err := s.runTier(t.Context(), &config.Tier{Label: "linux"}, &ScaleSet{ID: 1}, s.prov)
+	// test green while every restart went back to failing. The listener opens the
+	// session once its cleanup loop runs (#783), so this runs a real one over a real
+	// allocator; the fake's answer after the refusals is an error, which ends its Run.
+	err := s.runTier(t.Context(), &tiers[0], &ScaleSet{ID: 1}, s.prov)
 
 	// It gets past the refusals: the error it ends on is the one AFTER them, not
 	// the conflict.

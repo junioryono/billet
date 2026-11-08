@@ -3,20 +3,21 @@ package state
 import (
 	"database/sql"
 	"fmt"
+	"slices"
 	"testing"
 )
 
 // ledgerAt75 is a ledger migrated to 75 and no further, so the next open applies
 // migration 76 and every one after it. rewindNewest takes back the newest, which is
-// the pool clearance's 80, and then 79, 78, 77 and 76 are undone.
+// the cache stores' 82, and then 81, 80, 79, 78, 77 and 76 are undone.
 //
-// IT REFUSES A NEWER BINARY, as rewindNewest does: a migration 81 would be the one
-// rewindNewest took back, and 80 would stay behind on a ledger this test still calls 75.
+// IT REFUSES A NEWER BINARY, as rewindNewest does: a migration 83 would be the one
+// rewindNewest took back, and 82 would stay behind on a ledger this test still calls 75.
 func ledgerAt75(t *testing.T) string {
 	t.Helper()
 
-	if latest := LatestSchemaVersion(); latest != 80 {
-		t.Fatalf("this binary's newest migration is %d; ledgerAt75 undoes 80 through 76 and must be "+
+	if latest := LatestSchemaVersion(); latest != 82 {
+		t.Fatalf("this binary's newest migration is %d; ledgerAt75 undoes 82 through 76 and must be "+
 			"taught each migration after 75 before it can stand for a ledger at 75", latest)
 	}
 
@@ -30,7 +31,7 @@ func ledgerAt75(t *testing.T) string {
 	rewindNewest(t, db)
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		for _, stmt := range []string{
+		for _, stmt := range append(slices.Concat(undoJobHistoryNode, undoPoolClearance),
 			`ALTER TABLE pool_orders DROP COLUMN release_contradicted`,
 			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
 			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,
@@ -53,7 +54,7 @@ func ledgerAt75(t *testing.T) string {
 			`DROP INDEX join_tokens_pool_order_idx`,
 			`ALTER TABLE join_tokens DROP COLUMN pool_order`,
 			`DELETE FROM schema_migrations WHERE version = 76`,
-		} {
+		) {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
 			}

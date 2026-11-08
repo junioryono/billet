@@ -241,6 +241,13 @@ type Listener struct {
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
 	beforePoolReconcile func()
+	// TEST-ONLY: a background poll has returned and been dated, and the loop has not yet
+	// received its answer, let alone taken it (dateEmptyAnswer). Nil in every deployment.
+	afterPollDated func()
+	// TEST-ONLY: the loop has received a background poll's answer, the poll aside has
+	// finished, and the loop has not yet taken it (dateEmptyAnswer). Nil in every
+	// deployment.
+	beforeAnswerTaken func()
 
 	// timings is where this listener reports its loop's times. lastAnswered is when
 	// its last poll was answered, on the loop's goroutine alone.
@@ -319,6 +326,9 @@ type Listener struct {
 	waitingFor  int
 	demandKnown bool
 	demandAt    time.Time
+	// answeredAt is when GitHub last answered this tier's poll with nothing new
+	// (dateEmptyAnswer). Guarded by mu; reported, never scheduled on.
+	answeredAt time.Time
 	// demandReleases is the tier's release generation read with the runner
 	// count waitingFor was made from (alloc.ActiveRunnersAt).
 	demandReleases int64
@@ -791,8 +801,9 @@ func (l *Listener) Run(ctx context.Context) error {
 
 		// A session recoverSession already closed carries no advertisement, so the
 		// release below is licensed without closing it twice; one whose close it
-		// started is awaited rather than closed again.
-		if !l.sessionClosed {
+		// started is awaited rather than closed again. Nor does a session that never
+		// opened: this listener advertised nothing.
+		if !l.sessionClosed && l.session != nil {
 			closeSession := func() error { return l.session.Close(closeCtx) }
 
 			// ASIDE WHILE A RECOVERY IS UNDER WAY: an open it left behind can hold
@@ -830,6 +841,20 @@ func (l *Listener) Run(ctx context.Context) error {
 
 		l.releaseAll(releaseCtx, destroyed)
 	}()
+
+	// THE SESSION OPENS AFTER THE CLEANUP LOOP STARTS (#783), for a listener built without
+	// one. GitHub refuses a successor's session while the one a stopped control plane left is
+	// active, measured refused at 60 s and open at 91 or 92 s, and nothing the cleanup loop
+	// does needs it: a completion's destroy goes to its node and its withdrawal to the REST
+	// API. Opened first, every completion owed at a restart waited that long to be destroyed,
+	// and a held VM past its bound with them.
+	if l.session == nil {
+		if err := l.openFirstSession(ctx); err != nil {
+			l.noteStop(ctx)
+
+			return err
+		}
+	}
 
 	if err := l.refreshAdoptedCapacity(ctx); err != nil {
 		l.noteStop(ctx)

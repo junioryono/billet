@@ -344,6 +344,60 @@ func (q *Queries) ListPoolClearanceTargets(ctx context.Context) ([]ListPoolClear
 	return items, nil
 }
 
+const listPoolIdleHosts = `-- name: ListPoolIdleHosts :many
+SELECT p.order_id, p.node_name, p.arch,
+       CAST(COALESCE((SELECT MAX(h.finished_at) FROM job_history h WHERE h.node = p.node_name), '') AS TEXT) AS last_finished,
+       CAST(COALESCE((SELECT MAX(e.decided_at) FROM node_enrollments e
+                       WHERE e.name = p.node_name AND e.state = 'approved'), '') AS TEXT) AS joined
+  FROM pool_orders p
+ WHERE p.state = 'placed' AND p.release_requested_at = '' AND p.node_name != '' AND p.join_hold = ''
+   AND NOT EXISTS (SELECT 1 FROM leases l
+                    WHERE COALESCE(l.node, l.target_node) = p.node_name AND l.phase NOT IN ('done','failed'))
+ ORDER BY p.order_id
+`
+
+type ListPoolIdleHostsRow struct {
+	OrderID      string
+	NodeName     string
+	Arch         string
+	LastFinished string
+	Joined       string
+}
+
+// The joined pool hosts that hold nothing, with when each last held something: the end of
+// its newest job and its node's admission, the later of which the scaler reads as the
+// start of its idleness (ADR-030). A host whose release was asked for, held for a person,
+// or not placed is none of them. COALESCE(node, target_node), as everywhere: an escrow
+// aimed at a host has committed its room.
+func (q *Queries) ListPoolIdleHosts(ctx context.Context) ([]ListPoolIdleHostsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPoolIdleHosts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPoolIdleHostsRow
+	for rows.Next() {
+		var i ListPoolIdleHostsRow
+		if err := rows.Scan(
+			&i.OrderID,
+			&i.NodeName,
+			&i.Arch,
+			&i.LastFinished,
+			&i.Joined,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPoolOrders = `-- name: ListPoolOrders :many
 SELECT order_id, source, scope, shape, location, arch, state, host_id, node_name, reason, first_attempt_at, updated_at,
        node_fingerprint, node_cert_serial, join_hold, release_requested_at, release_reason, release_contradicted,
@@ -386,6 +440,49 @@ func (q *Queries) ListPoolOrders(ctx context.Context) ([]PoolOrder, error) {
 			&i.ClearObservedAt,
 			&i.ClearGeneration,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPoolServingHosts = `-- name: ListPoolServingHosts :many
+SELECT p.arch, CAST(COUNT(*) AS BIGINT) AS hosts FROM pool_orders p
+ WHERE p.state = 'placed' AND p.release_requested_at = '' AND p.node_name != ''
+   AND EXISTS (SELECT 1 FROM nodes n WHERE n.name = p.node_name AND n.live = 1 AND n.drained = 0)
+ GROUP BY p.arch
+ ORDER BY p.arch
+`
+
+type ListPoolServingHostsRow struct {
+	Arch  string
+	Hosts int64
+}
+
+// Each architecture's hosts still serving: placed, no release asked for, and a node joined
+// from it that placement would use now, live and not drained. A node is linked to its
+// order when its enrollment is approved, before it registers; a decommission or a drain
+// keeps its row with drained set; and a control-plane start marks every node not live
+// until it reconnects. None of those serves. The floor an automatic release must leave is
+// counted from these, by the scaler and again in the release's own transaction, so a
+// release a person asked for meanwhile is counted too.
+func (q *Queries) ListPoolServingHosts(ctx context.Context) ([]ListPoolServingHostsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPoolServingHosts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPoolServingHostsRow
+	for rows.Next() {
+		var i ListPoolServingHostsRow
+		if err := rows.Scan(&i.Arch, &i.Hosts); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -531,6 +628,47 @@ func (q *Queries) MarkUncertainPoolOrderFound(ctx context.Context, arg MarkUncer
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const readPoolIdleHost = `-- name: ReadPoolIdleHost :one
+SELECT p.order_id, p.node_name, p.arch,
+       CAST(CASE WHEN EXISTS (SELECT 1 FROM nodes n WHERE n.name = p.node_name AND n.live = 1 AND n.drained = 0)
+                 THEN 1 ELSE 0 END AS BIGINT) AS serving,
+       CAST(COALESCE((SELECT MAX(h.finished_at) FROM job_history h WHERE h.node = p.node_name), '') AS TEXT) AS last_finished,
+       CAST(COALESCE((SELECT MAX(e.decided_at) FROM node_enrollments e
+                       WHERE e.name = p.node_name AND e.state = 'approved'), '') AS TEXT) AS joined
+  FROM pool_orders p
+ WHERE p.order_id = $1 AND p.state = 'placed' AND p.release_requested_at = '' AND p.node_name != ''
+   AND p.join_hold = ''
+   AND NOT EXISTS (SELECT 1 FROM leases l
+                    WHERE COALESCE(l.node, l.target_node) = p.node_name AND l.phase NOT IN ('done','failed'))
+`
+
+type ReadPoolIdleHostRow struct {
+	OrderID      string
+	NodeName     string
+	Arch         string
+	Serving      int64
+	LastFinished string
+	Joined       string
+}
+
+// One order's row of ListPoolIdleHosts, read again in the transaction that asks for its
+// release, so a host that took work since is not proposed, with whether its node is
+// serving (ListPoolServingHosts' predicate), which decides whether its release takes a
+// host from the floor.
+func (q *Queries) ReadPoolIdleHost(ctx context.Context, orderID string) (ReadPoolIdleHostRow, error) {
+	row := q.db.QueryRowContext(ctx, readPoolIdleHost, orderID)
+	var i ReadPoolIdleHostRow
+	err := row.Scan(
+		&i.OrderID,
+		&i.NodeName,
+		&i.Arch,
+		&i.Serving,
+		&i.LastFinished,
+		&i.Joined,
+	)
+	return i, err
 }
 
 const readPoolOrder = `-- name: ReadPoolOrder :one

@@ -107,6 +107,9 @@ type LeaseStore interface {
 	// job, from alloc's closed vocabularies, fenced on the epoch.
 	RecordCacheObservation(ctx context.Context, leaseID string, epoch int64,
 		obs alloc.CacheObservation) error
+	// RecordCacheStoreState keeps what a node's breaker says about its site's store,
+	// under the registration in force.
+	RecordCacheStoreState(ctx context.Context, node, incarnation string, report alloc.CacheStoreReport) error
 	// RecordLeaseUsage keeps what the host measured a lease's job do, fenced on
 	// the epoch; the ledger keeps the first report.
 	RecordLeaseUsage(ctx context.Context, leaseID string, epoch int64,
@@ -417,6 +420,9 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	// process saying what it already holds, and this route gives it no name and no work.
 	mux.HandleFunc("POST /v1/nodes/{node}/custody", h.forNode(h.claimCustody))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
+	// forNewWork, BECAUSE THE ROW IS READ UNDER THE REGISTRATION IN FORCE: a superseded
+	// process's word on its store would be taken as its replacement's.
+	mux.HandleFunc("POST /v1/nodes/{node}/cache-store", h.forNewWork(h.cacheStore))
 
 	return mux
 }
@@ -1766,9 +1772,13 @@ func (h *handler) cacheObservation(w http.ResponseWriter, r *http.Request) {
 	// one that arrives anyway is dropped, not recorded as something its wire
 	// does not carry, and the rest of the observation is kept.
 	dropped := false
-	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
-		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionNpmObservation && obs.Npm != "" {
+	wire, known := h.plane.NegotiatedWire(r.PathValue("node"), r.Header.Get(nodeapi.HeaderIncarnation))
+	if known && wire < nodeapi.VersionNpmObservation && obs.Npm != "" {
 		obs.Npm, dropped = "", true
+	}
+	// AND A WORD ITS WIRE DOES NOT CARRY is kept as what it was before the word.
+	if known && wire < nodeapi.VersionCacheBreaker {
+		obs = obs.WithoutBypassed()
 	}
 	// AN OBSERVATION THAT WAS ONLY THAT is answered as recorded: there is nothing
 	// its wire carries left to keep. Only one the drop emptied: an observation
@@ -1785,6 +1795,46 @@ func (h *handler) cacheObservation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.RecordCacheObservation(r.Context(), r.PathValue("lease"), req.Epoch, obs); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// cacheStore keeps what a node's breaker says about its site's store: telemetry, which
+// `billet status` says back and nothing decides from.
+func (h *handler) cacheStore(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.CacheStoreRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	since, err := time.Parse(time.RFC3339, req.Since)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, "a store's state must say when it began")
+
+		return
+	}
+	report := alloc.CacheStoreReport{
+		Store: req.Store, State: alloc.CacheStoreState(req.State), Since: since,
+		Failures: req.Failures, Reason: alloc.CacheStoreReason(req.Reason),
+	}
+	if err := report.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+
+	err = h.store.RecordCacheStoreState(r.Context(), r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation), report)
+	if errors.Is(err, alloc.ErrCacheStoreStale) {
+		writeErr(w, http.StatusConflict, nodeapi.CodeSuperseded, err.Error())
+
+		return
+	}
+	if err != nil {
 		writeStoreErr(w, err)
 
 		return

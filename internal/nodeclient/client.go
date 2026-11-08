@@ -1380,6 +1380,10 @@ func (c *Client) RecordCacheObservation(
 	if c.WireVersion() < nodeapi.VersionCacheObservation {
 		return nil
 	}
+	// A PLANE BELOW THE WORD REFUSES THE WHOLE OBSERVATION over it.
+	if c.WireVersion() < nodeapi.VersionCacheBreaker {
+		obs = obs.WithoutBypassed()
+	}
 	request := nodeapi.CacheObservationRequest{
 		Epoch:           epoch,
 		ImageCache:      string(obs.ImageCache),
@@ -1400,6 +1404,23 @@ func (c *Client) RecordCacheObservation(
 	}
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/cache"), request, nil)
+}
+
+// ReportCacheStore tells the control plane what this node's breaker is doing about its
+// site's store. A plane below the version has no such route and loses one diagnostic.
+// Before a registration there is no wire to ask, so it is the next one's to say again.
+func (c *Client) ReportCacheStore(ctx context.Context, report alloc.CacheStoreReport) error {
+	switch wire := c.WireVersion(); {
+	case wire == 0:
+		return errUnregistered
+	case wire < nodeapi.VersionCacheBreaker:
+		return nil
+	}
+
+	return c.do(ctx, http.MethodPost, c.nodePath("/cache-store"), nodeapi.CacheStoreRequest{
+		Store: report.Store, State: string(report.State), Since: report.Since.UTC().Format(time.RFC3339),
+		Failures: report.Failures, Reason: string(report.Reason),
+	}, nil)
 }
 
 // errUnregistered says the client has not negotiated a wire with the control

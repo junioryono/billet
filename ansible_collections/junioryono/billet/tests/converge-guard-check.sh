@@ -166,6 +166,7 @@ sections_ran="shared checks"
 "$python" "$here/holder_check.py"
 "$python" "$here/controller_list_check.py"
 "$python" "$here/ordinary_inputs_check.py"
+"$python" "$here/registry_mirrors_check.py"
 
 # --- connection-free resets, then the guard before host operations -----------
 "$python" - "$role_tasks" <<'PYPREPORDER'

@@ -234,7 +234,8 @@ func WithHeartbeatOverrunReport(fn func()) Option {
 // the client's own retries rather than return, because a listener returning
 // stops every listener of the control plane, on every target (#207). open must
 // wait out ErrSessionHeld itself, since the session being replaced may not have
-// closed.
+// closed. A listener built without a session opens its first one with it too,
+// once its cleanup loop is running (#783).
 func WithSessionReopen(open func(context.Context) (Session, error)) Option {
 	return func(l *Listener) { l.reopen = open }
 }

@@ -26,12 +26,14 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A recorded device number is never acted on until the kernel's table proves it is still the volume's.**
 - **A discard is storage, not compute, and never runs on the node's command path (#223).**
 - **On Ceph, a discard moves to the trash and the node's sweep deletes (#280, #292).**
+- **A superseded generation outlives its last use by an hour, not its key's retention (#799).**
 - **A compaction is a clone and a flatten, never `rbd cp`.**
 - **Every cache image carries object-map, and every command that changes one keeps the kernel client (#394).**
 - **Storage background work yields to jobs (#394).**
 - **An intact orphan volume is reclaimed by an operator, on proof, through the trash (#301).**
 - **A kernel mapping no job accounts for is unmapped on proof, never forced, and counted (#494).**
 - **A golden's system disk is the builder's clone, renamed in place, and nothing that sweeps the cache pool takes it (#508).**
+- **A breaker per node and store stops jobs asking a store that has stopped answering, and decides nothing else (#531).**
 
 ### A store of whole objects, on EC2: [references/objects.md](references/objects.md)
 

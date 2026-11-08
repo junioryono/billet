@@ -124,6 +124,92 @@ func TestTheEvidenceSaysEachJobsTrustOriginPlacementAndCaches(t *testing.T) {
 	}
 }
 
+// THE WAIT COUNTS A JOB GITHUB STARTED, READ AS THE WAIT READS IT. Three leases are
+// staged through the real allocator and read back through readAcceptanceJobs: one a
+// job started on and finished; one an assignment bought whose launch failed, which
+// records the run before the compute exists, so GitHub may still hand its job to
+// another runner that would count it again; and a runner that ended with no job.
+// Only the first is the run's.
+func TestTheWaitCountsOnlyALeaseGitHubStartedAJobOn(t *testing.T) {
+	t.Parallel()
+
+	ws := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), filepath.Join(t.TempDir(), "acc"))
+	stateDir := filepath.Join(filepath.Dir(ws.ConfigPath), "server")
+	ledgertest.Seed(t, stateDir)
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		t.Fatalf("load the derived config: %v", err)
+	}
+	tier := cfg.Tiers[0]
+	db, err := state.Open(t.Context(), stateDir)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: tier.Node, Provider: config.ProviderDocker, VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	stage := func(assigned bool, through ...alloc.Phase) *alloc.Lease {
+		t.Helper()
+		lease, err := a.Reserve(t.Context(), tier.Label)
+		if err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+		if assigned {
+			if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 4242, 7); err != nil {
+				t.Fatalf("Assign: %v", err)
+			}
+		}
+		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, tier.Node); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+		for _, phase := range through {
+			if err := a.Advance(t.Context(), lease.ID, lease.Epoch, phase); err != nil {
+				t.Fatalf("Advance to %s: %v", phase, err)
+			}
+		}
+
+		return lease
+	}
+	ran := stage(true, alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy)
+	if err := a.Release(t.Context(), ran.ID, ran.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("release the job that ran: %v", err)
+	}
+	launchFailed := stage(true, alloc.PhaseLaunching)
+	if err := a.ReleaseFailed(t.Context(), launchFailed.ID, launchFailed.Epoch, "launch refused"); err != nil {
+		t.Fatalf("fail the launch: %v", err)
+	}
+	unused := stage(false, alloc.PhaseAssigned, alloc.PhaseLaunching, alloc.PhaseOnline)
+	if err := a.Release(t.Context(), unused.ID, unused.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("release the runner that ran nothing: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the ledger: %v", err)
+	}
+
+	jobs, err := readAcceptanceJobs(t.Context(), ws)
+	if err != nil {
+		t.Fatalf("readAcceptanceJobs: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("the wait read %d jobs, want the three staged: %+v", len(jobs), jobs)
+	}
+	for i := range jobs {
+		if jobs[i].LeaseID == launchFailed.ID && jobs[i].RunID == 0 {
+			t.Fatalf("the failed launch's history carries no run, so it proves nothing here: %+v", jobs[i])
+		}
+	}
+	got := newTerminalJobs(jobs, map[string]bool{})
+	if len(got) != 1 || got[0].LeaseID != ran.ID {
+		t.Errorf("the wait counted %+v; want only lease %s, the one GitHub started a job on", got, ran.ID)
+	}
+}
+
 // A HISTORY ROW THAT CANNOT BE READ IS SAID SO ON ITS JOB, and the rest of the
 // evidence is still written: a lease listed in one read and gone by the next
 // must not cost the run the document that says what it held.

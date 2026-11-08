@@ -95,6 +95,10 @@ func (mtlsStore) RecordCacheObservation(context.Context, string, int64, alloc.Ca
 	return nil
 }
 
+func (mtlsStore) RecordCacheStoreState(context.Context, string, string, alloc.CacheStoreReport) error {
+	return nil
+}
+
 func (mtlsStore) EndedLeaseNode(context.Context, string) (string, error) {
 	return "", alloc.ErrLeaseNotFound
 }

@@ -20,6 +20,10 @@ const (
 const (
 	DefaultPoolInterval       = 30 * time.Second
 	DefaultPoolRefusalBackoff = 10 * time.Minute
+	// MinPoolIdleAfter is the shortest idle_after: the pool reads a tier's demand from
+	// reports up to five minutes old, so a host idle for less may be one a report has
+	// not yet said is wanted.
+	MinPoolIdleAfter = 5 * time.Minute
 )
 
 // PoolConfig is server.pool: a pool of rented bare metal the control plane orders
@@ -39,6 +43,11 @@ type PoolConfig struct {
 	// RefusalBackoff is how long a choice a source refused (no stock, a quota) is
 	// passed over before it is asked again, a Go duration.
 	RefusalBackoff string `yaml:"refusal_backoff,omitempty"`
+	// IdleAfter is how long a joined host must have held nothing before the pool asks
+	// for its release, a Go duration, at least MinPoolIdleAfter. The release then drains
+	// it and seals it only on proof it holds nothing (ADR-030). Empty, the pool never
+	// shrinks itself and a person releases a host.
+	IdleAfter string `yaml:"idle_after,omitempty"`
 	// Architectures says, per architecture, how many hosts the pool keeps and may
 	// hold, and where it orders them, in order of preference.
 	Architectures map[Arch]PoolArch `yaml:"architectures"`
@@ -109,6 +118,17 @@ func (p *PoolConfig) PoolRefusalBackoff() time.Duration {
 	}
 
 	return DefaultPoolRefusalBackoff
+}
+
+// PoolIdleAfter is how long a joined host must have held nothing before the pool asks
+// for its release, and whether the pool shrinks itself at all.
+func (p *PoolConfig) PoolIdleAfter() (time.Duration, bool) {
+	d, err := time.ParseDuration(p.IdleAfter)
+	if err != nil || d < MinPoolIdleAfter {
+		return 0, false
+	}
+
+	return d, true
 }
 
 // ShapeArch is the architecture a source's shape was declared with, and whether it
@@ -207,6 +227,13 @@ func (s *ServerConfig) validatePool() []error {
 		}
 		if d, err := time.ParseDuration(v); err != nil || d <= 0 {
 			errs = append(errs, fmt.Errorf("server.pool.%s %q must be a positive Go duration", field, v))
+		}
+	}
+	if p.IdleAfter != "" {
+		if d, err := time.ParseDuration(p.IdleAfter); err != nil || d < MinPoolIdleAfter {
+			errs = append(errs, fmt.Errorf("server.pool.idle_after %q must be a Go duration of at least %s: "+
+				"the pool reads demand from reports up to that old, so a shorter one could release a host "+
+				"a report has not yet said is wanted", p.IdleAfter, MinPoolIdleAfter))
 		}
 	}
 

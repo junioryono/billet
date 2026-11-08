@@ -373,6 +373,7 @@ func (c *Config) applyDefaults() {
 		c.Node.Ceph.normalize()
 		c.Node.Cache.normalize()
 		c.Node.RegistryMirrors.normalize()
+		c.Node.RegistryMirrorsCA = strings.TrimSpace(c.Node.RegistryMirrorsCA)
 		c.Node.Firecracker.Normalize()
 		c.Node.Tart.Normalize()
 

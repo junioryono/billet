@@ -25,12 +25,24 @@ type runnerlessPool struct {
 	results   []recordedResult
 }
 
+// runnerlessTiers is the one tier a runnerless pool runs.
+func runnerlessTiers() []config.Tier { return []config.Tier{tier("billet-4vcpu-a")} }
+
 func newRunnerlessPool(t *testing.T, assigned ...dispatch.Job) *runnerlessPool {
 	t.Helper()
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	return newRunnerlessPoolOver(t,
+		newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, runnerlessTiers()), assigned...)
+}
+
+// newRunnerlessPoolOver is newRunnerlessPool over an allocator the test built, for one that writes
+// to its ledger otherwise.
+func newRunnerlessPoolOver(t *testing.T, a *alloc.Allocator, assigned ...dispatch.Job) *runnerlessPool {
+	t.Helper()
+
+	tiers := runnerlessTiers()
 	p := &runnerlessPool{
-		a:        newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers),
+		a:        a,
 		session:  &fakeSession{},
 		registry: &fakeRunnerRegistry{busy: map[string]bool{}},
 	}

@@ -754,13 +754,12 @@ func poolLaunchBatchFor(t *config.Tier) int {
 	return 1
 }
 
-// runTier opens a session on the tier's target and runs one listener on it.
+// runTier runs one listener for the tier, which opens its session on the tier's target.
+//
+// THE LISTENER OPENS IT, after its cleanup loop starts (#783): opened here, every completion a
+// restart restored waited for GitHub to give up the stopped control plane's session before any
+// of them was destroyed, a held VM past its bound included.
 func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, prov Provisioner) error {
-	session, err := s.openSession(ctx, t, set, prov)
-	if err != nil {
-		return err
-	}
-
 	// The LISTENER closes the session, not this function. Closing has to happen
 	// before the escrow is released, and splitting the two across functions is
 	// what put them in the wrong order: Go runs Run's defer first, so the escrow
@@ -784,7 +783,7 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 		opts = append(opts, WithGitHubTarget(target.Config.Path()))
 	}
 
-	return NewListener(s.alloc, t.Label, session, opts...).Run(ctx)
+	return NewListener(s.alloc, t.Label, nil, opts...).Run(ctx)
 }
 
 // openSession takes this tier's message session, waiting out one an abandoned

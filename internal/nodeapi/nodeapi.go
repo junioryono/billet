@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 46
+	Version = 47
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -605,6 +605,18 @@ const (
 	// nothing.
 	VersionJobAttach = 45
 
+	// VersionCacheBreaker is the version from which a cache observation may say
+	// `bypassed`, what a job got when its node's breaker had stopped asking the site's
+	// store (#531), and from which a node may report what the breaker is doing
+	// (POST /v1/nodes/{node}/cache-store), which `billet status` says back.
+	//
+	// DIAGNOSTICS, reported rather than refused. CHECKED WHERE THEY ARE SENT, because
+	// an older plane validates an observation's words and would refuse the whole of
+	// one over this, and has no such route: below it the node says `unavailable`,
+	// which is true as far as it goes, and sends no report. CHECKED WHERE THE WORD IS
+	// READ too, so a pairing below it that sends one anyway is kept as `unavailable`.
+	VersionCacheBreaker = 46
+
 	// VersionCustodyClaim is the version from which a superseded process may claim
 	// the leases it holds in custody on the controller that serves now
 	// (ClaimCustodyRequest), because a controller's ownership record does not
@@ -617,7 +629,7 @@ const (
 	// which then waits as it always did. A node asks whatever it negotiated, since
 	// that was with another controller and the answer settles it with this one. An
 	// older node never asks, and the plane needs no gate.
-	VersionCustodyClaim = 46
+	VersionCustodyClaim = 47
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

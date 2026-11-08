@@ -58,6 +58,7 @@
       - iproute2
       - kmod
       - nftables
+      - openssl
       - util-linux
     state: present
     update_cache: true

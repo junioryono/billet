@@ -32,7 +32,7 @@ On AWS the same contract is EBS snapshots for generations and an S3 object for t
 - **Sticky disks**: an ext4 volume mounted into one job under a key you choose, published in a post step (`actions/stickydisk`).
 - **BuildKit state**: a per-job BuildKit daemon whose whole state lives on a sticky disk (`actions/setup-docker-builder`, `build-push-action`), with a per-mount ceiling from the tier's `buildkit_cache_mount_limit`.
 - **The Docker image store**: guests request a deployment-, site- and architecture-scoped `/var/lib/docker` volume before the runner starts, so image layers pulled by one job are there for the next.
-- **Registry mirrors**: three optional site-local mirrors for Docker Hub, GHCR and Quay, serving public content with no upstream credential.
+- **Registry mirrors**: three site-local mirrors for Docker Hub, GHCR and Quay, serving public content with no upstream credential. The host role runs them on every Firecracker host unless told otherwise ([Registry mirrors](../operating/build-caches.md#registry-mirrors)).
 - **The Actions cache**: `actions/cache` traffic served locally instead of crossing the internet, on Linux Firecracker tiers that opt in ([Transparent Actions cache](../operating/actions-cache.md)).
 
 Firecracker reserves five hot-attach slots per guest; EC2 attaches owned volumes to the one-job instance at workflow runtime. macOS guests have no cache today.
