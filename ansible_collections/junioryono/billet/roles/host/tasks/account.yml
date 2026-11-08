@@ -605,7 +605,7 @@
   # and leaves one it did not write alone (it writes beside it and stops).
   when:
     - not billet_binary_upgrade | default(false)
-    - not billet_node_prepare_only | default(false)
+    - not billet_node_prepare_only | default(false) | bool
 
 # THE CONTROL PLANE'S ENVIRONMENT, and what it exists for is the PostgreSQL
 # ledger: `server.state.postgres.dsn_env` names a variable rather than carrying a

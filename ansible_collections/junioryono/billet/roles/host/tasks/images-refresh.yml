@@ -24,9 +24,10 @@
 - name: Apply guest image refresh unit changes
   ansible.builtin.meta: flush_handlers
 
-# NOT ARMED ON A NODE PREPARED FOR `billet join`, nor disarmed: its service reads
-# /etc/billet/billet.yaml, which only the join writes, and `billet local up`, the
-# join's last step, arms the timer itself. The units are installed either way.
+# NOT ARMED ON A NODE PREPARED FOR `billet join`, nor disarmed or removed below:
+# its service reads /etc/billet/billet.yaml, which only the join writes, and
+# `billet local up`, the join's last step, arms the timer itself. The units are
+# installed either way.
 - name: Enable the guest image refresh timer when the deployment updates itself
   ansible.builtin.systemd_service:
     name: billet-images-refresh.timer
@@ -55,6 +56,7 @@
     - not (billet_firecracker_enabled and billet_ceph_enabled)
     - billet_images_refresh_timer_unit.stat.exists
     - not ansible_check_mode
+    - not billet_node_prepare_only | default(false) | bool
   notify: billet unit files changed
 
 - name: Remove the guest image refresh units from a host that boots no guests
@@ -66,4 +68,6 @@
     - billet-images-refresh.service
   become: true
   notify: Reload systemd
-  when: not (billet_firecracker_enabled and billet_ceph_enabled)
+  when:
+    - not (billet_firecracker_enabled and billet_ceph_enabled)
+    - not billet_node_prepare_only | default(false) | bool

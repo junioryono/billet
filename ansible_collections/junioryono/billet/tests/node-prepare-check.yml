@@ -14,9 +14,12 @@
 #      drain owed: the role neither validates, renders, drains nor disables it.
 #   3. The guest image refresh units are installed and the timer is left unarmed,
 #      where the same tasks arm it on an ordinary host: its service reads the
-#      config only the join writes, and `billet local up` arms it.
+#      config only the join writes, and `billet local up` arms it. Nor is a timer
+#      the join armed disarmed or removed by a converge that provisions no Ceph.
 #   4. A binary source is refused before anything is staged: the role's upgrade
-#      transaction installs a config with the binary and restarts the node.
+#      transaction installs a config with the binary and restarts the node. So is
+#      the package's untouched template in place of a config, which the join would
+#      leave alone.
 #
 # A docker node, so the converge needs neither KVM nor disks; the Firecracker, Ceph
 # and network preparation the mode exists for are the same tasks an ordinary node
@@ -243,6 +246,40 @@
           The refresh timer was {{ billet_prepare_timer.stdout | trim }} on a node prepared
           for billet join and {{ billet_ordinary_timer.stdout | trim }} on an ordinary one.
 
+    # The timer the join's billet local up armed stands for the ordinary converge's.
+    - name: Converge a node prepared for billet join that provisions no Ceph over the armed timer
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: images-refresh.yml
+      vars:
+        billet_firecracker_enabled: true
+        billet_ceph_enabled: false
+        billet_node_prepare_only: true
+        billet_automatic_updates: true
+
+    - name: Ask systemd about the armed timer after that converge
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, billet-images-refresh.timer]
+      register: billet_prepared_teardown_timer
+      changed_when: false
+      failed_when: false
+
+    - name: Inspect the refresh units after that converge
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ item }}"
+      loop: [billet-images-refresh.service, billet-images-refresh.timer]
+      register: billet_prepared_teardown_units
+
+    - name: Require the armed timer and its units left as they were
+      ansible.builtin.assert:
+        that:
+          - billet_prepared_teardown_timer.stdout | trim == 'enabled'
+          - billet_prepared_teardown_units.results | map(attribute='stat.exists') | list == [true, true]
+        fail_msg: >-
+          A converge of a node prepared for billet join left the refresh timer
+          {{ billet_prepared_teardown_timer.stdout | trim }} and its units
+          {{ billet_prepared_teardown_units.results | map(attribute='stat.exists') | list }}.
+
     - name: Disarm the timer the ordinary converge armed
       ansible.builtin.systemd_service:
         name: billet-images-refresh.timer
@@ -309,6 +346,69 @@
         - name: Note how the pinned version was refused
           ansible.builtin.set_fact:
             billet_prepare_refused_version: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: Make the package's template directory
+      ansible.builtin.file:
+        path: /usr/share/billet
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Leave the package's untouched template where it seeds the config
+      ansible.builtin.copy:
+        content: "# billet's packaged starting config, as postinstall seeds it.\nserver: {}\n"
+        dest: "{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: [/usr/share/billet/billet.yaml, /etc/billet/billet.yaml]
+
+    - name: Converge over the package's seed
+      block:
+        - name: Converge the role over the seed
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+          vars:
+            billet_enable_server: "{{ billet_prepare_refusal_role.billet_enable_server }}"
+            billet_enable_node: "{{ billet_prepare_refusal_role.billet_enable_node }}"
+            billet_node_prepare_only: "{{ billet_prepare_refusal_role.billet_node_prepare_only }}"
+            billet_firecracker_enabled: "{{ billet_prepare_refusal_role.billet_firecracker_enabled }}"
+            billet_ceph_enabled: "{{ billet_prepare_refusal_role.billet_ceph_enabled }}"
+            billet_config: "{{ billet_prepare_refusal_role.billet_config }}"
+
+        - name: Note that the seed was not refused
+          ansible.builtin.set_fact:
+            billet_prepare_refused_seed: ""
+      rescue:
+        - name: Note how the seed was refused
+          ansible.builtin.set_fact:
+            billet_prepare_refused_seed: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: Read the seeded config after the refusal
+      ansible.builtin.stat:
+        path: /etc/billet/billet.yaml
+        checksum_algorithm: sha256
+      register: billet_prepare_seed_after
+
+    - name: Read the package's template
+      ansible.builtin.stat:
+        path: /usr/share/billet/billet.yaml
+        checksum_algorithm: sha256
+      register: billet_prepare_seed_template
+
+    - name: Require the seed refused and left as it was
+      ansible.builtin.assert:
+        that:
+          - "'is the package' in billet_prepare_refused_seed"
+          - billet_prepare_seed_after.stat.checksum == billet_prepare_seed_template.stat.checksum
+        fail_msg: "seed: {{ billet_prepare_refused_seed or 'not refused' }}"
+
+    - name: Remove the seed and the template
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: [/etc/billet/billet.yaml, /usr/share/billet]
 
     - name: Inspect whether anything was written or staged
       ansible.builtin.find:

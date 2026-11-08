@@ -171,6 +171,8 @@ func TestEveryDrainingStopTheRoleProvesIsJudgedByItsEnding(t *testing.T) {
 				"billet_node_unwanted_before.stdout_lines)",
 			when: []string{
 				"not billet_node_should_run",
+				// A node prepared for `billet join` is the join's to stop, never the role's.
+				"not billet_node_prepare_only | default(false) | bool",
 				"not ansible_check_mode",
 				"billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed'] or " +
 					"billet_node_unwanted_state_dir | length > 0 or billet_node_unwanted_state.rc != 4",
@@ -540,6 +542,8 @@ func TestAnOwedDrainIsRecordedFirstAndForgottenOnlyOnceProved(t *testing.T) {
 			"billet_previous_config.get('node') is mapping",
 			"billet_effective_config.get('node') is not mapping or billet_node_config_changed | default(billet_config_preview.changed | default(false)) | bool",
 			"not ansible_check_mode",
+			// A node prepared for `billet join` changes nothing of the join's config.
+			"not billet_node_prepare_only | default(false) | bool",
 		}, "\n")) {
 		t.Errorf("account.yml records the owed drain as %v (register %v) when %q, want the installed node state "+
 			"directory whenever the node is changed or rendered away", copied, account[record]["register"],

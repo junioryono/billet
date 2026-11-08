@@ -43,8 +43,9 @@
   block:
     # A NODE PREPARED FOR `billet join` NEVER TRANSACTS: the transaction installs
     # its staged config with the binary, and the join's config is the join's. So
-    # billet is the package's or the image's, already installed, and refused here,
-    # before anything is fetched or staged, both a source and its absence.
+    # billet is the release archive's binary or the image's, already installed, and
+    # refused here, before anything is fetched or staged, both a source and its
+    # absence.
     - name: Refuse a binary change, or no binary, on a node prepared for billet join
       ansible.builtin.assert:
         that:
@@ -55,9 +56,9 @@
         fail_msg: >-
           billet_node_prepare_only leaves the node's config to `billet join`, and the
           role's upgrade transaction installs a config with the binary and restarts
-          the node, so this mode never changes billet: install billet from its
-          package or the image before converging, and set none of billet_binary_src,
-          billet_version and billet_release_channel. A joined node is upgraded by its
+          the node, so this mode never changes billet: install billet's binary at
+          /usr/bin/billet from its release archive or the image before converging,
+          and set none of billet_binary_src, billet_version and billet_release_channel. A joined node is upgraded by its
           control plane's rollout.
       when: billet_node_prepare_only | default(false) | bool
 

@@ -1254,7 +1254,7 @@
 # its new process, and the transaction finished. Withdrawn unconditionally, so a
 # request a failed or resumed converge left behind does not keep later stops
 # draining.
-# On a node prepared for `billet join`, only a request this converge wrote (guest
+# On a node prepared for `billet join`, only a request this converge created (guest
 # networking's, over a node that was not up): any other is someone else's.
 - name: Withdraw the drain request now that the node is where this converge leaves it
   ansible.builtin.include_tasks: release-node-drain.yml
