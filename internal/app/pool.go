@@ -241,6 +241,11 @@ func PoolBoot(cfg *config.Config, prelude, fingerprint, order, token string) ([]
 	case cfg.GitHub != nil && cfg.GitHub.Repository != "":
 		join = append(join, "--repository", cfg.GitHub.Repository)
 	}
+	// WHAT INIT NEEDS AND THE JOIN CANNOT KNOW: a Firecracker node's config names its
+	// kernel image and Ceph identity, which the prelude prepared on the host.
+	if len(pc.InitArgs) > 0 {
+		join = append(append(join, "--"), pc.InitArgs...)
+	}
 	quoted := make([]string, len(join))
 	for i, a := range join {
 		// NO NUL IN A WORD OR THE PRELUDE: bash drops it, so what runs is not what was

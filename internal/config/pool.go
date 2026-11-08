@@ -38,6 +38,10 @@ type PoolConfig struct {
 	// BootPrelude is a script an ordered host runs on its first boot before `billet
 	// join`: it installs billet and what a Firecracker node needs. Absolute.
 	BootPrelude string `yaml:"boot_prelude"`
+	// InitArgs are the arguments an ordered host's `billet join` hands to `billet init`
+	// after `--`: a Firecracker node's kernel image and Ceph identity, at the paths the
+	// prelude prepared, which the node's generated config needs.
+	InitArgs []string `yaml:"init_args,omitempty"`
 	// Interval is how often the pool looks at demand and its orders, a Go duration.
 	Interval string `yaml:"interval,omitempty"`
 	// RefusalBackoff is how long a choice a source refused (no stock, a quota) is
@@ -220,6 +224,14 @@ func (s *ServerConfig) validatePool() []error {
 	if p.BootPrelude == "" || !filepath.IsAbs(p.BootPrelude) {
 		errs = append(errs, fmt.Errorf("server.pool.boot_prelude %q must be an absolute path to the script a "+
 			"host runs before it joins", p.BootPrelude))
+	}
+	// EACH ONE WORD OF THE BOOT, quoted as it is: a NUL bash drops and a line break would
+	// end the join's line, so either would make what runs not what was configured.
+	for i, a := range p.InitArgs {
+		if a == "" || strings.ContainsAny(a, "\x00\n\r") {
+			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word with no NUL "+
+				"or line break", i, a))
+		}
 	}
 	for field, v := range map[string]string{"interval": p.Interval, "refusal_backoff": p.RefusalBackoff} {
 		if v == "" {

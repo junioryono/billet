@@ -112,6 +112,8 @@ func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
 		"an unknown arch shape":   {"{type: s2.c2.small, arch: x64}", "{type: s2.c2.small, arch: sparc}", "not an architecture billet knows"},
 		"a non-metal aws shape":   {"- {type: z1d.metal, arch: x64}", "- {type: c7i.2xlarge, arch: x64}", "not a bare-metal type"},
 		"a bad bootstrap addr":    {"    boot_prelude:", "    bootstrap_addr: nowhere\n    boot_prelude:", "bootstrap_addr"},
+		"an init arg over lines":  {"    boot_prelude:", "    init_args: ['--kernel-image', \"a\\nb\"]\n    boot_prelude:", "init_args[1]"},
+		"an empty init arg":       {"    boot_prelude:", "    init_args: ['']\n    boot_prelude:", "init_args[0]"},
 		"an ipv6 wildcard join":   {"join_server: 10.77.0.10:7717", "join_server: '[::]:7717'", "join_server"},
 		"an empty shape type":     {"{type: s2.c2.small, arch: x64}", "{type: '', arch: x64}", "type is required"},
 		"an empty order":          {"        order:\n          - {source: aws-metal, shape: m7gd.metal, location: us-west-2a}", "        order: []", "order is empty"},
