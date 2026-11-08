@@ -50,7 +50,7 @@ func checkPoolInitArgs(args []string) []error {
 
 			continue
 		}
-		name, value, inline := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
+		name, _, inline := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-"), "=")
 		if !strings.HasPrefix(a, "-") || strings.HasPrefix(a, "---") || !slices.Contains(PoolInitFlags, name) {
 			errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q is not one of %v: every other flag of "+
 				"billet init is the join's to decide", i, a, PoolInitFlags))
@@ -68,8 +68,7 @@ func checkPoolInitArgs(args []string) []error {
 				break
 			}
 			i++
-			value = args[i]
-			if value == "" || strings.ContainsAny(value, "\x00\n\r") {
+			if value := args[i]; value == "" || strings.ContainsAny(value, "\x00\n\r") {
 				errs = append(errs, fmt.Errorf("server.pool.init_args[%d] %q must be one non-empty word with no "+
 					"NUL or line break", i, value))
 			}
