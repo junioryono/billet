@@ -90,21 +90,41 @@
       when: not billet_ceph_conf.stat.exists
 
 
+    # EACH NAMED DEVICE BY THE NAME CEPH REPORTS: the inventory names a disk by its
+    # kernel path (/dev/nvme0n1), and a device named by an alias (/dev/disk/by-id/...)
+    # is resolved to it, so the wait and the selection below compare like with like. A
+    # named device the host does not have fails here.
+    - name: Resolve each named OSD device to the path Ceph reports
+      ansible.builtin.command:
+        argv: [readlink, -e, "{{ item }}"]
+      loop: "{{ billet_ceph_devices }}"
+      register: billet_ceph_device_paths
+      changed_when: false
+      check_mode: false
+      become: true
+      when: billet_ceph_conf.stat.exists or not ansible_check_mode
+
     # ASKED AGAIN UNTIL IT NAMES EVERY DEVICE, BOUNDED. On a cluster this converge just
     # bootstrapped, cephadm has not yet inventoried the host's disks: on a fresh z1d.metal
     # (2026-11-08) the first answer did not list the named NVMe, so no OSD was added and
     # the pools' initialisation then waited on placement groups that had no OSD to land
-    # on. A device listed at all, available or already an OSD, ends the wait; a name the
-    # host never lists fails the converge here instead of being skipped.
+    # on. A device listed at all, available or already an OSD, ends the wait; a device
+    # the host never lists fails the converge here instead of being skipped. A read, so
+    # a dry run asks it too, of a cluster that exists; a dry run that only simulated the
+    # bootstrap has no cluster to ask.
     - name: Inspect Ceph's current device inventory
       ansible.builtin.command:
         argv: [ceph, orch, device, ls, --hostname, "{{ inventory_hostname }}", --format, json, --refresh]
       register: billet_ceph_device_inventory
       changed_when: false
+      check_mode: false
       become: true
+      when: billet_ceph_conf.stat.exists or not ansible_check_mode
+      vars:
+        billet_ceph_named_paths: "{{ billet_ceph_device_paths.results | map(attribute='stdout') | map('trim') | list }}"
       until: >-
         billet_ceph_device_inventory.rc == 0 and
-        (billet_ceph_devices | difference(
+        (billet_ceph_named_paths | difference(
           (((billet_ceph_device_inventory.stdout | from_json) | selectattr('devices', 'defined') | map(attribute='devices') | flatten(levels=1))
            + ((billet_ceph_device_inventory.stdout | from_json) | rejectattr('devices', 'defined') | list))
           | selectattr('path', 'defined') | map(attribute='path') | list)) | length == 0
@@ -118,18 +138,20 @@
     - name: Add each explicitly named available OSD device
       ansible.builtin.command:
         argv: [ceph, orch, daemon, add, osd, "{{ inventory_hostname }}:{{ item }}"]
-      loop: "{{ billet_ceph_devices }}"
+      loop: "{{ billet_ceph_device_paths.results | map(attribute='stdout') | map('trim') | list }}"
       vars:
         billet_ceph_inventory_entries: "{{ billet_ceph_device_inventory.stdout | from_json }}"
         billet_ceph_inventory_devices: >-
           {{ (billet_ceph_inventory_entries | selectattr('devices', 'defined') | map(attribute='devices') | flatten(levels=1))
              + (billet_ceph_inventory_entries | rejectattr('devices', 'defined') | list) }}
-      when: >-
-        item in (
-          billet_ceph_inventory_devices |
-          selectattr('available', 'defined') | selectattr('available', 'equalto', true) |
-          map(attribute='path') | list
-        )
+      when:
+        - billet_ceph_conf.stat.exists or not ansible_check_mode
+        - >-
+          item in (
+            billet_ceph_inventory_devices |
+            selectattr('available', 'defined') | selectattr('available', 'equalto', true) |
+            map(attribute='path') | list
+          )
       changed_when: true
       become: true
 
