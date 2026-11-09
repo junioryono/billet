@@ -549,13 +549,14 @@ func (s *CacheService) actionsKeysFor(
 		if session.trust != provider.TrustTrusted || s.actionRule == nil {
 			return actionsKeys{}, alloc.ActionsCacheSpliced
 		}
+		ask := s.policyMemo.begin(s.now())
 		policyCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
 		allowed, policyErr := s.actionRule.ActionsCacheAllowed(policyCtx,
 			session.owner, session.repository)
 		cancel()
-		answer := s.notePolicy(config.CacheActions, session.owner, session.repository, allowed, policyErr)
+		answer := s.notePolicy(config.CacheActions, session.owner, session.repository, allowed, policyErr, ask)
 		if answer == policyUnknown {
-			answer = s.rememberedPolicy(config.CacheActions, session.owner, session.repository, policyErr)
+			answer, _ = s.rememberedPolicy(config.CacheActions, session.owner, session.repository, policyErr)
 		}
 		switch answer {
 		case policyUnknown:
@@ -1101,6 +1102,10 @@ func (s *CacheService) finalizeActionsCache(
 	return s.publishActionsReceipt(ctx, session, receipt)
 }
 
+// errActionsPublicationRefused is a finalize the kill switch did not allow, as
+// the plane answered at that moment.
+var errActionsPublicationRefused = errors.New("the cache kill switch did not allow publishing this Actions cache entry")
+
 // publishActionsReceipt is called while session.mu is held. The receipt is
 // durable before the pointer CAS and complete before success is returned.
 func (s *CacheService) publishActionsReceipt(
@@ -1110,6 +1115,13 @@ func (s *CacheService) publishActionsReceipt(
 ) (*http.Response, error) {
 	if receipt.Complete {
 		return actionsReceiptResponse(receipt)
+	}
+	// A PUBLICATION ASKS THE KILL SWITCH NOW, on a retried finalize too: the
+	// reservation and its upload may have been served by a remembered answer
+	// while the plane was down, and what this publishes is what later jobs
+	// restore.
+	if !s.actionsPublicationAllowed(ctx, session) {
+		return nil, errActionsPublicationRefused
 	}
 	if receipt.Upload != "" {
 		return s.publishObjectReceipt(ctx, session, receipt)

@@ -152,7 +152,8 @@ func (s *CacheService) casVolume(
 	if !setting.Enabled {
 		return nil, errCacheOff
 	}
-	if err := casPolicyErr(s.sessionServingPolicy(ctx, session, kind)); err != nil {
+	answer, answered := s.sessionServingPolicyAt(ctx, session, kind)
+	if err := casPolicyErr(answer); err != nil {
 		return nil, err
 	}
 
@@ -194,7 +195,7 @@ func (s *CacheService) casVolume(
 
 	// DURABLE BEFORE IT IS MOUNTED, so a crash between the two leaves a record
 	// restart cleanup can find.
-	hv := &hostVolume{Kind: kind, Volume: volume, allowedAt: s.now()}
+	hv := &hostVolume{Kind: kind, Volume: volume, allowedAt: allowedAt(s.now(), answered)}
 	session.hosts[kind] = hv
 	if err := s.persistSession(session); err != nil {
 		delete(session.hosts, kind)
@@ -488,8 +489,9 @@ func (s *CacheService) openCASHandle(
 		// THE KILL SWITCH IS ASKED AGAIN WHILE THE VOLUME IS IN USE, not only
 		// when it is attached, so disabling a cache stops a running job's use of
 		// it within casPolicyAge.
-		if err = casPolicyErr(s.sessionServingPolicy(ctx, session, kind)); err == nil {
-			hv.allowedAt = s.now()
+		answer, answered := s.sessionServingPolicyAt(ctx, session, kind)
+		if err = casPolicyErr(answer); err == nil {
+			hv.allowedAt = allowedAt(s.now(), answered)
 		}
 	}
 	if err == nil && write && !hv.Dirty {

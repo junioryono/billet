@@ -1,8 +1,10 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -11,6 +13,147 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 )
+
+// rememberingService is a cache service with one trusted-only session that names a
+// repository, so every kill-switch question about it is asked of the plane.
+func rememberingService(t *testing.T, plane *planeSwitch) (*CacheService, *fakeCacheStore, string) {
+	t.Helper()
+
+	storage := &fakeCacheStore{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	service.SetCachePolicy(plane)
+	credentials, err := service.PrepareScoped("billet-one", CacheSessionScope{
+		Trust: provider.TrustTrusted, Owner: "acme", Repository: "api",
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+
+	return service, storage, credentials.Token
+}
+
+// A STICKY DISK ATTACHED BY A REMEMBERED ANSWER IS NOT PUBLISHED BY ONE: its
+// commit asks the plane, keeps the clone while the plane cannot answer, and
+// publishes once it can.
+func TestAStickyCommitIsNotPublishedByARememberedAnswer(t *testing.T) {
+	t.Parallel()
+
+	plane := &planeSwitch{}
+	service, storage, token := rememberingService(t, plane)
+	service.servingPolicy(t.Context(), config.CacheSticky, "acme", "api")
+	plane.mode.Store(switchUnreachable)
+
+	attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(1 << 30),
+	})
+	if attached.Code != http.StatusCreated {
+		t.Fatalf("attach with the plane down inside the age = %d: %s", attached.Code, attached.Body.String())
+	}
+	committed := cacheRequest(t, service, token, "/v1/volumes/0/commit", nil)
+	if committed.Code != http.StatusOK || !bytes.Contains(committed.Body.Bytes(), []byte(`"published":false`)) ||
+		!bytes.Contains(committed.Body.Bytes(), []byte("kill switch")) {
+		t.Fatalf("commit with the plane down = %d %s, want unpublished by the kill switch",
+			committed.Code, committed.Body.String())
+	}
+	if storage.published != 0 {
+		t.Fatalf("published %d time(s) by a remembered answer", storage.published)
+	}
+
+	plane.mode.Store(switchAllows)
+	if again := cacheRequest(t, service, token, "/v1/volumes/0/commit", nil); !bytes.Contains(again.Body.Bytes(),
+		[]byte(`"published":true`)) {
+		t.Fatalf("commit with the plane back = %d %s, want published", again.Code, again.Body.String())
+	}
+}
+
+// A DOCKER IMAGE STORE ATTACHED BY A REMEMBERED ANSWER IS NOT PUBLISHED BY ONE.
+func TestADockerStoreIsNotPublishedByARememberedAnswer(t *testing.T) {
+	t.Parallel()
+
+	plane := &planeSwitch{}
+	service, storage, token := rememberingService(t, plane)
+	service.servingPolicy(t.Context(), config.CacheDocker, "acme", "api")
+	plane.mode.Store(switchUnreachable)
+
+	if response := cacheRequest(t, service, token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+		t.Fatalf("Docker store with the plane down inside the age = %d: %s", response.Code, response.Body.String())
+	}
+	proof := map[string]any{"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true}}
+	settled := make(chan error, 1)
+	go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ready := cacheRequest(t, service, token, "/v1/docker-store/ready", proof)
+		if ready.Code == http.StatusOK {
+			break
+		}
+		if ready.Code != http.StatusConflict || time.Now().After(deadline) {
+			t.Fatalf("Docker store readiness status = %d: %s", ready.Code, ready.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	<-settled
+	if storage.published != 0 {
+		t.Fatalf("the Docker image store was published %d time(s) by a remembered answer", storage.published)
+	}
+}
+
+// AN ACTIONS CACHE ENTRY RESERVED AND UPLOADED BY A REMEMBERED ANSWER IS NOT
+// PUBLISHED BY ONE: finalize asks the plane, fails locally while it cannot
+// answer, and publishes on a retry once it can.
+func TestAnActionsFinalizeIsNotPublishedByARememberedAnswer(t *testing.T) {
+	t.Parallel()
+
+	service, storage, session, _ := testActionsService(t)
+	plane := &planeSwitch{}
+	service.SetActionsPolicy(plane)
+	create := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"remembered","version":"v1"}`)
+	response, _, err := service.actionsResponse(create, session)
+	if err != nil {
+		t.Fatalf("CreateCacheEntry: %v", err)
+	}
+	created := responseJSON(t, response)
+	uploadURL, ok := created["signed_upload_url"].(string)
+	if !ok || uploadURL == "" {
+		t.Fatalf("CreateCacheEntry response = %v", created)
+	}
+	plane.mode.Store(switchUnreachable)
+	upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "archive-body")
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	response, _, err = service.actionsResponse(upload, session)
+	if err != nil {
+		t.Fatalf("upload with the plane down inside the age: %v", err)
+	}
+	response.Body.Close()
+
+	finalizeBody := `{"key":"remembered","version":"v1","size_bytes":"12"}`
+	finalize := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
+	response, handled := service.actions.respond(finalize, session)
+	if !handled {
+		t.Fatal("a reserved finalize was passed to GitHub")
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway || storage.published != 0 || storage.current != "" {
+		t.Fatalf("finalize with the plane down: status=%d published=%d current=%q; want a local failure and no pointer",
+			response.StatusCode, storage.published, storage.current)
+	}
+
+	plane.mode.Store(switchAllows)
+	retry := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
+	response, _ = service.actions.respond(retry, session)
+	defer response.Body.Close()
+	if retried := responseJSON(t, response); retried["ok"] != true || storage.current != "next" {
+		t.Fatalf("finalize with the plane back = %v current=%q, want published", retried, storage.current)
+	}
+}
 
 // planeSwitch answers the kill switch as a plane does: allowing, refusing, or
 // not answering at all, as a restarting controller does.
@@ -43,12 +186,18 @@ func (p *planeSwitch) ActionsCacheAllowed(ctx context.Context, owner, repository
 	return p.CacheAllowed(ctx, config.CacheActions, owner, repository)
 }
 
+// noteAt records an answer about the npm cache to an ask begun at at, as
+// askKindPolicy does.
+func noteAt(memory *policyMemory, owner, repository string, allowed bool, at time.Time) {
+	memory.note(config.CacheNpm, owner, repository, allowed, memory.begin(at))
+}
+
 func TestPolicyMemoryKeepsAnAllowedAnswerForItsAgeOnly(t *testing.T) {
 	t.Parallel()
 
 	var memory policyMemory
 	start := time.Date(2026, 11, 9, 4, 46, 0, 0, time.UTC)
-	memory.note(config.CacheNpm, "Acme", "API", true, start)
+	noteAt(&memory, "Acme", "API", true, start)
 
 	if _, ok := memory.standing(config.CacheNpm, "acme", "api", start.Add(policyRememberedFor-time.Second)); !ok {
 		t.Fatal("an allowed answer younger than its age does not stand (names folded)")
@@ -72,11 +221,62 @@ func TestPolicyMemoryForgetsAnAllowedAnswerWhenTheSwitchRefuses(t *testing.T) {
 
 	var memory policyMemory
 	start := time.Date(2026, 11, 9, 4, 46, 0, 0, time.UTC)
-	memory.note(config.CacheNpm, "acme", "api", true, start)
-	memory.note(config.CacheNpm, "ACME", "api", false, start.Add(time.Second))
+	noteAt(&memory, "acme", "api", true, start)
+	noteAt(&memory, "ACME", "api", false, start.Add(time.Second))
 
 	if _, ok := memory.standing(config.CacheNpm, "acme", "api", start.Add(2*time.Second)); ok {
 		t.Fatal("an allowed answer outlived a later refusal")
+	}
+}
+
+// AN ANSWER THAT LEFT THE PLANE BEFORE A BLOCK REACHED IT, and arrives after a
+// refusal was noted, is not kept: two asks race, the one begun first answers
+// last.
+func TestPolicyMemoryKeepsNoAllowedAnswerThatRacedARefusal(t *testing.T) {
+	t.Parallel()
+
+	var memory policyMemory
+	start := time.Date(2026, 11, 9, 4, 46, 0, 0, time.UTC)
+	early := memory.begin(start)
+	noteAt(&memory, "acme", "api", false, start.Add(time.Second))
+	memory.note(config.CacheNpm, "acme", "api", true, early)
+
+	if _, ok := memory.standing(config.CacheNpm, "acme", "api", start.Add(2*time.Second)); ok {
+		t.Fatal("an allowed answer begun before a refusal was noted outlived it")
+	}
+
+	noteAt(&memory, "acme", "api", true, start.Add(3*time.Second))
+	if _, ok := memory.standing(config.CacheNpm, "acme", "api", start.Add(4*time.Second)); !ok {
+		t.Fatal("an allowed answer begun after the refusal is not kept")
+	}
+}
+
+// AN ANSWER IS DATED WHEN IT WAS ASKED, so a slow reply does not stand longer.
+func TestPolicyMemoryDatesAnAnswerWhenItWasAsked(t *testing.T) {
+	t.Parallel()
+
+	var memory policyMemory
+	start := time.Date(2026, 11, 9, 4, 46, 0, 0, time.UTC)
+	noteAt(&memory, "acme", "api", true, start)
+
+	answered, ok := memory.standing(config.CacheNpm, "acme", "api", start.Add(time.Minute))
+	if !ok || !answered.Equal(start) {
+		t.Fatalf("the remembered answer is dated %s (standing %t), want %s", answered, ok, start)
+	}
+}
+
+// A SESSION'S OWN WINDOW ENDS WHERE A REMEMBERED ANSWER STOPS STANDING.
+func TestASessionWindowNeverOutlivesTheRememberedAnswer(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 9, 5, 0, 0, 0, time.UTC)
+	if got := allowedAt(now, now); !got.Equal(now) {
+		t.Fatalf("a live answer's window starts at %s, want now", got)
+	}
+	answered := now.Add(-policyRememberedFor + time.Second)
+	if got := allowedAt(now, answered); !got.Add(casPolicyAge).Equal(answered.Add(policyRememberedFor)) {
+		t.Fatalf("a window from a remembered answer one second from its age ends at %s, want %s",
+			got.Add(casPolicyAge), answered.Add(policyRememberedFor))
 	}
 }
 
@@ -85,8 +285,8 @@ func TestPolicyMemoryDropsAnswersPastTheirAge(t *testing.T) {
 
 	var memory policyMemory
 	start := time.Date(2026, 11, 9, 4, 46, 0, 0, time.UTC)
-	memory.note(config.CacheNpm, "acme", "old", true, start)
-	memory.note(config.CacheNpm, "acme", "new", true, start.Add(policyRememberedFor))
+	noteAt(&memory, "acme", "old", true, start)
+	noteAt(&memory, "acme", "new", true, start.Add(policyRememberedFor))
 
 	memory.mu.Lock()
 	defer memory.mu.Unlock()
@@ -194,6 +394,7 @@ func TestACacheInUseIsServedThroughAControllerRestart(t *testing.T) {
 	if code := putObject(t, service, token, "before the restart"); code != http.StatusOK {
 		t.Fatalf("PUT with the plane answering = %d", code)
 	}
+	answered := now
 	plane.mode.Store(switchUnreachable)
 	now = now.Add(casPolicyAge)
 	asked := plane.asked.Load()
@@ -203,9 +404,14 @@ func TestACacheInUseIsServedThroughAControllerRestart(t *testing.T) {
 	if plane.asked.Load() == asked {
 		t.Fatal("the write was not asked of the switch again, so the memory decided nothing")
 	}
-	now = now.Add(policyRememberedFor)
-	if code := putObject(t, service, token, "long after"); code == http.StatusOK {
-		t.Fatalf("PUT with the plane down past the age = %d, want refused", code)
+	now = answered.Add(policyRememberedFor - time.Second)
+	if code := putObject(t, service, token, "a second before the age"); code != http.StatusOK {
+		t.Fatalf("PUT with the plane down a second inside the age = %d, want 200", code)
+	}
+	// THE SESSION'S OWN THIRTY SECONDS DO NOT CARRY IT PAST THE AGE.
+	now = answered.Add(policyRememberedFor)
+	if code := putObject(t, service, token, "at the age"); code == http.StatusOK {
+		t.Fatalf("PUT with the plane down at the age = %d, want refused", code)
 	}
 }
 

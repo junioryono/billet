@@ -1773,6 +1773,11 @@ func (s *CacheService) publishDocker(
 	if err := s.attacher.DetachVolume(ctx, session.instance, 0, attachment.Volume.Device); err != nil {
 		return fmt.Errorf("detach Docker image store: %w", err)
 	}
+	// A PUBLICATION ASKS THE KILL SWITCH NOW: the store may have been attached
+	// by a remembered answer while the plane was down.
+	if !s.sessionKindAllowed(ctx, session, config.CacheDocker) {
+		return errors.New("the cache kill switch did not allow publishing the Docker image store")
+	}
 
 	lease, fence, err := s.acquireWriter(ctx, attachment, session.instance)
 	if err != nil {
@@ -2090,6 +2095,17 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 			return
 		}
 		writeCacheJSON(w, http.StatusOK, map[string]any{"published": false, "reason": reason})
+
+		return
+	}
+
+	// A PUBLICATION ASKS THE KILL SWITCH NOW: the disk may have been attached by
+	// a remembered answer while the plane was down. The clone stays in the
+	// session's custody for its cleanup, as when the store is not answering.
+	if !s.sessionKindAllowed(ctx, session, config.CacheSticky) {
+		writeCacheJSON(w, http.StatusOK, map[string]any{
+			"published": false, "reason": "the cache kill switch did not allow publishing it",
+		})
 
 		return
 	}
