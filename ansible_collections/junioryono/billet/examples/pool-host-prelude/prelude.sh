@@ -214,7 +214,16 @@ if [ ! -s "$work/disks.env" ]; then
 		exit 1
 	}
 	# Compared by kernel name, so a /dev/disk/by-id alias is not taken for another disk.
+	# A named OSD passes the same tests as a chosen one: the root's disk, or one holding
+	# anything, would be recorded for good and then left out by Ceph, with no OSD at all.
 	osd=$(readlink -f "$osd")
+	case $'\n'"$free"$'\n' in
+	*$'\n'"$osd"$'\n'*) ;;
+	*)
+		echo "prelude: PRELUDE_OSD_DEVICE is not a free disk (no partitions, nothing mounted, no signature)" >&2
+		exit 1
+		;;
+	esac
 	scratch=""
 	for d in "${disks[@]}"; do
 		[ "$d" = "$osd" ] || {
@@ -297,6 +306,14 @@ if [ -n "$scratch" ]; then
 	mkdir -p /etc/systemd/system/docker.service.d
 	printf '[Unit]\nRequiresMountsFor=/var/lib/docker /var/lib/ceph\n' \
 		>/etc/systemd/system/docker.service.d/billet-pool-scratch.conf
+	# The scheduled image refresh stages in its own private /var/tmp, on the small root;
+	# its staging is bound onto the scratch disk. Measured under systemd 255.4 on
+	# 2026-11-09 with the unit's PrivateTmp and ProtectSystem=strict: what the unit
+	# writes under /var/tmp/billet-images lands on the bound directory.
+	mkdir -p /var/lib/pool-scratch/images /etc/systemd/system/billet-images-refresh.service.d
+	printf '[Unit]\nRequiresMountsFor=/var/lib/pool-scratch\n[Service]\nBindPaths=%s\n' \
+		/var/lib/pool-scratch/images:/var/tmp/billet-images \
+		>/etc/systemd/system/billet-images-refresh.service.d/billet-pool-scratch.conf
 	systemctl daemon-reload
 	mkdir -p /var/lib/pool-scratch/images
 	staging=/var/lib/pool-scratch/images
@@ -402,44 +419,53 @@ pull+=("$image")
 # given what is left of PRELUDE_BUDGET_SECONDS from the prelude's start, and none begins
 # with under a minute left. The join's token lives two hours from the order, and the host
 # needs time after this to enroll.
-budget=${PRELUDE_BUDGET_SECONDS:-5400}
-# ROOM FIRST: a pull without room for the image's staging fails every attempt until the
-# budget is spent, so too little is refused now. 97 GB was the peak for the x86_64 image
-# of 2026-11-08; PRELUDE_STAGING_GB is the room required, in units of 10^9 bytes.
 #
-# A pull removes its own pull-* directory as it ends, and a pull killed by a reboot
-# cannot, so what one left is reclaimed first. Only while the image unit is not running:
-# it is the other pull into this staging, and its directory is not abandoned.
-need=${PRELUDE_STAGING_GB:-100}
-stage_dir=${staging:-/var/tmp/billet-images}
-mkdir -p "$stage_dir"
-case $(systemctl show -p ActiveState --value billet-pool-image-pull.service) in
-active | activating | reloading) ;;
-*) find "$stage_dir" -mindepth 1 -maxdepth 1 -type d -name 'pull-*' -exec rm -rf {} + ;;
-esac
-avail=$(df --output=avail -B1000000000 "$stage_dir")
-avail=${avail##*[!0-9 ]}
-avail=${avail//[[:space:]]/}
-[ "$avail" -ge "$need" ] || {
-	echo "prelude: the image's staging has ${avail} GB free and needs ${need}; see PRELUDE_STAGING_GB" >&2
-	exit 1
-}
-kernel=""
-while [ $((budget - SECONDS)) -gt 60 ]; do
-	timeout --kill-after=60 $((budget - SECONDS)) billet images pull --config "$work/preview/billet.yaml" \
-		"${pull[@]:5}" >"$work/kernel-pull.log" 2>&1 || true
-	if [ -d /var/lib/billet/kernels ]; then
-		kernel=$(find /var/lib/billet/kernels -maxdepth 1 -type f -name 'vmlinux-*' -printf '%T@ %p\n' |
-			sort -n | tail -1 | cut -d' ' -f2-)
-	fi
-	[ -z "$kernel" ] || break
-	sleep 30
-done
-[ -n "$kernel" ] || {
-	echo "prelude: no guest kernel was installed within the budget; see $work/kernel-pull.log" >&2
-	exit 1
-}
-install -m 0644 "$kernel" /var/lib/billet/kernels/vmlinux
+# ONCE: a run again finds the kernel an earlier run installed and pulls nothing. The image
+# unit that run started is then the one pull on this host, and a second beside it would
+# need the staging's room twice.
+if [ ! -s /var/lib/billet/kernels/vmlinux ]; then
+	budget=${PRELUDE_BUDGET_SECONDS:-5400}
+	# ROOM FIRST: a pull without room for the image's staging fails every attempt until
+	# the budget is spent, so too little is refused now. 97 GB was the peak for the x86_64
+	# image of 2026-11-08; PRELUDE_STAGING_GB is the room required, in 10^9 bytes.
+	#
+	# A pull removes its pull-* directory as it ends, and keeps it while a guest it booted
+	# is not proved gone. No guest outlives a reboot, so a directory last changed before
+	# this boot is abandoned and is reclaimed; anything newer is left alone.
+	need=${PRELUDE_STAGING_GB:-100}
+	stage_dir=${staging:-/var/tmp/billet-images}
+	mkdir -p "$stage_dir"
+	up=$(cut -d. -f1 /proc/uptime)
+	boot=$(($(date +%s) - up))
+	find "$stage_dir" -mindepth 1 -maxdepth 1 -type d -name 'pull-*' ! -newermt "@$boot" -exec rm -rf {} +
+	avail=$(df --output=avail -B1000000000 "$stage_dir")
+	avail=${avail##*[!0-9 ]}
+	avail=${avail//[[:space:]]/}
+	[ "$avail" -ge "$need" ] || {
+		echo "prelude: the image's staging has ${avail} GB free and needs ${need}; see PRELUDE_STAGING_GB" >&2
+		exit 1
+	}
+	kernel=""
+	while [ $((budget - SECONDS)) -gt 60 ]; do
+		timeout --kill-after=60 $((budget - SECONDS)) billet images pull --config "$work/preview/billet.yaml" \
+			"${pull[@]:5}" >"$work/kernel-pull.log" 2>&1 || true
+		if [ -d /var/lib/billet/kernels ]; then
+			kernel=$(find /var/lib/billet/kernels -maxdepth 1 -type f -name 'vmlinux-*' -printf '%T@ %p\n' |
+				sort -n | tail -1 | cut -d' ' -f2-)
+		fi
+		[ -z "$kernel" ] || break
+		sleep 30
+	done
+	[ -n "$kernel" ] || {
+		echo "prelude: no guest kernel was installed within the budget; see $work/kernel-pull.log" >&2
+		exit 1
+	}
+	# Renamed into place, since a run again trusts a kernel it finds there.
+	install -m 0644 "$kernel" /var/lib/billet/kernels/vmlinux.new
+	sync /var/lib/billet/kernels/vmlinux.new
+	mv /var/lib/billet/kernels/vmlinux.new /var/lib/billet/kernels/vmlinux
+	sync /var/lib/billet/kernels
+fi
 
 # THE IMAGE, ONCE THE NODE HAS REGISTERED: a transient unit waits for its acceptance
 # record and pulls, retrying, then stops. A run again leaves one that is running alone,
