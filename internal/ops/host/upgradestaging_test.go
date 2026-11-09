@@ -150,6 +150,73 @@ func TestAStagingThatOutrunsTheAnswersDeadlineIsRefused(t *testing.T) {
 	noClaim(t)
 }
 
+// THE RESOLVE SHARES THE ANSWER'S DEADLINE: a release server that never answers
+// the manifest leaves the updater refusing when the node stops listening, with
+// nothing claimed, never hung past it.
+func TestAResolveThatOutrunsTheAnswersDeadlineIsRefused(t *testing.T) {
+	withUpgradeRoot(t)
+
+	prev := newReleaseClient
+	newReleaseClient = func() *releasesource.Client {
+		return &releasesource.Client{HTTP: &http.Client{Transport: stalledRelease{}}}
+	}
+	t.Cleanup(func() { newReleaseClient = prev })
+
+	ack, answer := ackReader(t)
+	ack.deadline = time.Now().Add(300 * time.Millisecond)
+
+	started := time.Now()
+	err := startHostUpgradeHolding(t.Context(), processEnv(), &config.Config{}, "",
+		hostUpgradeTarget{pin: "v0.17.0", generation: 10}, ack, releasesource.Policy{}, heldTxLock(t))
+	if err == nil {
+		t.Fatal("a resolve that never answered succeeded")
+	}
+	if waited := time.Since(started); waited > 30*time.Second {
+		t.Fatalf("the resolve ran %s past the answer's deadline", waited)
+	}
+
+	ack.refuse(err)
+	if got := answer(); !strings.HasPrefix(got, node.AckRefused) {
+		t.Errorf("the node was answered %q, want a refusal", got)
+	}
+	noClaim(t)
+}
+
+// A STAGING THAT FINISHES AFTER THE ANSWER'S DEADLINE IS STILL REFUSED: the
+// deadline passes while the archive downloads, the staging completes, and the
+// check before the answer gives the claim back rather than accept into a node
+// that has stopped listening.
+func TestAStagingThatFinishesPastTheAnswersDeadlineIsRefused(t *testing.T) {
+	withUpgradeRoot(t)
+
+	prev := runningRelease
+	runningRelease = func() string { return "v0.16.0" }
+	t.Cleanup(func() { runningRelease = prev })
+
+	client, manifest := publishedArchive(t)
+	ack, answer := ackReader(t)
+	serve := client.HTTP.Transport
+	client.HTTP.Transport = roundTrip(func(req *http.Request) (*http.Response, error) {
+		// THE NODE STOPS LISTENING WHILE THE ARCHIVE IS ON ITS WAY; the staging's
+		// own context was set from the deadline before, so it finishes.
+		ack.deadline = time.Now().Add(-time.Second)
+
+		return serve.RoundTrip(req)
+	})
+
+	err := actOnResolved(t.Context(), processEnv(), &config.Config{}, "", hostUpgradeTarget{generation: 10},
+		ack, client, manifest, strings.Repeat("b", 64), heldTxLock(t))
+	if !errors.Is(err, errAnswerLate) {
+		t.Fatalf("a staging that finished past the deadline returned %v, want errAnswerLate", err)
+	}
+
+	ack.refuse(err)
+	if got := answer(); !strings.HasPrefix(got, node.AckRefused) {
+		t.Errorf("the node was answered %q, want a refusal", got)
+	}
+	noClaim(t)
+}
+
 // AN ACCEPTANCE THE NODE DID NOT TAKE STOPS THE TRANSACTION BEFORE ANYTHING IS
 // STOPPED (#817): the candidate staged, but nobody is listening, so the claim is
 // given back rather than a drain begun that the rollout does not know about.
@@ -171,23 +238,27 @@ func TestAnAcceptanceTheNodeDidNotTakeGivesTheClaimBack(t *testing.T) {
 	noClaim(t)
 }
 
-// A RESUME THAT ABANDONS A TRANSACTION THAT NEVER STAGED REFUSES A WAITING NODE:
-// nothing will be installed, so an acceptance would leave the rollout waiting
-// for a host that is not moving.
-func TestAResumeThatAbandonsRefusesTheNodeWaitingOnIt(t *testing.T) {
+// A RESUME ANSWERS NO NODE: one waiting on it is refused at once, through the
+// command itself, and the transaction on the machine is left as it was. A
+// resume that finished would drain past the node's wait, and one that abandoned
+// would be heard as an acceptance of nothing.
+func TestAResumeRefusesAnAnswerSocket(t *testing.T) {
 	withUpgradeRoot(t)
 
-	stageJournal(t, &hostupgrade.Journal{
+	journal := stageJournal(t, &hostupgrade.Journal{
 		FromVersion: "v0.34.0", ToVersion: "v0.35.0", Step: hostupgrade.StepClaimed,
 	})
 	ack, answer := ackReader(t)
 
-	if err := resumeHostUpgradeAnswering(t.Context(), processEnv(), &config.Config{}, ack); err != nil {
-		t.Fatalf("resuming a transaction that never staged: %v", err)
+	err := Upgrade(t.Context(), processEnv(), []string{"--resume", "--ack-path", ack.path})
+	if err == nil || !strings.Contains(err.Error(), "accepts no --ack-path") {
+		t.Fatalf("a resume given an answer socket returned %v, want it refused", err)
 	}
-	ack.accept()
-	if got := answer(); !strings.HasPrefix(got, node.AckRefused) || !strings.Contains(got, "never staged") {
-		t.Errorf("the node was answered %q, want a refusal saying the transaction never staged", got)
+	if got := answer(); !strings.HasPrefix(got, node.AckRefused) || !strings.Contains(got, "--ack-path") {
+		t.Errorf("the node was answered %q, want a refusal naming --ack-path", got)
+	}
+	if _, err := os.Stat(journal.Dir); err != nil {
+		t.Errorf("a refused resume touched the transaction: %v", err)
 	}
 }
 

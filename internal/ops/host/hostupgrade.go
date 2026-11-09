@@ -104,6 +104,18 @@ func Upgrade(ctx context.Context, env cli.Env, args []string) error {
 	ack := newUpgradeAck(*ackPath)
 	defer ack.close()
 
+	// A RESUME IS AN OPERATOR'S COMMAND, NEVER A DISPATCH. It finishes, unwinds or
+	// abandons a transaction already here, and none of those is a job a node can
+	// be told was taken: finishing drains for as long as the work takes, and
+	// abandoning installs nothing. No node passes both.
+	if *resume && *ackPath != "" {
+		err := errors.New("--resume continues the transaction already on this machine and answers " +
+			"no node; it accepts no --ack-path")
+		ack.refuse(err)
+
+		return err
+	}
+
 	if err := checkFleetInstruction(*rolloutID, *generation); err != nil {
 		ack.refuse(err)
 
@@ -142,7 +154,7 @@ func Upgrade(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	if *resume {
-		err := resumeHostUpgradeAnswering(ctx, env, cfg, ack)
+		err := resumeHostUpgrade(ctx, env, cfg)
 		if err != nil {
 			ack.refuse(err)
 		} else {
@@ -708,7 +720,7 @@ func startHostUpgradeHolding(ctx context.Context, env cli.Env, cfg *config.Confi
 		}
 	}
 
-	client := &releasesource.Client{}
+	client := newReleaseClient()
 
 	// BOUNDED BY WHEN A WAITING NODE STOPS LISTENING, the deadline the staging
 	// shares.
@@ -722,6 +734,10 @@ func startHostUpgradeHolding(ctx context.Context, env cli.Env, cfg *config.Confi
 
 	return actOnResolved(ctx, env, cfg, cfgPath, target, ack, client, manifest, digest, tx)
 }
+
+// newReleaseClient is the client a transaction resolves and stages through, a
+// seam so a test can stand a release server in for GitHub.
+var newReleaseClient = func() *releasesource.Client { return &releasesource.Client{} }
 
 // The transaction's two seams after the lock: the platform check and the
 // resolver, each a step a guarded host must never reach; and timerBarrier, a
@@ -1035,13 +1051,6 @@ func ledgerKindFor(cfg *config.Config) string {
 
 // resumeHostUpgrade continues or unwinds the transaction already on this machine.
 func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config) error {
-	return resumeHostUpgradeAnswering(ctx, env, cfg, newUpgradeAck(""))
-}
-
-// resumeHostUpgradeAnswering is resumeHostUpgrade answering a node that waits
-// on ack: a transaction it abandons is refused, since nothing will be
-// installed, and anything it finishes is the caller's to accept.
-func resumeHostUpgradeAnswering(ctx context.Context, env cli.Env, cfg *config.Config, ack *upgradeAck) error {
 	// A LIVE UPDATER IS NOT AN ABANDONED ONE, and nothing here could tell the
 	// difference before this lock existed. The claim survives a crash on purpose,
 	// so its presence proves a transaction was STARTED and says nothing about
@@ -1127,13 +1136,7 @@ func resumeHostUpgradeAnswering(ctx context.Context, env cli.Env, cfg *config.Co
 	// the archive); it is abandoned instead, and the rollout's next dispatch
 	// starts over.
 	if journal.Step == hostupgrade.StepClaimed {
-		if err := abandonUnstaged(env, tx.dir, journal); err != nil {
-			return err
-		}
-		ack.refuse(errors.New("the upgrade on this machine never staged its candidate, so it was " +
-			"abandoned and nothing will be installed; the rollout retries it"))
-
-		return nil
+		return abandonUnstaged(env, tx.dir, journal)
 	}
 
 	fmt.Fprintf(env.Stdout, "Resuming the upgrade %s -> %s, which reached %s.\n",
