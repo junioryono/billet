@@ -1545,6 +1545,17 @@ func (c *Client) purgeTrashEntries(ctx context.Context, budget *yieldBudget) (in
 
 				err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
 
+				// A MOVE INTO THE TRASH THAT WAS INTERRUPTED is finished, then
+				// deleted: librbd refuses to remove an entry still marked moving,
+				// every pass, for as long as nobody completes the move.
+				if isTrashMovePending(err) {
+					if resumeErr := c.resumeTrashMove(ctx, d.name); resumeErr != nil {
+						err = resumeErr
+					} else {
+						err = c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
+					}
+				}
+
 				mu.Lock()
 				switch {
 				case err == nil || isNoSuchFile(err):
@@ -2283,6 +2294,50 @@ func (c *Client) evictVolumes(ctx context.Context, olderThan time.Duration) erro
 type cacheTrashImage struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+// isTrashMovePending reports librbd refusing to remove a trash entry whose move
+// into the trash never finished: EUCLEAN (117) with its own words, both, since
+// 117 alone is not specific to the trash (Ceph v20.2.0, librbd/api/Trash.cc
+// Trash::remove). Seen on ubuntu-01 on 2026-11-09 for one cache volume moved on
+// 2026-11-08, refused on every purge since.
+func isTrashMovePending(err error) bool {
+	return exitedWith(err, 117) && strings.Contains(err.Error(), "pending moving to the trash")
+}
+
+// resumeTrashMove finishes an interrupted move of the image named name into the
+// cache pool's trash, which librbd does when asked to move a name its directory
+// no longer holds: it finds the trash entry of that name still marked moving and
+// completes it (Ceph v20.2.0, librbd/api/Trash.cc Trash::move by name).
+//
+// ONLY ON PROOF THE NAME IS GONE FROM THE POOL. Asked of a name the directory
+// still holds, the same command moves that live image into the trash instead;
+// billet's names carry a random suffix and are never reused, and `rbd info`
+// answering ENOENT is the proof. Anything else, a live image or an answer that
+// cannot tell, finishes nothing.
+func (c *Client) resumeTrashMove(ctx context.Context, name string) error {
+	if kind, _, ok := cacheImageName(name); !strings.HasPrefix(name, "billet-") && (!ok || kind != "v") {
+		return fmt.Errorf("ceph: %s is not an image billet named, so its interrupted trash move is left", bounded(name))
+	}
+	if err := checkCloneName(name); err != nil {
+		return err
+	}
+
+	handle := c.cfg.CachePool + "/" + name
+	_, err := c.rbdCmd(ctx, true, "info", handle)
+	switch {
+	case err == nil:
+		return fmt.Errorf("ceph: %s is still in the pool, so its interrupted trash move is not resumed", handle)
+	case !isNoSuchFile(err):
+		return fmt.Errorf("ceph: could not tell whether %s is still in the pool, so its interrupted trash "+
+			"move is not resumed: %w", handle, err)
+	}
+
+	if err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "mv", handle)...); err != nil {
+		return fmt.Errorf("ceph: finish the interrupted trash move of %s: %w", handle, err)
+	}
+
+	return nil
 }
 
 // isImageNotEmpty reports ENOTEMPTY (39): a copy-on-write child still reads the
