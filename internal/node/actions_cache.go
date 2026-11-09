@@ -549,18 +549,19 @@ func (s *CacheService) actionsKeysFor(
 		if session.trust != provider.TrustTrusted || s.actionRule == nil {
 			return actionsKeys{}, alloc.ActionsCacheSpliced
 		}
+		ask := s.policyMemo.begin(s.now())
 		policyCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
 		allowed, policyErr := s.actionRule.ActionsCacheAllowed(policyCtx,
 			session.owner, session.repository)
 		cancel()
-		if policyErr != nil {
-			s.log.Warn("Actions cache policy is unavailable",
-				"instance", session.instance, "owner", session.owner,
-				"repository", session.repository, "error", policyErr)
-
-			return actionsKeys{}, alloc.ActionsCacheSpliced
+		answer := s.notePolicy(config.CacheActions, session.owner, session.repository, allowed, policyErr, ask)
+		if answer == policyUnknown {
+			answer, _ = s.rememberedPolicy(config.CacheActions, session.owner, session.repository, policyErr)
 		}
-		if !allowed {
+		switch answer {
+		case policyUnknown:
+			return actionsKeys{}, alloc.ActionsCacheSpliced
+		case policyRefused:
 			return actionsKeys{}, alloc.ActionsCacheDisabled
 		}
 		prefix := func(version string) string {
@@ -576,7 +577,7 @@ func (s *CacheService) actionsKeysFor(
 	if !ok {
 		return actionsKeys{}, alloc.ActionsCacheSpliced
 	}
-	if !s.kindAllowed(ctx, config.CacheActions, session.cache.Owner, session.cache.Repository) {
+	if s.servingPolicy(ctx, config.CacheActions, session.cache.Owner, session.cache.Repository) != policyAllowed {
 		return actionsKeys{}, alloc.ActionsCacheDisabled
 	}
 	prefix := func(ref, version string) string {
@@ -1055,6 +1056,12 @@ func (s *CacheService) finalizeActionsCache(
 	if err := s.actionIO.Trim(ctx, s.actionsMountPath(session, archive)); err != nil {
 		return nil, fmt.Errorf("trim freed Actions cache blocks: %w", err)
 	}
+	// ASKED BEFORE A WRITER IS TAKEN, so a finalize the switch does not allow
+	// leaves no writer for anyone to give back; publishActionsReceipt asks again
+	// immediately before the pointer moves.
+	if err := s.actionsPublicationErr(ctx, session); err != nil {
+		return nil, err
+	}
 	lease, fence, err := s.store.AcquireWriter(ctx, archive.StoreKey,
 		session.instance+"/actions/"+archive.ID, cacheWriterTTL)
 	s.countedPublication(session.instance, "an Actions cache writer", err)
@@ -1128,6 +1135,15 @@ func (s *CacheService) publishActionsReceipt(
 		}
 	}
 	for attempt := range 2 {
+		// A PUBLICATION ASKS THE KILL SWITCH NOW, immediately before each attempt
+		// moves the pointer, after any reacquisition or lookup before it, and on
+		// a retried finalize too: the reservation and its upload may have been
+		// served by a remembered answer while the plane was down, and what this
+		// publishes is what later jobs restore. A refused receipt keeps its
+		// writer for a retry, and the session's cleanup gives it back.
+		if err := s.actionsPublicationErr(ctx, session); err != nil {
+			return nil, err
+		}
 		err = s.store.PublishCAS(ctx, receipt.StoreKey, "", receipt.Candidate,
 			receipt.Lease, receipt.Fence)
 		s.countedPublish(session.instance, err)

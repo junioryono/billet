@@ -606,6 +606,8 @@ func TestFinalizingALostArchiveIsRecordedAsUnavailable(t *testing.T) {
 
 // A RESERVED BLOB WHOSE POLICY CANNOT BE READ IS BILLET'S FAILURE: GitHub knows
 // nothing of the URL, so it is not a splice, and the kill switch is a refusal.
+// The reservation's own "allowed" stands for policyRememberedFor, so the
+// unreadable case is asked after it.
 func TestAReservedBlobWhosePolicyCannotBeReadIsRecordedAsUnavailable(t *testing.T) {
 	t.Parallel()
 
@@ -625,6 +627,8 @@ func TestAReservedBlobWhosePolicyCannotBeReadIsRecordedAsUnavailable(t *testing.
 			observer := &recordingObserver{}
 			service.SetCacheObserver(observer)
 			uploadURL, _ := reserveActionsUpload(t, service, session, "policy")
+			later := time.Now().Add(policyRememberedFor)
+			service.now = func() time.Time { return later }
 			service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
 				return tc.allowed, tc.err
 			}))
@@ -653,6 +657,30 @@ func TestAReservedBlobWhosePolicyCannotBeReadIsRecordedAsUnavailable(t *testing.
 				t.Fatalf("observer was told %v, want %v", told, tc.want)
 			}
 		})
+	}
+}
+
+// A RESERVED BLOB WHOSE POLICY CANNOT BE READ SOON AFTER IT WAS ALLOWED IS
+// SERVED: the reservation's "allowed" stands while the plane restarts.
+func TestAReservedBlobIsServedThroughAControllerRestart(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	uploadURL, _ := reserveActionsUpload(t, service, session, "restart")
+	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		return false, errors.New("dial tcp: connect: no route to host")
+	}))
+
+	response, handled := service.actionsProxy().respond(
+		actionsBlockRequest(t, uploadURL, "block", "YQ==", bytes.NewBufferString("a")), session)
+	if !handled || response.StatusCode != http.StatusCreated {
+		t.Fatalf("a reserved block with the plane down handled=%t status=%v; want a local 201", handled, response)
+	}
+	closeActionsResponse(t, response)
+	if told := observedActions(observer); len(told) != 1 || told[0] != alloc.ActionsCacheServed {
+		t.Fatalf("observer was told %v, want only the reservation's served", told)
 	}
 }
 
@@ -785,6 +813,8 @@ func TestAPolicyRefusalIsAnsweredPromptlyUnderABusyLock(t *testing.T) {
 
 	service, _, session, _ := testActionsService(t)
 	uploadURL, _ := reserveActionsUpload(t, service, session, "busy-policy")
+	later := time.Now().Add(policyRememberedFor)
+	service.now = func() time.Time { return later }
 	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
 		return false, errors.New("the policy service did not answer")
 	}))

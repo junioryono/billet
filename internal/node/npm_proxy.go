@@ -190,7 +190,7 @@ func (n *npmCache) intercept(ctx context.Context, w http.ResponseWriter, session
 		cacheable = false
 		n.note(session, alloc.BuildCacheUnavailable)
 	default:
-		if answer := n.service.sessionKindPolicy(ctx, session, config.CacheNpm); answer != policyAllowed {
+		if answer := n.service.sessionServingPolicy(ctx, session, config.CacheNpm); answer != policyAllowed {
 			cacheable = false
 			session.mu.Lock()
 			noteRefused(session, config.CacheNpm, answer)

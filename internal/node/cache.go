@@ -98,6 +98,9 @@ type CacheService struct {
 	actionIO   actionsVolumeManager
 	actionRule ActionsPolicy
 	policy     CachePolicy
+	// policyMemo is the kill switch's last "allowed" per cache and repository,
+	// which a job's cache is served by while the control plane cannot be asked.
+	policyMemo policyMemory
 	authority  CacheAuthorityReader
 	observer   CacheObserver
 	// remoteAPI serves Bazel's and Buck2's gRPC remote caches.
@@ -1263,9 +1266,23 @@ func (s *CacheService) cleanupSession(
 	}
 	// A FINALIZATION THAT NEVER COMPLETED LEFT ITS BLOCKS, its archive having become
 	// this receipt.
+	// AND A VOLUME'S LEFT ITS WRITER, which nothing else gives back: a
+	// publication the kill switch refused, or one that failed and was never
+	// retried, would hold the key from every other job until its lease ran out.
+	// Best effort, under one bound for all of them that this pass's own
+	// cancellation ends, because the session's lock is held: one the store does
+	// not answer ends with its lease.
+	releaseCtx, endReleases := context.WithTimeout(ctx, cacheCleanupMargin)
+	defer endReleases()
 	for _, receipt := range session.receipts {
 		if receipt.Upload != "" && !receipt.Complete {
 			s.releaseStagedBlocks(ctx, session, receipt.Upload)
+		}
+		if receipt.Upload == "" && !receipt.Complete && receipt.Lease.ID != "" && releaseCtx.Err() == nil {
+			if err := s.store.ReleaseWriter(releaseCtx, receipt.Lease, receipt.Fence); err != nil {
+				s.log.Warn("could not give back an unpublished Actions cache entry's writer; it ends with its lease",
+					"instance", session.instance, "key", receipt.StoreKey, "error", err)
+			}
 		}
 	}
 
@@ -1437,7 +1454,7 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 	setting := sessionSetting(session, config.CacheDocker)
-	if !setting.Enabled || !s.sessionKindAllowed(requestCtx, session, config.CacheDocker) {
+	if !setting.Enabled || !s.sessionServingAllowed(requestCtx, session, config.CacheDocker) {
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "the Docker image store is off for this job", http.StatusForbidden)
 
@@ -1661,6 +1678,14 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 		return err
 	}
 	defer session.mu.Unlock()
+
+	// A PUBLICATION ASKS THE KILL SWITCH NOW, before it takes the breaker's trial,
+	// which a refusal would hold without asking the store: the store may have been
+	// attached by a remembered answer while the plane was down. publishAcquired
+	// asks again immediately before the pointer moves.
+	if !s.sessionKindAllowed(ctx, session, config.CacheDocker) {
+		return errPublicationRefused
+	}
 
 	// ASKED AGAIN AFTER THE WAIT, in which the breaker may have moved, and for the trial
 	// on probation, which a publication can settle.
@@ -1891,7 +1916,7 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	}
 	// AN UNREADABLE SWITCH IS REFUSED AS AN OFF ONE IS; only what is recorded
 	// differs.
-	if answer := s.sessionKindPolicy(ctx, session, config.CacheSticky); answer != policyAllowed {
+	if answer := s.sessionServingPolicy(ctx, session, config.CacheSticky); answer != policyAllowed {
 		noteRefused(session, config.CacheSticky, answer)
 		http.Error(w, "sticky disks are off for this job", http.StatusForbidden)
 
@@ -2091,6 +2116,20 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		return
 	}
 
+	// A PUBLICATION ASKS THE KILL SWITCH NOW: the disk may have been attached by
+	// a remembered answer while the plane was down. The clone stays in the
+	// session's custody for its cleanup, as when the store is not answering.
+	refused := func() {
+		writeCacheJSON(w, http.StatusOK, map[string]any{
+			"published": false, "reason": errPublicationRefused.Error(),
+		})
+	}
+	if !s.sessionKindAllowed(ctx, session, config.CacheSticky) {
+		refused()
+
+		return
+	}
+
 	if !s.breaker.admit() {
 		storeNotAsked()
 
@@ -2124,6 +2163,11 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 
 		return
 	}
+	if errors.Is(err, errPublicationRefused) {
+		refused()
+
+		return
+	}
 	if err != nil {
 		s.nonFatalCommit(w, session, commitOperation(step), err)
 
@@ -2139,6 +2183,10 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 // is not the generation this disk was cloned from: another job published it since, or
 // the disk started cold beside one too large to clone.
 const supersededReason = "superseded: the key holds a generation this disk was not cloned from, and cas keeps it"
+
+// errPublicationRefused is a Docker image store or sticky disk publication the
+// kill switch did not allow, as the plane answered at that moment.
+var errPublicationRefused = errors.New("the cache kill switch did not allow publishing it")
 
 // publishStep names the step of publishAcquired that failed, for the caller's
 // own diagnostic.
@@ -2182,8 +2230,15 @@ func (s *CacheService) publishAcquired(
 		return storecontract.Candidate{}, stepRecordConsumed,
 			errors.Join(err, s.releaseWriter(ctx, lease, fence))
 	}
-	err = s.publish(ctx, attachment, candidate, lease, fence)
-	s.countedPublish(session.instance, err)
+	// ASKED AGAIN IMMEDIATELY BEFORE THE POINTER MOVES, after the writer's wait,
+	// which a last-write-wins publication can spend minutes in, and the snapshot:
+	// a block set meanwhile stops it.
+	err = s.publish(ctx, attachment, candidate, lease, fence, func() bool {
+		return s.sessionKindAllowed(ctx, session, attachmentKind(attachment))
+	})
+	if !errors.Is(err, errPublicationRefused) {
+		s.countedPublish(session.instance, err)
+	}
 	if err != nil {
 		return storecontract.Candidate{}, stepPublish, errors.Join(err, s.releaseWriter(ctx, lease, fence))
 	}
@@ -2308,13 +2363,21 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// publish moves an attachment's pointer to candidate. allowed asks the kill
+// switch immediately before each attempt, the first and a last-write-wins
+// rebase after its lookup, and a refusal is errPublicationRefused, which asked
+// the store nothing and is never counted as the store's failure.
 func (s *CacheService) publish(
 	ctx context.Context,
 	attachment *cacheAttachment,
 	candidate storecontract.Candidate,
 	lease storecontract.WriterLease,
 	fence storecontract.FencingToken,
+	allowed func() bool,
 ) error {
+	if !allowed() {
+		return errPublicationRefused
+	}
 	err := s.store.PublishCAS(ctx, attachment.Volume.Key, attachment.Volume.Generation,
 		candidate, lease, fence)
 	if attachment.Publication != publicationLWW || !errors.Is(err, storecontract.ErrConflict) {
@@ -2324,6 +2387,9 @@ func (s *CacheService) publish(
 	current, currentErr := s.store.Current(ctx, attachment.Volume.Key)
 	if currentErr != nil {
 		return errors.Join(err, currentErr)
+	}
+	if !allowed() {
+		return errPublicationRefused
 	}
 
 	return s.store.PublishCAS(ctx, attachment.Volume.Key, current, candidate, lease, fence)
