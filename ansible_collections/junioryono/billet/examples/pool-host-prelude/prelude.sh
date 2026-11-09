@@ -415,39 +415,46 @@ pull+=("$image")
 # anything leaves none, and a find of a missing directory fails the pipeline, which under
 # pipefail ended the boot on the first failed pull instead of retrying it (2026-11-09).
 #
-# A BUDGET, NOT A COUNT: a pull's download has no deadline of its own, so each attempt is
-# given what is left of PRELUDE_BUDGET_SECONDS from the prelude's start, and none begins
-# with under a minute left. The join's token lives two hours from the order, and the host
-# needs time after this to enroll.
+# A BUDGET, NOT A COUNT: a pull's download has no deadline of its own, so the attempts
+# share PRELUDE_BUDGET_SECONDS from the prelude's start, none begins with under a minute
+# left, and each is cut off at forty minutes (a whole pull took seventeen), so a stalled
+# one leaves time for another. The join's token lives two hours from the order, and the
+# host needs time after this to enroll.
 #
 # ONCE: a run again finds the kernel an earlier run installed and pulls nothing. The image
 # unit that run started is then the one pull on this host, and a second beside it would
 # need the staging's room twice.
-if [ ! -s /var/lib/billet/kernels/vmlinux ]; then
-	budget=${PRELUDE_BUDGET_SECONDS:-5400}
-	# ROOM FIRST: a pull without room for the image's staging fails every attempt until
-	# the budget is spent, so too little is refused now. 97 GB was the peak for the x86_64
-	# image of 2026-11-08; PRELUDE_STAGING_GB is the room required, in 10^9 bytes.
-	#
-	# A pull removes its pull-* directory as it ends, and keeps it while a guest it booted
-	# is not proved gone. No guest outlives a reboot, so a directory last changed before
-	# this boot is abandoned and is reclaimed; anything newer is left alone.
-	need=${PRELUDE_STAGING_GB:-100}
-	stage_dir=${staging:-/var/tmp/billet-images}
-	mkdir -p "$stage_dir"
-	up=$(cut -d. -f1 /proc/uptime)
-	boot=$(($(date +%s) - up))
-	find "$stage_dir" -mindepth 1 -maxdepth 1 -type d -name 'pull-*' ! -newermt "@$boot" -exec rm -rf {} +
+#
+# A pull removes its pull-* directory as it ends, and keeps it while a guest it booted is
+# not proved gone. No guest outlives a reboot, so a directory last changed before this
+# boot is abandoned and is reclaimed, on every run; anything newer is left alone.
+stage_dir=${staging:-/var/tmp/billet-images}
+mkdir -p "$stage_dir"
+up=$(cut -d. -f1 /proc/uptime)
+boot=$(($(date +%s) - up))
+find "$stage_dir" -mindepth 1 -maxdepth 1 -type d -name 'pull-*' ! -newermt "@$boot" -exec rm -rf {} +
+# ROOM FIRST, before either pull starts: one without room for the image's staging fails
+# every attempt. 97 GB was the peak for the x86_64 image of 2026-11-08;
+# PRELUDE_STAGING_GB is the room required, in 10^9 bytes.
+need=${PRELUDE_STAGING_GB:-100}
+room() {
+	local avail
 	avail=$(df --output=avail -B1000000000 "$stage_dir")
 	avail=${avail##*[!0-9 ]}
 	avail=${avail//[[:space:]]/}
 	[ "$avail" -ge "$need" ] || {
 		echo "prelude: the image's staging has ${avail} GB free and needs ${need}; see PRELUDE_STAGING_GB" >&2
-		exit 1
+		return 1
 	}
+}
+if [ ! -s /var/lib/billet/kernels/vmlinux ]; then
+	budget=${PRELUDE_BUDGET_SECONDS:-5400}
+	room
 	kernel=""
 	while [ $((budget - SECONDS)) -gt 60 ]; do
-		timeout --kill-after=60 $((budget - SECONDS)) billet images pull --config "$work/preview/billet.yaml" \
+		attempt=$((budget - SECONDS))
+		[ "$attempt" -le 2400 ] || attempt=2400
+		timeout --kill-after=60 "$attempt" billet images pull --config "$work/preview/billet.yaml" \
 			"${pull[@]:5}" >"$work/kernel-pull.log" 2>&1 || true
 		if [ -d /var/lib/billet/kernels ]; then
 			kernel=$(find /var/lib/billet/kernels -maxdepth 1 -type f -name 'vmlinux-*' -printf '%T@ %p\n' |
@@ -468,17 +475,19 @@ if [ ! -s /var/lib/billet/kernels/vmlinux ]; then
 fi
 
 # THE IMAGE, ONCE THE NODE HAS REGISTERED: a transient unit waits for its acceptance
-# record and pulls, retrying, then stops. A run again leaves one that is running alone,
-# and starts another in place of one that failed or finished.
+# record and pulls, retrying, each attempt cut off at an hour, then stops. A run again
+# leaves one that is running alone, and starts another in place of one that failed or
+# finished, once the staging has room for it.
 printf '%q ' "${pull[@]}" >"$work/image-pull.cmd"
 case $(systemctl show -p ActiveState --value billet-pool-image-pull.service) in
 active | activating | reloading) ;;
 *)
+	room
 	systemctl reset-failed billet-pool-image-pull.service >/dev/null 2>&1 || true
 	systemd-run --unit billet-pool-image-pull --no-block --property=Type=oneshot /bin/bash -c \
 		"until [ -s /var/lib/billet/node/image-acceptance.json ]; do sleep 10; done
-		for _ in \$(seq 1 10); do $(cat "$work/image-pull.cmd") >>$work/image-pull.log 2>&1 && exit 0; sleep 60; done
-		exit 1" >/dev/null
+		for _ in \$(seq 1 10); do timeout --kill-after=60 3600 $(cat "$work/image-pull.cmd") >>$work/image-pull.log 2>&1 && exit 0; sleep 60; done
+		exit 1" >>"$work/image-unit.log" 2>&1
 	;;
 esac
 echo "prelude: host prepared"

@@ -23,15 +23,15 @@ It is an example to copy and render, not a script the collection installs. Where
    - the guests' bridges on 10.240.0.0/23. The role's default 172.31.0.0/24 would put an AWS default VPC's resolver, 172.31.0.2, behind the first guest bridge.
 6. **Acknowledges the single OSD** (`mon_warn_on_pool_no_redundancy false`, `osd_pool_default_size 1`), and restarts Ceph's managers. One of the two that cephadm starts kept the default size it started with and reported `TOO_FEW_OSDS` until it was restarted. Until a pool site has a store, a pool host keeps only golden images, which are pulled again from the signed source, and per-job clones.
 7. **Installs the guest kernel** the node's config names, from a pull that is retried. A pull installs an image's paired kernel and then refuses to import until the node has registered and recorded what its control plane accepts (#584). This pull fetches and decompresses the whole image first, so it takes as long, and as much staging, as the import itself. The kernel is renamed into place, and a run again that finds it pulls nothing, so the image unit is the one pull on the host after the first run.
-8. **Leaves a transient unit,** `billet-pool-image-pull`, that waits for that record and then pulls and verifies the image.
+8. **Leaves a transient unit,** `billet-pool-image-pull`, that waits for that record and then pulls and verifies the image. Each of its attempts is cut off at an hour, so a stalled download reaches the next.
 
 Its output reaches the console the host source reads for the join's line, so no command that talks to a network writes there. What curl, apt, pip, Galaxy, the role, Ceph and the pulls say goes to logs in `/var/lib/billet-pool-prelude`. The script's own lines start `prelude:`, and a failure is reported by the line it stopped on; a local command that fails (a mount, say) may add its own error first.
 
 Retries:
 - each of these is retried, so one refused answer does not skip the join: the instance metadata requests, apt (update and install, whole, since its lock timeout does not cover the package lists' lock), pip (whole), Galaxy, the downloads, the disk scan, the role's converge (three times, whole), Ceph's settings and the kernel pull;
 - a download attempt that falls under 1 KB/s for a minute, or runs fifteen minutes, is abandoned and asked again, and none begins after twenty;
-- the kernel pull has no deadline of its own, so its attempts share a budget: `PRELUDE_BUDGET_SECONDS` from the prelude's start (default 5400, ninety minutes). Each attempt is cut off at what is left, and none begins with under a minute left. The join's token lives two hours from the order, and the host still has to enroll;
-- before the pull, the staging directory's free room is checked against `PRELUDE_STAGING_GB` (default 100, in units of 10⁹ bytes, for the 97 GB the x86_64 image of 2026-11-08 needed). Too little is refused at once rather than retried until the budget is spent. Set it for another image or architecture. A pull keeps its `pull-*` directory while a guest it booted is not proved gone, and no guest outlives a reboot. So before the check, a directory last changed before this boot is reclaimed, and anything newer is left alone.
+- the kernel pull has no deadline of its own, so its attempts share a budget: `PRELUDE_BUDGET_SECONDS` from the prelude's start (default 5400, ninety minutes). Each attempt is cut off at forty minutes or what is left, whichever is sooner, so a stalled one leaves time for another (a whole pull took seventeen), and none begins with under a minute left. The join's token lives two hours from the order, and the host still has to enroll;
+- before either pull starts (the kernel's, or a new image unit), the staging directory's free room is checked against `PRELUDE_STAGING_GB` (default 100, in units of 10⁹ bytes, for the 97 GB the x86_64 image of 2026-11-08 needed). Too little is refused at once rather than retried until the budget is spent. Set it for another image or architecture. A pull keeps its `pull-*` directory while a guest it booted is not proved gone, and no guest outlives a reboot. So on every run, a directory last changed before this boot is reclaimed, and anything newer is left alone.
 
 The S3 credentials reach curl on its standard input, never its arguments. They are written into its configuration only when every character is one a credential is made of, so no answer can add a configuration line of its own.
 
@@ -52,7 +52,7 @@ Write the exports below to a file, append the script's body without its comment 
 { cat exports.sh; tail -n +2 prelude.sh | sed '/^[[:space:]]*#/d'; } >/etc/billet/pool-prelude.sh
 ```
 
-The comments are why each step is there, and they cost room the payload does not have. The script with them is about 22.5 KB, past the 16384 bytes the control plane carries (it refuses a longer boot, naming `boot_prelude`). Without them it is about 12.1 KB. No line the script needs starts with `#`: the full-line comments inside its two YAML heredocs are YAML's own.
+The comments are why each step is there, and they cost room the payload does not have. The script with them is about 22.7 KB, past the 16384 bytes the control plane carries (it refuses a longer boot, naming `boot_prelude`). Without them it is about 12.2 KB. No line the script needs starts with `#`: the full-line comments inside its two YAML heredocs are YAML's own.
 
 The exports:
 
@@ -79,8 +79,8 @@ Also set `server.pool.init_args` to the same three flags the script gives `bille
 - `--ceph-keyring=/etc/ceph/ceph.client.billet.keyring`
 
 The whole payload carries a join token, so keep it to the source's API, and within EC2's 16384 bytes of user data. The control plane adds the join's line and a few lines around the prelude, under 1 KB. The sizes:
-- **The body without comments** is about 12.1 KB.
-- **Exports naming release URLs or S3 keys** add a few hundred bytes. Rendered with S3 keys it was 12 KB.
+- **The body without comments** is about 12.2 KB.
+- **Exports naming release URLs or S3 keys** add a few hundred bytes. Rendered with S3 keys it was 12.8 KB.
 - **A presigned link** adds about 1.9 KB. Two of them do not fit beside the control plane's lines, so use release URLs or S3 keys.
 
 Check the rendered file's size (`wc -c`) before pointing the pool at it.
@@ -99,13 +99,20 @@ Check the rendered file's size (`wc -c`) before pointing the pool at it.
 
   The last two runs there fetched from S3 with the instance's own credentials, and after a reboot the mounts and Ceph came back.
 
-  **The version before this one** (rendered the same way, 13.5 KB, its disks blank by `blkid`) ran twice on a fresh host. Each run printed only `prelude: host prepared`, and after a reboot Docker started after both mounts and Ceph was `HEALTH_OK`. On its second run GitHub reset the kernel pull's connection, and the run took the kernel the first had installed.
-
-  **This version** was rendered as above (comments stripped, presigned links, 14.4 KB) on another fresh host, as its user data. `PRELUDE_OSD_DEVICE` named the smaller volume by its `/dev/disk/by-id` alias. It ran twice, then the host was rebooted, and it ran a third time:
-  - **The console.** Each run exited 0, with `prelude: host prepared` the only line on the console.
+  **Three later versions,** each on a fresh host with the comment-stripped rendering as its user data and `PRELUDE_OSD_DEVICE` naming the smaller volume by its `/dev/disk/by-id` alias. Across them:
+  - **The console.** Every run exited 0, with `prelude: host prepared` the only line on the console. One run found systemd-run's "Running as unit" there, which now goes to a log.
   - **The disks.** The scan excluded the root disk, which booted as `nvme1n1` with the volumes on either side of it. The alias's disk took the OSD and the larger disk the staging, and the record kept both by their `by-id` names.
-  - **The renumbering.** After the reboot the kernel had renumbered them: root `nvme0n1`, the OSD `nvme1n1`. The third run resolved the record to the OSD's new name and handed the role that.
-  - **The rest.** The guard was released, Ceph was `HEALTH_OK` after every run and after the reboot, the kernel was installed within the budget's first attempt, and the image unit was left waiting for the node's acceptance record.
+  - **The renumbering.** After a reboot the kernel had renumbered them: root `nvme0n1`, the OSD `nvme1n1`. The next run resolved the record to the OSD's new name and handed the role that.
+  - **After every reboot,** the scratch disk and both bind mounts came back from `/etc/fstab`, Docker started after both, and Ceph was `HEALTH_OK` with its OSD up.
+  - **The kernel.** GitHub once reset a kernel pull's connection, and that run took the kernel an earlier one had installed.
+  - **The guard** was released.
+  - **The image unit** was left waiting for the node's acceptance record.
+
+  **This version,** rendered with S3 keys (12.8 KB) and fetching with the instance role's checked credentials, on the last of those hosts:
+  - **A run again** on the prepared host pulled nothing.
+  - **A missing kernel.** With the kernel removed and two `pull-*` directories planted, one dated before the boot and one after, a run reclaimed the first, kept the second, pulled and installed the kernel by rename, and left the staging empty.
+  - **A stopped image unit.** With the unit stopped, a run checked the room and started a new one whose attempts are bounded by `timeout`.
+  - **The refresh unit** showed the drop-in's bind of its staging onto the scratch disk.
 
   **Not part of these runs:** a join, the node's registration, and the image's import.
 - **Not proven:** a phoenixNAP host. It has no instance metadata service, so the address and the credential fetch here are AWS's.
