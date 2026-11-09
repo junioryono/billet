@@ -152,13 +152,13 @@ The `s1.c1.small` of 2026-11-05 is no longer in the catalogue, and this was the 
 - **One thread's speed was unchanged beside 95 busy processes.** `openssl speed -seconds 5 -bytes 16384 sha256` hashed 1,383 MB/s alone (no affinity set). Pinned to cpu 0 with `taskset` beside 95 busy-loop shells, whose placement was not recorded, it hashed 1,401 MB/s. The AWS method (above) differs, so compare within a row, not across.
 - **A Firecracker guest's hashing pipeline ran as fast as the host's in these runs.** Firecracker v1.13.1 booted its CI's 6.1.141 kernel and Ubuntu 24.04 rootfs with one vcpu and 1 GiB. The same pipeline, `head -c 2147483648 /dev/zero | sha256sum`, ran three times each on the host and in the guest, alone and beside 95 busy-loop shells:
 
-  | Where | Alone | 95 host cores busy |
+  | Where | Alone | Beside 95 busy-loop shells |
   |---|---|---|
   | Host | 2,348 to 2,419 ms | 2,579 to 2,608 ms |
   | Guest | 2,396 to 2,451 ms | 2,398 to 2,403 ms |
 
   Alone, the guest's times overlapped the host's, their mean about 2% higher (2,417 against 2,376 ms). Beside the busy shells the guest's did not change, while the host's mean rose about 9% (2,589 ms). Three runs of one pipeline on one host, so this characterises that workload here, not virtualisation's cost in general.
-- **NVMe.** An 8 GiB direct write (`dd oflag=direct`, 1 MiB blocks, after one warm-up write) took 3.25 s, 2.5 GiB/s. The read back took 3.09 s, 2.6 GiB/s. The root filesystem is LVM over the first NVMe.
+- **NVMe.** An 8 GiB direct write (`dd oflag=direct`, 1 MiB blocks, after one warm-up write) took 3.25 s, 2.5 GiB/s. The direct read back (`dd iflag=direct`) took 3.09 s, 2.6 GiB/s. The root filesystem is LVM over the first NVMe.
 - **What the API answers after a delete is still not measured.** These measurements had no API credentials at hand. The API client's order refusal is with phoenixNAP (#828): on 2026-11-09 its live chat, with Sales (the only group online; technical support is offered through their Slack), was asked to check that client's permissions now that a portal order works.
 
 ## Still to measure
