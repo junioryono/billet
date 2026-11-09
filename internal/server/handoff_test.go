@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -277,6 +279,81 @@ func TestAHandoffLeavesARecordedCompletionsDestroyToTheNextProcess(t *testing.T)
 	}
 	if !f.tore(22) {
 		t.Errorf("the handoff skipped a destroy the ledger does not hold:\n%s", f.log.String())
+	}
+}
+
+// WHAT A HANDOFF LEAVES, THE NEXT PROCESS DOES. A completion recorded the way a
+// message records it, whose destroy failed once, is left by the handoff's
+// teardown with its pending row and lease in the ledger; a fresh listener over
+// that ledger restores it, destroys the compute and releases the lease.
+func TestTheNextProcessDestroysWhatAHandoffLeft(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	p.l.completionStore = openState(t)
+	runner := p.launchedFor11(t)
+
+	started := job11
+	started.RunnerID, started.RunnerName = 77, runner.RunnerName
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("start job 11: %v", err)
+	}
+
+	fake, ok := p.l.runner.(*fakeRunner)
+	if !ok {
+		t.Fatalf("the pool's runner is a %T", p.l.runner)
+	}
+	destroy := fake.onDestroy
+	nodeBusy := true
+	fake.onDestroy = func(id int64) error {
+		if nodeBusy {
+			return errors.New("the node is still settling this job's cache")
+		}
+
+		return destroy(id)
+	}
+
+	finished := started
+	finished.Result = "Succeeded"
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{finished},
+		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
+		t.Fatalf("complete job 11: %v", err)
+	}
+	p.l.mu.Lock()
+	owed := p.l.cleanup[11]
+	p.l.mu.Unlock()
+	if owed == nil || owed.job.Result == "" {
+		t.Fatalf("the failed destroy left no obligation carrying the result: %+v", owed)
+	}
+
+	nodeBusy = false
+	p.l.handingOff = true
+	p.l.destroyAll(t.Context(), false, nil)
+	if slices.Contains(p.destroyed, 11) {
+		t.Fatal("the handoff destroyed job 11's compute itself")
+	}
+
+	rows, err := p.l.completionStore.PendingCompletions(t.Context(), p.l.tier)
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if !slices.ContainsFunc(rows, func(row state.PendingCompletion) bool {
+		return row.RequestID == 11 && !row.Retired && row.LeaseID == runner.LeaseID
+	}) {
+		t.Fatalf("the ledger does not hold job 11's completion with its lease for the next process: %+v", rows)
+	}
+
+	p.restartHeld(t, 0)
+	p.l.retryCleanup(t.Context())
+
+	if !slices.Contains(p.destroyed, 11) {
+		t.Fatalf("the next process did not destroy what the handoff left: destroyed %v", p.destroyed)
+	}
+	// A RELEASED LEASE IS NO LONGER A LIVE ONE, which is how the ledger answers.
+	if lease, err := p.a.Lease(t.Context(), runner.LeaseID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Errorf("job 11's lease after the next process destroyed its compute: %+v, %v; want it released",
+			lease, err)
 	}
 }
 
