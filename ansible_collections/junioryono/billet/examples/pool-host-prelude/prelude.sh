@@ -20,6 +20,8 @@
 #   PRELUDE_OSD_DEVICE                 optional: the OSD's disk, else the first free one
 #   PRELUDE_BUDGET_SECONDS             optional: how long after it starts the prelude
 #                                      still begins a kernel pull (default 5400)
+#   PRELUDE_STAGING_GB                 optional: the free room the image's staging
+#                                      needs, in 10^9 bytes (default 100)
 #
 # It runs under the pool's `bash -euo pipefail`, and its output reaches the console the
 # source reads, so it prints nothing a network answered and no line of the join's form:
@@ -44,8 +46,13 @@ retry() {
 	done
 }
 
-apt-get -o Acquire::Retries=10 -o DPkg::Lock::Timeout=600 update -qq >"$work/apt.log" 2>&1
-apt-get -o Acquire::Retries=10 -o DPkg::Lock::Timeout=600 install -y -qq python3-venv curl >>"$work/apt.log" 2>&1
+# Retried whole: the lock timeout covers dpkg's lock, not the package lists' an update
+# takes, and a first boot's own apt may hold either.
+apt_install() {
+	apt-get -o Acquire::Retries=10 -o DPkg::Lock::Timeout=600 update -qq &&
+		apt-get -o Acquire::Retries=10 -o DPkg::Lock::Timeout=600 install -y -qq python3-venv curl
+} >>"$work/apt.log" 2>&1
+retry 5 20 apt_install
 
 # The instance metadata service, retried: one refused or slow answer would otherwise end
 # the boot before the join. What curl says goes to a log, as every fetch's does.
@@ -134,13 +141,15 @@ retry 5 15 galaxy
 #
 # BLANK IS WIPEFS'S EMPTY LIST, read successfully, as the role decides a ledger volume:
 # blkid's "nothing found" is also its answer when it could not read the device, and a
-# partition table carries no filesystem type. A disk wipefs could not read is not free,
-# and a probe that fails fails the scan, so a scan cut short is never recorded.
+# partition table carries no filesystem type. Any probe that fails, wipefs's read
+# included, fails the whole scan, which is tried again and prints its list only once it
+# is complete, so a disk that could not be read just then is never left out of the
+# record for good.
 signatures() {
 	wipefs --no-act --noheadings --output TYPE "$1" 2>>"$work/disks.log"
 }
 free_disks() {
-	local root_disk names d type parts mounts sigs
+	local root_disk names d type parts mounts sigs found=""
 	root_disk=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)") || return 1
 	root_disk=${root_disk%%$'\n'*}
 	names=$(lsblk -dnpo NAME,TYPE) || return 1
@@ -151,11 +160,11 @@ free_disks() {
 		[ "$(wc -l <<<"$parts")" -eq 1 ] || continue
 		mounts=$(lsblk -no MOUNTPOINT "$d") || return 1
 		[ -z "${mounts//[[:space:]]/}" ] || continue
-		sigs=$(signatures "$d") || continue
+		sigs=$(signatures "$d") || return 1
 		[ -z "${sigs//[[:space:]]/}" ] || continue
-		echo "$d"
+		found+="$d"$'\n'
 	done <<<"$names"
-	return 0
+	printf '%s' "$found"
 }
 # stable_name DISK: a /dev/disk/by-id name of the disk, waiting for udev to make one. A
 # kernel name is only the order the disks were found in at this boot, so a disk with no
@@ -176,9 +185,9 @@ stable_name() {
 	return 1
 }
 if [ ! -s "$work/disks.env" ]; then
-	free=$(free_disks)
+	free=$(retry 5 10 free_disks)
 	disks=()
-	[ -z "$free" ] || mapfile -t disks <<<"$free"
+	[ -z "$free" ] || mapfile -t disks < <(printf '%s' "$free")
 	osd=${PRELUDE_OSD_DEVICE:-${disks[0]:-}}
 	[ -n "$osd" ] || {
 		echo "prelude: no free disk for the OSD" >&2
@@ -368,6 +377,18 @@ pull+=("${PRELUDE_IMAGE:-ubuntu-2404-x64}")
 # with under a minute left. The join's token lives two hours from the order, and the host
 # needs time after this to enroll.
 budget=${PRELUDE_BUDGET_SECONDS:-5400}
+# ROOM FIRST: a pull without room for the image's staging fails every attempt until the
+# budget is spent, so too little is refused now. 97 GB was the peak for the x86_64 image
+# of 2026-11-08; PRELUDE_STAGING_GB is the room required, in units of 10^9 bytes.
+need=${PRELUDE_STAGING_GB:-100}
+mkdir -p "${staging:-/var/tmp/billet-images}"
+avail=$(df --output=avail -B1000000000 "${staging:-/var/tmp/billet-images}")
+avail=${avail##*[!0-9 ]}
+avail=${avail//[[:space:]]/}
+[ "$avail" -ge "$need" ] || {
+	echo "prelude: the image's staging has ${avail} GB free and needs ${need}; see PRELUDE_STAGING_GB" >&2
+	exit 1
+}
 kernel=""
 while [ $((budget - SECONDS)) -gt 60 ]; do
 	timeout --kill-after=60 $((budget - SECONDS)) billet images pull --config "$work/preview/billet.yaml" \
