@@ -710,13 +710,34 @@ func TestAStalledProofDoesNotStarveAHeldToken(t *testing.T) {
 		t.Fatalf("the first token: %v", err)
 	}
 
-	broker.server.proofBound = 50 * time.Millisecond
+	// THE PROOF'S BOUND IS LONG ENOUGH FOR ITS REQUEST TO ARRIVE. At 50 ms a loaded
+	// race-and-coverage runner did not get the request to the stand-in before the
+	// bound ended it, so the proof failed with nothing asked and the count read 0
+	// (#773). Two seconds still ends every stalled proof, well inside a client's
+	// wait; and each lookup is signalled, so the count is read once the stand-in
+	// has seen it.
+	asked := make(chan struct{}, 8)
+
+	broker.server.proofBound = 2 * time.Second
 	gh.lookup = func(_ http.ResponseWriter, r *http.Request) {
 		lookups.Add(1)
+		asked <- struct{}{}
 
 		select {
 		case <-stalled:
 		case <-r.Context().Done():
+		}
+	}
+
+	// awaitLookup waits for the next lookup, the bound only a guard against one
+	// that never comes.
+	awaitLookup := func(which string) {
+		t.Helper()
+
+		select {
+		case <-asked:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("GitHub was never asked for the %s proof", which)
 		}
 	}
 
@@ -730,6 +751,8 @@ func TestAStalledProofDoesNotStarveAHeldToken(t *testing.T) {
 		}
 	}
 
+	awaitLookup("due")
+
 	if got := lookups.Load(); got != 1 {
 		t.Errorf("GitHub was asked to prove it %d times in one retry period", got)
 	}
@@ -741,6 +764,8 @@ func TestAStalledProofDoesNotStarveAHeldToken(t *testing.T) {
 	if _, err := source().InstallationToken(t.Context()); err != nil {
 		t.Fatalf("after the retry period: %v", err)
 	}
+
+	awaitLookup("overdue")
 
 	if got := lookups.Load(); got != 2 {
 		t.Errorf("the overdue proof was asked for %d times, want it tried again after its retry period", got)
