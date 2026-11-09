@@ -710,14 +710,17 @@ func TestAStalledProofDoesNotStarveAHeldToken(t *testing.T) {
 		t.Fatalf("the first token: %v", err)
 	}
 
-	// LONG ENOUGH FOR THE ASK TO ARRIVE: the count below is taken in GitHub's handler, and
-	// on a loaded runner a 50 ms bound expired before the request reached it, so the
-	// overdue proof was counted as never asked (#820, 2026-11-08). The stall still ends
-	// the proof, now after two seconds.
-	broker.server.proofBound = 2 * time.Second
-	gh.lookup = func(_ http.ResponseWriter, r *http.Request) {
+	// THE PROOFS ARE COUNTED AS THEY BEGIN, not where GitHub's handler is reached: on a
+	// loaded runner the bound expired before the request arrived there, and an overdue
+	// proof that was asked was counted as never asked (#820, 2026-11-08). The lookup still
+	// goes to the stalled GitHub, and the bound still ends it.
+	broker.server.proofBound = 50 * time.Millisecond
+	broker.server.verify = func(r *http.Request, inst *installation) error {
 		lookups.Add(1)
 
+		return verifyInstallation(r, inst)
+	}
+	gh.lookup = func(_ http.ResponseWriter, r *http.Request) {
 		select {
 		case <-stalled:
 		case <-r.Context().Done():
