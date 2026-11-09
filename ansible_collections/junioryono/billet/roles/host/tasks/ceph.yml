@@ -35,10 +35,49 @@
         path: /etc/ceph/ceph.conf
       register: billet_ceph_conf
 
+    # THE DAEMONS RUN THE HOST CLIENT'S OWN RELEASE. cephadm's default image is a
+    # floating tag (quay.io/ceph/ceph:v19), and on 2026-11-08 it was 19.2.7 against
+    # Ubuntu 24.04's ceph-common 19.2.3, which could not parse the admin key 19.2.7
+    # wrote ("error setting modifier for [client.admin] type=key ... Malformed input"):
+    # every `ceph` and `rbd` on the host, the role's own included, then failed to
+    # connect. So the image is the tag of the installed client's release unless one
+    # is named.
+    - name: Read the release of the host's Ceph client
+      ansible.builtin.command:
+        argv: [dpkg-query, -W, "-f=${Version}", ceph-common]
+      register: billet_ceph_client_release
+      changed_when: false
+      check_mode: false
+      when:
+        - not billet_ceph_conf.stat.exists
+        - billet_ceph_container_image | length == 0
+
+    - name: Name the image the daemons run
+      ansible.builtin.set_fact:
+        billet_ceph_bootstrap_image: >-
+          {{ billet_ceph_container_image
+             if billet_ceph_container_image | length > 0
+             else 'quay.io/ceph/ceph:v' ~ (billet_ceph_client_release.stdout | trim | regex_replace('^[0-9]+:', '') | regex_search('^[0-9]+[.][0-9]+[.][0-9]+') | default('', true)) }}
+      when: not billet_ceph_conf.stat.exists
+
+    - name: Refuse a bootstrap whose image names no release
+      ansible.builtin.assert:
+        that:
+          - >-
+            billet_ceph_container_image | length > 0
+            or billet_ceph_bootstrap_image is match('^quay[.]io/ceph/ceph:v[0-9]+[.][0-9]+[.][0-9]+$')
+        fail_msg: >-
+          The Ceph daemons' image would be {{ billet_ceph_bootstrap_image }}, which names no
+          release: ceph-common answered {{ billet_ceph_client_release.stdout | default('nothing') }}.
+          Name the image with billet_ceph_container_image (a named image is used as given).
+      when: not billet_ceph_conf.stat.exists
+
     - name: Bootstrap Ceph without opening root SSH
       ansible.builtin.command:
         argv:
           - cephadm
+          - --image
+          - "{{ billet_ceph_bootstrap_image }}"
           - bootstrap
           - --mon-ip
           - "{{ billet_ceph_mon_ip }}"
@@ -51,23 +90,68 @@
       when: not billet_ceph_conf.stat.exists
 
 
+    # EACH NAMED DEVICE BY THE NAME CEPH REPORTS: the inventory names a disk by its
+    # kernel path (/dev/nvme0n1), and a device named by an alias (/dev/disk/by-id/...)
+    # is resolved to it, so the wait and the selection below compare like with like. A
+    # named device the host does not have fails here.
+    - name: Resolve each named OSD device to the path Ceph reports
+      ansible.builtin.command:
+        argv: [readlink, -e, "{{ item }}"]
+      loop: "{{ billet_ceph_devices }}"
+      register: billet_ceph_device_paths
+      changed_when: false
+      check_mode: false
+      become: true
+      when: billet_ceph_conf.stat.exists or not ansible_check_mode
+
+    # ASKED AGAIN UNTIL IT NAMES EVERY DEVICE, BOUNDED. On a cluster this converge just
+    # bootstrapped, cephadm has not yet inventoried the host's disks: on a fresh z1d.metal
+    # (2026-11-08) the first answer did not list the named NVMe, so no OSD was added and
+    # the pools' initialisation then waited on placement groups that had no OSD to land
+    # on. A device listed at all, available or already an OSD, ends the wait; a device
+    # the host never lists fails the converge here instead of being skipped. A read, so
+    # a dry run asks it too, of a cluster that exists; a dry run that only simulated the
+    # bootstrap has no cluster to ask.
     - name: Inspect Ceph's current device inventory
       ansible.builtin.command:
         argv: [ceph, orch, device, ls, --hostname, "{{ inventory_hostname }}", --format, json, --refresh]
       register: billet_ceph_device_inventory
       changed_when: false
+      check_mode: false
       become: true
+      when: billet_ceph_conf.stat.exists or not ansible_check_mode
+      vars:
+        billet_ceph_named_paths: "{{ billet_ceph_device_paths.results | map(attribute='stdout') | map('trim') | list }}"
+      until: >-
+        billet_ceph_device_inventory.rc == 0 and
+        (billet_ceph_named_paths | difference(
+          (((billet_ceph_device_inventory.stdout | from_json) | selectattr('devices', 'defined') | map(attribute='devices') | flatten(levels=1))
+           + ((billet_ceph_device_inventory.stdout | from_json) | rejectattr('devices', 'defined') | list))
+          | selectattr('path', 'defined') | map(attribute='path') | list)) | length == 0
+      retries: 30
+      delay: 10
 
+    # A LIST OF HOSTS, EACH WITH ITS devices (measured on Ceph 19.2.3, 2026-11-08:
+    # `[{"addr", "devices": [{"path", "available", ...}], "labels", "name"}]`), so the
+    # devices are read from inside each host; an entry with no devices list is read
+    # as a device itself, the flat shape.
     - name: Add each explicitly named available OSD device
       ansible.builtin.command:
         argv: [ceph, orch, daemon, add, osd, "{{ inventory_hostname }}:{{ item }}"]
-      loop: "{{ billet_ceph_devices }}"
-      when: >-
-        item in (
-          billet_ceph_device_inventory.stdout | from_json |
-          selectattr('available', 'equalto', true) |
-          map(attribute='path') | list
-        )
+      loop: "{{ billet_ceph_device_paths.results | map(attribute='stdout') | map('trim') | list }}"
+      vars:
+        billet_ceph_inventory_entries: "{{ billet_ceph_device_inventory.stdout | from_json }}"
+        billet_ceph_inventory_devices: >-
+          {{ (billet_ceph_inventory_entries | selectattr('devices', 'defined') | map(attribute='devices') | flatten(levels=1))
+             + (billet_ceph_inventory_entries | rejectattr('devices', 'defined') | list) }}
+      when:
+        - billet_ceph_conf.stat.exists or not ansible_check_mode
+        - >-
+          item in (
+            billet_ceph_inventory_devices |
+            selectattr('available', 'defined') | selectattr('available', 'equalto', true) |
+            map(attribute='path') | list
+          )
       changed_when: true
       become: true
 

@@ -888,3 +888,184 @@ func TestAFailedReleaseIsReportedPastTheFailureCap(t *testing.T) {
 		t.Errorf("Evict = %v, want the cap reached, so it proves nothing otherwise", err)
 	}
 }
+
+// THE SWEEP TAKES ONLY SUPERSEDED GENERATIONS, and does none of the full pass's
+// work: an expired generation no key moved past, an expired active record and the
+// full pass's resume point are all left for the full pass.
+func TestTheSupersededSweepTakesOnlySupersededGenerations(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	twoHours := now.Add(-2 * time.Hour)
+	old := now.Add(-8 * 24 * time.Hour)
+
+	f := newCacheFake()
+	c := evictingClient(t, f, f.run)
+
+	const key = "acme/api/go"
+	current := expiredGeneration(twoHours, 'a')
+	superseded := expiredGeneration(twoHours, 'b')
+	expired := expiredGeneration(old, 'c')
+
+	for handle, at := range map[string]time.Time{current: now, superseded: twoHours, expired: old} {
+		f.addVolume(handle)
+		f.metadata[handle] = map[string]string{cacheMetaPrefix + "used_at": at.Format(time.RFC3339Nano)}
+	}
+
+	record := func(handle string, usedAt time.Time) cachePointer {
+		return cachePointer{Key: key, Generation: "gen-" + handle, Handle: handle, UsedAt: usedAt,
+			RetentionHours: 7 * 24}
+	}
+	setIndexRecord(t, f, c, pointerKey(key), record(current, now))
+	setIndexRecord(t, f, c, generationKey(key, "gen-"+current), record(current, now))
+	setIndexRecord(t, f, c, generationKey(key, "gen-"+superseded), record(superseded, twoHours))
+	f.metadata[c.cacheIndex()][activeKey("lease-gone")] = "not json"
+
+	c.evictResume = "cache-g-0-resume"
+
+	if err := c.EvictSuperseded(t.Context()); err != nil {
+		t.Fatalf("EvictSuperseded: %v", err)
+	}
+
+	if f.images[superseded] {
+		t.Error("the sweep kept a superseded generation past its grace")
+	}
+	if !f.images[current] || !f.images[expired] || f.ranWith("rm", expired) {
+		t.Error("the sweep removed the key's current generation or an expired one no key moved past")
+	}
+	if _, ok := f.metadata[c.cacheIndex()][activeKey("lease-gone")]; !ok {
+		t.Error("the sweep removed an expired active record, which is the full pass's bookkeeping")
+	}
+	if c.evictResume != "cache-g-0-resume" {
+		t.Errorf("the sweep moved the full pass's resume point to %q", c.evictResume)
+	}
+}
+
+// A SWEEP CUT SHORT RESUMES WHERE IT STOPPED, on a resume point of its own:
+// superseded generations that fail slowly at the front of its order would
+// otherwise spend every sweep's budget, and the one behind them would wait for the
+// full pass.
+func TestASweepCutShortResumesWhereItStopped(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	twoHours := now.Add(-2 * time.Hour)
+
+	const key = "acme/api/go"
+	current := expiredGeneration(now, 'a')
+	stuck := []string{expiredGeneration(twoHours, '1'), expiredGeneration(twoHours.Add(time.Second), '2')}
+	behind := expiredGeneration(twoHours.Add(2*time.Second), '3')
+
+	f := newCacheFake()
+	clock := time.Now()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "rm") && (slices.Contains(args, stuck[0]) || slices.Contains(args, stuck[1])) {
+			f.calls = append(f.calls, slices.Clone(args))
+			clock = clock.Add(supersededSweepBudget / 2)
+
+			return nil, errors.New("signal: killed")
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	c.clock = func() time.Time { return clock }
+	c.evictResume = "cache-g-0-resume"
+
+	record := func(handle string, usedAt time.Time) cachePointer {
+		return cachePointer{Key: key, Generation: "gen-" + handle, Handle: handle, UsedAt: usedAt,
+			RetentionHours: 7 * 24}
+	}
+	f.addVolume(current)
+	setIndexRecord(t, f, c, pointerKey(key), record(current, now))
+	for _, handle := range append(slices.Clone(stuck), behind) {
+		f.addVolume(handle)
+		f.metadata[handle] = map[string]string{cacheMetaPrefix + "used_at": twoHours.Format(time.RFC3339Nano)}
+		setIndexRecord(t, f, c, generationKey(key, "gen-"+handle), record(handle, twoHours))
+	}
+
+	for sweep := range 2 {
+		if err := c.EvictSuperseded(t.Context()); err == nil {
+			t.Fatalf("sweep %d reported no failure although two removals failed", sweep+1)
+		}
+	}
+
+	if f.images[behind] {
+		t.Error("two sweeps never reached the superseded generation behind the ones that spent the budget")
+	}
+	if !f.images[stuck[0]] || !f.images[stuck[1]] {
+		t.Error("a generation whose removal failed was not kept")
+	}
+	if c.evictResume != "cache-g-0-resume" {
+		t.Errorf("the sweep moved the full pass's resume point to %q", c.evictResume)
+	}
+}
+
+// THE SWEEP UNWINDS A LINEAGE A COMPACTION CUT OFF, as the full pass does, purging
+// the trash between its rounds and never under the lock.
+func TestTheSupersededSweepUnwindsALineage(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	generations := cutOffLineage(t, f, c, "acme/api/go")
+
+	if err := c.EvictSuperseded(t.Context()); err != nil {
+		t.Fatalf("EvictSuperseded: %v", err)
+	}
+
+	if !f.images[generations[len(generations)-1].Handle] {
+		t.Fatal("the sweep removed the key's current generation")
+	}
+	for _, candidate := range generations[:len(generations)-1] {
+		if f.images[candidate.Handle] {
+			t.Errorf("the sweep kept superseded ancestor %s", candidate.Handle)
+		}
+	}
+	if len(f.trash) != 0 {
+		t.Errorf("the sweep left retired writers: %v", f.trash)
+	}
+	if call := trashDeletedUnderLock(f); call != "" {
+		t.Errorf("the sweep ran %q under the cache lock", call)
+	}
+}
+
+// THE SWEEP HOLDS THE LOCK FOR ITS OWN BUDGET, its rounds together, which is what
+// lets it run every few minutes beside writers.
+func TestTheSupersededSweepHoldsTheLockForItsBudget(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	first := cutOffLineage(t, f, c, "acme/api/go")
+	second := cutOffLineage(t, f, c, "acme/web/go")
+
+	clock := time.Now()
+	c.clock = func() time.Time { return clock }
+	c.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		out, err := f.run(ctx, bin, args)
+		if err == nil && slices.Contains(args, "rm") && !slices.Contains(args, "lock") &&
+			!slices.Contains(args, "trash") {
+			clock = clock.Add(supersededSweepBudget * 3 / 8)
+		}
+
+		return out, err
+	}
+
+	if err := c.EvictSuperseded(t.Context()); err != nil &&
+		!strings.Contains(err.Error(), "wait for the next eviction pass") {
+		t.Fatalf("EvictSuperseded = %v, want no failure but the budget's stop", err)
+	}
+
+	if f.images[first[3].Handle] || f.images[second[3].Handle] {
+		t.Fatal("the first round kept a lineage's leaf, inside the budget, so the test proves nothing")
+	}
+	if kept := btoi(f.images[first[2].Handle]) + btoi(f.images[second[2].Handle]); kept != 1 {
+		t.Errorf("the second round kept %d of the two generations it could reach, want 1", kept)
+	}
+	for _, generation := range []storecontract.Candidate{first[0], first[1], second[0], second[1]} {
+		if !f.images[generation.Handle] {
+			t.Errorf("the sweep removed %s after its budget was spent", generation.Handle)
+		}
+	}
+}

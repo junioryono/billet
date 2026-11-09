@@ -363,6 +363,12 @@ billet_ceph_cache_pool_min_size: "{{ billet_ceph_pool_min_size }}"
 # every OSD of the cluster, so a cluster that also serves something else sets ""
 # to leave its own policy alone.
 billet_ceph_osd_mclock_profile: high_client_ops
+# The image a bootstrap runs the Ceph daemons from. Empty, the default, is the tag
+# of the host's own ceph-common release (quay.io/ceph/ceph:v<major.minor.patch>), so
+# the daemons and every client on the host agree; cephadm's own default is a floating
+# tag whose newer point release wrote a key Ubuntu's client could not read
+# (2026-11-08). Read only when this host bootstraps a cluster.
+billet_ceph_container_image: ""
 billet_ceph_user: billet
 billet_ceph_keyring_path: /etc/ceph/ceph.client.billet.keyring
 

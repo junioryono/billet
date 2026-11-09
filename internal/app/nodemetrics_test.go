@@ -413,9 +413,26 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 		t.Errorf("startNodeCache calls evictPass(evictCtx, storage, _, sweeping, _) %d times, want once", passes)
 	}
 
+	// AND THE SUPERSEDED SWEEP, ON THE SAME CONTEXT AND STORE (#799).
+	sweeps := 0
+	ast.Inspect(start, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if ok && isIdent(call.Fun, "sweepSuperseded") && len(call.Args) == 3 &&
+			isIdent(call.Args[0], "evictCtx") && isIdent(call.Args[1], "storage") {
+			sweeps++
+		}
+
+		return true
+	})
+	if sweeps != 1 {
+		t.Errorf("startNodeCache calls sweepSuperseded(evictCtx, storage, _) %d times, want once", sweeps)
+	}
+
 	// THE CONTEXT IS ITS OWN, made from the node's, and the eviction loop ends on
 	// it: a stop that cancelled something else would wait out a pass still
-	// starting unmaps.
+	// starting unmaps. The loop is runEviction, handed evictCtx, and
+	// TestTheNodeSweepsSupersededGenerationsBetweenFullPasses proves it returns once
+	// its context ends.
 	var derived, loopEnds bool
 	ast.Inspect(start, func(n ast.Node) bool {
 		switch node := n.(type) {
@@ -426,15 +443,9 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 				derived = ok && namesSelector(call.Fun, "context", "WithCancel") && len(call.Args) == 1 &&
 					isIdent(call.Args[0], "ctx")
 			}
-		case *ast.CommClause:
-			recv, ok := node.Comm.(*ast.ExprStmt)
-			if !ok {
-				return true
-			}
-			if arrow, ok := recv.X.(*ast.UnaryExpr); ok && arrow.Op == token.ARROW {
-				if call, ok := arrow.X.(*ast.CallExpr); ok && namesSelector(call.Fun, "evictCtx", "Done") {
-					loopEnds = true
-				}
+		case *ast.CallExpr:
+			if isIdent(node.Fun, "runEviction") && len(node.Args) == 3 && isIdent(node.Args[0], "evictCtx") {
+				loopEnds = true
 			}
 		}
 
@@ -442,7 +453,7 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 	})
 	if !derived || !loopEnds {
 		t.Errorf("startNodeCache's eviction does not run on evictCtx, stopEviction := context.WithCancel(ctx) "+
-			"(made %v) or its loop does not end on evictCtx.Done() (%v)", derived, loopEnds)
+			"(made %v) or its loop, runEviction, is not handed evictCtx (%v)", derived, loopEnds)
 	}
 
 	var stopped, awaited, received, shut token.Pos
