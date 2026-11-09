@@ -1,13 +1,20 @@
 package host
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
@@ -58,6 +65,130 @@ func TestACandidateThatCannotBeDownloadedIsRefusedAndGivesTheClaimBack(t *testin
 		t.Errorf("the node was answered %q, want a refusal naming the staging failure", got)
 	}
 	noClaim(t)
+}
+
+// stalledRelease is a transport that never answers until its request's context
+// ends, as a release server under an outage can.
+type stalledRelease struct{}
+
+func (stalledRelease) RoundTrip(req *http.Request) (*http.Response, error) {
+	<-req.Context().Done()
+
+	return nil, req.Context().Err()
+}
+
+// publishedArchive serves one release archive holding a billet binary, and
+// returns a manifest naming it with its real digest and size.
+func publishedArchive(t *testing.T) (*releasesource.Client, *releasesource.Manifest) {
+	t.Helper()
+
+	var archive bytes.Buffer
+	zipped := gzip.NewWriter(&archive)
+	tarred := tar.NewWriter(zipped)
+	body := []byte("#!/bin/sh\nexit 0\n")
+	if err := tarred.WriteHeader(&tar.Header{Name: "billet", Mode: 0o755, Size: int64(len(body))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tarred.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarred.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zipped.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(archive.Bytes())
+
+	manifest := candidateManifest(t)
+	manifest.Artifacts[0].SHA256 = hex.EncodeToString(sum[:])
+	manifest.Artifacts[0].Size = int64(archive.Len())
+
+	served := archive.Bytes()
+	client := &releasesource.Client{HTTP: &http.Client{Transport: roundTrip(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{},
+			Body: io.NopCloser(bytes.NewReader(served)), Request: req,
+		}, nil
+	})}}
+
+	return client, manifest
+}
+
+type roundTrip func(*http.Request) (*http.Response, error)
+
+func (f roundTrip) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// THE ANSWER'S DEADLINE BOUNDS THE STAGING TOO: a download still going when the
+// node stops listening is a refusal, with the claim given back, never an
+// acceptance nobody hears (#817).
+func TestAStagingThatOutrunsTheAnswersDeadlineIsRefused(t *testing.T) {
+	withUpgradeRoot(t)
+
+	prev := runningRelease
+	runningRelease = func() string { return "v0.16.0" }
+	t.Cleanup(func() { runningRelease = prev })
+
+	ack, answer := ackReader(t)
+	ack.deadline = time.Now().Add(300 * time.Millisecond)
+	client := &releasesource.Client{HTTP: &http.Client{Transport: stalledRelease{}}}
+
+	started := time.Now()
+	err := actOnResolved(t.Context(), processEnv(), &config.Config{}, "", hostUpgradeTarget{generation: 10},
+		ack, client, candidateManifest(t), strings.Repeat("b", 64), heldTxLock(t))
+	if err == nil || !strings.Contains(err.Error(), "staging v0.17.0") {
+		t.Fatalf("a staging past the answer's deadline returned %v, want the staging failure", err)
+	}
+	if waited := time.Since(started); waited > 30*time.Second {
+		t.Fatalf("the staging ran %s past its deadline", waited)
+	}
+
+	ack.refuse(err)
+	if got := answer(); !strings.HasPrefix(got, node.AckRefused) {
+		t.Errorf("the node was answered %q, want a refusal", got)
+	}
+	noClaim(t)
+}
+
+// AN ACCEPTANCE THE NODE DID NOT TAKE STOPS THE TRANSACTION BEFORE ANYTHING IS
+// STOPPED (#817): the candidate staged, but nobody is listening, so the claim is
+// given back rather than a drain begun that the rollout does not know about.
+func TestAnAcceptanceTheNodeDidNotTakeGivesTheClaimBack(t *testing.T) {
+	withUpgradeRoot(t)
+
+	prev := runningRelease
+	runningRelease = func() string { return "v0.16.0" }
+	t.Cleanup(func() { runningRelease = prev })
+
+	client, manifest := publishedArchive(t)
+	ack := newUpgradeAck(filepath.Join(t.TempDir(), "nobody-listens"))
+
+	err := actOnResolved(t.Context(), processEnv(), &config.Config{}, "", hostUpgradeTarget{generation: 10},
+		ack, client, manifest, strings.Repeat("b", 64), heldTxLock(t))
+	if !errors.Is(err, errAcceptanceLost) {
+		t.Fatalf("an acceptance nobody took returned %v, want errAcceptanceLost", err)
+	}
+	noClaim(t)
+}
+
+// A RESUME THAT ABANDONS A TRANSACTION THAT NEVER STAGED REFUSES A WAITING NODE:
+// nothing will be installed, so an acceptance would leave the rollout waiting
+// for a host that is not moving.
+func TestAResumeThatAbandonsRefusesTheNodeWaitingOnIt(t *testing.T) {
+	withUpgradeRoot(t)
+
+	stageJournal(t, &hostupgrade.Journal{
+		FromVersion: "v0.34.0", ToVersion: "v0.35.0", Step: hostupgrade.StepClaimed,
+	})
+	ack, answer := ackReader(t)
+
+	if err := resumeHostUpgradeAnswering(t.Context(), processEnv(), &config.Config{}, ack); err != nil {
+		t.Fatalf("resuming a transaction that never staged: %v", err)
+	}
+	ack.accept()
+	if got := answer(); !strings.HasPrefix(got, node.AckRefused) || !strings.Contains(got, "never staged") {
+		t.Errorf("the node was answered %q, want a refusal saying the transaction never staged", got)
+	}
 }
 
 // A RESUME OF A TRANSACTION THAT NEVER STAGED ABANDONS IT RATHER THAN STOPPING

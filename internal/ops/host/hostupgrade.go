@@ -142,7 +142,7 @@ func Upgrade(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	if *resume {
-		err := resumeHostUpgrade(ctx, env, cfg)
+		err := resumeHostUpgradeAnswering(ctx, env, cfg, ack)
 		if err != nil {
 			ack.refuse(err)
 		} else {
@@ -710,7 +710,12 @@ func startHostUpgradeHolding(ctx context.Context, env cli.Env, cfg *config.Confi
 
 	client := &releasesource.Client{}
 
-	manifest, digest, err := resolveRelease(ctx, client, policy, target.channel, target.pin)
+	// BOUNDED BY WHEN A WAITING NODE STOPS LISTENING, the deadline the staging
+	// shares.
+	resolveCtx, endResolve := ack.bound(ctx)
+	manifest, digest, err := resolveRelease(resolveCtx, client, policy, target.channel, target.pin)
+	endResolve()
+
 	if err != nil {
 		return err
 	}
@@ -960,15 +965,11 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 	// no candidate to install (2026-11-09, a 504 on the release archive). Refused
 	// here, the rollout records the refusal and backs off as for any other.
 	//
-	// BOUNDED WHILE A NODE WAITS FOR THE ANSWER, inside its ackWait (90 s) with
-	// room for the resolve and the claim before it; a slower download is a
-	// refusal the rollout retries. With nobody waiting, as under the timer, the
-	// download takes what it takes.
-	stageCtx, endStaging := ctx, func() {}
-	if ack.waiting() {
-		stageCtx, endStaging = context.WithTimeout(ctx, stagingLimit)
-	}
-
+	// BOUNDED BY WHEN A WAITING NODE STOPS LISTENING, one deadline from the
+	// command's start that the resolve shares, so a slower download is a refusal
+	// the rollout retries rather than an acceptance nobody hears. With nobody
+	// waiting, as under the timer, the download takes what it takes.
+	stageCtx, endStaging := ack.bound(ctx)
 	staged, err := stageCandidate(stageCtx, client, manifest, dir)
 	endStaging()
 
@@ -977,6 +978,13 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 	}
 
 	if err := journal.Advance(hostupgrade.StepStaged); err != nil {
+		return refuseClaimed(tx.dir, dir, err)
+	}
+
+	// AND ASKED AGAIN BEFORE THE ANSWER: past the deadline the node has counted a
+	// refusal, and an acceptance it does not hear is a transaction the rollout
+	// believes was never taken.
+	if err := ack.late(); err != nil {
 		return refuseClaimed(tx.dir, dir, err)
 	}
 
@@ -990,7 +998,13 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 	// there is nothing left for the caller to wait for and a great deal it must
 	// not wait for: the next step drains a host for as long as somebody's job
 	// takes.
-	ack.accept()
+	//
+	// AN ACCEPTANCE THE WAITING NODE DID NOT TAKE STOPS HERE, before anything is
+	// stopped: the rollout does not know the job was taken, so it would count a
+	// refusal and retry beside a transaction draining the host.
+	if !ack.accept() {
+		return refuseClaimed(tx.dir, dir, errAcceptanceLost)
+	}
 
 	fmt.Fprintf(env.Stdout, "Upgrading %s -> %s\n", journal.FromVersion, journal.ToVersion)
 	fmt.Fprintf(env.Stdout, "  recovery journal %s\n", dir)
@@ -1021,6 +1035,13 @@ func ledgerKindFor(cfg *config.Config) string {
 
 // resumeHostUpgrade continues or unwinds the transaction already on this machine.
 func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config) error {
+	return resumeHostUpgradeAnswering(ctx, env, cfg, newUpgradeAck(""))
+}
+
+// resumeHostUpgradeAnswering is resumeHostUpgrade answering a node that waits
+// on ack: a transaction it abandons is refused, since nothing will be
+// installed, and anything it finishes is the caller's to accept.
+func resumeHostUpgradeAnswering(ctx context.Context, env cli.Env, cfg *config.Config, ack *upgradeAck) error {
 	// A LIVE UPDATER IS NOT AN ABANDONED ONE, and nothing here could tell the
 	// difference before this lock existed. The claim survives a crash on purpose,
 	// so its presence proves a transaction was STARTED and says nothing about
@@ -1106,7 +1127,13 @@ func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config) err
 	// the archive); it is abandoned instead, and the rollout's next dispatch
 	// starts over.
 	if journal.Step == hostupgrade.StepClaimed {
-		return abandonUnstaged(env, tx.dir, journal)
+		if err := abandonUnstaged(env, tx.dir, journal); err != nil {
+			return err
+		}
+		ack.refuse(errors.New("the upgrade on this machine never staged its candidate, so it was " +
+			"abandoned and nothing will be installed; the rollout retries it"))
+
+		return nil
 	}
 
 	fmt.Fprintf(env.Stdout, "Resuming the upgrade %s -> %s, which reached %s.\n",
