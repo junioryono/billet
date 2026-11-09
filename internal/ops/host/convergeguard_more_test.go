@@ -1485,9 +1485,11 @@ func TestATrustedJournalTakesAResumeToTheBarrier(t *testing.T) {
 	continued := observeResumeContinuation(t)
 	mustOK(t, os.Mkdir(f.root, 0o700))
 
+	// PAST `claimed`, which a resume abandons before the barrier because it never
+	// staged a candidate (#817).
 	recovery := filepath.Join(f.root, "recovery-x")
 	mustOK(t, os.Mkdir(recovery, 0o700))
-	writeJournalFixture(t, recovery, "claimed")
+	writeJournalFixture(t, recovery, "staged")
 	mustOK(t, os.Symlink(recovery, f.active()))
 
 	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, errStoppedAtTheBarrier) {
