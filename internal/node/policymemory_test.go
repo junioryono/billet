@@ -237,17 +237,86 @@ func TestAnActionsPublicationAsksAgainBeforeItsSecondAttempt(t *testing.T) {
 	// ALLOWED UNTIL THE FIRST ATTEMPT HAS BEEN MADE, which conflicts over an
 	// absent pointer, so the publication reacquires its writer and would try again.
 	storage.publishConflicts = 1
+	acquiredBefore := storage.writerAcquisitions
+	askedAfterFirst, acquiredAtAsk := 0, 0
 	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
-		return storage.published == 0, nil
+		if storage.published == 0 {
+			return true, nil
+		}
+		askedAfterFirst++
+		acquiredAtAsk = storage.writerAcquisitions
+
+		return false, nil
 	}))
 
 	finalize := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
 		`{"key":"second","version":"v2","size_bytes":"4"}`)
-	response, _ = service.actionsProxy().respond(finalize, session)
-	closeActionsResponse(t, response)
+	response, handled, err := service.actionsResponse(finalize, session)
+	if response != nil {
+		response.Body.Close()
+	}
+	if !handled || !errors.Is(err, errActionsPublicationDisabled) {
+		t.Fatalf("finalize handled=%t error=%v, want the block's refusal", handled, err)
+	}
+	// THE WRITER WAS REACQUIRED AFTER THE CONFLICT, AND THE ASK CAME AFTER THAT.
+	if askedAfterFirst != 1 || acquiredAtAsk != acquiredBefore+2 {
+		t.Fatalf("asked %d time(s) after the first attempt, with %d writer acquisition(s) by then; want one ask "+
+			"after the reacquisition (%d)", askedAfterFirst, acquiredAtAsk-acquiredBefore, 2)
+	}
 	if storage.published != 1 || storage.current != "" {
 		t.Fatalf("attempts=%d current=%q; want the second attempt stopped by the block", storage.published,
 			storage.current)
+	}
+}
+
+// lookupStore is the fake store, saying when a deferred publication has looked
+// the pointer up once armed.
+type lookupStore struct {
+	*fakeCacheStore
+	armed, lookedUp atomic.Bool
+}
+
+func (l *lookupStore) Current(ctx context.Context, key string) (string, error) {
+	if l.armed.Load() {
+		l.lookedUp.Store(true)
+	}
+
+	return l.fakeCacheStore.Current(ctx, key)
+}
+
+// A BLOCK SET WHILE A DEFERRED PUBLICATION LOOKS ITS POINTER UP STOPS IT BEFORE
+// THE POINTER MOVES, and abandons it as one at the writer does: lifted later,
+// the block does not let that candidate publish on the next pass.
+func TestADeferredPublicationAsksAgainAfterItsLookup(t *testing.T) {
+	t.Parallel()
+
+	storage := &lookupStore{fakeCacheStore: &fakeCacheStore{}}
+	service, token, instance := scopedService(t, provider.TrustUntrusted, defaultBranchCache(), nil, storage)
+	var blocked atomic.Bool
+	service.SetCachePolicy(cachePolicyFunc(func(context.Context, config.CacheKind, string, string) (bool, error) {
+		return !blocked.Load() && !storage.lookedUp.Load(), nil
+	}))
+	if body := attachAndCommit(t, service, token); body["pending"] != true {
+		t.Fatalf("commit answered %v, want pending", body)
+	}
+
+	storage.armed.Store(true)
+	endSession(t, service, instance, publishingAuthority())
+	if !storage.lookedUp.Load() {
+		t.Fatal("the pass never looked its pointer up, so the ask after it was not reached")
+	}
+	if storage.published != 0 {
+		t.Fatalf("published %d time(s) after a block set during the lookup", storage.published)
+	}
+
+	storage.lookedUp.Store(false)
+	storage.armed.Store(false)
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	if storage.published != 0 {
+		t.Fatalf("a refused candidate published %d time(s) on the next pass, once the block lifted",
+			storage.published)
 	}
 }
 

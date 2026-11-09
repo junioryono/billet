@@ -189,11 +189,23 @@ func (s *CacheService) publishDeferred(
 
 		return true, errors.Join(s.releaseWriter(ctx, lease, fence), s.persistSession(session))
 	}
+	// ASKED IMMEDIATELY BEFORE EACH ATTEMPT, after the lookup above and before a
+	// last-write-wins rebase, and a refusal there abandons the publication as
+	// one at the writer does.
+	refusal := ""
 	err = s.publish(ctx, attachment, candidate, lease, fence, func() bool {
-		allowed, _ := s.stillAuthorised(ctx, session, attachment)
+		allowed, reason := s.stillAuthorised(ctx, session, attachment)
+		refusal = reason
 
 		return allowed
 	})
+	if errors.Is(err, errPublicationRefused) {
+		if err := s.releaseWriter(ctx, lease, fence); err != nil {
+			s.log.Warn("could not release a cache writer", "key", key, "error", err)
+		}
+
+		return abandon(refusal)
+	}
 	s.countedPublish(session.instance, err)
 	if err != nil {
 		journal.Phase = phaseSnapshotted

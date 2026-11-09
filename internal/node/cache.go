@@ -2233,13 +2233,12 @@ func (s *CacheService) publishAcquired(
 	// ASKED AGAIN IMMEDIATELY BEFORE THE POINTER MOVES, after the writer's wait,
 	// which a last-write-wins publication can spend minutes in, and the snapshot:
 	// a block set meanwhile stops it.
-	allowed := func() bool { return s.sessionKindAllowed(ctx, session, attachmentKind(attachment)) }
-	if !allowed() {
-		return storecontract.Candidate{}, stepPublish,
-			errors.Join(errPublicationRefused, s.releaseWriter(ctx, lease, fence))
+	err = s.publish(ctx, attachment, candidate, lease, fence, func() bool {
+		return s.sessionKindAllowed(ctx, session, attachmentKind(attachment))
+	})
+	if !errors.Is(err, errPublicationRefused) {
+		s.countedPublish(session.instance, err)
 	}
-	err = s.publish(ctx, attachment, candidate, lease, fence, allowed)
-	s.countedPublish(session.instance, err)
 	if err != nil {
 		return storecontract.Candidate{}, stepPublish, errors.Join(err, s.releaseWriter(ctx, lease, fence))
 	}
@@ -2364,9 +2363,10 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// publish moves an attachment's pointer to candidate. Its caller asked the kill
-// switch immediately before; allowed asks it again before a last-write-wins
-// rebase moves the pointer a second time, after the lookup between them.
+// publish moves an attachment's pointer to candidate. allowed asks the kill
+// switch immediately before each attempt, the first and a last-write-wins
+// rebase after its lookup, and a refusal is errPublicationRefused, which asked
+// the store nothing and is never counted as the store's failure.
 func (s *CacheService) publish(
 	ctx context.Context,
 	attachment *cacheAttachment,
@@ -2375,6 +2375,9 @@ func (s *CacheService) publish(
 	fence storecontract.FencingToken,
 	allowed func() bool,
 ) error {
+	if !allowed() {
+		return errPublicationRefused
+	}
 	err := s.store.PublishCAS(ctx, attachment.Volume.Key, attachment.Volume.Generation,
 		candidate, lease, fence)
 	if attachment.Publication != publicationLWW || !errors.Is(err, storecontract.ErrConflict) {
