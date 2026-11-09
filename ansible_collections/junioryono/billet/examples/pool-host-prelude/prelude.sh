@@ -35,6 +35,16 @@ mkdir -p "$work"
 cd "$work"
 trap 'echo "prelude: stopped at line $LINENO; its logs are in /var/lib/billet-pool-prelude" >&2' ERR
 
+# The image by its name alone: a pull assigns the generation and refuses a name that
+# names one, and it would refuse it on every attempt until the budget was spent.
+image=${PRELUDE_IMAGE:-ubuntu-2404-x64}
+case $image in
+*@*)
+	echo "prelude: PRELUDE_IMAGE is an image's name alone, without @ and what follows" >&2
+	exit 1
+	;;
+esac
+
 # retry N DELAY COMMAND...: COMMAND until it succeeds, at most N times.
 retry() {
 	local n=$1 delay=$2 i
@@ -75,7 +85,9 @@ download=(curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 60 --m
 # stops working when the session ends, and the control plane reads boot_prelude once,
 # when it starts, so every later order would fail on it (2026-11-09). The role's
 # credentials are fetched per call and reach curl on its standard input, never its
-# arguments or the console.
+# arguments or the console. They are written into curl's configuration only when every
+# character is one a credential is made of, so no answer can add a line of its own
+# there, and curl's standard output goes to the log with its errors.
 fetch() {
 	if [ -z "${ARTIFACT_BUCKET:-}" ]; then
 		"${download[@]}" -o "$2" "$1"
@@ -85,15 +97,23 @@ fetch() {
 	token=$(imds_token)
 	role=$(imds "$token" iam/security-credentials/)
 	creds=$(imds "$token" "iam/security-credentials/$role")
-	ak=$(printf '%s' "$creds" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKeyId"])')
-	sk=$(printf '%s' "$creds" | python3 -c 'import json,sys; print(json.load(sys.stdin)["SecretAccessKey"])')
-	st=$(printf '%s' "$creds" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Token"])')
+	creds=$(printf '%s' "$creds" | python3 -c 'import json, re, sys
+c = json.load(sys.stdin)
+v = [c["AccessKeyId"], c["SecretAccessKey"], c["Token"]]
+if not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9/+=]+", x) for x in v):
+    sys.exit("the instance role answered a credential with a character no credential has")
+print("\n".join(v))')
+	{
+		read -r ak
+		read -r sk
+		read -r st
+	} <<<"$creds"
 	"${download[@]}" --aws-sigv4 "aws:amz:${ARTIFACT_REGION}:s3" -K - \
 		-o "$2" "https://${ARTIFACT_BUCKET}.s3.${ARTIFACT_REGION}.amazonaws.com/$1" <<EOF
 user = "$ak:$sk"
 header = "x-amz-security-token: $st"
 EOF
-} 2>>"$work/fetch.log"
+} >>"$work/fetch.log" 2>&1
 
 # A release's archive (its sha256 is in the release's checksums.txt) or a bare binary.
 fetch "${BILLET_KEY:-${BILLET_URL:-}}" billet.download
@@ -206,7 +226,13 @@ if [ ! -s "$work/disks.env" ]; then
 	osd_id=$(stable_name "$osd")
 	scratch_id=""
 	[ -z "$scratch" ] || scratch_id=$(stable_name "$scratch")
-	printf 'osd=%q\nscratch=%q\n' "$osd_id" "$scratch_id" >"$work/disks.env"
+	# DURABLE BEFORE EITHER DISK IS CHANGED: a power cut after the format or the OSD but
+	# before the record reached the disk would leave a rerun scanning disks this run
+	# already took.
+	printf 'osd=%q\nscratch=%q\n' "$osd_id" "$scratch_id" >"$work/disks.env.new"
+	sync "$work/disks.env.new"
+	mv "$work/disks.env.new" "$work/disks.env"
+	sync "$work"
 fi
 # shellcheck source=/dev/null
 . "$work/disks.env"
@@ -367,7 +393,7 @@ billet converge-guard release --holder pool-prelude >"$work/guard-release.log" 2
 pull=(billet images pull --config /etc/billet/billet.yaml --verify)
 [ -z "$staging" ] || pull+=(--staging-dir "$staging")
 [ -z "${PRELUDE_IMAGE_SOURCE:-}" ] || pull+=(--source "$PRELUDE_IMAGE_SOURCE")
-pull+=("${PRELUDE_IMAGE:-ubuntu-2404-x64}")
+pull+=("$image")
 # The directory is asked for before it is listed: a pull that failed before installing
 # anything leaves none, and a find of a missing directory fails the pipeline, which under
 # pipefail ended the boot on the first failed pull instead of retrying it (2026-11-09).
@@ -380,9 +406,18 @@ budget=${PRELUDE_BUDGET_SECONDS:-5400}
 # ROOM FIRST: a pull without room for the image's staging fails every attempt until the
 # budget is spent, so too little is refused now. 97 GB was the peak for the x86_64 image
 # of 2026-11-08; PRELUDE_STAGING_GB is the room required, in units of 10^9 bytes.
+#
+# A pull removes its own pull-* directory as it ends, and a pull killed by a reboot
+# cannot, so what one left is reclaimed first. Only while the image unit is not running:
+# it is the other pull into this staging, and its directory is not abandoned.
 need=${PRELUDE_STAGING_GB:-100}
-mkdir -p "${staging:-/var/tmp/billet-images}"
-avail=$(df --output=avail -B1000000000 "${staging:-/var/tmp/billet-images}")
+stage_dir=${staging:-/var/tmp/billet-images}
+mkdir -p "$stage_dir"
+case $(systemctl show -p ActiveState --value billet-pool-image-pull.service) in
+active | activating | reloading) ;;
+*) find "$stage_dir" -mindepth 1 -maxdepth 1 -type d -name 'pull-*' -exec rm -rf {} + ;;
+esac
+avail=$(df --output=avail -B1000000000 "$stage_dir")
 avail=${avail##*[!0-9 ]}
 avail=${avail//[[:space:]]/}
 [ "$avail" -ge "$need" ] || {

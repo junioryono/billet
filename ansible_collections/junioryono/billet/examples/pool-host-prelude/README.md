@@ -9,7 +9,7 @@ It is an example to copy and render, not a script the collection installs. Where
 1. **Installs billet's binary** at `/usr/bin/billet`, checked against the sha256 you render in. It never installs the package: the package's postinstall seeds `/etc/billet/billet.yaml` from its template, and the join leaves a config it did not write alone, so the host could not be joined. The role refuses that seed in this mode.
 2. **Fetches the collection** at the commit you pin, and installs the pinned `ansible-core` and `ansible.posix` in a venv.
 3. **Chooses its disks once and records them** in `/var/lib/billet-pool-prelude/disks.env`:
-   - the record names each disk by a `/dev/disk/by-id` name, resolved again on every run, since a kernel name like `/dev/nvme1n1` is only the order the disks were found in at that boot. A disk with no such name is refused rather than recorded by its kernel name, and the record is written only after the whole scan and every name succeeded;
+   - the record names each disk by a `/dev/disk/by-id` name, resolved again on every run, since a kernel name like `/dev/nvme1n1` is only the order the disks were found in at that boot. A disk with no such name is refused rather than recorded by its kernel name, and the record is written only after the whole scan and every name succeeded. It is synced to disk and renamed into place before either disk is changed;
    - the OSD takes `PRELUDE_OSD_DEVICE` (an alias is compared by the disk it names), else the first whole disk with no partitions, nothing mounted, no signature, and not the root's (an instance store's NVMe on metal). Blank means `wipefs --no-act` read the disk and listed nothing, the role's own test for a ledger volume. `blkid`'s "nothing found" is also its answer when it could not read the disk. Any probe that fails, a `wipefs` read included, fails the whole scan, which is tried again (five times), so a disk that could not be read just then is never left out of the record for good;
    - a second such disk, when there is one, is formatted only when it is blank by that test. It is used as it is when it holds exactly one ext4 filesystem (this prelude's, from a run cut short before the mount), and refused otherwise. It is mounted by its filesystem's UUID from `/etc/fstab`, with Docker's and Ceph's directories bound onto it there. The entries are `nofail`, so a disk gone after a reboot does not stop the boot. A drop-in makes Docker require both mounts, so neither Docker nor Ceph's daemons, which are its containers, starts on the root's empty directories. The disk holds Docker's data (cephadm's containers), Ceph's (the monitor warns below 30% free, which an 8 GB root reaches) and the guest image's staging. The staging holds the image's parts, its assembled archive and the decompressed image at once: 97 GB at its peak for the x86_64 image of 2026-11-08. A 40 GB disk filled, and the pull failed.
    - "First" is the kernel's listing order, not the order the disks were attached or their size. When the host's disks differ, set `PRELUDE_OSD_DEVICE`, so the staging lands on a disk large enough for it.
@@ -31,9 +31,11 @@ Retries:
 - each of these is retried, so one refused answer does not skip the join: the instance metadata requests, apt (update and install, whole, since its lock timeout does not cover the package lists' lock), pip (whole), Galaxy, the downloads, the disk scan, the role's converge (three times, whole), Ceph's settings and the kernel pull;
 - a download attempt that falls under 1 KB/s for a minute, or runs fifteen minutes, is abandoned and asked again, and none begins after twenty;
 - the kernel pull has no deadline of its own, so its attempts share a budget: `PRELUDE_BUDGET_SECONDS` from the prelude's start (default 5400, ninety minutes). Each attempt is cut off at what is left, and none begins with under a minute left. The join's token lives two hours from the order, and the host still has to enroll;
-- before the pull, the staging directory's free room is checked against `PRELUDE_STAGING_GB` (default 100, in units of 10⁹ bytes, for the 97 GB the x86_64 image of 2026-11-08 needed). Too little is refused at once rather than retried until the budget is spent. Set it for another image or architecture.
+- before the pull, the staging directory's free room is checked against `PRELUDE_STAGING_GB` (default 100, in units of 10⁹ bytes, for the 97 GB the x86_64 image of 2026-11-08 needed). Too little is refused at once rather than retried until the budget is spent. Set it for another image or architecture. A `pull-*` directory a pull left when it was killed (a reboot, say) is reclaimed before the check, unless the image unit is running, since it is the other pull into that staging.
 
-The S3 credentials reach curl on its standard input, never its arguments.
+The S3 credentials reach curl on its standard input, never its arguments. They are written into its configuration only when every character is one a credential is made of, so no answer can add a configuration line of its own.
+
+An image name with `@` (a tier's `ubuntu-2404-x64@verified`) is refused at the start. A pull assigns the generation itself and refuses a name that names one.
 
 It may be run again on the same host:
 - the disks come from the record, and a mounted scratch disk is reused;
@@ -49,7 +51,7 @@ Write the exports below to a file, append the script's body without its comment 
 { cat exports.sh; tail -n +2 prelude.sh | sed '/^[[:space:]]*#/d'; } >/etc/billet/pool-prelude.sh
 ```
 
-The comments are why each step is there, and they cost room the payload does not have. The script with them is about 19.5 KB, past the 16384 bytes the control plane carries (it refuses a longer boot, naming `boot_prelude`). Without them it is about 10.9 KB. No line the script needs starts with `#`: the full-line comments inside its two YAML heredocs are YAML's own.
+The comments are why each step is there, and they cost room the payload does not have. The script with them is about 21 KB, past the 16384 bytes the control plane carries (it refuses a longer boot, naming `boot_prelude`). Without them it is about 11.4 KB. No line the script needs starts with `#`: the full-line comments inside its two YAML heredocs are YAML's own.
 
 The exports:
 
@@ -61,7 +63,7 @@ export BILLET_SHA256='…'
 export COLLECTION_URL='https://github.com/junioryono/billet/archive/refs/tags/v0.36.0.tar.gz'
 export COLLECTION_SHA256='…'
 export PRELUDE_JOIN_SERVER='10.0.0.5:7717'   # server.pool.join_server
-export PRELUDE_IMAGE='ubuntu-2404-x64'       # the tier's image name
+export PRELUDE_IMAGE='ubuntu-2404-x64'       # the tier's image, by its name alone (no @verified)
 ```
 
 The collection tarball may hold `ansible_collections/` at its top (a tarball of that directory alone, as the run used) or one directory down (GitHub's source archive of a tag or commit).
@@ -75,7 +77,12 @@ Also set `server.pool.init_args` to the same three flags the script gives `bille
 - `--ceph-user=billet`
 - `--ceph-keyring=/etc/ceph/ceph.client.billet.keyring`
 
-The whole payload carries a join token, so keep it to the source's API, and within EC2's 16384 bytes of user data. The control plane adds the join's line and a few lines around the prelude, under 1 KB. The body without comments plus exports naming S3 keys is about 11 KB; exports holding presigned links add about 2 KB each. Check the rendered file's size (`wc -c`) before pointing the pool at it.
+The whole payload carries a join token, so keep it to the source's API, and within EC2's 16384 bytes of user data. The control plane adds the join's line and a few lines around the prelude, under 1 KB. The sizes:
+- **The body without comments** is about 11.4 KB.
+- **Exports naming release URLs or S3 keys** add a few hundred bytes.
+- **A presigned link** adds about 1.9 KB. Two of them leave about half a kilobyte of room once the control plane's lines are added, so prefer S3 keys.
+
+Check the rendered file's size (`wc -c`) before pointing the pool at it.
 
 ## What has been proven, and what has not
 
