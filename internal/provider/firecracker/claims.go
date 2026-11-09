@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -695,10 +696,45 @@ func (p *Provider) removeCgroup(j jail) error {
 }
 
 func (p *Provider) removeCgroupAt(root string, j jail) error {
-	if err := os.Remove(filepath.Join(root, j.execName, j.id)); err != nil &&
-		!errors.Is(err, os.ErrNotExist) {
+	if err := removeEmptiedCgroup(filepath.Join(root, j.execName, j.id), os.Remove, time.Sleep,
+		cgroupReleaseWait); err != nil {
 		return fmt.Errorf("firecracker: remove the cgroup of %s: %w", j.id, err)
 	}
 
 	return nil
+}
+
+// cgroupReleaseWait and cgroupReleasePoll bound how long a microVM's cgroup is given to
+// become removable after its process is proved gone.
+const (
+	cgroupReleaseWait = 10 * time.Second
+	cgroupReleasePoll = 20 * time.Millisecond
+)
+
+// removeEmptiedCgroup removes a cgroup whose process is gone, waiting out the kernel's
+// release of it.
+//
+// THE PROCESS GOES BEFORE THE CGROUP SAYS SO. On Ubuntu 24.04's 6.8.0-149-generic a
+// boot-verify's probe was proved gone and its cgroup's rmdir answered EBUSY every time,
+// while cgroup.events went on saying populated 1 for a moment more and then 0, and six of
+// seven jobs' teardowns met it, for 41 to 187 ms (measured 2026-11-09); kernel 7.0 had not
+// shown it. A single rmdir failed every such teardown, and with it the release of the
+// lease, until a later one retried.
+// EBUSY is the only answer waited on, and only for a while: an rmdir removes nothing
+// that is not empty, so a cgroup a live process still holds is refused as before.
+func removeEmptiedCgroup(dir string, remove func(string) error, sleep func(time.Duration),
+	wait time.Duration,
+) error {
+	for waited := time.Duration(0); ; waited += cgroupReleasePoll {
+		err := remove(dir)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		if !errors.Is(err, unix.EBUSY) || waited >= wait {
+			return err
+		}
+
+		sleep(cgroupReleasePoll)
+	}
 }

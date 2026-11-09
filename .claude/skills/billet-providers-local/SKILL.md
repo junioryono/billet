@@ -26,6 +26,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Every guest runs under the jailer**
 - **`jailer --daemonize` exits 0 for a VM that died on startup**
 - **The jailer creates a per-VM cgroup only when given a `--cgroup`, and the two cgroup forms cannot coexist on a host**
+- **A microVM's cgroup goes on answering EBUSY for a moment after its process is gone.**
 - **There is no API action that kills a microVM.**
 - **The kernel is linked into each jail and stays root-owned.**
 - **Two defects survived every unit test and died on the first real launch**
