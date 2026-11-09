@@ -152,7 +152,7 @@ func (s *CacheService) casVolume(
 	if !setting.Enabled {
 		return nil, errCacheOff
 	}
-	if err := casPolicyErr(s.sessionKindPolicy(ctx, session, kind)); err != nil {
+	if err := casPolicyErr(s.sessionServingPolicy(ctx, session, kind)); err != nil {
 		return nil, err
 	}
 
@@ -488,7 +488,7 @@ func (s *CacheService) openCASHandle(
 		// THE KILL SWITCH IS ASKED AGAIN WHILE THE VOLUME IS IN USE, not only
 		// when it is attached, so disabling a cache stops a running job's use of
 		// it within casPolicyAge.
-		if err = casPolicyErr(s.sessionKindPolicy(ctx, session, kind)); err == nil {
+		if err = casPolicyErr(s.sessionServingPolicy(ctx, session, kind)); err == nil {
 			hv.allowedAt = s.now()
 		}
 	}

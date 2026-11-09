@@ -682,7 +682,7 @@ func (s *CacheService) gitAllowed(ctx context.Context, session *cacheSession) bo
 	if s.now().Sub(session.gitAllowedAt) < casPolicyAge {
 		return true
 	}
-	if answer := s.sessionKindPolicy(ctx, session, config.CacheGit); answer != policyAllowed {
+	if answer := s.sessionServingPolicy(ctx, session, config.CacheGit); answer != policyAllowed {
 		noteRefused(session, config.CacheGit, answer)
 
 		return false

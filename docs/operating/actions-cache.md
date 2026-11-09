@@ -122,7 +122,7 @@ One limit is worth knowing. BuildKit writes one cache entry per layer blob while
 
 ## Kill switch
 
-The control plane owns a deny list in its state database, one entry per cache or for every cache (`--kind`, default `all`), and the node asks it before every locally handled cache operation. Before any local reservation exists, policy lookup failure or denial is passthrough, never local permission. A blob upload or finalization already bound to a Billet reservation fails locally instead of being misrouted to GitHub, which never received that reservation. Organisation and repository names are case-insensitive.
+The control plane owns a deny list in its state database, one entry per cache or for every cache (`--kind`, default `all`), and the node asks it before every locally handled cache operation. Before any local reservation exists, a denial is passthrough, never local permission, and so is a failed lookup, with one exception. While the control plane cannot be asked, as through its own restart, a node serves a job by the switch's last answer for that cache of that repository if that answer allowed it and is less than ten minutes old. A refusal the node has read is never outlived this way. A publication is never decided by a remembered answer. A block set while the plane is not answering takes effect at the plane's next answer, or ten minutes after the last answer that allowed the cache at the latest. A blob upload or finalization already bound to a Billet reservation fails locally instead of being misrouted to GitHub, which never received that reservation. Organisation and repository names are case-insensitive.
 
 ```bash
 billet cache disable --org acme                           # every cache

@@ -98,6 +98,9 @@ type CacheService struct {
 	actionIO   actionsVolumeManager
 	actionRule ActionsPolicy
 	policy     CachePolicy
+	// policyMemo is the kill switch's last "allowed" per cache and repository,
+	// which a job's cache is served by while the control plane cannot be asked.
+	policyMemo policyMemory
 	authority  CacheAuthorityReader
 	observer   CacheObserver
 	// remoteAPI serves Bazel's and Buck2's gRPC remote caches.
@@ -1437,7 +1440,7 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 	setting := sessionSetting(session, config.CacheDocker)
-	if !setting.Enabled || !s.sessionKindAllowed(requestCtx, session, config.CacheDocker) {
+	if !setting.Enabled || !s.sessionServingAllowed(requestCtx, session, config.CacheDocker) {
 		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
 		http.Error(w, "the Docker image store is off for this job", http.StatusForbidden)
 
@@ -1891,7 +1894,7 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	}
 	// AN UNREADABLE SWITCH IS REFUSED AS AN OFF ONE IS; only what is recorded
 	// differs.
-	if answer := s.sessionKindPolicy(ctx, session, config.CacheSticky); answer != policyAllowed {
+	if answer := s.sessionServingPolicy(ctx, session, config.CacheSticky); answer != policyAllowed {
 		noteRefused(session, config.CacheSticky, answer)
 		http.Error(w, "sticky disks are off for this job", http.StatusForbidden)
 

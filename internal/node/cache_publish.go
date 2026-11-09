@@ -239,7 +239,8 @@ func pendingPublication(attachment *cacheAttachment) bool {
 }
 
 // sessionKindAllowed asks the kill switch about a cache for the session's
-// static scope, which is all a guest's first request can be judged by.
+// static scope, as the plane answers now: what a publication is decided by.
+// Serving a job asks sessionServingAllowed.
 func (s *CacheService) sessionKindAllowed(ctx context.Context, session *cacheSession,
 	kind config.CacheKind,
 ) bool {
@@ -260,6 +261,26 @@ func (s *CacheService) sessionKindPolicy(ctx context.Context, session *cacheSess
 	}
 
 	return s.kindPolicy(ctx, kind, owner, repository)
+}
+
+// sessionServingAllowed is sessionServingPolicy's answer as allowed or not.
+func (s *CacheService) sessionServingAllowed(ctx context.Context, session *cacheSession,
+	kind config.CacheKind,
+) bool {
+	return s.sessionServingPolicy(ctx, session, kind) == policyAllowed
+}
+
+// sessionServingPolicy is servingPolicy for the session's static scope: what
+// serving the session's job from a cache asks, never a publication.
+func (s *CacheService) sessionServingPolicy(ctx context.Context, session *cacheSession,
+	kind config.CacheKind,
+) policyAnswer {
+	owner, repository := session.cacheOwner(), session.cacheRepository()
+	if owner == "" || repository == "" {
+		return policyAllowed
+	}
+
+	return s.servingPolicy(ctx, kind, owner, repository)
 }
 
 // volumeCeiling is the largest volume a cache setting admits.
@@ -373,25 +394,83 @@ func (s *CacheService) kindAllowed(ctx context.Context, kind config.CacheKind,
 
 // kindPolicy is kindAllowed's answer with could-not-tell kept apart, for a
 // caller that records what the cache did: an unreadable switch is not one that
-// refused.
+// refused. It is the plane's answer now and nothing else, which is what a
+// publication is decided by.
 func (s *CacheService) kindPolicy(ctx context.Context, kind config.CacheKind,
 	owner, repository string,
 ) policyAnswer {
-	if s.policy == nil {
+	answer, err := s.askKindPolicy(ctx, kind, owner, repository)
+	if answer == policyUnknown {
+		s.log.Warn("the cache kill switch could not be read; the cache is not used",
+			"kind", kind, "owner", owner, "repository", repository, "error", err)
+	}
+
+	return answer
+}
+
+// servingPolicy is the kill switch's answer for serving a job from a cache:
+// the plane's answer now, or, while the plane cannot be asked, its last
+// "allowed" for that cache of that repository if that is younger than
+// policyRememberedFor. A publication never uses it: what it writes is read by
+// later jobs, and its own pass retries inside its window.
+func (s *CacheService) servingPolicy(ctx context.Context, kind config.CacheKind,
+	owner, repository string,
+) policyAnswer {
+	answer, err := s.askKindPolicy(ctx, kind, owner, repository)
+	if answer != policyUnknown {
+		return answer
+	}
+
+	return s.rememberedPolicy(kind, owner, repository, err)
+}
+
+// rememberedPolicy is what serving falls back to when the plane could not be
+// asked: allowed while the last "allowed" stands, could-not-tell otherwise.
+func (s *CacheService) rememberedPolicy(kind config.CacheKind, owner, repository string,
+	err error,
+) policyAnswer {
+	if age, ok := s.policyMemo.standing(kind, owner, repository, s.now()); ok {
+		s.log.Warn("the cache kill switch could not be read; serving by its last answer, which allowed this cache",
+			"kind", kind, "owner", owner, "repository", repository,
+			"answered", age.Round(time.Second), "error", err)
+
 		return policyAllowed
+	}
+	s.log.Warn("the cache kill switch could not be read; the cache is not used",
+		"kind", kind, "owner", owner, "repository", repository, "error", err)
+
+	return policyUnknown
+}
+
+// askKindPolicy asks the plane and records what it answered: an "allowed" is
+// remembered and a refusal forgets it.
+func (s *CacheService) askKindPolicy(ctx context.Context, kind config.CacheKind,
+	owner, repository string,
+) (policyAnswer, error) {
+	if s.policy == nil {
+		return policyAllowed, nil
 	}
 	policyCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
 	defer cancel()
 	allowed, err := s.policy.CacheAllowed(policyCtx, kind, owner, repository)
+
+	return s.notePolicy(kind, owner, repository, allowed, err), err
+}
+
+// notePolicy turns one answer of the plane into a policyAnswer and records it.
+func (s *CacheService) notePolicy(kind config.CacheKind, owner, repository string,
+	allowed bool, err error,
+) policyAnswer {
 	switch {
 	case err != nil:
-		s.log.Warn("the cache kill switch could not be read; the cache is not used",
-			"kind", kind, "owner", owner, "repository", repository, "error", err)
-
 		return policyUnknown
 	case allowed:
+		s.policyMemo.note(kind, owner, repository, true, s.now())
+
 		return policyAllowed
 	default:
+		s.policyMemo.note(kind, owner, repository, false, s.now())
+
 		return policyRefused
 	}
 }

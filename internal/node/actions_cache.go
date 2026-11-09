@@ -553,14 +553,14 @@ func (s *CacheService) actionsKeysFor(
 		allowed, policyErr := s.actionRule.ActionsCacheAllowed(policyCtx,
 			session.owner, session.repository)
 		cancel()
-		if policyErr != nil {
-			s.log.Warn("Actions cache policy is unavailable",
-				"instance", session.instance, "owner", session.owner,
-				"repository", session.repository, "error", policyErr)
-
-			return actionsKeys{}, alloc.ActionsCacheSpliced
+		answer := s.notePolicy(config.CacheActions, session.owner, session.repository, allowed, policyErr)
+		if answer == policyUnknown {
+			answer = s.rememberedPolicy(config.CacheActions, session.owner, session.repository, policyErr)
 		}
-		if !allowed {
+		switch answer {
+		case policyUnknown:
+			return actionsKeys{}, alloc.ActionsCacheSpliced
+		case policyRefused:
 			return actionsKeys{}, alloc.ActionsCacheDisabled
 		}
 		prefix := func(version string) string {
@@ -576,7 +576,7 @@ func (s *CacheService) actionsKeysFor(
 	if !ok {
 		return actionsKeys{}, alloc.ActionsCacheSpliced
 	}
-	if !s.kindAllowed(ctx, config.CacheActions, session.cache.Owner, session.cache.Repository) {
+	if s.servingPolicy(ctx, config.CacheActions, session.cache.Owner, session.cache.Repository) != policyAllowed {
 		return actionsKeys{}, alloc.ActionsCacheDisabled
 	}
 	prefix := func(ref, version string) string {
