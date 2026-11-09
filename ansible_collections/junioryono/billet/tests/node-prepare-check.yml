@@ -11,7 +11,9 @@
 #   2. A converge over a joined node (a config the role did not write, the node
 #      enabled, and a drain request that is not the role's) leaves the config's
 #      bytes, the node's enablement and the request as they were, and records no
-#      drain owed: the role neither validates, renders, drains nor disables it.
+#      drain owed: the role neither validates, renders, drains nor disables it. And
+#      the node unit it rendered is one `billet local up`, the join's last step,
+#      starts: the package's shape, notify with its state directory declared.
 #   3. The guest image refresh units are installed and the timer is left unarmed,
 #      where the same tasks arm it on an ordinary host: its service reads the
 #      config only the join writes, and `billet local up` arms it. Nor is a timer
@@ -187,6 +189,35 @@
           {{ billet_prepare_join_after.results[1:] | map(attribute='stat.exists') | list }},
           check {{ 'skipped' if billet_check is skipped else 'ran' }},
           node {{ billet_prepare_join_node.results | map(attribute='stdout') | list }}.
+
+    - name: Read the node unit the role rendered
+      ansible.builtin.slurp:
+        src: /etc/systemd/system/billet-node.service
+      register: billet_prepare_unit
+
+    # THE JOIN'S LAST STEP, asked what it would do: on a z1d.metal (2026-11-09) it
+    # refused the role's exec unit with no declared state directory, and the node
+    # never started. A dry run starts nothing and reports every refusal.
+    - name: Ask billet local up what it would do with the join's config
+      ansible.builtin.command:
+        argv: [/usr/bin/billet, local, up, --dry-run, --config, /etc/billet/billet.yaml]
+      register: billet_prepare_local_up
+      changed_when: false
+      failed_when: false
+
+    - name: Require a unit of the package's shape that billet local up would start
+      ansible.builtin.assert:
+        that:
+          - "'Type=notify' in billet_prepare_unit_text"
+          - "'NotifyAccess=main' in billet_prepare_unit_text"
+          - "'StateDirectory=billet/node' in billet_prepare_unit_text"
+          - "'billet-node.service' in billet_prepare_local_up_out"
+          - "'rather than Type=notify' not in billet_prepare_local_up_out"
+          - "'declares no directory for state_dir' not in billet_prepare_local_up_out"
+        fail_msg: "{{ billet_prepare_local_up_out }}"
+      vars:
+        billet_prepare_unit_text: "{{ billet_prepare_unit.content | b64decode }}"
+        billet_prepare_local_up_out: "{{ billet_prepare_local_up.stdout ~ billet_prepare_local_up.stderr }}"
 
     - name: Put the node back as the first converge left it
       ansible.builtin.command:
