@@ -22,7 +22,13 @@ type cacheFake struct {
 	depths    map[string]int
 	trash     map[string]string
 	// trashFailures makes `trash rm` of a handle answer its error.
-	trashFailures       map[string]error
+	trashFailures map[string]error
+	// trashMoving are trash entries, by id, whose move into the trash was
+	// interrupted: `trash rm` refuses them with EUCLEAN, and `trash mv` of their
+	// name, which the pool no longer holds, finishes the move (Ceph v20.2.0).
+	trashMoving map[string]bool
+	// infoFailures makes `rbd info` of an image answer its error.
+	infoFailures        map[string]error
 	metadata            map[string]map[string]string
 	mappings            map[string]string
 	lockCookie          string
@@ -179,6 +185,17 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 
 		image := args[1]
 		if !f.images[image] {
+			// LIBRBD FINISHES AN INTERRUPTED MOVE OF A NAME ITS DIRECTORY NO LONGER
+			// HOLDS, found by the trash entry's name and moving state.
+			_, name, _ := strings.Cut(image, "/")
+			for id := range f.trashMoving {
+				if f.trash[id] == name {
+					delete(f.trashMoving, id)
+
+					return nil, nil
+				}
+			}
+
 			return nil, errors.New("rbd: (2) No such file or directory")
 		}
 
@@ -213,6 +230,12 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 		name, ok := f.trash[id]
 		if !ok {
 			return nil, errors.New("rbd: (2) No such file or directory")
+		}
+		if f.trashMoving[id] {
+			// As ubuntu-01's rbd answered on 2026-11-09.
+			return nil, fmt.Errorf("exit status 117: %w", cacheExitError{
+				code: 117, message: "librbd::api::Trash: remove: error: image is pending moving to the trash.",
+			})
 		}
 
 		image := "billet-cache/" + name
@@ -564,6 +587,9 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 
 		return nil, nil
 	case "info":
+		if err, ok := f.infoFailures[tail[0]]; ok {
+			return nil, err
+		}
 		if !f.images[tail[0]] && !f.snapshots[tail[0]] {
 			return nil, errors.New("rbd: (2) No such file or directory")
 		}
