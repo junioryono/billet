@@ -690,6 +690,13 @@ func startHostUpgradeHolding(ctx context.Context, env cli.Env, cfg *config.Confi
 		return err
 	}
 
+	// A CLAIM A DEAD UPDATER LEFT BEFORE STAGING IS NOT AN UPGRADE IN PROGRESS.
+	// Left alone, every later dispatch was refused as one, and the host could
+	// not move again until somebody ran `--resume` by hand.
+	if err := abandonUntouchedClaim(env, tx); err != nil {
+		return err
+	}
+
 	// A BINARY DIRECTORY THIS ACCOUNT CANNOT WRITE IS REFUSED HERE, under the
 	// lock and before the network: on a Mac /usr/local/bin is root-owned until
 	// the setup's chown, and finding that at the rename would be a rollback
@@ -946,26 +953,44 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 		}
 	}
 
+	// THE CANDIDATE IS STAGED BEFORE THE JOB IS TAKEN, and a staging that fails
+	// gives the claim back and refuses. Staged after acceptance, a download that
+	// failed left a claim nothing worked on: the rollout counted the host as
+	// draining with no attempt to retry, and a resume stopped both services with
+	// no candidate to install (2026-11-09, a 504 on the release archive). Refused
+	// here, the rollout records the refusal and backs off as for any other.
+	//
+	// BOUNDED WHILE A NODE WAITS FOR THE ANSWER, inside its ackWait (90 s) with
+	// room for the resolve and the claim before it; a slower download is a
+	// refusal the rollout retries. With nobody waiting, as under the timer, the
+	// download takes what it takes.
+	stageCtx, endStaging := ctx, func() {}
+	if ack.waiting() {
+		stageCtx, endStaging = context.WithTimeout(ctx, stagingLimit)
+	}
+
+	staged, err := stageCandidate(stageCtx, client, manifest, dir)
+	endStaging()
+
+	if err != nil {
+		return refuseClaimed(tx.dir, dir, fmt.Errorf("staging %s: %w", manifest.Version, err))
+	}
+
+	if err := journal.Advance(hostupgrade.StepStaged); err != nil {
+		return refuseClaimed(tx.dir, dir, err)
+	}
+
 	// THE JOB IS TAKEN, AND THIS IS THE MOMENT IT BECAME TRUE.
 	//
 	// Everything that can refuse without touching the deployment has now run — the
 	// channel resolved, the digest agreed, the candidate was found compatible, the
-	// generation was not superseded, the claim was taken, and the recovery journal
-	// is on the disk and fsynced. From here the transaction is recoverable by a
-	// resume even if this process dies, so there is nothing left for the caller to
-	// wait for and a great deal it must not wait for: the very next step downloads
-	// an archive, and the one after that drains a host for as long as somebody's
-	// job takes.
+	// generation was not superseded, the claim was taken, the candidate is staged
+	// and verified, and the recovery journal is on the disk and fsynced. From here
+	// the transaction is recoverable by a resume even if this process dies, so
+	// there is nothing left for the caller to wait for and a great deal it must
+	// not wait for: the next step drains a host for as long as somebody's job
+	// takes.
 	ack.accept()
-
-	staged, err := stageCandidate(ctx, client, manifest, dir)
-	if err != nil {
-		return fmt.Errorf("staging %s: %w", manifest.Version, err)
-	}
-
-	if err := journal.Advance(hostupgrade.StepStaged); err != nil {
-		return err
-	}
 
 	fmt.Fprintf(env.Stdout, "Upgrading %s -> %s\n", journal.FromVersion, journal.ToVersion)
 	fmt.Fprintf(env.Stdout, "  recovery journal %s\n", dir)
@@ -1074,6 +1099,16 @@ func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config) err
 	// makes a removal act somewhere nobody intended.
 	journal.Dir = dir
 
+	// A TRANSACTION AT `claimed` HAS NO CANDIDATE TO RESUME WITH, and nothing on
+	// this machine was touched: the work between `claimed` and `staged` is a
+	// download into its own directory. Resuming it stopped both services and
+	// then failed for the missing binary (2026-11-09, ubuntu-01, after a 504 on
+	// the archive); it is abandoned instead, and the rollout's next dispatch
+	// starts over.
+	if journal.Step == hostupgrade.StepClaimed {
+		return abandonUnstaged(env, tx.dir, journal)
+	}
+
 	fmt.Fprintf(env.Stdout, "Resuming the upgrade %s -> %s, which reached %s.\n",
 		journal.FromVersion, journal.ToVersion, journal.Step)
 
@@ -1093,6 +1128,44 @@ func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config) err
 	}
 
 	return finishHostUpgrade(ctx, env, tx.dir, journal, host)
+}
+
+// abandonUnstaged releases a transaction that never staged its candidate, the
+// one state that provably touched nothing, and says so.
+func abandonUnstaged(env cli.Env, root *os.File, journal *hostupgrade.Journal) error {
+	fmt.Fprintf(env.Stdout, "An upgrade %s -> %s claimed this machine and never staged its candidate, so\n",
+		journal.FromVersion, journal.ToVersion)
+	fmt.Fprintf(env.Stdout, "nothing here was touched. Releasing its claim; the next instruction starts over.\n")
+
+	return abandonClaim(root, journal.Dir)
+}
+
+// abandonUntouchedClaim releases a claim a dead updater left at `claimed`, so a
+// new transaction can take the host. Called with the transaction lock held,
+// which every updater holds for its whole transaction, so the claim's updater
+// is gone. A claim in any other state, or one whose journal cannot be read, is
+// left for publishClaim to refuse naming `--resume`.
+func abandonUntouchedClaim(env cli.Env, tx *txLock) error {
+	shape, err := classifyClaimAt(tx.dir)
+	if err != nil || shape.Kind != claimHostUpgrade {
+		return err
+	}
+
+	journal, err := readJournalUnder(tx.dir, shape.Target)
+	if err != nil {
+		// COULD NOT TELL WHAT IT TOUCHED, so it is not abandoned: publishClaim
+		// refuses beside it naming `--resume`, which reads it again.
+		fmt.Fprintf(env.Stdout, "An earlier upgrade's journal could not be read (%v); leaving its claim.\n", err)
+
+		return nil
+	}
+	if journal.Step != hostupgrade.StepClaimed {
+		return nil
+	}
+
+	journal.Dir = shape.Target
+
+	return abandonUnstaged(env, tx.dir, journal)
 }
 
 // finishHostUpgrade runs the transaction and releases the claim only once the

@@ -314,8 +314,9 @@ func (unreachable) RoundTrip(*http.Request) (*http.Response, error) {
 // exactly as it was.
 //
 // Taking the transaction is observable without a network: it claims the machine
-// before it downloads anything, so the claim is there whether or not the download
-// could have worked.
+// and then stages the candidate, so with no release server the answer is the
+// staging failure, which only a transaction reaches, and the claim is given back
+// (#817).
 func TestTheFastPathDoesNotWaveThroughADisagreeingHost(t *testing.T) {
 	withUpgradeRoot(t)
 	seedInstalledRecord(t, strings.Repeat("e", 64))
@@ -331,9 +332,11 @@ func TestTheFastPathDoesNotWaveThroughADisagreeingHost(t *testing.T) {
 			"operator to fix with this command")
 	}
 
-	if _, statErr := os.Lstat(activePath()); statErr != nil {
-		t.Errorf("it did not start a transaction: %v", statErr)
+	if !strings.Contains(err.Error(), "staging") {
+		t.Errorf("it did not start a transaction: %v", err)
 	}
+
+	noClaim(t)
 }
 
 // AND A HOST THAT CANNOT SAY IS LEFT ALONE.
@@ -392,7 +395,9 @@ func TestReinstallInstallsEvenWhenTheVersionAlreadyMatches(t *testing.T) {
 			"whose record is damaged has no way back into a rollout")
 	}
 
-	if _, statErr := os.Lstat(activePath()); statErr != nil {
-		t.Errorf("--reinstall did not start a transaction: %v", statErr)
+	if !strings.Contains(err.Error(), "staging") {
+		t.Errorf("--reinstall did not start a transaction: %v", err)
 	}
+
+	noClaim(t)
 }

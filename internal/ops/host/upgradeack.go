@@ -21,6 +21,13 @@ func newUpgradeAck(path string) *upgradeAck {
 	return &upgradeAck{path: path}
 }
 
+// stagingLimit bounds staging the candidate while a node waits for the answer:
+// the node's ackWait is 90 s, and the resolve and the claim come first.
+const stagingLimit = 60 * time.Second
+
+// waiting says a node is waiting for this updater's answer.
+func (a *upgradeAck) waiting() bool { return a.path != "" && !a.sent }
+
 // accept follows every preflight that can refuse without consequence.
 func (a *upgradeAck) accept() { a.send(node.AckAccepted) }
 

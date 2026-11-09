@@ -88,6 +88,10 @@ type Client struct {
 	// verify is the signature check. Nil means the real one; a test replaces it
 	// so it can exercise the surrounding refusals without minting certificates.
 	verify func(document, signature []byte, p Policy) error
+
+	// backoff is the wait before a failed fetch's second try. Zero means
+	// fetchBackoff; a test sets it so it does not wait seconds.
+	backoff time.Duration
 }
 
 func (c *Client) repo() string {
@@ -337,30 +341,70 @@ func (c *Client) get(ctx context.Context, url string, limit int64) ([]byte, erro
 	return read, nil
 }
 
+// fetchAttempts is how many times a fetch is tried, and fetchBackoff the wait
+// before the second try, doubling after it. GitHub's release downloads answered
+// 504 Gateway Timeout in windows from seconds to hours on 2026-11-08 and
+// 2026-11-09, often within 100 ms, and a rollout's dispatch that failed on the
+// first one waited minutes for its retry.
+const (
+	fetchAttempts = 3
+	fetchBackoff  = time.Second
+)
+
+// open fetches url, trying again after a transport failure, a 5xx or a 429
+// while ctx allows. A 404 and any other answer are final.
 func (c *Client) open(ctx context.Context, url string) (io.ReadCloser, error) {
+	wait := c.backoff
+	if wait == 0 {
+		wait = fetchBackoff
+	}
+
+	for attempt := 1; ; attempt++ {
+		body, retry, err := c.openOnce(ctx, url)
+		if err == nil || !retry || attempt == fetchAttempts {
+			return body, err
+		}
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return nil, err
+		case <-timer.C:
+		}
+
+		wait *= 2
+	}
+}
+
+// openOnce is one fetch, and whether its failure is worth another.
+func (c *Client) openOnce(ctx context.Context, url string) (io.ReadCloser, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
-		return nil, fmt.Errorf("releasesource: request %s: %w", url, err)
+		return nil, false, fmt.Errorf("releasesource: request %s: %w", url, err)
 	}
 
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("releasesource: fetch %s: %w", url, imagesource.WithoutSignedQuery(err))
+		return nil, ctx.Err() == nil,
+			fmt.Errorf("releasesource: fetch %s: %w", url, imagesource.WithoutSignedQuery(err))
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
 		_ = resp.Body.Close()
 
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, url)
+		return nil, false, fmt.Errorf("%w: %s", ErrNotFound, url)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
 
-		return nil, fmt.Errorf("releasesource: %s returned %s", url, resp.Status)
+		return nil, resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusTooManyRequests,
+			fmt.Errorf("releasesource: %s returned %s", url, resp.Status)
 	}
 
-	return resp.Body, nil
+	return resp.Body, false, nil
 }
 
 func digest(body []byte) []byte {

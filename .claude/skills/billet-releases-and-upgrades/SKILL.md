@@ -41,6 +41,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **`billet host-upgrade` is a separate detached program with everything on disk.** `claimed → staged → stopped → imaged → fenced → snapshotted → installed → migrated → probed → committed | rolled_back`; the order is the safety content.
 - **The disk the transaction will fill is asked before anything stops (#802).** The ledger's size plus a margin under the upgrade root, judged before the claim.
+- **The candidate is staged before the job is taken, and a transaction that never staged is abandoned, never resumed (#817).** A failed download gives the claim back as a refusal; release fetches try a 5xx three times.
 - **One transaction, two service managers, three ledgers.**
 - **Two answers over a Unix socket, and a spawn is not an answer.**
 - **The probe answers by exiting or by saying it is ready, the candidate says which, and the fence is cleared under the reason it was written with.**
