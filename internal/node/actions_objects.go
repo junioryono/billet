@@ -171,6 +171,12 @@ func (s *CacheService) publishObjectReceipt(
 	if receipt.Complete {
 		return actionsReceiptResponse(receipt)
 	}
+	// A PUBLICATION ASKS THE KILL SWITCH NOW, the first finalize and a retried
+	// one alike: the reservation and its blocks may have been served by a
+	// remembered answer while the plane was down.
+	if err := s.actionsPublicationErr(ctx, session); err != nil {
+		return nil, err
+	}
 
 	published, err := s.commitReceipt(ctx, session, receipt)
 	if err != nil {

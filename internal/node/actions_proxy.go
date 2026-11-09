@@ -736,7 +736,12 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 			if err != nil {
 				p.service.log.Warn("a reserved Actions cache finalization failed locally",
 					"instance", session.instance, "path", req.URL.Path, "error", err)
-				if billets(err) {
+				// A PUBLICATION THE KILL SWITCH REFUSED is the operator's choice,
+				// never billet's failure.
+				switch {
+				case errors.Is(err, errActionsPublicationDisabled):
+					observe(req.Context(), alloc.ActionsCacheDisabled)
+				case billets(err):
 					observe(req.Context(), alloc.ActionsCacheUnavailable)
 				}
 
@@ -763,7 +768,12 @@ func (p *actionsProxy) respond(req *http.Request, session *cacheSession) (*http.
 			// otherwise recorded as whatever its reservation was (#694). A body the
 			// guest cut short, or a request that ran out of time, is not billet's
 			// failure to record; what it says is not known.
-			if billets(err) {
+			// A PUBLICATION THE KILL SWITCH REFUSED is the operator's choice, never
+			// billet's failure.
+			switch {
+			case errors.Is(err, errActionsPublicationDisabled):
+				p.service.observeActions(req.Context(), session, alloc.ActionsCacheDisabled)
+			case billets(err):
 				p.service.observeActions(req.Context(), session, alloc.ActionsCacheUnavailable)
 			}
 

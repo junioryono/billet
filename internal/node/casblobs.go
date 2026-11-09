@@ -99,7 +99,7 @@ func (s *CacheService) blobStore() storecontract.BlobStore {
 
 // attachBlobVolume is casVolume on a store of objects. Called with session.mu held.
 func (s *CacheService) attachBlobVolume(
-	session *cacheSession, kind config.CacheKind, key string,
+	session *cacheSession, kind config.CacheKind, key string, answered time.Time,
 ) (*hostVolume, error) {
 	root := s.casMountPath(session, kind)
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -107,7 +107,7 @@ func (s *CacheService) attachBlobVolume(
 	}
 	hv := &hostVolume{
 		Kind: kind, Volume: storecontract.Volume{Key: key}, Objects: true, Mounted: true,
-		allowedAt: s.now(),
+		allowedAt: allowedAt(s.now(), answered),
 	}
 	session.hosts[kind] = hv
 	if err := s.persistSession(session); err != nil {

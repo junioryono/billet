@@ -502,29 +502,51 @@ func (s *CacheService) notePolicy(kind config.CacheKind, owner, repository strin
 	}
 }
 
-// actionsPublicationAllowed asks the plane now whether a session's Actions
-// cache may publish what it saved, the same reader actionsKeysFor asks for
-// that session, and never by a remembered answer: a published entry is what
-// later jobs restore.
-func (s *CacheService) actionsPublicationAllowed(ctx context.Context, session *cacheSession) bool {
-	if sessionPolicy(session) == config.CachePublishDefaultBranch {
-		return s.kindAllowed(ctx, config.CacheActions, session.cache.Owner, session.cache.Repository)
-	}
-	if s.actionRule == nil {
-		return false
-	}
-	ask := s.policyMemo.begin(s.now())
-	policyCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
-	allowed, err := s.actionRule.ActionsCacheAllowed(policyCtx, session.owner, session.repository)
-	cancel()
-	answer := s.notePolicy(config.CacheActions, session.owner, session.repository, allowed, err, ask)
-	if answer == policyUnknown {
-		s.log.Warn("the cache kill switch could not be read; this Actions cache entry is not published",
-			"instance", session.instance, "owner", session.owner, "repository", session.repository,
-			"error", err)
-	}
+// errActionsPublicationDisabled is a publication of an Actions cache entry the
+// kill switch refused, as the plane answered at that moment: the operator's
+// choice, recorded as disabled, never as billet's failure.
+var errActionsPublicationDisabled = errors.New("the cache kill switch refused publishing this Actions cache entry")
 
-	return answer == policyAllowed
+// errActionsPublicationUnknown is a publication of an Actions cache entry whose
+// kill switch could not be read at that moment.
+var errActionsPublicationUnknown = errors.New("the cache kill switch could not be read, so this Actions cache entry is not published")
+
+// actionsPublicationErr asks the plane now whether a session's Actions cache
+// may publish what it saved, through the same reader actionsKeysFor asks for
+// that session, and never by a remembered answer: a published entry is what
+// later jobs restore. A refusal gives back a probation's trial, since the
+// store was not asked.
+func (s *CacheService) actionsPublicationErr(ctx context.Context, session *cacheSession) error {
+	var answer policyAnswer
+	switch {
+	case sessionPolicy(session) == config.CachePublishDefaultBranch:
+		answer = s.kindPolicy(ctx, config.CacheActions, session.cache.Owner, session.cache.Repository)
+	case s.actionRule == nil:
+		answer = policyUnknown
+	default:
+		ask := s.policyMemo.begin(s.now())
+		policyCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
+		allowed, err := s.actionRule.ActionsCacheAllowed(policyCtx, session.owner, session.repository)
+		cancel()
+		answer = s.notePolicy(config.CacheActions, session.owner, session.repository, allowed, err, ask)
+		if answer == policyUnknown {
+			s.log.Warn("the cache kill switch could not be read; this Actions cache entry is not published",
+				"instance", session.instance, "owner", session.owner, "repository", session.repository,
+				"error", err)
+		}
+	}
+	switch answer {
+	case policyAllowed:
+		return nil
+	case policyRefused:
+		s.breaker.unused()
+
+		return errActionsPublicationDisabled
+	default:
+		s.breaker.unused()
+
+		return errActionsPublicationUnknown
+	}
 }
 
 func attachmentKind(attachment *cacheAttachment) config.CacheKind {

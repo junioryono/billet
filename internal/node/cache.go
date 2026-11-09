@@ -1270,6 +1270,15 @@ func (s *CacheService) cleanupSession(
 		if receipt.Upload != "" && !receipt.Complete {
 			s.releaseStagedBlocks(ctx, session, receipt.Upload)
 		}
+		// AND A VOLUME'S LEFT ITS WRITER, which nothing else gives back: a
+		// publication the kill switch refused, or one that failed and was never
+		// retried, would hold the key from every other job until its lease ran out.
+		if receipt.Upload == "" && !receipt.Complete && receipt.Lease.ID != "" {
+			if err := s.releaseWriter(ctx, receipt.Lease, receipt.Fence); err != nil {
+				s.log.Warn("could not give back an unpublished Actions cache entry's writer; it ends with its lease",
+					"instance", session.instance, "key", receipt.StoreKey, "error", err)
+			}
+		}
 	}
 
 	late := slices.Clone(session.late)
@@ -1665,6 +1674,14 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 	}
 	defer session.mu.Unlock()
 
+	// A PUBLICATION ASKS THE KILL SWITCH NOW, before it takes the breaker's trial,
+	// which a refusal would hold without asking the store: the store may have been
+	// attached by a remembered answer while the plane was down. publishAcquired
+	// asks again immediately before the pointer moves.
+	if !s.sessionKindAllowed(ctx, session, config.CacheDocker) {
+		return errPublicationRefused
+	}
+
 	// ASKED AGAIN AFTER THE WAIT, in which the breaker may have moved, and for the trial
 	// on probation, which a publication can settle.
 	if !s.breaker.admit() {
@@ -1772,11 +1789,6 @@ func (s *CacheService) publishDocker(
 ) error {
 	if err := s.attacher.DetachVolume(ctx, session.instance, 0, attachment.Volume.Device); err != nil {
 		return fmt.Errorf("detach Docker image store: %w", err)
-	}
-	// A PUBLICATION ASKS THE KILL SWITCH NOW: the store may have been attached
-	// by a remembered answer while the plane was down.
-	if !s.sessionKindAllowed(ctx, session, config.CacheDocker) {
-		return errors.New("the cache kill switch did not allow publishing the Docker image store")
 	}
 
 	lease, fence, err := s.acquireWriter(ctx, attachment, session.instance)
@@ -2102,10 +2114,13 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	// A PUBLICATION ASKS THE KILL SWITCH NOW: the disk may have been attached by
 	// a remembered answer while the plane was down. The clone stays in the
 	// session's custody for its cleanup, as when the store is not answering.
-	if !s.sessionKindAllowed(ctx, session, config.CacheSticky) {
+	refused := func() {
 		writeCacheJSON(w, http.StatusOK, map[string]any{
-			"published": false, "reason": "the cache kill switch did not allow publishing it",
+			"published": false, "reason": errPublicationRefused.Error(),
 		})
+	}
+	if !s.sessionKindAllowed(ctx, session, config.CacheSticky) {
+		refused()
 
 		return
 	}
@@ -2143,6 +2158,11 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 
 		return
 	}
+	if errors.Is(err, errPublicationRefused) {
+		refused()
+
+		return
+	}
 	if err != nil {
 		s.nonFatalCommit(w, session, commitOperation(step), err)
 
@@ -2158,6 +2178,10 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 // is not the generation this disk was cloned from: another job published it since, or
 // the disk started cold beside one too large to clone.
 const supersededReason = "superseded: the key holds a generation this disk was not cloned from, and cas keeps it"
+
+// errPublicationRefused is a Docker image store or sticky disk publication the
+// kill switch did not allow, as the plane answered at that moment.
+var errPublicationRefused = errors.New("the cache kill switch did not allow publishing it")
 
 // publishStep names the step of publishAcquired that failed, for the caller's
 // own diagnostic.
@@ -2200,6 +2224,13 @@ func (s *CacheService) publishAcquired(
 	if err := s.persistSession(session); err != nil {
 		return storecontract.Candidate{}, stepRecordConsumed,
 			errors.Join(err, s.releaseWriter(ctx, lease, fence))
+	}
+	// ASKED AGAIN IMMEDIATELY BEFORE THE POINTER MOVES, after the writer's wait,
+	// which a last-write-wins publication can spend minutes in, and the snapshot:
+	// a block set meanwhile stops it.
+	if !s.sessionKindAllowed(ctx, session, attachmentKind(attachment)) {
+		return storecontract.Candidate{}, stepPublish,
+			errors.Join(errPublicationRefused, s.releaseWriter(ctx, lease, fence))
 	}
 	err = s.publish(ctx, attachment, candidate, lease, fence)
 	s.countedPublish(session.instance, err)

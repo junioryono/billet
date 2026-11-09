@@ -127,6 +127,22 @@ func (b *storeBreaker) admit() bool {
 	return false
 }
 
+// unused gives back a probation's trial that admit gave a job which then asked
+// the store nothing, as a publication the kill switch refused does, so the next
+// job takes it rather than wait out trialFor. A job that did ask settled it
+// already, and a breaker not on probation holds no trial.
+func (b *storeBreaker) unused() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.state == lease.CacheStoreProbation {
+		b.trialUntil = time.Time{}
+	}
+}
+
 // report is the breaker's state as the control plane is told it.
 func (b *storeBreaker) report() lease.CacheStoreReport {
 	b.mu.Lock()

@@ -6,11 +6,14 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/lease"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -70,19 +73,12 @@ func TestAStickyCommitIsNotPublishedByARememberedAnswer(t *testing.T) {
 	}
 }
 
-// A DOCKER IMAGE STORE ATTACHED BY A REMEMBERED ANSWER IS NOT PUBLISHED BY ONE.
-func TestADockerStoreIsNotPublishedByARememberedAnswer(t *testing.T) {
-	t.Parallel()
+// settleDocker settles the session's Docker image store as the runner does at
+// a job's completion, with the guest proving it quiesced, and returns what the
+// settlement answered.
+func settleDocker(t *testing.T, service *CacheService, token string) error {
+	t.Helper()
 
-	plane := &planeSwitch{}
-	service, storage, token := rememberingService(t, plane)
-	service.servingPolicy(t.Context(), config.CacheDocker, "acme", "api")
-	plane.mode.Store(switchUnreachable)
-
-	if response := cacheRequest(t, service, token, "/v1/docker-store",
-		map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
-		t.Fatalf("Docker store with the plane down inside the age = %d: %s", response.Code, response.Body.String())
-	}
 	proof := map[string]any{"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true}}
 	settled := make(chan error, 1)
 	go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
@@ -97,9 +93,307 @@ func TestADockerStoreIsNotPublishedByARememberedAnswer(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	<-settled
-	if storage.published != 0 {
-		t.Fatalf("the Docker image store was published %d time(s) by a remembered answer", storage.published)
+
+	return <-settled
+}
+
+// A DOCKER IMAGE STORE ATTACHED BY A REMEMBERED ANSWER IS NOT PUBLISHED BY ONE,
+// and one the plane allows at its settlement is.
+func TestADockerStoreIsNotPublishedByARememberedAnswer(t *testing.T) {
+	t.Parallel()
+
+	for name, down := range map[string]bool{"plane down": true, "plane answering": false} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			plane := &planeSwitch{}
+			service, storage, token := rememberingService(t, plane)
+			service.servingPolicy(t.Context(), config.CacheDocker, "acme", "api")
+			if down {
+				plane.mode.Store(switchUnreachable)
+			}
+			if response := cacheRequest(t, service, token, "/v1/docker-store",
+				map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+				t.Fatalf("Docker store = %d: %s", response.Code, response.Body.String())
+			}
+			asked := plane.asked.Load()
+			err := settleDocker(t, service, token)
+			if plane.asked.Load() == asked {
+				t.Fatal("the settlement never asked the plane")
+			}
+			if down {
+				if !errors.Is(err, errPublicationRefused) || storage.published != 0 {
+					t.Fatalf("settlement with the plane down = %v, published %d; want refused by the kill switch",
+						err, storage.published)
+				}
+
+				return
+			}
+			if err != nil || storage.published != 1 {
+				t.Fatalf("settlement with the plane answering = %v, published %d; want published once",
+					err, storage.published)
+			}
+		})
+	}
+}
+
+// A BLOCK SET WHILE A STICKY COMMIT WAITS FOR ITS WRITER STOPS IT: the commit
+// asks again immediately before the pointer moves, gives the writer back and
+// publishes nothing.
+func TestAStickyCommitAsksAgainBeforeThePointerMoves(t *testing.T) {
+	t.Parallel()
+
+	var asks atomic.Int32
+	storage := &fakeCacheStore{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	// THE ATTACH AND THE COMMIT'S FIRST ASK ARE ALLOWED; THE ASK AFTER THE WRITER IS REFUSED.
+	service.SetCachePolicy(cachePolicyFunc(func(context.Context, config.CacheKind, string, string) (bool, error) {
+		return asks.Add(1) <= 2, nil
+	}))
+	credentials, err := service.PrepareScoped("billet-one", CacheSessionScope{
+		Trust: provider.TrustTrusted, Owner: "acme", Repository: "api",
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	if attached := cacheRequest(t, service, credentials.Token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(1 << 30),
+	}); attached.Code != http.StatusCreated {
+		t.Fatalf("attach = %d: %s", attached.Code, attached.Body.String())
+	}
+	committed := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/commit", nil)
+	if !bytes.Contains(committed.Body.Bytes(), []byte(`"published":false`)) ||
+		!bytes.Contains(committed.Body.Bytes(), []byte("kill switch")) {
+		t.Fatalf("commit refused after its writer = %d %s, want unpublished by the kill switch",
+			committed.Code, committed.Body.String())
+	}
+	if asks.Load() != 3 || storage.published != 0 || len(storage.released) != 1 {
+		t.Fatalf("asks=%d published=%d released=%v; want the third ask to stop it and the writer given back",
+			asks.Load(), storage.published, storage.released)
+	}
+}
+
+// AN OBJECT-BACKED ACTIONS FINALIZE IS NOT PUBLISHED BY A REMEMBERED ANSWER,
+// the first finalize or a retry, and is once the plane answers.
+func TestAnObjectFinalizeIsNotPublishedByARememberedAnswer(t *testing.T) {
+	t.Parallel()
+
+	service, storage, _ := objectService(t)
+	plane := &planeSwitch{}
+	service.SetActionsPolicy(plane)
+	session := objectActionsSession(t, service, "billet-actions")
+	stagedUpload(t, service, session, "remembered", []string{"body"}, []string{"a"})
+	plane.mode.Store(switchUnreachable)
+
+	finalize := func() (*http.Response, bool, error) {
+		request := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+			`{"key":"remembered","version":"v1","size_bytes":"4"}`)
+
+		return service.actionsResponse(request, session)
+	}
+	for _, attempt := range []string{"first", "retried"} {
+		response, _, err := finalize()
+		if response != nil {
+			response.Body.Close()
+		}
+		if !errors.Is(err, errActionsPublicationUnknown) {
+			t.Fatalf("the %s finalize with the plane down answered %v, want the kill switch unread", attempt, err)
+		}
+		storage.mu.Lock()
+		published := len(storage.archives)
+		storage.mu.Unlock()
+		if published != 0 {
+			t.Fatalf("the %s finalize published %d archive(s) by a remembered answer", attempt, published)
+		}
+	}
+
+	plane.mode.Store(switchAllows)
+	response, handled, err := finalize()
+	if err != nil || !handled {
+		t.Fatalf("the finalize with the plane back handled=%t error=%v", handled, err)
+	}
+	if got := responseJSON(t, response); got["ok"] != true {
+		t.Fatalf("the finalize with the plane back = %v", got)
+	}
+}
+
+// probationBreaker is a breaker on probation, its trial not yet taken.
+func probationBreaker() *storeBreaker {
+	b, _ := testBreaker()
+	b.mu.Lock()
+	b.state = lease.CacheStoreProbation
+	b.mu.Unlock()
+
+	return b
+}
+
+// A TRIAL A JOB TOOK AND ASKED THE STORE NOTHING WITH IS GIVEN BACK, so the next
+// job takes it rather than wait out the trial.
+func TestAnUnusedTrialIsGivenBack(t *testing.T) {
+	t.Parallel()
+
+	b := probationBreaker()
+	if !b.admit() || b.admit() {
+		t.Fatal("probation did not give one trial at a time")
+	}
+	b.unused()
+	if !b.admit() {
+		t.Fatal("a trial given back was not taken by the next job")
+	}
+}
+
+// AN ACTIONS PUBLICATION THE KILL SWITCH REFUSES, OR CANNOT ANSWER, GIVES BACK
+// THE PROBATION'S TRIAL ITS FINALIZE TOOK: it asked the store nothing, so it
+// settles nothing.
+func TestARefusedActionsPublicationGivesItsTrialBack(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		mode int32
+		want error
+	}{
+		"refused":    {switchRefuses, errActionsPublicationDisabled},
+		"unreadable": {switchUnreachable, errActionsPublicationUnknown},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			service, _, session, _ := testActionsService(t)
+			service.breaker = probationBreaker()
+			plane := &planeSwitch{}
+			plane.mode.Store(tc.mode)
+			service.SetActionsPolicy(plane)
+			if !service.breaker.admit() {
+				t.Fatal("the finalize's trial was not given")
+			}
+
+			if err := service.actionsPublicationErr(t.Context(), session); !errors.Is(err, tc.want) {
+				t.Fatalf("actionsPublicationErr = %v, want %v", err, tc.want)
+			}
+			if !service.breaker.admit() {
+				t.Fatal("a publication the kill switch stopped kept the probation's trial")
+			}
+		})
+	}
+}
+
+// AN OBJECT-BACKED GO CACHE ATTACHED BY A REMEMBERED ANSWER COUNTS ITS THIRTY
+// SECONDS FROM THAT ANSWER: attached a second before the age, it asks again at
+// the age rather than thirty seconds after it.
+func TestAnObjectCacheWindowEndsWithTheRememberedAnswer(t *testing.T) {
+	t.Parallel()
+
+	service, _, _ := objectService(t)
+	plane := &planeSwitch{}
+	service.SetCachePolicy(plane)
+	now := time.Now()
+	service.now = func() time.Time { return now }
+	token := scopedObjectCAS(t, service)
+	answered := now
+	service.servingPolicy(t.Context(), config.CacheGo, "acme", "api")
+	plane.mode.Store(switchUnreachable)
+
+	now = answered.Add(policyRememberedFor - time.Second)
+	if code := putObject(t, service, token, "a second before the age"); code != http.StatusOK {
+		t.Fatalf("PUT attaching a second before the age = %d, want 200", code)
+	}
+	now = answered.Add(policyRememberedFor)
+	if code := putObject(t, service, token, "at the age"); code == http.StatusOK {
+		t.Fatalf("PUT at the age = %d, want refused", code)
+	}
+}
+
+// AN UNPUBLISHED RECEIPT'S WRITER IS GIVEN BACK WHEN THE SESSION ENDS: a
+// finalize whose publication failed keeps it for a retry, the retry is refused
+// with the plane down, and the job ends; left alone, the writer would hold the
+// key from every other job until its lease ran out.
+func TestAnUnpublishedReceiptsWriterIsGivenBackAtCleanup(t *testing.T) {
+	t.Parallel()
+
+	service, storage, session, _ := testActionsService(t)
+	plane := &planeSwitch{}
+	service.SetActionsPolicy(plane)
+	uploadURL, _ := reserveActionsUpload(t, service, session, "kept")
+	upload := actionsBlockRequest(t, uploadURL, "", "", bytes.NewBufferString("body"))
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	response, handled := service.actionsProxy().respond(upload, session)
+	if !handled || response.StatusCode != http.StatusCreated {
+		t.Fatalf("upload handled=%t status=%v", handled, response)
+	}
+	closeActionsResponse(t, response)
+
+	storage.publishErr = errors.New("publication unavailable")
+	finalizeBody := `{"key":"kept","version":"v2","size_bytes":"4"}`
+	for _, down := range []bool{false, true} {
+		if down {
+			plane.mode.Store(switchUnreachable)
+		}
+		finalize := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+			finalizeBody)
+		response, _ = service.actionsProxy().respond(finalize, session)
+		closeActionsResponse(t, response)
+	}
+	// ONE ATTEMPT, THE FIRST, which the store failed; the refused retry made none.
+	if storage.published != 1 || storage.current != "" || len(storage.released) != 0 {
+		t.Fatalf("before cleanup attempts=%d current=%q released=%v; want one failed attempt and the receipt "+
+			"holding its writer", storage.published, storage.current, storage.released)
+	}
+
+	if err := service.Cleanup(t.Context(), session.instance); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if len(storage.released) != 1 {
+		t.Fatalf("released %v at cleanup, want the receipt's writer given back", storage.released)
+	}
+}
+
+// A FINALIZE THE KILL SWITCH REFUSES IS NOT RECORDED AS BILLET'S FAILURE: it is
+// the operator's choice, so `unavailable`, which outlasts every other
+// observation, is never written (the reservation's `served`, being first, is
+// kept).
+func TestARefusedFinalizeIsNotRecordedAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	uploadURL, _ := reserveActionsUpload(t, service, session, "refused")
+	upload := actionsBlockRequest(t, uploadURL, "", "", bytes.NewBufferString("body"))
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	response, handled := service.actionsProxy().respond(upload, session)
+	if !handled || response.StatusCode != http.StatusCreated {
+		t.Fatalf("upload handled=%t status=%v", handled, response)
+	}
+	closeActionsResponse(t, response)
+	// THE FINALIZE'S SERVING ASK IS ALLOWED AND ITS PUBLICATION'S REFUSED, as when
+	// a block lands between the two: a switch refusing both is answered by the
+	// serving check before any publication is decided.
+	var asked, refuseFrom atomic.Int32
+	refuseFrom.Store(1 << 30)
+	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		return asked.Add(1) < refuseFrom.Load(), nil
+	}))
+	refuseFrom.Store(asked.Load() + 2)
+
+	finalize := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"refused","version":"v2","size_bytes":"4"}`)
+	response, handled = service.actionsProxy().respond(finalize, session)
+	if !handled || response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("a refused finalize handled=%t status=%v; want a local failure", handled, response)
+	}
+	closeActionsResponse(t, response)
+	if asked.Load() < refuseFrom.Load() {
+		t.Fatalf("the switch was asked %d times; the publication's own ask (number %d) never came",
+			asked.Load(), refuseFrom.Load())
+	}
+	told := observedActions(observer)
+	if slices.Contains(told, alloc.ActionsCacheUnavailable) || session.actionsFailed.Load() {
+		t.Fatalf("observer was told %v (failed %t), want the refusal never recorded as unavailable",
+			told, session.actionsFailed.Load())
 	}
 }
 

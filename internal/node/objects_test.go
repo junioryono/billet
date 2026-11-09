@@ -1657,13 +1657,13 @@ func TestClosedSessionsUploadSideBySide(t *testing.T) {
 	}
 }
 
-// scopedObjectCAS opens a session the kill switch can name.
-func scopedObjectCAS(t *testing.T, service *CacheService, lease string) string {
+// scopedObjectCAS opens a session for scopedLease the kill switch can name.
+func scopedObjectCAS(t *testing.T, service *CacheService) string {
 	t.Helper()
 	spec := goBazelCache()
 	spec.Owner, spec.Repository = "acme", "api"
-	credentials, err := service.PrepareScoped(provider.InstanceName(lease), CacheSessionScope{
-		Trust: provider.TrustTrusted, LeaseID: lease, Epoch: 1, Cache: spec,
+	credentials, err := service.PrepareScoped(provider.InstanceName(scopedLease), CacheSessionScope{
+		Trust: provider.TrustTrusted, LeaseID: scopedLease, Epoch: 1, Cache: spec,
 	})
 	if err != nil {
 		t.Fatalf("PrepareScoped: %v", err)
@@ -1691,7 +1691,7 @@ func TestAPublicationIsAbandonedOnTheKillSwitchAndItsWindow(t *testing.T) {
 			now := time.Now()
 			service.now = func() time.Time { return now }
 			instance := provider.InstanceName(scopedLease)
-			token := scopedObjectCAS(t, service, scopedLease)
+			token := scopedObjectCAS(t, service)
 			if code := putObject(t, service, token, "object"); code != http.StatusOK {
 				t.Fatalf("PUT = %d", code)
 			}
@@ -1718,7 +1718,7 @@ func TestAPublicationIsAbandonedOnTheKillSwitchAndItsWindow(t *testing.T) {
 func uploadInProgress(t *testing.T, service *CacheService, storage *objectStore, hold chan struct{}) chan error {
 	t.Helper()
 	instance := provider.InstanceName(scopedLease)
-	token := scopedObjectCAS(t, service, scopedLease)
+	token := scopedObjectCAS(t, service)
 	if code := putObject(t, service, token, "object"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
@@ -1831,7 +1831,7 @@ func TestAKillSwitchThatCannotBeReadHoldsAPublication(t *testing.T) {
 	}))
 	instance := provider.InstanceName(scopedLease)
 	readable.Store(true)
-	token := scopedObjectCAS(t, service, scopedLease)
+	token := scopedObjectCAS(t, service)
 	if code := putObject(t, service, token, "object"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}

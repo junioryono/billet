@@ -1056,6 +1056,12 @@ func (s *CacheService) finalizeActionsCache(
 	if err := s.actionIO.Trim(ctx, s.actionsMountPath(session, archive)); err != nil {
 		return nil, fmt.Errorf("trim freed Actions cache blocks: %w", err)
 	}
+	// ASKED BEFORE A WRITER IS TAKEN, so a finalize the switch does not allow
+	// leaves no writer for anyone to give back; publishActionsReceipt asks again
+	// immediately before the pointer moves.
+	if err := s.actionsPublicationErr(ctx, session); err != nil {
+		return nil, err
+	}
 	lease, fence, err := s.store.AcquireWriter(ctx, archive.StoreKey,
 		session.instance+"/actions/"+archive.ID, cacheWriterTTL)
 	s.countedPublication(session.instance, "an Actions cache writer", err)
@@ -1102,10 +1108,6 @@ func (s *CacheService) finalizeActionsCache(
 	return s.publishActionsReceipt(ctx, session, receipt)
 }
 
-// errActionsPublicationRefused is a finalize the kill switch did not allow, as
-// the plane answered at that moment.
-var errActionsPublicationRefused = errors.New("the cache kill switch did not allow publishing this Actions cache entry")
-
 // publishActionsReceipt is called while session.mu is held. The receipt is
 // durable before the pointer CAS and complete before success is returned.
 func (s *CacheService) publishActionsReceipt(
@@ -1116,13 +1118,6 @@ func (s *CacheService) publishActionsReceipt(
 	if receipt.Complete {
 		return actionsReceiptResponse(receipt)
 	}
-	// A PUBLICATION ASKS THE KILL SWITCH NOW, on a retried finalize too: the
-	// reservation and its upload may have been served by a remembered answer
-	// while the plane was down, and what this publishes is what later jobs
-	// restore.
-	if !s.actionsPublicationAllowed(ctx, session) {
-		return nil, errActionsPublicationRefused
-	}
 	if receipt.Upload != "" {
 		return s.publishObjectReceipt(ctx, session, receipt)
 	}
@@ -1132,6 +1127,14 @@ func (s *CacheService) publishActionsReceipt(
 		return s.completeReceipt(ctx, session, receipt, current)
 	}
 	if !errors.Is(err, storecontract.ErrMiss) {
+		return nil, err
+	}
+	// A PUBLICATION ASKS THE KILL SWITCH NOW, immediately before the pointer
+	// moves and on a retried finalize too: the reservation and its upload may
+	// have been served by a remembered answer while the plane was down, and what
+	// this publishes is what later jobs restore. A refused receipt keeps its
+	// writer for a retry, and the session's cleanup gives it back.
+	if err := s.actionsPublicationErr(ctx, session); err != nil {
 		return nil, err
 	}
 	if err := receipt.Lease.ValidAt(receipt.StoreKey, s.now()); err != nil {

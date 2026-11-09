@@ -172,7 +172,7 @@ func (s *CacheService) casVolume(
 	ceiling := volumeCeiling(setting)
 	key := s.cacheKeyFor(session, kind, "", "")
 	if s.blobStore() != nil {
-		hv, err := s.attachBlobVolume(session, kind, key)
+		hv, err := s.attachBlobVolume(session, kind, key, answered)
 		if err != nil {
 			backOff()
 		}
