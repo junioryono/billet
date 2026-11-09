@@ -130,6 +130,37 @@ What they do not cover, said plainly. They are a budget for the whole host, so a
 - **The shared test host stops itself after two idle hours** unless a detached job holds its keepalive lock. The control plane was restarted once for that. GitHub had kept the old message session, so the new one opened 31 s later, and nothing queued was lost.
 - **Cost.** Eight `z1d.metal` orders across both days, at $4.464 an hour on demand; Cost Explorer's figure is in #553.
 
+## A phoenixNAP server ordered from the portal, 2026-11-09
+
+**How.** The API client still cannot order (above), so one hourly server was ordered in the portal:
+- an `s4.x6.c6.large` in Phoenix: Xeon 6 6731E, 96 cores and no SMT, 256 GB, two 1.92 TB NVMe;
+- Ubuntu Noble, a public /31, and a throwaway SSH key;
+- $1.72 an hour, plus $0.007 for the IPs.
+
+The `s1.c1.small` of 2026-11-05 is no longer in the catalogue, and this was the cheapest type with stock in Phoenix that day. The host was measured over SSH and deleted in the portal without keeping its IPs. The quota page reads 0/1 servers.
+
+| Step | Time (UTC) |
+|---|---|
+| Order placed in the portal | about 15:48:50 |
+| The portal's created time | 15:51:44 |
+| SSH answered as `ubuntu` | 15:52:06 |
+| Delete confirmed in the portal | 15:55:45 |
+| SSH stopped answering | by 15:56:41 |
+| The portal's server list was empty | by 15:58 |
+
+- **The host was already running when it was handed over.** `uptime` said up 3 days and 4 hours, `/dev/kvm` dated from two days before, and the journal's only boot began at 15:51:23. phoenixNAP's "typically deploys in 60 seconds" for Ubuntu here is a machine kept running and personalised, not a cold boot. About three minutes from order to SSH.
+- **Single-thread speed held under full load.** `openssl speed -bytes 16384 sha256` hashed 1,383 MB/s on one cpu alone and 1,401 MB/s pinned to cpu 0 with the other 95 cores spinning: no loss. The AWS method (above) differs, so compare within a row, not across.
+- **A Firecracker guest costs about 2% and kept its speed under load.** Firecracker v1.13.1 booted its CI's 6.1.141 kernel and Ubuntu 24.04 rootfs with one vcpu and 1 GiB, and hashed 2 GiB of zeros with `sha256sum`, three times each:
+
+  | Where | Alone | 95 host cores busy |
+  |---|---|---|
+  | Host | 2,348 to 2,419 ms | 2,579 to 2,608 ms |
+  | Guest | 2,396 to 2,451 ms | 2,398 to 2,403 ms |
+
+  The host's own pipeline slowed under load. The guest's vcpu, a single thread on an otherwise contended host, did not.
+- **NVMe.** An 8 GiB direct write (`dd oflag=direct`, 1 MiB blocks, after one warm-up write) took 3.25 s, 2.5 GiB/s. The read back took 3.09 s, 2.6 GiB/s. The root filesystem is LVM over the first NVMe.
+- **What the API answers after a delete is still not measured.** These measurements had no API credentials at hand. The API client's order refusal is with phoenixNAP (#828): on 2026-11-09 its live chat, with Sales (the only group online; technical support is offered through their Slack), was asked to check that client's permissions now that a portal order works.
+
 ## Still to measure
 
 - A no-stock and a quota refusal from each source, read as the scaler will read them.
@@ -138,4 +169,4 @@ What they do not cover, said plainly. They are a budget for the whole host, so a
 - `m6id.metal`, `m8gd.metal-24xl` and `m8id.metal-48xl`, which fit the shape on paper and were not launched.
 - What `DescribeInstances` answers for a terminated metal instance, and for how long: billet read each released host as gone about 20 minutes after asking, and the answers in between were not recorded.
 - A store volume attached to a metal instance and handed to a Firecracker guest.
-- phoenixNAP: everything after an accepted order.
+- phoenixNAP: an order through the API, which is still refused (#828), and with it the join's person-approved admission and the API's answer after a delete.
