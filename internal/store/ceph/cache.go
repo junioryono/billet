@@ -2308,7 +2308,10 @@ func isTrashMovePending(err error) bool {
 // resumeTrashMove finishes an interrupted move of the image named name into the
 // cache pool's trash, which librbd does when asked to move a name its directory
 // no longer holds: it finds the trash entry of that name still marked moving and
-// completes it (Ceph v20.2.0, librbd/api/Trash.cc Trash::move by name).
+// completes it (Ceph v20.2.0, librbd/api/Trash.cc Trash::move by name). Measured
+// on ubuntu-01 (Ceph 20.2.0) on 2026-11-09 for the one entry stuck since
+// 2026-11-08: `rbd info` of its name answered ENOENT, `rbd trash mv` of the name
+// exited 0, and the purge's next `trash rm` of its id deleted it.
 //
 // ONLY ON PROOF THE NAME IS GONE FROM THE POOL. Asked of a name the directory
 // still holds, the same command moves that live image into the trash instead;
