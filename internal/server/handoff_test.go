@@ -228,6 +228,92 @@ func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 	}
 }
 
+// oweRecorded gives the listener a destroy it owes for a completion the ledger
+// holds: one carrying GitHub's result, on a listener whose completion store was
+// set before it started.
+func (f *handoffFixture) oweRecorded(id int64) {
+	f.l.mu.Lock()
+	defer f.l.mu.Unlock()
+
+	if f.l.cleanup == nil {
+		f.l.cleanup = map[int64]*pendingCleanup{}
+	}
+	f.l.cleanup[id] = &pendingCleanup{job: dispatch.Job{RequestID: id, Result: "succeeded", CompletionID: 7},
+		at: time.Now().Add(time.Hour)}
+}
+
+// A HANDOFF LEAVES A RECORDED COMPLETION'S DESTROY TO THE NEXT PROCESS, which
+// restores it from the ledger, rather than wait on a node for it; a destroy the
+// ledger does not hold is still done before it stops.
+func TestAHandoffLeavesARecordedCompletionsDestroyToTheNextProcess(t *testing.T) {
+	t.Parallel()
+
+	f := newHandoffFixture(t, WithRestartHandoff())
+	f.l.completionStore = f.db
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	deadline, endDeadline := context.WithTimeout(t.Context(), 30*time.Second)
+	defer endDeadline()
+
+	run := f.start(ctx, t, cancel)
+
+	waitUntil(deadline, t, "the job to be running", func() bool { return f.l.Running() == 1 })
+	f.oweRecorded(33)
+	f.owe(22)
+
+	cancel()
+	awaitRun(deadline, t, run)
+
+	if !f.log.saw(handedOver) {
+		t.Fatalf("the stop did not hand over:\n%s", f.log.String())
+	}
+	if f.tore(33) {
+		t.Errorf("the handoff waited on the destroy of a completion the ledger holds:\n%s", f.log.String())
+	}
+	if !f.log.saw("leaving a finished job's destroy to the next control plane") {
+		t.Errorf("the destroy left to the next process was not said:\n%s", f.log.String())
+	}
+	if !f.tore(22) {
+		t.Errorf("the handoff skipped a destroy the ledger does not hold:\n%s", f.log.String())
+	}
+}
+
+// A SEALED STOP STILL DESTROYS A RECORDED COMPLETION: the deployment is leaving,
+// and no next process will restore it.
+func TestASealedStopStillDestroysARecordedCompletion(t *testing.T) {
+	t.Parallel()
+
+	f := newHandoffFixture(t, WithRestartHandoff())
+	f.l.completionStore = f.db
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	deadline, endDeadline := context.WithTimeout(t.Context(), 30*time.Second)
+	defer endDeadline()
+
+	run := f.start(ctx, t, cancel)
+
+	waitUntil(deadline, t, "the job to be running", func() bool { return f.l.Running() == 1 })
+	f.oweRecorded(33)
+	if _, err := f.db.Seal(t.Context(), state.SealRequest{
+		Provenance: state.ProvenanceOperator, Reason: "leaving", Actor: "ops",
+	}); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	cancel()
+	awaitDrainStart(deadline, t, f.log, run)
+	f.hurryUp()
+	awaitRun(deadline, t, run)
+
+	if !f.tore(33) {
+		t.Errorf("a sealed stop left a recorded completion's destroy undone:\n%s", f.log.String())
+	}
+}
+
 // A SEALED STOP IS THE DEPLOYMENT LEAVING, AND IT STILL DRAINS: an operator who
 // sealed asked for exactly that, and the drain closes the session when it ends.
 func TestASealedStopStillDrains(t *testing.T) {

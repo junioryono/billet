@@ -157,6 +157,7 @@ func (l *Listener) destroyAll(
 	// second one would win the single teardown slot and spend the budget on work
 	// already in progress while unrelated requests are never reached.
 	skipped := make([]int64, 0, len(l.destroying))
+	var left []int64
 
 	if includeRunning {
 		for id := range l.running {
@@ -205,6 +206,18 @@ func (l *Listener) destroyAll(
 			continue
 		}
 
+		// A HANDOFF LEAVES A RECORDED COMPLETION'S DESTROY TO THE NEXT PROCESS, for the
+		// same reason. A job's result reaches an entry only after recordCompletion
+		// committed it, and restoreCompletions gives the next process the obligation and
+		// its lease; waiting on a node here only lengthens the restart. Measured on
+		// 2026-11-09: one destroy behind a Ceph stall held a controller's upgrade for
+		// two minutes, launching nothing.
+		if !includeRunning && l.handingOff && l.completionStore != nil && entry.job.Result != "" {
+			left = append(left, id)
+
+			continue
+		}
+
 		if !inScope(id) {
 			continue
 		}
@@ -246,6 +259,11 @@ func (l *Listener) destroyAll(
 	}()
 
 	l.mu.Unlock()
+
+	for _, id := range left {
+		l.log.Info("leaving a finished job's destroy to the next control plane, which restores "+
+			"it from the ledger", "tier", l.tier, "request", id)
+	}
 
 	for _, id := range skipped {
 		l.log.Warn("not destroying this job's compute during shutdown because a cleanup "+
