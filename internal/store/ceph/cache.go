@@ -1547,13 +1547,20 @@ func (c *Client) purgeTrashEntries(ctx context.Context, budget *yieldBudget) (in
 
 				// A MOVE INTO THE TRASH THAT WAS INTERRUPTED is finished, then
 				// deleted: librbd refuses to remove an entry still marked moving,
-				// every pass, for as long as nobody completes the move.
+				// every pass, for as long as nobody completes the move. One that
+				// cannot be finished is reported and held, as one a child holds
+				// is, so it is not asked about again every pass.
 				if isTrashMovePending(err) {
 					if resumeErr := c.resumeTrashMove(ctx, d.name); resumeErr != nil {
-						err = resumeErr
-					} else {
-						err = c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
+						mu.Lock()
+						failures = append(failures, fmt.Errorf("ceph: delete %s (%s) from the trash: %w",
+							d.name, d.handle, resumeErr))
+						c.holdTrash(d.handle, trashHold{at: c.now(), removals: removals})
+						mu.Unlock()
+
+						continue
 					}
+					err = c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
 				}
 
 				mu.Lock()
@@ -2313,14 +2320,18 @@ func isTrashMovePending(err error) bool {
 // 2026-11-08: `rbd info` of its name answered ENOENT, `rbd trash mv` of the name
 // exited 0, and the purge's next `trash rm` of its id deleted it.
 //
-// ONLY ON PROOF THE NAME IS GONE FROM THE POOL. Asked of a name the directory
-// still holds, the same command moves that live image into the trash instead;
-// billet's names carry a random suffix and are never reused, and `rbd info`
-// answering ENOENT is the proof. Anything else, a live image or an answer that
-// cannot tell, finishes nothing.
+// ONLY FOR A WRITABLE CACHE VOLUME, AND ON PROOF ITS NAME IS GONE FROM THE POOL.
+// Asked of a name the directory holds, the same command moves that live image
+// into the trash instead. A cache volume's name carries a random suffix and is
+// never made again, so `rbd info` answering ENOENT stays true; a root disk's
+// (billet-<lease>) is made again by a relaunch of its lease, which could land
+// between the proof and the move, so one is reported and left for an operator.
+// Anything else, a live image or an answer that cannot tell, finishes nothing.
 func (c *Client) resumeTrashMove(ctx context.Context, name string) error {
-	if kind, _, ok := cacheImageName(name); !strings.HasPrefix(name, "billet-") && (!ok || kind != "v") {
-		return fmt.Errorf("ceph: %s is not an image billet named, so its interrupted trash move is left", bounded(name))
+	if kind, _, ok := cacheImageName(name); !ok || kind != "v" {
+		return fmt.Errorf("ceph: %s is not a cache volume, whose name is never made again, so its "+
+			"interrupted trash move is left for an operator (`rbd trash mv` of the name, once nothing can "+
+			"make it again)", bounded(name))
 	}
 	if err := checkCloneName(name); err != nil {
 		return err
