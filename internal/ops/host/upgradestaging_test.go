@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/node"
@@ -156,9 +157,26 @@ func TestAStagingThatOutrunsTheAnswersDeadlineIsRefused(t *testing.T) {
 func TestAResolveThatOutrunsTheAnswersDeadlineIsRefused(t *testing.T) {
 	withUpgradeRoot(t)
 
+	// LINUX'S PREFLIGHT, so no other refusal answers before the resolve is reached.
+	prevOS := cli.HostOS
+	cli.HostOS = "linux"
+	t.Cleanup(func() { cli.HostOS = prevOS })
+
+	var (
+		asked    atomic.Int32
+		deadline atomic.Value
+	)
 	prev := newReleaseClient
 	newReleaseClient = func() *releasesource.Client {
-		return &releasesource.Client{HTTP: &http.Client{Transport: stalledRelease{}}}
+		return &releasesource.Client{HTTP: &http.Client{Transport: roundTrip(func(req *http.Request) (*http.Response, error) {
+			if asked.Add(1) == 1 {
+				if at, ok := req.Context().Deadline(); ok {
+					deadline.Store(at)
+				}
+			}
+
+			return stalledRelease{}.RoundTrip(req)
+		})}}
 	}
 	t.Cleanup(func() { newReleaseClient = prev })
 
@@ -170,6 +188,12 @@ func TestAResolveThatOutrunsTheAnswersDeadlineIsRefused(t *testing.T) {
 		hostUpgradeTarget{pin: "v0.17.0", generation: 10}, ack, releasesource.Policy{}, heldTxLock(t))
 	if err == nil {
 		t.Fatal("a resolve that never answered succeeded")
+	}
+	if asked.Load() == 0 {
+		t.Fatalf("the resolve was never reached; the run ended on %v", err)
+	}
+	if at, ok := deadline.Load().(time.Time); !ok || !at.Equal(ack.deadline) {
+		t.Fatalf("the resolve's request ran to %v, want the answer's deadline %v", deadline.Load(), ack.deadline)
 	}
 	if waited := time.Since(started); waited > 30*time.Second {
 		t.Fatalf("the resolve ran %s past the answer's deadline", waited)
