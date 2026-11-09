@@ -13,7 +13,6 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/lease"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -221,35 +220,76 @@ func TestAnObjectFinalizeIsNotPublishedByARememberedAnswer(t *testing.T) {
 	}
 }
 
-// probationBreaker is a breaker on probation, its trial not yet taken.
-func probationBreaker() *storeBreaker {
-	b, _ := testBreaker()
-	b.mu.Lock()
-	b.state = lease.CacheStoreProbation
-	b.mu.Unlock()
-
-	return b
-}
-
-// A TRIAL A JOB TOOK AND ASKED THE STORE NOTHING WITH IS GIVEN BACK, so the next
-// job takes it rather than wait out the trial.
-func TestAnUnusedTrialIsGivenBack(t *testing.T) {
+// A BLOCK SET AFTER AN ACTIONS PUBLICATION'S FIRST ATTEMPT CONFLICTED STOPS ITS
+// SECOND: the switch is asked again before each attempt moves the pointer.
+func TestAnActionsPublicationAsksAgainBeforeItsSecondAttempt(t *testing.T) {
 	t.Parallel()
 
-	b := probationBreaker()
-	if !b.admit() || b.admit() {
-		t.Fatal("probation did not give one trial at a time")
+	service, storage, session, _ := testActionsService(t)
+	uploadURL, _ := reserveActionsUpload(t, service, session, "second")
+	upload := actionsBlockRequest(t, uploadURL, "", "", bytes.NewBufferString("body"))
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	response, handled := service.actionsProxy().respond(upload, session)
+	if !handled || response.StatusCode != http.StatusCreated {
+		t.Fatalf("upload handled=%t status=%v", handled, response)
 	}
-	b.unused()
-	if !b.admit() {
-		t.Fatal("a trial given back was not taken by the next job")
+	closeActionsResponse(t, response)
+	// ALLOWED UNTIL THE FIRST ATTEMPT HAS BEEN MADE, which conflicts over an
+	// absent pointer, so the publication reacquires its writer and would try again.
+	storage.publishConflicts = 1
+	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		return storage.published == 0, nil
+	}))
+
+	finalize := actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"second","version":"v2","size_bytes":"4"}`)
+	response, _ = service.actionsProxy().respond(finalize, session)
+	closeActionsResponse(t, response)
+	if storage.published != 1 || storage.current != "" {
+		t.Fatalf("attempts=%d current=%q; want the second attempt stopped by the block", storage.published,
+			storage.current)
 	}
 }
 
-// AN ACTIONS PUBLICATION THE KILL SWITCH REFUSES, OR CANNOT ANSWER, GIVES BACK
-// THE PROBATION'S TRIAL ITS FINALIZE TOOK: it asked the store nothing, so it
-// settles nothing.
-func TestARefusedActionsPublicationGivesItsTrialBack(t *testing.T) {
+// A BLOCK SET AFTER A LAST-WRITE-WINS PUBLICATION'S FIRST ATTEMPT STOPS ITS
+// REBASE: the switch is asked again before the pointer moves a second time.
+func TestALastWriteWinsRebaseAsksAgain(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{current: "baseline", advanceOnSnapshot: true}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	service.SetCachePolicy(cachePolicyFunc(func(context.Context, config.CacheKind, string, string) (bool, error) {
+		return storage.published == 0, nil
+	}))
+	credentials, err := service.PrepareScoped("billet-one", CacheSessionScope{
+		Trust: provider.TrustTrusted, Owner: "acme", Repository: "api",
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	if attached := cacheRequest(t, service, credentials.Token, "/v1/volumes", map[string]any{
+		"key": "acme/api/buildkit", "size_bytes": int64(10 << 30), "publication": publicationLWW,
+	}); attached.Code != http.StatusCreated {
+		t.Fatalf("attach = %d: %s", attached.Code, attached.Body.String())
+	}
+	committed := cacheRequest(t, service, credentials.Token, "/v1/volumes/0/commit", nil)
+	if !bytes.Contains(committed.Body.Bytes(), []byte("kill switch")) {
+		t.Fatalf("commit = %d %s, want stopped by the kill switch before its rebase",
+			committed.Code, committed.Body.String())
+	}
+	if got := storage.publishExpected; len(got) != 1 {
+		t.Fatalf("publication attempts expected %v, want only the first", got)
+	}
+}
+
+// AN ACTIONS PUBLICATION TELLS A REFUSAL FROM A SWITCH IT COULD NOT READ, even
+// with an allowed answer remembered: the first is the operator's choice, the
+// second could not be told, and neither publishes.
+func TestAnActionsPublicationTellsARefusalFromAnUnreadSwitch(t *testing.T) {
 	t.Parallel()
 
 	for name, tc := range map[string]struct {
@@ -263,19 +303,14 @@ func TestARefusedActionsPublicationGivesItsTrialBack(t *testing.T) {
 			t.Parallel()
 
 			service, _, session, _ := testActionsService(t)
-			service.breaker = probationBreaker()
 			plane := &planeSwitch{}
-			plane.mode.Store(tc.mode)
 			service.SetActionsPolicy(plane)
-			if !service.breaker.admit() {
-				t.Fatal("the finalize's trial was not given")
+			if err := service.actionsPublicationErr(t.Context(), session); err != nil {
+				t.Fatalf("actionsPublicationErr with the plane allowing = %v", err)
 			}
-
+			plane.mode.Store(tc.mode)
 			if err := service.actionsPublicationErr(t.Context(), session); !errors.Is(err, tc.want) {
 				t.Fatalf("actionsPublicationErr = %v, want %v", err, tc.want)
-			}
-			if !service.breaker.admit() {
-				t.Fatal("a publication the kill switch stopped kept the probation's trial")
 			}
 		})
 	}

@@ -1266,15 +1266,20 @@ func (s *CacheService) cleanupSession(
 	}
 	// A FINALIZATION THAT NEVER COMPLETED LEFT ITS BLOCKS, its archive having become
 	// this receipt.
+	// AND A VOLUME'S LEFT ITS WRITER, which nothing else gives back: a
+	// publication the kill switch refused, or one that failed and was never
+	// retried, would hold the key from every other job until its lease ran out.
+	// Best effort, under one bound for all of them that this pass's own
+	// cancellation ends, because the session's lock is held: one the store does
+	// not answer ends with its lease.
+	releaseCtx, endReleases := context.WithTimeout(ctx, cacheCleanupMargin)
+	defer endReleases()
 	for _, receipt := range session.receipts {
 		if receipt.Upload != "" && !receipt.Complete {
 			s.releaseStagedBlocks(ctx, session, receipt.Upload)
 		}
-		// AND A VOLUME'S LEFT ITS WRITER, which nothing else gives back: a
-		// publication the kill switch refused, or one that failed and was never
-		// retried, would hold the key from every other job until its lease ran out.
-		if receipt.Upload == "" && !receipt.Complete && receipt.Lease.ID != "" {
-			if err := s.releaseWriter(ctx, receipt.Lease, receipt.Fence); err != nil {
+		if receipt.Upload == "" && !receipt.Complete && receipt.Lease.ID != "" && releaseCtx.Err() == nil {
+			if err := s.store.ReleaseWriter(releaseCtx, receipt.Lease, receipt.Fence); err != nil {
 				s.log.Warn("could not give back an unpublished Actions cache entry's writer; it ends with its lease",
 					"instance", session.instance, "key", receipt.StoreKey, "error", err)
 			}
@@ -2228,11 +2233,12 @@ func (s *CacheService) publishAcquired(
 	// ASKED AGAIN IMMEDIATELY BEFORE THE POINTER MOVES, after the writer's wait,
 	// which a last-write-wins publication can spend minutes in, and the snapshot:
 	// a block set meanwhile stops it.
-	if !s.sessionKindAllowed(ctx, session, attachmentKind(attachment)) {
+	allowed := func() bool { return s.sessionKindAllowed(ctx, session, attachmentKind(attachment)) }
+	if !allowed() {
 		return storecontract.Candidate{}, stepPublish,
 			errors.Join(errPublicationRefused, s.releaseWriter(ctx, lease, fence))
 	}
-	err = s.publish(ctx, attachment, candidate, lease, fence)
+	err = s.publish(ctx, attachment, candidate, lease, fence, allowed)
 	s.countedPublish(session.instance, err)
 	if err != nil {
 		return storecontract.Candidate{}, stepPublish, errors.Join(err, s.releaseWriter(ctx, lease, fence))
@@ -2358,12 +2364,16 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// publish moves an attachment's pointer to candidate. Its caller asked the kill
+// switch immediately before; allowed asks it again before a last-write-wins
+// rebase moves the pointer a second time, after the lookup between them.
 func (s *CacheService) publish(
 	ctx context.Context,
 	attachment *cacheAttachment,
 	candidate storecontract.Candidate,
 	lease storecontract.WriterLease,
 	fence storecontract.FencingToken,
+	allowed func() bool,
 ) error {
 	err := s.store.PublishCAS(ctx, attachment.Volume.Key, attachment.Volume.Generation,
 		candidate, lease, fence)
@@ -2374,6 +2384,9 @@ func (s *CacheService) publish(
 	current, currentErr := s.store.Current(ctx, attachment.Volume.Key)
 	if currentErr != nil {
 		return errors.Join(err, currentErr)
+	}
+	if !allowed() {
+		return errPublicationRefused
 	}
 
 	return s.store.PublishCAS(ctx, attachment.Volume.Key, current, candidate, lease, fence)

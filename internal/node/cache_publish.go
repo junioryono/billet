@@ -189,7 +189,11 @@ func (s *CacheService) publishDeferred(
 
 		return true, errors.Join(s.releaseWriter(ctx, lease, fence), s.persistSession(session))
 	}
-	err = s.publish(ctx, attachment, candidate, lease, fence)
+	err = s.publish(ctx, attachment, candidate, lease, fence, func() bool {
+		allowed, _ := s.stillAuthorised(ctx, session, attachment)
+
+		return allowed
+	})
 	s.countedPublish(session.instance, err)
 	if err != nil {
 		journal.Phase = phaseSnapshotted
@@ -514,8 +518,9 @@ var errActionsPublicationUnknown = errors.New("the cache kill switch could not b
 // actionsPublicationErr asks the plane now whether a session's Actions cache
 // may publish what it saved, through the same reader actionsKeysFor asks for
 // that session, and never by a remembered answer: a published entry is what
-// later jobs restore. A refusal gives back a probation's trial, since the
-// store was not asked.
+// later jobs restore. A refusal on a store's probation keeps the trial its
+// finalize took until trialFor ends it, as any job that took one and then asked
+// the store nothing does; giving it back could hand back another job's.
 func (s *CacheService) actionsPublicationErr(ctx context.Context, session *cacheSession) error {
 	var answer policyAnswer
 	switch {
@@ -539,12 +544,8 @@ func (s *CacheService) actionsPublicationErr(ctx context.Context, session *cache
 	case policyAllowed:
 		return nil
 	case policyRefused:
-		s.breaker.unused()
-
 		return errActionsPublicationDisabled
 	default:
-		s.breaker.unused()
-
 		return errActionsPublicationUnknown
 	}
 }

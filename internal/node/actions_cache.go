@@ -1129,20 +1129,21 @@ func (s *CacheService) publishActionsReceipt(
 	if !errors.Is(err, storecontract.ErrMiss) {
 		return nil, err
 	}
-	// A PUBLICATION ASKS THE KILL SWITCH NOW, immediately before the pointer
-	// moves and on a retried finalize too: the reservation and its upload may
-	// have been served by a remembered answer while the plane was down, and what
-	// this publishes is what later jobs restore. A refused receipt keeps its
-	// writer for a retry, and the session's cleanup gives it back.
-	if err := s.actionsPublicationErr(ctx, session); err != nil {
-		return nil, err
-	}
 	if err := receipt.Lease.ValidAt(receipt.StoreKey, s.now()); err != nil {
 		if err := s.reacquireReceiptWriter(ctx, session, receipt); err != nil {
 			return nil, err
 		}
 	}
 	for attempt := range 2 {
+		// A PUBLICATION ASKS THE KILL SWITCH NOW, immediately before each attempt
+		// moves the pointer, after any reacquisition or lookup before it, and on
+		// a retried finalize too: the reservation and its upload may have been
+		// served by a remembered answer while the plane was down, and what this
+		// publishes is what later jobs restore. A refused receipt keeps its
+		// writer for a retry, and the session's cleanup gives it back.
+		if err := s.actionsPublicationErr(ctx, session); err != nil {
+			return nil, err
+		}
 		err = s.store.PublishCAS(ctx, receipt.StoreKey, "", receipt.Candidate,
 			receipt.Lease, receipt.Fence)
 		s.countedPublish(session.instance, err)
