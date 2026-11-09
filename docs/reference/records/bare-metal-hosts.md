@@ -97,13 +97,45 @@ A build's outbound load is small and bursty: its heaviest second was 5505 packet
 
 What they do not cover, said plainly. They are a budget for the whole host, so a flooding job is cut off with its neighbours rather than alone; a cap per guest needs ADR-028's per-interface chain and is not built. The connection limit counts every packet conntrack calls new, a first SYN and its retransmissions and each packet of a one-way UDP flow, not each flow once, so one guest sending a one-way UDP stream spends it for every guest. The packet limit counts what the host forwards before a guest's TCP segmentation offload is undone: a flood of small packets, the scanner's kind a provider polices, is counted packet for packet, while a bulk transfer's large buffers count once each and are bounded by the byte limit, so the packets on the uplink can exceed the packet setting while a guest sends something large. And a guest's requests to the host's own services, its DNS and the registry mirrors, end at the host, whose own upstream traffic leaves through its output and is not counted here: a provider sees it, and these limits do not cap it.
 
+## The pool on AWS metal, end to end, 2026-11-08 and 2026-11-09
+
+**How.** One control plane ran `billet server` from a build of main with this branch's role, on the shared Linux test host. The test GitHub App served one Firecracker tier, `b1t22-pool-fc-4`: four vcpu, every cache off and no site. Its pool named `z1d.metal` in the host's own subnet, at floor 0, a maximum of 2 (3 for the last attempt) and `idle_after` 5m. Its credential was an IAM user holding exactly `billet init iam --pool`'s policy, attached as a managed policy, because at 2,210 bytes minified it is past an IAM user's 2,048-byte inline limit. Jobs were queued from the test repository. Each pool host booted Ubuntu 24.04's own image with a boot prelude:
+- billet's binary from the release archive, fetched from S3 with the instance profile's own credentials;
+- the host role converged locally in `billet_node_prepare_only`, its config the one `billet init --join` renders for this host, so the bridges, pools and kernel path it prepared were the ones the join's config names;
+- a single OSD on the first instance-store NVMe;
+- Docker's data, Ceph's and the guest image's staging on the second;
+- the guests' bridges moved off 172.31.0.0/16, because an AWS default VPC's resolver is 172.31.0.2, inside the role's default first bridge;
+- the guest kernel pulled, and a unit left waiting to import the guest image once the node had registered.
+
+| Step | Time (UTC) |
+|---|---|
+| A job queued with no host able to place it; the pool ordered one | 05:17:47 (on the first attempt, 17:33:30, in the job's own second) |
+| `RunInstances` returned the instance | 05:17:49 |
+| The host enrolled and was admitted on its source's word: "the console, the identity document, the address and EC2 agree" | 06:17:10 |
+| The node registered | 06:19:21 |
+| The guest image imported and verified: a microVM booted, took its registration from the metadata service, ran runner 2.338.2 and a container | 06:34:58 |
+| Three jobs ran and succeeded on the host | 06:36:05 to 06:40:36 |
+| Idle past `idle_after`, the pool asked for its release by drain | 06:45:47 |
+| Its node answered empty twice across five minutes | 06:45:50 to 06:50:50 |
+| Sealed, its certificates revoked, termination requested | 06:51:17 |
+
+- **Growth and admission worked as ADR-030 says.** The pool ordered within a second of a shortage, grew one host at a time while one was on its way, and admitted both hosts that reached their join with no person: the first at 19:21:32 on 2026-11-08, the second at 06:17:10. A held order did what the operating page says. Every one of its join tokens lapsed with nothing joined, so it counted against the maximum, was listed as held for a person and was not counted as on its way.
+- **Shrink worked on proof.** The release was asked 5 min 11 s after the host's last job ended, waited on "what the host holds could not be read" until its node had answered empty twice across five minutes, and sealed then. Each of seven released or sealed hosts was read back as gone by its source about 20 minutes after its termination was requested. A host stays shutting down for most of that, and the order holds its place under the maximum until then.
+- **The order to a registered node is not measured clean.** The second host's boot spent most of its hour on GitHub. github.com answered its release downloads (Firecracker's, the guest image's manifest and parts) with 504 on two requests in three from that instance, while the same assets answered 206 from elsewhere. The prelude was re-run, and the image's assets fetched with curl's own retries and imported with `billet images pull --from`.
+- **Four things stopped a host on the way, each now fixed or known:**
+  - The host role's Ceph bootstrap ran a newer point release than the host's client could read. The device inventory was read as a flat list. On a fresh cluster the inventory did not yet list the NVMe, so no OSD was added and the pools' initialisation waited over an hour. All three are fixed in the role (#816).
+  - The node unit the role rendered in this mode was one `billet local up`, the join's last step, refuses: exec rather than notify, and no declared state directory. The first host's node therefore never registered, and the second's did once the packaged unit was installed by hand. The role now renders the package's shape in this mode.
+  - A pull refuses to import a guest image until the node has registered and recorded what its control plane accepts (#584). So a prelude can install the kernel, and the image waits for the registration.
+  - The control plane reads `server.pool.boot_prelude` when it starts. A prelude rendered with presigned links signed by a session's credentials kept failing with 400 once the session expired, until the control plane was restarted on a prelude that fetches with the instance profile.
+- **The shared test host stops itself after two idle hours** unless a detached job holds its keepalive lock. The control plane was restarted once for that. GitHub had kept the old message session, so the new one opened 31 s later, and nothing queued was lost.
+- **Cost.** Eight `z1d.metal` orders across both days, at $4.464 an hour on demand; Cost Explorer's figure is in #553.
+
 ## Still to measure
 
 - A no-stock and a quota refusal from each source, read as the scaler will read them.
-- The time from an order to a registered node, with the order-bound join of ADR-030.
+- The time from an order to a registered node with nothing in the way: on 2026-11-09 GitHub's 504s took most of the hour.
 - Single-thread speed inside a Firecracker guest under full load, on each candidate, with cpus pinned so a sibling hyperthread is told apart from the rest of the load.
 - `m6id.metal`, `m8gd.metal-24xl` and `m8id.metal-48xl`, which fit the shape on paper and were not launched.
-- What `DescribeInstances` answers for a terminated metal instance, and for how long, which is what proves an AWS pool host gone.
-- The console and the identity document on a metal instance, measured above on a t3.micro, and the whole join of ADR-030 from a booted pool host.
+- What `DescribeInstances` answers for a terminated metal instance, and for how long: billet read each released host as gone about 20 minutes after asking, and the answers in between were not recorded.
 - A store volume attached to a metal instance and handed to a Firecracker guest.
 - phoenixNAP: everything after an accepted order.
