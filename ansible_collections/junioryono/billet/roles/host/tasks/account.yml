@@ -313,9 +313,13 @@
 # THE ENDPOINT DECISION, before the configuration is staged or rendered and
 # before the transaction's first stop: what the running node dials against what
 # the render would install, judged by the command over the rendering on stdin.
+# Not on a node prepared for `billet join`, which renders nothing: the endpoint a
+# joined node dials is the join's.
 - name: Decide the node's endpoint migration before the render
   ansible.builtin.import_tasks: endpoint-decision.yml
-  when: not billet_retirement_node_ordinary | bool
+  when:
+    - not billet_retirement_node_ordinary | bool
+    - not billet_node_prepare_only | default(false) | bool
 
 - name: Resolve node environment operands before unit replacement
   ansible.builtin.import_tasks: node-environment.yml
@@ -527,7 +531,9 @@
   check_mode: true
   register: billet_config_preview
   become: true
-  when: not billet_binary_upgrade | default(false)
+  when:
+    - not billet_binary_upgrade | default(false)
+    - not billet_node_prepare_only | default(false) | bool
 
 # NOT ON A RETIRING NODE'S RETAINED CONVERGE, whose commands are admitted one
 # by one (retirement-role-observe.py) and whose node a retirement holds to the
@@ -538,6 +544,7 @@
   when:
     - not billet_binary_upgrade | default(false)
     - not billet_retirement_node_ordinary | bool
+    - not billet_node_prepare_only | default(false) | bool
 
 - name: Make the node's next stop a drain before its configuration changes
   ansible.builtin.include_tasks: request-node-drain.yml
@@ -549,7 +556,8 @@
 
 # A NODE THIS CONVERGE CHANGES OR RENDERS AWAY OWES ITS DRAIN, recorded where
 # the record is before the configuration changes: once it names no node, only
-# this says where that is.
+# this says where that is. A node prepared for `billet join` is neither: its
+# configuration is the join's, and this converge changes nothing of it.
 - name: Record the drain the billet node owes before its configuration changes
   ansible.builtin.copy:
     content: "{{ billet_previous_node_state_dir }}\n"
@@ -563,6 +571,7 @@
     - billet_previous_config.get('node') is mapping
     - billet_effective_config.get('node') is not mapping or billet_node_config_changed | default(billet_config_preview.changed | default(false)) | bool
     - not ansible_check_mode
+    - not billet_node_prepare_only | default(false) | bool
 
 # DURABLE BEFORE THE RENDER IT GUARDS: a rename is atomic, not durable, so a
 # crash could otherwise keep the new configuration and lose the drain it owes.
@@ -592,7 +601,11 @@
     mode: "0640"
   register: billet_config_install
   become: true
-  when: not billet_binary_upgrade | default(false)
+  # A NODE PREPARED FOR `billet join` HAS NO CONFIG OF THE ROLE'S: the join generates it,
+  # and leaves one it did not write alone (it writes beside it and stops).
+  when:
+    - not billet_binary_upgrade | default(false)
+    - not billet_node_prepare_only | default(false) | bool
 
 # THE CONTROL PLANE'S ENVIRONMENT, and what it exists for is the PostgreSQL
 # ledger: `server.state.postgres.dsn_env` names a variable rather than carrying a

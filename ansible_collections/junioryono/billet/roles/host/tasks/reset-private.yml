@@ -40,6 +40,7 @@
     billet_endpoint_rendering: ""
     billet_endpoint_planned: false
     billet_endpoint_migrated: false
+    billet_node_drain_requested_here: false
     billet_preparation_state_backend: ""
     billet_github_key_required: false
     billet_github_key_managed: false

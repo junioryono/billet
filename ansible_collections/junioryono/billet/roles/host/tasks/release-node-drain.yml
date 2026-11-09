@@ -2,9 +2,20 @@
 # THE OPERATION THAT ASKED FOR A DRAIN IS DONE (#374), so the node's next stops
 # may hand over again where node.stop says so. Left behind by a converge that
 # failed, the request only makes later stops drain until this runs.
+#
+# ON A NODE PREPARED FOR `billet join`, ONLY A REQUEST THIS CONVERGE CREATED
+# (request-node-drain.yml), from every caller: any other is someone else's. Spent
+# when withdrawn, so a later caller cannot take a request written since.
 - name: Withdraw the request that billet node stops drain
   ansible.builtin.file:
     path: /var/run/billet-node-drain
     state: absent
-  when: not ansible_check_mode
+  when:
+    - not ansible_check_mode
+    - not billet_node_prepare_only | default(false) | bool or billet_node_drain_requested_here | default(false) | bool
   become: true
+
+- name: Note that this converge's drain request is withdrawn
+  ansible.builtin.set_fact:
+    billet_node_drain_requested_here: false
+  when: not ansible_check_mode

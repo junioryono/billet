@@ -30,7 +30,7 @@
         ['billet_node_should_run', 'not ansible_check_mode']
       - >-
         (billet_gate_services | selectattr('name', 'equalto', 'Stop and disable the billet node unless it may run here') | first).when ==
-        ['not billet_node_should_run', 'not ansible_check_mode']
+        ['not billet_node_should_run', 'not billet_node_prepare_only | default(false) | bool', 'not ansible_check_mode']
 
 # The restart predicate cannot be applied here: it is read out of a task file and
 # Ansible refuses a template from an untrusted source. Its shape is pinned

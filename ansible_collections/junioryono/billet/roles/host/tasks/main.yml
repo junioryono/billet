@@ -36,8 +36,14 @@
     # forbids a pre-provisioned node.tls bundle, so that is not guaranteed.
     # Holding the node is therefore conservative rather than exact, and costs
     # nothing: its control plane is not running, so it has nothing to dial.
+    #
+    # A NODE PREPARED AND NOT YET JOINED is held as well (billet_node_prepare_only): a
+    # pool host's first boot converges this role for its Firecracker, its network and
+    # its Ceph, and then `billet join` writes the node's config, enrolls it and starts
+    # it (ADR-030). A node started here would have neither.
     billet_node_should_run: >-
-      {{ billet_enable_node and not (billet_server_prepare_only | default(false)) }}
+      {{ billet_enable_node and not (billet_server_prepare_only | default(false))
+         and not (billet_node_prepare_only | default(false) | bool) }}
 
 # Missing installation input must refuse before an absent classifier can hold.
 # Config shape and key presence remain behind retirement's ordinary boundary.
@@ -102,12 +108,45 @@
           - >-
             not (billet_server_prepare_only | default(false)) or
             billet_ledger_volume_id | default('') | length > 0
+          - not (billet_node_prepare_only | default(false) | bool) or billet_enable_node
+          - not (billet_node_prepare_only | default(false) | bool) or not billet_enable_server
         fail_msg: >-
           billet_server_prepare_only prepares a control-plane host without starting
           it, so it requires billet_enable_server (this host is the control plane; it
           is simply not commissioned yet) and billet_ledger_volume_id (without a
           ledger volume there is no mounted, proved, still-unclaimed filesystem for
           the preserved state to be copied onto, which is the entire purpose).
+          billet_node_prepare_only prepares a node's host for `billet join` to finish,
+          so it requires billet_enable_node and a host that is no control plane.
+
+    # THE PACKAGE SEEDS /etc/billet/billet.yaml FROM ITS TEMPLATE, and `billet join`
+    # replaces only a config identical to what it generates: over the seed it writes
+    # `<path>.new` and stops, enrolling nothing. A node prepared for the join over an
+    # untouched seed is one the join cannot finish, so it is refused here, before
+    # anything changes. A config that is not the seed (the join's own) is left alone.
+    - name: Inspect the installed config and the package's template on a node prepared for billet join
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop: [/etc/billet/billet.yaml, /usr/share/billet/billet.yaml]
+      register: billet_prepare_seed
+      check_mode: false
+      become: true
+      when: billet_node_prepare_only | default(false) | bool
+
+    - name: Refuse a node prepared for billet join over the package's untouched config
+      ansible.builtin.assert:
+        that:
+          - >-
+            not (billet_prepare_seed.results[0].stat.exists and billet_prepare_seed.results[1].stat.exists)
+            or billet_prepare_seed.results[0].stat.checksum != billet_prepare_seed.results[1].stat.checksum
+        fail_msg: >-
+          /etc/billet/billet.yaml is the package's template, untouched, and `billet join`
+          leaves a config it did not generate alone (it writes billet.yaml.new and stops),
+          so this host could not be joined. Install billet from its release archive
+          (the binary at /usr/bin/billet) or an image instead of the package, or remove
+          the seeded file before converging.
+      when: billet_node_prepare_only | default(false) | bool
 
     - name: Inspect a durable host-upgrade journal before normal convergence
       ansible.builtin.import_tasks: upgrade-inspect.yml

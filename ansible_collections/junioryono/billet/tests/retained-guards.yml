@@ -98,7 +98,8 @@
           conditions: [billet_node_should_run, not ansible_check_mode]
         - file: services.yml
           name: Stop and disable the billet node unless it may run here
-          conditions: [not billet_node_should_run, not ansible_check_mode]
+          # A node prepared for `billet join` is the join's to stop, never the role's.
+          conditions: [not billet_node_should_run, not billet_node_prepare_only | default(false) | bool, not ansible_check_mode]
         - file: network.yml
           name: Drain billet compute before changing guest networking
           conditions:

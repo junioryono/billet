@@ -105,6 +105,37 @@
   check_mode: false
   become: true
 
+# A NODE PREPARED FOR `billet join` IS STARTED BY THE JOIN, AND ONLY THE JOIN: the
+# drain below stops it, and nothing in this mode would start it again. So a change
+# to guest networking under one that is up is refused before anything is stopped;
+# one that is not up (every first converge, before the join) is judged by its last
+# ending, as below, and is not started; a drain request already on the host is
+# not the role's, and is left (request-node-drain.yml).
+- name: Inspect whether a node prepared for billet join is up before the network drain
+  ansible.builtin.command:
+    argv: [systemctl, is-active, billet-node.service]
+  register: billet_network_prepared_node_state
+  changed_when: false
+  failed_when: billet_network_prepared_node_state.rc not in [0, 3, 4]
+  check_mode: false
+  become: true
+  when:
+    - billet_node_prepare_only | default(false) | bool
+    - billet_network_requires_drain
+    - billet_node_unit_load_state.stdout | trim != 'not-found'
+
+- name: Refuse a guest network change that would stop a joined node prepared for billet join
+  ansible.builtin.assert:
+    that:
+      - billet_network_prepared_node_state.stdout | trim in ['inactive', 'failed']
+    fail_msg: >-
+      Guest networking would change on this host, which drains and stops
+      billet-node.service ({{ billet_network_prepared_node_state.stdout | trim }}),
+      and billet_node_prepare_only leaves the node's start to `billet join`, so
+      nothing would start it again. Nothing was stopped or changed. Drain the node
+      with billet and converge again, or converge without billet_node_prepare_only.
+  when: billet_network_prepared_node_state is not skipped
+
 - name: Make every node stop while guest networking changes a drain
   ansible.builtin.include_tasks: request-node-drain.yml
   when:

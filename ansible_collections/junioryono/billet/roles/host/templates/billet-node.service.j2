@@ -12,7 +12,14 @@ After=network-online.target
 {% endif %}
 Wants=network-online.target
 
-{% set billet_notify_ready = billet_systemd_notify_ready | default(false) %}
+{# A NODE PREPARED FOR `billet join` IS STARTED BY THE JOIN'S `billet local up`, which
+   starts only a unit of the package's shape: notify, so a start means ready, and the
+   state directory declared, so it can tell the directory is writable (it refused this
+   template's exec unit on a z1d.metal, 2026-11-09). The binary there is the release
+   archive's, which notifies. Read in plain Jinja2, which billet's Go tests render this
+   with, the way Ansible's bool reads it, so a string "false" is false. #}
+{% set billet_node_prepared = (billet_node_prepare_only | default(false) | string | lower) in ['true', 'yes', 'on', '1'] %}
+{% set billet_notify_ready = (billet_systemd_notify_ready | default(false)) or billet_node_prepared %}
 {% if billet_server_prepare_only | default(false) %}
 
 # HELD, FOR THE SERVER'S REASON RATHER THAN ITS OWN. On a host running both
@@ -41,6 +48,11 @@ Group=root
 # controller it has to open the ledger the server's way; see billet-server.service.
 EnvironmentFile={{ '-' if environment_file.ignore_errors else '' }}{{ environment_file.path }}
 {% endfor %}
+{% if billet_node_prepared %}
+# THE PACKAGE'S STATE DIRECTORY, which `billet local up` reads to judge state_dir.
+StateDirectory=billet/node
+StateDirectoryMode=0700
+{% endif %}
 ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml{{ (' --upgrade-probe' ~ (' --upgrade-probe-hold' if billet_systemd_upgrade_probe_hold | default(false) else '')) if billet_systemd_upgrade_probe | default(false) else '' }}
 TimeoutStartSec=120
 # billet/registration holds the node's registration record (root-owned, written
