@@ -455,7 +455,8 @@ type Listener struct {
 	hurry <-chan struct{}
 	// restartHandoff makes a stop while admission is open a handoff rather than a
 	// drain; see WithRestartHandoff. handingOff is Run's decision, read only by
-	// its own teardown on the same goroutine.
+	// its own teardown on the same goroutine (destroyAll reads it only when not
+	// forcing, which is that teardown's call).
 	restartHandoff bool
 	handingOff     bool
 

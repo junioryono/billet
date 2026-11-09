@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -225,6 +227,167 @@ func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 			t.Errorf("the handoff released held escrow %s (%s); it is reclaimed when its "+
 				"renewal stops, not handed back under a session left open", h.ID, got.Phase)
 		}
+	}
+}
+
+// oweRecorded gives the listener a destroy it owes for a completion the ledger
+// holds: one carrying GitHub's result, on a listener whose completion store was
+// set before it started.
+func (f *handoffFixture) oweRecorded(id int64) {
+	f.l.mu.Lock()
+	defer f.l.mu.Unlock()
+
+	if f.l.cleanup == nil {
+		f.l.cleanup = map[int64]*pendingCleanup{}
+	}
+	f.l.cleanup[id] = &pendingCleanup{job: dispatch.Job{RequestID: id, Result: "succeeded", CompletionID: 7},
+		at: time.Now().Add(time.Hour)}
+}
+
+// A HANDOFF LEAVES A RECORDED COMPLETION'S DESTROY TO THE NEXT PROCESS, which
+// restores it from the ledger, rather than wait on a node for it; a destroy the
+// ledger does not hold is still done before it stops.
+func TestAHandoffLeavesARecordedCompletionsDestroyToTheNextProcess(t *testing.T) {
+	t.Parallel()
+
+	f := newHandoffFixture(t, WithRestartHandoff())
+	f.l.completionStore = f.db
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	deadline, endDeadline := context.WithTimeout(t.Context(), 30*time.Second)
+	defer endDeadline()
+
+	run := f.start(ctx, t, cancel)
+
+	waitUntil(deadline, t, "the job to be running", func() bool { return f.l.Running() == 1 })
+	f.oweRecorded(33)
+	f.owe(22)
+
+	cancel()
+	awaitRun(deadline, t, run)
+
+	if !f.log.saw(handedOver) {
+		t.Fatalf("the stop did not hand over:\n%s", f.log.String())
+	}
+	if f.tore(33) {
+		t.Errorf("the handoff waited on the destroy of a completion the ledger holds:\n%s", f.log.String())
+	}
+	if !f.log.saw("leaving a finished job's destroy to the next control plane") {
+		t.Errorf("the destroy left to the next process was not said:\n%s", f.log.String())
+	}
+	if !f.tore(22) {
+		t.Errorf("the handoff skipped a destroy the ledger does not hold:\n%s", f.log.String())
+	}
+}
+
+// WHAT A HANDOFF LEAVES, THE NEXT PROCESS DOES. A completion recorded the way a
+// message records it, whose destroy failed once, is left by the handoff's
+// teardown with its pending row and lease in the ledger; a fresh listener over
+// that ledger restores it, destroys the compute and releases the lease.
+func TestTheNextProcessDestroysWhatAHandoffLeft(t *testing.T) {
+	t.Parallel()
+
+	p := newRunnerlessPool(t, job11)
+	p.l.completionStore = openState(t)
+	runner := p.launchedFor11(t)
+
+	started := job11
+	started.RunnerID, started.RunnerName = 77, runner.RunnerName
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("start job 11: %v", err)
+	}
+
+	fake, ok := p.l.runner.(*fakeRunner)
+	if !ok {
+		t.Fatalf("the pool's runner is a %T", p.l.runner)
+	}
+	destroy := fake.onDestroy
+	nodeBusy := true
+	fake.onDestroy = func(id int64) error {
+		if nodeBusy {
+			return errors.New("the node is still settling this job's cache")
+		}
+
+		return destroy(id)
+	}
+
+	finished := started
+	finished.Result = "Succeeded"
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{finished},
+		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
+		t.Fatalf("complete job 11: %v", err)
+	}
+	p.l.mu.Lock()
+	owed := p.l.cleanup[11]
+	p.l.mu.Unlock()
+	if owed == nil || owed.job.Result == "" {
+		t.Fatalf("the failed destroy left no obligation carrying the result: %+v", owed)
+	}
+
+	nodeBusy = false
+	p.l.handingOff = true
+	p.l.destroyAll(t.Context(), false, nil)
+	if slices.Contains(p.destroyed, 11) {
+		t.Fatal("the handoff destroyed job 11's compute itself")
+	}
+
+	rows, err := p.l.completionStore.PendingCompletions(t.Context(), p.l.tier)
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if !slices.ContainsFunc(rows, func(row state.PendingCompletion) bool {
+		return row.RequestID == 11 && !row.Retired && row.LeaseID == runner.LeaseID
+	}) {
+		t.Fatalf("the ledger does not hold job 11's completion with its lease for the next process: %+v", rows)
+	}
+
+	p.restartHeld(t, 0)
+	p.l.retryCleanup(t.Context())
+
+	if !slices.Contains(p.destroyed, 11) {
+		t.Fatalf("the next process did not destroy what the handoff left: destroyed %v", p.destroyed)
+	}
+	// A RELEASED LEASE IS NO LONGER A LIVE ONE, which is how the ledger answers.
+	if lease, err := p.a.Lease(t.Context(), runner.LeaseID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Errorf("job 11's lease after the next process destroyed its compute: %+v, %v; want it released",
+			lease, err)
+	}
+}
+
+// A SEALED STOP STILL DESTROYS A RECORDED COMPLETION: the deployment is leaving,
+// and no next process will restore it.
+func TestASealedStopStillDestroysARecordedCompletion(t *testing.T) {
+	t.Parallel()
+
+	f := newHandoffFixture(t, WithRestartHandoff())
+	f.l.completionStore = f.db
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	deadline, endDeadline := context.WithTimeout(t.Context(), 30*time.Second)
+	defer endDeadline()
+
+	run := f.start(ctx, t, cancel)
+
+	waitUntil(deadline, t, "the job to be running", func() bool { return f.l.Running() == 1 })
+	f.oweRecorded(33)
+	if _, err := f.db.Seal(t.Context(), state.SealRequest{
+		Provenance: state.ProvenanceOperator, Reason: "leaving", Actor: "ops",
+	}); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	cancel()
+	awaitDrainStart(deadline, t, f.log, run)
+	f.hurryUp()
+	awaitRun(deadline, t, run)
+
+	if !f.tore(33) {
+		t.Errorf("a sealed stop left a recorded completion's destroy undone:\n%s", f.log.String())
 	}
 }
 
