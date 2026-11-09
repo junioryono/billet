@@ -1,6 +1,6 @@
 # Bare-metal hosts
 
-What was measured of the two kinds of rented bare metal [ADR-030](../decisions/adr-030-rented-bare-metal-pool.md) builds a pool from, and when. Every AWS number is from `us-west-2`, every phoenixNAP number from its API on the day named.
+What was measured of the two kinds of rented bare metal [ADR-030](../decisions/adr-030-rented-bare-metal-pool.md) builds a pool from, and when. Every AWS number is from `us-west-2`, every phoenixNAP number from its API on the day named, except the 2026-11-09 server, which was ordered in the portal and measured over SSH.
 
 ## AWS bare-metal instances, 2026-11-05
 
@@ -141,23 +141,23 @@ The `s1.c1.small` of 2026-11-05 is no longer in the catalogue, and this was the 
 
 | Step | Time (UTC) |
 |---|---|
-| Order placed in the portal | about 15:48:50 |
-| The portal's created time | 15:51:44 |
+| The last clock reading before the order was placed (the click came a few form steps later; its own time was not recorded) | 15:48:09 |
+| The portal's "Created On" | 15:51:44 |
 | SSH answered as `ubuntu` | 15:52:06 |
-| Delete confirmed in the portal | 15:55:45 |
-| SSH stopped answering | by 15:56:41 |
-| The portal's server list was empty | by 15:58 |
+| The last clock reading before the delete was confirmed (the confirmation's own time was not recorded) | 15:55:41 |
+| SSH refused | by 15:56:41 |
+| The portal's server list empty, when next looked at | 15:58 |
 
-- **The host was already running when it was handed over.** `uptime` said up 3 days and 4 hours, `/dev/kvm` dated from two days before, and the journal's only boot began at 15:51:23. phoenixNAP's "typically deploys in 60 seconds" for Ubuntu here is a machine kept running and personalised, not a cold boot. About three minutes from order to SSH.
-- **Single-thread speed held under full load.** `openssl speed -bytes 16384 sha256` hashed 1,383 MB/s on one cpu alone and 1,401 MB/s pinned to cpu 0 with the other 95 cores spinning: no loss. The AWS method (above) differs, so compare within a row, not across.
-- **A Firecracker guest costs about 2% and kept its speed under load.** Firecracker v1.13.1 booted its CI's 6.1.141 kernel and Ubuntu 24.04 rootfs with one vcpu and 1 GiB, and hashed 2 GiB of zeros with `sha256sum`, three times each:
+- **The kernel had been running for days.** At 15:52:21 `/proc/uptime` read 275,665 s (3 days and 4 hours) and `/dev/kvm` was dated two days earlier. Yet the journal listed one boot, whose first retained entry was 15:51:23. So the server was not booted for this order. How phoenixNAP prepares such a host, and why it advertises "typically deploys in 60 seconds" for this image, was not observed. From the last clock reading before the order to SSH answering was under four minutes.
+- **One thread's speed was unchanged beside 95 busy processes.** `openssl speed -seconds 5 -bytes 16384 sha256` hashed 1,383 MB/s alone (no affinity set). Pinned to cpu 0 with `taskset` beside 95 busy-loop shells, whose placement was not recorded, it hashed 1,401 MB/s. The AWS method (above) differs, so compare within a row, not across.
+- **A Firecracker guest's hashing pipeline ran as fast as the host's in these runs.** Firecracker v1.13.1 booted its CI's 6.1.141 kernel and Ubuntu 24.04 rootfs with one vcpu and 1 GiB. The same pipeline, `head -c 2147483648 /dev/zero | sha256sum`, ran three times each on the host and in the guest, alone and beside 95 busy-loop shells:
 
   | Where | Alone | 95 host cores busy |
   |---|---|---|
   | Host | 2,348 to 2,419 ms | 2,579 to 2,608 ms |
   | Guest | 2,396 to 2,451 ms | 2,398 to 2,403 ms |
 
-  The host's own pipeline slowed under load. The guest's vcpu, a single thread on an otherwise contended host, did not.
+  Alone, the guest's times overlapped the host's, their mean about 2% higher (2,417 against 2,376 ms). Beside the busy shells the guest's did not change, while the host's mean rose about 9% (2,589 ms). Three runs of one pipeline on one host, so this characterises that workload here, not virtualisation's cost in general.
 - **NVMe.** An 8 GiB direct write (`dd oflag=direct`, 1 MiB blocks, after one warm-up write) took 3.25 s, 2.5 GiB/s. The read back took 3.09 s, 2.6 GiB/s. The root filesystem is LVM over the first NVMe.
 - **What the API answers after a delete is still not measured.** These measurements had no API credentials at hand. The API client's order refusal is with phoenixNAP (#828): on 2026-11-09 its live chat, with Sales (the only group online; technical support is offered through their Slack), was asked to check that client's permissions now that a portal order works.
 
