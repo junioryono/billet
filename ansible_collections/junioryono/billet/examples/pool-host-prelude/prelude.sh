@@ -18,6 +18,8 @@
 #   PRELUDE_IMAGE                      the tier's image name (default ubuntu-2404-x64)
 #   PRELUDE_IMAGE_SOURCE               optional: a guest image release to pull from
 #   PRELUDE_OSD_DEVICE                 optional: the OSD's disk, else the first free one
+#   PRELUDE_BUDGET_SECONDS             optional: how long after it starts the prelude
+#                                      still begins a kernel pull (default 5400)
 #
 # It runs under the pool's `bash -euo pipefail`, and its output reaches the console the
 # source reads, so it prints nothing a network answered and no line of the join's form:
@@ -56,10 +58,10 @@ imds() {
 		-H "X-aws-ec2-metadata-token: $1" "http://169.254.169.254/latest/meta-data/$2"
 } 2>>"$work/fetch.log"
 
-# A DOWNLOAD THAT STALLS IS ABANDONED AND ASKED AGAIN: under 1 KB/s for a minute ends an
-# attempt, and twenty minutes ends the retrying, so a stalled connection cannot hold the
-# boot until the join's two-hour token has lapsed.
-download=(curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 60
+# A DOWNLOAD THAT STALLS IS ABANDONED AND ASKED AGAIN: under 1 KB/s for a minute or
+# fifteen minutes in all ends an attempt, and no attempt begins after twenty, so a stalled
+# connection cannot hold the boot until the join's two-hour token has lapsed.
+download=(curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 60 --max-time 900
 	--retry 20 --retry-all-errors --retry-delay 5 --retry-max-time 1200)
 
 # PLAIN HTTPS, OR S3 WITH THE INSTANCE'S ROLE. A link presigned with a person's session
@@ -110,10 +112,14 @@ collections_root=$(dirname "$(find src -maxdepth 2 -type d -name ansible_collect
 }
 tests=$collections_root/ansible_collections/junioryono/billet/tests
 
+# The install is retried whole: pip retries a request, not every answer an index gives.
+pip_install() {
+	venv/bin/pip install -q --retries 10 "ansible-core==$(cat "$tests/ansible-core-version")" >>"$work/pip.log" 2>&1
+}
 [ -x venv/bin/ansible-playbook ] || {
 	rm -rf venv
 	python3 -m venv venv
-	venv/bin/pip install -q --retries 10 "ansible-core==$(cat "$tests/ansible-core-version")" >"$work/pip.log" 2>&1
+	retry 5 15 pip_install
 }
 galaxy() {
 	venv/bin/ansible-galaxy collection install -p "$work/collections" \
@@ -122,38 +128,57 @@ galaxy() {
 retry 5 15 galaxy
 
 # THE DISKS, CHOSEN ONCE AND RECORDED. The OSD takes PRELUDE_OSD_DEVICE, else the first
-# whole disk with no partitions, nothing mounted, no signature blkid can find and not the
-# root's; a second such disk holds what the image's small root cannot. A run again reads
-# the record: the OSD's disk is no longer free, and the second is mounted. Lists are read
-# whole, never cut short by `head`: under pipefail a writer that loses its reader fails
-# the boot with 141. A disk blkid could not read is not free: only its "nothing here"
-# (status 2) is.
-free_disks() {
-	local root_disk d rc
-	root_disk=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | sed -n 1p)
-	for d in $(lsblk -dnpo NAME,TYPE | awk '$2 == "disk" {print $1}'); do
-		[ "${d##*/}" = "$root_disk" ] && continue
-		[ "$(lsblk -no NAME "$d" | wc -l)" -eq 1 ] || continue
-		[ -z "$(lsblk -no MOUNTPOINT "$d" | tr -d '[:space:]')" ] || continue
-		rc=0
-		blkid -p "$d" >/dev/null 2>&1 || rc=$?
-		[ "$rc" -eq 2 ] || continue
-		echo "$d"
-	done
+# whole disk with no partitions, nothing mounted, no signature and not the root's; a
+# second such disk holds what the image's small root cannot. A run again reads the
+# record: the OSD's disk is no longer free, and the second is mounted.
+#
+# BLANK IS WIPEFS'S EMPTY LIST, read successfully, as the role decides a ledger volume:
+# blkid's "nothing found" is also its answer when it could not read the device, and a
+# partition table carries no filesystem type. A disk wipefs could not read is not free,
+# and a probe that fails fails the scan, so a scan cut short is never recorded.
+signatures() {
+	wipefs --no-act --noheadings --output TYPE "$1" 2>>"$work/disks.log"
 }
-# stable_name DISK: a /dev/disk/by-id name of the disk, else the name it was given.
+free_disks() {
+	local root_disk names d type parts mounts sigs
+	root_disk=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)") || return 1
+	root_disk=${root_disk%%$'\n'*}
+	names=$(lsblk -dnpo NAME,TYPE) || return 1
+	while read -r d type; do
+		[ "$type" = disk ] || continue
+		[ "${d##*/}" != "$root_disk" ] || continue
+		parts=$(lsblk -no NAME "$d") || return 1
+		[ "$(wc -l <<<"$parts")" -eq 1 ] || continue
+		mounts=$(lsblk -no MOUNTPOINT "$d") || return 1
+		[ -z "${mounts//[[:space:]]/}" ] || continue
+		sigs=$(signatures "$d") || continue
+		[ -z "${sigs//[[:space:]]/}" ] || continue
+		echo "$d"
+	done <<<"$names"
+	return 0
+}
+# stable_name DISK: a /dev/disk/by-id name of the disk, waiting for udev to make one. A
+# kernel name is only the order the disks were found in at this boot, so a disk with no
+# such name is refused rather than recorded by one.
 stable_name() {
-	local l
-	for l in /dev/disk/by-id/*; do
-		if [ -e "$l" ] && [ "$(readlink -f "$l")" = "$1" ]; then
-			echo "$l"
-			return 0
-		fi
+	local l try
+	for try in 1 2 3 4 5 6 7 8 9 10; do
+		udevadm settle --timeout=10 >/dev/null 2>&1 || true
+		for l in /dev/disk/by-id/*; do
+			if [ -e "$l" ] && [ "$(readlink -f "$l")" = "$1" ]; then
+				echo "$l"
+				return 0
+			fi
+		done
+		[ "$try" -eq 10 ] || sleep 3
 	done
-	echo "$1"
+	echo "prelude: $1 has no /dev/disk/by-id name to record it by" >&2
+	return 1
 }
 if [ ! -s "$work/disks.env" ]; then
-	mapfile -t disks < <(free_disks)
+	free=$(free_disks)
+	disks=()
+	[ -z "$free" ] || mapfile -t disks <<<"$free"
 	osd=${PRELUDE_OSD_DEVICE:-${disks[0]:-}}
 	[ -n "$osd" ] || {
 		echo "prelude: no free disk for the OSD" >&2
@@ -168,10 +193,11 @@ if [ ! -s "$work/disks.env" ]; then
 			break
 		}
 	done
-	# RECORDED BY IDENTITY, since a kernel name is only the order the disks were found in
-	# at this boot, and may name another disk after the next one.
-	printf 'osd=%q\nscratch=%q\n' "$(stable_name "$osd")" "$(if [ -n "$scratch" ]; then stable_name "$scratch"; fi)" \
-		>"$work/disks.env"
+	# RECORDED BY IDENTITY, and only once every name is in hand.
+	osd_id=$(stable_name "$osd")
+	scratch_id=""
+	[ -z "$scratch" ] || scratch_id=$(stable_name "$scratch")
+	printf 'osd=%q\nscratch=%q\n' "$osd_id" "$scratch_id" >"$work/disks.env"
 fi
 # shellcheck source=/dev/null
 . "$work/disks.env"
@@ -192,20 +218,25 @@ fi
 # below 30% free, which an 8 GB root reaches) and the guest image's staging, which needs
 # room for its parts, the assembled archive and the decompressed image at once: 97 GB at
 # its peak for the x86_64 image of 2026-11-08, which filled a 40 GB disk (2026-11-09).
-# It is formatted only on blkid's word that it holds nothing, and mounted by its
-# filesystem's UUID from /etc/fstab, so a reboot brings Docker's and Ceph's data back
-# before either starts. nofail, because a disk gone after a reboot must not stop the
-# boot: the host is then not a working node, and the pool's drain finds it so.
+# It is formatted only when wipefs read it and found nothing, used when it holds exactly
+# one ext4 (this prelude's, from a run cut short before the mount), and refused
+# otherwise. It is mounted by its filesystem's UUID from /etc/fstab, so a reboot brings
+# Docker's and Ceph's data back before either starts. nofail, because a disk gone after a
+# reboot must not stop the boot: the host is then not a working node, and the pool's
+# drain finds it so.
 staging=""
 if [ -n "$scratch" ]; then
 	if ! mountpoint -q /var/lib/pool-scratch; then
-		rc=0
-		blkid -p "$scratch" >/dev/null 2>&1 || rc=$?
-		case $rc in
-		0) ;;
-		2) mkfs.ext4 -q -F "$scratch" ;;
+		sigs=$(signatures "$scratch") || {
+			echo "prelude: could not tell what $scratch holds" >&2
+			exit 1
+		}
+		sigs=${sigs//[[:space:]]/}
+		case $sigs in
+		"") mkfs.ext4 -q -F "$scratch" ;;
+		ext4) ;;
 		*)
-			echo "prelude: could not tell whether $scratch holds a filesystem" >&2
+			echo "prelude: $scratch holds something other than one ext4 filesystem" >&2
 			exit 1
 			;;
 		esac
@@ -331,9 +362,16 @@ pull+=("${PRELUDE_IMAGE:-ubuntu-2404-x64}")
 # The directory is asked for before it is listed: a pull that failed before installing
 # anything leaves none, and a find of a missing directory fails the pipeline, which under
 # pipefail ended the boot on the first failed pull instead of retrying it (2026-11-09).
+#
+# A BUDGET, NOT A COUNT: a pull's download has no deadline of its own, so each attempt is
+# given what is left of PRELUDE_BUDGET_SECONDS from the prelude's start, and none begins
+# with under a minute left. The join's token lives two hours from the order, and the host
+# needs time after this to enroll.
+budget=${PRELUDE_BUDGET_SECONDS:-5400}
 kernel=""
-for _ in $(seq 1 10); do
-	billet images pull --config "$work/preview/billet.yaml" "${pull[@]:5}" >"$work/kernel-pull.log" 2>&1 || true
+while [ $((budget - SECONDS)) -gt 60 ]; do
+	timeout --kill-after=60 $((budget - SECONDS)) billet images pull --config "$work/preview/billet.yaml" \
+		"${pull[@]:5}" >"$work/kernel-pull.log" 2>&1 || true
 	if [ -d /var/lib/billet/kernels ]; then
 		kernel=$(find /var/lib/billet/kernels -maxdepth 1 -type f -name 'vmlinux-*' -printf '%T@ %p\n' |
 			sort -n | tail -1 | cut -d' ' -f2-)
@@ -342,7 +380,7 @@ for _ in $(seq 1 10); do
 	sleep 30
 done
 [ -n "$kernel" ] || {
-	echo "prelude: no guest kernel was installed; see $work/kernel-pull.log" >&2
+	echo "prelude: no guest kernel was installed within the budget; see $work/kernel-pull.log" >&2
 	exit 1
 }
 install -m 0644 "$kernel" /var/lib/billet/kernels/vmlinux
