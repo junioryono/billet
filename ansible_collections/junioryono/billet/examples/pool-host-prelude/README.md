@@ -9,8 +9,9 @@ It is an example to copy and render, not a script the collection installs. Where
 1. **Installs billet's binary** at `/usr/bin/billet`, checked against the sha256 you render in. It never installs the package: the package's postinstall seeds `/etc/billet/billet.yaml` from its template, and the join leaves a config it did not write alone, so the host could not be joined. The role refuses that seed in this mode.
 2. **Fetches the collection** at the commit you pin, and installs the pinned `ansible-core` and `ansible.posix` in a venv.
 3. **Chooses its disks once and records them** in `/var/lib/billet-pool-prelude/disks.env`:
-   - the OSD takes `PRELUDE_OSD_DEVICE` (an alias such as `/dev/disk/by-id/...` is resolved to its kernel name), else the first whole disk with no partitions, nothing mounted, no signature `blkid` can find, and not the root's (an instance store's NVMe on metal). A disk `blkid` could not read is not free;
-   - a second such disk, when there is one, is formatted only on `blkid`'s word that it holds nothing. It is mounted by its filesystem's UUID from `/etc/fstab`, with Docker's and Ceph's directories bound onto it there, so a reboot brings their data back before either starts. The entries are `nofail`: a disk gone after a reboot does not stop the boot. The disk holds Docker's data (cephadm's containers), Ceph's (the monitor warns below 30% free, which an 8 GB root reaches) and the guest image's staging. The staging holds the image's parts, its assembled archive and the decompressed image at once: 97 GB at its peak for the x86_64 image of 2026-11-08. A 40 GB disk filled, and the pull failed.
+   - the record names each disk by a `/dev/disk/by-id` name, resolved again on every run, since a kernel name like `/dev/nvme1n1` is only the order the disks were found in at that boot;
+   - the OSD takes `PRELUDE_OSD_DEVICE` (an alias is compared by the disk it names), else the first whole disk with no partitions, nothing mounted, no signature `blkid` can find, and not the root's (an instance store's NVMe on metal). A disk `blkid` could not read is not free;
+   - a second such disk, when there is one, is formatted only on `blkid`'s word that it holds nothing. It is mounted by its filesystem's UUID from `/etc/fstab`, with Docker's and Ceph's directories bound onto it there. The entries are `nofail`, so a disk gone after a reboot does not stop the boot. A drop-in makes Docker require both mounts, so neither Docker nor Ceph's daemons, which are its containers, starts on the root's empty directories. The disk holds Docker's data (cephadm's containers), Ceph's (the monitor warns below 30% free, which an 8 GB root reaches) and the guest image's staging. The staging holds the image's parts, its assembled archive and the decompressed image at once: 97 GB at its peak for the x86_64 image of 2026-11-08. A 40 GB disk filled, and the pull failed.
    - "First" is the kernel's listing order, not the order the disks were attached or their size. When the host's disks differ, set `PRELUDE_OSD_DEVICE`, so the staging lands on a disk large enough for it.
 4. **Renders the role's inputs from the join's own config.** `billet init --join` is given the flags `server.pool.init_args` hands the join, and writes to a scratch path, never `/etc/billet/billet.yaml`. So the bridges, the pools and the kernel path the role prepares are the ones the join's config will name. (`--join` cannot be combined with `--emit ansible`.)
 5. **Converges the role on localhost.** The settings:
@@ -24,7 +25,13 @@ It is an example to copy and render, not a script the collection installs. Where
 7. **Installs the guest kernel** the node's config names, from a pull that is retried. A pull installs an image's paired kernel and then refuses to import until the node has registered and recorded what its control plane accepts (#584). This pull fetches and decompresses the whole image first, so it takes as long, and as much staging, as the import itself.
 8. **Leaves a transient unit,** `billet-pool-image-pull`, that waits for that record and then pulls and verifies the image.
 
-Its output reaches the console the host source reads for the join's line, so it prints only lines of its own, each starting `prelude:`. What apt, pip, Galaxy, the role, Ceph and the pulls say goes to logs in `/var/lib/billet-pool-prelude`. A failure is reported by the line it stopped on. The instance metadata requests, apt, pip, Galaxy, Ceph's settings and the kernel pull are each retried, so one refused answer does not skip the join. The S3 credentials reach curl on its standard input, never its arguments.
+Its output reaches the console the host source reads for the join's line, so no command that talks to a network writes there. What curl, apt, pip, Galaxy, the role, Ceph and the pulls say goes to logs in `/var/lib/billet-pool-prelude`. The script's own lines start `prelude:`, and a failure is reported by the line it stopped on; a local command that fails (a mount, say) may add its own error first.
+
+Retries:
+- each of these is retried, so one refused answer does not skip the join: the instance metadata requests, apt, pip, Galaxy, the downloads, the role's converge (three times, whole), Ceph's settings and the kernel pull;
+- a download that falls under 1 KB/s for a minute is abandoned and asked again, and its retrying stops after twenty minutes, so a stalled connection cannot outlast the join's two-hour token.
+
+The S3 credentials reach curl on its standard input, never its arguments.
 
 It may be run again on the same host:
 - the disks come from the record, and a mounted scratch disk is reused;
@@ -34,7 +41,15 @@ It may be run again on the same host:
 
 ## Rendering it
 
-Prepend exports to the script's body (everything after its first line) and point `server.pool.boot_prelude` at the result:
+Write the exports below to a file, append the script's body without its comment lines, and point `server.pool.boot_prelude` at the result:
+
+```bash
+{ cat exports.sh; tail -n +2 prelude.sh | sed '/^[[:space:]]*#/d'; } >/etc/billet/pool-prelude.sh
+```
+
+The comments are why each step is there, and they cost room the payload does not have. The script with them is about 16.9 KB, past the 16384 bytes the control plane carries (it refuses a longer boot, naming `boot_prelude`). Without them it is about 9.6 KB. No line the script needs starts with `#`: the full-line comments inside its two YAML heredocs are YAML's own.
+
+The exports:
 
 ```bash
 # A release's archive (or a bare binary); its sha256 is the archive's line in the
@@ -58,24 +73,32 @@ Also set `server.pool.init_args` to the same three flags the script gives `bille
 - `--ceph-user=billet`
 - `--ceph-keyring=/etc/ceph/ceph.client.billet.keyring`
 
-The whole payload carries a join token, so keep it to the source's API, and within EC2's 16384 bytes of user data. Rendered with presigned links it was about 11 KB.
+The whole payload carries a join token, so keep it to the source's API, and within EC2's 16384 bytes of user data. The control plane adds the join's line and a few lines around the prelude, under 1 KB. The body without comments plus exports naming S3 keys is about 10 KB; exports holding presigned links add about 2 KB each.
 
 ## What has been proven, and what has not
 
 - **On AWS metal, 2026-11-09** ([the bare-metal hosts record](../../../../../docs/reference/records/bare-metal-hosts.md), "The pool on AWS metal, end to end"), a version of this script prepared a `z1d.metal` that was admitted with no person, registered, imported the guest image and ran jobs. **Not unchanged:** on that host, the OSD was added by hand, the payload was re-run after GitHub refused downloads, the image's assets were fetched with curl's retries and imported with `--from`, and the packaged node unit was installed before `local up`. The role (#816, #810) and this script now carry the fixes for each.
-- **This version, 2026-11-09,** on a nested-virtualisation `m8i.2xlarge` (Ubuntu 24.04) with two spare EBS volumes and no control plane to join. Its predecessors on the same host found what the script now handles:
+- **On nested-virtualisation `m8i.2xlarge` hosts, 2026-11-09** (Ubuntu 24.04, two spare EBS volumes, no control plane to join).
+
+  Earlier versions, run five times on one host, found what the script now handles:
   - a `head` that ended a pipeline under `pipefail` (141);
   - a kernel lookup that stopped the boot on the first failed pull;
   - a 40 GB scratch disk the image's staging filled;
   - a Ceph manager that kept the old pool size;
   - the converge guard left held.
 
-  Then this version ran twice in a row, fetching from S3 with the instance's own credentials, and each run exited 0 with one line on the console, `prelude: host prepared`. Across the runs:
-  - the disk record stayed the same;
-  - the guard was released;
-  - the kernel was installed;
-  - the image unit was left waiting for the node's acceptance record.
+  The last two runs there fetched from S3 with the instance's own credentials, and after a reboot the mounts and Ceph came back.
 
-  After a reboot, the scratch disk and both bind mounts came back from `/etc/fstab`, and Ceph was `HEALTH_OK` with its one OSD up. A join, the node's registration and the image's import were not part of this run.
+  **This version** was rendered as above (comments stripped, presigned links, 13.5 KB) on a fresh host as its user data. `PRELUDE_OSD_DEVICE` named the smaller volume by its `/dev/disk/by-id` alias. It ran twice in a row:
+  - **The console.** Each run exited 0, with `prelude: host prepared` the only line on the console.
+  - **The disks.** The alias's disk took the OSD and the larger disk the staging, and the record kept both by their `by-id` names.
+  - **The guard** was released.
+  - **Ceph** was `HEALTH_OK`.
+  - **The kernel** was installed. On the second run GitHub reset the pull's connection, and the run took the kernel the first had installed.
+  - **The image unit** was left waiting for the node's acceptance record.
+
+  After a reboot, the scratch disk and both bind mounts came back from `/etc/fstab`, Docker started after both, and Ceph was `HEALTH_OK` with its OSD up.
+
+  **Not part of these runs:** a join, the node's registration, and the image's import.
 - **Not proven:** a phoenixNAP host. It has no instance metadata service, so the address and the credential fetch here are AWS's.
 

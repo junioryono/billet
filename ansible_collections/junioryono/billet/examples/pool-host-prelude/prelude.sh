@@ -46,15 +46,21 @@ apt-get -o Acquire::Retries=10 -o DPkg::Lock::Timeout=600 update -qq >"$work/apt
 apt-get -o Acquire::Retries=10 -o DPkg::Lock::Timeout=600 install -y -qq python3-venv curl >>"$work/apt.log" 2>&1
 
 # The instance metadata service, retried: one refused or slow answer would otherwise end
-# the boot before the join.
+# the boot before the join. What curl says goes to a log, as every fetch's does.
 imds_token() {
 	curl -fsS --retry 10 --retry-all-errors --retry-delay 2 --connect-timeout 2 --max-time 10 \
 		-X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' http://169.254.169.254/latest/api/token
-}
+} 2>>"$work/fetch.log"
 imds() {
 	curl -fsS --retry 10 --retry-all-errors --retry-delay 2 --connect-timeout 2 --max-time 10 \
 		-H "X-aws-ec2-metadata-token: $1" "http://169.254.169.254/latest/meta-data/$2"
-}
+} 2>>"$work/fetch.log"
+
+# A DOWNLOAD THAT STALLS IS ABANDONED AND ASKED AGAIN: under 1 KB/s for a minute ends an
+# attempt, and twenty minutes ends the retrying, so a stalled connection cannot hold the
+# boot until the join's two-hour token has lapsed.
+download=(curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 60
+	--retry 20 --retry-all-errors --retry-delay 5 --retry-max-time 1200)
 
 # PLAIN HTTPS, OR S3 WITH THE INSTANCE'S ROLE. A link presigned with a person's session
 # stops working when the session ends, and the control plane reads boot_prelude once,
@@ -63,7 +69,7 @@ imds() {
 # arguments or the console.
 fetch() {
 	if [ -z "${ARTIFACT_BUCKET:-}" ]; then
-		curl -fsSL --retry 20 --retry-all-errors --retry-delay 5 -o "$2" "$1"
+		"${download[@]}" -o "$2" "$1"
 		return
 	fi
 	local token role creds ak sk st
@@ -73,16 +79,16 @@ fetch() {
 	ak=$(printf '%s' "$creds" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKeyId"])')
 	sk=$(printf '%s' "$creds" | python3 -c 'import json,sys; print(json.load(sys.stdin)["SecretAccessKey"])')
 	st=$(printf '%s' "$creds" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Token"])')
-	curl -fsSL --retry 20 --retry-all-errors --retry-delay 5 --aws-sigv4 "aws:amz:${ARTIFACT_REGION}:s3" -K - \
+	"${download[@]}" --aws-sigv4 "aws:amz:${ARTIFACT_REGION}:s3" -K - \
 		-o "$2" "https://${ARTIFACT_BUCKET}.s3.${ARTIFACT_REGION}.amazonaws.com/$1" <<EOF
 user = "$ak:$sk"
 header = "x-amz-security-token: $st"
 EOF
-}
+} 2>>"$work/fetch.log"
 
 # A release's archive (its sha256 is in the release's checksums.txt) or a bare binary.
 fetch "${BILLET_KEY:-${BILLET_URL:-}}" billet.download
-echo "$BILLET_SHA256  billet.download" | sha256sum -c - >/dev/null
+echo "$BILLET_SHA256  billet.download" | sha256sum -c - >/dev/null 2>&1
 if tar -tzf billet.download billet >/dev/null 2>&1; then
 	tar -xzf billet.download billet
 else
@@ -91,7 +97,7 @@ fi
 install -m 0755 -o root -g root billet /usr/bin/billet
 
 fetch "${COLLECTION_KEY:-${COLLECTION_URL:-}}" collection.tar.gz
-echo "$COLLECTION_SHA256  collection.tar.gz" | sha256sum -c - >/dev/null
+echo "$COLLECTION_SHA256  collection.tar.gz" | sha256sum -c - >/dev/null 2>&1
 rm -rf src
 mkdir src
 tar -xzf collection.tar.gz -C src
@@ -135,6 +141,17 @@ free_disks() {
 		echo "$d"
 	done
 }
+# stable_name DISK: a /dev/disk/by-id name of the disk, else the name it was given.
+stable_name() {
+	local l
+	for l in /dev/disk/by-id/*; do
+		if [ -e "$l" ] && [ "$(readlink -f "$l")" = "$1" ]; then
+			echo "$l"
+			return 0
+		fi
+	done
+	echo "$1"
+}
 if [ ! -s "$work/disks.env" ]; then
 	mapfile -t disks < <(free_disks)
 	osd=${PRELUDE_OSD_DEVICE:-${disks[0]:-}}
@@ -142,7 +159,7 @@ if [ ! -s "$work/disks.env" ]; then
 		echo "prelude: no free disk for the OSD" >&2
 		exit 1
 	}
-	# By its kernel name, so a /dev/disk/by-id alias is not taken for another disk.
+	# Compared by kernel name, so a /dev/disk/by-id alias is not taken for another disk.
 	osd=$(readlink -f "$osd")
 	scratch=""
 	for d in "${disks[@]}"; do
@@ -151,10 +168,25 @@ if [ ! -s "$work/disks.env" ]; then
 			break
 		}
 	done
-	printf 'osd=%q\nscratch=%q\n' "$osd" "$scratch" >"$work/disks.env"
+	# RECORDED BY IDENTITY, since a kernel name is only the order the disks were found in
+	# at this boot, and may name another disk after the next one.
+	printf 'osd=%q\nscratch=%q\n' "$(stable_name "$osd")" "$(if [ -n "$scratch" ]; then stable_name "$scratch"; fi)" \
+		>"$work/disks.env"
 fi
 # shellcheck source=/dev/null
 . "$work/disks.env"
+osd=$(readlink -f "$osd")
+[ -b "$osd" ] || {
+	echo "prelude: the OSD's recorded disk is not here" >&2
+	exit 1
+}
+if [ -n "$scratch" ]; then
+	scratch=$(readlink -f "$scratch")
+	[ -b "$scratch" ] || {
+		echo "prelude: the scratch disk's recorded disk is not here" >&2
+		exit 1
+	}
+fi
 
 # THE SECOND DISK holds Docker's data (cephadm's containers), Ceph's (the monitor warns
 # below 30% free, which an 8 GB root reaches) and the guest image's staging, which needs
@@ -193,6 +225,12 @@ if [ -n "$scratch" ]; then
 			echo "/var/lib/pool-scratch/$dir /var/lib/$dir none bind,nofail,x-systemd.requires-mounts-for=/var/lib/pool-scratch 0 0" >>/etc/fstab
 		mountpoint -q "/var/lib/$dir" || mount "/var/lib/$dir"
 	done
+	# nofail lets the boot go on without the mounts, so Docker is made to wait for both
+	# itself, and Ceph's daemons, which are its containers, with it: Docker on the root's
+	# empty directories would start Ceph without its data.
+	mkdir -p /etc/systemd/system/docker.service.d
+	printf '[Unit]\nRequiresMountsFor=/var/lib/docker /var/lib/ceph\n' \
+		>/etc/systemd/system/docker.service.d/billet-pool-scratch.conf
 	systemctl daemon-reload
 	mkdir -p /var/lib/pool-scratch/images
 	staging=/var/lib/pool-scratch/images
@@ -252,13 +290,21 @@ EOF
 # a host left holding it would refuse every upgrade for its life. It is released however
 # the converge ended, as the published action releases it; after a converge that
 # succeeded, a release that fails stops the boot.
+#
+# THE CONVERGE IS RETRIED WHOLE: its package installs and Ceph's container pulls are not
+# all retried inside the role, and a converge run again on a host it has prepared, its
+# own guard still held, finishes it (four runs on one host, 2026-11-09).
+converge() {
+	ANSIBLE_COLLECTIONS_PATH="$work/$collections_root:$work/collections" ANSIBLE_FORCE_COLOR=0 venv/bin/ansible-playbook \
+		-i "$(hostname)," -e "@$work/billet-vars.yml" -e "@$work/prepare-vars.yml" "$work/prepare.yml" \
+		>>"$work/converge.log" 2>&1
+}
+: >"$work/converge.log"
 converged=0
-ANSIBLE_COLLECTIONS_PATH="$work/$collections_root:$work/collections" ANSIBLE_FORCE_COLOR=0 venv/bin/ansible-playbook \
-	-i "$(hostname)," -e "@$work/billet-vars.yml" -e "@$work/prepare-vars.yml" "$work/prepare.yml" \
-	>"$work/converge.log" 2>&1 || converged=$?
+retry 3 60 converge || converged=$?
 if [ "$converged" -ne 0 ]; then
 	billet converge-guard release --holder pool-prelude >"$work/guard-release.log" 2>&1 || true
-	echo "prelude: the host role's converge failed; see $work/converge.log" >&2
+	echo "prelude: the host role's converge failed three times; see $work/converge.log" >&2
 	exit 1
 fi
 billet converge-guard release --holder pool-prelude >"$work/guard-release.log" 2>&1
