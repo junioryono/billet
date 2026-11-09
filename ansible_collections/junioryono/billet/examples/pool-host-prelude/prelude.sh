@@ -120,7 +120,8 @@ fi
 
 # THE SECOND DISK holds Docker's data (cephadm's containers), Ceph's (the monitor warns
 # below 30% free, which an 8 GB root reaches) and the guest image's staging, which needs
-# room for its parts, the assembled archive and the decompressed image at once.
+# room for its parts, the assembled archive and the decompressed image at once: 97 GB at
+# its peak for the x86_64 image of 2026-11-08, which filled a 40 GB disk (2026-11-09).
 staging=""
 if [ -n "$scratch" ]; then
 	mountpoint -q /var/lib/pool-scratch || {
@@ -193,6 +194,9 @@ ANSIBLE_COLLECTIONS_PATH="$work/$collections_root:$work/collections" ANSIBLE_FOR
 # hold golden images, pulled again from the signed source, and per-job clones.
 ceph config set global mon_warn_on_pool_no_redundancy false
 ceph config set global osd_pool_default_size 1
+# The managers are restarted to read it: one of the two cephadm starts kept the size it
+# started with, and reported TOO_FEW_OSDS against it until restarted (2026-11-09).
+ceph orch restart mgr >/dev/null
 
 # THE KERNEL NOW, THE IMAGE AFTER THE JOIN. A pull installs the image's paired kernel
 # first and then refuses to import until the node has registered and recorded what its
@@ -203,11 +207,16 @@ pull=(billet images pull --config /etc/billet/billet.yaml --verify)
 [ -z "$staging" ] || pull+=(--staging-dir "$staging")
 [ -z "${PRELUDE_IMAGE_SOURCE:-}" ] || pull+=(--source "$PRELUDE_IMAGE_SOURCE")
 pull+=("${PRELUDE_IMAGE:-ubuntu-2404-x64}")
+# The directory is asked for before it is listed: a pull that failed before installing
+# anything leaves none, and a find of a missing directory fails the pipeline, which under
+# pipefail ended the boot on the first failed pull instead of retrying it (2026-11-09).
 kernel=""
 for _ in $(seq 1 10); do
 	billet images pull --config "$work/preview/billet.yaml" "${pull[@]:5}" >"$work/kernel-pull.log" 2>&1 || true
-	kernel=$(find /var/lib/billet/kernels -maxdepth 1 -type f -name 'vmlinux-*' -printf '%T@ %p\n' 2>/dev/null |
-		sort -n | tail -1 | cut -d' ' -f2-)
+	if [ -d /var/lib/billet/kernels ]; then
+		kernel=$(find /var/lib/billet/kernels -maxdepth 1 -type f -name 'vmlinux-*' -printf '%T@ %p\n' |
+			sort -n | tail -1 | cut -d' ' -f2-)
+	fi
 	[ -z "$kernel" ] || break
 	sleep 30
 done
@@ -220,7 +229,7 @@ install -m 0644 "$kernel" /var/lib/billet/kernels/vmlinux
 # THE IMAGE, ONCE THE NODE HAS REGISTERED: a transient unit waits for its acceptance
 # record and pulls, retrying, then stops. Started once; a run again leaves one alone.
 printf '%q ' "${pull[@]}" >"$work/image-pull.cmd"
-if ! systemctl list-units --all --plain --no-legend billet-pool-image-pull.service | grep -q .; then
+if [ -z "$(systemctl list-units --all --plain --no-legend billet-pool-image-pull.service)" ]; then
 	systemd-run --unit billet-pool-image-pull --no-block --property=Type=oneshot /bin/bash -c \
 		"until [ -s /var/lib/billet/node/image-acceptance.json ]; do sleep 10; done
 		for _ in \$(seq 1 10); do $(cat "$work/image-pull.cmd") >>$work/image-pull.log 2>&1 && exit 0; sleep 60; done

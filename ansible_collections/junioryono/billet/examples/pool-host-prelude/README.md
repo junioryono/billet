@@ -10,7 +10,8 @@ It is an example to copy and render, not a script the collection installs. Where
 2. **Fetches the collection** at the commit you pin, and installs the pinned `ansible-core` and `ansible.posix` in a venv.
 3. **Chooses its disks once and records them** in `/var/lib/billet-pool-prelude/disks.env`:
    - the OSD takes `PRELUDE_OSD_DEVICE`, else the first whole disk with no partitions, no filesystem and nothing mounted, and not the root's (an instance store's NVMe on metal);
-   - a second such disk, when there is one, is formatted and holds Docker's data (cephadm's containers), Ceph's (the monitor warns below 30% free, which an 8 GB root reaches) and the guest image's staging.
+   - a second such disk, when there is one, is formatted and holds Docker's data (cephadm's containers), Ceph's (the monitor warns below 30% free, which an 8 GB root reaches) and the guest image's staging. The staging holds the image's parts, its assembled archive and the decompressed image at once: 97 GB at its peak for the x86_64 image of 2026-11-08. A 40 GB disk filled, and the pull failed.
+   - "First" is the kernel's listing order, not the order the disks were attached or their size. When the host's disks differ, set `PRELUDE_OSD_DEVICE`, so the staging lands on a disk large enough for it.
 4. **Renders the role's inputs from the join's own config.** `billet init --join` is given the flags `server.pool.init_args` hands the join, and writes to a scratch path, never `/etc/billet/billet.yaml`. So the bridges, the pools and the kernel path the role prepares are the ones the join's config will name. (`--join` cannot be combined with `--emit ansible`.)
 5. **Converges the role on localhost.** The settings:
    - `billet_node_prepare_only`, and a converge guard holder;
@@ -19,8 +20,8 @@ It is an example to copy and render, not a script the collection installs. Where
    - more retries for the role's downloads;
    - uplink shaping off;
    - the guests' bridges on 10.240.0.0/23. The role's default 172.31.0.0/24 would put an AWS default VPC's resolver, 172.31.0.2, behind the first guest bridge.
-6. **Acknowledges the single OSD** (`mon_warn_on_pool_no_redundancy false`, `osd_pool_default_size 1`). Until a pool site has a store, a pool host keeps only golden images, which are pulled again from the signed source, and per-job clones.
-7. **Installs the guest kernel** the node's config names, from a pull that is retried. A pull installs an image's paired kernel and then refuses to import until the node has registered and recorded what its control plane accepts (#584).
+6. **Acknowledges the single OSD** (`mon_warn_on_pool_no_redundancy false`, `osd_pool_default_size 1`), and restarts Ceph's managers. One of the two that cephadm starts kept the default size it started with and reported `TOO_FEW_OSDS` until it was restarted. Until a pool site has a store, a pool host keeps only golden images, which are pulled again from the signed source, and per-job clones.
+7. **Installs the guest kernel** the node's config names, from a pull that is retried. A pull installs an image's paired kernel and then refuses to import until the node has registered and recorded what its control plane accepts (#584). This pull fetches and decompresses the whole image first, so it takes as long, and as much staging, as the import itself.
 8. **Leaves a transient unit,** `billet-pool-image-pull`, that waits for that record and then pulls and verifies the image.
 
 It may be run again on the same host. The disks come from the record, and a mounted scratch disk is reused. The preview config is rendered afresh. The role's converge is its own, and the image unit is started once.
