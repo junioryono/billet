@@ -19,6 +19,7 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // stack is billet, assembled the way cmd/billet assembles it, through
@@ -219,6 +220,13 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 
 		targets = append(targets, app.Target{Config: target, Client: client})
 	}
+
+	// THE LEDGER STARTS FROM THE TEMPLATE, migrated once per test binary under
+	// ledgertest's own budget. Migrated from empty here, under the production
+	// startup budget beside every other package's race-and-coverage tests, it
+	// missed thirty seconds and failed every replay in the run (#188, three runs
+	// on 2026-11-09).
+	ledgertest.Seed(t, cfg.Server.IdentityDir)
 
 	cp, err := app.OpenControlPlane(t.Context(), cfg, harnessHost(), targets, app.ControlPlaneOptions{
 		Steering: &app.Steering{
