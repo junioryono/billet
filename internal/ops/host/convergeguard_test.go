@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -465,6 +466,12 @@ func TestGuardHelperProcess(t *testing.T) {
 
 		announce(fmt.Sprintf("%s:%d", guardHelperReadyMsg, os.Getpid()))
 		waitForParent()
+
+		// THE FILE IS KEPT REACHABLE UNTIL THE PARENT RELEASES IT. Nothing reads f
+		// after the flock, so without this the collector may finalize it while the
+		// parent waits, and closing its descriptor drops the lock: the parent then
+		// found the transaction lock free while it believed it held (#632).
+		runtime.KeepAlive(f)
 		announce("RELEASED")
 
 		return
