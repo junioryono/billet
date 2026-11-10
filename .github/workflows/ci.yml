@@ -185,6 +185,12 @@ jobs:
       # install came from the second in 4 s; a lenient update passes). The
       # rewrite matches the archive line's exact spelling (and ports.ubuntu.com's,
       # for an arm64 runner), so any other source is left alone.
+      # EVERY apt CALL IN THIS WORKFLOW IS BOUNDED AND RETRIED (apt_bounded, in each
+      # step that calls apt): three attempts of at most three minutes. A connection
+      # the fleet's uplink stops answering after its handshake (#818) is not always
+      # ended by apt's own timeouts: host-lifecycle (retirement) on #854's run sat in
+      # `apt-get update` from 19:26 to 20:11 UTC on 2026-11-10, until the job's limit
+      # cancelled it.
       - name: Install the AppArmor tools the vendored kernel checker grades
         # A guest image that already carries the package never reaches the archive:
         # the fleet's uplink is shared with everything else at its site, and every
@@ -194,8 +200,9 @@ jobs:
         run: |
           [ "$(dpkg-query -W -f '${db:Status-Status}' apparmor 2>/dev/null)" = installed ] && { echo "apparmor already installed"; exit 0; }
           sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends apparmor
+          apt_bounded() { for attempt in 1 2 3; do sudo timeout -v -k 10 180 apt-get -o Acquire::Retries=3 "$@" && return 0; [ "$attempt" -lt 3 ] && sleep $((attempt * 10)); done; return 1; }
+          apt_bounded update
+          apt_bounded install -y --no-install-recommends apparmor
 
       - name: Install the router the reference configuration is tested on
         # Installed only where the image lacks it, for the reason the step above gives.
@@ -204,8 +211,9 @@ jobs:
         run: |
           [ "$(dpkg-query -W -f '${db:Status-Status}' haproxy 2>/dev/null)" = installed ] && { echo "haproxy already installed"; exit 0; }
           sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends haproxy
+          apt_bounded() { for attempt in 1 2 3; do sudo timeout -v -k 10 180 apt-get -o Acquire::Retries=3 "$@" && return 0; [ "$attempt" -lt 3 ] && sleep $((attempt * 10)); done; return 1; }
+          apt_bounded update
+          apt_bounded install -y --no-install-recommends haproxy
           sudo systemctl stop haproxy || true
 
       # /tmp IS MEMORY FOR THE SUITE, NOT THE GUEST'S DISK. Every t.TempDir, every
@@ -881,7 +889,8 @@ jobs:
       - name: Refresh apt's package lists
         run: |
           sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get update
+          apt_bounded() { for attempt in 1 2 3; do sudo timeout -v -k 10 180 apt-get -o Acquire::Retries=3 "$@" && return 0; [ "$attempt" -lt 3 ] && sleep $((attempt * 10)); done; return 1; }
+          apt_bounded update
           ls /var/lib/apt/lists/*InRelease >/dev/null
 
       # The check-mode scenario pins /usr/bin/python3, and the apt module in
@@ -890,7 +899,8 @@ jobs:
       - name: Install python3-apt for the apt module's check mode
         run: |
           [ "$(dpkg-query -W -f '${db:Status-Status}' python3-apt 2>/dev/null)" = installed ] && { echo "python3-apt already installed"; exit 0; }
-          sudo apt-get install -y --no-install-recommends python3-apt
+          apt_bounded() { for attempt in 1 2 3; do sudo timeout -v -k 10 180 apt-get -o Acquire::Retries=3 "$@" && return 0; [ "$attempt" -lt 3 ] && sleep $((attempt * 10)); done; return 1; }
+          apt_bounded install -y --no-install-recommends python3-apt
 
       # The emitted-block and hybrid-emission gates build billet to render what
       # they check; the hosted image had a Go on PATH, the guest has none.
@@ -951,7 +961,8 @@ jobs:
       - name: Render the guests' egress limits
         if: matrix.group == 'shape'
         run: |
-          command -v nft >/dev/null || sudo apt-get install -y -qq nftables
+          apt_bounded() { for attempt in 1 2 3; do sudo timeout -v -k 10 180 apt-get -o Acquire::Retries=3 "$@" && return 0; [ "$attempt" -lt 3 ] && sleep $((attempt * 10)); done; return 1; }
+          command -v nft >/dev/null || apt_bounded install -y -qq nftables
           scripts/gates/scenario.sh guest-limits-check
 
       # billet ships its units twice — the package installs deploy/*.service,
