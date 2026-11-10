@@ -123,10 +123,12 @@ func TestCheckMaintenanceProbeCrossesTheFence(t *testing.T) {
 		t.Fatalf("write the key: %v", err)
 	}
 
+	// THE LEDGER STARTS FROM THE TEMPLATE. Migrated from empty inside the probe, under
+	// the production startup budget beside every other package's race-and-coverage
+	// tests, it missed thirty seconds (#188, 2026-11-10); the property is the fence's,
+	// not the migration's.
 	stateDir := filepath.Join(dir, "server")
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		t.Fatalf("make state dir: %v", err)
-	}
+	ledgertest.Seed(t, stateDir)
 	if err := os.WriteFile(filepath.Join(stateDir, "billet.maintenance"),
 		[]byte("host upgrade\n"), 0o600); err != nil {
 		t.Fatalf("fence: %v", err)
