@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -114,13 +115,15 @@ node:
 func TestDecommissionPurgesAMetalSitesCacheAlone(t *testing.T) {
 	configPath := metalDecommissionConfig(t)
 	asked := 0
-	none := func(_ context.Context, owner, region string, _ awscreds.Source) ([]ec2.HostRecord, error) {
+	none := func(_ context.Context, owner, region, endpoint string, _ awscreds.Source) (
+		[]*provider.Instance, []ec2.HostRecord, error,
+	) {
 		asked++
-		if owner == "" || region != "us-west-2" {
-			return nil, fmt.Errorf("the pool hosts were listed for owner %q in %q", owner, region)
+		if owner == "" || region != "us-west-2" || endpoint != "" {
+			return nil, nil, fmt.Errorf("the compute was listed for owner %q in %q at %q", owner, region, endpoint)
 		}
 
-		return []ec2.HostRecord{}, nil
+		return []*provider.Instance{}, []ec2.HostRecord{}, nil
 	}
 
 	var err error
@@ -148,32 +151,83 @@ func TestDecommissionPurgesAMetalSitesCacheAlone(t *testing.T) {
 	}
 }
 
-// A METAL SITE'S CACHE IS NOT PURGED WHILE ANY OF ITS POOL HOSTS IS LEFT: a job there may
-// be reading objects no clone lease names. A list that could not be read refuses too.
-func TestDecommissionRefusesAMetalSiteWithAPoolHostLeft(t *testing.T) {
+// A SITE'S CACHE IS NOT PURGED WHILE ANY OF THE DEPLOYMENT'S COMPUTE IS LEFT: a job on
+// a pool host, or on an ec2 node's instance at the same site, may be reading objects no
+// clone lease names. A list that could not be read refuses too.
+func TestDecommissionRefusesAMetalSiteWithComputeLeft(t *testing.T) {
 	configPath := metalDecommissionConfig(t)
 
 	for name, tc := range map[string]struct {
-		hosts poolHostLister
+		jobs  []*provider.Instance
+		hosts []ec2.HostRecord
+		err   error
 		want  string
 	}{
-		"a host left": {func(context.Context, string, string, awscreds.Source) ([]ec2.HostRecord, error) {
-			return []ec2.HostRecord{{ID: "i-0123456789abcdef0", State: "stopped", Order: "p1"}}, nil
-		}, "1 pool host(s) of this deployment are not terminated"},
-		"a list that failed": {func(context.Context, string, string, awscreds.Source) ([]ec2.HostRecord, error) {
-			return nil, errors.New("UnauthorizedOperation")
-		}, "must all be gone before its cache is purged"},
+		"a pool host left": {hosts: []ec2.HostRecord{{ID: "i-0123456789abcdef0", State: "stopped", Order: "p1"}},
+			want: "0 job instance(s) and 1 pool host(s) of this deployment are not terminated"},
+		"a job instance left": {jobs: []*provider.Instance{{ID: "i-0fedcba987654321f", Name: "billet-l1"}},
+			want: "1 job instance(s) and 0 pool host(s) of this deployment are not terminated"},
+		"a list that failed": {err: errors.New("UnauthorizedOperation"),
+			want: "must all be gone before its site's cache is purged"},
 	} {
+		reader := func(context.Context, string, string, string, awscreds.Source) (
+			[]*provider.Instance, []ec2.HostRecord, error,
+		) {
+			return tc.jobs, tc.hosts, tc.err
+		}
 		var err error
 		out := capture(t, func() {
-			err = decommission(t.Context(), processEnv(), []string{"--config", configPath, "--yes"}, tc.hosts)
+			err = decommission(t.Context(), processEnv(), []string{"--config", configPath, "--yes"}, reader)
 		})
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: decommission answered %v; want a refusal saying %q", name, err, tc.want)
 		}
 		if strings.Contains(out, "purge") {
-			t.Errorf("%s: the cache was reached with a pool host unaccounted for:\n%s", name, out)
+			t.Errorf("%s: the cache was reached with compute unaccounted for:\n%s", name, out)
 		}
+	}
+}
+
+// AN EC2 NODE AT A SITE A POOL SHARES DOES NOT PURGE IT under the pool's hosts: with its
+// own instances gone, a pool host still running refuses the purge, asked at the ec2
+// node's own endpoint.
+func TestDecommissionOfAnEC2SiteRefusesWhileAPoolHostIsLeft(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+	endpoint := fakeEC2With(t, fakeEC2Topology{accept: "AKIDEXAMPLE"}) // no job instances
+	configPath := decommissionConfig(t, endpoint, true)
+	body, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withCache := strings.Replace(string(body), "  ec2:\n", "  site: aws-us-west-2a\n  ebs_s3:\n    region: us-west-2\n"+
+		"    availability_zone: us-west-2a\n    bucket: billet-cache-example\n  ec2:\n", 1)
+	if err := os.WriteFile(configPath, []byte(withCache), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	asked := ""
+	reader := func(_ context.Context, _, _, at string, _ awscreds.Source) ([]*provider.Instance, []ec2.HostRecord, error) {
+		asked = at
+		if at == "" {
+			return nil, nil, errors.New("asked at the region's own endpoint, not the node's")
+		}
+
+		return []*provider.Instance{{ID: "i-job-gone-by-now"}},
+			[]ec2.HostRecord{{ID: "i-0123456789abcdef0", State: "running", Order: "p1"}}, nil
+	}
+	out := capture(t, func() {
+		err = decommission(t.Context(), processEnv(), []string{"--config", configPath, "--yes"}, reader)
+	})
+	if err == nil || !strings.Contains(err.Error(), "0 job instance(s) and 1 pool host(s)") {
+		t.Fatalf("an ec2 site's decommission with a pool host left answered %v", err)
+	}
+	if asked != endpoint {
+		t.Errorf("the pool's hosts were asked at %q, want the ec2 node's own endpoint %q", asked, endpoint)
+	}
+	if strings.Contains(out, "purge") {
+		t.Errorf("the cache was reached with a pool host left:\n%s", out)
 	}
 }
 

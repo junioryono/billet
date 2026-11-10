@@ -292,18 +292,22 @@ func TestLiveListsEveryPoolHostNotTerminated(t *testing.T) {
 	}
 }
 
-// A HOSTS-ONLY READER NEEDS NO LAUNCH NETWORK, and still the region rule and an owner.
-func TestNewPoolHostsNeedsARegionAndAnOwnerAlone(t *testing.T) {
+// A READER NEEDS NO LAUNCH NETWORK, and still the region and endpoint rules and an owner;
+// it lists the deployment's jobs and its pool hosts apart.
+func TestNewReaderNeedsARegionAndAnOwnerAlone(t *testing.T) {
 	t.Parallel()
 
-	if _, err := NewPoolHosts("dep-1", "us-west-2"); err != nil {
-		t.Errorf("a hosts-only reader with a region and an owner was refused: %v", err)
+	if _, err := NewReader("dep-1", "us-west-2", ""); err != nil {
+		t.Errorf("a reader with a region and an owner was refused: %v", err)
 	}
-	if _, err := NewPoolHosts("dep-1", "x@attacker.example/?"); err == nil {
-		t.Error("a hosts-only reader took a region that chooses another host")
+	if _, err := NewReader("dep-1", "x@attacker.example/?", ""); err == nil {
+		t.Error("a reader took a region that chooses another host")
 	}
-	if _, err := NewPoolHosts("", "us-west-2"); err == nil {
-		t.Error("a hosts-only reader took no owner")
+	if _, err := NewReader("dep-1", "us-west-2", "http://attacker.example"); err == nil {
+		t.Error("a reader took an endpoint the provider's rule refuses")
+	}
+	if _, err := NewReader("", "us-west-2", ""); err == nil {
+		t.Error("a reader took no owner")
 	}
 
 	// AND A PROVIDER THAT LAUNCHES IS NOT SPARED THE GROUPS.

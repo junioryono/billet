@@ -213,6 +213,24 @@ func (c *Config) validatePoolSite() []error {
 		}
 	}
 
+	// THE STORE IS AWS'S, and init_args go to every host the pool orders: a phoenixNAP
+	// host handed it would start a node that attaches volumes to an EC2 instance it is not.
+	if store != nil {
+		archs := make([]Arch, 0, len(c.Server.Pool.Architectures))
+		for a := range c.Server.Pool.Architectures {
+			archs = append(archs, a)
+		}
+		slices.Sort(archs)
+		for _, a := range archs {
+			for _, choice := range c.Server.Pool.Architectures[a].Order {
+				if choice.Source != PoolSourceAWSMetal {
+					errs = append(errs, fmt.Errorf("server.pool.init_args name an ebs-s3 store, which only a host "+
+						"on AWS metal can attach, and server.pool.architectures.%s orders from %s", a, choice.Source))
+				}
+			}
+		}
+	}
+
 	if m := c.Server.Pool.AWSMetal; store != nil && m != nil && store.AvailabilityZone != m.AvailabilityZone {
 		errs = append(errs, fmt.Errorf("server.pool.init_args' --ebs-s3-availability-zone %q is not %q, where "+
 			"server.pool.aws_metal orders its hosts: a volume attaches only in its own zone",

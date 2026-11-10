@@ -73,7 +73,8 @@ func TestAPoolHostsBootGeneratesAFirecrackerNodeWithItsKernelAndCeph(t *testing.
 // A METAL POOL HOST'S BOOT GENERATES A NODE AT ITS SITE, WITH THE SITE'S EBS-S3 STORE AND
 // THE CACHE LISTENER ITS GUESTS REACH (ADR-030): every flag server.pool.init_args may
 // name for it reaches the real init through the boot's join, so a flag init spells
-// otherwise is a host rented that joins with no cache.
+// otherwise is a host rented that joins with no cache; and a padded value, which the
+// pool's config accepts as loading trims it, is trimmed by init too.
 func TestAMetalPoolHostsBootGeneratesANodeAtItsEBSSite(t *testing.T) {
 	t.Parallel()
 	pool := &config.Config{
@@ -84,7 +85,7 @@ func TestAMetalPoolHostsBootGeneratesANodeAtItsEBSSite(t *testing.T) {
 				"--kernel-image=/var/lib/billet/kernels/vmlinux", "--ceph-user=billet",
 				"--ceph-keyring=/etc/ceph/ceph.client.billet.keyring", "--site=aws-us-west-2a",
 				"--ebs-s3-region=us-west-2", "--ebs-s3-availability-zone=us-west-2a",
-				"--ebs-s3-bucket=billet-cache-example", "--ebs-s3-prefix=cache",
+				"--ebs-s3-bucket= billet-cache-example ", "--ebs-s3-prefix=cache",
 				"--ebs-s3-kms-key-id=alias/billet-cache", "--cache-listen=10.240.0.1:7718",
 				"--cache-guest-endpoint=http://10.240.0.1:7718",
 			},

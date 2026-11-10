@@ -33,11 +33,19 @@ func someBlockDevice(t *testing.T) (string, uint64) {
 	return "", 0
 }
 
-// stageProcess makes procRoot/<pid>/fd with one descriptor per target.
+// stageProcess makes procRoot/<pid>/task/<pid>/fd with one descriptor per target: a
+// process of one thread, whose table is its leader's.
 func stageProcess(t *testing.T, procRoot, pid string, targets ...string) {
 	t.Helper()
 
-	fds := filepath.Join(procRoot, pid, "fd")
+	stageThread(t, procRoot, pid, pid, targets...)
+}
+
+// stageThread makes procRoot/<pid>/task/<tid>/fd with one descriptor per target.
+func stageThread(t *testing.T, procRoot, pid, tid string, targets ...string) {
+	t.Helper()
+
+	fds := filepath.Join(procRoot, pid, "task", tid, "fd")
 	if err := os.MkdirAll(fds, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -58,16 +66,16 @@ func TestAProcessWithTheDeviceOpenIsFound(t *testing.T) {
 
 	stageProcess(t, procRoot, "100", "/dev/null", os.TempDir())
 	stageProcess(t, procRoot, "200", "/dev/null", device)
-	// Not a process: /proc holds other names too, and this one's descriptors would be
-	// read as unreadable if it were taken for one.
-	if err := os.MkdirAll(filepath.Join(procRoot, "sys", "fd"), 0o755); err != nil {
+	// Not a process: /proc holds other names too, and this one's threads would be read
+	// as unreadable if it were taken for one.
+	if err := os.MkdirAll(filepath.Join(procRoot, "sys", "task"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(filepath.Join(procRoot, "sys", "fd"), 0); err != nil {
+	if err := os.Chmod(filepath.Join(procRoot, "sys", "task"), 0); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := os.Chmod(filepath.Join(procRoot, "sys", "fd"), 0o755); err != nil {
+		if err := os.Chmod(filepath.Join(procRoot, "sys", "task"), 0o755); err != nil {
 			t.Error(err)
 		}
 	})
@@ -79,6 +87,24 @@ func TestAProcessWithTheDeviceOpenIsFound(t *testing.T) {
 
 	if holder != "200" {
 		t.Fatalf("the holder of %s was reported as %q, want 200", device, holder)
+	}
+}
+
+// A THREAD WITH A TABLE OF ITS OWN HOLDS THE DEVICE FOR ITS PROCESS, though the leader's
+// table does not have it: a thread that unshared its table, or that outlived its leader.
+func TestAThreadsOwnTableIsRead(t *testing.T) {
+	device, rdev := someBlockDevice(t)
+	procRoot := t.TempDir()
+
+	stageThread(t, procRoot, "400", "400", "/dev/null")
+	stageThread(t, procRoot, "400", "401", "/dev/null", device)
+
+	holder, err := openedBy(procRoot, rdev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if holder != "400" {
+		t.Fatalf("a thread holding %s left its process reported as %q, want 400", device, holder)
 	}
 }
 
@@ -118,7 +144,7 @@ func TestUnreadableOpenFilesAreCouldNotTell(t *testing.T) {
 
 	stageProcess(t, procRoot, "100", "/dev/null")
 
-	fds := filepath.Join(procRoot, "100", "fd")
+	fds := filepath.Join(procRoot, "100", "task", "100", "fd")
 	if err := os.Chmod(fds, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -139,8 +165,8 @@ func TestUnreadableOpenFilesAreCouldNotTell(t *testing.T) {
 }
 
 // A LOOP DEVICE BACKED BY THE DEVICE HOLDS IT, with no process's descriptor to show for
-// it; an unconfigured loop device, one backed by another file, and one whose backing file
-// is gone hold nothing; and a backing file that cannot be read is could-not-tell.
+// it; an unconfigured loop device and one backed by another file hold nothing; and a
+// backing file that cannot be read, or no longer resolves, is could-not-tell.
 func TestALoopDeviceBackedByTheDeviceHoldsIt(t *testing.T) {
 	device, rdev := someBlockDevice(t)
 	sysBlock := t.TempDir()
@@ -162,7 +188,6 @@ func TestALoopDeviceBackedByTheDeviceHoldsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	backing("loop1", "/dev/null")
-	backing("loop2", filepath.Join(sysBlock, "gone.img")+" (deleted)")
 
 	if loop, err := loopBackedBy(sysBlock, rdev); err != nil || loop != "" {
 		t.Fatalf("no loop backed by %s was answered %q, %v", device, loop, err)
@@ -171,6 +196,18 @@ func TestALoopDeviceBackedByTheDeviceHoldsIt(t *testing.T) {
 	backing("loop3", device)
 	if loop, err := loopBackedBy(sysBlock, rdev); err != nil || loop != "loop3" {
 		t.Fatalf("a loop backed by %s was answered %q, %v; want loop3", device, loop, err)
+	}
+	if err := os.RemoveAll(filepath.Join(sysBlock, "loop3")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A BACKING FILE THAT NO LONGER RESOLVES may have been a second node of this device.
+	backing("loop2", filepath.Join(sysBlock, "gone")+" (deleted)")
+	if loop, err := loopBackedBy(sysBlock, rdev); err == nil || !strings.Contains(err.Error(), "cannot be identified") {
+		t.Fatalf("a loop whose backing file is gone was answered %q, %v", loop, err)
+	}
+	if err := os.RemoveAll(filepath.Join(sysBlock, "loop2")); err != nil {
+		t.Fatal(err)
 	}
 
 	if os.Geteuid() != 0 {

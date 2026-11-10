@@ -128,7 +128,12 @@ const (
 func TestAPoolMayHandItsHostsAnEBSSite(t *testing.T) {
 	t.Parallel()
 
-	valid := poolConfig(strings.Replace(poolBlock, "    boot_prelude:", metalArgs, 1)) + metalSites
+	// AWS METAL ALONE: the store is attached by the host's own instance.
+	metalOnly := strings.Replace(poolBlock, "          - {source: phoenixnap, shape: s2.c2.small, location: PHX}\n", "", 1)
+	if metalOnly == poolBlock {
+		t.Fatal("the pool block has no phoenixNAP choice to leave out")
+	}
+	valid := poolConfig(strings.Replace(metalOnly, "    boot_prelude:", metalArgs, 1)) + metalSites
 	if _, err := loadServer(t, valid); err != nil {
 		t.Fatalf("a pool handing its hosts an ebs-s3 site was refused: %v", err)
 	}
@@ -147,7 +152,10 @@ func TestAPoolMayHandItsHostsAnEBSSite(t *testing.T) {
 			"'--cache-guest-endpoint=http://10.240.0.2:7718'", "name exactly the address in"},
 		"an https endpoint": {"'--cache-guest-endpoint=http://10.240.0.1:7718'",
 			"'--cache-guest-endpoint=https://10.240.0.1:7718'", "must use http on the isolated Firecracker bridge"},
-		"a store with no bucket": {"'--ebs-s3-bucket=billet-cache-example', ", "", "bucket"},
+		"a store with no bucket": {"'--ebs-s3-bucket=billet-cache-example', ", "", "server.pool.init_args: "},
+		"a phoenixNAP fallback": {"          - {source: aws-metal, shape: z1d.metal}\n",
+			"          - {source: aws-metal, shape: z1d.metal}\n          - {source: phoenixnap, shape: s2.c2.small, location: PHX}\n",
+			"which only a host on AWS metal can attach"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

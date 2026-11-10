@@ -144,19 +144,28 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	return build(owner, cfg, true, opts...)
 }
 
-// NewPoolHosts reads a deployment's pool hosts in region, and launches nothing: what a
-// command that must know whether any is left (a metal site's decommission) needs, from a
-// config that names no launch network.
-func NewPoolHosts(owner, region string, opts ...Option) (*Hosts, error) {
-	p, err := build(owner, config.EC2Config{Region: region}, false, opts...)
+// Reader lists a deployment's compute in one region, its jobs' instances and its pool's
+// hosts, and launches nothing: what a command that must know whether any is left (a
+// site's decommission) needs, from a config that may name no launch network.
+type Reader struct{ p *Provider }
+
+// NewReader is a Reader for owner in region, at endpoint, or the region's own when empty.
+func NewReader(owner, region, endpoint string, opts ...Option) (Reader, error) {
+	p, err := build(owner, config.EC2Config{Region: region, Endpoint: endpoint}, false, opts...)
 	if err != nil {
-		return nil, err
+		return Reader{}, err
 	}
 
-	return p.Hosts(), nil
+	return Reader{p: p}, nil
 }
 
-// build is New, and NewPoolHosts when launches is false: the one rule a provider that
+// Jobs lists the deployment's job instances that are not terminated, as List does.
+func (r Reader) Jobs(ctx context.Context) ([]*provider.Instance, error) { return r.p.List(ctx) }
+
+// PoolHosts lists the deployment's pool hosts that are not terminated (Hosts.Live).
+func (r Reader) PoolHosts(ctx context.Context) ([]HostRecord, error) { return r.p.Hosts().Live(ctx) }
+
+// build is New, and NewReader when launches is false: the one rule a provider that
 // launches nothing is spared is the launch network's.
 func build(owner string, cfg config.EC2Config, launches bool, opts ...Option) (*Provider, error) {
 	if strings.TrimSpace(owner) == "" {

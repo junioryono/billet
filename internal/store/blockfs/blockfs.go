@@ -266,15 +266,14 @@ func loopBackedBy(sysBlock string, rdev uint64) (string, error) {
 			return "", fmt.Errorf("blockfs: read %s's backing file: %w", name, err)
 		}
 
+		// A BACKING FILE THAT NO LONGER RESOLVES IS COULD-NOT-TELL. The kernel keeps the
+		// file it was given, and a path unlinked since ("… (deleted)") may have been a
+		// second node of this very device, so a loop whose backing cannot be named
+		// refuses rather than reads as another file's.
 		var st unix.Stat_t
 		if err := unix.Stat(strings.TrimSpace(string(body)), &st); err != nil {
-			// A BACKING FILE THAT IS GONE ("… (deleted)") or a path no longer there is
-			// not this device's node, which this host still has.
-			if errors.Is(err, unix.ENOENT) {
-				continue
-			}
-
-			return "", fmt.Errorf("blockfs: stat %s's backing file: %w", name, err)
+			return "", fmt.Errorf("blockfs: %s's backing file cannot be identified, so it may be this device: %w",
+				name, err)
 		}
 
 		if st.Mode&unix.S_IFMT == unix.S_IFBLK && rdevOf(&st) == rdev {
@@ -288,6 +287,10 @@ func loopBackedBy(sysBlock string, rdev uint64) (string, error) {
 // openedBy names a process that has a block device with device number rdev open,
 // or "" when none does. Every process is read: one that ends while it is read is
 // gone and holds nothing, and any other failure is could-not-tell.
+//
+// EVERY THREAD'S TABLE, NOT THE PROCESS'S. /proc lists thread-group leaders, and a
+// leader's fd directory is its own table: a thread that unshared its table, or one still
+// running after its leader exited, holds descriptors only its task directory shows.
 func openedBy(procRoot string, rdev uint64) (string, error) {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
@@ -300,37 +303,58 @@ func openedBy(procRoot string, rdev uint64) (string, error) {
 			continue
 		}
 
-		fds := filepath.Join(procRoot, pid, "fd")
-
-		names, err := os.ReadDir(fds)
+		tasks, err := os.ReadDir(filepath.Join(procRoot, pid, "task"))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
 				continue
 			}
 
-			return "", fmt.Errorf("blockfs: read process %s's open files: %w", pid, err)
+			return "", fmt.Errorf("blockfs: list process %s's threads: %w", pid, err)
 		}
 
-		for _, name := range names {
-			var st unix.Stat_t
-			if err := unix.Stat(filepath.Join(fds, name.Name()), &st); err != nil {
-				// A descriptor closed or a process ended between the listing and the
-				// stat holds nothing now. A descriptor naming a file that cannot be
-				// stat'ed (a deleted path on a gone mount) cannot be this device's
-				// node, which this host still has.
-				if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) ||
-					errors.Is(err, unix.ENOENT) {
-					continue
-				}
-
-				return "", fmt.Errorf("blockfs: inspect process %s's open file %s: %w", pid, name.Name(), err)
+		for _, task := range tasks {
+			held, err := tableHolds(filepath.Join(procRoot, pid, "task", task.Name(), "fd"), rdev)
+			if err != nil {
+				return "", fmt.Errorf("blockfs: read process %s's open files (thread %s): %w", pid, task.Name(), err)
 			}
-
-			if st.Mode&unix.S_IFMT == unix.S_IFBLK && rdevOf(&st) == rdev {
+			if held {
 				return pid, nil
 			}
 		}
 	}
 
 	return "", nil
+}
+
+// tableHolds reports whether a descriptor table, one fd directory, holds the block
+// device with device number rdev. A thread that ended while it is read holds nothing.
+func tableHolds(fds string, rdev uint64) (bool, error) {
+	names, err := os.ReadDir(fds)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	for _, name := range names {
+		var st unix.Stat_t
+		if err := unix.Stat(filepath.Join(fds, name.Name()), &st); err != nil {
+			// A descriptor closed or a thread ended between the listing and the stat
+			// holds nothing now: the link resolves to the open file itself, so a file
+			// that is open always answers.
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) || errors.Is(err, unix.ENOENT) {
+				continue
+			}
+
+			return false, fmt.Errorf("inspect open file %s: %w", name.Name(), err)
+		}
+
+		if st.Mode&unix.S_IFMT == unix.S_IFBLK && rdevOf(&st) == rdev {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }

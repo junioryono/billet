@@ -404,6 +404,17 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 			return fmt.Errorf("--join-deployment: %w", err)
 		}
 	}
+	// A SITE IS THE CONTROL PLANE'S TO DECLARE, so a host names one only when it joins a
+	// control plane that does: a whole deployment written here would name a site its
+	// own control plane does not declare, and refuse its node's registration for good.
+	if !joining {
+		for _, name := range []string{"site", "ebs-s3-region", "ebs-s3-availability-zone", "ebs-s3-bucket",
+			"ebs-s3-prefix", "ebs-s3-kms-key-id"} {
+			if setFlags[name] {
+				return fmt.Errorf("--%s names this host's place in a control plane's sites; pass it with --join", name)
+			}
+		}
+	}
 	if joining && emitValue == emitAnsible {
 		return errors.New("--join writes this machine's node config and prints the control " +
 			"plane's half; it has no inventory form, so it cannot be combined with --emit ansible")
@@ -1374,6 +1385,27 @@ func serviceOwnership(env cli.Env, path string) {
 		path, initconfig.ServiceGroup, initconfig.ServiceGroup, filepath.Dir(path), path)
 }
 
+// ebsS3Inputs is node.ebs_s3 from its flags, nil when none was passed. Passing any of
+// them asks for the store, so a partial set reaches validation as one rather than
+// being dropped as if absent.
+//
+// TRIMMED, AS LOADING THE CONFIG TRIMS THEM: a pool's init_args are checked as the
+// config will hold them, so a padded bucket the pool accepted must not be one the host
+// refuses after it was rented.
+func ebsS3Inputs(region, zone, bucket, prefix, kms string, set map[string]bool) *config.EBSS3Config {
+	for _, name := range []string{"ebs-s3-region", "ebs-s3-availability-zone", "ebs-s3-bucket",
+		"ebs-s3-prefix", "ebs-s3-kms-key-id"} {
+		if set[name] {
+			return &config.EBSS3Config{
+				Region: strings.TrimSpace(region), AvailabilityZone: strings.TrimSpace(zone),
+				Bucket: strings.TrimSpace(bucket), Prefix: strings.TrimSpace(prefix), KMSKeyID: strings.TrimSpace(kms),
+			}
+		}
+	}
+
+	return nil
+}
+
 // printInitNextFor is printInitNext, except when the App identity was carried
 // over from the file being converged — an App that exists must not be created
 // again, so the guidance starts at check.
@@ -1412,22 +1444,6 @@ func stateParams(set map[string]bool, backend, dsnEnv string) *initconfig.StateP
 // SEPARATE FROM stateParams because the two answer different questions: this one
 // can refuse and that one cannot fail, so folding them together would mean a
 // builder that returns a nil value beside a nil error for the ordinary case.
-// ebsS3Inputs is node.ebs_s3 from its flags, nil when none was passed. Passing any of
-// them asks for the store, so a partial set reaches validation as one rather than
-// being dropped as if absent.
-func ebsS3Inputs(region, zone, bucket, prefix, kms string, set map[string]bool) *config.EBSS3Config {
-	for _, name := range []string{"ebs-s3-region", "ebs-s3-availability-zone", "ebs-s3-bucket",
-		"ebs-s3-prefix", "ebs-s3-kms-key-id"} {
-		if set[name] {
-			return &config.EBSS3Config{
-				Region: region, AvailabilityZone: zone, Bucket: bucket, Prefix: prefix, KMSKeyID: kms,
-			}
-		}
-	}
-
-	return nil
-}
-
 func refuseEmptyStateFlags(set map[string]bool, backend, dsnEnv string) error {
 	for _, f := range []struct {
 		name  string
