@@ -791,6 +791,29 @@ func (s *stub) dirExists(name string) bool {
 	return err == nil
 }
 
+// spawned counts the fake runners started in the stub's guest. A runner records
+// itself just after the launcher announces its pid, so a launch can be proved
+// before the record lands: the read waits for the first one, bounded only so a
+// launch that started nothing still ends the test.
+func (s *stub) spawned(t *testing.T) int {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		b, err := os.ReadFile(filepath.Join(s.guestHome, spawnedPIDs))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read the spawn record: %v", err)
+		}
+
+		if n := strings.Count(string(b), "\n"); n > 0 || time.Now().After(deadline) {
+			return n
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func (s *stub) argv(t *testing.T) string {
 	t.Helper()
 
