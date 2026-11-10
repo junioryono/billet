@@ -58,6 +58,8 @@ type fakeCompute struct {
 	// when the wait around it ends — the state in which it returns
 	// context.Canceled, which is not a custody failure.
 	onTend func(context.Context) error
+	// onSweep does the same for Sweep.
+	onSweep func(context.Context) error
 
 	keptAlive   int
 	tendedCount int
@@ -314,11 +316,15 @@ func (f *fakeCompute) recoverCount() int {
 	return f.recovered
 }
 
-func (f *fakeCompute) Sweep(context.Context) error {
+func (f *fakeCompute) Sweep(ctx context.Context) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	f.swept++
+	hook := f.onSweep
+	f.mu.Unlock()
+
+	if hook != nil {
+		return hook(ctx)
+	}
 
 	return nil
 }

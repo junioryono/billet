@@ -378,138 +378,184 @@ func TestATendCancelledByTheSecondSignalIsNotReportedAsAFailure(t *testing.T) {
 	}
 }
 
-// NOR IS THE SERVING LOOP'S TEND, CANCELLED BY THE FIRST SIGNAL.
-//
-// The sweep tends custody on its own cadence, so the first signal can land inside
-// that Tend before any drain begins; it returns the cancellation, which the loop
-// logged as "could not advance custody" on the way out. The test above met it
-// whenever its first Tend was this one rather than the drain's (run 42829135688,
-// 2026-11-10). Here the node holds nothing, so no drain follows and the only Tend
-// the signal can land in is the loop's.
-func TestTheServingLoopsTendCancelledByTheFirstSignalIsNotReportedAsAFailure(t *testing.T) {
-	t.Parallel()
+// servedNode runs a node until stop, which sends the first signal and then the
+// second, ending a drain where the node holds compute, and waits for Run to
+// return. A cleanup does the same, so a test that fails before stop never leaves
+// Run outliving it and the harness's server.
+type servedNode struct {
+	stop func(t *testing.T)
+	read func() string
+}
 
-	_, c := harness(t)
+func serveNode(t *testing.T, c *nodeclient.Client, compute *fakeCompute, sweepEvery time.Duration) servedNode {
+	t.Helper()
 
-	tending := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var (
+		logMu  sync.Mutex
+		logged bytes.Buffer
+	)
+
+	read := func() string {
+		logMu.Lock()
+		defer logMu.Unlock()
+
+		return logged.String()
+	}
+
+	hurry := make(chan struct{})
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+
+		_ = nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
+			Provider:   config.ProviderDocker,
+			Deployment: deployment,
+			Log: slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, w: &logged},
+				&slog.HandlerOptions{Level: slog.LevelInfo})),
+			Backoff:      20 * time.Millisecond,
+			SweepEvery:   sweepEvery,
+			DrainTimeout: time.Nanosecond,
+			Hurry:        hurry,
+		})
+	}()
 
 	var once sync.Once
 
-	compute := &fakeCompute{}
-	compute.onTend = func(ctx context.Context) error {
-		once.Do(func() { close(tending) })
-
-		<-ctx.Done()
-
-		return ctx.Err()
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	var (
-		logMu  sync.Mutex
-		logged bytes.Buffer
-	)
-
-	read := func() string {
-		logMu.Lock()
-		defer logMu.Unlock()
-
-		return logged.String()
-	}
-
-	done := make(chan error, 1)
-
-	go func() {
-		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
-			VCPU:       testNodeVCPU,
-			Memory:     testNodeMemory,
-			Provider:   config.ProviderDocker,
-			Deployment: deployment,
-			Log: slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, w: &logged},
-				&slog.HandlerOptions{Level: slog.LevelInfo})),
-			Backoff:    20 * time.Millisecond,
-			SweepEvery: 10 * time.Millisecond,
+	signal := func() {
+		once.Do(func() {
+			cancel()
+			close(hurry)
 		})
-	}()
-
-	select {
-	case <-tending:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the serving loop never tended custody")
 	}
 
-	cancel()
+	t.Cleanup(func() {
+		signal()
+		<-finished
+	})
 
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the node never stopped after its signal")
-	}
+	return servedNode{
+		stop: func(t *testing.T) {
+			t.Helper()
 
-	for _, line := range []string{"could not advance custody", "sweep failed"} {
-		if strings.Contains(read(), line) {
-			t.Errorf("the serving loop's work cancelled by the shutdown was logged as %q:\n%s", line, read())
-		}
+			signal()
+
+			select {
+			case <-finished:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the node never stopped after its signals")
+			}
+		},
+		read: read,
 	}
 }
 
-// BUT A TEND THAT FAILS WHILE THE NODE IS SERVING IS STILL REPORTED. The quiet
-// above is for the shutdown's own cancellation, and a rule that silenced every
-// failure would pass it.
-func TestTheServingLoopReportsATendThatFails(t *testing.T) {
+// servingCases are the serving loop's three pieces of custody work and what makes
+// the loop reach each: the sweep and its Tend on the sweep's cadence, and the
+// Tend after a command poll, which runs only while the node holds compute and,
+// with no sweep, is the loop's only Tend.
+var servingCases = []struct {
+	name       string
+	holding    bool
+	sweepEvery time.Duration
+	hook       func(*fakeCompute, func(context.Context) error)
+	logged     string
+}{
+	{
+		"the sweep", false, 10 * time.Millisecond,
+		func(f *fakeCompute, h func(context.Context) error) { f.onSweep = h }, "sweep failed",
+	},
+	{
+		"the Tend on the sweep's cadence", false, 10 * time.Millisecond,
+		func(f *fakeCompute, h func(context.Context) error) { f.onTend = h }, "could not advance custody;",
+	},
+	{
+		"the Tend after a command poll", true, 0,
+		func(f *fakeCompute, h func(context.Context) error) { f.onTend = h },
+		"could not advance custody after the command poll",
+	},
+}
+
+// NOR IS THE SERVING LOOP'S WORK, CANCELLED BY THE FIRST SIGNAL.
+//
+// The loop sweeps and tends custody on its own cadence, so the first signal can
+// land inside that work before any drain begins; it returns the cancellation,
+// which the loop logged as a failure on the way out. The test above met it
+// whenever its first Tend was the loop's rather than the drain's (run
+// 42829135688, 2026-11-10). Here each piece blocks until the signal, so it is the
+// one the signal lands in.
+func TestTheServingLoopsWorkCancelledByTheFirstSignalIsNotReportedAsAFailure(t *testing.T) {
 	t.Parallel()
 
-	_, c := harness(t)
+	for _, tc := range servingCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	compute := &fakeCompute{}
-	compute.onTend = func(context.Context) error {
-		return errors.New("the provider could not list its instances")
-	}
+			_, c := harness(t)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
+			entered := make(chan struct{})
 
-	var (
-		logMu  sync.Mutex
-		logged bytes.Buffer
-	)
+			var once sync.Once
 
-	read := func() string {
-		logMu.Lock()
-		defer logMu.Unlock()
+			compute := &fakeCompute{holding: tc.holding}
+			tc.hook(compute, func(ctx context.Context) error {
+				once.Do(func() { close(entered) })
 
-		return logged.String()
-	}
+				<-ctx.Done()
 
-	done := make(chan error, 1)
+				return ctx.Err()
+			})
 
-	go func() {
-		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
-			VCPU:       testNodeVCPU,
-			Memory:     testNodeMemory,
-			Provider:   config.ProviderDocker,
-			Deployment: deployment,
-			Log: slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, w: &logged},
-				&slog.HandlerOptions{Level: slog.LevelInfo})),
-			Backoff:    20 * time.Millisecond,
-			SweepEvery: 10 * time.Millisecond,
+			node := serveNode(t, c, compute, tc.sweepEvery)
+
+			select {
+			case <-entered:
+			case <-time.After(30 * time.Second):
+				t.Fatalf("the serving loop never reached %s", tc.name)
+			}
+
+			node.stop(t)
+
+			for _, line := range []string{"could not advance custody", "sweep failed"} {
+				if strings.Contains(node.read(), line) {
+					t.Errorf("%s, cancelled by the shutdown, was logged as %q:\n%s", tc.name, line, node.read())
+				}
+			}
 		})
-	}()
-
-	waitFor(t, func() bool { return strings.Contains(read(), "could not advance custody") })
-
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the node never stopped after its signal")
 	}
+}
 
-	if !strings.Contains(read(), "the provider could not list its instances") {
-		t.Errorf("the failure was logged without its cause:\n%s", read())
+// BUT WORK THAT FAILS WHILE THE NODE IS SERVING IS STILL REPORTED. The quiet
+// above is for the shutdown's own cancellation, and a rule that silenced every
+// failure would pass it.
+func TestTheServingLoopReportsWorkThatFails(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range servingCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, c := harness(t)
+
+			compute := &fakeCompute{holding: tc.holding}
+			tc.hook(compute, func(context.Context) error {
+				return errors.New("the provider could not list its instances")
+			})
+
+			node := serveNode(t, c, compute, tc.sweepEvery)
+
+			waitFor(t, func() bool { return strings.Contains(node.read(), tc.logged) })
+
+			node.stop(t)
+
+			if !strings.Contains(node.read(), "the provider could not list its instances") {
+				t.Errorf("the failure was logged without its cause:\n%s", node.read())
+			}
+		})
 	}
 }
 
