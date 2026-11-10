@@ -244,15 +244,23 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 // context ending while the device is waited for, and a cleanup on that context would
 // leave the volume attached and the record naming it until it expired.
 func (s Store) releaseLocal(ctx context.Context, key, leaseID, volume string) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unansweredVolumeLimit)
-	defer cancel()
-
-	if err := s.detachLocal(cleanupCtx, volume); err != nil {
-		return errors.Join(fmt.Errorf("ebs-s3: cache volume %s is left attached for the sweep: %w", volume, err),
-			s.dropActive(cleanupCtx, key, leaseID))
+	var released error
+	{
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unansweredVolumeLimit)
+		if err := s.detachLocal(cleanupCtx, volume); err != nil {
+			released = fmt.Errorf("ebs-s3: cache volume %s is left attached for the sweep: %w", volume, err)
+		} else {
+			released = s.blocks.DeleteVolume(cleanupCtx, volume)
+		}
+		cancel()
 	}
 
-	return errors.Join(s.blocks.DeleteVolume(cleanupCtx, volume), s.dropActive(cleanupCtx, key, leaseID))
+	// THE RECORD ON A BUDGET OF ITS OWN: a detach that waited out its deadline must not
+	// leave the record naming the volume for as long as its lease, which a purge waits on.
+	dropCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unansweredVolumeLimit)
+	defer cancel()
+
+	return errors.Join(released, s.dropActive(dropCtx, key, leaseID))
 }
 
 // MappedDevice is the device a volume is on now. A remote store's volume is attached to

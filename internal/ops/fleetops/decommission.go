@@ -186,7 +186,9 @@ func CacheResidue(ctx context.Context, cfgPath string) (ebss3.Residue, error) {
 }
 
 // refuseLiveCompute refuses a site's purge while any of the deployment's compute is
-// not terminated: its pool's hosts, and with jobs its job instances too (an ec2 node's
+// not terminated, as the inventories read now say; a control plane still running can
+// order more, so it is stopped first, as an ec2 node is (the operator's order, which the
+// docs and the refusal state): its pool's hosts, and with jobs its job instances too (an ec2 node's
 // own path has just accounted for those). Anything running, or able to start again, may
 // run a job reading the cache, and a node that publishes after the purge undoes it. A
 // pool host is the pool's to release, by drain on proof (`billet pool release`), never
@@ -218,7 +220,8 @@ func refuseLiveCompute(
 
 	return fmt.Errorf("%d job instance(s) and %d pool host(s) of this deployment are not terminated, and a "+
 		"job on one may be using the site's cache; stop the ec2 node so its jobs drain, release the pool's "+
-		"hosts (`billet pool release`), and re-run once they are gone", len(instances), len(hosts))
+		"hosts (`billet pool release`), stop the control plane so the pool orders no more, and re-run once "+
+		"they are gone", len(instances), len(hosts))
 }
 
 // decommissionInstances lists the deployment's instances and, with --yes and

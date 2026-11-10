@@ -34,7 +34,9 @@ type fakeAttach struct {
 	detached []string
 	// awaited are the volumes AwaitDetached was asked about, after their detach.
 	awaited []string
-	now     *time.Time
+	// awaitBlocks makes AwaitDetached wait out its context, as EC2 not settling would.
+	awaitBlocks bool
+	now         *time.Time
 }
 
 func newFakeAttach(now *time.Time) *fakeAttach {
@@ -80,6 +82,11 @@ func (f *fakeAttach) Attachment(ctx context.Context, id string) (volumeAttachmen
 // AwaitDetached is answered from the fake's own attachments, and honours its context, so
 // a cleanup on a context that has ended fails visibly.
 func (f *fakeAttach) AwaitDetached(ctx context.Context, id string) error {
+	if f.awaitBlocks {
+		<-ctx.Done()
+
+		return ctx.Err()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -244,7 +251,7 @@ func TestARefusedAttachReleasesTheVolume(t *testing.T) {
 	if !slices.Equal(blocks.deletedVolume, []string{"vol-1"}) {
 		t.Fatalf("the unattached volume was not deleted: %v", blocks.deletedVolume)
 	}
-	assertNoActive(t, s, "sticky/a")
+	assertNoActive(t, s)
 }
 
 // A VOLUME EC2 ATTACHED AND THE HOST NEVER SHOWED is taken off and deleted, its device
@@ -288,6 +295,27 @@ func TestAnAttachWhoseCallerGaveUpIsStillReleased(t *testing.T) {
 	})
 }
 
+// A CLEANUP WHOSE DETACH WAITS OUT ITS DEADLINE STILL DROPS THE RECORD, on a budget of its
+// own: the volume is left for the sweep, and the record does not outlive it for a lease.
+func TestACleanupThatRanOutOfTimeStillDropsTheRecord(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+		s, _, attach, disks := localTestStore(&now)
+		disks.hidden["vol-1"] = true
+		attach.awaitBlocks = true
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		if _, err := s.Create(ctx, "sticky/a", 1<<30); err == nil {
+			t.Fatal("an attach no device showed was answered a volume")
+		}
+		assertNoActive(t, s)
+	})
+}
+
 // assertReleased holds that vol-1 was detached, waited off, deleted, and its record dropped.
 func assertReleased(t *testing.T, s *Store, blocks *fakeBlocks, attach *fakeAttach) {
 	t.Helper()
@@ -297,7 +325,7 @@ func assertReleased(t *testing.T, s *Store, blocks *fakeBlocks, attach *fakeAtta
 		t.Fatalf("detached %v, awaited %v, deleted %v; want the volume detached, waited off and deleted",
 			attach.detached, attach.awaited, blocks.deletedVolume)
 	}
-	assertNoActive(t, s, "sticky/a")
+	assertNoActive(t, s)
 }
 
 // A HELD DEVICE IS NEVER DETACHED. EBS detaches a volume in use without refusing, so a
@@ -329,7 +357,7 @@ func TestADiscardNeverDetachesAHeldDevice(t *testing.T) {
 	if !slices.Equal(attach.detached, []string{volume.Handle}) || !slices.Equal(blocks.deletedVolume, []string{volume.Handle}) {
 		t.Fatalf("detached %v, deleted %v once nothing held it", attach.detached, blocks.deletedVolume)
 	}
-	assertNoActive(t, s, "sticky/a")
+	assertNoActive(t, s)
 }
 
 // A SNAPSHOT IS PUBLISHED UNDER THIS HOST'S PROOF, from the device itself, never the
@@ -626,8 +654,11 @@ func TestSysDisksFindsAVolumeBySerial(t *testing.T) {
 	}
 }
 
-func assertNoActive(t *testing.T, s *Store, key string) {
+// assertNoActive holds that the test's cache, sticky/a, records no active lease.
+func assertNoActive(t *testing.T, s *Store) {
 	t.Helper()
+
+	const key = "sticky/a"
 
 	state, _, err := s.load(t.Context(), key)
 	if err != nil {
