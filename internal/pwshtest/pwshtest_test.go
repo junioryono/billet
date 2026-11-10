@@ -38,6 +38,10 @@ func TestIsolateWrapsThePwshFoundOnPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A failure below still removes what Isolate made; the call at the end is the
+	// one whose effect is checked, and a second is harmless.
+	t.Cleanup(cleanup)
+
 	found, err := exec.LookPath("pwsh")
 	if err != nil {
 		t.Fatal(err)
