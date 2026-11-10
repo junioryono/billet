@@ -16,7 +16,10 @@ func someBlockDevice(t *testing.T) (string, uint64) {
 	t.Helper()
 
 	for _, pattern := range []string{"/dev/loop*", "/dev/sd*", "/dev/vd*", "/dev/nvme*n*", "/dev/disk*"} {
-		matches, _ := filepath.Glob(pattern)
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for _, path := range matches {
 			var st unix.Stat_t
 			if unix.Stat(path, &st) == nil && st.Mode&unix.S_IFMT == unix.S_IFBLK {
@@ -105,7 +108,11 @@ func TestUnreadableOpenFilesAreCouldNotTell(t *testing.T) {
 	if err := os.Chmod(fds, 0); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(fds, 0o755) })
+	t.Cleanup(func() {
+		if err := os.Chmod(fds, 0o755); err != nil {
+			t.Error(err)
+		}
+	})
 
 	holder, err := openedBy(procRoot, rdev)
 	if err == nil {

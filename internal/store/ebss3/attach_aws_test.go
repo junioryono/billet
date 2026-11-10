@@ -46,8 +46,10 @@ func (f *attachEC2) handler(w http.ResponseWriter, r *http.Request) {
 	action := values.Get("Action")
 	if refusal, ok := f.refuse[action]; ok {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, "<Response><Errors><Error><Code>"+refusal[0]+"</Code><Message>"+refusal[1]+
-			"</Message></Error></Errors></Response>")
+		if _, err := io.WriteString(w, "<Response><Errors><Error><Code>"+refusal[0]+"</Code><Message>"+refusal[1]+
+			"</Message></Error></Errors></Response>"); err != nil {
+			f.t.Error(err)
+		}
 
 		return
 	}
@@ -78,7 +80,9 @@ func (f *attachEC2) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		if values.Get("VolumeId.1") != "" && items.Len() == 0 {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = io.WriteString(w, "<Response><Errors><Error><Code>InvalidVolume.NotFound</Code></Error></Errors></Response>")
+			if _, err := io.WriteString(w, "<Response><Errors><Error><Code>InvalidVolume.NotFound</Code></Error></Errors></Response>"); err != nil {
+				f.t.Error(err)
+			}
 
 			return
 		}

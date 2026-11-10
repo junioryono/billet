@@ -223,6 +223,9 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 // awaitDetached waits until a volume is attached to nothing, for a store whose EC2
 // client is a test's.
 func (s Store) awaitDetached(ctx context.Context, volume string) error {
+	poll := time.NewTicker(devicePoll)
+	defer poll.Stop()
+
 	for {
 		attachment, found, err := s.attach.Attachment(ctx, volume)
 		if err != nil {
@@ -235,7 +238,7 @@ func (s Store) awaitDetached(ctx context.Context, volume string) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(devicePoll):
+		case <-poll.C:
 		}
 	}
 }
