@@ -196,15 +196,24 @@ jobs:
       # inside their 30 s budget, often dozens of tests at once; on 2026-11-10 the
       # guest's CPU fell to half a core while they waited and its writes stopped,
       # as other guests' did in the same ten seconds. A mount over /tmp itself,
-      # rather than TMPDIR elsewhere, keeps every path the length and the
-      # filesystem it was: a socket path near Linux's limit, a helper that checks
-      # its fixture is under os.TempDir, and a test that needs /dev/shm to be
-      # another filesystem all go on as they did. The guest has 62 GiB, and go
-      # test removes each package's binary once it has run.
+      # rather than TMPDIR elsewhere, keeps every temporary path its length,
+      # keeps the default temporary paths together, and stays a filesystem apart
+      # from /dev/shm: a socket path near Linux's limit, a helper that checks its
+      # fixture is under os.TempDir, and a test that needs /dev/shm to be another
+      # filesystem each depend on one of those. The guest has 62 GiB and go test
+      # removes each package's binary once it has run; the high-water mark is
+      # sampled and reported after the suite, so the ceiling is read, not assumed.
       - name: Give /tmp to memory
         run: |
           sudo mount -t tmpfs -o mode=1777,nosuid,nodev,size=32g billet-test-tmp /tmp
           findmnt /tmp
+          (
+            peak=0
+            while sleep 5; do
+              used=$(df --output=used -B1M /tmp | tail -n 1 | tr -d ' ')
+              [ "$used" -le "$peak" ] || { peak=$used; echo "$peak" >"$RUNNER_TEMP/tmp-peak-mib"; }
+            done
+          ) >/dev/null 2>&1 &
 
       # -race matters more than usual here: the control plane is a capacity
       # allocator with concurrent scale-set listeners, and a data race in that
@@ -228,6 +237,12 @@ jobs:
           go test -race -count=1 -timeout 35m -vet=off -coverprofile=coverage.out -covermode=atomic -json ./... \
             | tee test-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
+
+      - name: Report how much of /tmp the suite used
+        if: always()
+        run: |
+          echo "the suite's /tmp peaked at $(cat "$RUNNER_TEMP/tmp-peak-mib" 2>/dev/null || echo "an unsampled amount of") MiB of 32768"
+          df -h /tmp
 
       - name: Report the slowest tests
         if: always()
