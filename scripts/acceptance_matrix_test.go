@@ -743,6 +743,34 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A HELPER THAT FAILED SAYS NOTHING: a python3 that exits 1 for the lookup, as an
+	// uncaught exception or a failed start would, is never read as an absent ledger, by
+	// down or by stopped.
+	if err := os.MkdirAll(filepath.Join(dir, "ws", "server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ws", "server", "billet.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("no python3")
+	}
+	broken := t.TempDir()
+	if err := forkSafeWriteFile(filepath.Join(broken, "python3"), []byte("#!/usr/bin/env bash\n"+
+		"case \"$*\" in *billet.db) exit 1 ;; esac\nexec "+python+" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	brokenPath := []string{"PATH=" + broken + string(os.PathListSeparator) + f.path}
+	for _, phase := range []string{"down", "stopped"} {
+		if out, code := f.run(t, "acceptance/matrix-host.sh", brokenPath, phase, dir); code == 0 ||
+			!strings.Contains(out, "could not be read") {
+			t.Fatalf("%s with a lookup helper that failed: exit %d\n%s", phase, code, out)
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "ws", "server")); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "ws", "acceptance.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}

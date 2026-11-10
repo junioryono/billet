@@ -71,15 +71,17 @@ usage() {
 	exit 2
 }
 
-# lstat_kind PATH prints what lstat says PATH is (dir, file, link or other) and exits 0,
-# exits 1 when lstat answers ENOENT, and exits 2 on any other answer. Only ENOENT is a
-# name that is not there: the shell's -e and -L answer false for an I/O error as well.
+# lstat_kind PATH prints what lstat says PATH is: dir, file, link or other, or absent
+# when lstat answered ENOENT, and exits 0 only having printed one of those. Only that
+# ENOENT is a name that is not there: the shell's -e and -L answer false for an I/O error
+# as well, and a helper that failed for any reason prints nothing a caller accepts.
 lstat_kind() {
 	python3 -I -c 'import errno, os, stat, sys
 try:
     m = os.lstat(sys.argv[1]).st_mode
-except OSError as e:
-    sys.exit(1 if e.errno == errno.ENOENT else 2)
+except FileNotFoundError:
+    print("absent")
+    sys.exit(0)
 print("link" if stat.S_ISLNK(m) else "dir" if stat.S_ISDIR(m) else "file" if stat.S_ISREG(m) else "other")' "$1"
 }
 
@@ -94,7 +96,7 @@ recorded() {
 	kind=$(lstat_kind "$ws/acceptance.json")
 	case $?:$kind in
 	0:file) return 0 ;;
-	1:) ;;
+	0:absent) ;;
 	*)
 		echo "matrix: $ws/acceptance.json could not be read, so whether its run made anything cannot be told" >&2
 		return 2
@@ -103,7 +105,7 @@ recorded() {
 	for dir in "$ws" "$ws/server"; do
 		kind=$(lstat_kind "$dir")
 		case $?:$kind in
-		1:) return 1 ;;
+		0:absent) return 1 ;;
 		0:dir) ;;
 		*)
 			echo "matrix: $dir could not be read, so whether its run made anything cannot be told" >&2
@@ -112,9 +114,9 @@ recorded() {
 		esac
 	done
 	kind=$(lstat_kind "$ws/server/billet.db")
-	case $? in
-	1) return 1 ;;
-	0)
+	case $?:$kind in
+	0:absent) return 1 ;;
+	0:*)
 		echo "matrix: $ws holds a ledger and no acceptance.json, so what its run made cannot be named;" \
 			"a person decides" >&2
 		;;
