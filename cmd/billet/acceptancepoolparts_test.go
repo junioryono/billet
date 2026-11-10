@@ -207,6 +207,21 @@ func TestAnIdleShrinkAnswersForEveryJobOnItsHost(t *testing.T) {
 	if s := judge(partial); s.Verdict != verdictFail || !strings.Contains(s.Reason, "may be unread") {
 		t.Errorf("evidence cut at its limit: %+v; want a fail", s)
 	}
+	// EVIDENCE WRITTEN BEFORE THE FLAG, decoded, says so by its count.
+	full := poolEvidence(slices.Repeat([]acceptanceJob{mine}, acceptanceJobLimit)...)
+	body, err := json.Marshal(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var older acceptanceEvidenceDoc
+	if err := json.Unmarshal([]byte(strings.Replace(string(body), `"jobs_may_be_missing":true,`, "", 1)),
+		&older); err != nil {
+		t.Fatal(err)
+	}
+	if s := judge(older); older.JobsMayBeMissing || s.Verdict != verdictFail || !strings.Contains(s.Reason,
+		"may be unread") {
+		t.Errorf("older evidence of %d jobs: %+v; want a fail", len(older.Jobs), s)
+	}
 }
 
 // A POOL CELL'S JOB RAN ON A HOST ITS ORDER RENTED AS THE CELL'S ARCHITECTURE: a job of
@@ -586,6 +601,22 @@ func TestAResumeOfAnEditedBaseIsRefused(t *testing.T) {
 	}
 	if after, err := os.ReadFile(first.ConfigPath); err != nil || !bytes.Equal(after, written) {
 		t.Errorf("the refused resume replaced the derived config (%v)", err)
+	}
+
+	// A RECORD WITH NO DIGEST resumes only onto the derived config on disk, byte for byte.
+	noDigest := first
+	noDigest.ConfigSHA256 = ""
+	if err := writeAcceptanceWorkspace(filepath.Dir(first.ConfigPath), noDigest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deriveAcceptance(t.Context(), in); err == nil || !strings.Contains(err.Error(), "derives differently") {
+		t.Errorf("a digestless resume of an edited base answered %v", err)
+	}
+	if err := os.WriteFile(base, []byte(poolBaseConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := deriveAcceptance(t.Context(), in); err != nil || again.ConfigSHA256 != first.ConfigSHA256 {
+		t.Errorf("a digestless resume of the same base: %v, digest %s", err, again.ConfigSHA256)
 	}
 }
 

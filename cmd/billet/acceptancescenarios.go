@@ -150,7 +150,8 @@ func judgeBurst(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixScope)
 func judgeShrinkIdle(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixScope) {
 	// EVERY JOB ON A HOST IS ITS TO ANSWER FOR, so evidence that may hold only some of
 	// them cannot pass it.
-	if doc.JobsMayBeMissing {
+	// Evidence written before the flag existed says so by its count alone.
+	if doc.JobsMayBeMissing || len(doc.Jobs) >= acceptanceJobLimit {
 		s.Verdict = verdictFail
 		s.Reason = fmt.Sprintf("the evidence holds the first %d jobs only, so a job on a released host may be "+
 			"unread", acceptanceJobLimit)

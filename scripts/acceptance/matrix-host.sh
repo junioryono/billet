@@ -71,6 +71,35 @@ usage() {
 	exit 2
 }
 
+# recorded answers 0 when the workspace holds its record, 1 when it holds none and
+# nothing ever ran in it (no workspace, or no ledger: neither a control plane nor a
+# pool's `up` made one), and anything else, said, when it could not tell or the record
+# is missing beside a ledger, whose deployment nothing here can then name. A missing
+# record is never on its own a run with nothing to take down.
+recorded() {
+	if [ -f "$ws/acceptance.json" ]; then
+		return 0
+	fi
+	if [ ! -e "$ws" ]; then
+		return 1
+	fi
+	if [ ! -d "$ws" ] || [ ! -r "$ws" ] || [ ! -x "$ws" ]; then
+		echo "matrix: $ws could not be read, so whether its run made anything cannot be told" >&2
+		return 2
+	fi
+	if [ -e "$ws/server" ] && { [ ! -r "$ws/server" ] || [ ! -x "$ws/server" ]; }; then
+		echo "matrix: $ws/server could not be read, so whether its run made anything cannot be told" >&2
+		return 2
+	fi
+	if [ -e "$ws/server/billet.db" ]; then
+		echo "matrix: $ws holds a ledger and no acceptance.json, so what its run made cannot be named;" \
+			"a person decides" >&2
+		return 2
+	fi
+
+	return 1
+}
+
 phase=${1:-}
 run_dir=${2:-}
 [ -n "$phase" ] && [ -n "$run_dir" ] || usage
@@ -227,10 +256,17 @@ stopped)
 	fi
 	# AND ITS SERVICES, by their own locks: the run returns once its stop's grace is
 	# over, and a node still draining past it holds none of the run's lock.
-	if [ -f "$ws/acceptance.json" ] && ! "$billet" acceptance stopped --workspace "$ws"; then
-		echo "matrix: a service of the run may still live; its workspace is $ws" >&2
-		exit 1
-	fi
+	recorded
+	case $? in
+	0)
+		if ! "$billet" acceptance stopped --workspace "$ws"; then
+			echo "matrix: a service of the run may still live; its workspace is $ws" >&2
+			exit 1
+		fi
+		;;
+	1) ;;
+	*) exit 1 ;;
+	esac
 	echo "matrix: no run lives in $run_dir"
 	;;
 down)
@@ -242,10 +278,15 @@ down)
 			exit 1
 		fi
 	fi
-	if [ ! -f "$ws/acceptance.json" ]; then
+	recorded
+	case $? in
+	0) ;;
+	1)
 		echo "matrix: no workspace at $ws; nothing to take down"
 		exit 0
-	fi
+		;;
+	*) exit 1 ;;
+	esac
 	# WHATEVER IT KEEPS, the teardown runs and answers: a log not kept is said, and costs
 	# only the log.
 	python3 -I "$supervise" keep-logs "$run_dir"

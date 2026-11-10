@@ -465,11 +465,22 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 	// A RESUME DERIVES WHAT THE FIRST ATTEMPT DID, OR NOTHING: a base edited in place
 	// between them (another cache prefix, another region) would point the teardown at
 	// resources the first attempt never made, and away from the ones it did.
+	// A RECORD WITH NO DIGEST resumes only onto the derived config already on disk, byte
+	// for byte: that is the one proof left of what the first attempt derived.
 	digest := fmt.Sprintf("%x", sha256.Sum256(derived))
-	if found && existing.ConfigSHA256 != "" && existing.ConfigSHA256 != digest {
-		return acceptanceWorkspace{}, fmt.Errorf("%s was derived from %s as it was then, and it derives "+
-			"differently now; re-deriving would point the teardown away from what the first attempt "+
-			"made. Tear this workspace down first, or use a new one", dir, in.base)
+	if found {
+		recorded := existing.ConfigSHA256
+		if recorded == "" {
+			if onDisk, err := os.ReadFile(ws.ConfigPath); err == nil {
+				recorded = fmt.Sprintf("%x", sha256.Sum256(onDisk))
+			}
+		}
+		if recorded != digest {
+			return acceptanceWorkspace{}, fmt.Errorf("%s was derived from %s as it was then, and it derives "+
+				"differently now (or what it derived then is not on disk to compare); re-deriving would point "+
+				"the teardown away from what the first attempt made. Tear this workspace down first, or use a "+
+				"new one", dir, in.base)
+		}
 	}
 
 	if err := os.WriteFile(ws.ConfigPath, derived, 0o600); err != nil {

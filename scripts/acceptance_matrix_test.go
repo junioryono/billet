@@ -672,7 +672,25 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "nothing to take down") {
 		t.Fatalf("down with no workspace: exit %d\n%s", code, out)
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
+	// A WORKSPACE NOTHING RAN IN (no ledger) is nothing to take down; ONE WITH A LEDGER AND
+	// NO RECORD is never read as that, by down or by stopped, since its run may have
+	// made what nothing here can now name.
+	if err := os.MkdirAll(filepath.Join(dir, "ws", "server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "nothing to take down") {
+		t.Fatalf("down of a workspace with no ledger and no record: exit %d\n%s", code, out)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ws", "server", "billet.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"down", "stopped"} {
+		if out, code := f.run(t, "acceptance/matrix-host.sh", nil, phase, dir); code == 0 ||
+			!strings.Contains(out, "a person decides") {
+			t.Fatalf("%s of a workspace with a ledger and no record: exit %d\n%s", phase, code, out)
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "ws", "server")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "ws", "acceptance.json"), []byte("{}"), 0o600); err != nil {
