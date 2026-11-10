@@ -548,13 +548,21 @@ func TestTheServingLoopReportsWorkThatFails(t *testing.T) {
 
 			node := serveNode(t, c, compute, tc.sweepEvery)
 
-			waitFor(t, func() bool { return strings.Contains(node.read(), tc.logged) })
+			// ONE LINE CARRYING BOTH, read before the stop: a drain's Tend logs the
+			// same cause, so a search of the whole log after the stop could find it
+			// there while this site's line had lost it.
+			waitFor(t, func() bool {
+				for line := range strings.SplitSeq(node.read(), "\n") {
+					if strings.Contains(line, tc.logged) &&
+						strings.Contains(line, "the provider could not list its instances") {
+						return true
+					}
+				}
+
+				return false
+			})
 
 			node.stop(t)
-
-			if !strings.Contains(node.read(), "the provider could not list its instances") {
-				t.Errorf("the failure was logged without its cause:\n%s", node.read())
-			}
 		})
 	}
 }
