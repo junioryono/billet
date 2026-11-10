@@ -1,9 +1,11 @@
 package scripts_test
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -349,10 +351,15 @@ func TestTheMatrixHostRendersAPoolsPrelude(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	billetBody, err := os.ReadFile(filepath.Join(f.bin, "billet"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{
 		"export ARTIFACT_BUCKET=runs-bucket ARTIFACT_REGION=us-west-2\n",
-		"export BILLET_KEY=runs/42-1-pool/billet BILLET_SHA256=",
-		"export COLLECTION_KEY=runs/42-1-pool/collection.tar.gz COLLECTION_SHA256=",
+		fmt.Sprintf("export BILLET_KEY=runs/42-1-pool/billet BILLET_SHA256=%x\n", sha256.Sum256(billetBody)),
+		fmt.Sprintf("export COLLECTION_KEY=runs/42-1-pool/collection.tar.gz COLLECTION_SHA256=%x\n",
+			sha256.Sum256([]byte("a collection"))),
 		"export PRELUDE_JOIN_SERVER=10.77.0.10:7717\n",
 		"export PRELUDE_INIT_ARGS=--site=aws-us-west-2a\\ --cache-listen=10.240.0.1:7718\n",
 		"export PRELUDE_MAX_LIFETIME_MINUTES=240\n",
@@ -1169,6 +1176,20 @@ func TestTheMatrixDispatchersPoolImageStepsWaitForTheHost(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "await", "billet-testbed/m", "t1",
 		filepath.Join(t.TempDir(), "runs"), "-"); code != 1 || !strings.Contains(out, "names no run") {
 		t.Fatalf("await with no run sent: exit %d\n%s", code, out)
+	}
+
+	// EVERY RUN SENT, not the first or the last: two tiers' cold runs, the first done.
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	runs = filepath.Join(t.TempDir(), "runs")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images-cold", "billet-testbed/m", "t1",
+		runs, "accept-pool", "accept-pool-2"); code != 0 {
+		t.Fatalf("images-cold on two tiers: exit %d\n%s", code, out)
+	}
+	f.fixture(t, "done-1", "")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "await", "billet-testbed/m", "t1",
+		runs, "-"); code != 1 || !strings.Contains(out, "run 2 did not complete") {
+		t.Fatalf("await, with the second cold run still running: exit %d\n%s", code, out)
 	}
 }
 

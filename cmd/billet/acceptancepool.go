@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
+	"unicode"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/cli"
@@ -38,6 +42,8 @@ const (
 // ec2.Reader, or a test's.
 type acceptancePoolHosts interface {
 	PoolHosts(ctx context.Context) ([]ec2.HostRecord, error)
+	PoolHost(ctx context.Context, id string) (ec2.HostRecord, error)
+	FindPoolHost(ctx context.Context, order string) (ec2.HostRecord, bool, error)
 	TerminatePoolHost(ctx context.Context, id string) error
 }
 
@@ -92,14 +98,31 @@ func newAcceptancePool(cfg *config.Config, deployment string) (acceptancePool, e
 // decommission ends every host of the run's pool EC2 has not terminated, waits until
 // it says each is, then purges the site's cache. The cache only after the hosts: a host
 // still up may hold a session whose objects no volume lease names.
-func (p acceptancePool) decommission(ctx context.Context, env cli.Env) error {
+//
+// EVERY ORDER THE LEDGER RECORDS IS ACCOUNTED FOR BY ITS OWN HOST, never by the tag
+// listing alone: DescribeInstances is eventually consistent, and a host it leaves out of
+// one listing is not a host that is gone. An order whose host EC2 cannot name could still
+// hold one, and is residue for a person.
+func (p acceptancePool) decommission(ctx context.Context, env cli.Env, orders []acceptancePoolOrder) error {
 	live, err := p.hosts.PoolHosts(ctx)
 	if err != nil {
 		return fmt.Errorf("list this run's pool hosts: %w", err)
 	}
+	ids, err := p.orderHosts(ctx, orders, live)
+	if err != nil {
+		return err
+	}
 
-	for _, h := range live {
-		if h.State == "shutting-down" {
+	for _, id := range ids {
+		h, err := p.hosts.PoolHost(ctx, id)
+		switch {
+		case errors.Is(err, ec2.ErrHostNotFound):
+			// NOT FOUND IS NOT GONE: a terminated instance stays described for about an
+			// hour, so the wait below decides.
+			continue
+		case err != nil:
+			return fmt.Errorf("describe pool host %s: %w", id, err)
+		case h.State == "terminated" || h.State == "shutting-down":
 			continue
 		}
 		if err := p.hosts.TerminatePoolHost(ctx, h.ID); err != nil {
@@ -108,7 +131,7 @@ func (p acceptancePool) decommission(ctx context.Context, env cli.Env) error {
 		fmt.Fprintf(env.Stdout, "pool     ended host %s (order %s), which the pool had not released\n", h.ID, h.Order)
 	}
 
-	if err := p.awaitGone(ctx, env); err != nil {
+	if err := p.awaitGone(ctx, env, ids); err != nil {
 		return err
 	}
 
@@ -128,26 +151,71 @@ func (p acceptancePool) decommission(ctx context.Context, env cli.Env) error {
 	return nil
 }
 
-// awaitGone waits, bounded, until EC2 lists no host of the run's pool that is not
-// terminated.
-func (p acceptancePool) awaitGone(ctx context.Context, env cli.Env) error {
+// orderHosts is every instance the run's pool may hold: each order's host as the ledger
+// names it, or as EC2 finds it by the order's tag when the ledger names none, and every
+// host the listing found. An order its source refused holds none. An order that names no
+// host and whose host EC2 does not find could still hold one EC2 has not yet listed,
+// which nothing here can rule out.
+func (p acceptancePool) orderHosts(ctx context.Context, orders []acceptancePoolOrder,
+	live []ec2.HostRecord,
+) ([]string, error) {
+	var ids []string
+	add := func(id string) {
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	for i := range live {
+		add(live[i].ID)
+	}
+	var unknown []string
+	for i := range orders {
+		o := &orders[i]
+		switch {
+		case o.HostID != "":
+			add(o.HostID)
+		case o.State == alloc.PoolRefused:
+		default:
+			h, found, err := p.hosts.FindPoolHost(ctx, o.ID)
+			switch {
+			case err != nil:
+				return nil, fmt.Errorf("find order %s's pool host: %w", o.ID, err)
+			case found:
+				add(h.ID)
+			default:
+				unknown = append(unknown, o.ID+" ("+o.State+")")
+			}
+		}
+	}
+	if len(unknown) > 0 {
+		return ids, fmt.Errorf("%w: EC2 names no host for pool order(s) %s, which the ledger does not say were "+
+			"refused, so nothing here proves they hold none; a person decides", errAcceptanceResidue,
+			strings.Join(unknown, ", "))
+	}
+
+	return ids, nil
+}
+
+// awaitGone waits, bounded, until EC2 describes every one of ids as terminated and lists
+// no other host of the run's pool that is not.
+func (p acceptancePool) awaitGone(ctx context.Context, env cli.Env, ids []string) error {
 	deadline := time.Now().Add(p.gone)
 	ticker := time.NewTicker(p.poll)
 	defer ticker.Stop()
 
 	for {
-		live, err := p.hosts.PoolHosts(ctx)
+		left, err := p.notTerminated(ctx, ids)
 		if err != nil {
-			return fmt.Errorf("list this run's pool hosts: %w", err)
+			return err
 		}
-		if len(live) == 0 {
-			fmt.Fprintf(env.Stdout, "pool     no host of this run's pool is left\n")
+		if len(left) == 0 {
+			fmt.Fprintf(env.Stdout, "pool     every host of this run's pool is terminated (%d)\n", len(ids))
 
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%w: after %s, %d pool host(s) of this run are not terminated (%s)",
-				errAcceptanceResidue, p.gone, len(live), describeHosts(live))
+			return fmt.Errorf("%w: after %s, %d pool host(s) of this run are not described as terminated (%s)",
+				errAcceptanceResidue, p.gone, len(left), strings.Join(left, ", "))
 		}
 
 		select {
@@ -158,17 +226,59 @@ func (p acceptancePool) awaitGone(ctx context.Context, env cli.Env) error {
 	}
 }
 
-// sweep is the last question: no host of the run's pool EC2 has not terminated, and
-// nothing in the site's cache under the run's owner.
-func (p acceptancePool) sweep(ctx context.Context, env cli.Env, deployment string) error {
+// notTerminated is each of the run's pool hosts EC2 does not describe as terminated,
+// with what it said instead: every host the listing returns, and each of ids EC2
+// describes in another state or cannot find.
+func (p acceptancePool) notTerminated(ctx context.Context, ids []string) ([]string, error) {
+	live, err := p.hosts.PoolHosts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list this run's pool hosts: %w", err)
+	}
+	left := make([]string, 0, len(live)+len(ids))
+	for _, h := range live {
+		left = append(left, h.ID+" "+h.State)
+	}
+	for _, id := range ids {
+		if slices.ContainsFunc(live, func(l ec2.HostRecord) bool { return l.ID == id }) {
+			continue
+		}
+		h, err := p.hosts.PoolHost(ctx, id)
+		switch {
+		case errors.Is(err, ec2.ErrHostNotFound):
+			left = append(left, id+" not found")
+		case err != nil:
+			return nil, fmt.Errorf("describe pool host %s: %w", id, err)
+		case h.State != "terminated":
+			left = append(left, id+" "+h.State)
+		}
+	}
+
+	return left, nil
+}
+
+// sweep is the last question: every host the run's pool may hold is described as
+// terminated, no other is listed, and nothing is left in the site's cache under the
+// run's owner.
+func (p acceptancePool) sweep(ctx context.Context, env cli.Env, deployment string,
+	orders []acceptancePoolOrder,
+) error {
 	live, err := p.hosts.PoolHosts(ctx)
 	if err != nil {
 		return fmt.Errorf("the sweep could not list this run's pool hosts, so nothing here establishes whether "+
 			"it left one running: %w", err)
 	}
-	if len(live) > 0 {
-		return fmt.Errorf("%w: %d pool host(s) of %s are not terminated (%s)", errAcceptanceResidue, len(live),
-			deployment, describeHosts(live))
+	ids, err := p.orderHosts(ctx, orders, live)
+	if err != nil {
+		return err
+	}
+	left, err := p.notTerminated(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("the sweep could not read this run's pool hosts, so nothing here establishes whether "+
+			"it left one running: %w", err)
+	}
+	if len(left) > 0 {
+		return fmt.Errorf("%w: %d pool host(s) of %s are not described as terminated (%s)", errAcceptanceResidue,
+			len(left), deployment, strings.Join(left, ", "))
 	}
 
 	if p.cache != nil {
@@ -184,21 +294,10 @@ func (p acceptancePool) sweep(ctx context.Context, env cli.Env, deployment strin
 		}
 	}
 
-	fmt.Fprintf(env.Stdout, "sweep: no pool host and nothing in the cache carrying %s remains\n", deployment)
+	fmt.Fprintf(env.Stdout, "sweep: every pool host of %s is terminated and nothing in the cache carrying it "+
+		"remains\n", deployment)
 
 	return nil
-}
-
-func describeHosts(hosts []ec2.HostRecord) string {
-	out := ""
-	for i, h := range hosts {
-		if i > 0 {
-			out += ", "
-		}
-		out += h.ID + " " + h.State
-	}
-
-	return out
 }
 
 // preludeFlags are the init_args a pool prelude prepares a host by itself (the kernel it
@@ -228,6 +327,12 @@ func cmdMatrixPoolInitArgs(env cli.Env, args []string) error {
 		value, ok := values[flag]
 		if !ok || slices.Contains(preludeFlags, flag) {
 			continue
+		}
+		// A PRELUDE TAKES THEM AS WORDS (PRELUDE_INIT_ARGS), so a value holding whitespace
+		// would reach init as two arguments, and prepare another host than the join's.
+		if strings.ContainsFunc(value, unicode.IsSpace) {
+			return fmt.Errorf("server.pool.init_args' --%s holds whitespace, which a prelude's words cannot "+
+				"carry", flag)
 		}
 		fmt.Fprintf(env.Stdout, "--%s=%s\n", flag, value)
 	}
@@ -275,22 +380,33 @@ func cmdMatrixPoolHostIAM(ctx context.Context, env cli.Env, args []string) error
 // pool's init_args name.
 func poolHostNodeConfig(cfg *config.Config, site string, store *config.EBSS3Config, dir string) []byte {
 	values := cfg.Server.Pool.InitArgValues()
+	// EVERY VALUE QUOTED, as JSON, which YAML reads as written: an unquoted value YAML
+	// reads otherwise (a prefix `cache #v2` is `cache`) would grant another namespace
+	// than the hosts' own config names.
+	q := func(v string) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			panic(err) // a string always marshals
+		}
+
+		return string(b)
+	}
 	kms := ""
 	if store.KMSKeyID != "" {
-		kms = "    kms_key_id: " + store.KMSKeyID + "\n"
+		kms = "    kms_key_id: " + q(store.KMSKeyID) + "\n"
 	}
 
 	return []byte(`node:
   server_addr: 127.0.0.1:7717
   name: pool-host
   provider: firecracker
-  state_dir: ` + filepath.Join(dir, "pool-host-node") + `
-  site: ` + site + `
+  state_dir: ` + q(filepath.Join(dir, "pool-host-node")) + `
+  site: ` + q(site) + `
   ebs_s3:
-    region: ` + store.Region + `
-    availability_zone: ` + store.AvailabilityZone + `
-    bucket: ` + store.Bucket + `
-    prefix: ` + store.Prefix + `
+    region: ` + q(store.Region) + `
+    availability_zone: ` + q(store.AvailabilityZone) + `
+    bucket: ` + q(store.Bucket) + `
+    prefix: ` + q(store.Prefix) + `
 ` + kms + `  firecracker:
     kernel_image: /var/lib/billet/kernels/vmlinux
     bridge: billet0
@@ -298,7 +414,7 @@ func poolHostNodeConfig(cfg *config.Config, site string, store *config.EBSS3Conf
     image_pool: billet-images
     cache_pool: billet-cache
   cache:
-    listen: ` + values["cache-listen"] + `
-    guest_endpoint: ` + values["cache-guest-endpoint"] + `
+    listen: ` + q(values["cache-listen"]) + `
+    guest_endpoint: ` + q(values["cache-guest-endpoint"]) + `
 `)
 }

@@ -50,7 +50,7 @@ func TestAPoolsRunIsNotRefusedForANodeItDoesNotHave(t *testing.T) {
 	err := cmdAcceptanceUp(t.Context(), cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv},
 		[]string{"--config", base, "--workspace", workspace})
 	if err == nil || strings.Contains(err.Error(), "choose a shorter one") ||
-		!strings.Contains(err.Error(), "--fleet-listen") {
+		!strings.Contains(err.Error(), "pass --fleet-listen") {
 		t.Fatalf("up = %v, want the derivation's refusal for the missing fleet flags", err)
 	}
 }

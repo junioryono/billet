@@ -358,12 +358,18 @@ type matrixScope struct {
 	// which only a hand-run judge without --runs does.
 	runs       map[int64]bool
 	repository string
-	// poolNodes is each pool host's node and the source its order rented it from: a pool
-	// cell's job is one that ran on a node of its source, and an EC2 cell's one that ran
-	// on no pool's.
-	poolNodes map[string]string
+	// poolNodes is each pool host's node and the source and architecture its order
+	// rented it as: a pool cell's job is one that ran on a node of its source and its
+	// architecture, and an EC2 cell's one that ran on no pool's.
+	poolNodes map[string]poolNode
 	// poolFloors is the floor the config's pool keeps on each architecture.
 	poolFloors map[config.Arch]int
+}
+
+// poolNode is what a pool's order says of the host that joined as a node.
+type poolNode struct {
+	source string
+	arch   config.Arch
 }
 
 // belongs reports whether a job is one of this matrix run's.
@@ -380,10 +386,11 @@ func judgeMatrix(cells []matrixCell, doc acceptanceEvidenceDoc, scope matrixScop
 	out := matrixDoc{Version: matrixDocVersion, JudgedAt: time.Now().UTC().Format(time.RFC3339),
 		DeploymentID: doc.DeploymentID}
 	if scope.poolNodes == nil {
-		scope.poolNodes = map[string]string{}
+		scope.poolNodes = map[string]poolNode{}
 		for i := range doc.Pool {
 			if doc.Pool[i].Node != "" {
-				scope.poolNodes[doc.Pool[i].Node] = doc.Pool[i].Source
+				scope.poolNodes[doc.Pool[i].Node] = poolNode{source: doc.Pool[i].Source,
+					arch: config.Arch(doc.Pool[i].Arch)}
 			}
 		}
 	}
@@ -426,10 +433,12 @@ func judgeCell(cell matrixCell, jobs []acceptanceJob, scope matrixScope) matrixR
 		if !ok || t.arch != cell.Arch || !slices.Contains(t.providers, cell.Backend) {
 			continue
 		}
-		// ON A HOST OF THE CELL'S SOURCE, which only the pool's own orders say: a Firecracker
-		// job on a host the operator owns is not a pool's. A job whose history could not be
-		// read has no node to tell by, and is kept, as below.
-		if j.Unread == "" && scope.poolNodes[j.Node] != cell.Source {
+		// ON A HOST OF THE CELL'S SOURCE AND ARCHITECTURE, which only the pool's own orders
+		// say: a Firecracker job on a host the operator owns is not a pool's, nor one on a
+		// host its order rented as another architecture than its tier's. A job whose
+		// history could not be read has no node to tell by, and is kept, as below.
+		if node, pooled := scope.poolNodes[j.Node]; j.Unread == "" &&
+			(node.source != cell.Source || (pooled && node.arch != cell.Arch)) {
 			continue
 		}
 		if workflowFile(j.WorkflowRef) != cell.Run.Workflow || j.JobName != cell.Run.Job {
@@ -565,11 +574,13 @@ func matrixTeardownPolicy(cfg *config.Config, deployment string) (awspolicy.Poli
 	// hosts, whose cache the teardown purges as a node's decommission would.
 	var store *config.EBSS3Config
 	var site string
+	pool := false
 	switch {
 	case cfg.Node != nil:
 		store, site = cfg.Node.EBSS3, cfg.Node.Site
 	case cfg.Server != nil && cfg.Server.Pool != nil:
 		site, store = cfg.Server.Pool.SiteStore()
+		pool = true
 	}
 	if store == nil {
 		return awspolicy.Policy{}, false, nil
@@ -580,11 +591,24 @@ func matrixTeardownPolicy(cfg *config.Config, deployment string) (awspolicy.Poli
 	}
 	prefix := ebss3.StatePrefix(*store, app.CacheNamespace(deployment, site))
 
-	return awspolicy.Policy{Version: "2012-10-17", Statement: []awspolicy.Statement{{
+	policy := awspolicy.Policy{Version: "2012-10-17", Statement: []awspolicy.Statement{{
 		Sid: "BilletMatrixDecommissionState", Effect: "Allow", Action: []string{"s3:DeleteObject"},
 		Resource: []string{fmt.Sprintf("arn:%s:s3:::%s/%s*", awspolicy.PartitionForRegion(store.Region),
 			store.Bucket, prefix)},
-	}}}, true, nil
+	}}}
+	// A POOL'S RUN PURGES A CACHE IT NEVER RAN AS A NODE: the control plane's own policy
+	// is the pool's, and the cache's are its hosts', so the teardown is granted the
+	// purge's half of a node's for this deployment as well.
+	if pool {
+		purge, err := awspolicy.CachePurge(store.Region, deployment,
+			awspolicy.Cache{Bucket: store.Bucket, Prefix: store.Prefix})
+		if err != nil {
+			return awspolicy.Policy{}, false, fmt.Errorf("the pool's cache purge: %w", err)
+		}
+		policy.Statement = append(policy.Statement, purge...)
+	}
+
+	return policy, true, nil
 }
 
 // matrixJobsPerArch is how many jobs one dispatch of every matrix workflow runs on one
@@ -873,6 +897,11 @@ func parseMatrixBackends(s string) ([]string, error) {
 			return nil, fmt.Errorf("--backends: %q is not a backend the matrix declares (%v)", b, known)
 		}
 		out = append(out, b)
+	}
+	// NO BACKEND IS NOT A SELECTION: it would owe nothing, and a run that ran nothing
+	// would pass.
+	if len(out) == 0 {
+		return nil, fmt.Errorf("--backends: name the backends this run served (%v)", known)
 	}
 
 	return out, nil

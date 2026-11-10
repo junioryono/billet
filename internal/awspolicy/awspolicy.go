@@ -1049,6 +1049,40 @@ func cacheStatements(partition, suffix, region, owner string, c Cache) ([]Statem
 	return stmts, nil
 }
 
+// cachePurgeSids are the cache statements a purge exercises: it describes, lists, reads
+// and deletes, and never creates, attaches or encrypts.
+var cachePurgeSids = []string{
+	"BilletCacheDescribe", "BilletCacheDelete", "BilletCacheObjects", "BilletCacheList",
+	"BilletCacheObjectsEvict", "BilletCacheUploads",
+}
+
+// CachePurge is what a teardown needs to purge one deployment's ebs-s3 cache when it
+// does not run as that cache's node: the purge's statements of the node's own policy,
+// for owner alone. A state object's delete is not among them, as it is not in a node's.
+func CachePurge(region, owner string, c Cache) ([]Statement, error) {
+	if owner == "" {
+		return nil, errors.New("awspolicy: a cache purge is granted for one deployment, and none was named")
+	}
+	partition := PartitionForRegion(region)
+	stmts, err := cacheStatements(partition, dnsSuffix(partition), region, owner, c)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]Statement, 0, len(cachePurgeSids))
+	for _, st := range stmts {
+		if slices.Contains(cachePurgeSids, st.Sid) {
+			out = append(out, st)
+		}
+	}
+	if len(out) != len(cachePurgeSids) {
+		return nil, fmt.Errorf("awspolicy: the cache policy carries %d of the purge's %d statements",
+			len(out), len(cachePurgeSids))
+	}
+
+	return out, nil
+}
+
 // backupStatements is what a control plane needs to put its archives somewhere
 // other than the disk it protects, and nothing else.
 //

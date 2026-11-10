@@ -126,12 +126,12 @@ func tearDownAcceptanceWithin(
 	// A POOL'S RUN (#829) HAS NO NODE TO DECOMMISSION FROM: its hosts are its pool's,
 	// and what the pool did not release is ended here, then the site's cache its
 	// init_args name is purged.
-	pool, isPool, poolErr := acceptancePoolFor(ws)
+	pool, orders, isPool, poolErr := acceptancePoolFor(ctx, ws)
 	switch {
 	case poolErr != nil:
 		problems = append(problems, poolErr)
 	case isPool:
-		if err := pool.decommission(ctx, env); err != nil {
+		if err := pool.decommission(ctx, env, orders); err != nil {
 			problems = append(problems, err)
 		}
 	default:
@@ -147,7 +147,7 @@ func tearDownAcceptanceWithin(
 	switch {
 	case poolErr != nil:
 	case isPool:
-		if err := pool.sweep(ctx, env, ws.DeploymentID); err != nil {
+		if err := pool.sweep(ctx, env, ws.DeploymentID, orders); err != nil {
 			problems = append(problems, err)
 		}
 	default:
@@ -279,12 +279,12 @@ func cmdAcceptanceSweep(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	pool, isPool, err := acceptancePoolFor(ws)
+	pool, orders, isPool, err := acceptancePoolFor(ctx, ws)
 	if err != nil {
 		return err
 	}
 	if isPool {
-		return pool.sweep(ctx, env, ws.DeploymentID)
+		return pool.sweep(ctx, env, ws.DeploymentID, orders)
 	}
 
 	// A STANDALONE SWEEP HAS NO BARRIER BEHIND IT. `run` proves the fleet clear
@@ -294,23 +294,31 @@ func cmdAcceptanceSweep(ctx context.Context, env cli.Env, args []string) error {
 	return sweepAcceptance(ctx, env, ws, false)
 }
 
-// acceptancePoolFor is the teardown of a workspace whose deployment is a pool's run, and
-// false for any other.
-func acceptancePoolFor(ws acceptanceWorkspace) (acceptancePool, bool, error) {
+// acceptancePoolFor is the teardown of a workspace whose deployment is a pool's run, with
+// every order its ledger records, and false for any other. A ledger it cannot read is an
+// error, never no orders: the orders are what name the hosts the teardown must prove gone.
+func acceptancePoolFor(ctx context.Context, ws acceptanceWorkspace) (
+	acceptancePool, []acceptancePoolOrder, bool, error,
+) {
 	cfg, err := config.Load(ws.ConfigPath)
 	if err != nil {
-		return acceptancePool{}, false, fmt.Errorf("read this run's config: %w", err)
+		return acceptancePool{}, nil, false, fmt.Errorf("read this run's config: %w", err)
 	}
 	if !poolOnly(cfg) {
-		return acceptancePool{}, false, nil
+		return acceptancePool{}, nil, false, nil
 	}
 
 	pool, err := newAcceptancePool(cfg, ws.DeploymentID)
 	if err != nil {
-		return acceptancePool{}, true, err
+		return acceptancePool{}, nil, true, err
+	}
+	orders, err := readAcceptancePool(ctx, ws)
+	if err != nil {
+		return acceptancePool{}, nil, true, fmt.Errorf("read this run's pool orders, which name the hosts its "+
+			"teardown must prove gone: %w", err)
 	}
 
-	return pool, true, nil
+	return pool, orders, true, nil
 }
 
 // sweepAcceptance is the final ASK: does anything still carry this deployment.

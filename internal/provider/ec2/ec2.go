@@ -165,6 +165,17 @@ func (r Reader) Jobs(ctx context.Context) ([]*provider.Instance, error) { return
 // PoolHosts lists the deployment's pool hosts that are not terminated (Hosts.Live).
 func (r Reader) PoolHosts(ctx context.Context) ([]HostRecord, error) { return r.p.Hosts().Live(ctx) }
 
+// PoolHost describes one of the deployment's pool hosts by its instance id
+// (Hosts.Describe): ErrHostNotFound when EC2 names none, which is not proof it is gone.
+func (r Reader) PoolHost(ctx context.Context, id string) (HostRecord, error) {
+	return r.p.Hosts().Describe(ctx, id)
+}
+
+// FindPoolHost reads back the host an order launched, by the order's tag (Hosts.Find).
+func (r Reader) FindPoolHost(ctx context.Context, order string) (HostRecord, bool, error) {
+	return r.p.Hosts().Find(ctx, order)
+}
+
 // TerminatePoolHost ends one of the deployment's pool hosts, as Hosts.Terminate does:
 // only an instance described as this deployment's pool host.
 func (r Reader) TerminatePoolHost(ctx context.Context, id string) error {

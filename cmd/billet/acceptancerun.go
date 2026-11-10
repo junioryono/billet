@@ -491,14 +491,23 @@ const acceptancePoolPoll = 30 * time.Second
 // host: every one released, gone, refused or abandoned. An order being ordered or
 // uncertain may hold one, so it holds the wait too.
 func waitForPoolReleased(ctx context.Context, env cli.Env, ws acceptanceWorkspace, bound time.Duration) error {
+	return awaitPoolReleased(ctx, env, func(ctx context.Context) ([]acceptancePoolOrder, error) {
+		return readAcceptancePool(ctx, ws)
+	}, bound, acceptancePoolPoll)
+}
+
+// awaitPoolReleased is waitForPoolReleased over the orders read reads, asked every poll.
+func awaitPoolReleased(ctx context.Context, env cli.Env,
+	read func(context.Context) ([]acceptancePoolOrder, error), bound, poll time.Duration,
+) error {
 	fmt.Fprintf(env.Stdout, "\nWaiting up to %s for the pool to release its hosts itself.\n", bound)
 
 	deadline := time.Now().Add(bound)
-	ticker := time.NewTicker(acceptancePoolPoll)
+	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 
 	for {
-		orders, err := readAcceptancePool(ctx, ws)
+		orders, err := read(ctx)
 		if err != nil {
 			return err
 		}

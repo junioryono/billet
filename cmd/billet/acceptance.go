@@ -196,8 +196,11 @@ func checkAcceptanceFleet(cfg *config.Config, fleet *acceptanceFleet) error {
 	if !filepath.IsAbs(fleet.Prelude) {
 		return fmt.Errorf("--boot-prelude %q must be an absolute path", fleet.Prelude)
 	}
-	if info, err := os.Stat(fleet.Prelude); err != nil || !info.Mode().IsRegular() {
+	switch info, err := os.Stat(fleet.Prelude); {
+	case err != nil:
 		return fmt.Errorf("--boot-prelude %s is not a file this run can read: %w", fleet.Prelude, err)
+	case !info.Mode().IsRegular():
+		return fmt.Errorf("--boot-prelude %s is not a regular file", fleet.Prelude)
 	}
 
 	return nil

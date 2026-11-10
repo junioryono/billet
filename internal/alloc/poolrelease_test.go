@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +49,12 @@ func TestANeverJoinedHostIsSealedByTheAsking(t *testing.T) {
 	}
 	if _, err := a.RequestPoolRelease(ctx, "pa", "again"); !errors.Is(err, ErrPoolOrderMoved) {
 		t.Fatalf("a second release answered %v", err)
+	}
+	// A PERSON'S REASON MAY NOT SAY IT WAS THE POOL'S SHRINK, which the acceptance judge
+	// reads a release's provenance by.
+	if _, err := a.RequestPoolRelease(ctx, "pa", PoolShrinkReason+"noon"); err == nil ||
+		!strings.Contains(err.Error(), "may not begin") {
+		t.Fatalf("a person's release in the shrink's words answered %v", err)
 	}
 	proof, err := a.PoolReleaseProof(ctx, "pa")
 	if err != nil || proof.For("i-pa") != nil || proof.For("i-other") == nil {

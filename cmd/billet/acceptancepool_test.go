@@ -198,15 +198,37 @@ func TestAPoolOrderHoldsAHostUntilItLetsGo(t *testing.T) {
 	}
 }
 
-// fakePoolHosts is EC2's account of a run's pool hosts: a terminated host is not listed,
-// as Hosts.Live leaves it out, and an ended one is shutting down for its first reads.
+// fakePoolHosts is EC2's account of a run's pool hosts. An ended host is shutting down
+// for its next shutdown reads and terminated after; a terminated host is described by
+// its id and left out of the listing, as Hosts.Live leaves it out; and a host in
+// unlisted is left out of every listing whatever its state, as an eventually consistent
+// DescribeInstances may leave one out.
 type fakePoolHosts struct {
-	live       []ec2.HostRecord
-	ended      []string
-	listErr    error
-	shutdown   int
-	reads      int
-	terminates map[string]int
+	hosts    []ec2.HostRecord
+	unlisted map[string]bool
+	listErr  error
+	shutdown int
+	reads    int
+	endedAt  map[string]int
+	ended    []string
+	// purgedAt is the read count when the cache was purged, -1 before.
+	purgedAt int
+}
+
+func newFakePoolHosts(shutdown int, hosts ...ec2.HostRecord) *fakePoolHosts {
+	return &fakePoolHosts{hosts: hosts, unlisted: map[string]bool{}, shutdown: shutdown, endedAt: map[string]int{},
+		purgedAt: -1}
+}
+
+func (f *fakePoolHosts) state(h ec2.HostRecord) ec2.HostRecord {
+	if at, ok := f.endedAt[h.ID]; ok {
+		h.State = "shutting-down"
+		if f.reads-at > f.shutdown {
+			h.State = "terminated"
+		}
+	}
+
+	return h
 }
 
 func (f *fakePoolHosts) PoolHosts(context.Context) ([]ec2.HostRecord, error) {
@@ -215,120 +237,227 @@ func (f *fakePoolHosts) PoolHosts(context.Context) ([]ec2.HostRecord, error) {
 	}
 	f.reads++
 	var out []ec2.HostRecord
-	for _, h := range f.live {
-		if f.terminates[h.ID] > 0 {
-			if f.reads > f.shutdown {
-				continue
-			}
-			h.State = "shutting-down"
+	for _, h := range f.hosts {
+		if h = f.state(h); h.State != "terminated" && !f.unlisted[h.ID] {
+			out = append(out, h)
 		}
-		out = append(out, h)
 	}
 
 	return out, nil
 }
 
+func (f *fakePoolHosts) PoolHost(_ context.Context, id string) (ec2.HostRecord, error) {
+	f.reads++
+	for _, h := range f.hosts {
+		if h.ID == id {
+			return f.state(h), nil
+		}
+	}
+
+	return ec2.HostRecord{}, ec2.ErrHostNotFound
+}
+
+func (f *fakePoolHosts) FindPoolHost(_ context.Context, order string) (ec2.HostRecord, bool, error) {
+	for _, h := range f.hosts {
+		if h.Order == order {
+			return f.state(h), true, nil
+		}
+	}
+
+	return ec2.HostRecord{}, false, nil
+}
+
 func (f *fakePoolHosts) TerminatePoolHost(_ context.Context, id string) error {
 	f.ended = append(f.ended, id)
-	f.terminates[id]++
+	if _, ok := f.endedAt[id]; !ok {
+		f.endedAt[id] = f.reads
+	}
 
 	return nil
 }
 
 type fakePoolCache struct {
-	purged  int
-	residue ebss3.Residue
-	order   *[]string
+	purged   int
+	residue  ebss3.Residue
+	residErr error
+	hosts    *fakePoolHosts
 }
 
 func (f *fakePoolCache) Purge(context.Context) (ebss3.PurgeReport, error) {
 	f.purged++
-	*f.order = append(*f.order, "purge")
+	if f.hosts != nil {
+		f.hosts.purgedAt = f.hosts.reads
+	}
 
 	return ebss3.PurgeReport{Snapshots: 2}, nil
 }
 
-func (f *fakePoolCache) Residue(context.Context) (ebss3.Residue, error) { return f.residue, nil }
+func (f *fakePoolCache) Residue(context.Context) (ebss3.Residue, error) { return f.residue, f.residErr }
 
 func quietEnv(out *bytes.Buffer) cli.Env {
 	return cli.Env{Stdout: out, Stderr: io.Discard, Stdin: strings.NewReader(""), Getenv: os.Getenv}
 }
 
-// THE TEARDOWN ENDS WHAT THE POOL DID NOT RELEASE, WAITS FOR EC2 TO SAY IT IS TERMINATED,
-// AND ONLY THEN PURGES THE CACHE: a host still up may hold a session no lease names. A
-// host already shutting down is not ended again.
+// order is a pool order of the ledger's, as the evidence records it.
+func order(id, state, host string) acceptancePoolOrder {
+	return acceptancePoolOrder{ID: id, Source: config.PoolSourceAWSMetal, Arch: "x64", State: state, HostID: host}
+}
+
+// THE TEARDOWN ENDS WHAT THE POOL DID NOT RELEASE, WAITS FOR EC2 TO DESCRIBE IT
+// TERMINATED, AND ONLY THEN PURGES THE CACHE: a host still up may hold a session no lease
+// names. A host already shutting down is not ended again.
 func TestAPoolsTeardownEndsItsHostsBeforeThePurge(t *testing.T) {
 	t.Parallel()
 
-	var order []string
-	hosts := &fakePoolHosts{terminates: map[string]int{}, shutdown: 2, live: []ec2.HostRecord{
-		{ID: "i-1", State: "running", Order: "p1"}, {ID: "i-2", State: "shutting-down", Order: "p2"},
-	}}
-	hosts.terminates["i-2"] = 1
-	cache := &fakePoolCache{order: &order}
+	hosts := newFakePoolHosts(3, ec2.HostRecord{ID: "i-1", State: "running", Order: "p1"},
+		ec2.HostRecord{ID: "i-2", State: "running", Order: "p2"})
+	hosts.endedAt["i-2"] = 0
+	cache := &fakePoolCache{hosts: hosts}
 	p := acceptancePool{hosts: hosts, cache: cache, gone: time.Minute, poll: time.Millisecond}
 
 	var out bytes.Buffer
-	if err := p.decommission(t.Context(), quietEnv(&out)); err != nil {
+	orders := []acceptancePoolOrder{order("p1", alloc.PoolPlaced, "i-1"), order("p2", alloc.PoolReleased, "i-2")}
+	if err := p.decommission(t.Context(), quietEnv(&out), orders); err != nil {
 		t.Fatalf("decommission: %v\n%s", err, out.String())
 	}
 	if len(hosts.ended) != 1 || hosts.ended[0] != "i-1" {
 		t.Errorf("ended %v, want i-1 alone (i-2 was shutting down already)", hosts.ended)
 	}
-	if cache.purged != 1 || hosts.reads <= hosts.shutdown {
-		t.Errorf("purged %d time(s) after %d read(s) of the hosts; want once, after they were gone", cache.purged,
-			hosts.reads)
+	if cache.purged != 1 || hosts.purgedAt < hosts.endedAt["i-1"]+hosts.shutdown+1 {
+		t.Errorf("purged %d time(s), at read %d, with i-1 ended at read %d; want once, after it was terminated",
+			cache.purged, hosts.purgedAt, hosts.endedAt["i-1"])
+	}
+}
+
+// A HOST THE LISTING LEFT OUT IS ENDED AND WAITED FOR BY THE ID ITS ORDER NAMES:
+// DescribeInstances is eventually consistent, and a host one listing leaves out is not a
+// host that is gone.
+func TestAPoolsTeardownEndsAHostTheListingLeftOut(t *testing.T) {
+	t.Parallel()
+
+	hosts := newFakePoolHosts(2, ec2.HostRecord{ID: "i-3", State: "running", Order: "p3"},
+		ec2.HostRecord{ID: "i-4", State: "running", Order: "p4"})
+	hosts.unlisted["i-3"], hosts.unlisted["i-4"] = true, true
+	cache := &fakePoolCache{hosts: hosts}
+	p := acceptancePool{hosts: hosts, cache: cache, gone: time.Minute, poll: time.Millisecond}
+
+	var out bytes.Buffer
+	// p4 names no host in the ledger, and EC2 finds it by its order's tag.
+	orders := []acceptancePoolOrder{order("p3", alloc.PoolSealed, "i-3"), order("p4", alloc.PoolUncertain, "")}
+	if err := p.decommission(t.Context(), quietEnv(&out), orders); err != nil {
+		t.Fatalf("decommission: %v\n%s", err, out.String())
+	}
+	if strings.Join(hosts.ended, ",") != "i-3,i-4" {
+		t.Errorf("ended %v, want both hosts the listing left out", hosts.ended)
+	}
+	if cache.purged != 1 || hosts.purgedAt <= hosts.endedAt["i-4"]+hosts.shutdown {
+		t.Errorf("purged %d time(s) at read %d; want once, after both were terminated", cache.purged,
+			hosts.purgedAt)
+	}
+}
+
+// AN ORDER WHOSE HOST EC2 CANNOT NAME IS RESIDUE FOR A PERSON, and the cache is kept: the
+// host could be one EC2 has not listed yet. An order its source refused holds none.
+func TestAnOrderWhoseHostEC2CannotNameIsResidue(t *testing.T) {
+	t.Parallel()
+
+	hosts := newFakePoolHosts(0)
+	cache := &fakePoolCache{hosts: hosts}
+	p := acceptancePool{hosts: hosts, cache: cache, gone: time.Minute, poll: time.Millisecond}
+
+	var out bytes.Buffer
+	if err := p.decommission(t.Context(), quietEnv(&out),
+		[]acceptancePoolOrder{order("p5", alloc.PoolRefused, "")}); err != nil {
+		t.Errorf("a refused order with no host answered %v", err)
+	}
+	cache.purged = 0
+	err := p.decommission(t.Context(), quietEnv(&out), []acceptancePoolOrder{order("p6", alloc.PoolOrdering, "")})
+	if !errors.Is(err, errAcceptanceResidue) || !strings.Contains(err.Error(), "p6 (ordering)") {
+		t.Fatalf("an order EC2 names no host for answered %v", err)
+	}
+	if cache.purged != 0 {
+		t.Error("the cache was purged beside an order that may hold a host")
+	}
+	if err := p.sweep(t.Context(), quietEnv(&out), "d1",
+		[]acceptancePoolOrder{order("p6", alloc.PoolOrdering, "")}); !errors.Is(err, errAcceptanceResidue) {
+		t.Errorf("the sweep of an order EC2 names no host for answered %v", err)
 	}
 }
 
 // A HOST THAT DOES NOT GO IS RESIDUE, AND THE CACHE IS LEFT: purging under it could take
-// a session's objects from a job still there.
+// a session's objects from a job still there. So is a host its order names that EC2 no
+// longer describes at all: not found is not terminated.
 func TestAPoolHostThatWillNotGoIsResidueAndTheCacheIsKept(t *testing.T) {
 	t.Parallel()
 
-	var order []string
-	hosts := &fakePoolHosts{terminates: map[string]int{}, shutdown: 1 << 30,
-		live: []ec2.HostRecord{{ID: "i-1", State: "running", Order: "p1"}}}
-	cache := &fakePoolCache{order: &order}
-	p := acceptancePool{hosts: hosts, cache: cache, gone: 10 * time.Millisecond, poll: time.Millisecond}
+	for name, c := range map[string]struct {
+		hosts  *fakePoolHosts
+		orders []acceptancePoolOrder
+		want   string
+	}{
+		"a host that stays up": {newFakePoolHosts(1<<30, ec2.HostRecord{ID: "i-1", State: "running", Order: "p1"}),
+			[]acceptancePoolOrder{order("p1", alloc.PoolPlaced, "i-1")}, "i-1 shutting-down"},
+		"a host EC2 does not describe": {newFakePoolHosts(0),
+			[]acceptancePoolOrder{order("p1", alloc.PoolReleased, "i-9")}, "i-9 not found"},
+	} {
+		cache := &fakePoolCache{hosts: c.hosts}
+		p := acceptancePool{hosts: c.hosts, cache: cache, gone: 10 * time.Millisecond, poll: time.Millisecond}
 
-	var out bytes.Buffer
-	err := p.decommission(t.Context(), quietEnv(&out))
-	if !errors.Is(err, errAcceptanceResidue) || !strings.Contains(err.Error(), "i-1") {
-		t.Fatalf("a host that never went answered %v", err)
-	}
-	if cache.purged != 0 {
-		t.Error("the cache was purged under a pool host still up")
+		var out bytes.Buffer
+		err := p.decommission(t.Context(), quietEnv(&out), c.orders)
+		if !errors.Is(err, errAcceptanceResidue) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s answered %v; want residue naming %q", name, err, c.want)
+		}
+		if cache.purged != 0 {
+			t.Errorf("%s: the cache was purged under a pool host not proved terminated", name)
+		}
 	}
 }
 
-// THE SWEEP FINDS A HOST STILL UP AND A CACHE LEFT, AND A LIST IT COULD NOT READ IS NOT
-// A CLEAN ONE.
+// THE SWEEP FINDS A HOST STILL UP, ONE ITS ORDER NAMES AND THE LISTING LEFT OUT, AND A
+// CACHE LEFT; AND A LIST OR A CACHE IT COULD NOT READ IS NOT A CLEAN ONE.
 func TestAPoolsSweepAsksEC2AndTheCache(t *testing.T) {
 	t.Parallel()
 
-	var order []string
-	clean := acceptancePool{hosts: &fakePoolHosts{terminates: map[string]int{}}, cache: &fakePoolCache{order: &order}}
 	var out bytes.Buffer
-	if err := clean.sweep(t.Context(), quietEnv(&out), "d1"); err != nil {
+	gone := newFakePoolHosts(0, ec2.HostRecord{ID: "i-1", State: "running", Order: "p1"})
+	gone.endedAt["i-1"] = -1
+	clean := acceptancePool{hosts: gone, cache: &fakePoolCache{}}
+	if err := clean.sweep(t.Context(), quietEnv(&out), "d1",
+		[]acceptancePoolOrder{order("p1", alloc.PoolGone, "i-1")}); err != nil {
 		t.Errorf("a clean pool's sweep answered %v", err)
 	}
 
-	up := acceptancePool{hosts: &fakePoolHosts{terminates: map[string]int{},
-		live: []ec2.HostRecord{{ID: "i-1", State: "stopped"}}}}
-	if err := up.sweep(t.Context(), quietEnv(&out), "d1"); !errors.Is(err, errAcceptanceResidue) {
+	up := acceptancePool{hosts: newFakePoolHosts(0, ec2.HostRecord{ID: "i-1", State: "stopped", Order: "p1"})}
+	if err := up.sweep(t.Context(), quietEnv(&out), "d1", nil); !errors.Is(err, errAcceptanceResidue) ||
+		!strings.Contains(err.Error(), "i-1 stopped") {
 		t.Errorf("a stopped pool host answered %v", err)
 	}
 
-	left := acceptancePool{hosts: &fakePoolHosts{terminates: map[string]int{}},
-		cache: &fakePoolCache{order: &order, residue: ebss3.Residue{Snapshots: 1}}}
-	if err := left.sweep(t.Context(), quietEnv(&out), "d1"); !errors.Is(err, errAcceptanceResidue) {
+	hidden := newFakePoolHosts(0, ec2.HostRecord{ID: "i-2", State: "running", Order: "p2"})
+	hidden.unlisted["i-2"] = true
+	if err := (acceptancePool{hosts: hidden}).sweep(t.Context(), quietEnv(&out), "d1",
+		[]acceptancePoolOrder{order("p2", alloc.PoolPlaced, "i-2")}); !errors.Is(err, errAcceptanceResidue) ||
+		!strings.Contains(err.Error(), "i-2 running") {
+		t.Errorf("a host its order names and the listing left out answered %v", err)
+	}
+
+	left := acceptancePool{hosts: newFakePoolHosts(0), cache: &fakePoolCache{residue: ebss3.Residue{Snapshots: 1}}}
+	if err := left.sweep(t.Context(), quietEnv(&out), "d1", nil); !errors.Is(err, errAcceptanceResidue) {
 		t.Errorf("a cache left behind answered %v", err)
 	}
 
-	blind := acceptancePool{hosts: &fakePoolHosts{terminates: map[string]int{}, listErr: errors.New("throttled")}}
-	if err := blind.sweep(t.Context(), quietEnv(&out), "d1"); err == nil || errors.Is(err, errAcceptanceResidue) {
+	throttled := errors.New("throttled")
+	blindHosts := newFakePoolHosts(0)
+	blindHosts.listErr = throttled
+	if err := (acceptancePool{hosts: blindHosts}).sweep(t.Context(), quietEnv(&out), "d1",
+		nil); !errors.Is(err, throttled) || errors.Is(err, errAcceptanceResidue) {
 		t.Errorf("a list that could not be read answered %v; want could-not-tell", err)
+	}
+	blindCache := acceptancePool{hosts: newFakePoolHosts(0), cache: &fakePoolCache{residErr: throttled}}
+	if err := blindCache.sweep(t.Context(), quietEnv(&out), "d1", nil); !errors.Is(err, throttled) ||
+		errors.Is(err, errAcceptanceResidue) {
+		t.Errorf("a cache that could not be read answered %v; want could-not-tell", err)
 	}
 }
 
@@ -370,7 +499,13 @@ func TestAPoolsRunServesItsFleetOnlyWhereItWasTold(t *testing.T) {
 		"a relative prelude": {pool, &acceptanceFleet{Listen: good.Listen, Bootstrap: good.Bootstrap,
 			Prelude: "prelude.sh"}, "absolute"},
 		"a missing prelude": {pool, &acceptanceFleet{Listen: good.Listen, Bootstrap: good.Bootstrap,
-			Prelude: prelude + ".gone"}, "not a file"},
+			Prelude: prelude + ".gone"}, "not a file this run can read: stat"},
+		"a directory for a prelude": {pool, &acceptanceFleet{Listen: good.Listen, Bootstrap: good.Bootstrap,
+			Prelude: filepath.Dir(prelude)}, "is not a regular file"},
+		"a hostname": {pool, &acceptanceFleet{Listen: "pool.example:7717", Bootstrap: "pool.example:7718",
+			Prelude: prelude}, "literal"},
+		"port zero": {pool, &acceptanceFleet{Listen: "10.77.0.10:0", Bootstrap: "10.77.0.10:7718",
+			Prelude: prelude}, "literal"},
 	} {
 		if err := checkAcceptanceFleet(c.cfg, c.fleet); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s answered %v; want a refusal saying %q", name, err, c.want)
@@ -476,7 +611,7 @@ func TestAPoolsDerivationServesItsFleet(t *testing.T) {
 	}
 
 	if _, err := deriveAcceptance(t.Context(), acceptanceInputs{base: base, workspace: t.TempDir(),
-		prefix: "accept-pool"}); err == nil || !strings.Contains(err.Error(), "--fleet-listen") {
+		prefix: "accept-pool"}); err == nil || !strings.Contains(err.Error(), "pass --fleet-listen") {
 		t.Errorf("a pool's run with no fleet answered %v", err)
 	}
 }

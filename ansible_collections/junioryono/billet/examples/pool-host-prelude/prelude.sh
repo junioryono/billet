@@ -40,7 +40,9 @@ cd "$work"
 trap 'echo "prelude: stopped at line $LINENO; its logs are in /var/lib/billet-pool-prelude" >&2' ERR
 
 # A HOST NOTHING WATCHES STILL STOPS BILLING: a halted instance is stopped, and a stopped
-# one bills no compute. First, so a prelude that fails later is bounded too.
+# one bills no compute. First, so a prelude that fails later is bounded too. FORCED, so
+# the halt waits on no unit's stop: the node's own may wait a day for a drain. A run again
+# leaves the deadline the first run set.
 if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
 	case $PRELUDE_MAX_LIFETIME_MINUTES in
 	*[!0-9]* | 0*)
@@ -48,7 +50,10 @@ if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
 		exit 1
 		;;
 	esac
-	shutdown -h "+$PRELUDE_MAX_LIFETIME_MINUTES" >>"$work/lifetime.log" 2>&1
+	if ! systemctl is-active --quiet billet-pool-lifetime.timer; then
+		systemd-run --unit billet-pool-lifetime --on-active="${PRELUDE_MAX_LIFETIME_MINUTES}m" \
+			/usr/bin/systemctl poweroff --force >>"$work/lifetime.log" 2>&1
+	fi
 fi
 
 # The image by its name alone: a pull assigns the generation and refuses a name that

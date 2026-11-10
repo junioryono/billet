@@ -290,7 +290,7 @@ func (p *Pool) shrink(ctx context.Context, orders []alloc.PoolOrder, quiet map[c
 		if pick == nil {
 			continue
 		}
-		reason := fmt.Sprintf("idle since %s, past server.pool.idle_after %s",
+		reason := fmt.Sprintf("%s%s, past server.pool.idle_after %s", alloc.PoolShrinkReason,
 			pick.Since.UTC().Format(time.RFC3339), p.cfg.IdleAfter)
 		switch err := p.ledger.ReleaseIdlePoolHost(ctx, pick.Order, cutoff, a.Floor, reason); {
 		case errors.Is(err, alloc.ErrPoolHostNotIdle):

@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 
@@ -148,7 +147,7 @@ func judgeShrinkIdle(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixS
 	orders := scenarioOrders(s, doc)
 	var released []acceptancePoolOrder
 	for i := range orders {
-		if orders[i].ReleaseRequested != "" && strings.HasPrefix(orders[i].ReleaseReason, "idle since ") {
+		if orders[i].ReleaseRequested != "" && strings.HasPrefix(orders[i].ReleaseReason, alloc.PoolShrinkReason) {
 			released = append(released, orders[i])
 		}
 	}
@@ -168,7 +167,15 @@ func judgeShrinkIdle(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixS
 
 			continue
 		}
-		if !slices.Contains([]string{alloc.PoolReleased, alloc.PoolGone}, o.State) {
+		// THE SOURCE TOOK IT BACK, ON ITS OWN WORD: released, or gone as its source said, and
+		// never closed by a person, whose close a stalled release could otherwise end in.
+		switch {
+		case o.State == alloc.PoolReleased:
+		case o.State == alloc.PoolGone && o.Reason == alloc.PoolGoneBySource:
+		case o.State == alloc.PoolGone:
+			wrong = append(wrong, fmt.Sprintf("%s: released by the shrink and closed other than by its source (%s)",
+				o.ID, o.Reason))
+		default:
 			wrong = append(wrong, fmt.Sprintf("%s: released by the shrink and still %s", o.ID, o.State))
 		}
 		jobs := nodeJobs(o.Node, doc, scope)
