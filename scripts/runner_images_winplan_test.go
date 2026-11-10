@@ -476,8 +476,21 @@ func runWindowsDriverAt(t *testing.T, driver string, env []string) (string, stri
 		t.Skip("no pwsh on this machine, so nothing here can run the driver")
 	}
 
+	// THE STEPS' SHELL IS NAMED BY ITS PATH, the one LookPath found, which is the
+	// wrapper that gives each pwsh a cache of its own (internal/pwshtest): pwsh puts
+	// its own directory first on PATH as it starts, so a step started by the bare
+	// name would run the real pwsh and share the driver's cache.
+	shelled := make([]string, len(env))
+	for i, kv := range env {
+		if kv == "BILLET_AMI_SHELL=pwsh" {
+			kv = "BILLET_AMI_SHELL=" + pwsh
+		}
+
+		shelled[i] = kv
+	}
+
 	cmd := exec.CommandContext(t.Context(), pwsh, "-NoProfile", "-NonInteractive", "-File", driver)
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(os.Environ(), shelled...)
 	out, runErr := cmd.CombinedOutput()
 
 	read := func(prefix string) string {
