@@ -296,7 +296,7 @@ func (c *Client) wasAbandoned(image, cookie string) bool {
 // removeAbandoned takes away a lock held under a cookie this process abandoned,
 // and always answers contention, so a waiter retries the add rather than failing.
 func (c *Client) removeAbandoned(ctx context.Context, image string, holder lockEntry) error {
-	_, err := c.rbdCmd(ctx, false, "lock", "rm", image, holder.ID, holder.Locker)
+	_, err := c.rbdCmd(ctx, false, noBlocklist("lock", "rm", image, holder.ID, holder.Locker)...)
 	if err == nil || exitedWith(err, 2) {
 		c.abandoned.Delete(abandonKey(image, holder.ID))
 
@@ -475,7 +475,7 @@ func (c *Client) takeLockAttempt(
 			image, holder.ID, current.ID, currentAge.Round(time.Second))
 	}
 
-	if _, err := c.rbdCmd(ctx, false, "lock", "rm", image, holder.ID, holder.Locker); err != nil {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("lock", "rm", image, holder.ID, holder.Locker)...); err != nil {
 		if exitedWith(err, 2) {
 			return nil, lockContendedf("ceph: %s was released while its holder was being removed; "+
 				"this publisher will retry rather than treating the race as a failure", image)
@@ -683,8 +683,8 @@ func (l *PublishLock) Release(ctx context.Context) error {
 			continue
 		}
 
-		if _, err := l.client.rbdCmd(ctx, false, "lock", "rm", l.image,
-			entry.ID, entry.Locker); err != nil {
+		if _, err := l.client.rbdCmd(ctx, false, noBlocklist("lock", "rm", l.image,
+			entry.ID, entry.Locker)...); err != nil {
 			l.client.abandon(l.image, l.cookie)
 
 			return fmt.Errorf("ceph: could not release %s: %w", l.image, err)

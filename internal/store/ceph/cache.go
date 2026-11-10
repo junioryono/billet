@@ -335,7 +335,7 @@ func (c *Client) metaGet(
 }
 
 func (c *Client) metaSet(ctx context.Context, image, key, value string) error {
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("image-meta", "set", image, key, value)...); err != nil {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("image-meta", "set", image, key, value)...); err != nil {
 		return fmt.Errorf("ceph: write cache metadata %s: %w", key, err)
 	}
 
@@ -343,7 +343,7 @@ func (c *Client) metaSet(ctx context.Context, image, key, value string) error {
 }
 
 func (c *Client) metaRemove(ctx context.Context, image, key string) error {
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("image-meta", "remove", image, key)...); err != nil &&
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("image-meta", "remove", image, key)...); err != nil &&
 		!isNoSuchFile(err) {
 		return fmt.Errorf("ceph: remove cache metadata %s: %w", key, err)
 	}
@@ -389,7 +389,7 @@ func (c *Client) writeJSON(ctx context.Context, key string, value any) error {
 // gains them at its next clone.
 //
 // EXCLUSIVE-LOCK COMES WITH IT, which the kernel holds while a volume is mapped,
-// so every command that changes a cache volume runs under keepKernelClient: a
+// so every command that changes a cache volume runs under noBlocklist: a
 // lock an interrupted unmap left behind is broken without blocklisting the
 // host's kernel client, the failure recorded for root disks.
 const cacheImageFeatures = "layering,exclusive-lock,object-map,fast-diff,deep-flatten"
@@ -655,7 +655,7 @@ func (c *Client) snapshotAt(
 
 	_, generation, _ := strings.Cut(generationName, "cache-s-")
 	stage := volume.Handle + "@" + generation
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "create", stage)...); err != nil {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("snap", "create", stage)...); err != nil {
 		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, "",
 			fmt.Errorf("ceph: snapshot cache %q: %w", volume.Key, err))
 	}
@@ -679,7 +679,7 @@ func (c *Client) snapshotAt(
 				fmt.Errorf("ceph: clone immutable candidate for %q: %w", volume.Key, err))
 		}
 
-		if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "create", handle+"@"+generation)...); err != nil {
+		if _, err := c.rbdCmd(ctx, false, noBlocklist("snap", "create", handle+"@"+generation)...); err != nil {
 			return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
 				fmt.Errorf("ceph: freeze immutable candidate for %q: %w", volume.Key, err))
 		}
@@ -701,7 +701,7 @@ func (c *Client) snapshotAt(
 		}
 	}
 
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "rm", stage)...); err != nil {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("snap", "rm", stage)...); err != nil {
 		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
 			fmt.Errorf("ceph: remove cache staging snapshot: %w", err))
 	}
@@ -778,7 +778,7 @@ func (c *Client) compactCacheCandidate(
 	if err := c.compactCacheImage(ctx, source, destination); err != nil {
 		return err
 	}
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "create", destination+"@"+generation)...); err != nil {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("snap", "create", destination+"@"+generation)...); err != nil {
 		return fmt.Errorf("ceph: freeze compacted cache candidate: %w", err)
 	}
 
@@ -845,7 +845,7 @@ func (c *Client) compactCacheImage(ctx context.Context, source, destination stri
 		return fmt.Errorf("ceph: compact cache lineage: %w", err)
 	}
 	if _, err := c.run(compactCtx, c.bin, append(c.identity(),
-		keepKernelClient("flatten", destination)...)); err != nil {
+		noBlocklist("flatten", destination)...)); err != nil {
 		return errors.Join(fmt.Errorf("ceph: compact cache lineage: %w", err),
 			c.removePartialCompaction(ctx, destination))
 	}
@@ -860,7 +860,7 @@ func (c *Client) removePartialCompaction(ctx context.Context, image string) erro
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partialCompactionLimit)
 	defer cancel()
 
-	if _, err := c.run(cleanupCtx, c.bin, append(c.identity(), keepKernelClient("rm", image)...)); err != nil &&
+	if _, err := c.run(cleanupCtx, c.bin, append(c.identity(), noBlocklist("rm", image)...)); err != nil &&
 		!isNoSuchFile(err) {
 		return fmt.Errorf("ceph: remove the partial compaction %s, which is left for eviction: %w", image, err)
 	}
@@ -879,7 +879,7 @@ func (c *Client) cleanupSnapshotFailure(
 
 	var failures []error
 	if candidate != "" {
-		if _, err := c.rbdCmd(cleanupCtx, false, keepKernelClient("snap", "purge", candidate)...); err != nil &&
+		if _, err := c.rbdCmd(cleanupCtx, false, noBlocklist("snap", "purge", candidate)...); err != nil &&
 			!isNoSuchFile(err) {
 			failures = append(failures, err)
 		}
@@ -888,7 +888,7 @@ func (c *Client) cleanupSnapshotFailure(
 		}
 	}
 	if stage != "" {
-		if _, err := c.rbdCmd(cleanupCtx, false, keepKernelClient("snap", "rm", stage)...); err != nil &&
+		if _, err := c.rbdCmd(cleanupCtx, false, noBlocklist("snap", "rm", stage)...); err != nil &&
 			!isNoSuchFile(err) {
 			failures = append(failures, err)
 		}
@@ -1279,7 +1279,7 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 // copy-on-write child still reads, or an image still open, before it deletes
 // anything. A generation never goes to the trash, where neither is refused.
 func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("rm", handle)...); err != nil && !isNoSuchFile(err) {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("rm", handle)...); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: remove cache image %s: %w", handle, err)
 	}
 
@@ -1320,12 +1320,12 @@ func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 	// can leave its staging snapshot behind, and in the trash that snapshot makes
 	// every `trash rm` answer ENOTEMPTY, which the purge takes for a live child and
 	// waits on forever; listed, the next discard purges it.
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "purge", handle)...); err != nil && !isNoSuchFile(err) {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("snap", "purge", handle)...); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: purge the snapshots of cache volume %s before the trash: %w",
 			handle, err)
 	}
 
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("trash", "mv", handle)...); err != nil && !isNoSuchFile(err) {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("trash", "mv", handle)...); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: move cache volume %s to the trash: %w", handle, err)
 	}
 
@@ -1541,7 +1541,7 @@ func (c *Client) purgeTrashEntries(ctx context.Context, budget *yieldBudget) (in
 				// READ BEFORE THE ASK, so a removal racing it makes the entry due.
 				removals := c.cacheRemovals.Load()
 
-				err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
+				err := c.rbdCmdWithin(ctx, PurgeTimeout, noBlocklist("trash", "rm", d.handle)...)
 
 				// A MOVE INTO THE TRASH THAT WAS INTERRUPTED is finished, then
 				// deleted: librbd refuses to remove an entry still marked moving,
@@ -1558,7 +1558,7 @@ func (c *Client) purgeTrashEntries(ctx context.Context, budget *yieldBudget) (in
 
 						continue
 					}
-					err = c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
+					err = c.rbdCmdWithin(ctx, PurgeTimeout, noBlocklist("trash", "rm", d.handle)...)
 				}
 
 				mu.Lock()
@@ -1726,7 +1726,7 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 
 		c.waitForQuietIO(ctx, budget)
 
-		if err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("rm", handle)...); err != nil &&
+		if err := c.rbdCmdWithin(ctx, PurgeTimeout, noBlocklist("rm", handle)...); err != nil &&
 			!isNoSuchFile(err) {
 			c.halfRemoved[name] = first
 
@@ -1752,7 +1752,7 @@ func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
 			"named is retired", bounded(handle))
 	}
 
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("trash", "mv", handle)...); err != nil {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("trash", "mv", handle)...); err != nil {
 		return fmt.Errorf("ceph: retire cache volume %s: %w", handle, err)
 	}
 
@@ -2195,7 +2195,7 @@ func (c *Client) evictGeneration(
 		return false, nil
 	}
 
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "purge", handle)...); err != nil && !isNoSuchFile(err) {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("snap", "purge", handle)...); err != nil && !isNoSuchFile(err) {
 		return false, fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
 	}
 
@@ -2345,7 +2345,7 @@ func (c *Client) resumeTrashMove(ctx context.Context, name string) error {
 			"move is not resumed: %w", handle, err)
 	}
 
-	if err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "mv", handle)...); err != nil {
+	if err := c.rbdCmdWithin(ctx, PurgeTimeout, noBlocklist("trash", "mv", handle)...); err != nil {
 		return fmt.Errorf("ceph: finish the interrupted trash move of %s: %w", handle, err)
 	}
 

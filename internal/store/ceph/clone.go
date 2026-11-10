@@ -340,7 +340,7 @@ func (c *Client) unmapDevice(ctx context.Context, device, name string) error {
 	// flight logged "failed to unlock header: -512", and the root disk's discard
 	// blocklisted the node's kernel client twenty-eight seconds later. Each attempt
 	// still ends at its own bound, MapTimeout, because unmap does the same kernel
-	// work a map does; a kill there remains possible and is what keepKernelClient
+	// work a map does; a kill there remains possible and is what noBlocklist
 	// covers.
 	detached := context.WithoutCancel(ctx)
 	started := time.Now()
@@ -404,7 +404,7 @@ func isDeviceBusy(err error) bool {
 func (c *Client) removeClone(ctx context.Context, name string) error {
 	spec := c.cfg.CachePool + "/" + name
 
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("trash", "mv", spec)...); err != nil {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("trash", "mv", spec)...); err != nil {
 		if isNoSuchFile(err) {
 			return nil
 		}

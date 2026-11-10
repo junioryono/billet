@@ -63,7 +63,7 @@ func (c *Client) publishRootAt(ctx context.Context, name, golden string, now tim
 	// on a context of its own, since the usual reason it failed is that the caller's
 	// ended: a snapshot that may exist is removed, and a rename that may have happened
 	// is renamed back from whichever name holds the clone (WithdrawRoot).
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "create",
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("snap", "create",
 		clone+"@"+generation)...); err != nil {
 		err = fmt.Errorf("ceph: snapshot the root disk %s as %s as client.%s: %w",
 			clone, generation, c.cfg.User, err)
@@ -75,7 +75,7 @@ func (c *Client) publishRootAt(ctx context.Context, name, golden string, now tim
 		return "", err
 	}
 
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("rename", clone, disk)...); err != nil {
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("rename", clone, disk)...); err != nil {
 		err = fmt.Errorf("ceph: rename %s to %s as client.%s: %w", clone, disk, c.cfg.User, err)
 		if undoErr := c.WithdrawRoot(context.WithoutCancel(ctx), golden+"@"+generation, name); undoErr != nil {
 			return "", fmt.Errorf("%w (and it could not be undone, so %s may hold the builder's disk with "+
@@ -107,7 +107,7 @@ func (c *Client) WithdrawRoot(ctx context.Context, ref, name string) error {
 	disk := c.cfg.CachePool + "/" + golden
 	clone := c.cfg.CachePool + "/" + name
 
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("rename", disk, clone)...); err != nil &&
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("rename", disk, clone)...); err != nil &&
 		!isNoSuchFile(err) {
 		return fmt.Errorf("ceph: rename the unpublished golden %s back to %s as client.%s: %w",
 			disk, clone, c.cfg.User, err)
@@ -168,7 +168,7 @@ func (c *Client) CloneGolden(ctx context.Context, ref, name string) (string, err
 
 // removeSnapshot removes one snapshot, an absent one being success.
 func (c *Client) removeSnapshot(ctx context.Context, spec string) error {
-	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "rm", spec)...); err != nil &&
+	if _, err := c.rbdCmd(ctx, false, noBlocklist("snap", "rm", spec)...); err != nil &&
 		!isNoSuchFile(err) {
 		return fmt.Errorf("ceph: remove the snapshot %s as client.%s: %w", spec, c.cfg.User, err)
 	}
