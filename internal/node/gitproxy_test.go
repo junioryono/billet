@@ -410,6 +410,12 @@ func gitNodeOnClock(t *testing.T, upstream *gitUpstream) (*CacheService, *httpte
 	service, _, token, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
 	service.git.upstream, service.git.api = upstream.URL, upstream.URL+"/api"
 	service.git.fullFraction = 1
+	// A FAILURE GUARD, NOT production's ten seconds: an advertisement waits this long
+	// for its mirror's refresh and is then GitHub's, and a loaded runner's refresh
+	// outlasted ten seconds, so a test that expected the mirror to answer saw
+	// GitHub answer (TestARefreshFetchesOnlyWhatMoved, CI 2026-11-05 and -06). A
+	// test of the wait itself sets its own.
+	service.git.refreshWait = gitGuard
 	clock := clockNode(service)
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
