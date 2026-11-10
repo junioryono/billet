@@ -417,10 +417,16 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 	// with nothing to do with draining.
 	var launches, total atomic.Int32
 
+	// THE FLAG IS READ BEFORE THE LAUNCH IS COUNTED. The test sets the flag once it
+	// sees the count, so counting first left a window between the two in which the
+	// flag was set while the first launch was still here, and that launch then
+	// counted itself as one the drain permitted (#760).
 	runner := &fakeRunner{onLaunch: func(int64) error {
+		duringDrain := draining.Load()
+
 		total.Add(1)
 
-		if draining.Load() {
+		if duringDrain {
 			launches.Add(1)
 		}
 
@@ -440,12 +446,25 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 	// flag must not be set while the pre-drain launch is still inside the runner.
 	waitUntil(deadline, t, "the first launch to complete", func() bool { return total.Load() == 1 })
 
+	// NOR WHILE THE LISTENER IS STILL SETTLING IT. Leaving the runner is not the end
+	// of a launch: the listener then registers the runner, on the context the cancel
+	// below ends, and that registration is the launch's last write.
+	waitUntil(deadline, t, "the first launch's runner to be registered", func() bool {
+		runners, err := a.PoolRunners(deadline, "billet-4vcpu-a")
+
+		return err == nil && len(runners) == 1
+	})
+
 	draining.Store(true)
 	cancel()
 
 	waitUntil(deadline, t, "the drain to be advertising just the running job", func() bool {
 		return l.Running() == 1 && len(l.Held()) == 0
 	})
+
+	// THE DRAIN HAS BEGUN before the offer is made, or a refusal would prove only
+	// that a listener not yet draining was never offered anything.
+	awaitDrainStart(deadline, t, &dl, run)
 
 	close(offerNow)
 	waitUntil(deadline, t, "the offer to be delivered", offered.Load)
