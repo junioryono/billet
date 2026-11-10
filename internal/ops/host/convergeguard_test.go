@@ -465,6 +465,14 @@ func TestGuardHelperProcess(t *testing.T) {
 
 		announce(fmt.Sprintf("%s:%d", guardHelperReadyMsg, os.Getpid()))
 		waitForParent()
+
+		// f IS KEPT REACHABLE THROUGH THE WAIT by this use, since a finalized f
+		// closes its descriptor and so releases the flock; and it is closed before
+		// RELEASED is said. A parent that closes stdin ends this process instead.
+		if err := f.Close(); err != nil {
+			t.Fatalf("helper close: %v", err)
+		}
+
 		announce("RELEASED")
 
 		return
