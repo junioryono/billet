@@ -143,9 +143,14 @@ func TestASocketFlushThenSIGTERMSendsExactlyOneFinalBatch(t *testing.T) {
 		t.Fatalf("%d posts, %d final, want the one final batch", len(posts), finals(posts))
 	}
 
-	if _, err := os.Lstat(socket); !os.IsNotExist(err) {
-		t.Errorf("the socket outlived the agent: %v", err)
-	}
+	// REMOVED, NOT REMOVED BY THE TIME Run RETURNS: Run answers a cancellation within
+	// exitBudget whatever its teardown is doing, and the teardown that closes the
+	// listener, and so removes the socket, goes on after it.
+	waitFor(t, "the socket to be removed", func() bool {
+		_, err := os.Lstat(socket)
+
+		return os.IsNotExist(err)
+	})
 }
 
 // A connection is answered once the final flush is done, or after 2 s whatever
