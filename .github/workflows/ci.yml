@@ -207,11 +207,17 @@ jobs:
         run: |
           sudo mount -t tmpfs -o mode=1777,nosuid,nodev,size=32g billet-test-tmp /tmp
           findmnt /tmp
+          # A SAMPLE THAT CANNOT BE READ CHANGES NOTHING: the maximum is kept, and
+          # written whole by a rename, so the report reads the last good one.
           (
+            set +e
             peak=0
             while sleep 5; do
-              used=$(df --output=used -B1M /tmp | tail -n 1 | tr -d ' ')
-              [ "$used" -le "$peak" ] || { peak=$used; echo "$peak" >"$RUNNER_TEMP/tmp-peak-mib"; }
+              used=$(df --output=used -B1M /tmp 2>/dev/null | tail -n 1 | tr -d ' ')
+              case "$used" in '' | *[!0-9]*) continue ;; esac
+              [ "$used" -gt "$peak" ] || continue
+              peak=$used
+              echo "$peak" >"$RUNNER_TEMP/tmp-peak-mib.next" && mv -f "$RUNNER_TEMP/tmp-peak-mib.next" "$RUNNER_TEMP/tmp-peak-mib"
             done
           ) >/dev/null 2>&1 &
 
@@ -238,11 +244,16 @@ jobs:
             | tee test-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
 
+      # A DIAGNOSTIC, so nothing here can fail the job.
       - name: Report how much of /tmp the suite used
         if: always()
         run: |
-          echo "the suite's /tmp peaked at $(cat "$RUNNER_TEMP/tmp-peak-mib" 2>/dev/null || echo "an unsampled amount of") MiB of 32768"
-          df -h /tmp
+          peak=$(cat "$RUNNER_TEMP/tmp-peak-mib" 2>/dev/null || true)
+          case "$peak" in
+          '' | *[!0-9]*) echo "the suite's use of /tmp was not sampled" ;;
+          *) echo "the suite's /tmp: at most ${peak} MiB of 32768 in any sample, taken every 5 s" ;;
+          esac
+          df -h /tmp || echo "could not read /tmp's use now"
 
       - name: Report the slowest tests
         if: always()
