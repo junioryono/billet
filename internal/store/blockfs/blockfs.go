@@ -181,22 +181,32 @@ var ErrHeld = errors.New("blockfs: the device is still held")
 // could-not-tell, and both refuse: a caller about to take a device away from the host
 // does it only on this proof.
 //
-// FOUR WAYS A DEVICE IS HELD, and an exclusive open answers only two of them. A mount,
+// FIVE WAYS A DEVICE IS HELD, and an exclusive open answers only two of them. A mount,
 // in any mount namespace, and a device mapper or md array stacked on it each claim the
 // device, so an O_EXCL open of it fails with EBUSY. A process that opened it without
-// O_EXCL — a VMM serving it to a guest — claims nothing, so every process's open files
-// are read for a file whose device number is this one. And a loop device backed by it
-// keeps the kernel's own reference after the process that set it up has closed its
-// descriptor, claiming nothing either, so every configured loop device's backing file is
-// read too. EBS DETACHES A MOUNTED VOLUME
+// O_EXCL — a VMM serving it to a guest — claims nothing, so every thread's open files are
+// read for a file whose device number is this one, and every process's mappings, since a
+// shared mapping keeps the file after its descriptor is closed. A loop device backed by
+// it keeps the kernel's own reference after its setup closed its descriptor, so every
+// configured loop's backing device is asked of the kernel. And a partition is a device
+// of its own number, whose openers none of those see, so a device with partitions is
+// refused outright: billet formats its cache volumes whole. EBS DETACHES A MOUNTED VOLUME
 // WITHOUT REFUSING: measured on 2026-11-09 (us-west-2, t3.small), a detach of an ext4
 // volume mounted on the host completed in 4.4 s, and the kernel aborted its journal on
 // the I/O errors that followed. Nothing on AWS's side stops it, so this is what does.
 func Unheld(device string) error {
-	return unheld(device, "/proc", "/sys/block")
+	return unheld(device, hostView{proc: "/proc", sysBlock: "/sys/block", sysDev: "/sys/dev/block",
+		loopBacking: loopBacking})
 }
 
-func unheld(device, procRoot, sysBlock string) error {
+// hostView is where Unheld reads the host: the process table, the block devices and the
+// kernel's own answer for a loop device's backing (loopBacking), each a test's to stage.
+type hostView struct {
+	proc, sysBlock, sysDev string
+	loopBacking            func(loop string) (rdev uint64, configured bool, err error)
+}
+
+func unheld(device string, host hostView) error {
 	var st unix.Stat_t
 	if err := unix.Stat(device, &st); err != nil {
 		return fmt.Errorf("blockfs: stat %s: %w", device, err)
@@ -207,6 +217,10 @@ func unheld(device, procRoot, sysBlock string) error {
 	}
 
 	rdev := rdevOf(&st)
+
+	if err := refusePartitions(host.sysDev, device, rdev); err != nil {
+		return err
+	}
 
 	fd, err := unix.Open(device, unix.O_RDONLY|unix.O_EXCL|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -221,7 +235,7 @@ func unheld(device, procRoot, sysBlock string) error {
 		return fmt.Errorf("blockfs: close %s: %w", device, err)
 	}
 
-	holder, err := openedBy(procRoot, rdev)
+	holder, err := openedBy(host.proc, rdev)
 	if err != nil {
 		return err
 	}
@@ -230,7 +244,7 @@ func unheld(device, procRoot, sysBlock string) error {
 		return fmt.Errorf("%w: process %s has %s open", ErrHeld, holder, device)
 	}
 
-	loop, err := loopBackedBy(sysBlock, rdev)
+	loop, err := loopBackedBy(host.sysBlock, rdev, host.loopBacking)
 	if err != nil {
 		return err
 	}
@@ -242,10 +256,43 @@ func unheld(device, procRoot, sysBlock string) error {
 	return nil
 }
 
-// loopBackedBy names a configured loop device whose backing file is the block device
-// with device number rdev, or "" when none is. A loop device that is not configured has
-// no backing_file; any other failure to read one is could-not-tell.
-func loopBackedBy(sysBlock string, rdev uint64) (string, error) {
+// refusePartitions refuses a device with partitions, read from sysfs by its number: a
+// partition is a device of its own number, held by openers the scans of this device's
+// number never see. A device sysfs does not show is could-not-tell.
+func refusePartitions(sysDev, device string, rdev uint64) error {
+	dir := filepath.Join(sysDev, fmt.Sprintf("%d:%d", unix.Major(rdev), unix.Minor(rdev)))
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("blockfs: read %s's partitions: %w", device, err)
+	}
+
+	for _, entry := range entries {
+		// A PARTITION IS A DIRECTORY with a "partition" file; the device's attributes
+		// beside it are files, which stat answers ENOTDIR under (measured on a t3.small,
+		// 2026-11-10: alignment_offset).
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, entry.Name(), "partition")); err == nil {
+			return fmt.Errorf("%w: %s has a partition, %s, whose holders are not this device's", ErrHeld,
+				device, entry.Name())
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("blockfs: read %s's partitions: %w", device, err)
+		}
+	}
+
+	return nil
+}
+
+// loopBackedBy names a configured loop device whose backing device is the one with
+// device number rdev, or "" when none is. Each loop's backing is the kernel's own answer
+// (backing), never its pathname, which can name another file than the one the loop holds
+// (a path unlinked since, or one spelled with trailing spaces); a loop the kernel cannot
+// answer for is could-not-tell.
+func loopBackedBy(
+	sysBlock string, rdev uint64, backing func(loop string) (uint64, bool, error),
+) (string, error) {
 	entries, err := os.ReadDir(sysBlock)
 	if err != nil {
 		return "", fmt.Errorf("blockfs: list block devices: %w", err)
@@ -257,26 +304,12 @@ func loopBackedBy(sysBlock string, rdev uint64) (string, error) {
 			continue
 		}
 
-		body, err := os.ReadFile(filepath.Join(sysBlock, name, "loop", "backing_file"))
+		backed, configured, err := backing(name)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-
-			return "", fmt.Errorf("blockfs: read %s's backing file: %w", name, err)
+			return "", fmt.Errorf("blockfs: ask the kernel what %s is backed by: %w", name, err)
 		}
 
-		// A BACKING FILE THAT NO LONGER RESOLVES IS COULD-NOT-TELL. The kernel keeps the
-		// file it was given, and a path unlinked since ("… (deleted)") may have been a
-		// second node of this very device, so a loop whose backing cannot be named
-		// refuses rather than reads as another file's.
-		var st unix.Stat_t
-		if err := unix.Stat(strings.TrimSpace(string(body)), &st); err != nil {
-			return "", fmt.Errorf("blockfs: %s's backing file cannot be identified, so it may be this device: %w",
-				name, err)
-		}
-
-		if st.Mode&unix.S_IFMT == unix.S_IFBLK && rdevOf(&st) == rdev {
+		if configured && backed == rdev {
 			return name, nil
 		}
 	}
@@ -301,6 +334,16 @@ func openedBy(procRoot string, rdev uint64) (string, error) {
 		pid := entry.Name()
 		if _, err := strconv.Atoi(pid); err != nil {
 			continue
+		}
+
+		// A SHARED MAPPING keeps the file after its descriptor is closed, and a process's
+		// mappings are its whole thread group's.
+		mapped, err := tableHolds(filepath.Join(procRoot, pid, "map_files"), rdev)
+		if err != nil {
+			return "", fmt.Errorf("blockfs: read process %s's mappings: %w", pid, err)
+		}
+		if mapped {
+			return pid, nil
 		}
 
 		tasks, err := os.ReadDir(filepath.Join(procRoot, pid, "task"))

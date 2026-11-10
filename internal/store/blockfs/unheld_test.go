@@ -2,6 +2,7 @@ package blockfs
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -164,66 +165,119 @@ func TestUnreadableOpenFilesAreCouldNotTell(t *testing.T) {
 	}
 }
 
-// A LOOP DEVICE BACKED BY THE DEVICE HOLDS IT, with no process's descriptor to show for
-// it; an unconfigured loop device and one backed by another file hold nothing; and a
-// backing file that cannot be read, or no longer resolves, is could-not-tell.
+// A LOOP DEVICE BACKED BY THE DEVICE HOLDS IT, by the kernel's own answer for its backing
+// and never its pathname; an unconfigured loop and one backed by something else hold
+// nothing; and a loop the kernel cannot answer for is could-not-tell.
 func TestALoopDeviceBackedByTheDeviceHoldsIt(t *testing.T) {
-	device, rdev := someBlockDevice(t)
+	const rdev = 0x10300
 	sysBlock := t.TempDir()
-
-	backing := func(name, body string) {
-		t.Helper()
-		dir := filepath.Join(sysBlock, name, "loop")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "backing_file"), []byte(body+"\n"), 0o644); err != nil {
+	for _, name := range []string{"loop0", "loop1", "loop2", "nvme0n1"} {
+		if err := os.MkdirAll(filepath.Join(sysBlock, name), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.MkdirAll(filepath.Join(sysBlock, "loop0"), 0o755); err != nil {
-		t.Fatal(err)
+	answers := map[string]struct {
+		rdev       uint64
+		configured bool
+		err        error
+	}{
+		"loop0": {},
+		"loop1": {rdev: 0x10301, configured: true},
+		"loop2": {rdev: 0, configured: true},
 	}
-	if err := os.MkdirAll(filepath.Join(sysBlock, "nvme0n1", "loop"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	backing("loop1", "/dev/null")
-
-	if loop, err := loopBackedBy(sysBlock, rdev); err != nil || loop != "" {
-		t.Fatalf("no loop backed by %s was answered %q, %v", device, loop, err)
-	}
-
-	backing("loop3", device)
-	if loop, err := loopBackedBy(sysBlock, rdev); err != nil || loop != "loop3" {
-		t.Fatalf("a loop backed by %s was answered %q, %v; want loop3", device, loop, err)
-	}
-	if err := os.RemoveAll(filepath.Join(sysBlock, "loop3")); err != nil {
-		t.Fatal(err)
-	}
-
-	// A BACKING FILE THAT NO LONGER RESOLVES may have been a second node of this device.
-	backing("loop2", filepath.Join(sysBlock, "gone")+" (deleted)")
-	if loop, err := loopBackedBy(sysBlock, rdev); err == nil || !strings.Contains(err.Error(), "cannot be identified") {
-		t.Fatalf("a loop whose backing file is gone was answered %q, %v", loop, err)
-	}
-	if err := os.RemoveAll(filepath.Join(sysBlock, "loop2")); err != nil {
-		t.Fatal(err)
-	}
-
-	if os.Geteuid() != 0 {
-		unreadable := filepath.Join(sysBlock, "loop1", "loop", "backing_file")
-		if err := os.Chmod(unreadable, 0); err != nil {
-			t.Fatal(err)
+	backing := func(loop string) (uint64, bool, error) {
+		if loop == "nvme0n1" {
+			t.Errorf("a device that is not a loop was asked for its backing")
 		}
-		if loop, err := loopBackedBy(sysBlock, rdev); err == nil {
-			t.Fatalf("an unreadable backing file was read as holding nothing (%q)", loop)
-		}
+		a := answers[loop]
+
+		return a.rdev, a.configured, a.err
+	}
+
+	if loop, err := loopBackedBy(sysBlock, rdev, backing); err != nil || loop != "" {
+		t.Fatalf("no loop backed by the device was answered %q, %v", loop, err)
+	}
+
+	answers["loop2"] = struct {
+		rdev       uint64
+		configured bool
+		err        error
+	}{rdev: rdev, configured: true}
+	if loop, err := loopBackedBy(sysBlock, rdev, backing); err != nil || loop != "loop2" {
+		t.Fatalf("a loop backed by the device was answered %q, %v; want loop2", loop, err)
+	}
+
+	answers["loop1"] = struct {
+		rdev       uint64
+		configured bool
+		err        error
+	}{err: errors.New("permission denied")}
+	if loop, err := loopBackedBy(sysBlock, rdev, backing); err == nil || !strings.Contains(err.Error(), "loop1") {
+		t.Fatalf("a loop the kernel would not answer for was answered %q, %v", loop, err)
+	}
+}
+
+// A SHARED MAPPING HOLDS THE DEVICE AFTER ITS DESCRIPTOR IS CLOSED, so a process whose
+// mappings name it holds it, with nothing in any descriptor table.
+func TestAMappingHoldsTheDevice(t *testing.T) {
+	device, rdev := someBlockDevice(t)
+	procRoot := t.TempDir()
+
+	stageProcess(t, procRoot, "500", "/dev/null")
+	maps := filepath.Join(procRoot, "500", "map_files")
+	if err := os.MkdirAll(maps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(device, filepath.Join(maps, "7f0000000000-7f0000001000")); err != nil {
+		t.Fatal(err)
+	}
+
+	holder, err := openedBy(procRoot, rdev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if holder != "500" {
+		t.Fatalf("a process mapping %s was reported as %q, want 500", device, holder)
+	}
+}
+
+// A DEVICE WITH A PARTITION IS HELD for all its own number's scans can tell, and one
+// sysfs does not show is could-not-tell.
+func TestADeviceWithAPartitionIsRefused(t *testing.T) {
+	const rdev = 0x10300
+	sysDev := t.TempDir()
+	dir := filepath.Join(sysDev, fmt.Sprintf("%d:%d", unix.Major(rdev), unix.Minor(rdev)))
+	if err := os.MkdirAll(filepath.Join(dir, "queue"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// AN ATTRIBUTE IS A FILE, under which nothing is a partition.
+	if err := os.WriteFile(filepath.Join(dir, "alignment_offset"), []byte("0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := refusePartitions(sysDev, "/dev/nvme3n1", rdev); err != nil {
+		t.Fatalf("a whole disk with no partition was answered %v", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(dir, "nvme3n1p1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "nvme3n1p1", "partition"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := refusePartitions(sysDev, "/dev/nvme3n1", rdev); !errors.Is(err, ErrHeld) ||
+		!strings.Contains(err.Error(), "nvme3n1p1") {
+		t.Fatalf("a disk with a partition was answered %v", err)
+	}
+
+	if err := refusePartitions(t.TempDir(), "/dev/nvme3n1", rdev); err == nil || errors.Is(err, ErrHeld) {
+		t.Fatalf("a device sysfs does not show was answered %v; want could-not-tell", err)
 	}
 }
 
 // A PATH THAT IS NOT A BLOCK DEVICE IS REFUSED before anything is opened.
 func TestUnheldRefusesWhatIsNotABlockDevice(t *testing.T) {
-	err := unheld("/dev/null", t.TempDir(), t.TempDir())
+	err := unheld("/dev/null", hostView{})
 	if err == nil || errors.Is(err, ErrHeld) || !strings.Contains(err.Error(), "not a block device") {
 		t.Fatalf("a character device was answered %v", err)
 	}
@@ -235,14 +289,26 @@ func TestAHeldDeviceIsErrHeld(t *testing.T) {
 		t.Skip("an exclusive open of a block device needs root")
 	}
 
-	device, _ := someBlockDevice(t)
+	device, rdev := someBlockDevice(t)
+	// A DEVICE IN USE ON THIS HOST is refused by the exclusive open before the staged
+	// process is read, which is not what this test is about.
+	fd, err := unix.Open(device, unix.O_RDONLY|unix.O_EXCL|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Skipf("%s cannot be opened exclusively here (%v)", device, err)
+	}
+	if err := unix.Close(fd); err != nil {
+		t.Fatal(err)
+	}
+
 	procRoot := t.TempDir()
-
 	stageProcess(t, procRoot, "300", device)
+	sysDev := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(sysDev, fmt.Sprintf("%d:%d", unix.Major(rdev), unix.Minor(rdev))), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
-	err := unheld(device, procRoot, t.TempDir())
-	// BY THE STAGED PROCESS, not by an exclusive open a mount refused, which the device
-	// the test found may well have.
+	err = unheld(device, hostView{proc: procRoot, sysBlock: t.TempDir(), sysDev: sysDev,
+		loopBacking: func(string) (uint64, bool, error) { return 0, false, nil }})
 	if !errors.Is(err, ErrHeld) || !strings.Contains(err.Error(), "process 300 has") {
 		t.Fatalf("a device a process holds was answered %v; want it named as process 300's", err)
 	}
