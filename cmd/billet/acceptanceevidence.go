@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/app"
-	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
@@ -253,10 +252,7 @@ func writeAcceptanceEvidence(ctx context.Context, env cli.Env, ws acceptanceWork
 func collectAcceptanceEvidence(
 	ctx context.Context, ws acceptanceWorkspace,
 ) (acceptanceEvidenceDoc, error) {
-	if err := requireAcceptancePoolLedger(ctx, ws); err != nil {
-		return acceptanceEvidenceDoc{}, err
-	}
-	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	db, cfg, err := openAcceptanceLedger(ctx, ws)
 	if err != nil {
 		return acceptanceEvidenceDoc{}, err
 	}
@@ -494,7 +490,7 @@ func readAcceptancePool(ctx context.Context, ws acceptanceWorkspace) ([]acceptan
 }
 
 func readAcceptanceJobs(ctx context.Context, ws acceptanceWorkspace) ([]acceptanceJob, error) {
-	db, _, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	db, _, err := openAcceptanceLedger(ctx, ws)
 	if err != nil {
 		return nil, err
 	}

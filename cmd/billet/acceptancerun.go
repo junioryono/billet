@@ -327,7 +327,7 @@ func refuseASealedWorkspace(ctx context.Context, env cli.Env, ws acceptanceWorks
 func proveAcceptanceComputeClear(
 	ctx context.Context, env cli.Env, ws acceptanceWorkspace, wait time.Duration,
 ) (bool, error) {
-	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	db, cfg, err := openAcceptanceLedger(ctx, ws)
 	if err != nil {
 		return false, fmt.Errorf("open this run's ledger: %w", err)
 	}

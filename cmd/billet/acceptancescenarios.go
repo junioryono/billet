@@ -177,7 +177,7 @@ func judgeShrinkIdle(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixS
 		if len(nodeJobs(o.Node, doc, scope)) > 0 {
 			witnessed = true
 		}
-		wrong = append(wrong, judgeShrunkOrder(o, doc, scope)...)
+		wrong = append(wrong, judgeShrunkOrder(o, doc)...)
 	}
 	switch {
 	case len(wrong) > 0:
@@ -197,7 +197,7 @@ func judgeShrinkIdle(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixS
 // judgeShrunkOrder is what is wrong with one order the pool's own shrink released: its
 // release not completed on its source's word, a job on its host disrupted, or one that
 // ended after the release was asked.
-func judgeShrunkOrder(o *acceptancePoolOrder, doc acceptanceEvidenceDoc, scope matrixScope) []string {
+func judgeShrunkOrder(o *acceptancePoolOrder, doc acceptanceEvidenceDoc) []string {
 	var wrong []string
 	asked, err := time.Parse(time.RFC3339Nano, o.ReleaseRequested)
 	if err != nil {
@@ -214,7 +214,9 @@ func judgeShrunkOrder(o *acceptancePoolOrder, doc acceptanceEvidenceDoc, scope m
 	default:
 		wrong = append(wrong, fmt.Sprintf("%s: released by the shrink and still %s", o.ID, o.State))
 	}
-	jobs := nodeJobs(o.Node, doc, scope)
+	// EVERY JOB ON THE HOST, OF THIS RUN OR NOT: the run's jobs witness the shrink, and
+	// any job the release could have cut short is the shrink's to answer for.
+	jobs := nodeJobs(o.Node, doc, matrixScope{})
 	for k := range jobs {
 		j := &jobs[k]
 		if j.Disruption != "" {

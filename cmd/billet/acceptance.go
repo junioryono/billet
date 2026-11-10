@@ -18,6 +18,7 @@ import (
 	"github.com/junioryono/billet/internal/awssts"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/ops/fleetops"
 	"github.com/junioryono/billet/internal/ops/host"
 	"github.com/junioryono/billet/internal/state"
 
@@ -538,6 +539,18 @@ func requireAcceptancePoolLedger(ctx context.Context, ws acceptanceWorkspace) er
 	}
 
 	return prepareAcceptancePoolLedger(ctx, ws.ConfigPath, true)
+}
+
+// openAcceptanceLedger is every operator open of a run's ledger after `up`: a pool's run's
+// must already exist, because the operator open creates one where there is none and an
+// empty ledger reads as a pool that ordered nothing. The check is a moment before the
+// open, which no other process of the run's opens the ledger between.
+func openAcceptanceLedger(ctx context.Context, ws acceptanceWorkspace) (*state.DB, *config.Config, error) {
+	if err := requireAcceptancePoolLedger(ctx, ws); err != nil {
+		return nil, nil, err
+	}
+
+	return fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
 }
 
 // requireEmptyWorkspace refuses a directory that already holds something.

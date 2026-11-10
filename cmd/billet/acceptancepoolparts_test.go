@@ -174,6 +174,34 @@ func TestAnIdleShrinkIsCompletedByItsSourceNotAPerson(t *testing.T) {
 	}
 }
 
+// THE SHRINK ANSWERS FOR EVERY JOB ON THE HOST, OF THIS RUN OR NOT: the run's job
+// witnesses it, and another run's job on the same host that ended after the release was
+// asked, or was disrupted, fails it.
+func TestAnIdleShrinkAnswersForEveryJobOnItsHost(t *testing.T) {
+	t.Parallel()
+
+	mine := poolJob()
+	mine.GitHubRunID = 1
+	scope := matrixScope{tiers: matrixTestTiers(), runs: map[int64]bool{1: true}}
+	judge := func(doc acceptanceEvidenceDoc) matrixScenario {
+		return scenarioOf(t, judgeMatrix(matrixCells(), doc, scope), scenarioShrinkIdle)
+	}
+	if s := judge(poolEvidence(mine)); s.Verdict != verdictPass {
+		t.Fatalf("this run's job alone: %+v; want a pass", s)
+	}
+
+	late := poolJob()
+	late.LeaseID, late.GitHubRunID, late.FinishedAt = "l-other", 2, "2026-11-05T11:05:00Z"
+	if s := judge(poolEvidence(mine, late)); s.Verdict != verdictFail || !strings.Contains(s.Reason, "l-other") {
+		t.Errorf("another run's job ending after the release: %+v; want a fail naming it", s)
+	}
+	cut := poolJob()
+	cut.LeaseID, cut.GitHubRunID, cut.Disruption = "l-cut", 2, "host-lost"
+	if s := judge(poolEvidence(mine, cut)); s.Verdict != verdictFail || !strings.Contains(s.Reason, "l-cut") {
+		t.Errorf("another run's job disrupted on the host: %+v; want a fail naming it", s)
+	}
+}
+
 // A POOL CELL'S JOB RAN ON A HOST ITS ORDER RENTED AS THE CELL'S ARCHITECTURE: a job of
 // an x64 tier on a host ordered as arm64 is no x64 cell's.
 func TestAPoolCellReadsOnlyHostsOfItsArchitecture(t *testing.T) {
@@ -514,6 +542,52 @@ func TestATeardownKnowsAPoolsRunFromItsConfig(t *testing.T) {
 	node := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), t.TempDir())
 	if _, _, isPool, err := acceptancePoolFor(t.Context(), node); isPool || err != nil {
 		t.Errorf("a run with a node was torn down as a pool's: %v, %v", isPool, err)
+	}
+}
+
+// AN ORDER PLACED WHILE THE TEARDOWN RAN FAILS IT: the snapshot the teardown proved gone
+// is read again once the control plane is proved stopped again, and an order it did not
+// hold is one no step proved gone.
+func TestAnOrderPlacedDuringTheTeardownFailsIt(t *testing.T) {
+	t.Parallel()
+
+	prelude := filepath.Join(t.TempDir(), "prelude.sh")
+	if err := os.WriteFile(prelude, []byte("true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := deriveAcceptance(t.Context(), acceptanceInputs{base: writeAcceptanceBase(t, poolBaseConfig),
+		workspace: t.TempDir(), prefix: "accept-pool",
+		fleet: &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sameAcceptancePoolOrders(t.Context(), ws, nil); err != nil {
+		t.Fatalf("a pool that ordered nothing, read twice: %v", err)
+	}
+
+	db, cfg, err := openAcceptanceLedger(t.Context(), ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := app.NewAllocator(cfg, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	placed := alloc.PoolOrder{ID: "p9", Source: config.PoolSourceAWSMetal, Scope: "aws:us-west-2:subnet-0abc:us-west-2a",
+		Shape: "z1d.metal", Location: "us-west-2a", Arch: config.ArchX64}
+	if err := a.RecordPoolOrder(t.Context(), placed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sameAcceptancePoolOrders(t.Context(), ws, nil); !errors.Is(err, errAcceptanceResidue) ||
+		!strings.Contains(err.Error(), "p9") {
+		t.Errorf("an order the snapshot did not hold answered %v", err)
+	}
+	if err := sameAcceptancePoolOrders(t.Context(), ws, []acceptancePoolOrder{{ID: "p9"}}); err != nil {
+		t.Errorf("the same orders read twice answered %v", err)
 	}
 }
 

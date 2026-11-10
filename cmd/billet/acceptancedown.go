@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -157,6 +158,11 @@ func tearDownAcceptanceWithin(
 		if err := pool.sweep(ctx, env, ws.DeploymentID, orders, ended); err != nil {
 			problems = append(problems, err)
 		}
+		// AND THE ORDERS AGAIN, the control plane proved stopped again: an order a
+		// control plane started in between placed is one no step above proved gone.
+		if err := sameAcceptancePoolOrders(ctx, ws, orders); err != nil {
+			problems = append(problems, err)
+		}
 	default:
 		if err := sweepAcceptance(ctx, env, ws, computeProved); err != nil {
 			problems = append(problems, err)
@@ -176,7 +182,7 @@ func tearDownAcceptanceWithin(
 // drainAcceptance seals and waits, through the same code `billet drain --wait`
 // runs.
 func drainAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, wait time.Duration) error {
-	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	db, cfg, err := openAcceptanceLedger(ctx, ws)
 	if err != nil {
 		return fmt.Errorf("open this run's ledger: %w", err)
 	}
@@ -331,6 +337,28 @@ func acceptancePoolFor(ctx context.Context, ws acceptanceWorkspace) (
 	}
 
 	return pool, orders, true, nil
+}
+
+// sameAcceptancePoolOrders reads a pool's run's orders again, once its control plane is
+// proved stopped again, and fails when one is there that before was not: the snapshot
+// the teardown proved gone is complete only if nothing placed an order since.
+func sameAcceptancePoolOrders(ctx context.Context, ws acceptanceWorkspace, before []acceptancePoolOrder) error {
+	_, after, _, err := acceptancePoolFor(ctx, ws)
+	if err != nil {
+		return fmt.Errorf("read the pool's orders again after the teardown: %w", err)
+	}
+	var placed []string
+	for i := range after {
+		if !slices.ContainsFunc(before, func(o acceptancePoolOrder) bool { return o.ID == after[i].ID }) {
+			placed = append(placed, after[i].ID)
+		}
+	}
+	if len(placed) > 0 {
+		return fmt.Errorf("%w: pool order(s) %s were placed while the teardown ran, so it proved none of their "+
+			"hosts gone", errAcceptanceResidue, strings.Join(placed, ", "))
+	}
+
+	return nil
 }
 
 // sweepAcceptance is the final ASK: does anything still carry this deployment.
