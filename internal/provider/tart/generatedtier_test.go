@@ -66,9 +66,9 @@ func TestEveryGeneratedTartTierLaunchesOnThisBackend(t *testing.T) {
 					// one directory every VM shares. With one stub for every tier, the
 					// first launch's claim and pid file were already there for the
 					// second and third, so neither spawned its own command: each proved
-					// the first tier's runner, a `sleep 30`, and a loaded runner that
-					// took more than 30 s over the first two failed the third (#814),
-					// while a later tier whose command could not start passed.
+					// the first tier's runner, then a `sleep 30`, and a loaded runner
+					// that took more than 30 s over the first two failed the third
+					// (#814), while a later tier whose command could not start passed.
 					s := newStub(t)
 					placeRunnerWherePublishedImagesPutIt(t, s)
 					markMeasuredImagesPulled(t, s)
@@ -95,8 +95,9 @@ func TestEveryGeneratedTartTierLaunchesOnThisBackend(t *testing.T) {
 					}
 
 					// THIS TIER'S COMMAND RAN: the fake runner records every start,
-					// and in a guest of its own the one record can only be this
-					// launch's.
+					// and in a guest that held none before the launch, the record can
+					// only be this launch's. It proves the command started, not that it
+					// started once; the claim's own tests hold that.
 					if spawned := s.spawned(t); spawned != 1 {
 						t.Errorf("the launch started %d runner(s) in its guest, want 1", spawned)
 					}
