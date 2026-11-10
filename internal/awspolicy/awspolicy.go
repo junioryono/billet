@@ -624,6 +624,24 @@ func (in Inputs) Build() (Policy, error) {
 			Resource:  []string{"arn:" + partition + ":ec2:*:*:instance/*"},
 			Condition: ownerTagCondition("aws:ResourceTag/"+ec2.PoolOwnerTagKey, in.Owner),
 		})
+
+		// AND THE TAGS A CREATE CARRIES, which EC2 authorizes as ec2:CreateTags of its
+		// own. An ec2 node's runtime statement grants that; a metal node's role launches
+		// nothing and has none, and its first CreateVolume was refused UnauthorizedOperation
+		// under exactly this policy without this statement (2026-11-09). Only the two
+		// creates the store makes, only on the volumes and snapshots they make, and only
+		// with this deployment's owner tag.
+		if in.NoCompute {
+			tags := createTagCondition(in.Owner, false)
+			tags["StringEquals"].(map[string]any)["ec2:CreateAction"] = []string{"CreateVolume", "CreateSnapshot"}
+			p.Statement = append(p.Statement, Statement{
+				Sid: "BilletCacheTag", Effect: "Allow",
+				Action: ec2.RuntimeTagIAMActions(),
+				Resource: []string{"arn:" + partition + ":ec2:*:*:volume/*",
+					"arn:" + partition + ":ec2:*::snapshot/*"},
+				Condition: tags,
+			})
+		}
 	}
 
 	if in.CodeBuild != nil {
