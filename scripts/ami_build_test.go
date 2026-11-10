@@ -87,13 +87,16 @@ exec bash "$REAL_CHECK_COMPONENT" "$@"
 `
 	fakeLayer = "#!/bin/sh\necho layer >>\"$FAKE/calls\"\nexit \"${FAKE_LAYER_STATUS:-0}\"\n"
 	// tee WRITES LATE, as a real one may: the build must wait for it before it
-	// reads its own log.
+	// reads its own log. AND TO THE FILE IT OPENED, as a real one does: reopening
+	// the path for each line recreated the log inside the build's directory while
+	// the build removed it, and the build failed on a directory that was not empty.
 	fakeTee = `#!/bin/bash
 # tee -a FILE, a line at a time, each a little late.
+exec 5>>"$2"
 while IFS= read -r line; do
 	/bin/sleep 0.1
 	printf '%s\n' "$line"
-	[ -n "${FAKE_REMOVE_LOG:-}" ] || printf '%s\n' "$line" >>"$2"
+	[ -n "${FAKE_REMOVE_LOG:-}" ] || printf '%s\n' "$line" >&5
 done
 `
 	// A command the build runs on the machine: logged, and successful.
