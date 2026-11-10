@@ -20,6 +20,8 @@
 #   PRELUDE_OSD_DEVICE                 optional: the OSD's disk, else the first free one
 #   PRELUDE_BUDGET_SECONDS             optional: how long after it starts the prelude
 #                                      still begins a kernel pull (default 5400)
+#   PRELUDE_INIT_ARGS                  optional: the rest of server.pool.init_args, as
+#                                      words (the site, its store, the cache listener)
 #   PRELUDE_STAGING_GB                 optional: the free room the image's staging
 #                                      needs, in 10^9 bytes (default 100)
 #
@@ -327,10 +329,15 @@ ip=$(imds "$(imds_token)" local-ipv4)
 # kernel path the role prepares are the ones the join's config names.
 rm -rf "$work/preview"
 mkdir -p "$work/preview"
+#
+# PRELUDE_INIT_ARGS are the rest of server.pool.init_args, one word each, as the join is
+# given them: on AWS metal, the site, its ebs-s3 store and the cache listener, without
+# which the role would not open the guests' way to the cache.
+read -r -a init_args <<<"${PRELUDE_INIT_ARGS:-}"
 billet init --join "$PRELUDE_JOIN_SERVER" --provider firecracker --profile local-service \
 	--node-name pool-prepare --kernel-image /var/lib/billet/kernels/vmlinux \
 	--ceph-user billet --ceph-keyring /etc/ceph/ceph.client.billet.keyring \
-	--config "$work/preview/billet.yaml" >"$work/preview/init.log" 2>&1
+	"${init_args[@]}" --config "$work/preview/billet.yaml" >"$work/preview/init.log" 2>&1
 venv/bin/python3 -I -c 'import sys, yaml; print(yaml.safe_dump({"billet_config": yaml.safe_load(open(sys.argv[1]))}))' \
 	"$work/preview/billet.yaml" >"$work/billet-vars.yml"
 

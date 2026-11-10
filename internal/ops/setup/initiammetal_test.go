@@ -63,7 +63,7 @@ func TestInitIAMPrintsAMetalNodesCacheRole(t *testing.T) {
 		}
 	}
 	for _, need := range []string{"BilletCacheCreateVolume", "BilletCacheAttach", "BilletCacheSelfAttach",
-		"BilletCacheObjects", "BilletCacheKMSUse"} {
+		"BilletCacheObjects", "BilletCacheKMSUse", "BilletCacheTag"} {
 		if !slices.Contains(got, need) {
 			t.Errorf("the metal node's role has no %s: %v", need, got)
 		}
