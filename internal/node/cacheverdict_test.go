@@ -365,6 +365,13 @@ func TestSettlementWaitsForAnNpmRequestInFlight(t *testing.T) {
 	// waits for the handler this releases.
 	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	service, credentials := npmService(t, registry)
+	// THE WAIT IS LONG ENOUGH FOR WHAT FOLLOWS THE RELEASE. At its default of five
+	// seconds the two left after the three-second release had to cover the answer,
+	// the store's fill and the note, which a loaded race-and-coverage runner did
+	// not, and the verdict read "" (#188, 2026-11-09). The property is that the
+	// wait outlasts settlement's own two-second budget, which the release at three
+	// seconds still proves; a wait bounded by that budget fails it.
+	service.npmSettleWait = time.Minute
 	observer := &recordingObserver{}
 	service.SetCacheObserver(observer)
 
