@@ -17,12 +17,7 @@ const pgDeployment = "abababababababababababababababab"
 func schemaFrom(t *testing.T, name string) string {
 	t.Helper()
 
-	s := strings.ToLower("billet_test_" + strings.ReplaceAll(name, "/", "_"))
-	if len(s) > 60 {
-		s = s[:60]
-	}
-
-	return s
+	return testSchemaName(name)
 }
 
 // AN EMPTY SCHEMA IS SAID TO BE EMPTY, positively: the schema it resolved to,
