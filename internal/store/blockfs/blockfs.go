@@ -190,7 +190,13 @@ var ErrHeld = errors.New("blockfs: the device is still held")
 // it keeps the kernel's own reference after its setup closed its descriptor, so every
 // configured loop's backing device is asked of the kernel. And a partition is a device
 // of its own number, whose openers none of those see, so a device with partitions is
-// refused outright: billet formats its cache volumes whole. EBS DETACHES A MOUNTED VOLUME
+// refused outright: billet formats its cache volumes whole.
+//
+// NOT AN IO_URING'S REGISTERED FILE. A process that registers the device in a ring and
+// closes its descriptor holds it through an anonymous inode no scan here can read, and
+// refusing every ring would refuse Firecracker's own async block engine. On a pool host
+// the only process that opens a cache device is billet's VMM, which keeps its descriptor
+// for as long as it serves the drive, so the descriptor scan sees it. EBS DETACHES A MOUNTED VOLUME
 // WITHOUT REFUSING: measured on 2026-11-09 (us-west-2, t3.small), a detach of an ext4
 // volume mounted on the host completed in 4.4 s, and the kernel aborted its journal on
 // the I/O errors that followed. Nothing on AWS's side stops it, so this is what does.
@@ -336,16 +342,6 @@ func openedBy(procRoot string, rdev uint64) (string, error) {
 			continue
 		}
 
-		// A SHARED MAPPING keeps the file after its descriptor is closed, and a process's
-		// mappings are its whole thread group's.
-		mapped, err := tableHolds(filepath.Join(procRoot, pid, "map_files"), rdev)
-		if err != nil {
-			return "", fmt.Errorf("blockfs: read process %s's mappings: %w", pid, err)
-		}
-		if mapped {
-			return pid, nil
-		}
-
 		tasks, err := os.ReadDir(filepath.Join(procRoot, pid, "task"))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
@@ -355,13 +351,23 @@ func openedBy(procRoot string, rdev uint64) (string, error) {
 			return "", fmt.Errorf("blockfs: list process %s's threads: %w", pid, err)
 		}
 
+		// EACH THREAD'S DESCRIPTORS AND MAPPINGS. A shared mapping keeps the file after its
+		// descriptor is closed; the mappings are the thread group's, but a leader that has
+		// exited shows none of them, so they are read through every thread that is left,
+		// at /proc/<tid>, which resolves for any thread though /proc lists only leaders.
 		for _, task := range tasks {
-			held, err := tableHolds(filepath.Join(procRoot, pid, "task", task.Name(), "fd"), rdev)
-			if err != nil {
-				return "", fmt.Errorf("blockfs: read process %s's open files (thread %s): %w", pid, task.Name(), err)
-			}
-			if held {
-				return pid, nil
+			for _, view := range []string{
+				filepath.Join(procRoot, pid, "task", task.Name(), "fd"),
+				filepath.Join(procRoot, task.Name(), "map_files"),
+			} {
+				held, err := tableHolds(view, rdev)
+				if err != nil {
+					return "", fmt.Errorf("blockfs: read process %s's thread %s (%s): %w", pid, task.Name(),
+						filepath.Base(view), err)
+				}
+				if held {
+					return pid, nil
+				}
 			}
 		}
 	}

@@ -218,13 +218,19 @@ func TestALoopDeviceBackedByTheDeviceHoldsIt(t *testing.T) {
 }
 
 // A SHARED MAPPING HOLDS THE DEVICE AFTER ITS DESCRIPTOR IS CLOSED, so a process whose
-// mappings name it holds it, with nothing in any descriptor table.
+// mappings name it holds it, with nothing in any descriptor table, read through a thread
+// that is left when the leader has exited and shows none.
 func TestAMappingHoldsTheDevice(t *testing.T) {
 	device, rdev := someBlockDevice(t)
 	procRoot := t.TempDir()
 
+	// THE LEADER HAS EXITED, SHOWING NO MAPPINGS; a thread left holds the mapping.
 	stageProcess(t, procRoot, "500", "/dev/null")
-	maps := filepath.Join(procRoot, "500", "map_files")
+	if err := os.MkdirAll(filepath.Join(procRoot, "500", "map_files"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stageThread(t, procRoot, "500", "501")
+	maps := filepath.Join(procRoot, "501", "map_files")
 	if err := os.MkdirAll(maps, 0o755); err != nil {
 		t.Fatal(err)
 	}
