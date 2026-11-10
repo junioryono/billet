@@ -440,6 +440,18 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 	// flag must not be set while the pre-drain launch is still inside the runner.
 	waitUntil(deadline, t, "the first launch to complete", func() bool { return total.Load() == 1 })
 
+	// NOR WHILE THE LISTENER IS STILL SETTLING IT. Leaving the runner is not the end
+	// of a launch: the listener then registers the runner on the poll's context,
+	// which the cancel below ends. Cut there, the assignment's message is held and
+	// handled again inside the drain, which launches its job a second time and was
+	// counted as a launch the drain permitted (#760). The registration is the
+	// launch's last write.
+	waitUntil(deadline, t, "the first launch's runner to be registered", func() bool {
+		runners, err := a.PoolRunners(deadline, "billet-4vcpu-a")
+
+		return err == nil && len(runners) == 1
+	})
+
 	draining.Store(true)
 	cancel()
 
