@@ -205,8 +205,21 @@ jobs:
         # are kept for the ranking below: the run's floor is one package's
         # wall clock, and a per-test ranking is how it is shortened rather
         # than guessed at. `fromjson?` lets a build error's plain line through.
+        #
+        # THE SUITE'S SCRATCH IS MEMORY, NOT THE GUEST'S DISK. Every test's ledger,
+        # socket and temporary file, and every test binary go test links, went to
+        # the runner's root disk, a Ceph image the whole fleet shares: 12 to 16 GB
+        # of writes a run. Twenty-three test jobs between 2026-10-11 and 2026-11-10
+        # failed with test ledgers that could not open inside their 30 s budget,
+        # often dozens of tests at once, while the guest's CPU fell idle and its
+        # writes stopped beside other guests' (#188). The guest has 62 GiB and the
+        # suite peaks near 20, and go test removes each package's binary once it
+        # has run.
         run: |
           set -o pipefail
+          scratch=$(mktemp -d /dev/shm/billet-test.XXXXXX)
+          mkdir "$scratch/tmp" "$scratch/go"
+          export TMPDIR="$scratch/tmp" GOTMPDIR="$scratch/go"
           go test -race -count=1 -timeout 35m -vet=off -coverprofile=coverage.out -covermode=atomic -json ./... \
             | tee test-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
