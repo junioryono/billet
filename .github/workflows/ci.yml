@@ -207,17 +207,15 @@ jobs:
         run: |
           sudo mount -t tmpfs -o mode=1777,nosuid,nodev,size=32g billet-test-tmp /tmp
           findmnt /tmp
-          # A SAMPLE THAT CANNOT BE READ CHANGES NOTHING: the maximum is kept, and
-          # written whole by a rename, so the report reads the last good one.
+          # EVERY GOOD SAMPLE IS KEPT, stamped, and nothing else: the report finds
+          # the maximum, the count and the newest sample's age, so a sampler that
+          # stopped shows as one.
           (
             set +e
-            peak=0
             while sleep 5; do
               used=$(df --output=used -B1M /tmp 2>/dev/null | tail -n 1 | tr -d ' ')
               case "$used" in '' | *[!0-9]*) continue ;; esac
-              [ "$used" -gt "$peak" ] || continue
-              peak=$used
-              echo "$peak" >"$RUNNER_TEMP/tmp-peak-mib.next" && mv -f "$RUNNER_TEMP/tmp-peak-mib.next" "$RUNNER_TEMP/tmp-peak-mib"
+              echo "$(date +%s) $used" >>"$RUNNER_TEMP/tmp-usage"
             done
           ) >/dev/null 2>&1 &
 
@@ -248,11 +246,12 @@ jobs:
       - name: Report how much of /tmp the suite used
         if: always()
         run: |
-          peak=$(cat "$RUNNER_TEMP/tmp-peak-mib" 2>/dev/null || true)
-          case "$peak" in
-          '' | *[!0-9]*) echo "the suite's use of /tmp was not sampled" ;;
-          *) echo "the suite's /tmp: at most ${peak} MiB of 32768 in any sample, taken every 5 s" ;;
-          esac
+          awk -v now="$(date +%s)" '
+            NF == 2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { n++; if ($2 > max) max = $2; if ($1 > last) last = $1 }
+            END {
+              if (n == 0) { print "the suite'"'"'s use of /tmp was not sampled"; exit }
+              printf "the suite'"'"'s /tmp: at most %d MiB of 32768 in %d samples about 5 s apart; the newest was %d s before this step\n", max, n, now - last
+            }' "$RUNNER_TEMP/tmp-usage" 2>/dev/null || echo "the suite's use of /tmp could not be read"
           df -h /tmp || echo "could not read /tmp's use now"
 
       - name: Report the slowest tests
