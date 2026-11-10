@@ -146,6 +146,32 @@ func TestAnIdleShrinkIsCompletedByItsSourceNotAPerson(t *testing.T) {
 	if s := judge(closed); s.Verdict != verdictFail || !strings.Contains(s.Reason, "other than by its source") {
 		t.Errorf("closed by a person: %+v; want a fail", s)
 	}
+
+	// AN ORDER THAT NEVER JOINED IS JUDGED TOO: a host a person released before it joined,
+	// or an order a person abandoned, is a person's doing beside the pool's shrink; one its
+	// source refused never held a host.
+	for name, c := range map[string]struct {
+		o    acceptancePoolOrder
+		pass bool
+	}{
+		"an unjoined host a person released": {acceptancePoolOrder{ID: "p4", Source: config.PoolSourceAWSMetal,
+			Arch: "x64", State: alloc.PoolReleased, HostID: "i-4", ReleaseRequested: "2026-11-05T09:00:00Z",
+			ReleaseReason: "it never booted"}, false},
+		"an order a person abandoned": {acceptancePoolOrder{ID: "p5", Source: config.PoolSourceAWSMetal,
+			Arch: "x64", State: alloc.PoolAbandoned, Reason: "given up by a person"}, false},
+		"an order its source refused": {acceptancePoolOrder{ID: "p6", Source: config.PoolSourceAWSMetal,
+			Arch: "x64", State: alloc.PoolRefused, Reason: "InsufficientInstanceCapacity"}, true},
+	} {
+		doc := poolEvidence(poolJob())
+		doc.Pool = append(doc.Pool, c.o)
+		s := judge(doc)
+		if c.pass && s.Verdict != verdictPass {
+			t.Errorf("%s beside a shrunk host: %+v; want a pass", name, s)
+		}
+		if !c.pass && (s.Verdict != verdictFail || !strings.Contains(s.Reason, c.o.ID+": "+c.o.State+" other than")) {
+			t.Errorf("%s beside a shrunk host: %+v; want a fail naming it", name, s)
+		}
+	}
 }
 
 // A POOL CELL'S JOB RAN ON A HOST ITS ORDER RENTED AS THE CELL'S ARCHITECTURE: a job of
@@ -306,7 +332,7 @@ func TestAPreludesInitArgsAreThePoolsLessItsOwn(t *testing.T) {
 	t.Parallel()
 
 	path, _ := writePoolBase(t, "init_args: ['--site=metal',",
-		"init_args: ['--kernel-image=/k/vmlinux', '--ceph-user=billet', '--site=metal',")
+		"init_args: ['--kernel-image=/var/lib/billet/kernels/vmlinux', '--ceph-user=billet', '--site=metal',")
 	var out bytes.Buffer
 	if err := cmdMatrixPoolInitArgs(quietEnv(&out), []string{"--config", path}); err != nil {
 		t.Fatalf("pool-init-args: %v", err)
@@ -325,6 +351,17 @@ func TestAPreludesInitArgsAreThePoolsLessItsOwn(t *testing.T) {
 	if err := cmdMatrixPoolInitArgs(quietEnv(&out), []string{"--config", spaced}); err == nil ||
 		!strings.Contains(err.Error(), "whitespace") {
 		t.Errorf("a value with a space answered %v", err)
+	}
+
+	// A KERNEL OR A CEPH IDENTITY THE PRELUDE DOES NOT PREPARE is refused: the join would
+	// start the node on it.
+	for _, other := range []string{"'--kernel-image=/k/vmlinux',", "'--ceph-user=other',",
+		"'--ceph-keyring=/etc/ceph/other.keyring',"} {
+		mismatched, _ := writePoolBase(t, "'--site=metal',", "'--site=metal', "+other)
+		if err := cmdMatrixPoolInitArgs(quietEnv(&out), []string{"--config", mismatched}); err == nil ||
+			!strings.Contains(err.Error(), "the prelude prepares") {
+			t.Errorf("%s answered %v", other, err)
+		}
 	}
 }
 
@@ -375,7 +412,7 @@ func TestAHostEC2FindsLateIsEndedWhenItIs(t *testing.T) {
 	p := acceptancePool{hosts: hosts, cache: cache, gone: time.Minute, poll: time.Millisecond}
 
 	var out bytes.Buffer
-	if err := p.decommission(t.Context(), quietEnv(&out),
+	if _, err := p.decommission(t.Context(), quietEnv(&out),
 		[]acceptancePoolOrder{order("p5", alloc.PoolPlaced, "i-5")}); err != nil {
 		t.Fatalf("decommission: %v\n%s", err, out.String())
 	}
@@ -384,6 +421,36 @@ func TestAHostEC2FindsLateIsEndedWhenItIs(t *testing.T) {
 	}
 	if cache.purged != 1 {
 		t.Errorf("purged %d time(s), want once", cache.purged)
+	}
+}
+
+// A HOST ONE LISTING SHOWED IS PROVED GONE BY ITS ID, though the next listing leaves it
+// out: the wait and the sweep after it describe it until it reads terminated, and the
+// sweep asks again about every host the teardown saw.
+func TestAHostOneListingShowedIsProvedGoneByItsID(t *testing.T) {
+	t.Parallel()
+
+	hosts := newFakePoolHosts(4, ec2.HostRecord{ID: "i-7", State: "running", Order: "p7"})
+	// Left out of the first listing, shown by the wait's first, and left out after.
+	hosts.listedFrom, hosts.listedUntil = map[string]int{"i-7": 2}, map[string]int{"i-7": 3}
+	cache := &fakePoolCache{hosts: hosts}
+	p := acceptancePool{hosts: hosts, cache: cache, gone: time.Minute, poll: time.Millisecond}
+
+	var out bytes.Buffer
+	ids, err := p.decommission(t.Context(), quietEnv(&out), nil)
+	if err != nil {
+		t.Fatalf("decommission: %v\n%s", err, out.String())
+	}
+	if !slices.Contains(ids, "i-7") || cache.purged != 1 || hosts.purgedAt <= hosts.endedAt["i-7"]+hosts.shutdown {
+		t.Errorf("answered %v, purged %d time(s) at read %d with i-7 ended at read %d; want it proved terminated "+
+			"first", ids, cache.purged, hosts.purgedAt, hosts.endedAt["i-7"])
+	}
+
+	up := newFakePoolHosts(0, ec2.HostRecord{ID: "i-8", State: "running", Order: "p8"})
+	up.unlisted["i-8"] = true
+	if err := (acceptancePool{hosts: up}).sweep(t.Context(), quietEnv(&out), "d1", nil,
+		[]string{"i-8"}); !errors.Is(err, errAcceptanceResidue) || !strings.Contains(err.Error(), "i-8 running") {
+		t.Errorf("the sweep of a host the teardown saw and no listing shows answered %v", err)
 	}
 }
 
@@ -419,6 +486,21 @@ func TestATeardownKnowsAPoolsRunFromItsConfig(t *testing.T) {
 	}
 	if _, _, isPool, err := acceptancePoolFor(t.Context(), ws); !isPool || !errors.Is(err, state.ErrNoLedger) {
 		t.Errorf("a pool's run whose ledger is gone: pool %v, %v; want could-not-tell", isPool, err)
+	}
+	// NOR DOES A TEARDOWN, OR ITS RETRY, OR THE RUN AND ITS EVIDENCE: each refuses before
+	// any open that would make one.
+	var out bytes.Buffer
+	for attempt := range 2 {
+		if err := tearDownAcceptanceWithin(t.Context(), quietEnv(&out), ws, time.Second, false); !errors.Is(err,
+			state.ErrNoLedger) {
+			t.Errorf("teardown %d of a pool's run whose ledger is gone answered %v", attempt+1, err)
+		}
+	}
+	if err := requireAcceptancePoolLedger(t.Context(), ws); !errors.Is(err, state.ErrNoLedger) {
+		t.Errorf("the run's and the evidence's check answered %v", err)
+	}
+	if _, err := collectAcceptanceEvidence(t.Context(), ws); !errors.Is(err, state.ErrNoLedger) {
+		t.Errorf("the evidence of a pool's run whose ledger is gone answered %v", err)
 	}
 	if _, err := os.Stat(ledger); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("reading the orders made a ledger in place of the lost one (%v)", err)

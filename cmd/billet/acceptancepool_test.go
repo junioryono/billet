@@ -236,6 +236,9 @@ type fakePoolHosts struct {
 	purgedAt int
 	// hiddenUntil is, by id, the read before which EC2 does not describe a host at all.
 	hiddenUntil map[string]int
+	// listedFrom and listedUntil are, by id, the reads before and from which every
+	// listing leaves a host out.
+	listedFrom, listedUntil map[string]int
 }
 
 func newFakePoolHosts(shutdown int, hosts ...ec2.HostRecord) *fakePoolHosts {
@@ -261,7 +264,8 @@ func (f *fakePoolHosts) PoolHosts(context.Context) ([]ec2.HostRecord, error) {
 	f.reads++
 	var out []ec2.HostRecord
 	for _, h := range f.hosts {
-		if h = f.state(h); h.State != "terminated" && !f.unlisted[h.ID] {
+		if h = f.state(h); h.State != "terminated" && !f.unlisted[h.ID] &&
+			f.reads >= f.listedFrom[h.ID] && (f.listedUntil[h.ID] == 0 || f.reads < f.listedUntil[h.ID]) {
 			out = append(out, h)
 		}
 	}
@@ -343,7 +347,7 @@ func TestAPoolsTeardownEndsItsHostsBeforeThePurge(t *testing.T) {
 
 	var out bytes.Buffer
 	orders := []acceptancePoolOrder{order("p1", alloc.PoolPlaced, "i-1"), order("p2", alloc.PoolReleased, "i-2")}
-	if err := p.decommission(t.Context(), quietEnv(&out), orders); err != nil {
+	if _, err := p.decommission(t.Context(), quietEnv(&out), orders); err != nil {
 		t.Fatalf("decommission: %v\n%s", err, out.String())
 	}
 	if len(hosts.ended) != 1 || hosts.ended[0] != "i-1" {
@@ -370,7 +374,7 @@ func TestAPoolsTeardownEndsAHostTheListingLeftOut(t *testing.T) {
 	var out bytes.Buffer
 	// p4 names no host in the ledger, and EC2 finds it by its order's tag.
 	orders := []acceptancePoolOrder{order("p3", alloc.PoolSealed, "i-3"), order("p4", alloc.PoolUncertain, "")}
-	if err := p.decommission(t.Context(), quietEnv(&out), orders); err != nil {
+	if _, err := p.decommission(t.Context(), quietEnv(&out), orders); err != nil {
 		t.Fatalf("decommission: %v\n%s", err, out.String())
 	}
 	if strings.Join(hosts.ended, ",") != "i-3,i-4" {
@@ -392,12 +396,12 @@ func TestAnOrderWhoseHostEC2CannotNameIsResidue(t *testing.T) {
 	p := acceptancePool{hosts: hosts, cache: cache, gone: time.Minute, poll: time.Millisecond}
 
 	var out bytes.Buffer
-	if err := p.decommission(t.Context(), quietEnv(&out),
+	if _, err := p.decommission(t.Context(), quietEnv(&out),
 		[]acceptancePoolOrder{order("p5", alloc.PoolRefused, "")}); err != nil {
 		t.Errorf("a refused order with no host answered %v", err)
 	}
 	cache.purged = 0
-	err := p.decommission(t.Context(), quietEnv(&out), []acceptancePoolOrder{order("p6", alloc.PoolOrdering, "")})
+	_, err := p.decommission(t.Context(), quietEnv(&out), []acceptancePoolOrder{order("p6", alloc.PoolOrdering, "")})
 	if !errors.Is(err, errAcceptanceResidue) || !strings.Contains(err.Error(), "p6 (ordering)") {
 		t.Fatalf("an order EC2 names no host for answered %v", err)
 	}
@@ -405,7 +409,7 @@ func TestAnOrderWhoseHostEC2CannotNameIsResidue(t *testing.T) {
 		t.Error("the cache was purged beside an order that may hold a host")
 	}
 	if err := p.sweep(t.Context(), quietEnv(&out), "d1",
-		[]acceptancePoolOrder{order("p6", alloc.PoolOrdering, "")}); !errors.Is(err, errAcceptanceResidue) {
+		[]acceptancePoolOrder{order("p6", alloc.PoolOrdering, "")}, nil); !errors.Is(err, errAcceptanceResidue) {
 		t.Errorf("the sweep of an order EC2 names no host for answered %v", err)
 	}
 }
@@ -430,7 +434,7 @@ func TestAPoolHostThatWillNotGoIsResidueAndTheCacheIsKept(t *testing.T) {
 		p := acceptancePool{hosts: c.hosts, cache: cache, gone: 10 * time.Millisecond, poll: time.Millisecond}
 
 		var out bytes.Buffer
-		err := p.decommission(t.Context(), quietEnv(&out), c.orders)
+		_, err := p.decommission(t.Context(), quietEnv(&out), c.orders)
 		if !errors.Is(err, errAcceptanceResidue) || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s answered %v; want residue naming %q", name, err, c.want)
 		}
@@ -450,12 +454,12 @@ func TestAPoolsSweepAsksEC2AndTheCache(t *testing.T) {
 	gone.endedAt["i-1"] = -1
 	clean := acceptancePool{hosts: gone, cache: &fakePoolCache{}}
 	if err := clean.sweep(t.Context(), quietEnv(&out), "d1",
-		[]acceptancePoolOrder{order("p1", alloc.PoolGone, "i-1")}); err != nil {
+		[]acceptancePoolOrder{order("p1", alloc.PoolGone, "i-1")}, nil); err != nil {
 		t.Errorf("a clean pool's sweep answered %v", err)
 	}
 
 	up := acceptancePool{hosts: newFakePoolHosts(0, ec2.HostRecord{ID: "i-1", State: "stopped", Order: "p1"})}
-	if err := up.sweep(t.Context(), quietEnv(&out), "d1", nil); !errors.Is(err, errAcceptanceResidue) ||
+	if err := up.sweep(t.Context(), quietEnv(&out), "d1", nil, nil); !errors.Is(err, errAcceptanceResidue) ||
 		!strings.Contains(err.Error(), "i-1 stopped") {
 		t.Errorf("a stopped pool host answered %v", err)
 	}
@@ -463,13 +467,13 @@ func TestAPoolsSweepAsksEC2AndTheCache(t *testing.T) {
 	hidden := newFakePoolHosts(0, ec2.HostRecord{ID: "i-2", State: "running", Order: "p2"})
 	hidden.unlisted["i-2"] = true
 	if err := (acceptancePool{hosts: hidden}).sweep(t.Context(), quietEnv(&out), "d1",
-		[]acceptancePoolOrder{order("p2", alloc.PoolPlaced, "i-2")}); !errors.Is(err, errAcceptanceResidue) ||
+		[]acceptancePoolOrder{order("p2", alloc.PoolPlaced, "i-2")}, nil); !errors.Is(err, errAcceptanceResidue) ||
 		!strings.Contains(err.Error(), "i-2 running") {
 		t.Errorf("a host its order names and the listing left out answered %v", err)
 	}
 
 	left := acceptancePool{hosts: newFakePoolHosts(0), cache: &fakePoolCache{residue: ebss3.Residue{Snapshots: 1}}}
-	if err := left.sweep(t.Context(), quietEnv(&out), "d1", nil); !errors.Is(err, errAcceptanceResidue) {
+	if err := left.sweep(t.Context(), quietEnv(&out), "d1", nil, nil); !errors.Is(err, errAcceptanceResidue) {
 		t.Errorf("a cache left behind answered %v", err)
 	}
 
@@ -477,11 +481,11 @@ func TestAPoolsSweepAsksEC2AndTheCache(t *testing.T) {
 	blindHosts := newFakePoolHosts(0)
 	blindHosts.listErr = throttled
 	if err := (acceptancePool{hosts: blindHosts}).sweep(t.Context(), quietEnv(&out), "d1",
-		nil); !errors.Is(err, throttled) || errors.Is(err, errAcceptanceResidue) {
+		nil, nil); !errors.Is(err, throttled) || errors.Is(err, errAcceptanceResidue) {
 		t.Errorf("a list that could not be read answered %v; want could-not-tell", err)
 	}
 	blindCache := acceptancePool{hosts: newFakePoolHosts(0), cache: &fakePoolCache{residErr: throttled}}
-	if err := blindCache.sweep(t.Context(), quietEnv(&out), "d1", nil); !errors.Is(err, throttled) ||
+	if err := blindCache.sweep(t.Context(), quietEnv(&out), "d1", nil, nil); !errors.Is(err, throttled) ||
 		errors.Is(err, errAcceptanceResidue) {
 		t.Errorf("a cache that could not be read answered %v; want could-not-tell", err)
 	}

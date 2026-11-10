@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"strings"
 	"time"
@@ -157,9 +158,13 @@ func judgeShrinkIdle(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixS
 		case shrunk:
 		case poolOrderHolds(o.State):
 			wrong = append(wrong, fmt.Sprintf("%s: still %s, holding a host the pool did not let go", o.ID, o.State))
-		case o.Node != "":
-			wrong = append(wrong, fmt.Sprintf("%s: let go other than by the pool's own shrink (%s)", o.ID,
-				o.ReleaseReason))
+		case o.State == alloc.PoolRefused:
+			// ITS SOURCE REFUSED IT, so it never held a host.
+		default:
+			// EVERY OTHER WAY AN ORDER ENDS IS A PERSON'S, joined or not: the pool lets a host
+			// go only by its shrink, and holds a lapsed join for a person.
+			wrong = append(wrong, fmt.Sprintf("%s: %s other than by the pool's own shrink (%s)", o.ID, o.State,
+				cmp.Or(o.ReleaseReason, o.Reason)))
 		}
 		if o.Node == "" {
 			continue

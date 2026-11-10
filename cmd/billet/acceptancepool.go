@@ -103,34 +103,40 @@ func newAcceptancePool(cfg *config.Config, deployment string) (acceptancePool, e
 // listing alone: DescribeInstances is eventually consistent, and a host it leaves out of
 // one listing is not a host that is gone. An order whose host EC2 cannot name could still
 // hold one, and is residue for a person.
-func (p acceptancePool) decommission(ctx context.Context, env cli.Env, orders []acceptancePoolOrder) error {
+//
+// It answers every host it saw, for the sweep to ask about again by id: a host one
+// listing showed and the next left out is still one to prove gone.
+func (p acceptancePool) decommission(ctx context.Context, env cli.Env, orders []acceptancePoolOrder) (
+	[]string, error,
+) {
 	live, err := p.hosts.PoolHosts(ctx)
 	if err != nil {
-		return fmt.Errorf("list this run's pool hosts: %w", err)
+		return nil, fmt.Errorf("list this run's pool hosts: %w", err)
 	}
 	ids, err := p.orderHosts(ctx, orders, live)
 	if err != nil {
-		return err
+		return ids, err
 	}
 
-	if err := p.awaitGone(ctx, env, ids); err != nil {
-		return err
+	ids, err = p.awaitGone(ctx, env, ids)
+	if err != nil {
+		return ids, err
 	}
 
 	if p.cache == nil {
 		fmt.Fprintf(env.Stdout, "cache    this run's pool hands its hosts no ebs-s3 store, so there is none to purge\n")
 
-		return nil
+		return ids, nil
 	}
 
 	report, err := p.cache.Purge(ctx)
 	if err != nil {
-		return fmt.Errorf("purge the site's cache: %w", err)
+		return ids, fmt.Errorf("purge the site's cache: %w", err)
 	}
 	fmt.Fprintf(env.Stdout, "cache    purged %d snapshot(s), %d volume(s), %d state object(s), %d cache object(s)\n",
 		report.Snapshots, report.Volumes, report.StateObjects, report.CacheObjects)
 
-	return nil
+	return ids, nil
 }
 
 // orderHosts is every instance the run's pool may hold: each order's host as the ledger
@@ -181,8 +187,10 @@ func (p acceptancePool) orderHosts(ctx context.Context, orders []acceptancePoolO
 // awaitGone ends every host of the run's pool EC2 describes as live and waits, bounded,
 // until it describes every one of ids as terminated and lists no other host of the pool
 // that is not. A host is ended the first time EC2 describes it live, on whichever poll
-// that is: one EC2 could not find at first may be found running at the next.
-func (p acceptancePool) awaitGone(ctx context.Context, env cli.Env, ids []string) error {
+// that is: one EC2 could not find at first may be found running at the next. A host a
+// listing shows joins ids for good, so a later listing that leaves it out does not
+// excuse it; awaitGone answers ids as they grew.
+func (p acceptancePool) awaitGone(ctx context.Context, env cli.Env, ids []string) ([]string, error) {
 	deadline := time.Now().Add(p.gone)
 	ticker := time.NewTicker(p.poll)
 	defer ticker.Stop()
@@ -202,40 +210,45 @@ func (p acceptancePool) awaitGone(ctx context.Context, env cli.Env, ids []string
 	}
 
 	for {
-		left, err := p.notTerminated(ctx, ids, end)
+		left, err := p.notTerminated(ctx, &ids, end)
 		if err != nil {
-			return err
+			return ids, err
 		}
 		if len(left) == 0 {
 			fmt.Fprintf(env.Stdout, "pool     every host of this run's pool is terminated (%d)\n", len(ids))
 
-			return nil
+			return ids, nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%w: after %s, %d pool host(s) of this run are not described as terminated (%s)",
+			return ids, fmt.Errorf("%w: after %s, %d pool host(s) of this run are not described as terminated (%s)",
 				errAcceptanceResidue, p.gone, len(left), strings.Join(left, ", "))
 		}
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return ids, ctx.Err()
 		case <-ticker.C:
 		}
 	}
 }
 
 // notTerminated is each of the run's pool hosts EC2 does not describe as terminated,
-// with what it said instead: every host the listing returns, and each of ids EC2
-// describes in another state or cannot find. Each it describes as neither terminated nor
-// shutting down is handed to end, when there is one.
-func (p acceptancePool) notTerminated(ctx context.Context, ids []string, end func(ec2.HostRecord) error) (
+// with what it said instead: every host the listing returns, which joins ids, and each
+// of ids EC2 describes in another state or cannot find. Each it describes as neither
+// terminated nor shutting down is handed to end, when there is one.
+func (p acceptancePool) notTerminated(ctx context.Context, ids *[]string, end func(ec2.HostRecord) error) (
 	[]string, error,
 ) {
 	live, err := p.hosts.PoolHosts(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list this run's pool hosts: %w", err)
 	}
-	left := make([]string, 0, len(live)+len(ids))
+	for _, h := range live {
+		if !slices.Contains(*ids, h.ID) {
+			*ids = append(*ids, h.ID)
+		}
+	}
+	left := make([]string, 0, len(*ids))
 	stillUp := func(h ec2.HostRecord) error {
 		left = append(left, h.ID+" "+h.State)
 		if end == nil {
@@ -249,7 +262,7 @@ func (p acceptancePool) notTerminated(ctx context.Context, ids []string, end fun
 			return nil, err
 		}
 	}
-	for _, id := range ids {
+	for _, id := range *ids {
 		if slices.ContainsFunc(live, func(l ec2.HostRecord) bool { return l.ID == id }) {
 			continue
 		}
@@ -274,8 +287,10 @@ func (p acceptancePool) notTerminated(ctx context.Context, ids []string, end fun
 // sweep is the last question: every host the run's pool may hold is described as
 // terminated, no other is listed, and nothing is left in the site's cache under the
 // run's owner.
+//
+// known are hosts the teardown already saw, asked about again by id.
 func (p acceptancePool) sweep(ctx context.Context, env cli.Env, deployment string,
-	orders []acceptancePoolOrder,
+	orders []acceptancePoolOrder, known []string,
 ) error {
 	live, err := p.hosts.PoolHosts(ctx)
 	if err != nil {
@@ -286,7 +301,12 @@ func (p acceptancePool) sweep(ctx context.Context, env cli.Env, deployment strin
 	if err != nil {
 		return err
 	}
-	left, err := p.notTerminated(ctx, ids, nil)
+	for _, id := range known {
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	left, err := p.notTerminated(ctx, &ids, nil)
 	if err != nil {
 		return fmt.Errorf("the sweep could not read this run's pool hosts, so nothing here establishes whether "+
 			"it left one running: %w", err)
@@ -315,10 +335,15 @@ func (p acceptancePool) sweep(ctx context.Context, env cli.Env, deployment strin
 	return nil
 }
 
-// preludeFlags are the init_args a pool prelude prepares a host by itself (the kernel it
-// installs and the Ceph identity it creates), so it is handed the rest as
-// PRELUDE_INIT_ARGS.
-var preludeFlags = []string{"kernel-image", "ceph-user", "ceph-keyring"}
+// preludeFlags are the init_args a pool prelude prepares a host by itself, with the
+// values it prepares (the kernel it installs and the Ceph identity it creates), so it is
+// handed the rest as PRELUDE_INIT_ARGS. A pool whose init_args name another value would
+// join a node to a kernel or an identity its prelude never prepared.
+var preludeFlags = map[string]string{
+	"kernel-image": "/var/lib/billet/kernels/vmlinux",
+	"ceph-user":    "billet",
+	"ceph-keyring": "/etc/ceph/ceph.client.billet.keyring",
+}
 
 // cmdMatrixPoolInitArgs prints, one per line as --flag=value, the server.pool.init_args a
 // pool's prelude hands the config it converges the host from, in init's own order: the
@@ -340,7 +365,15 @@ func cmdMatrixPoolInitArgs(env cli.Env, args []string) error {
 	values := cfg.Server.Pool.InitArgValues()
 	for _, flag := range config.PoolInitFlags {
 		value, ok := values[flag]
-		if !ok || slices.Contains(preludeFlags, flag) {
+		if !ok {
+			continue
+		}
+		if own, prepared := preludeFlags[flag]; prepared {
+			if value != own {
+				return fmt.Errorf("server.pool.init_args' --%s is %q, and the prelude prepares %q, which the "+
+					"host's join would then not use", flag, value, own)
+			}
+
 			continue
 		}
 		// A PRELUDE TAKES THEM AS WORDS (PRELUDE_INIT_ARGS), so a value holding whitespace

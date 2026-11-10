@@ -96,8 +96,13 @@ func tearDownAcceptanceWithin(
 	var problems []error
 
 	// A POOL'S ORDERS ARE READ FIRST, before the drain's open of the ledger, which would
-	// create a lost one empty: the orders name the hosts step 3 must prove gone.
+	// create a lost one empty: the orders name the hosts step 3 must prove gone. Orders it
+	// could not read stop the teardown here, before that open, so a retry meets the same
+	// missing ledger rather than an empty one.
 	pool, orders, isPool, poolErr := acceptancePoolFor(ctx, ws)
+	if poolErr != nil {
+		return fmt.Errorf("the acceptance teardown did not start: %w", poolErr)
+	}
 
 	// 1. SEAL AND WAIT. Every later step assumes nothing new is starting, and a
 	// seal is what makes that true — but only for ADMISSION, so the wait is what
@@ -130,11 +135,11 @@ func tearDownAcceptanceWithin(
 	// A POOL'S RUN (#829) HAS NO NODE TO DECOMMISSION FROM: its hosts are its pool's,
 	// and what the pool did not release is ended here, then the site's cache its
 	// init_args name is purged.
+	var ended []string
 	switch {
-	case poolErr != nil:
-		problems = append(problems, poolErr)
 	case isPool:
-		if err := pool.decommission(ctx, env, orders); err != nil {
+		var err error
+		if ended, err = pool.decommission(ctx, env, orders); err != nil {
 			problems = append(problems, err)
 		}
 	default:
@@ -148,9 +153,8 @@ func tearDownAcceptanceWithin(
 	// a destroy that raced a launch, an instance whose lease had already gone —
 	// so the teardown ends by ASKING rather than by assuming.
 	switch {
-	case poolErr != nil:
 	case isPool:
-		if err := pool.sweep(ctx, env, ws.DeploymentID, orders); err != nil {
+		if err := pool.sweep(ctx, env, ws.DeploymentID, orders, ended); err != nil {
 			problems = append(problems, err)
 		}
 	default:
@@ -287,7 +291,7 @@ func cmdAcceptanceSweep(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 	if isPool {
-		return pool.sweep(ctx, env, ws.DeploymentID, orders)
+		return pool.sweep(ctx, env, ws.DeploymentID, orders, nil)
 	}
 
 	// A STANDALONE SWEEP HAS NO BARRIER BEHIND IT. `run` proves the fleet clear
@@ -314,6 +318,11 @@ func acceptancePoolFor(ctx context.Context, ws acceptanceWorkspace) (
 	pool, err := newAcceptancePool(cfg, ws.DeploymentID)
 	if err != nil {
 		return acceptancePool{}, nil, true, err
+	}
+	// READ ONCE THE CONTROL PLANE HAS STOPPED, so no order it places follows the read.
+	if err := acceptanceStopped(cfg, ws.DeploymentID); err != nil {
+		return acceptancePool{}, nil, true, fmt.Errorf("a pool's orders are read once its control plane has "+
+			"stopped, so none follows the read: %w", err)
 	}
 	orders, err := readAcceptancePool(ctx, ws)
 	if err != nil {

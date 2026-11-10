@@ -131,6 +131,12 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 
 	dir := filepath.Dir(ws.ConfigPath)
 
+	// A POOL'S LEDGER IS THE ONE ITS `up` MADE: the control plane started below would
+	// create a lost one empty, and its orders are what the teardown proves gone.
+	if err := requireAcceptancePoolLedger(ctx, ws); err != nil {
+		return err
+	}
+
 	if err := refuseASealedWorkspace(ctx, env, ws); err != nil {
 		return err
 	}

@@ -253,6 +253,9 @@ func writeAcceptanceEvidence(ctx context.Context, env cli.Env, ws acceptanceWork
 func collectAcceptanceEvidence(
 	ctx context.Context, ws acceptanceWorkspace,
 ) (acceptanceEvidenceDoc, error) {
+	if err := requireAcceptancePoolLedger(ctx, ws); err != nil {
+		return acceptanceEvidenceDoc{}, err
+	}
 	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
 	if err != nil {
 		return acceptanceEvidenceDoc{}, err

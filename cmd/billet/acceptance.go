@@ -526,6 +526,20 @@ func prepareAcceptancePoolLedger(ctx context.Context, configPath string, recorde
 	return db.Close()
 }
 
+// requireAcceptancePoolLedger requires a pool's run's ledger to exist before anything
+// opens it in a mode that would create it; any other run's is not asked.
+func requireAcceptancePoolLedger(ctx context.Context, ws acceptanceWorkspace) error {
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read this run's config: %w", err)
+	}
+	if !poolOnly(cfg) {
+		return nil
+	}
+
+	return prepareAcceptancePoolLedger(ctx, ws.ConfigPath, true)
+}
+
 // requireEmptyWorkspace refuses a directory that already holds something.
 //
 // BECAUSE A SUCCESSFUL TEARDOWN ENDS IN os.RemoveAll. An operator who points
