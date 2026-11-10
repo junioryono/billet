@@ -161,6 +161,48 @@ The `s1.c1.small` of 2026-11-05 is no longer in the catalogue, and this was the 
 - **NVMe.** An 8 GiB direct write (`dd oflag=direct`, 1 MiB blocks, after one warm-up write) took 3.25 s, 2.5 GiB/s. The direct read back (`dd iflag=direct`) took 3.09 s, 2.6 GiB/s. The root filesystem is LVM over the first NVMe.
 - **What the API answers after a delete is still not measured.** These measurements had no API credentials at hand. The API client's order refusal is with phoenixNAP (#828): on 2026-11-09 its live chat, with Sales (the only group online; technical support is offered through their Slack), was asked to check that client's permissions now that a portal order works.
 
+## The guests' caches on AWS metal, 2026-11-09 and 2026-11-10
+
+ADR-030 puts a metal pool's caches on the site's ebs-s3 store: the Actions, Go and Bazel caches as S3 objects, and a sticky disk or Docker image store as an EBS volume the node attaches to its own instance. Guest root disks and golden images stay on the host's single-OSD Ceph. No billet node had attached a volume to itself before, so the path was probed first, then run end to end.
+
+**The probe, 2026-11-09**, on a `t3.small` in us-west-2a, with the AWS CLI:
+- **The device.** After `AttachVolume` was accepted, the volume's `/dev/disk/by-id` link (`nvme-Amazon_Elastic_Block_Store_vol<id without the dash>`, and the same with `_1`) appeared in 0.26 to 0.54 s. That was before EC2 described the attachment as `attached`. billet finds the device by the serial the volume's NVMe controller reports, never by the name it asked for.
+- **Availability.** An empty volume was `available` in 2.7 s, a clone of a snapshot in 3.1 s. A snapshot of 1 GiB took about 62 s.
+- **EBS detached a mounted ext4 volume without refusing**, in 4.4 s, and the kernel aborted the filesystem's journal. So billet detaches a volume only on proof that nothing on the host holds it: an exclusive open of the device, which a mount or another opener refuses, and a scan of every process's open descriptors for its device number. A check that cannot tell refuses.
+- **Refusals, as EC2 worded them:**
+  - `IncorrectState` (a volume still being created);
+  - `InvalidParameterValue` "Attachment point /dev/sdf is already in use", the only refusal billet retries, under the next name;
+  - `VolumeInUse`;
+  - `InvalidParameterValue` "/dev/nvme5n1 is not a valid EBS device name";
+  - `InvalidVolume.ZoneMismatch` for a volume in another zone.
+- **The attachment limit.** `DescribeInstanceTypes` reports `MaximumEbsAttachments` 31, "shared", for `z1d.metal` and `m7gd.metal`, and 27 for `t3.small`.
+
+**The real test under the rendered role** (`TestRealSelfAttach`, `BILLET_LIVE_EBSS3_SELF_ATTACH=1`) ran the store's own create, publish, clone and discard through billet's signer. Its credential was an instance profile holding exactly what `billet init iam` prints for a Firecracker node with `node.ebs_s3`, on an instance tagged as a pool host of the test's deployment.
+- **On the `t3.small`, 2026-11-09:** create and attach 3.5 s; verify, detach and snapshot 55 s; clone and attach 4.0 s; mount and first read 38 ms; detach and delete 3.1 s. A held volume's detach was refused (`ErrHeld`).
+- **Its first run was refused `UnauthorizedOperation` by `CreateVolume`.** The role lacked `ec2:CreateTags` for the tags a create carries. `billet init iam` now grants it, conditioned on the deployment's owner tag and on `CreateVolume` and `CreateSnapshot` alone (`BilletCacheTag`).
+- **On the pool's `z1d.metal`, 2026-11-10,** under the host's own instance profile, at a site name of its own so nothing of the run's cache was touched: create and attach 3.9 s; verify, detach and snapshot 59.2 s; clone and attach 3.7 s; mount and first read 19 ms; detach and delete 11.6 s.
+
+**End to end, 2026-11-10.** One control plane on the shared Linux test host served a Firecracker tier, `b1t22-metal-fc-4`: trusted, with a runner group restricted to the matrix's workflows, interception on, and every cache publishing `trusted-only`. It had site `aws-us-west-2a`, whose store is `ebs-s3`, and a pool of `z1d.metal` at floor 0 and maximum 1. The pool's `init_args` named the site, the store and the cache listener on the guests' first bridge, and the prelude handed the same words to the config the role was converged from (`PRELUDE_INIT_ARGS`). The node registered at wire version 48, saying it uses its site's ebs-s3 store, and the plane accepted a Firecracker node at an ebs-s3 site on that word. The acceptance matrix's cold workflow was dispatched first, then its warm one, each job asserting what it found:
+
+| Step | Time (UTC) |
+|---|---|
+| The cold run queued its seven jobs; the pool ordered a host | 02:03:45 |
+| `RunInstances` returned the instance | 02:03:46 |
+| The host role converged (prepare-only) | 02:13 |
+| Admitted on its source's word, and the node registered | 02:26:07, 02:26:10 |
+| The first launch that found a verified guest image | 02:49:14 |
+| The cold run's seven jobs succeeded; the last publication settled | 02:51:41, 02:53:46 |
+| The warm run's seven jobs succeeded | 02:54:19 to 02:56:15 |
+
+- **Every cache was cold, then warm, as the ledger observed it**, never only as a job's log said. The cold jobs recorded the image store and the cache each one exercises as `cold`: sticky disk, builder, Git, Go, Bazel and npm, with Actions `served`. The warm jobs recorded each of them `warm`, and each asserted the cold job's content. The image store was a volume the node attached to itself: 3.8 to 11.3 s from the request to the guest's device on the cold run, and 3.8 to 6.4 s, cloned from the cold run's snapshot, for seven launches at once on the warm one.
+- **A publication is a snapshot, and the job waits for it.** A sticky disk's or builder's write is published by the action's post step, which took 58 and 55 s cold and 74 and 79 s warm, against 59 s for the store's own verify, detach and snapshot of 1 GiB above. Attaching took the sticky-disk action 6 s cold and 24 s warm.
+- **What waiting for the image cost.** The node registered 23 minutes before a launch could find a verified image, because a pull imports one only after the registration has recorded what its control plane accepts (#584). Launches dispatched meanwhile failed, and each held its lease's capacity until the node proved no compute existed. Up to 11 leases were held at once, and the tier's work waited for them to be released and bought again.
+- **The attachment limit, measured.** The idle host was given 1 GiB volumes until EC2 refused. It took 30 beside its root, named `/dev/sdd` to `/dev/sdz` and then `/dev/xvdba` to `/dev/xvdbg`. The 31st was refused `AttachmentLimitExceeded`, "You may attach up to 31 devices for this instance type". The instance store held `/dev/sdb` and `/dev/sdc` ("already in use") without counting against the 31. billet asked only for `/dev/sdf` to `/dev/sdz`, which would have stopped it at 21, so it now continues with `/dev/xvdba` to `/dev/xvdbz`, and EC2's limit refuses first. Each Firecracker guest holds its image store and, while a job uses one, a sticky disk, so 30 attachments serve 15 such jobs at once.
+- **Against the host's own Ceph.** On the same host, an RBD clone of a 1 GiB ext4 image took 0.04 to 0.06 s, its kernel map 0.06 to 0.07 s, and a mount and unmount 0.02 to 0.03 s, three times each. An EBS clone and attach took 3.7 s. A cache volume on EBS costs a launch about 4 s more than one on Ceph would, and its publication about a minute.
+- **An S3 object read.** A 1 GiB object read with one stream by curl from the host took 20.5 to 22.3 s, 48 to 52 MB/s, three times. The host's default VPC had no S3 gateway endpoint, so the reads went through its internet gateway. On 2026-11-04, the EC2 cache probes' one stream through an endpoint took 11.3 to 20.8 s.
+- **Decommission.** `billet decommission --yes` was run from the node's config on another machine, with an operator's credentials in its environment and the deployment's id in the node's state directory. It purged what the run had published: 5 snapshots, 3 state objects and 173 cache objects. It listed no instances, since a metal node's host is its pool's. A sweep by the deployment's tags then found no volume, snapshot or object.
+- **Cost.** One `z1d.metal` for about 1 hour 20 minutes at $4.464 an hour on demand, about $6, and less than $1 of EBS and S3.
+
 ## Still to measure
 
 - A no-stock and a quota refusal from each source, read as the scaler will read them.
@@ -168,5 +210,6 @@ The `s1.c1.small` of 2026-11-05 is no longer in the catalogue, and this was the 
 - Single-thread speed inside a Firecracker guest under full load, on each candidate, with cpus pinned so a sibling hyperthread is told apart from the rest of the load.
 - `m6id.metal`, `m8gd.metal-24xl` and `m8id.metal-48xl`, which fit the shape on paper and were not launched.
 - What `DescribeInstances` answers for a terminated metal instance, and for how long: billet read each released host as gone about 20 minutes after asking, and the answers in between were not recorded.
-- A store volume attached to a metal instance and handed to a Firecracker guest.
+- `m7gd.metal`'s attachment limit by attaching until refused; only `DescribeInstanceTypes`' 31 is recorded.
+- A metal host's cache reads through an S3 gateway endpoint in the pool's own VPC.
 - phoenixNAP: an order through the API, which is still refused (#828), and with it the join's person-approved admission and the API's answer after a delete.

@@ -78,6 +78,14 @@ Also set `server.pool.init_args` to the same three flags the script gives `bille
 - `--ceph-user=billet`
 - `--ceph-keyring=/etc/ceph/ceph.client.billet.keyring`
 
+For the guests' caches on AWS metal ([ADR-030](../../../../../docs/reference/decisions/adr-030-rented-bare-metal-pool.md)), `server.pool.init_args` also names the site, its ebs-s3 store and the cache listener, and `PRELUDE_INIT_ARGS` carries the same words, so the config the role is converged from is the one the join writes:
+
+```bash
+export PRELUDE_INIT_ARGS='--site=aws-us-west-2a --ebs-s3-region=us-west-2 --ebs-s3-availability-zone=us-west-2a --ebs-s3-bucket=my-cache-bucket --cache-listen=10.240.0.1:7718 --cache-guest-endpoint=http://10.240.0.1:7718'
+```
+
+The listener is on the guests' first bridge, the address the role gives the host there (the script moves them to 10.240.0.0/23, above), so only the guests reach it. The words are split on whitespace, so none may contain a space. The control plane checks them against its own `sites` and the pool's zone before it orders anything. The instance profile needs the node's cache policy, which `billet init iam --config <a node config with these flags> --deployment <id>` prints for a Firecracker node with `node.ebs_s3`: the bucket, the key, and attaching and detaching the store's volumes to and from an instance carrying this deployment's pool owner tag.
+
 The whole payload carries a join token, so keep it to the source's API, and within EC2's 16384 bytes of user data. The control plane adds the join's line and a few lines around the prelude, under 1 KB. The sizes:
 - **The body without comments** is about 12.2 KB.
 - **Exports naming release URLs or S3 keys** add a few hundred bytes. Rendered with S3 keys it was 12.8 KB.
