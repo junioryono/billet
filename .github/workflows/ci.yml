@@ -26,12 +26,18 @@ permissions:
 # one connection in 1,700 after its TCP handshake (#818), and Go's fetch has no
 # retry of its own: lint, release-config, terraform, test-postgres and
 # host-lifecycle each failed on `net/http: TLS handshake timeout` or a reset
-# stream from proxy.golang.org. Measured 2026-11-10 with Go 1.26: a black-holed
-# first entry fell through to the second for the module, while the checksum
-# database's lookup through the proxy did not, which only a module missing from
-# go.sum (`go install tool@version`) needs.
+# stream from proxy.golang.org.
+#
+# THE SECOND ENTRY ENDS IN A SLASH, AND MUST. Go caches a module's metadata by
+# proxy URL, its errors included, so an identical second entry answers with the
+# first's failure and never asks again. Measured 2026-11-10 with Go 1.26 against a
+# proxy that drops each path's first request: named identically, the .info's
+# drop failed the download with no second request; with the slash, the .info,
+# .mod and .zip were each asked again and the download succeeded. The checksum
+# database's lookup through the proxy does not fall through either way, which only
+# a module missing from go.sum (`go install tool@version`) needs.
 env:
-  GOPROXY: https://proxy.golang.org|https://proxy.golang.org,direct
+  GOPROXY: https://proxy.golang.org|https://proxy.golang.org/,direct
 
 concurrency:
   group: ci-${{ github.ref }}
