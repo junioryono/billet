@@ -158,6 +158,28 @@ func TestACreatedVolumeIsAttachedHereUnderAFreeName(t *testing.T) {
 	}
 }
 
+// THE NAMES OUTLAST EC2'S LIMIT: past /dev/sdz the store asks for /dev/xvdba, so a metal
+// host's 30 attachments are reachable rather than stopped at 21 by billet's own list.
+func TestTheNamesReachPastTwentyOneAttachments(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	s, _, attach, _ := localTestStore(&now)
+	for c := 'f'; c <= 'z'; c++ {
+		attach.used["/dev/sd"+string(c)] = true
+	}
+
+	if _, err := s.Create(t.Context(), "sticky/a", 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	if got := attach.asked[len(attach.asked)-1]; got != "/dev/xvdba" {
+		t.Fatalf("with /dev/sdf to /dev/sdz in use the volume was attached as %s, not /dev/xvdba", got)
+	}
+	if len(attachmentPoints) < 31 {
+		t.Fatalf("billet asks for %d names, fewer than the 31 attachments EC2 allows a metal host", len(attachmentPoints))
+	}
+}
+
 // A CLONE IS ATTACHED HERE TOO, from the generation it was made from.
 func TestACloneIsAttachedHere(t *testing.T) {
 	t.Parallel()

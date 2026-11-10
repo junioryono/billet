@@ -45,10 +45,18 @@ type hostDisks interface {
 // On a Nitro instance the name is only a label: the volume appears as an NVMe device
 // whose serial is its id. EC2 refuses a name already in use and one outside its naming
 // scheme (`/dev/nvme5n1` was "not a valid EBS device name", 2026-11-09).
+//
+// MORE NAMES THAN EC2 ALLOWS ATTACHMENTS, so its limit refuses before the names run out.
+// A z1d.metal took 30 volumes beside its root, `/dev/xvdba` to `/dev/xvdbg` among them,
+// and refused the next with AttachmentLimitExceeded, while its instance store held
+// `/dev/sdb` and `/dev/sdc` without counting against the 31 (2026-11-10).
 var attachmentPoints = func() []string {
 	var points []string
 	for c := 'f'; c <= 'z'; c++ {
 		points = append(points, "/dev/sd"+string(c))
+	}
+	for c := 'a'; c <= 'z'; c++ {
+		points = append(points, "/dev/xvdb"+string(c))
 	}
 
 	return points

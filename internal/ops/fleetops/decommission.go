@@ -71,10 +71,14 @@ func Decommission(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if *yes {
+	switch {
+	case *yes && metal:
+		fmt.Fprintf(env.Stdout, "decommission complete — the site's bucket and key can now be removed "+
+			"without leaving billet resources behind\n")
+	case *yes:
 		fmt.Fprintf(env.Stdout, "decommission complete — `terraform destroy` can now remove the module's "+
 			"VPC, IAM role, bucket and queue without leaving billet resources behind\n")
-	} else {
+	default:
 		fmt.Fprintf(env.Stdout, "(nothing was deleted — re-run with --yes to remove the above)\n")
 	}
 
