@@ -589,6 +589,10 @@ func TestAnOrderPlacedDuringTheTeardownFailsIt(t *testing.T) {
 	if err := sameAcceptancePoolOrders(t.Context(), ws, []acceptancePoolOrder{{ID: "p9"}}); err != nil {
 		t.Errorf("the same orders read twice answered %v", err)
 	}
+	if err := sameAcceptancePoolOrders(t.Context(), ws, []acceptancePoolOrder{{ID: "p9"}, {ID: "p8"}}); err == nil ||
+		!strings.Contains(err.Error(), "p8") || !strings.Contains(err.Error(), "no longer") {
+		t.Errorf("an order the second read no longer holds answered %v", err)
+	}
 }
 
 // THE RUN WAITS FOR THE POOL TO LET EVERY HOST GO, AND SAYS WHICH IT STILL HOLDS: an

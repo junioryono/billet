@@ -357,6 +357,18 @@ func sameAcceptancePoolOrders(ctx context.Context, ws acceptanceWorkspace, befor
 		return fmt.Errorf("%w: pool order(s) %s were placed while the teardown ran, so it proved none of their "+
 			"hosts gone", errAcceptanceResidue, strings.Join(placed, ", "))
 	}
+	// AN ORDER THAT VANISHED is a ledger replaced under the teardown, which can no longer
+	// say what else it held.
+	var vanished []string
+	for i := range before {
+		if !slices.ContainsFunc(after, func(o acceptancePoolOrder) bool { return o.ID == before[i].ID }) {
+			vanished = append(vanished, before[i].ID)
+		}
+	}
+	if len(vanished) > 0 {
+		return fmt.Errorf("pool order(s) %s are no longer in this run's ledger, so it is not the ledger the "+
+			"teardown read, and nothing here says what it held", strings.Join(vanished, ", "))
+	}
 
 	return nil
 }
