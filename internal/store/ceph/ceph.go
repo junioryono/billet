@@ -22,13 +22,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/store/blockfs"
 )
 
 // DefaultTimeout bounds one rbd invocation.
@@ -278,7 +278,7 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("ceph: %w", errors.Join(errs...))
 	}
 
-	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyFilesystem,
+	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: blockfs.VerifyExt4,
 		purgeWorkers: trashPurgeWorkers, ioPressure: readHostIOPressure, pause: sleepFor,
 		purgeSlot: make(chan struct{}, 1), checkSlot: generationMapSlot, damaged: checkDamage,
 		machine: config.HostMachine(runtime.GOARCH), readProbe: readProbeWithDebugfs}
@@ -547,44 +547,7 @@ func EffectiveCloneFormat(minCompatClient, configured string) (int, error) {
 // The package's rule is that output billet cannot parse is never echoed. A value
 // that DID parse is not thereby safe: it arrived inside json a binary billet does
 // not control, and a megabyte of it in an error string reaches the same terminal.
-func bounded(v string) string {
-	// QUOTED, so a control byte in another program's output cannot become a live
-	// terminal control when billet prints it.
-	clean := sanitize(v)
-	quoted := strconv.Quote(clean)
-
-	// THE RENDERED LENGTH, not the input length. Quoting EXPANDS — 300 NUL bytes
-	// become 1,200 characters of `\x00` — so capping what goes in leaves what comes
-	// out four times the bound it was supposed to have.
-	if len(quoted) <= maxDiagnostic {
-		return quoted
-	}
-
-	// THE LARGEST PREFIX WHOSE QUOTED FORM FITS, built up escape by escape rather
-	// than sliced out of the finished string. Slicing cuts inside an escape — 100
-	// NUL bytes truncate to `"\x00\x00…\x0` — and trimming the trailing backslash
-	// only fixes the subset where the cut landed on one. Assembling it cannot
-	// produce a partial escape at all, which is the difference between a rule and a
-	// patch for the case somebody noticed.
-	var b strings.Builder
-
-	b.WriteByte('"')
-
-	for _, r := range clean {
-		piece := strconv.Quote(string(r))
-		piece = piece[1 : len(piece)-1]
-
-		if b.Len()+len(piece)+len("…\"") > maxDiagnostic {
-			break
-		}
-
-		b.WriteString(piece)
-	}
-
-	b.WriteString("…\"")
-
-	return b.String()
-}
+func bounded(v string) string { return blockfs.Bounded(v) }
 
 // minCompatClient asks the cluster which client releases it admits.
 //
@@ -1038,7 +1001,7 @@ func execRunner(ctx context.Context, bin string, args []string) ([]byte, error) 
 	// executable could allocate for the whole timeout. Note that no test can observe
 	// the difference — lastLine caps the rendered result either way — so this
 	// wiring is covered by review rather than by an assertion.
-	stderr := &tailWriter{limit: maxDiagnostic}
+	stderr := &tailWriter{Limit: maxDiagnostic}
 	cmd.Stderr = stderr
 
 	// STDOUT IS NOT BOUNDED, and that is a decision. Its size is proportional to how
@@ -1102,49 +1065,10 @@ func execRunner(ctx context.Context, bin string, args []string) ([]byte, error) 
 // Keeping the TAIL rather than the head is what makes the bound compatible with
 // lastLine: librados prints its connection logging first and the sentence that
 // matters last.
-type tailWriter struct {
-	limit int
-	buf   []byte
-}
-
-func (w *tailWriter) Write(p []byte) (int, error) {
-	n := len(p)
-
-	// A LIMIT OF ZERO KEEPS NOTHING rather than panicking. Nothing constructs one
-	// today, but the slice arithmetic below indexes from the end and a negative
-	// limit would be a runtime panic in a control plane — a guard is cheaper than
-	// the next caller having to know that.
-	if w.limit <= 0 {
-		w.buf = nil
-
-		return n, nil
-	}
-
-	// TWO TRIMS, AND THE FIRST ONE IS NOT REDUNDANT even though deleting it leaves
-	// every observable behaviour identical — which is why its mutation survives, and
-	// the redundancy is said out loud here rather than assumed. It bounds the PEAK
-	// allocation of a single write: without it a lone 10GB write is appended in full
-	// and only then trimmed, which is the allocation this type exists to prevent.
-	// The second trim bounds what ACCUMULATES across writes, which the first cannot.
-	if len(p) > w.limit {
-		p = p[len(p)-w.limit:]
-	}
-
-	w.buf = append(w.buf, p...)
-	if len(w.buf) > w.limit {
-		w.buf = w.buf[len(w.buf)-w.limit:]
-	}
-
-	// The length WRITTEN TO US, never the length kept: io.Writer's contract makes a
-	// short count an error, so reporting what survived the trim would make exec
-	// conclude the pipe broke and abandon a healthy command.
-	return n, nil
-}
-
-func (w *tailWriter) String() string { return strings.TrimSpace(string(w.buf)) }
+type tailWriter = blockfs.TailWriter
 
 // maxDiagnostic bounds how much of rbd's output reaches a terminal or a log.
-const maxDiagnostic = 300
+const maxDiagnostic = blockfs.MaxDiagnostic
 
 // lastLine keeps the line rbd ended on, bounded.
 //
@@ -1183,4 +1107,4 @@ func lastLine(s string) string {
 // rune, which then reaches an error string that is printed, logged and marshalled.
 // Dropping is right rather than replacing: the replacement character would be
 // billet adding a glyph to somebody else's message.
-func sanitize(s string) string { return strings.ToValidUTF8(s, "") }
+func sanitize(s string) string { return blockfs.Sanitize(s) }

@@ -1,4 +1,4 @@
-package ceph
+package blockfs
 
 import (
 	"os"
@@ -21,7 +21,7 @@ func TestAnUncleanFilesystemIsRefusedInE2fscksWords(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	_, err := verifyFilesystem(t.Context(), "/dev/rbd-test")
+	_, err := VerifyExt4(t.Context(), "/dev/rbd-test")
 	if err == nil {
 		t.Fatal("a filesystem e2fsck refused was accepted")
 	}

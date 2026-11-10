@@ -397,6 +397,9 @@ func (e ebsAPI) LogValue() slog.Value { return slog.StringValue(e.String()) }
 type awsAPIError struct {
 	Code   string
 	Status int
+	// message is EC2's own sentence, kept to tell apart two refusals that share a code
+	// and never rendered: Error names the code alone, as it always has.
+	message string
 }
 
 func (e *awsAPIError) Error() string {
@@ -462,17 +465,21 @@ func (e ebsAPI) call(ctx context.Context, values url.Values, output any) error {
 	}
 	if response.StatusCode != http.StatusOK {
 		var refusal struct {
-			Codes []string `xml:"Errors>Error>Code"`
+			Codes    []string `xml:"Errors>Error>Code"`
+			Messages []string `xml:"Errors>Error>Message"`
 		}
 		if err := xml.Unmarshal(payload, &refusal); err != nil {
 			return &awsAPIError{Status: response.StatusCode}
 		}
-		code := ""
+		code, message := "", ""
 		if len(refusal.Codes) > 0 {
 			code = refusal.Codes[0]
 		}
+		if len(refusal.Messages) > 0 {
+			message = refusal.Messages[0]
+		}
 
-		return &awsAPIError{Code: code, Status: response.StatusCode}
+		return &awsAPIError{Code: code, Status: response.StatusCode, message: message}
 	}
 	if output != nil {
 		if err := xml.Unmarshal(payload, output); err != nil {

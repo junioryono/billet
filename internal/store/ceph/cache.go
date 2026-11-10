@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os/exec"
 	"regexp"
 	"slices"
 	"strconv"
@@ -32,7 +31,6 @@ const (
 	cacheLockWaitLimit   = CacheLockStaleAfter + HeartbeatObservation + cacheLockRecoveryGap
 	cacheVolumeTTL       = 7 * time.Hour
 	cacheMetaPrefix      = "billet.cache."
-	filesystemProbeLimit = 8 << 10
 	maxCacheCloneDepth   = 8
 	cacheCompactionLimit = 10 * time.Minute
 	// partialCompactionLimit bounds removing what a compaction cut short left. A
@@ -2427,60 +2425,4 @@ func cacheTimeFromName(name string) (time.Time, bool) {
 	}
 
 	return time.Unix(seconds, 0).UTC(), true
-}
-
-func verifyFilesystem(ctx context.Context, device string) (storecontract.Filesystem, error) {
-	blkid, err := exec.LookPath("blkid")
-	if err != nil {
-		return storecontract.Filesystem{}, fmt.Errorf("blkid is required to identify a cache filesystem: %w", err)
-	}
-
-	e2fsck, err := exec.LookPath("e2fsck")
-	if err != nil {
-		return storecontract.Filesystem{}, fmt.Errorf("e2fsck is required to verify an ext4 cache: %w", err)
-	}
-
-	output := &tailWriter{limit: filesystemProbeLimit}
-	cmd := exec.CommandContext(ctx, blkid, "-p", "-s", "TYPE", "-s", "UUID", "-o", "export", device)
-	cmd.Stdout = output
-	if err := cmd.Run(); err != nil {
-		return storecontract.Filesystem{}, fmt.Errorf("identify %s: %w", device, err)
-	}
-
-	filesystem := storecontract.Filesystem{}
-	for _, line := range strings.Split(output.String(), "\n") {
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-
-		switch key {
-		case "TYPE":
-			filesystem.Type = value
-		case "UUID":
-			filesystem.UUID = value
-		}
-	}
-
-	if filesystem.Type != "ext4" {
-		return storecontract.Filesystem{}, fmt.Errorf("cache device %s contains %q, want ext4",
-			device, filesystem.Type)
-	}
-
-	// E2FSCK'S OWN WORDS ARE KEPT, the tail of them. Every Go cache publication
-	// on one deployment was refused here from 2026-10-18 to 2026-10-26 with an
-	// exit status alone, and a refusal that cannot say what e2fsck found cannot
-	// be told from a journal awaiting replay, a damaged bitmap or a device that
-	// was not the volume (#689).
-	report := &tailWriter{limit: filesystemProbeLimit}
-	check := exec.CommandContext(ctx, e2fsck, "-f", "-n", device)
-	check.Stdout, check.Stderr = report, report
-	if err := check.Run(); err != nil {
-		return storecontract.Filesystem{}, fmt.Errorf("the ext4 filesystem on %s is not clean: %w: %s",
-			device, err, bounded(strings.TrimSpace(report.String())))
-	}
-
-	filesystem.Clean = true
-
-	return filesystem, filesystem.Valid()
 }
