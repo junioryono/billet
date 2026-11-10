@@ -2,7 +2,9 @@ package state
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -22,6 +24,47 @@ import (
 // refuses, what the catalogue reports — is a fact about the server rather than
 // about billet's code.
 const postgresDSNEnv = "BILLET_TEST_POSTGRES_DSN"
+
+// testSchemaName is the PostgreSQL schema a test named name runs in: lowercase,
+// because search_path folds an unquoted identifier and the CREATE SCHEMA quotes
+// one; and at most 60 bytes, inside the 63 an identifier may have.
+//
+// A NAME TOO LONG KEEPS A HASH OF ITSELF, not only its first 60 bytes: cut there,
+// two tests whose names share them, and two subtests of one test, ran in one
+// schema, each dropping and migrating the ledger the other was using (#853).
+func testSchemaName(name string) string {
+	s := strings.ToLower("billet_test_" + strings.ReplaceAll(name, "/", "_"))
+	if len(s) <= 60 {
+		return s
+	}
+
+	sum := sha256.Sum256([]byte(s))
+
+	return s[:51] + "_" + hex.EncodeToString(sum[:4])
+}
+
+// TWO TESTS WHOSE NAMES SHARE THEIR FIRST 60 BYTES GET TWO SCHEMAS, and a short
+// name is its own schema still (#853).
+func TestATestSchemaIsTheTestsOwn(t *testing.T) {
+	t.Parallel()
+
+	a := testSchemaName("TestAPostgresLedgerThatSharesALongPrefixWithAnotherOne/first_case")
+	b := testSchemaName("TestAPostgresLedgerThatSharesALongPrefixWithAnotherOne/second_case")
+
+	if a == b {
+		t.Fatalf("two tests share the schema %q", a)
+	}
+
+	for _, s := range []string{a, b} {
+		if len(s) > 60 || s != strings.ToLower(s) {
+			t.Errorf("schema %q is longer than 60 bytes or not lowercase", s)
+		}
+	}
+
+	if got := testSchemaName("TestShort/case"); got != "billet_test_testshort_case" {
+		t.Errorf("a short name became %q", got)
+	}
+}
 
 // requirePostgres returns a DSN pointing at a schema of this test's own, or
 // skips.
@@ -73,10 +116,7 @@ func requirePostgresSchema(t *testing.T, suffix string) DSN {
 	// SCHEMA below quotes one. A mixed-case name creates a schema nothing then
 	// selects, and the failure is "no schema has been selected to create in",
 	// which names neither.
-	schema := strings.ToLower("billet_test_" + strings.ReplaceAll(t.Name(), "/", "_") + suffix)
-	if len(schema) > 60 {
-		schema = schema[:60]
-	}
+	schema := testSchemaName(t.Name() + suffix)
 
 	admin, err := sql.Open("pgx", dsn)
 	if err != nil {

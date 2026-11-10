@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"database/sql"
+	"encoding/hex"
 	"encoding/pem"
 	"net/url"
 	"os"
@@ -324,6 +326,45 @@ tiers:
 // shape. internal/state states the rule for its own suite; this is the command
 // layer's copy of it, and the duplication is deliberate — a shared helper would
 // have to be exported from a package that has no business exporting one.
+// backupSchemaName is the PostgreSQL schema a test named name runs in, as
+// internal/state's testSchemaName names its own: lowercase, at most 60 bytes, and
+// a name too long keeps a hash of itself rather than only its first 60 bytes,
+// which two subtests of one test shared, each dropping and migrating the ledger
+// the other was using (#853).
+func backupSchemaName(name string) string {
+	s := strings.ToLower("billet_test_" + strings.ReplaceAll(name, "/", "_"))
+	if len(s) <= 60 {
+		return s
+	}
+
+	sum := sha256.Sum256([]byte(s))
+
+	return s[:51] + "_" + hex.EncodeToString(sum[:4])
+}
+
+// TWO TESTS WHOSE NAMES SHARE THEIR FIRST 60 BYTES GET TWO SCHEMAS, and a short
+// name is its own schema still. The pair is the one that met in CI (#853).
+func TestABackupTestSchemaIsTheTestsOwn(t *testing.T) {
+	t.Parallel()
+
+	clean := backupSchemaName("TestRetirementOrdinaryAlsoExaminesInertUnitInstallationTransitively/clean")
+	helper := backupSchemaName("TestRetirementOrdinaryAlsoExaminesInertUnitInstallationTransitively/transitive_helper")
+
+	if clean == helper {
+		t.Fatalf("two subtests share the schema %q", clean)
+	}
+
+	for _, s := range []string{clean, helper} {
+		if len(s) > 60 || s != strings.ToLower(s) {
+			t.Errorf("schema %q is longer than 60 bytes or not lowercase", s)
+		}
+	}
+
+	if got := backupSchemaName("TestShort/case"); got != "billet_test_testshort_case" {
+		t.Errorf("a short name became %q", got)
+	}
+}
+
 func requireBackupPostgres(t *testing.T) string {
 	t.Helper()
 
@@ -346,10 +387,7 @@ func requireBackupPostgres(t *testing.T) string {
 			"the end-to-end backup")
 	}
 
-	schema := strings.ToLower("billet_test_" + strings.ReplaceAll(t.Name(), "/", "_"))
-	if len(schema) > 60 {
-		schema = schema[:60]
-	}
+	schema := backupSchemaName(t.Name())
 
 	admin, err := sql.Open("pgx", dsn)
 	if err != nil {
