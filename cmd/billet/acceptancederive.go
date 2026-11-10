@@ -55,7 +55,7 @@ var errSharedLedger = errors.New(
 		"holding that connection string), or run the acceptance against a SQLite base")
 
 // rewriteForAcceptance edits the tree in place and returns the derived labels.
-func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string, error) {
+func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string, fleet *acceptanceFleet) ([]string, error) {
 	if err := refuseSharedLedger(root); err != nil {
 		return nil, err
 	}
@@ -71,13 +71,26 @@ func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string
 
 		setup.SetScalar(server, "listen", listen)
 
-		// AN ACCEPTANCE RUN NEVER SERVES THE FLEET. A base config binding a real
-		// address would have this deployment listening where the real one does, or
-		// racing it for the port; loopback is what an isolated run needs and is
-		// what `up` picked a port on.
-		setup.RemoveScalar(server, "bootstrap_listen")
+		// AN ACCEPTANCE RUN NEVER SERVES THE FLEET, BUT A POOL'S. A base config binding a
+		// real address would have this deployment listening where the real one does, or
+		// racing it for the port; loopback is what an isolated run needs and is what
+		// `up` picked a port on. A pool's hosts are other machines, so a pool's run
+		// serves exactly the addresses its operator named (acceptanceFleet), its hosts
+		// dial that wire and enroll there, and its prelude is the run's.
 		setup.RemoveScalar(server, "node_tls_hosts")
 		setup.RemoveScalar(server, "tls_router")
+		if fleet == nil {
+			setup.RemoveScalar(server, "bootstrap_listen")
+		} else {
+			setup.SetScalar(server, "bootstrap_listen", fleet.Bootstrap)
+			pool := mappingValue(server, "pool")
+			if pool == nil {
+				return nil, errors.New("the base config's server.pool is not a mapping")
+			}
+			setup.SetScalar(pool, "join_server", listen)
+			setup.SetScalar(pool, "boot_prelude", fleet.Prelude)
+			setup.RemoveScalar(pool, "bootstrap_addr")
+		}
 	}
 
 	if node := mappingValue(root, "node"); node != nil {

@@ -9,13 +9,16 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssts"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/ops/fleetops"
 	"github.com/junioryono/billet/internal/ops/host"
 	"github.com/junioryono/billet/internal/state"
 
@@ -112,6 +115,10 @@ type acceptanceWorkspace struct {
 	// Tiers are the derived labels, so the report names them without the config.
 	Tiers []string `json:"tiers,omitempty"`
 
+	// Fleet is the network wire a pool's hosts dial, for a run whose base config is a
+	// pool's (#829); nil for every other run, which serves only its loopback.
+	Fleet *acceptanceFleet `json:"fleet,omitempty"`
+
 	// ConfigSHA256 is the digest of the derived config as `up` wrote it.
 	//
 	// BECAUSE PROVING THE IDENTITY PROVES THE WRONG THING. Every destructive step
@@ -130,6 +137,78 @@ type acceptanceWorkspace struct {
 	// operator who pointed --workspace at a directory holding something else
 	// would otherwise lose it.
 	Created bool `json:"created"`
+}
+
+// acceptanceFleet is where a pool's acceptance run serves its hosts (#829): the node
+// wire and the enrollment listener on an address of this machine they can reach, and
+// the boot prelude the run's pool hands them.
+//
+// THE ONE RUN THAT SERVES THE FLEET, and only on the operator's word. A derived
+// deployment otherwise listens on loopback alone, so it cannot race the base one for a
+// port or be reached by anything else; a pool's hosts are other machines, so its run
+// cannot be, and these name exactly where it may listen.
+type acceptanceFleet struct {
+	Listen    string `json:"listen"`
+	Bootstrap string `json:"bootstrap"`
+	Prelude   string `json:"boot_prelude"`
+}
+
+// checkAcceptanceFleet refuses a fleet where the base config has no pool to serve, a
+// pool with no fleet, a pool beside a node of the run's own (a pool's run is the pool's
+// alone), and addresses that are not one literal, non-loopback address of this
+// machine's on two ports.
+func checkAcceptanceFleet(cfg *config.Config, fleet *acceptanceFleet) error {
+	pool := cfg.Server != nil && cfg.Server.Pool != nil
+	switch {
+	case !pool && fleet == nil:
+		return nil
+	case !pool:
+		return errors.New("--fleet-listen, --fleet-bootstrap and --boot-prelude serve a pool's hosts, and the " +
+			"base config has no server.pool; an acceptance run otherwise serves nothing but its loopback")
+	case fleet == nil:
+		return errors.New("the base config has a server.pool, whose hosts dial the control plane across the " +
+			"network; pass --fleet-listen, --fleet-bootstrap and --boot-prelude to say where this run serves them")
+	case cfg.Node != nil:
+		return errors.New("the base config has a server.pool and a node: a pool's acceptance run has no node " +
+			"of its own, as its only node is a pool host's")
+	case cfg.Server.Pool.IdleAfter == "":
+		return errors.New("the base config's server.pool has no idle_after, so the pool never releases a host " +
+			"itself, and a pool's acceptance run judges that it does")
+	}
+
+	hosts := make([]string, 0, 2)
+	ports := make([]string, 0, 2)
+	for _, a := range []struct{ flag, addr string }{
+		{"--fleet-listen", fleet.Listen}, {"--fleet-bootstrap", fleet.Bootstrap},
+	} {
+		addr, port, err := net.SplitHostPort(a.addr)
+		if err != nil {
+			return fmt.Errorf("%s %q: %w", a.flag, a.addr, err)
+		}
+		ip := net.ParseIP(addr)
+		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || port == "" || port == "0" {
+			return fmt.Errorf("%s %q must be one literal, non-loopback address of this machine and a port: a "+
+				"pool's hosts dial it, and a wildcard would serve every interface", a.flag, a.addr)
+		}
+		hosts = append(hosts, ip.String())
+		ports = append(ports, port)
+	}
+	if hosts[0] != hosts[1] || ports[0] == ports[1] {
+		return fmt.Errorf("--fleet-listen %s and --fleet-bootstrap %s must be one address on two ports",
+			fleet.Listen, fleet.Bootstrap)
+	}
+
+	if !filepath.IsAbs(fleet.Prelude) {
+		return fmt.Errorf("--boot-prelude %q must be an absolute path", fleet.Prelude)
+	}
+	switch info, err := os.Stat(fleet.Prelude); {
+	case err != nil:
+		return fmt.Errorf("--boot-prelude %s is not a file this run can read: %w", fleet.Prelude, err)
+	case !info.Mode().IsRegular():
+		return fmt.Errorf("--boot-prelude %s is not a regular file", fleet.Prelude)
+	}
+
+	return nil
 }
 
 // acceptanceRecordVersion is the record schema this binary writes and the only
@@ -153,7 +232,7 @@ func cmdAcceptance(ctx context.Context, env cli.Env, args []string) error {
 	case "evidence":
 		return cmdAcceptanceEvidence(ctx, env, args[1:])
 	case "matrix":
-		return cmdAcceptanceMatrix(env, args[1:])
+		return cmdAcceptanceMatrix(ctx, env, args[1:])
 	case "down":
 		return cmdAcceptanceDown(ctx, env, args[1:])
 	case "stopped":
@@ -182,6 +261,13 @@ func cmdAcceptanceUp(ctx context.Context, env cli.Env, args []string) error {
 			"from the ones the base config names")
 	region := fs.String("region", "",
 		"the region to ask sts:GetCallerIdentity in (default: the config's own)")
+	fleetListen := fs.String("fleet-listen", "",
+		"for a base config with a server.pool and no node: the node wire its hosts dial, one literal "+
+			"address of this machine and a port")
+	fleetBootstrap := fs.String("fleet-bootstrap", "",
+		"with --fleet-listen: the enrollment listener, the same address on another port")
+	bootPrelude := fs.String("boot-prelude", "",
+		"with --fleet-listen: the boot prelude this run's pool hands its hosts, an absolute path")
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -190,12 +276,20 @@ func cmdAcceptanceUp(ctx context.Context, env cli.Env, args []string) error {
 	// SAID HERE, BEFORE THE RUN. Otherwise `up` succeeds, `run` creates the scale
 	// sets, and only then does the node refuse to start, because a unix socket's
 	// path is at most 103 bytes on macOS and 107 on Linux and a temporary directory
-	// spends most of that (a Tart node, 2026-10-25).
+	// spends most of that (a Tart node, 2026-10-25). A pool's run has no node of its
+	// own; a base that does not load is the derivation's to refuse.
 	if strings.TrimSpace(*workspace) != "" {
-		if err := host.CheckNodeStateDir(filepath.Join(*workspace, "node")); err != nil {
-			return fmt.Errorf("--workspace %s is too long for this run's node, so choose a shorter "+
-				"one: %w", *workspace, err)
+		if cfg, err := config.Load(*base); err == nil && cfg.Node != nil {
+			if err := host.CheckNodeStateDir(filepath.Join(*workspace, "node")); err != nil {
+				return fmt.Errorf("--workspace %s is too long for this run's node, so choose a shorter "+
+					"one: %w", *workspace, err)
+			}
 		}
+	}
+
+	var fleet *acceptanceFleet
+	if *fleetListen != "" || *fleetBootstrap != "" || *bootPrelude != "" {
+		fleet = &acceptanceFleet{Listen: *fleetListen, Bootstrap: *fleetBootstrap, Prelude: *bootPrelude}
 	}
 
 	ws, err := deriveAcceptance(ctx, acceptanceInputs{
@@ -204,6 +298,7 @@ func cmdAcceptanceUp(ctx context.Context, env cli.Env, args []string) error {
 		account:   *account,
 		prefix:    *prefix,
 		region:    *region,
+		fleet:     fleet,
 		creds:     awscreds.Default(),
 	})
 	if err != nil {
@@ -222,10 +317,14 @@ type acceptanceInputs struct {
 	account   string
 	prefix    string
 	region    string
+	fleet     *acceptanceFleet
 	creds     awscreds.Source
 	// stsEndpoint points the account assertion at a test server. Empty is the
 	// real regional endpoint.
 	stsEndpoint string
+	// seedLedger, in a test, puts a migrated ledger in the state directory before a
+	// pool's run first opens it, which then only proves its schema; nil in production.
+	seedLedger func(stateDir string)
 }
 
 // deriveAcceptance is `up` without the printing, so a test can reach it.
@@ -267,6 +366,10 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 	// the acceptance teardown would then be acting on the real deployment's
 	// identity rather than on one it minted. Checked before anything is created.
 	if err := refuseWorkspaceInsideTheDeployment(dir, cfg); err != nil {
+		return acceptanceWorkspace{}, err
+	}
+
+	if err := checkAcceptanceFleet(cfg, in.fleet); err != nil {
 		return acceptanceWorkspace{}, err
 	}
 
@@ -316,6 +419,9 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 	if found {
 		listen = existing.Listen
 	}
+	if in.fleet != nil {
+		listen = in.fleet.Listen
+	}
 
 	if listen == "" {
 		if listen, err = pickLoopbackAddress(ctx); err != nil {
@@ -323,7 +429,7 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 		}
 	}
 
-	derived, labels, err := deriveAcceptanceConfig(in.base, raw, dir, in.prefix, listen)
+	derived, labels, err := deriveAcceptanceConfig(in.base, raw, dir, in.prefix, listen, in.fleet)
 	if err != nil {
 		return acceptanceWorkspace{}, err
 	}
@@ -337,6 +443,7 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 		Listen:      listen,
 		Account:     in.account,
 		Tiers:       labels,
+		Fleet:       in.fleet,
 	}
 
 	ws.Created = created
@@ -358,11 +465,32 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 		ws.CallerARN = id.ARN
 	}
 
+	// A RESUME DERIVES WHAT THE FIRST ATTEMPT DID, OR NOTHING: a base edited in place
+	// between them (another cache prefix, another region) would point the teardown at
+	// resources the first attempt never made, and away from the ones it did.
+	// A RECORD WITH NO DIGEST resumes only onto the derived config already on disk, byte
+	// for byte: that is the one proof left of what the first attempt derived.
+	digest := fmt.Sprintf("%x", sha256.Sum256(derived))
+	if found {
+		recorded := existing.ConfigSHA256
+		if recorded == "" {
+			if onDisk, err := os.ReadFile(ws.ConfigPath); err == nil {
+				recorded = fmt.Sprintf("%x", sha256.Sum256(onDisk))
+			}
+		}
+		if recorded != digest {
+			return acceptanceWorkspace{}, fmt.Errorf("%s was derived from %s as it was then, and it derives "+
+				"differently now (or what it derived then is not on disk to compare); re-deriving would point "+
+				"the teardown away from what the first attempt made. Tear this workspace down first, or use a "+
+				"new one", dir, in.base)
+		}
+	}
+
 	if err := os.WriteFile(ws.ConfigPath, derived, 0o600); err != nil {
 		return acceptanceWorkspace{}, fmt.Errorf("write the derived config: %w", err)
 	}
 
-	ws.ConfigSHA256 = fmt.Sprintf("%x", sha256.Sum256(derived))
+	ws.ConfigSHA256 = digest
 
 	// MINTED HERE, so the record carries the identity every later subcommand
 	// compares against. state.DeploymentID creates one if the directory has none
@@ -390,11 +518,69 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 
 	ws.DeploymentID = deployment
 
+	// A POOL'S LEDGER EXISTS BEFORE ITS RECORD DOES: its orders are what name the hosts
+	// the teardown must prove gone, and the teardown reads them without creating
+	// anything, so a ledger missing from a recorded workspace is a lost one, never a pool
+	// that ordered nothing. Created once, by the `up` that writes the record.
+	if in.fleet != nil {
+		if in.seedLedger != nil && !found {
+			in.seedLedger(serverDir)
+		}
+		if err := prepareAcceptancePoolLedger(ctx, ws.ConfigPath, found); err != nil {
+			return acceptanceWorkspace{}, err
+		}
+	}
+
 	if err := writeAcceptanceWorkspace(dir, ws); err != nil {
 		return acceptanceWorkspace{}, err
 	}
 
 	return ws, nil
+}
+
+// prepareAcceptancePoolLedger creates a pool's run's ledger, or for a workspace already
+// recorded, requires the one its first `up` created.
+func prepareAcceptancePoolLedger(ctx context.Context, configPath string, recorded bool) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("read the derived config: %w", err)
+	}
+	mode := app.LedgerOperator
+	if recorded {
+		mode = app.LedgerInspect
+	}
+	db, err := app.OpenLedger(ctx, cfg, mode)
+	if err != nil {
+		return fmt.Errorf("this run's ledger, which its pool's orders are read from: %w", err)
+	}
+
+	return db.Close()
+}
+
+// requireAcceptancePoolLedger requires a pool's run's ledger to exist before anything
+// opens it in a mode that would create it; any other run's is not asked.
+func requireAcceptancePoolLedger(ctx context.Context, ws acceptanceWorkspace) error {
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read this run's config: %w", err)
+	}
+	if !poolOnly(cfg) {
+		return nil
+	}
+
+	return prepareAcceptancePoolLedger(ctx, ws.ConfigPath, true)
+}
+
+// openAcceptanceLedger is every operator open of a run's ledger after `up`: a pool's run's
+// must already exist, because the operator open creates one where there is none and an
+// empty ledger reads as a pool that ordered nothing. The check is a moment before the
+// open, which no other process of the run's opens the ledger between.
+func openAcceptanceLedger(ctx context.Context, ws acceptanceWorkspace) (*state.DB, *config.Config, error) {
+	if err := requireAcceptancePoolLedger(ctx, ws); err != nil {
+		return nil, nil, err
+	}
+
+	return fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
 }
 
 // requireEmptyWorkspace refuses a directory that already holds something.
@@ -455,6 +641,12 @@ func refuseChangedRun(dir string, existing acceptanceWorkspace, in acceptanceInp
 				"and compute unreachable. Tear this workspace down first, or use a new one",
 			dir, existing.BaseConfig, in.base)
 
+	case !reflect.DeepEqual(existing.Fleet, in.fleet):
+		return fmt.Errorf(
+			"%s serves its pool's hosts at %s and this run says %s. Re-deriving would leave the hosts the "+
+				"first attempt ordered dialling an address nothing serves. Tear this workspace down first, or "+
+				"use a new one", dir, describeFleet(existing.Fleet), describeFleet(in.fleet))
+
 	case existing.LabelPrefix != in.prefix:
 		return fmt.Errorf(
 			"%s owns the tier labels prefixed %q and this run says %q. Re-deriving would "+
@@ -464,6 +656,15 @@ func refuseChangedRun(dir string, existing acceptanceWorkspace, in acceptanceInp
 	}
 
 	return nil
+}
+
+// describeFleet names a fleet for a refusal: its node wire, or that there is none.
+func describeFleet(f *acceptanceFleet) string {
+	if f == nil {
+		return "no fleet wire"
+	}
+
+	return f.Listen + " (enrollment " + f.Bootstrap + ", prelude " + f.Prelude + ")"
 }
 
 // checkLabelPrefix refuses a prefix that would not separate anything.
@@ -560,7 +761,7 @@ func pickLoopbackAddress(ctx context.Context) (string, error) {
 // derived file into something an operator reading it could not recognise as
 // theirs. Editing the tree changes exactly the keys named here.
 func deriveAcceptanceConfig(
-	basePath string, raw []byte, dir, prefix, listen string,
+	basePath string, raw []byte, dir, prefix, listen string, fleet *acceptanceFleet,
 ) ([]byte, []string, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
@@ -572,7 +773,7 @@ func deriveAcceptanceConfig(
 		return nil, nil, errors.New("the base config is not a YAML mapping")
 	}
 
-	labels, err := rewriteForAcceptance(root, dir, prefix, listen)
+	labels, err := rewriteForAcceptance(root, dir, prefix, listen, fleet)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -639,6 +840,10 @@ func printAcceptanceUp(env cli.Env, ws acceptanceWorkspace) {
 	fmt.Fprintf(env.Stdout, "  config       %s\n", ws.ConfigPath)
 	fmt.Fprintf(env.Stdout, "  deployment   %s\n", ws.DeploymentID)
 	fmt.Fprintf(env.Stdout, "  listen       %s\n", ws.Listen)
+	if ws.Fleet != nil {
+		fmt.Fprintf(env.Stdout, "  enrollment   %s\n", ws.Fleet.Bootstrap)
+		fmt.Fprintf(env.Stdout, "  prelude      %s\n", ws.Fleet.Prelude)
+	}
 	fmt.Fprintf(env.Stdout, "  tiers        %s\n", strings.Join(ws.Tiers, ", "))
 
 	if ws.Account != "" {
@@ -843,6 +1048,10 @@ func assertAWSAccount(
 
 // acceptanceRegion is the AWS region a config's own backend names, if any.
 func acceptanceRegion(cfg *config.Config) string {
+	if cfg.Node == nil && cfg.Server != nil && cfg.Server.Pool != nil && cfg.Server.Pool.AWSMetal != nil {
+		return cfg.Server.Pool.AWSMetal.Region
+	}
+
 	if cfg.Node == nil {
 		return ""
 	}

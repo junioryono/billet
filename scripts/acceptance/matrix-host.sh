@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Usage:
 #   matrix-host.sh prepare <run-dir> <base-config> <account> <kms-key-arn> [<guest-role-arn>]
-#   matrix-host.sh run <run-dir> <jobs>
+#   matrix-host.sh prelude <run-dir> <base-config> <listen> <bucket> <region> <run> <lifetime-minutes>
+#   matrix-host.sh prepare-pool <run-dir> <base-config> <account> <listen> <bootstrap> <pool-host-role-arn>
+#   matrix-host.sh run <run-dir> <jobs> [<pool-released>]
 #   matrix-host.sh stop <run-dir>
-#   matrix-host.sh judge <run-dir> <archs> <runs-file> <owner/repo>
+#   matrix-host.sh judge <run-dir> <archs> <runs-file> <owner/repo> [<backends>]
 #   matrix-host.sh stopped <run-dir>
 #   matrix-host.sh down <run-dir>
 #
@@ -20,6 +22,21 @@
 # role only for `down`; empty when the config has no ebs-s3 cache).
 # <guest-role-arn> is the role inside the base config's node.ec2.instance_profile, for the
 # policy's iam:PassRole; omit it when the guests carry no instance profile.
+#
+# prelude renders a pool's boot prelude (#829) at <run-dir>/prelude.sh, from the
+# collection's template at <run-dir>/prelude-template.sh: the exports name this run's
+# billet and collection in <bucket> under runs/<run>/ with their sha256, the node wire
+# <listen> the join dials, <base-config>'s server.pool.init_args (as `billet acceptance
+# matrix pool-init-args` prints them, without the kernel and Ceph flags the prelude sets
+# itself), and the host's halt <lifetime-minutes> after it boots; then the template's body
+# without its comments, which is what fits EC2's 16384 bytes of user data.
+#
+# prepare-pool stands a pool's deployment up from <base-config>, a control plane with a
+# server.pool and no node, serving its hosts at <listen> and <bootstrap> with the prelude
+# above, and writes <run-dir>/tiers, deployment and teardown.json as prepare does,
+# <run-dir>/iam.json (the control plane's pool policy, `billet init iam --pool`, passing
+# <pool-host-role-arn>) and <run-dir>/pool-host.json (the pool hosts' policy, `billet
+# acceptance matrix pool-host-iam`), each scoped to the run's deployment.
 #
 # run runs the deployment until <jobs> jobs have finished (`billet acceptance run
 # --no-teardown`, which writes the evidence and stops the services, and leaves the destroy
@@ -50,8 +67,63 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,8p' "$0" >&2
+	sed -n '2,10p' "$0" >&2
 	exit 2
+}
+
+# lstat_kind PATH prints what lstat says PATH is: dir, file, link or other, or absent
+# when lstat answered ENOENT, and exits 0 only having printed one of those. Only that
+# ENOENT is a name that is not there: the shell's -e and -L answer false for an I/O error
+# as well, and a helper that failed for any reason prints nothing a caller accepts.
+lstat_kind() {
+	python3 -I -c 'import errno, os, stat, sys
+try:
+    m = os.lstat(sys.argv[1]).st_mode
+except FileNotFoundError:
+    print("absent")
+    sys.exit(0)
+print("link" if stat.S_ISLNK(m) else "dir" if stat.S_ISDIR(m) else "file" if stat.S_ISREG(m) else "other")' "$1"
+}
+
+# recorded answers 0 when the workspace holds its record, 1 when it holds none and
+# nothing ever ran in it (no workspace, or no ledger: neither a control plane nor a
+# pool's `up` made one), and anything else, said, when it could not tell or the record
+# is missing beside a ledger, whose deployment nothing here can then name. A missing
+# record is never on its own a run with nothing to take down, and a name is absent only
+# when lstat says so of it inside a directory that is one: a link is not looked through.
+recorded() {
+	local kind
+	kind=$(lstat_kind "$ws/acceptance.json")
+	case $?:$kind in
+	0:file) return 0 ;;
+	0:absent) ;;
+	*)
+		echo "matrix: $ws/acceptance.json could not be read, so whether its run made anything cannot be told" >&2
+		return 2
+		;;
+	esac
+	for dir in "$ws" "$ws/server"; do
+		kind=$(lstat_kind "$dir")
+		case $?:$kind in
+		0:absent) return 1 ;;
+		0:dir) ;;
+		*)
+			echo "matrix: $dir could not be read, so whether its run made anything cannot be told" >&2
+			return 2
+			;;
+		esac
+	done
+	kind=$(lstat_kind "$ws/server/billet.db")
+	case $?:$kind in
+	0:absent) return 1 ;;
+	0:*)
+		echo "matrix: $ws holds a ledger and no acceptance.json, so what its run made cannot be named;" \
+			"a person decides" >&2
+		;;
+	*) echo "matrix: $ws/server/billet.db could not be read, so whether its run made anything cannot be told" >&2 ;;
+	esac
+
+	return 2
 }
 
 phase=${1:-}
@@ -96,9 +168,78 @@ prepare)
 	echo "matrix: deployment $(cat "$run_dir/deployment") is up; its tiers:"
 	cat "$run_dir/tiers"
 	;;
+prelude)
+	[ "$#" -eq 8 ] || usage
+	base=$3 listen=$4 bucket=$5 region=$6 run=$7 lifetime=$8
+	if ! args=$("$billet" acceptance matrix pool-init-args --config "$base"); then
+		echo "matrix: the base config's pool init_args could not be read" >&2
+		exit 1
+	fi
+	billet_sha=$(sha256sum "$billet" | cut -d' ' -f1) || exit 1
+	collection_sha=$(sha256sum "$run_dir/collection.tar.gz" | cut -d' ' -f1) || exit 1
+	{
+		printf 'export ARTIFACT_BUCKET=%q ARTIFACT_REGION=%q\n' "$bucket" "$region"
+		printf 'export BILLET_KEY=%q BILLET_SHA256=%q\n' "runs/$run/billet" "$billet_sha"
+		printf 'export COLLECTION_KEY=%q COLLECTION_SHA256=%q\n' "runs/$run/collection.tar.gz" "$collection_sha"
+		printf 'export PRELUDE_JOIN_SERVER=%q\n' "$listen"
+		printf 'export PRELUDE_INIT_ARGS=%q\n' "$(echo $args)"
+		printf 'export PRELUDE_MAX_LIFETIME_MINUTES=%q\n' "$lifetime"
+		tail -n +2 "$run_dir/prelude-template.sh" | sed '/^[[:space:]]*#/d'
+	} >"$run_dir/prelude.sh" || exit 1
+	size=$(wc -c <"$run_dir/prelude.sh")
+	# THE CONTROL PLANE ADDS THE JOIN'S LINE AND A FEW AROUND IT, under 1 KB, to EC2's 16384.
+	if [ "$size" -gt 15000 ]; then
+		echo "matrix: the rendered prelude is $size bytes, past what fits beside the join in EC2's user data" >&2
+		exit 1
+	fi
+	echo "matrix: the prelude is $size bytes"
+	;;
+prepare-pool)
+	[ "$#" -eq 7 ] || usage
+	base=$3 account=$4 listen=$5 bootstrap=$6 role=$7
+	if ! "$billet" acceptance up --config "$base" --workspace "$ws" --account "$account" --label-prefix accept-pool \
+		--fleet-listen "$listen" --fleet-bootstrap "$bootstrap" --boot-prelude "$run_dir/prelude.sh"; then
+		echo "matrix: the pool's deployment could not be stood up" >&2
+		exit 1
+	fi
+	if ! "$billet" acceptance matrix tiers --workspace "$ws" >"$run_dir/tiers"; then
+		echo "matrix: the workspace's tiers could not be read" >&2
+		exit 1
+	fi
+	if [ ! -s "$run_dir/tiers" ]; then
+		echo "matrix: the base config gives the matrix no pool tier to dispatch to" >&2
+		exit 1
+	fi
+	if ! jq -er '.deployment_id | select(. != "")' "$ws/acceptance.json" >"$run_dir/deployment"; then
+		echo "matrix: the workspace records no deployment id" >&2
+		exit 1
+	fi
+	if ! "$billet" init iam --pool --config "$ws/billet.yaml" --deployment "$(cat "$run_dir/deployment")" \
+		--role-arn "$role" >"$run_dir/iam.json"; then
+		echo "matrix: the pool's policy could not be rendered" >&2
+		exit 1
+	fi
+	if ! "$billet" acceptance matrix pool-host-iam --workspace "$ws" >"$run_dir/pool-host.json"; then
+		echo "matrix: the pool hosts' policy could not be rendered" >&2
+		exit 1
+	fi
+	if ! "$billet" acceptance matrix teardown-policy --workspace "$ws" >"$run_dir/teardown.json"; then
+		echo "matrix: the teardown's policy could not be rendered" >&2
+		exit 1
+	fi
+	echo "matrix: the pool's deployment $(cat "$run_dir/deployment") is up; its tiers:"
+	cat "$run_dir/tiers"
+	;;
 run)
-	[ "$#" -eq 3 ] || usage
-	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait 210m --no-teardown
+	[ "$#" -eq 3 ] || [ "$#" -eq 4 ] || usage
+	# A POOL'S RUN WAITS LESS FOR ITS JOBS, so the wait for the pool's own release after them
+	# still ends inside the 250 minutes SSM gives the command.
+	wait=210m released=()
+	if [ "$#" -eq 4 ]; then
+		wait=150m released=(--pool-released "$4")
+	fi
+	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait "$wait" \
+		"${released[@]}" --no-teardown
 	;;
 stop)
 	[ "$#" -eq 2 ] || usage
@@ -110,8 +251,8 @@ stop)
 	echo "matrix: a stop is requested; a live run is signalled once by its own supervisor"
 	;;
 judge)
-	[ "$#" -eq 5 ] || usage
-	archs=$3 runs=$4 repo=$5
+	[ "$#" -eq 5 ] || [ "$#" -eq 6 ] || usage
+	archs=$3 runs=$4 repo=$5 backends=${6:-ec2}
 	mkdir -p "$run_dir/out"
 	# THE LOG FIRST, whatever is judged: it is what explains a run with no exit.
 	if [ -f "$run_dir/run.log" ]; then
@@ -125,7 +266,7 @@ judge)
 		cp "$ws/evidence.json" "$run_dir/out/"
 	fi
 	"$billet" acceptance matrix judge --workspace "$ws" --archs "$archs" --runs "$runs" --repository "$repo" \
-		--out "$run_dir/out/matrix.json" >"$run_dir/out/matrix.txt"
+		--backends "$backends" --out "$run_dir/out/matrix.json" >"$run_dir/out/matrix.txt"
 	judged=$?
 	cat "$run_dir/out/matrix.txt"
 	exit "$judged"
@@ -141,10 +282,17 @@ stopped)
 	fi
 	# AND ITS SERVICES, by their own locks: the run returns once its stop's grace is
 	# over, and a node still draining past it holds none of the run's lock.
-	if [ -f "$ws/acceptance.json" ] && ! "$billet" acceptance stopped --workspace "$ws"; then
-		echo "matrix: a service of the run may still live; its workspace is $ws" >&2
-		exit 1
-	fi
+	recorded
+	case $? in
+	0)
+		if ! "$billet" acceptance stopped --workspace "$ws"; then
+			echo "matrix: a service of the run may still live; its workspace is $ws" >&2
+			exit 1
+		fi
+		;;
+	1) ;;
+	*) exit 1 ;;
+	esac
 	echo "matrix: no run lives in $run_dir"
 	;;
 down)
@@ -156,10 +304,15 @@ down)
 			exit 1
 		fi
 	fi
-	if [ ! -f "$ws/acceptance.json" ]; then
+	recorded
+	case $? in
+	0) ;;
+	1)
 		echo "matrix: no workspace at $ws; nothing to take down"
 		exit 0
-	fi
+		;;
+	*) exit 1 ;;
+	esac
 	# WHATEVER IT KEEPS, the teardown runs and answers: a log not kept is said, and costs
 	# only the log.
 	python3 -I "$supervise" keep-logs "$run_dir"

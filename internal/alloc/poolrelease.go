@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/releaseproof"
@@ -48,6 +49,10 @@ var ErrPoolReleaseAsked = errors.New("alloc: the pool host's release was asked f
 func (a *Allocator) RequestPoolRelease(ctx context.Context, order, reason string) (bool, error) {
 	if reason == "" {
 		return false, fmt.Errorf("alloc: releasing pool order %s needs the reason a person gave", order)
+	}
+	if strings.HasPrefix(reason, PoolShrinkReason) {
+		return false, fmt.Errorf("alloc: a person's reason for releasing pool order %s may not begin %q, which "+
+			"says the pool's own shrink asked", order, PoolShrinkReason)
 	}
 
 	var sealed bool
@@ -604,6 +609,10 @@ func (a *Allocator) PoolOrderReleased(ctx context.Context, id string) error {
 	})
 }
 
+// PoolGoneBySource is the reason of an order closed on its source's word that its host is
+// gone; a person's close says so in its own.
+const PoolGoneBySource = "its source said the host is gone"
+
 // PoolOrderGone records the source's own terminal answer that a released host is gone.
 //
 // THE SOURCE'S WORD IS PROOF THE NODE IS GONE, so a node whose seal's retirement was undone
@@ -612,7 +621,7 @@ func (a *Allocator) PoolOrderGone(ctx context.Context, id string) error {
 	return a.closePoolOrderTx(ctx, id, PoolReleased, true, "billet pool (its source said gone)",
 		func(w state.WriteOps, now string) (int64, error) {
 			return w.MarkPoolOrderGone(ctx, ledgerdb.MarkPoolOrderGoneParams{
-				Reason: "its source said the host is gone", OrderID: id, UpdatedAt: now,
+				Reason: PoolGoneBySource, OrderID: id, UpdatedAt: now,
 			})
 		})
 }

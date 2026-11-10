@@ -24,6 +24,8 @@
 #                                      words (the site, its store, the cache listener)
 #   PRELUDE_STAGING_GB                 optional: the free room the image's staging
 #                                      needs, in 10^9 bytes (default 100)
+#   PRELUDE_MAX_LIFETIME_MINUTES       optional: halt the host this many minutes after
+#                                      the prelude starts, whatever else happens
 #
 # It runs under the pool's `bash -euo pipefail`, and its output reaches the console the
 # source reads, so it prints nothing a network answered and no line of the join's form:
@@ -36,6 +38,38 @@ work=/var/lib/billet-pool-prelude
 mkdir -p "$work"
 cd "$work"
 trap 'echo "prelude: stopped at line $LINENO; its logs are in /var/lib/billet-pool-prelude" >&2' ERR
+
+# A HOST NOTHING WATCHES STILL STOPS BILLING: a halted instance is stopped, and a stopped
+# one bills no compute. First, so a prelude that fails later is bounded too. FORCED, so
+# the halt waits on no unit's stop: the node's own may wait a day for a drain. The
+# deadline is absolute and recorded once, by the first run, and a timer installed on
+# disk checks it a minute after every boot as well as firing at it, so neither a reboot
+# nor a run again moves it.
+if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
+	case $PRELUDE_MAX_LIFETIME_MINUTES in
+	*[!0-9]* | 0*)
+		echo "prelude: PRELUDE_MAX_LIFETIME_MINUTES is a whole number of minutes" >&2
+		exit 1
+		;;
+	esac
+	if [ ! -s /etc/billet-pool-lifetime ]; then
+		echo $(($(date +%s) + PRELUDE_MAX_LIFETIME_MINUTES * 60)) >/etc/billet-pool-lifetime.new
+		sync /etc/billet-pool-lifetime.new
+		mv /etc/billet-pool-lifetime.new /etc/billet-pool-lifetime
+	fi
+	deadline=$(cat /etc/billet-pool-lifetime)
+	printf '%s\n' '[Unit]' 'Description=Power this pool host off once its lifetime has passed' \
+		'[Service]' 'Type=oneshot' \
+		'ExecStart=/bin/sh -c '\''[ "$(date +%%s)" -lt "$(cat /etc/billet-pool-lifetime)" ] || exec /usr/bin/systemctl poweroff --force'\''' \
+		>/etc/systemd/system/billet-pool-lifetime.service
+	printf '%s\n' '[Unit]' 'Description=Check this pool host'\''s lifetime at boot and at its end' '[Timer]' \
+		'OnBootSec=1min' "OnCalendar=$(date -u -d "@$deadline" '+%Y-%m-%d %H:%M:%S') UTC" 'AccuracySec=1min' \
+		'[Install]' 'WantedBy=timers.target' >/etc/systemd/system/billet-pool-lifetime.timer
+	{
+		systemctl daemon-reload
+		systemctl enable --now billet-pool-lifetime.timer
+	} >>"$work/lifetime.log" 2>&1
+fi
 
 # The image by its name alone: a pull assigns the generation and refuses a name that
 # names one, and it would refuse it on every attempt until the budget was spent.

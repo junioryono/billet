@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -117,8 +118,8 @@ func matrixCells() []matrixCell {
 			for _, c := range matrixCaches {
 				for _, k := range matrixCases {
 					cell := matrixCellFor(c, k)
-					if b.source != "" {
-						cell = poolCells[b.source]
+					if waits, ok := poolCellsNotRun[b.source]; ok {
+						cell = waits
 					}
 					cell.Backend, cell.Source, cell.Arch, cell.Cache, cell.Case = b.kind, b.source, a, c, k
 					out = append(out, cell)
@@ -130,14 +131,21 @@ func matrixCells() []matrixCell {
 	return out
 }
 
-// poolCells is every cell of a pool's Firecracker hosts, by source: supported, and not
-// run until the lane runs them. AWS metal has its site store and has run every cache
-// cold and warm by hand (the bare-metal hosts record, 2026-11-10); phoenixNAP has no store.
-var poolCells = map[string]matrixCell{
-	config.PoolSourceAWSMetal: {Why: "the lane does not yet order AWS metal hosts (#829); their caches ran " +
-		"cold and warm by hand on 2026-11-10 (docs/reference/records/bare-metal-hosts.md)"},
+// poolCellsNotRun is every cell of a pool's Firecracker hosts from a source the lane does
+// not order from, and why. AWS metal's cells are run as EC2's are, by the same workflows
+// on the pool's tier, in the lane's pool job (#829).
+var poolCellsNotRun = map[string]matrixCell{
 	config.PoolSourcePhoenixNAP: {Why: "a phoenixNAP pool runs with every cache off until its site store is " +
 		"bought (#553), and the source has not taken an order through its API (#828)"},
+}
+
+// matrixBackendKey is a backend as the tables and the dispatcher name it.
+func matrixBackendKey(b matrixBackend) string {
+	if b.source != "" {
+		return string(b.kind) + "/" + b.source
+	}
+
+	return string(b.kind)
 }
 
 // matrixBackendName is a cell's backend as the tables print it: the source beside a
@@ -287,6 +295,8 @@ type matrixDoc struct {
 	Failed      int `json:"failed"`
 	NotRun      int `json:"not_run"`
 	Unsupported int `json:"unsupported"`
+	// Scenarios are what a pool did as a whole, beside the cells (#829).
+	Scenarios []matrixScenario `json:"scenarios,omitempty"`
 }
 
 const matrixDocVersion = 1
@@ -348,6 +358,18 @@ type matrixScope struct {
 	// which only a hand-run judge without --runs does.
 	runs       map[int64]bool
 	repository string
+	// poolNodes is each pool host's node and the source and architecture its order
+	// rented it as: a pool cell's job is one that ran on a node of its source and its
+	// architecture, and an EC2 cell's one that ran on no pool's.
+	poolNodes map[string]poolNode
+	// poolFloors is the floor the config's pool keeps on each architecture.
+	poolFloors map[config.Arch]int
+}
+
+// poolNode is what a pool's order says of the host that joined as a node.
+type poolNode struct {
+	source string
+	arch   config.Arch
 }
 
 // belongs reports whether a job is one of this matrix run's.
@@ -363,6 +385,16 @@ func (s matrixScope) belongs(j *acceptanceJob) bool {
 func judgeMatrix(cells []matrixCell, doc acceptanceEvidenceDoc, scope matrixScope) matrixDoc {
 	out := matrixDoc{Version: matrixDocVersion, JudgedAt: time.Now().UTC().Format(time.RFC3339),
 		DeploymentID: doc.DeploymentID}
+	if scope.poolNodes == nil {
+		scope.poolNodes = map[string]poolNode{}
+		for i := range doc.Pool {
+			if doc.Pool[i].Node != "" {
+				scope.poolNodes[doc.Pool[i].Node] = poolNode{source: doc.Pool[i].Source,
+					arch: config.Arch(doc.Pool[i].Arch)}
+			}
+		}
+	}
+	out.Scenarios = judgeScenarios(doc, scope)
 	for _, cell := range cells {
 		r := judgeCell(cell, doc.Jobs, scope)
 		switch r.Verdict {
@@ -399,6 +431,14 @@ func judgeCell(cell matrixCell, jobs []acceptanceJob, scope matrixScope) matrixR
 		j := &jobs[i]
 		t, ok := scope.tiers[j.Tier]
 		if !ok || t.arch != cell.Arch || !slices.Contains(t.providers, cell.Backend) {
+			continue
+		}
+		// ON A HOST OF THE CELL'S SOURCE AND ARCHITECTURE, which only the pool's own orders
+		// say: a Firecracker job on a host the operator owns is not a pool's, nor one on a
+		// host its order rented as another architecture than its tier's. A job whose
+		// history could not be read has no node to tell by, and is kept, as below.
+		if node, pooled := scope.poolNodes[j.Node]; j.Unread == "" &&
+			(node.source != cell.Source || (pooled && node.arch != cell.Arch)) {
 			continue
 		}
 		if workflowFile(j.WorkflowRef) != cell.Run.Workflow || j.JobName != cell.Run.Job {
@@ -476,7 +516,7 @@ func measureJob(r *matrixResult, j *acceptanceJob, prices map[string]config.USDP
 	}
 }
 
-func cmdAcceptanceMatrix(env cli.Env, args []string) error {
+func cmdAcceptanceMatrix(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("billet acceptance matrix needs a subcommand: cells or judge")
 	}
@@ -491,10 +531,14 @@ func cmdAcceptanceMatrix(env cli.Env, args []string) error {
 		return cmdMatrixJudge(env, args[1:])
 	case "teardown-policy":
 		return cmdMatrixTeardownPolicy(env, args[1:])
+	case "pool-init-args":
+		return cmdMatrixPoolInitArgs(env, args[1:])
+	case "pool-host-iam":
+		return cmdMatrixPoolHostIAM(ctx, env, args[1:])
 	}
 
-	return fmt.Errorf("billet acceptance matrix %s: unknown subcommand; it is cells, tiers, jobs, judge or "+
-		"teardown-policy", args[0])
+	return fmt.Errorf("billet acceptance matrix %s: unknown subcommand; it is cells, tiers, jobs, judge, "+
+		"teardown-policy, pool-init-args or pool-host-iam", args[0])
 }
 
 // cmdMatrixTeardownPolicy prints the IAM policy a run's teardown needs beside the node's
@@ -526,21 +570,46 @@ func cmdMatrixTeardownPolicy(env cli.Env, args []string) error {
 }
 
 func matrixTeardownPolicy(cfg *config.Config, deployment string) (awspolicy.Policy, bool, error) {
-	if cfg.Node == nil || cfg.Node.EBSS3 == nil {
+	// THE SITE'S STORE IS THE NODE'S, or for a pool's run the one its init_args hand its
+	// hosts, whose cache the teardown purges as a node's decommission would.
+	var store *config.EBSS3Config
+	var site string
+	pool := false
+	switch {
+	case cfg.Node != nil:
+		store, site = cfg.Node.EBSS3, cfg.Node.Site
+	case cfg.Server != nil && cfg.Server.Pool != nil:
+		site, store = cfg.Server.Pool.SiteStore()
+		pool = true
+	}
+	if store == nil {
 		return awspolicy.Policy{}, false, nil
 	}
 	if deployment == "" {
 		return awspolicy.Policy{}, false, errors.New("the workspace records no deployment id, so its " +
 			"cache's state prefix is unknown")
 	}
-	store := *cfg.Node.EBSS3
-	prefix := ebss3.StatePrefix(store, app.CacheNamespace(deployment, cfg.Node.Site))
+	prefix := ebss3.StatePrefix(*store, app.CacheNamespace(deployment, site))
 
-	return awspolicy.Policy{Version: "2012-10-17", Statement: []awspolicy.Statement{{
+	policy := awspolicy.Policy{Version: "2012-10-17", Statement: []awspolicy.Statement{{
 		Sid: "BilletMatrixDecommissionState", Effect: "Allow", Action: []string{"s3:DeleteObject"},
 		Resource: []string{fmt.Sprintf("arn:%s:s3:::%s/%s*", awspolicy.PartitionForRegion(store.Region),
 			store.Bucket, prefix)},
-	}}}, true, nil
+	}}}
+	// A POOL'S RUN PURGES A CACHE IT NEVER RAN AS A NODE: the control plane's own policy
+	// is the pool's, and the cache's are its hosts', so the teardown is granted the
+	// purge's half of a node's for this deployment as well.
+	if pool {
+		purge, err := awspolicy.CachePurge(store.Region, deployment,
+			awspolicy.Cache{Bucket: store.Bucket, Prefix: store.Prefix},
+			ebss3.OwnerPrefix(*store, app.CacheNamespace(deployment, site)))
+		if err != nil {
+			return awspolicy.Policy{}, false, fmt.Errorf("the pool's cache purge: %w", err)
+		}
+		policy.Statement = append(policy.Statement, purge...)
+	}
+
+	return policy, true, nil
 }
 
 // matrixJobsPerArch is how many jobs one dispatch of every matrix workflow runs on one
@@ -586,24 +655,43 @@ func cmdMatrixTiers(env cli.Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	for _, line := range matrixTierLines(matrixTiers(cfg)) {
+	for _, line := range matrixTierLines(matrixTiers(cfg), matrixPoolSources(cfg)) {
 		fmt.Fprintln(env.Stdout, line)
 	}
 
 	return nil
 }
 
+// matrixPoolSources is, by source, the architectures the config's pool orders hosts of.
+func matrixPoolSources(cfg *config.Config) map[string]map[config.Arch]bool {
+	out := map[string]map[config.Arch]bool{}
+	if cfg.Server == nil || cfg.Server.Pool == nil {
+		return out
+	}
+	for arch, a := range cfg.Server.Pool.Architectures {
+		for _, choice := range a.Order {
+			if out[choice.Source] == nil {
+				out[choice.Source] = map[config.Arch]bool{}
+			}
+			out[choice.Source][arch] = true
+		}
+	}
+
+	return out
+}
+
 // matrixTierLines is one line per backend and architecture whose tier is the only one
 // that serves it. Two tiers serving one would split a cell's jobs between them, and the
-// cold and warm jobs must meet on one tier's caches.
-func matrixTierLines(tiers map[string]matrixTier) []string {
+// cold and warm jobs must meet on one tier's caches. A pool's backend is one only where
+// the config's pool orders from its source on that architecture, as only then are the
+// tier's hosts the pool's.
+func matrixTierLines(tiers map[string]matrixTier, pools map[string]map[config.Arch]bool) []string {
 	var out []string
 	for _, b := range matrixBackends {
-		// A POOL'S CELLS ARE NOT RUN, so no pool tier is dispatched to.
-		if b.source != "" {
-			continue
-		}
 		for _, a := range matrixArchs {
+			if b.source != "" && !pools[b.source][a] {
+				continue
+			}
 			var labels []string
 			for label, t := range tiers {
 				if t.arch == a && slices.Contains(t.providers, b.kind) && len(t.providers) == 1 {
@@ -611,7 +699,7 @@ func matrixTierLines(tiers map[string]matrixTier) []string {
 				}
 			}
 			if len(labels) == 1 {
-				out = append(out, fmt.Sprintf("%s %s %s", b.kind, a, labels[0]))
+				out = append(out, fmt.Sprintf("%s %s %s", matrixBackendKey(b), a, labels[0]))
 			}
 		}
 	}
@@ -660,6 +748,8 @@ func cmdMatrixJudge(env cli.Env, args []string) error {
 		"only their jobs are judged (default: every job in the evidence)")
 	repository := fs.String("repository", "", "the owner/repository the runs were dispatched in; a job of any "+
 		"other is not judged")
+	backends := fs.String("backends", "ec2", "the backends this run served, comma-separated (ec2, "+
+		"firecracker/aws-metal); a cell or scenario of another is reported, never owed")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -678,6 +768,10 @@ func cmdMatrixJudge(env cli.Env, args []string) error {
 	if err != nil {
 		return err
 	}
+	served, err := parseMatrixBackends(*backends)
+	if err != nil {
+		return err
+	}
 	doc, err := readMatrixEvidence(*evidence, ws.DeploymentID)
 	if err != nil {
 		return err
@@ -686,7 +780,8 @@ func cmdMatrixJudge(env cli.Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	scope := matrixScope{tiers: matrixTiers(cfg), prices: matrixPrices(cfg), repository: *repository}
+	scope := matrixScope{tiers: matrixTiers(cfg), prices: matrixPrices(cfg), repository: *repository,
+		poolFloors: matrixPoolFloors(cfg)}
 	if *runsFile != "" {
 		if scope.runs, err = readMatrixRuns(*runsFile); err != nil {
 			return err
@@ -702,7 +797,7 @@ func cmdMatrixJudge(env cli.Env, args []string) error {
 	}
 	printMatrix(env.Stdout, verdicts)
 
-	return matrixOutcome(verdicts, required)
+	return matrixOutcome(verdicts, required, served)
 }
 
 // readMatrixEvidence reads a run's evidence, refusing one of another schema or another
@@ -755,13 +850,24 @@ func readMatrixRuns(file string) (map[int64]bool, error) {
 	return out, nil
 }
 
-// matrixOutcome fails a run with any failed cell, or a cell that should have run on an
-// architecture the run covered and did not.
-func matrixOutcome(d matrixDoc, required []config.Arch) error {
+// matrixOutcome fails a run with any failed cell or scenario, or one that should have
+// run on a backend the run served and an architecture it covered, and did not.
+func matrixOutcome(d matrixDoc, required []config.Arch, served []string) error {
 	var missing int
 	for i := range d.Results {
 		r := &d.Results[i]
-		if r.Verdict == verdictNotRun && r.Run != nil && slices.Contains(required, r.Arch) {
+		if r.Verdict == verdictNotRun && r.Run != nil && slices.Contains(required, r.Arch) &&
+			slices.Contains(served, matrixBackendName(&r.matrixCell)) {
+			missing++
+		}
+	}
+	for i := range d.Scenarios {
+		s := &d.Scenarios[i]
+		switch {
+		case s.Verdict == verdictFail:
+			d.Failed++
+		case s.Verdict == verdictNotRun && s.Owed && slices.Contains(required, s.Arch) &&
+			slices.Contains(served, string(config.ProviderFirecracker)+"/"+s.Source):
 			missing++
 		}
 	}
@@ -775,6 +881,31 @@ func matrixOutcome(d matrixDoc, required []config.Arch) error {
 	}
 
 	return nil
+}
+
+func parseMatrixBackends(s string) ([]string, error) {
+	known := make([]string, 0, len(matrixBackends))
+	for _, b := range matrixBackends {
+		known = append(known, matrixBackendKey(b))
+	}
+	var out []string
+	for part := range strings.SplitSeq(s, ",") {
+		b := strings.TrimSpace(part)
+		if b == "" {
+			continue
+		}
+		if !slices.Contains(known, b) {
+			return nil, fmt.Errorf("--backends: %q is not a backend the matrix declares (%v)", b, known)
+		}
+		out = append(out, b)
+	}
+	// NO BACKEND IS NOT A SELECTION: it would owe nothing, and a run that ran nothing
+	// would pass.
+	if len(out) == 0 {
+		return nil, fmt.Errorf("--backends: name the backends this run served (%v)", known)
+	}
+
+	return out, nil
 }
 
 func parseMatrixArchs(s string) ([]config.Arch, error) {
@@ -813,6 +944,19 @@ func printMatrix(w io.Writer, d matrixDoc) {
 	}
 	_ = tw.Flush()
 	fmt.Fprintf(w, "\n%d passed, %d failed, %d not run, %d unsupported\n", d.Passed, d.Failed, d.NotRun, d.Unsupported)
+
+	if len(d.Scenarios) == 0 {
+		return
+	}
+	fmt.Fprintln(w)
+	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "POOL\tARCH\tSCENARIO\tVERDICT\tORDERS\tREASON")
+	for i := range d.Scenarios {
+		s := &d.Scenarios[i]
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", s.Source, s.Arch, s.Name, s.Verdict,
+			dashIfEmpty(strings.Join(s.Orders, ",")), dashIfEmpty(oneLineReason(s.Reason)))
+	}
+	_ = tw.Flush()
 }
 
 func dashIfEmpty(s string) string {

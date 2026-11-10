@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/junioryono/billet/internal/store/ebss3"
 
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/config"
 )
 
 // The teardown, which is the half of `billet acceptance` that has to work when
@@ -94,6 +96,15 @@ func tearDownAcceptanceWithin(
 
 	var problems []error
 
+	// A POOL'S ORDERS ARE READ FIRST, before the drain's open of the ledger, which would
+	// create a lost one empty: the orders name the hosts step 3 must prove gone. Orders it
+	// could not read stop the teardown here, before that open, so a retry meets the same
+	// missing ledger rather than an empty one.
+	pool, orders, isPool, poolErr := acceptancePoolFor(ctx, ws)
+	if poolErr != nil {
+		return fmt.Errorf("the acceptance teardown did not start: %w", poolErr)
+	}
+
 	// 1. SEAL AND WAIT. Every later step assumes nothing new is starting, and a
 	// seal is what makes that true — but only for ADMISSION, so the wait is what
 	// covers the work already in flight.
@@ -121,16 +132,41 @@ func tearDownAcceptanceWithin(
 	// a config with no ec2 node, correctly, because there is nothing for it to
 	// remove — and an acceptance run against a docker or firecracker deployment is
 	// an ordinary thing to do.
-	if err := decommissionAcceptance(ctx, env, ws); err != nil {
-		problems = append(problems, err)
+	//
+	// A POOL'S RUN (#829) HAS NO NODE TO DECOMMISSION FROM: its hosts are its pool's,
+	// and what the pool did not release is ended here, then the site's cache its
+	// init_args name is purged.
+	var ended []string
+	switch {
+	case isPool:
+		var err error
+		if ended, err = pool.decommission(ctx, env, orders); err != nil {
+			problems = append(problems, err)
+		}
+	default:
+		if err := decommissionAcceptance(ctx, env, ws); err != nil {
+			problems = append(problems, err)
+		}
 	}
 
 	// 4. AND THE SWEEP, which is the step that turns "the commands ran" into "there
 	// is nothing left". Everything above can succeed while something survives —
 	// a destroy that raced a launch, an instance whose lease had already gone —
 	// so the teardown ends by ASKING rather than by assuming.
-	if err := sweepAcceptance(ctx, env, ws, computeProved); err != nil {
-		problems = append(problems, err)
+	switch {
+	case isPool:
+		if err := pool.sweep(ctx, env, ws.DeploymentID, orders, ended); err != nil {
+			problems = append(problems, err)
+		}
+		// AND THE ORDERS AGAIN, the control plane proved stopped again: an order a
+		// control plane started in between placed is one no step above proved gone.
+		if err := sameAcceptancePoolOrders(ctx, ws, orders); err != nil {
+			problems = append(problems, err)
+		}
+	default:
+		if err := sweepAcceptance(ctx, env, ws, computeProved); err != nil {
+			problems = append(problems, err)
+		}
 	}
 
 	if len(problems) > 0 {
@@ -146,7 +182,7 @@ func tearDownAcceptanceWithin(
 // drainAcceptance seals and waits, through the same code `billet drain --wait`
 // runs.
 func drainAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, wait time.Duration) error {
-	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	db, cfg, err := openAcceptanceLedger(ctx, ws)
 	if err != nil {
 		return fmt.Errorf("open this run's ledger: %w", err)
 	}
@@ -256,11 +292,89 @@ func cmdAcceptanceSweep(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	pool, orders, isPool, err := acceptancePoolFor(ctx, ws)
+	if err != nil {
+		return err
+	}
+	if isPool {
+		if err := pool.sweep(ctx, env, ws.DeploymentID, orders, nil); err != nil {
+			return err
+		}
+
+		return sameAcceptancePoolOrders(ctx, ws, orders)
+	}
+
 	// A STANDALONE SWEEP HAS NO BARRIER BEHIND IT. `run` proves the fleet clear
 	// while the control plane is still up and hands that fact to the teardown;
 	// invoked on its own, this has only the provider inventory — which for a
 	// backend `decommission` does not know is nothing at all, and says so.
 	return sweepAcceptance(ctx, env, ws, false)
+}
+
+// acceptancePoolFor is the teardown of a workspace whose deployment is a pool's run, with
+// every order its ledger records, and false for any other. A ledger it cannot read is an
+// error, never no orders: the orders are what name the hosts the teardown must prove gone.
+func acceptancePoolFor(ctx context.Context, ws acceptanceWorkspace) (
+	acceptancePool, []acceptancePoolOrder, bool, error,
+) {
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return acceptancePool{}, nil, false, fmt.Errorf("read this run's config: %w", err)
+	}
+	if !poolOnly(cfg) {
+		return acceptancePool{}, nil, false, nil
+	}
+
+	pool, err := newAcceptancePool(cfg, ws.DeploymentID)
+	if err != nil {
+		return acceptancePool{}, nil, true, err
+	}
+	// READ ONCE THE CONTROL PLANE HAS STOPPED, so no order it places follows the read.
+	if err := acceptanceStopped(cfg, ws.DeploymentID); err != nil {
+		return acceptancePool{}, nil, true, fmt.Errorf("a pool's orders are read once its control plane has "+
+			"stopped, so none follows the read: %w", err)
+	}
+	orders, err := readAcceptancePool(ctx, ws)
+	if err != nil {
+		return acceptancePool{}, nil, true, fmt.Errorf("read this run's pool orders, which name the hosts its "+
+			"teardown must prove gone: %w", err)
+	}
+
+	return pool, orders, true, nil
+}
+
+// sameAcceptancePoolOrders reads a pool's run's orders again, once its control plane is
+// proved stopped again, and fails when one is there that before was not: the snapshot
+// the teardown proved gone is complete only if nothing placed an order since.
+func sameAcceptancePoolOrders(ctx context.Context, ws acceptanceWorkspace, before []acceptancePoolOrder) error {
+	_, after, _, err := acceptancePoolFor(ctx, ws)
+	if err != nil {
+		return fmt.Errorf("read the pool's orders again after the teardown: %w", err)
+	}
+	var placed []string
+	for i := range after {
+		if !slices.ContainsFunc(before, func(o acceptancePoolOrder) bool { return o.ID == after[i].ID }) {
+			placed = append(placed, after[i].ID)
+		}
+	}
+	if len(placed) > 0 {
+		return fmt.Errorf("%w: pool order(s) %s were placed while the teardown ran, so it proved none of their "+
+			"hosts gone", errAcceptanceResidue, strings.Join(placed, ", "))
+	}
+	// AN ORDER THAT VANISHED is a ledger replaced under the teardown, which can no longer
+	// say what else it held.
+	var vanished []string
+	for i := range before {
+		if !slices.ContainsFunc(after, func(o acceptancePoolOrder) bool { return o.ID == before[i].ID }) {
+			vanished = append(vanished, before[i].ID)
+		}
+	}
+	if len(vanished) > 0 {
+		return fmt.Errorf("pool order(s) %s are no longer in this run's ledger, so it is not the ledger the "+
+			"teardown read, and nothing here says what it held", strings.Join(vanished, ", "))
+	}
+
+	return nil
 }
 
 // sweepAcceptance is the final ASK: does anything still carry this deployment.

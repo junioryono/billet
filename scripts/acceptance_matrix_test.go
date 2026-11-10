@@ -1,9 +1,11 @@
 package scripts_test
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -225,6 +227,12 @@ init-iam)
 matrix-teardown-policy)
 	echo '{"Version":"2012-10-17","Statement":[{"Sid":"BilletMatrixDecommissionState"}]}'
 	;;
+matrix-pool-init-args)
+	cat "$FAKE/init-args" 2>/dev/null
+	;;
+matrix-pool-host-iam)
+	echo '{"Version":"2012-10-17","Statement":[{"Sid":"BilletCacheSelfAttach"}]}'
+	;;
 acceptance-down)
 	# A teardown that succeeds removes the workspace, as the real one does.
 	ws=""
@@ -317,6 +325,141 @@ func TestTheMatrixHostPreparesADeploymentWithItsTiersAndPolicy(t *testing.T) {
 	}
 }
 
+// A POOL'S PRELUDE NAMES THIS RUN'S ARTIFACTS BY THEIR SHA256, ITS WIRE, THE POOL'S
+// init_args AND THE HOST'S HALT, ABOVE THE TEMPLATE'S BODY WITHOUT ITS COMMENTS; one past
+// what fits beside the join in EC2's user data is refused.
+func TestTheMatrixHostRendersAPoolsPrelude(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "sha256sum")
+	f.command(t, "billet", fakeBillet)
+	f.fixture(t, "init-args", "--site=aws-us-west-2a\n--cache-listen=10.240.0.1:7718\n")
+	dir := hostRunDir(t, f)
+	for file, body := range map[string]string{
+		"collection.tar.gz":   "a collection",
+		"prelude-template.sh": "#!/bin/bash\n# a comment\nset -Eeuo pipefail\n\t# an indented comment\necho prepared\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, file), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prelude", dir, "/pool.yaml", "10.77.0.10:7717",
+		"runs-bucket", "us-west-2", "42-1-pool", "240")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "prelude.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	billetBody, err := os.ReadFile(filepath.Join(f.bin, "billet"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"export ARTIFACT_BUCKET=runs-bucket ARTIFACT_REGION=us-west-2\n",
+		fmt.Sprintf("export BILLET_KEY=runs/42-1-pool/billet BILLET_SHA256=%x\n", sha256.Sum256(billetBody)),
+		fmt.Sprintf("export COLLECTION_KEY=runs/42-1-pool/collection.tar.gz COLLECTION_SHA256=%x\n",
+			sha256.Sum256([]byte("a collection"))),
+		"export PRELUDE_JOIN_SERVER=10.77.0.10:7717\n",
+		"export PRELUDE_INIT_ARGS=--site=aws-us-west-2a\\ --cache-listen=10.240.0.1:7718\n",
+		"export PRELUDE_MAX_LIFETIME_MINUTES=240\n",
+		"set -Eeuo pipefail\necho prepared\n",
+	} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("the prelude has no %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(string(got), "comment") || strings.Contains(string(got), "#!/bin/bash") {
+		t.Errorf("the prelude kept the template's comments:\n%s", got)
+	}
+	if !strings.Contains(billetLog(t, f), "acceptance matrix pool-init-args --config /pool.yaml\n") {
+		t.Errorf("billet was run as:\n%s", billetLog(t, f))
+	}
+
+	big := strings.Repeat("echo 0123456789012345678901234567890123456789\n", 400)
+	if err := os.WriteFile(filepath.Join(dir, "prelude-template.sh"), []byte("#!/bin/bash\n"+big), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prelude", dir, "/pool.yaml", "10.77.0.10:7717",
+		"runs-bucket", "us-west-2", "42-1-pool", "240"); code == 0 || !strings.Contains(out, "past what fits") {
+		t.Errorf("a prelude past EC2's user data: exit %d\n%s", code, out)
+	}
+}
+
+// A POOL'S DEPLOYMENT IS STOOD UP ON ITS FLEET WIRE WITH THE RUN'S PRELUDE, AND BOTH ITS
+// POLICIES ARE RENDERED FOR THE RUN'S DEPLOYMENT: the control plane's pool, passing the
+// pool hosts' role, and the hosts'.
+func TestTheMatrixHostPreparesAPoolsDeployment(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "billet", fakeBillet)
+	f.fixture(t, "tiers", "firecracker/aws-metal x64 accept-pool-metal\n")
+	dir := hostRunDir(t, f)
+	out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prepare-pool", dir, "/pool.yaml", "111122223333",
+		"10.77.0.10:7717", "10.77.0.10:7718", "arn:aws:iam::111122223333:role/b1t22-accept-pool-host")
+	if code != 0 || !strings.Contains(out, "pool's deployment dep-1 is up") {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	for file, want := range map[string]string{"iam.json": "2012-10-17", "pool-host.json": "BilletCacheSelfAttach",
+		"teardown.json": "BilletMatrixDecommissionState"} {
+		if got, err := os.ReadFile(filepath.Join(dir, file)); err != nil || !strings.Contains(string(got), want) {
+			t.Errorf("%s = %q, %v", file, got, err)
+		}
+	}
+	log := billetLog(t, f)
+	for _, want := range []string{
+		"acceptance up --config /pool.yaml --workspace " + dir + "/ws --account 111122223333 --label-prefix accept-pool " +
+			"--fleet-listen 10.77.0.10:7717 --fleet-bootstrap 10.77.0.10:7718 --boot-prelude " + dir + "/prelude.sh\n",
+		"init iam --pool --config " + dir + "/ws/billet.yaml --deployment dep-1 --role-arn " +
+			"arn:aws:iam::111122223333:role/b1t22-accept-pool-host\n",
+		"acceptance matrix pool-host-iam --workspace " + dir + "/ws\n",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("billet was not run as %q:\n%s", want, log)
+		}
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "billet", fakeBillet)
+	f.fixture(t, "tiers", "firecracker/aws-metal x64 accept-pool-metal\n")
+	f.fixture(t, "matrix-pool-host-iam.exit", "1")
+	dir = hostRunDir(t, f)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prepare-pool", dir, "/pool.yaml", "1",
+		"10.77.0.10:7717", "10.77.0.10:7718", "r"); code == 0 || !strings.Contains(out, "pool hosts' policy could not be rendered") {
+		t.Errorf("a pool host policy that could not be rendered: exit %d\n%s", code, out)
+	}
+}
+
+// A POOL'S RUN KEEPS ITS CONTROL PLANE UP FOR THE POOL'S OWN RELEASE, AND A POOL'S JUDGE
+// OWES ITS BACKEND.
+func TestTheMatrixHostRunsAndJudgesAPool(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t)
+	f.command(t, "billet", fakeBillet)
+	dir := hostRunDir(t, f)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", []string{"MATRIX_POLL=0.1"}, "run", dir, "27", "50m"); code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 150m "+
+		"--pool-released 50m --no-teardown\n") {
+		t.Errorf("billet was run as:\n%s", log)
+	}
+
+	f = newMatrixFakes(t)
+	f.command(t, "billet", fakeBillet)
+	dir = hostRunDir(t, f)
+	if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "run.exit"), []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "judge", dir, "x64", dir+"/runs", "billet-testbed/m",
+		"firecracker/aws-metal"); code != 0 || !strings.Contains(billetLog(t, f), "--backends firecracker/aws-metal --out") {
+		t.Errorf("a pool's judge: exit %d\n%s\n%s", code, out, billetLog(t, f))
+	}
+}
+
 // RUN EXITS WITH THE RUN'S STATUS AND RECORDS IT, and is live only while it runs; JUDGE
 // EXITS WITH THE JUDGE'S, for exactly the runs and repository it is named, keeping the
 // evidence beside the verdicts, and judges nothing for a run with no recorded exit.
@@ -379,7 +522,7 @@ func TestTheMatrixHostRunsAndJudges(t *testing.T) {
 			t.Fatalf("a judge that ended %s: exit %d\n%s", status, code, out)
 		}
 		if log := billetLog(t, f); !strings.Contains(log, "acceptance matrix judge --workspace "+dir+"/ws --archs x64 --runs "+
-			dir+"/runs --repository billet-testbed/m --out "+dir+"/out/matrix.json") {
+			dir+"/runs --repository billet-testbed/m --backends ec2 --out "+dir+"/out/matrix.json") {
 			t.Fatalf("billet was run as:\n%s", log)
 		}
 		if got, err := os.ReadFile(filepath.Join(dir, "out", "evidence.json")); err != nil || string(got) != `{"version":1}` {
@@ -529,7 +672,103 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "nothing to take down") {
 		t.Fatalf("down with no workspace: exit %d\n%s", code, out)
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
+	// A WORKSPACE NOTHING RAN IN (no ledger) is nothing to take down; ONE WITH A LEDGER AND
+	// NO RECORD is never read as that, by down or by stopped, since its run may have
+	// made what nothing here can now name.
+	if err := os.MkdirAll(filepath.Join(dir, "ws", "server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "nothing to take down") {
+		t.Fatalf("down of a workspace with no ledger and no record: exit %d\n%s", code, out)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ws", "server", "billet.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"down", "stopped"} {
+		if out, code := f.run(t, "acceptance/matrix-host.sh", nil, phase, dir); code == 0 ||
+			!strings.Contains(out, "a person decides") {
+			t.Fatalf("%s of a workspace with a ledger and no record: exit %d\n%s", phase, code, out)
+		}
+	}
+	// A LINK IS NEVER READ AS ABSENCE: a server directory linked to where nothing resolves,
+	// or a ledger name that is a dangling link, is a workspace whose run may have made
+	// something.
+	if err := os.RemoveAll(filepath.Join(dir, "ws", "server")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "gone"), filepath.Join(dir, "ws", "server")); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code == 0 ||
+		!strings.Contains(out, "could not be read") {
+		t.Fatalf("down of a workspace whose server is a dangling link: exit %d\n%s", code, out)
+	}
+	if err := os.Remove(filepath.Join(dir, "ws", "server")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "ws", "server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "gone"), filepath.Join(dir, "ws", "server", "billet.db")); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code == 0 ||
+		!strings.Contains(out, "a person decides") {
+		t.Fatalf("down of a workspace whose ledger is a dangling link: exit %d\n%s", code, out)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "ws", "server")); err != nil {
+		t.Fatal(err)
+	}
+	// A LOOKUP THAT FAILS IS NOT AN ABSENCE: a server directory that cannot be searched
+	// hides whether a ledger is in it, which the shell's -e reads as none.
+	if os.Geteuid() != 0 {
+		server := filepath.Join(dir, "ws", "server")
+		if err := os.MkdirAll(server, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(server, "billet.db"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(server, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir)
+		if err := os.Chmod(server, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if code == 0 || !strings.Contains(out, "could not be read") {
+			t.Fatalf("down of a workspace whose server directory cannot be searched: exit %d\n%s", code, out)
+		}
+		if err := os.RemoveAll(server); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A HELPER THAT FAILED SAYS NOTHING: a python3 that exits 1 for the lookup, as an
+	// uncaught exception or a failed start would, is never read as an absent ledger, by
+	// down or by stopped.
+	if err := os.MkdirAll(filepath.Join(dir, "ws", "server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ws", "server", "billet.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("no python3")
+	}
+	broken := t.TempDir()
+	if err := forkSafeWriteFile(filepath.Join(broken, "python3"), []byte("#!/usr/bin/env bash\n"+
+		"case \"$*\" in *billet.db) exit 1 ;; esac\nexec "+python+" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	brokenPath := []string{"PATH=" + broken + string(os.PathListSeparator) + f.path}
+	for _, phase := range []string{"down", "stopped"} {
+		if out, code := f.run(t, "acceptance/matrix-host.sh", brokenPath, phase, dir); code == 0 ||
+			!strings.Contains(out, "could not be read") {
+			t.Fatalf("%s with a lookup helper that failed: exit %d\n%s", phase, code, out)
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "ws", "server")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "ws", "acceptance.json"), []byte("{}"), 0o600); err != nil {
@@ -987,6 +1226,66 @@ func TestTheMatrixDispatchersImagePhaseRunsThePairAlone(t *testing.T) {
 		if strings.HasPrefix(line, "matrix-images-warm") {
 			t.Fatalf("a warm run was sent before every cold one finished: %q", dispatchSent(t, f))
 		}
+	}
+}
+
+// A POOL'S IMAGE PAIR IS THREE STEPS: the cold runs are sent and nothing is waited for,
+// the wait is a step of its own over every run sent, and only then are the warm runs sent
+// and waited for; a cold run still running at the wait's deadline fails it, sending no
+// warm one.
+func TestTheMatrixDispatchersPoolImageStepsWaitForTheHost(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	runs := filepath.Join(t.TempDir(), "runs")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images-cold", "billet-testbed/m", "t1",
+		runs, "accept-pool"); code != 0 || !strings.Contains(out, "cold runs are sent") {
+		t.Fatalf("images-cold, with nothing finished: exit %d\n%s", code, out)
+	}
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "await", "billet-testbed/m", "t1",
+		runs, "-"); code != 1 || !strings.Contains(out, "run 1 did not complete") {
+		t.Fatalf("await, with the cold run still running: exit %d\n%s", code, out)
+	}
+	if got := dispatchSent(t, f); len(got) != 1 {
+		t.Fatalf("sent %q, want the cold run alone", got)
+	}
+
+	f.fixture(t, "done-all", "")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "await", "billet-testbed/m", "t1",
+		runs, "-"); code != 0 {
+		t.Fatalf("await, with the cold run done: exit %d\n%s", code, out)
+	}
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images-warm", "billet-testbed/m", "t1",
+		runs, "accept-pool"); code != 0 || !strings.Contains(out, "image store's runs are done") {
+		t.Fatalf("images-warm: exit %d\n%s", code, out)
+	}
+	want := []string{"matrix-images-cold.yml accept-pool t1", "matrix-images-warm.yml accept-pool t1"}
+	if got := dispatchSent(t, f); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", got, want)
+	}
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "1\n2\n" {
+		t.Fatalf("the runs file is %q, %v", got, err)
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "await", "billet-testbed/m", "t1",
+		filepath.Join(t.TempDir(), "runs"), "-"); code != 1 || !strings.Contains(out, "names no run") {
+		t.Fatalf("await with no run sent: exit %d\n%s", code, out)
+	}
+
+	// EVERY RUN SENT, not the first or the last: two tiers' cold runs, the first done.
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	runs = filepath.Join(t.TempDir(), "runs")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images-cold", "billet-testbed/m", "t1",
+		runs, "accept-pool", "accept-pool-2"); code != 0 {
+		t.Fatalf("images-cold on two tiers: exit %d\n%s", code, out)
+	}
+	f.fixture(t, "done-1", "")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "await", "billet-testbed/m", "t1",
+		runs, "-"); code != 1 || !strings.Contains(out, "run 2 did not complete") {
+		t.Fatalf("await, with the second cold run still running: exit %d\n%s", code, out)
 	}
 }
 

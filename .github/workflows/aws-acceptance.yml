@@ -1,8 +1,14 @@
 name: aws-acceptance
-# billet's acceptance matrix on AWS (#554): a deployment built from this commit, stood up
-# beside the acceptance host's node, runs every cell the matrix declares on per-job EC2,
-# and `billet acceptance matrix judge` judges each from the ledger. Any failed cell, or any
-# cell that should have run on an architecture this run covered and did not, fails the run.
+# billet's acceptance matrix on AWS (#554), in two lanes, one after the other on the one
+# acceptance host. The ec2 lane stands a deployment built from this commit up beside the
+# host's node and runs every cell the matrix declares on per-job EC2. The pool lane (#829)
+# stands up a control plane with no node of its own whose pool rents an AWS metal host
+# on demand, runs the same cells on the pool's Firecracker tier, and keeps the control
+# plane up after them for the pool to release the host itself; its teardown ends any host
+# the pool did not release. `billet acceptance matrix judge` judges each lane's cells, and
+# the pool's burst and idle shrink, from the ledger. Any failed cell or scenario, or one
+# that should have run on a backend and architecture the lane covered and did not, fails
+# the lane.
 #
 # What it needs lives in the `acceptance` environment, which only main and release/* may
 # deploy to, and nothing here names the account:
@@ -21,11 +27,13 @@ name: aws-acceptance
 #           ACCEPTANCE_REGION       the region of everything below
 #           ACCEPTANCE_HOST         the acceptance host's instance id
 #           ACCEPTANCE_HOST_ROLE    the host's role name, which each run's node policy is put on
+#           ACCEPTANCE_POOL_HOST_ROLE the pool hosts' role name, which the pool lane's hosts'
+#                                   policy is put on
 #           ACCEPTANCE_KMS_KEY_ARN  the site store's key
 #           ACCEPTANCE_BUCKET       the bucket a run's binary and evidence travel through
 # The host is prepared once (docs/reference/records/aws-acceptance.md says how): a base
 # config at /srv/billet-accept/base.yaml whose App key path is /srv/billet-accept/app.pem,
-# which each run writes and removes.
+# which each run writes and removes, and the pool lane's at /srv/billet-accept/pool.yaml.
 on:
   workflow_dispatch:
     inputs:
@@ -43,8 +51,16 @@ concurrency:
   cancel-in-progress: false
 jobs:
   matrix:
+    name: matrix (${{ matrix.lane }})
     runs-on: ubuntu-24.04
     environment: acceptance
+    # ONE LANE AT A TIME: both hold the one acceptance host, and each lane's teardown
+    # releases it before the next takes it. A lane that failed does not stop the other.
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        lane: [ec2, pool]
     # THE BUDGET, inside GitHub's six hours for a hosted job: the host's run waits 210
     # minutes for its jobs, 20 more for its compute barrier and 5 for each service's stop
     # (SSM gives it 250), then the judge (15) and the teardown (`stopped` and `down`, at
@@ -53,21 +69,32 @@ jobs:
     # does fails its phase or its jobs' count, and never passes.
     timeout-minutes: 360
     env:
-      ARCHS: ${{ inputs.archs || 'x64' }}
-      RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+      LANE: ${{ matrix.lane }}
+      # THE POOL ORDERS x64 ALONE (its base config's one architecture).
+      ARCHS: ${{ matrix.lane == 'pool' && 'x64' || inputs.archs || 'x64' }}
+      BACKEND: ${{ matrix.lane == 'pool' && 'firecracker/aws-metal' || 'ec2' }}
+      RUN: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.lane }}
       AWS_REGION: ${{ vars.ACCEPTANCE_REGION }}
       HOST: ${{ vars.ACCEPTANCE_HOST }}
       REPO: ${{ vars.ACCEPTANCE_REPO }}
       BUCKET: ${{ vars.ACCEPTANCE_BUCKET }}
       HOST_ROLE: ${{ vars.ACCEPTANCE_HOST_ROLE }}
-      RUN_DIR: /srv/billet-accept/runs/${{ github.run_id }}-${{ github.run_attempt }}
+      POOL_HOST_ROLE: ${{ vars.ACCEPTANCE_POOL_HOST_ROLE }}
+      RUN_DIR: /srv/billet-accept/runs/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.lane }}
+      # A POOL HOST HALTS ITSELF THIS LONG AFTER IT BOOTS, whatever the lane does: a
+      # halted metal instance bills no compute. Longer than the lane's own six hours.
+      POOL_HOST_LIFETIME_MINUTES: "390"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: Build billet for the host
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/billet ./cmd/billet
+      - name: Build billet for the host, and the pool hosts' collection and prelude
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/billet ./cmd/billet
+          tar -czf dist/collection.tar.gz ansible_collections
+          cp ansible_collections/junioryono/billet/examples/pool-host-prelude/prelude.sh dist/prelude-template.sh
       - id: repo
         name: Name the repository the App serves, and the tiers to cover
         run: |
@@ -132,7 +159,8 @@ jobs:
       - name: Send this run's binary and scripts
         run: |
           set -euo pipefail
-          for f in dist/billet scripts/acceptance/matrix-host.sh scripts/acceptance/matrix-supervise.py; do
+          for f in dist/billet dist/collection.tar.gz dist/prelude-template.sh scripts/acceptance/matrix-host.sh \
+            scripts/acceptance/matrix-supervise.py; do
             aws s3 cp --only-show-errors "$f" "s3://$BUCKET/runs/$RUN/$(basename "$f")"
           done
       - name: Hand the host the App's key through Parameter Store
@@ -166,19 +194,31 @@ jobs:
           KMS_KEY_ARN: ${{ vars.ACCEPTANCE_KMS_KEY_ARN }}
         run: |
           set -euo pipefail
+          if [ "$LANE" = pool ]; then
+            # THE POOL'S WIRE IS THE HOST'S OWN ADDRESS, on the ports the control plane's
+            # security group opens to the pool hosts (enrollment) and to the VPC (the wire).
+            ip=$(aws ec2 describe-instances --instance-ids "$HOST" \
+              --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+            stand="runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' prelude '$RUN_DIR' /srv/billet-accept/pool.yaml '$ip:7717' '$BUCKET' '$AWS_REGION' '$RUN' '$POOL_HOST_LIFETIME_MINUTES'
+          runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' prepare-pool '$RUN_DIR' /srv/billet-accept/pool.yaml '$ACCOUNT' '$ip:7717' '$ip:7718' 'arn:aws:iam::$ACCOUNT:role/$POOL_HOST_ROLE'"
+            files="tiers deployment iam.json pool-host.json teardown.json"
+          else
+            stand="runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' prepare '$RUN_DIR' /srv/billet-accept/base.yaml '$ACCOUNT' '$KMS_KEY_ARN'"
+            files="tiers deployment iam.json teardown.json"
+          fi
           scripts/acceptance/ssm-run.sh run "$HOST" 900 "set -eu
           mkdir -p '$RUN_DIR'
-          aws s3 cp --only-show-errors 's3://$BUCKET/runs/$RUN/billet' '$RUN_DIR/billet'
-          aws s3 cp --only-show-errors 's3://$BUCKET/runs/$RUN/matrix-host.sh' '$RUN_DIR/matrix-host.sh'
-          aws s3 cp --only-show-errors 's3://$BUCKET/runs/$RUN/matrix-supervise.py' '$RUN_DIR/matrix-supervise.py'
+          for f in billet matrix-host.sh matrix-supervise.py collection.tar.gz prelude-template.sh; do
+            aws s3 cp --only-show-errors \"s3://$BUCKET/runs/$RUN/\$f\" \"$RUN_DIR/\$f\"
+          done
           chmod 0755 '$RUN_DIR/billet'
           (umask 077; aws ssm get-parameter --name '/billet-acceptance/runs/$RUN/app-key' --with-decryption \
             --query Parameter.Value --output text >/srv/billet-accept/app.pem)
           chown -R ubuntu: '$RUN_DIR' /srv/billet-accept/app.pem
-          runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' prepare '$RUN_DIR' /srv/billet-accept/base.yaml '$ACCOUNT' '$KMS_KEY_ARN'
-          for f in tiers deployment iam.json teardown.json; do aws s3 cp --only-show-errors \"$RUN_DIR/\$f\" \"s3://$BUCKET/runs/$RUN/\$f\"; done"
+          $stand
+          for f in $files; do aws s3 cp --only-show-errors \"$RUN_DIR/\$f\" \"s3://$BUCKET/runs/$RUN/\$f\"; done"
           mkdir -p out
-          for f in tiers deployment iam.json teardown.json; do
+          for f in $files; do
             aws s3 cp --only-show-errors "s3://$BUCKET/runs/$RUN/$f" "out/$f"
           done
       - name: Grant the node its policy, scoped to this run's deployment
@@ -186,6 +226,11 @@ jobs:
           set -euo pipefail
           aws iam put-role-policy --role-name "$HOST_ROLE" \
             --policy-name "billet-matrix-$RUN" --policy-document file://out/iam.json
+          # AND THE POOL'S HOSTS THEIRS, before the pool orders one.
+          if [ "$LANE" = pool ]; then
+            aws iam put-role-policy --role-name "$POOL_HOST_ROLE" \
+              --policy-name "billet-matrix-$RUN" --policy-document file://out/pool-host.json
+          fi
           # IAM is eventually consistent: a grant can take seconds to reach EC2's checks.
           sleep 20
       - id: host-run
@@ -198,9 +243,13 @@ jobs:
           # ITS DEADLINE IS ON THE CLOCK FROM HERE: SSM ends the command 15000 seconds
           # after it is sent, and the wait below waits only for what is left of that
           # (ssm-run.sh adds its own grace to whatever it is given).
+          # A POOL'S RUN WAITS AFTER ITS JOBS for the pool to release its host itself, which
+          # its idle_after (10 minutes) and a drain's proof (5) bound.
+          released=""
+          if [ "$LANE" = pool ]; then released=40m; fi
           sent=$(date +%s)
           id=$(scripts/acceptance/ssm-run.sh send "$HOST" 15000 \
-            "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' run '$RUN_DIR' '${{ steps.repo.outputs.jobs }}'")
+            "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' run '$RUN_DIR' '${{ steps.repo.outputs.jobs }}' $released")
           {
             echo "id=$id"
             echo "deadline=$((sent + 15000))"
@@ -211,9 +260,9 @@ jobs:
           set -euo pipefail
           labels=""
           for arch in ${ARCHS//,/ }; do
-            label=$(awk -v a="$arch" '$1 == "ec2" && $2 == a { print $3 }' out/tiers)
+            label=$(awk -v b="$BACKEND" -v a="$arch" '$1 == b && $2 == a { print $3 }' out/tiers)
             if [ -z "$label" ]; then
-              echo "the deployment has no ec2 $arch tier of its own for the matrix" >&2
+              echo "the deployment has no $BACKEND $arch tier of its own for the matrix" >&2
               exit 1
             fi
             labels="$labels $label"
@@ -229,6 +278,7 @@ jobs:
           owner: ${{ steps.repo.outputs.owner }}
           repositories: ${{ steps.repo.outputs.name }}
       - name: Dispatch the image store's runs, alone on each tier, and wait for them
+        if: ${{ env.LANE == 'ec2' }}
         env:
           GH_TOKEN: ${{ steps.images-token.outputs.token }}
           LABELS: ${{ steps.labels.outputs.labels }}
@@ -236,6 +286,49 @@ jobs:
           set -euo pipefail
           read -r -a labels <<<"$LABELS"
           scripts/acceptance/matrix-dispatch.sh images "$REPO" "$RUN" out/runs "${labels[@]}"
+      # A POOL'S TIER HAS NO HOST UNTIL ITS FIRST JOB ASKS FOR ONE, and a host takes about
+      # 45 minutes to boot, join and import the guest image, so the image store's cold run
+      # is sent, waited for under a token and a deadline of its own, and then the warm one.
+      - name: Send the image store's cold runs to the pool, which orders a host for them
+        if: ${{ env.LANE == 'pool' }}
+        env:
+          GH_TOKEN: ${{ steps.images-token.outputs.token }}
+          LABELS: ${{ steps.labels.outputs.labels }}
+        run: |
+          set -euo pipefail
+          read -r -a labels <<<"$LABELS"
+          scripts/acceptance/matrix-dispatch.sh images-cold "$REPO" "$RUN" out/runs "${labels[@]}"
+      - id: host-token
+        if: ${{ env.LANE == 'pool' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Wait for the pool's host to boot, join and run them
+        if: ${{ env.LANE == 'pool' }}
+        env:
+          GH_TOKEN: ${{ steps.host-token.outputs.token }}
+          MATRIX_TIMEOUT: "3300"
+        run: scripts/acceptance/matrix-dispatch.sh await "$REPO" "$RUN" out/runs -
+      - id: images-warm-token
+        if: ${{ env.LANE == 'pool' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Dispatch the image store's warm runs to the pool, and wait for them
+        if: ${{ env.LANE == 'pool' }}
+        env:
+          GH_TOKEN: ${{ steps.images-warm-token.outputs.token }}
+          LABELS: ${{ steps.labels.outputs.labels }}
+        run: |
+          set -euo pipefail
+          read -r -a labels <<<"$LABELS"
+          scripts/acceptance/matrix-dispatch.sh images-warm "$REPO" "$RUN" out/runs "${labels[@]}"
       - id: cold-token
         uses: actions/create-github-app-token@v2
         with:
@@ -342,19 +435,19 @@ jobs:
           status=0
           scripts/acceptance/ssm-run.sh run "$HOST" 900 "aws s3 cp --only-show-errors 's3://$BUCKET/runs/$RUN/runs' '$RUN_DIR/runs'
           chown ubuntu: '$RUN_DIR/runs'
-          runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' judge '$RUN_DIR' '$ARCHS' '$RUN_DIR/runs' '$REPO'
+          runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' judge '$RUN_DIR' '$ARCHS' '$RUN_DIR/runs' '$REPO' '$BACKEND'
           judged=\$?
           aws s3 cp --only-show-errors --recursive '$RUN_DIR/out' 's3://$BUCKET/runs/$RUN/out' || judged=1
           exit \$judged" || status=$?
           aws s3 cp --only-show-errors --recursive "s3://$BUCKET/runs/$RUN/out" out/ || status=1
           if [ -f out/matrix.txt ]; then
-            { echo '## Acceptance matrix'; echo; echo '```'; cat out/matrix.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+            { echo "## Acceptance matrix: the $LANE lane"; echo; echo '```'; cat out/matrix.txt; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
           fi
           exit "$status"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: acceptance-matrix-${{ github.run_id }}
+          name: acceptance-matrix-${{ github.run_id }}-${{ matrix.lane }}
           path: |
             out/matrix.json
             out/matrix.txt
@@ -408,8 +501,11 @@ jobs:
               fi
             fi
             # THE KEY GOES ONLY WITH THE DEPLOYMENT: a run still tearing down needs it to
-            # delete its scale sets.
-            if ! scripts/acceptance/ssm-run.sh run "$HOST" 2400 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' down '$RUN_DIR' || exit \$?
+            # delete its scale sets. A pool's teardown also waits for EC2 to say every
+            # host it ended is terminated, which can take most of 40 minutes.
+            downwait=2400
+            if [ "$LANE" = pool ]; then downwait=5400; fi
+            if ! scripts/acceptance/ssm-run.sh run "$HOST" "$downwait" "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' down '$RUN_DIR' || exit \$?
             rm -f /srv/billet-accept/app.pem"; then
               echo "the deployment may not be down: its workspace is $RUN_DIR on $HOST" >&2
               status=1
@@ -422,7 +518,8 @@ jobs:
           # them with the teardown.
           if [ "$down" -ne 0 ]; then
             echo "left for a person to finish the teardown in $RUN_DIR on $HOST, which is left running:" >&2
-            echo "  the policies billet-matrix-$RUN and billet-matrix-$RUN-down on $HOST_ROLE, /srv/billet-accept/app.pem on the host," >&2
+            echo "  the policies billet-matrix-$RUN and billet-matrix-$RUN-down on $HOST_ROLE, billet-matrix-$RUN on" >&2
+            echo "  $POOL_HOST_ROLE for the pool lane, /srv/billet-accept/app.pem on the host," >&2
             echo "  and the parameter /billet-acceptance/runs/$RUN/app-key" >&2
             # AND THE HOST STAYS HELD, by this run's hold, so no later run starts beside it.
             echo "the host stays held: delete /billet-acceptance/held once the teardown is done" >&2
@@ -430,6 +527,10 @@ jobs:
           fi
           gone "the run's node policy" NoSuchEntity \
             aws iam delete-role-policy --role-name "$HOST_ROLE" --policy-name "billet-matrix-$RUN"
+          if [ "$LANE" = pool ]; then
+            gone "the pool hosts' policy" NoSuchEntity \
+              aws iam delete-role-policy --role-name "$POOL_HOST_ROLE" --policy-name "billet-matrix-$RUN"
+          fi
           gone "the teardown's delete" NoSuchEntity \
             aws iam delete-role-policy --role-name "$HOST_ROLE" --policy-name "billet-matrix-$RUN-down"
           gone "the App key's parameter" ParameterNotFound \

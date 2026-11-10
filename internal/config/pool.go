@@ -275,6 +275,29 @@ type PoolConfig struct {
 	PhoenixNAP *PoolPhoenixNAP `yaml:"phoenixnap,omitempty"`
 }
 
+// InitArgValues are server.pool.init_args by flag, each flag's value as init will read
+// it, for a boot prelude that prepares a host with the same words the join hands init.
+func (p *PoolConfig) InitArgValues() map[string]string {
+	if p == nil {
+		return map[string]string{}
+	}
+	values, _ := readPoolInitArgs(p.InitArgs)
+
+	return values
+}
+
+// SiteStore is the site and the ebs-s3 store server.pool.init_args hand the pool's hosts,
+// as their configs will hold them: an empty site and a nil store when they name none. A
+// teardown that purges the site's cache reads them here, as the hosts' configs are theirs.
+func (p *PoolConfig) SiteStore() (string, *EBSS3Config) {
+	if p == nil {
+		return "", nil
+	}
+	values, _ := readPoolInitArgs(p.InitArgs)
+
+	return values["site"], poolStore(values)
+}
+
 // PoolArch is one architecture's part of the pool.
 type PoolArch struct {
 	// Floor is how many hosts the pool keeps whatever the demand.

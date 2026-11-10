@@ -37,6 +37,24 @@ func TestAWorkspaceTooLongForTheNodeIsRefusedBeforeAnythingIsMade(t *testing.T) 
 	}
 }
 
+// A POOL'S RUN HAS NO NODE, so a workspace too long for one is not refused for it: the
+// same path under a pool's base reaches the derivation, which refuses it for wanting the
+// fleet flags instead.
+func TestAPoolsRunIsNotRefusedForANodeItDoesNotHave(t *testing.T) {
+	t.Parallel()
+
+	workspace := filepath.Join(t.TempDir(), strings.Repeat("w", 120))
+	base := writeAcceptanceBase(t, poolBaseConfig)
+
+	var out bytes.Buffer
+	err := cmdAcceptanceUp(t.Context(), cli.Env{Stdout: &out, Stderr: &out, Getenv: os.Getenv},
+		[]string{"--config", base, "--workspace", workspace})
+	if err == nil || strings.Contains(err.Error(), "choose a shorter one") ||
+		!strings.Contains(err.Error(), "pass --fleet-listen") {
+		t.Fatalf("up = %v, want the derivation's refusal for the missing fleet flags", err)
+	}
+}
+
 // A RUN REFUSES A SEALED WORKSPACE, AND LIFTS NOTHING. With --no-teardown a run's
 // seal stays in the ledger, and the next run was assigned nothing for its whole
 // --wait (2026-10-25). Its own seal is refused like any other: another run may still

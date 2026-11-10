@@ -701,7 +701,7 @@ tiers:
 		}
 	}
 
-	if _, err := rewriteForAcceptance(root, t.TempDir(), "accept", "127.0.0.1:1234"); err != nil {
+	if _, err := rewriteForAcceptance(root, t.TempDir(), "accept", "127.0.0.1:1234", nil); err != nil {
 		t.Fatalf("rewriteForAcceptance: %v", err)
 	}
 

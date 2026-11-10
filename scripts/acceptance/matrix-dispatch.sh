@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Usage:
 #   matrix-dispatch.sh images <owner/repo> <tag> <runs-file> <label>...
+#   matrix-dispatch.sh images-cold <owner/repo> <tag> <runs-file> <label>...
+#   matrix-dispatch.sh await <owner/repo> <tag> <runs-file> -
+#   matrix-dispatch.sh images-warm <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh cold <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh warm <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh writers <owner/repo> <tag> <runs-file> <label>...
@@ -10,7 +13,12 @@
 # matrix judge --runs` reads. `images` runs first and alone on each tier: it sends the
 # image store's cold run, waits for it, waits MATRIX_SETTLE seconds, and sends and waits
 # for the warm one, because every job on a tier publishes an image-store generation and
-# none may run beside that pair. `cold` sends the cold and failed-writer runs and waits for
+# none may run beside that pair. A pool's tier has no host until its first job asks for one,
+# and a host takes about 45 minutes to boot, join and import the guest image (#829), so
+# for it `images` is three steps, each with a token of its own: `images-cold` sends the
+# cold runs and waits for nothing, `await` waits for every run in <runs-file> within
+# MATRIX_TIMEOUT, and `images-warm` waits MATRIX_SETTLE seconds and sends and waits for
+# the warm ones. `cold` sends the cold and failed-writer runs and waits for
 # the cold ones to finish; `warm` waits MATRIX_SETTLE seconds more, so the cold runs'
 # publications have time to land, sends the warm runs with the same tag, and waits for
 # every run in <runs-file> to finish. `writers` comes last, and sends each label's
@@ -32,7 +40,7 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,6p' "$0" >&2
+	sed -n '2,9p' "$0" >&2
 	exit 2
 }
 
@@ -106,6 +114,35 @@ images)
 	done
 	await "${cold[@]}" || exit 1
 	echo "the image store's cold runs are done; its warm ones are sent in ${settle}s"
+	sleep "$settle"
+	warm=()
+	for label in "$@"; do
+		id=$(dispatch matrix-images-warm.yml "$label") || exit 1
+		warm+=("$id")
+	done
+	await "${warm[@]}" || exit 1
+	echo "the image store's runs are done"
+	;;
+images-cold)
+	for label in "$@"; do
+		dispatch matrix-images-cold.yml "$label" >/dev/null || exit 1
+	done
+	echo "the image store's cold runs are sent"
+	;;
+await)
+	every=()
+	while read -r id; do
+		[ -n "$id" ] && every+=("$id")
+	done <"$runs"
+	if [ "${#every[@]}" -eq 0 ]; then
+		echo "$runs names no run" >&2
+		exit 1
+	fi
+	await "${every[@]}" || exit 1
+	echo "every run sent so far has completed"
+	;;
+images-warm)
+	echo "the image store's warm runs are sent in ${settle}s"
 	sleep "$settle"
 	warm=()
 	for label in "$@"; do

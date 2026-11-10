@@ -59,6 +59,11 @@ func (a *Allocator) PoolIdleHosts(ctx context.Context) ([]PoolIdleHost, error) {
 	return out, err
 }
 
+// PoolShrinkReason begins the reason of every release the pool's own shrink asks for,
+// and no person's: RequestPoolRelease refuses a reason that begins with it, so a release
+// carrying it was the pool's.
+const PoolShrinkReason = "idle since "
+
 // ReleaseIdlePoolHost asks for the release of a joined pool host on the pool's word, in
 // one transaction that reads it again: it must still hold nothing, have no release asked
 // for, and have held nothing since idleBefore, or it answers ErrPoolHostNotIdle; and its

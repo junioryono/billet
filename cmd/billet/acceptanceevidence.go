@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/app"
-	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
@@ -49,6 +48,14 @@ type acceptanceEvidenceDoc struct {
 	// where those disagree is the finding, so neither is dropped.
 	Jobs []acceptanceJob `json:"jobs"`
 
+	// Pool is every order the run's pool placed (#829), as the ledger keeps it: what a
+	// pool cell's job ran on, and what the pool's growth and shrink did. Empty for a run
+	// with no pool.
+	Pool []acceptancePoolOrder `json:"pool,omitempty"`
+	// JobsMayBeMissing says the history read stopped at its limit, so a job past it is
+	// not in Jobs; a judgement over every job on a host cannot be made from them.
+	JobsMayBeMissing bool `json:"jobs_may_be_missing,omitempty"`
+
 	// Outstanding is what the ledger still holds at the moment this was written.
 	// Empty is the expected answer and is not by itself proof of anything — see
 	// Clearance.
@@ -62,6 +69,26 @@ type acceptanceEvidenceDoc struct {
 	// only field here that can see compute whose lease has already gone, which is
 	// the class an acceptance run most needs to be sure about.
 	Clearance acceptanceClearance `json:"clearance"`
+}
+
+// acceptancePoolOrder is one of a pool's orders, as the ledger keeps it (alloc.PoolOrder).
+type acceptancePoolOrder struct {
+	ID     string `json:"id"`
+	Source string `json:"source"`
+	Shape  string `json:"shape"`
+	Arch   string `json:"arch"`
+	State  string `json:"state"`
+	HostID string `json:"host_id,omitempty"`
+	// Node is the node the order's host joined as, empty if none joined.
+	Node         string `json:"node,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	FirstAttempt string `json:"first_attempt"`
+	Updated      string `json:"updated"`
+	// ReleaseRequested is when a release was asked for, by a person or by the pool's own
+	// shrink (ReleaseReason says which), empty when none was.
+	ReleaseRequested string `json:"release_requested,omitempty"`
+	ReleaseReason    string `json:"release_reason,omitempty"`
+	JoinHold         string `json:"join_hold,omitempty"`
 }
 
 type acceptanceJob struct {
@@ -228,7 +255,7 @@ func writeAcceptanceEvidence(ctx context.Context, env cli.Env, ws acceptanceWork
 func collectAcceptanceEvidence(
 	ctx context.Context, ws acceptanceWorkspace,
 ) (acceptanceEvidenceDoc, error) {
-	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	db, cfg, err := openAcceptanceLedger(ctx, ws)
 	if err != nil {
 		return acceptanceEvidenceDoc{}, err
 	}
@@ -253,11 +280,18 @@ func collectAcceptanceEvidence(
 	describeAcceptanceJobs(ctx, db, cfg, jobs)
 
 	doc.Jobs = jobs
+	doc.JobsMayBeMissing = len(jobs) >= acceptanceJobLimit
 
 	allocator, err := acceptanceAllocator(db, cfg)
 	if err != nil {
 		return acceptanceEvidenceDoc{}, err
 	}
+
+	orders, err := allocator.PoolOrders(ctx)
+	if err != nil {
+		return acceptanceEvidenceDoc{}, fmt.Errorf("read the pool's orders: %w", err)
+	}
+	doc.Pool = acceptancePoolOrders(orders)
 
 	q, err := allocator.Quiescence(ctx)
 	if err != nil {
@@ -408,8 +442,59 @@ func describeAcceptanceJobs(
 }
 
 // readAcceptanceJobs is what the wait loop asks.
+// acceptancePoolOrders is the pool's orders as the evidence records them.
+func acceptancePoolOrders(orders []alloc.PoolOrder) []acceptancePoolOrder {
+	out := make([]acceptancePoolOrder, 0, len(orders))
+	for i := range orders {
+		o := &orders[i]
+		r := acceptancePoolOrder{
+			ID: o.ID, Source: o.Source, Shape: o.Shape, Arch: string(o.Arch), State: o.State,
+			HostID: o.HostID, Node: o.NodeName, Reason: o.Reason, ReleaseReason: o.ReleaseReason,
+			JoinHold:     o.JoinHold,
+			FirstAttempt: o.FirstAttempt.UTC().Format(time.RFC3339Nano),
+			Updated:      o.Updated.UTC().Format(time.RFC3339Nano),
+		}
+		if !o.ReleaseRequested.IsZero() {
+			r.ReleaseRequested = o.ReleaseRequested.UTC().Format(time.RFC3339Nano)
+		}
+		out = append(out, r)
+	}
+
+	return out
+}
+
+// readAcceptancePool reads the run's pool orders from its ledger.
+//
+// AN INSPECTION, WHICH CREATES NOTHING: the orders name the hosts a teardown must prove
+// gone, and an open that made a fresh ledger in place of a lost one would read as a pool
+// that ordered nothing. A missing ledger is state.ErrNoLedger.
+func readAcceptancePool(ctx context.Context, ws acceptanceWorkspace) ([]acceptancePoolOrder, error) {
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerInspect)
+	if err != nil {
+		return nil, fmt.Errorf("read this run's ledger: %w", err)
+	}
+
+	defer db.Close()
+
+	allocator, err := acceptanceAllocator(db, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	orders, err := allocator.PoolOrders(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the pool's orders: %w", err)
+	}
+
+	return acceptancePoolOrders(orders), nil
+}
+
 func readAcceptanceJobs(ctx context.Context, ws acceptanceWorkspace) ([]acceptanceJob, error) {
-	db, _, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	db, _, err := openAcceptanceLedger(ctx, ws)
 	if err != nil {
 		return nil, err
 	}
