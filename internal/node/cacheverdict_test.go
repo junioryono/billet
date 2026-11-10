@@ -365,6 +365,11 @@ func TestSettlementWaitsForAnNpmRequestInFlight(t *testing.T) {
 	// waits for the handler this releases.
 	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	service, credentials := npmService(t, registry)
+	// THE WAIT IS LONG ENOUGH FOR WHAT FOLLOWS THE RELEASE. At its default of five
+	// seconds the two left after a three-second release had to cover the answer,
+	// the store's fill and the note, which a loaded race-and-coverage runner did
+	// not, and the verdict read "" (#188, 2026-11-09).
+	service.npmSettleWait = time.Minute
 	observer := &recordingObserver{}
 	service.SetCacheObserver(observer)
 
@@ -377,11 +382,26 @@ func TestSettlementWaitsForAnNpmRequestInFlight(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the request never reached the registry")
 	}
-	// PAST SETTLEMENT'S OWN TWO-SECOND BUDGET and inside the wait's, which is
-	// where a shared budget lost the verdict.
-	time.AfterFunc(3*time.Second, func() { releaseOnce.Do(func() { close(release) }) })
+	// SETTLEMENT IS STILL WAITING PAST ITS OWN TWO-SECOND BUDGET, counted from when
+	// it began, with the request held: a wait that shared that budget lost the
+	// verdict. Only then is the request let go.
+	settled := make(chan struct{})
+	go func() {
+		defer close(settled)
+		service.SettleObservation(t.Context(), "billet-lease-npm")
+	}()
+	select {
+	case <-settled:
+		t.Fatal("settlement returned with an npm request still in flight")
+	case <-time.After(cacheReportLimit + time.Second):
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-settled:
+	case <-time.After(time.Minute):
+		t.Fatal("settlement did not return after the request ended")
+	}
 
-	service.SettleObservation(t.Context(), "billet-lease-npm")
 	var got alloc.BuildCache
 	for _, call := range observer.recorded() {
 		if call.obs.Npm != "" {
