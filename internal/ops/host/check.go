@@ -531,6 +531,14 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			reportKernelMappings(ctx, env, cfg)
 		}
 
+		// ON AWS METAL, THE SITE'S STORE IS EBS AND S3, and its volumes attach only to
+		// the instance this node runs on, in their own zone (ADR-030).
+		if cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.EBSS3 != nil && !skipNetworkProbes {
+			if err := checkMetalCacheStore(ctx, env, cfg, bundle); err != nil {
+				return report, errors.Join(cacheFailure, err)
+			}
+		}
+
 		// AFTER THE STORAGE, because the storage belongs to the SITE and this belongs
 		// to the machine: a cluster a host cannot reach is wrong for every node there,
 		// while a missing /dev/kvm is wrong for this one. An operator reading a wall

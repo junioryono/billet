@@ -77,6 +77,20 @@ func judgeNodeCache(cfg *config.Config) ([]string, error) {
 	}
 
 	switch {
+	case n.EBSS3 != nil && n.Provider == config.ProviderFirecracker:
+		// ON AWS METAL THE STORE BACKS THE GUEST CACHE AND NOTHING ELSE: the guests boot
+		// from node.ceph's images either way (ADR-030).
+		return []string{
+				"NONE: node.ebs_s3 names this site's cache store and this node offers no node.cache " +
+					"endpoint, so no guest can ask it for anything",
+				"a job placed on THIS NODE gets no billet cache: no sticky disk, no image store, " +
+					"no local Actions, Go or Bazel cache, and no published generation; its guests " +
+					"still boot from node.ceph's images",
+				"add node.cache (listen and guest_endpoint on the guest bridge), or drop node.ebs_s3",
+			}, errors.New("node.ebs_s3 names a cache store nothing can reach: this node offers no " +
+				"node.cache endpoint. Add node.cache (listen and guest_endpoint on the guest bridge), " +
+				"or drop node.ebs_s3")
+
 	case n.EBSS3 != nil:
 		return []string{
 				"NONE: node.ebs_s3 names a cache store and this node offers no node.cache " +

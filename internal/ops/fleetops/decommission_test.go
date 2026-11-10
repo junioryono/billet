@@ -66,8 +66,68 @@ node:
 	}
 
 	err := Decommission(t.Context(), processEnv(), []string{"--config", configPath})
-	if err == nil || !strings.Contains(err.Error(), "no ec2 node") {
+	if err == nil || !strings.Contains(err.Error(), "this config has neither") {
 		t.Fatalf("decommission did not refuse a non-ec2 config: %v", err)
+	}
+}
+
+// metalDecommissionConfig writes a Firecracker node's config on AWS metal, with its
+// site's ebs-s3 store and a minted deployment id, and returns its path.
+func metalDecommissionConfig(t *testing.T) string {
+	t.Helper()
+
+	stateDir := t.TempDir()
+	if _, err := state.DeploymentID(stateDir); err != nil {
+		t.Fatalf("mint deployment id: %v", err)
+	}
+
+	configPath := filepath.Join(t.TempDir(), "billet.yaml")
+	body := `
+node:
+  server_addr: 127.0.0.1:7717
+  provider: firecracker
+  state_dir: ` + stateDir + `
+  site: aws-us-west-2a
+  ebs_s3:
+    region: us-west-2
+    availability_zone: us-west-2a
+    bucket: billet-cache-example
+  firecracker:
+    kernel_image: /var/lib/billet/kernels/vmlinux
+    bridge: billet0
+  ceph:
+    image_pool: billet-images
+    cache_pool: billet-cache
+`
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	return configPath
+}
+
+// A METAL SITE'S CACHE IS DECOMMISSIONED FROM ITS NODE'S CONFIG, with no instances of its
+// own to list: its host is the pool's. Without --yes it reports and touches nothing.
+func TestDecommissionPurgesAMetalSitesCacheAlone(t *testing.T) {
+	configPath := metalDecommissionConfig(t)
+
+	var err error
+	out := capture(t, func() {
+		err = Decommission(t.Context(), processEnv(), []string{"--config", configPath})
+	})
+	if err != nil {
+		t.Fatalf("decommission of a metal node's config: %v", err)
+	}
+	if !strings.Contains(out, "would purge the ebs-s3 cache") {
+		t.Errorf("the metal node's cache was not reported:\n%s", out)
+	}
+	if strings.Contains(out, "instance") {
+		t.Errorf("a metal node's decommission spoke of instances:\n%s", out)
+	}
+
+	err = Decommission(t.Context(), processEnv(), []string{"--config", configPath, "--terminate-instances", "--yes"})
+	if err == nil || !strings.Contains(err.Error(), "--terminate-instances") {
+		t.Fatalf("--terminate-instances on a metal node was answered %v", err)
 	}
 }
 

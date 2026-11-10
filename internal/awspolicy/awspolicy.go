@@ -414,6 +414,12 @@ type Inputs struct {
 	Network *Network
 	// Cache, when non-nil, adds the sticky-disk cache statements.
 	Cache *Cache
+	// SelfAttach adds what a node on AWS metal needs to attach its cache volumes to its
+	// own instance (ADR-030): the instance half of AttachVolume and DetachVolume, on an
+	// instance carrying this deployment's pool-owner tag, which every pool host and no
+	// job instance carries. The volume half is the cache's own attach statement. It
+	// needs Cache.
+	SelfAttach bool
 	// CodeBuild, when non-nil, adds the statements a codebuild NODE needs.
 	//
 	// A DIFFERENT PRINCIPAL FROM THE BUILD ITSELF, and that split is the whole
@@ -601,6 +607,23 @@ func (in Inputs) Build() (Policy, error) {
 		}
 
 		p.Statement = append(p.Statement, stmts...)
+	}
+
+	if in.SelfAttach {
+		if in.Cache == nil {
+			return Policy{}, errors.New("awspolicy: a node attaches cache volumes to its own instance " +
+				"only for a cache; this policy has none")
+		}
+
+		// THE INSTANCE HALF. AttachVolume and DetachVolume authorize the volume and the
+		// instance each, and the cache's attach statement scopes the volume by billet's
+		// owner tag, which a pool host does not carry: it is launched with the pool's.
+		p.Statement = append(p.Statement, Statement{
+			Sid: "BilletCacheSelfAttach", Effect: "Allow",
+			Action:    ebss3.SelfAttachIAMActions(),
+			Resource:  []string{"arn:" + partition + ":ec2:*:*:instance/*"},
+			Condition: ownerTagCondition("aws:ResourceTag/"+ec2.PoolOwnerTagKey, in.Owner),
+		})
 	}
 
 	if in.CodeBuild != nil {

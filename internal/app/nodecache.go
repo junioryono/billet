@@ -147,7 +147,7 @@ func nodeCacheStore(ctx context.Context, cfg *config.Config, deployment string) 
 		// stay on the host's own Ceph, and the caches go where a shrinking pool cannot
 		// take them, on volumes this node attaches to its own instance.
 		if cfg.Node.EBSS3 != nil {
-			host, err := thisInstance(ctx)
+			host, err := ThisInstance(ctx)
 			if err != nil {
 				return nil, fmt.Errorf("billet: a Firecracker node.ebs_s3 attaches its cache volumes to "+
 					"its own instance, which it could not identify: %w", err)
@@ -530,8 +530,8 @@ type attachmentSweeper interface {
 	SweepAttachments(ctx context.Context) ([]string, error)
 }
 
-// thisInstance is the EC2 instance this node runs on, from its own identity document.
-func thisInstance(ctx context.Context) (ebss3.Host, error) {
+// ThisInstance is the EC2 instance this node runs on, from its own identity document.
+func ThisInstance(ctx context.Context) (ebss3.Host, error) {
 	doc, _, err := awscreds.InstanceIdentity(ctx, "")
 	if err != nil {
 		return ebss3.Host{}, err

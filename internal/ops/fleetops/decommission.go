@@ -40,9 +40,18 @@ func Decommission(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if cfg.Node == nil || cfg.Node.Provider != config.ProviderEC2 || cfg.Node.EC2 == nil {
+	// A FIRECRACKER NODE ON AWS METAL HAS THE SITE'S CACHE AND NO INSTANCES OF ITS OWN:
+	// its host is the pool's, which releases it by drain (ADR-030). So its decommission
+	// is the cache's purge alone, which refuses while a clone lease is live.
+	metal := cfg.Node != nil && cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.EBSS3 != nil
+	if !metal && (cfg.Node == nil || cfg.Node.Provider != config.ProviderEC2 || cfg.Node.EC2 == nil) {
 		return errors.New("decommission tears down the ec2 backend's out-of-Terraform " +
-			"resources; this config has no ec2 node, so there is nothing for it to remove")
+			"resources, or a metal site's ebs-s3 cache; this config has neither, so there is " +
+			"nothing for it to remove")
+	}
+	if metal && *terminateInstances {
+		return errors.New("--terminate-instances is for an ec2 node's instances; a Firecracker node's " +
+			"host is its pool's, which releases it by drain")
 	}
 
 	owner, err := decommissionOwner(cfg)
@@ -52,8 +61,10 @@ func Decommission(ctx context.Context, env cli.Env, args []string) error {
 
 	creds := awscreds.Default()
 
-	if err := decommissionInstances(ctx, env, cfg, owner, creds, *yes, *terminateInstances); err != nil {
-		return err
+	if !metal {
+		if err := decommissionInstances(ctx, env, cfg, owner, creds, *yes, *terminateInstances); err != nil {
+			return err
+		}
 	}
 
 	if err := decommissionCache(ctx, env, cfg, owner, creds, *yes); err != nil {
