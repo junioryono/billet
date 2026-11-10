@@ -342,12 +342,16 @@ jobs:
       # client is older than the service below. Its bin directory goes first on
       # PATH rather than through Debian's pg_wrapper, which picks a version by
       # the connection and could answer --version for the image's local cluster.
-      # Every fetch bounded and retried, the restore rehearsal's apt rule.
+      # Every fetch bounded and retried, the restore rehearsal's apt rule. RETRIED
+      # ON EVERY ERROR: curl's --retry alone does not retry a connection that
+      # broke mid-answer (exit 56), and the fleet's uplink drops about one
+      # connection in 1,700 after its TCP handshake (#818); this fetch failed
+      # the job on main that way twice (2026-11-07 and 2026-11-09).
       - name: Install the PostgreSQL 18 client
         run: |
           set -euo pipefail
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -fsSL --retry 3 --max-time 60 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+          sudo curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
             https://www.postgresql.org/media/keys/ACCC4CF8.asc
           . /etc/os-release
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" |
@@ -441,7 +445,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -fsSL --retry 3 --max-time 60 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+          sudo curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
             https://www.postgresql.org/media/keys/ACCC4CF8.asc
           . /etc/os-release
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" |
