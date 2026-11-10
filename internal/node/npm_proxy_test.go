@@ -424,7 +424,10 @@ func TestARegistryThatNeverAnswersIsA504(t *testing.T) {
 		<-r.Context().Done()
 	})
 	service, credentials := npmService(t, registry)
-	service.npmCache().headerWait = 300 * time.Millisecond
+	// LONG ENOUGH FOR EACH ATTEMPT TO REACH THE REGISTRY: the wait starts before the
+	// request is sent, and at 300 ms a loaded runner's retry, on a new connection,
+	// was cancelled before the registry saw it (CI 2026-11-07, 504 after 1 attempt).
+	service.npmCache().headerWait = 3 * time.Second
 
 	resp, _ := npmGet(t, service, credentials, npmRequestLine("/left-pad"))
 	if resp.StatusCode != http.StatusGatewayTimeout || registry.count() != 2 {

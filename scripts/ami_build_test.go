@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,12 +24,21 @@ const amiBuildNonce = "0123456789abcdef0123456789abcdef"
 const (
 	fakeAMIRunner = `#!/bin/bash
 set -eu
+# THE BUILD'S tee HAS OPENED ITS LOG before any step runs, as a real one has long
+# before a template's first step: its open is not left to land inside a removal.
+n=0
+while [ ! -e "$FAKE/tee-open" ] && [ "$n" -lt 1000 ]; do
+	/bin/sleep 0.01
+	n=$((n + 1))
+done
+[ -e "$FAKE/tee-open" ] || { echo "the build's tee never opened its log" >&2; exit 1; }
+rm -f "$FAKE/tee-open"
 echo "runner scope=$BILLET_RI_SCOPE from=$BILLET_RI_FROM tmp=${TMPDIR:-}" >>"$FAKE/calls"
 grep -qxF '$nrconf{override_rc}{qr(^billet-ami-build)} = 0;' "$BILLET_AMI_ROOT/etc/needrestart/conf.d/billet-ami-build.conf" &&
 	echo "runner needrestart-exempt" >>"$FAKE/calls"
 [ -z "${FAKE_FAIL_FIRST:-}" ] || exit 1
-# A LOG THAT IS GONE when the failure handler reads it, as a real tee goes on
-# writing to the file it opened (the stand-in tee writes nothing more).
+# A LOG THAT IS GONE when the failure handler reads it, while the tee goes on
+# writing to the file it opened.
 [ -z "${FAKE_REMOVE_LOG:-}" ] || rm -f "$BILLET_AMI_ROOT/var/lib/billet-ami-build/build.log"
 mkdir -p "$BILLET_AMI_ROOT/var/tmp/billet-ri"
 echo staged >"$BILLET_AMI_ROOT/var/tmp/billet-ri/step.sh"
@@ -87,13 +97,18 @@ exec bash "$REAL_CHECK_COMPONENT" "$@"
 `
 	fakeLayer = "#!/bin/sh\necho layer >>\"$FAKE/calls\"\nexit \"${FAKE_LAYER_STATUS:-0}\"\n"
 	// tee WRITES LATE, as a real one may: the build must wait for it before it
-	// reads its own log.
+	// reads its own log. AND TO THE FILE IT OPENED, once, as a real one does, and
+	// says so for the runner to wait on: a path reopened for each line, or opened
+	// late, recreated the log inside the build's directory while the build removed
+	// it, and the build failed on a directory that was not empty.
 	fakeTee = `#!/bin/bash
 # tee -a FILE, a line at a time, each a little late.
+exec 5>>"$2"
+: >"$FAKE/tee-open"
 while IFS= read -r line; do
 	/bin/sleep 0.1
 	printf '%s\n' "$line"
-	[ -n "${FAKE_REMOVE_LOG:-}" ] || printf '%s\n' "$line" >>"$2"
+	printf '%s\n' "$line" >&5
 done
 `
 	// A command the build runs on the machine: logged, and successful.
@@ -239,6 +254,11 @@ func (fx amiBuildFixture) run(t *testing.T, env ...string) (string, error) {
 
 	here, err := filepath.Abs("check-guest-component.sh")
 	if err != nil {
+		t.Fatal(err)
+	}
+
+	// THIS RUN'S tee SAYS IT OPENED, not an earlier run's that never reached a step.
+	if err := os.Remove(filepath.Join(fx.fake, "tee-open")); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
 
@@ -502,6 +522,15 @@ func TestTheAMIBuildReportsEachFailureAndKeepsTheMachine(t *testing.T) {
 
 			if strings.Contains(fx.calls(t), "poweroff") {
 				t.Errorf("a failed build powered the builder off:\n%s", fx.calls(t))
+			}
+
+			// THE LOG WAS GONE WHEN IT WAS READ, or the case proves only an empty one.
+			if slices.Contains(tc.env, "FAKE_REMOVE_LOG=1") {
+				log := filepath.Join(fx.root, "var", "lib", "billet-ami-build", "build.log")
+				if _, err := os.Lstat(log); !os.IsNotExist(err) {
+					t.Errorf("the log a step removed is there again (%v), so its absence was not what the "+
+						"handler read", err)
+				}
 			}
 		})
 	}

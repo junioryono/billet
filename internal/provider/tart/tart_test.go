@@ -148,6 +148,9 @@ type stub struct {
 	// probeSays is a guest whose shell answers the agent probe with these
 	// bytes on stderr and a failure: what billet must never quote.
 	probeSays string
+	// runnersAllowed exists while the stub lives; a fake runner starts only
+	// after recording itself and finding it (killRunner).
+	runnersAllowed string
 }
 
 func newStub(t *testing.T) *stub {
@@ -207,6 +210,7 @@ func newStub(t *testing.T) *stub {
 		guestSaysRefusal:  filepath.Join(dir, "guest-says-refusal"),
 		guestAsked:        filepath.Join(dir, "guest-asked"),
 		probeSays:         filepath.Join(dir, "probe-says"),
+		runnersAllowed:    filepath.Join(dir, "runners-allowed"),
 	}
 
 	if err := os.MkdirAll(filepath.Join(s.home, "vms"), 0o755); err != nil {
@@ -221,15 +225,25 @@ func newStub(t *testing.T) *stub {
 	// whether it did. A guest whose runner exits at once is a real failure the
 	// provider must report, and it has its own test rather than being the
 	// accidental state of every other one.
-	// Short enough that a leaked one is gone in half a minute, long enough that
-	// no reasonable test races its exit.
+	// Five minutes, so no launch on a loaded runner outlives it: at thirty seconds
+	// a slow one proved a runner that had already exited (#814). The cleanup below
+	// kills it, so the length bounds only a runner a killed test binary leaves.
+	//
+	// RECORDED, THEN ALLOWED, THEN RUNNING, in that order, so the cleanup cannot
+	// miss one: it removes the marker before it reads the record, and a runner
+	// that recorded itself too late to be read finds no marker and does not start.
 	runner := filepath.Join(s.guestHome, "run.sh")
 	body := "#!/bin/sh\n" +
-		"printf '%s %s\\n' \"$$\" \"$(ps -p $$ -o lstart=)\" >> \"$HOME/" + spawnedPIDs + "\"\n" +
-		"exec sleep 30\n"
+		"printf '%s %s\\n' \"$$\" \"$(ps -p $$ -o lstart=)\" >> \"$HOME/" + spawnedPIDs + "\" || exit 1\n" +
+		"[ -e " + shellQuote(s.runnersAllowed) + " ] || exit 1\n" +
+		"exec sleep 300\n"
 
 	if err := forkSafeWriteFile(runner, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake runner: %v", err)
+	}
+
+	if err := os.WriteFile(s.runnersAllowed, nil, 0o600); err != nil {
+		t.Fatalf("allow the fake runners: %v", err)
 	}
 
 	// Those sleeps are real host processes: without this they outlive the test
@@ -627,10 +641,21 @@ func (s *stub) vm(t *testing.T, name, state, owner string) {
 func (s *stub) killRunner(t *testing.T) {
 	t.Helper()
 
+	// BEFORE THE READ: a runner that records itself after this finds no marker and
+	// exits rather than sleeping where nothing will kill it.
+	if err := os.Remove(s.runnersAllowed); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stop allowing fake runners: %v", err)
+	}
+
 	b, err := os.ReadFile(filepath.Join(s.guestHome, spawnedPIDs))
 	if err != nil {
 		return
 	}
+
+	// NOT t.Context() ALONE: this runs from t.Cleanup, by which time that context
+	// is cancelled, every ps below failed, and no runner was ever killed.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+	defer cancel()
 
 	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
 		pid, birth, ok := strings.Cut(strings.TrimSpace(line), " ")
@@ -644,7 +669,7 @@ func (s *stub) killRunner(t *testing.T) {
 		}
 
 		// The same identity check proveRunning makes, for the same reason.
-		out, err := exec.CommandContext(t.Context(), "ps", "-p", pid, "-o", "lstart=").Output()
+		out, err := exec.CommandContext(ctx, "ps", "-p", pid, "-o", "lstart=").Output()
 		if err != nil || strings.TrimSpace(string(out)) != birth {
 			continue
 		}
@@ -789,6 +814,29 @@ func (s *stub) dirExists(name string) bool {
 	_, err := os.Stat(filepath.Join(s.home, "vms", name))
 
 	return err == nil
+}
+
+// spawned counts the fake runners started in the stub's guest. A runner records
+// itself just after the launcher announces its pid, so a launch can be proved
+// before the record lands: the read waits for the first one, bounded only so a
+// launch that started nothing still ends the test.
+func (s *stub) spawned(t *testing.T) int {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		b, err := os.ReadFile(filepath.Join(s.guestHome, spawnedPIDs))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read the spawn record: %v", err)
+		}
+
+		if n := strings.Count(string(b), "\n"); n > 0 || time.Now().After(deadline) {
+			return n
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func (s *stub) argv(t *testing.T) string {

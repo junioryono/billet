@@ -1,11 +1,13 @@
 package tart
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
@@ -47,12 +49,6 @@ func TestEveryGeneratedTartTierLaunchesOnThisBackend(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := generatedTartConfig(t, tc.trust)
 
-			s := newStub(t)
-			placeRunnerWherePublishedImagesPutIt(t, s)
-			markMeasuredImagesPulled(t, s)
-
-			p := newProvider(t, s)
-
 			// THE NODE BLOCK THE GENERATION WROTE, not one the test chose. This is
 			// what cmd/billet does with cfg.Node.Tart, and it is the difference
 			// between the two cases: an untrusted tier launches only because the
@@ -63,13 +59,38 @@ func TestEveryGeneratedTartTierLaunchesOnThisBackend(t *testing.T) {
 				tartCfg = *cfg.Node.Tart
 			}
 
-			WithConfig(tartCfg)(p)
-
 			for i := range cfg.Tiers {
 				tier := &cfg.Tiers[i]
 
 				t.Run(tier.Label, func(t *testing.T) {
+					// A STUB OF ITS OWN PER TIER, because the stub's fake guest home is
+					// one directory every VM shares. With one stub for every tier, the
+					// first launch's claim and pid file were already there for the
+					// second and third, so neither spawned its own command: each proved
+					// the first tier's runner, then a `sleep 30`, and a loaded runner
+					// that took more than 30 s over the first two failed the third
+					// (#814), while a later tier whose command could not start passed.
+					s := newStub(t)
+					placeRunnerWherePublishedImagesPutIt(t, s)
+					markMeasuredImagesPulled(t, s)
+
+					p := newProvider(t, s)
+					WithConfig(tartCfg)(p)
+
+					// A FAILURE GUARD, NOT A CONDITION, and inside the fake runner's
+					// five minutes: what is under test is whether the tier launches,
+					// and a dead runner fails at its first sample whatever this is.
+					// The proof's own deadline has tests of its own.
+					p.proveWindow = 2 * time.Minute
+
 					spec := specForTier(tier, fmt.Sprintf("billet-lease%d", i+1))
+
+					for _, f := range []string{launchClaim, runnerPIDFile, spawnedPIDs} {
+						if _, err := os.Stat(filepath.Join(s.guestHome, f)); !errors.Is(err, os.ErrNotExist) {
+							t.Fatalf("the guest holds %s before its launch (%v), so the launch would "+
+								"prove a runner it did not start", f, err)
+						}
+					}
 
 					inst, err := p.Launch(t.Context(), spec)
 					if err != nil {
@@ -78,6 +99,14 @@ func TestEveryGeneratedTartTierLaunchesOnThisBackend(t *testing.T) {
 
 					if !inst.Running {
 						t.Error("Launch returned an instance that does not report running")
+					}
+
+					// THIS TIER'S COMMAND RAN: the fake runner records every start,
+					// and in a guest that held none before the launch, the record can
+					// only be this launch's. It proves the command started, not that it
+					// started once; the claim's own tests hold that.
+					if spawned := s.spawned(t); spawned != 1 {
+						t.Errorf("the launch started %d runner(s) in its guest, want 1", spawned)
 					}
 
 					// THE IMAGE THE GENERATION NAMED IS THE ONE TART WAS ASKED
