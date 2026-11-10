@@ -171,6 +171,9 @@ func checkAcceptanceFleet(cfg *config.Config, fleet *acceptanceFleet) error {
 	case cfg.Node != nil:
 		return errors.New("the base config has a server.pool and a node: a pool's acceptance run has no node " +
 			"of its own, as its only node is a pool host's")
+	case cfg.Server.Pool.IdleAfter == "":
+		return errors.New("the base config's server.pool has no idle_after, so the pool never releases a host " +
+			"itself, and a pool's acceptance run judges that it does")
 	}
 
 	hosts := make([]string, 0, 2)
@@ -459,11 +462,21 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 		ws.CallerARN = id.ARN
 	}
 
+	// A RESUME DERIVES WHAT THE FIRST ATTEMPT DID, OR NOTHING: a base edited in place
+	// between them (another cache prefix, another region) would point the teardown at
+	// resources the first attempt never made, and away from the ones it did.
+	digest := fmt.Sprintf("%x", sha256.Sum256(derived))
+	if found && existing.ConfigSHA256 != "" && existing.ConfigSHA256 != digest {
+		return acceptanceWorkspace{}, fmt.Errorf("%s was derived from %s as it was then, and it derives "+
+			"differently now; re-deriving would point the teardown away from what the first attempt "+
+			"made. Tear this workspace down first, or use a new one", dir, in.base)
+	}
+
 	if err := os.WriteFile(ws.ConfigPath, derived, 0o600); err != nil {
 		return acceptanceWorkspace{}, fmt.Errorf("write the derived config: %w", err)
 	}
 
-	ws.ConfigSHA256 = fmt.Sprintf("%x", sha256.Sum256(derived))
+	ws.ConfigSHA256 = digest
 
 	// MINTED HERE, so the record carries the identity every later subcommand
 	// compares against. state.DeploymentID creates one if the directory has none

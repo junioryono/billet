@@ -52,6 +52,9 @@ type acceptanceEvidenceDoc struct {
 	// pool cell's job ran on, and what the pool's growth and shrink did. Empty for a run
 	// with no pool.
 	Pool []acceptancePoolOrder `json:"pool,omitempty"`
+	// JobsMayBeMissing says the history read stopped at its limit, so a job past it is
+	// not in Jobs; a judgement over every job on a host cannot be made from them.
+	JobsMayBeMissing bool `json:"jobs_may_be_missing,omitempty"`
 
 	// Outstanding is what the ledger still holds at the moment this was written.
 	// Empty is the expected answer and is not by itself proof of anything — see
@@ -277,6 +280,7 @@ func collectAcceptanceEvidence(
 	describeAcceptanceJobs(ctx, db, cfg, jobs)
 
 	doc.Jobs = jobs
+	doc.JobsMayBeMissing = len(jobs) >= acceptanceJobLimit
 
 	allocator, err := acceptanceAllocator(db, cfg)
 	if err != nil {

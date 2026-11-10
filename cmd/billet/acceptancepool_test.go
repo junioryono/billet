@@ -501,7 +501,7 @@ func TestAPoolsRunServesItsFleetOnlyWhereItWasTold(t *testing.T) {
 	if err := os.WriteFile(prelude, []byte("true\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	pool := &config.Config{Server: &config.ServerConfig{Pool: &config.PoolConfig{}}}
+	pool := &config.Config{Server: &config.ServerConfig{Pool: &config.PoolConfig{IdleAfter: "10m"}}}
 	good := &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}
 
 	if err := checkAcceptanceFleet(pool, good); err != nil {
@@ -518,6 +518,8 @@ func TestAPoolsRunServesItsFleetOnlyWhereItWasTold(t *testing.T) {
 		"a fleet with no pool": {&config.Config{Server: &config.ServerConfig{}}, good, "has no server.pool"},
 		"a pool with no fleet": {pool, nil, "pass --fleet-listen"},
 		"a pool beside a node": {&config.Config{Server: pool.Server, Node: &config.NodeConfig{}}, good, "and a node"},
+		"a pool that never shrinks": {&config.Config{Server: &config.ServerConfig{Pool: &config.PoolConfig{}}}, good,
+			"no idle_after"},
 		"a loopback wire": {pool, &acceptanceFleet{Listen: "127.0.0.1:7717", Bootstrap: "127.0.0.1:7718",
 			Prelude: prelude}, "non-loopback"},
 		"a wildcard wire": {pool, &acceptanceFleet{Listen: "0.0.0.0:7717", Bootstrap: "0.0.0.0:7718",
@@ -552,6 +554,7 @@ const poolBaseConfig = `server:
   max_vcpu: 48
   max_memory: 360GiB
   pool:
+    idle_after: 10m
     join_server: 10.0.0.9:7717
     bootstrap_addr: 10.0.0.9:7718
     boot_prelude: /etc/billet/pool-prelude.sh

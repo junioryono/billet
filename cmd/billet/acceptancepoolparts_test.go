@@ -200,6 +200,13 @@ func TestAnIdleShrinkAnswersForEveryJobOnItsHost(t *testing.T) {
 	if s := judge(poolEvidence(mine, cut)); s.Verdict != verdictFail || !strings.Contains(s.Reason, "l-cut") {
 		t.Errorf("another run's job disrupted on the host: %+v; want a fail naming it", s)
 	}
+
+	// EVIDENCE THAT MAY HOLD ONLY SOME OF THE JOBS cannot pass it.
+	partial := poolEvidence(mine)
+	partial.JobsMayBeMissing = true
+	if s := judge(partial); s.Verdict != verdictFail || !strings.Contains(s.Reason, "may be unread") {
+		t.Errorf("evidence cut at its limit: %+v; want a fail", s)
+	}
 }
 
 // A POOL CELL'S JOB RAN ON A HOST ITS ORDER RENTED AS THE CELL'S ARCHITECTURE: a job of
@@ -542,6 +549,43 @@ func TestATeardownKnowsAPoolsRunFromItsConfig(t *testing.T) {
 	node := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), t.TempDir())
 	if _, _, isPool, err := acceptancePoolFor(t.Context(), node); isPool || err != nil {
 		t.Errorf("a run with a node was torn down as a pool's: %v, %v", isPool, err)
+	}
+}
+
+// A RESUME DERIVES WHAT THE FIRST ATTEMPT DID: the same base resumes, and one edited in
+// place since, as a cache prefix changed, is refused before the derived config is
+// replaced, since the teardown would then purge another prefix than the run used.
+func TestAResumeOfAnEditedBaseIsRefused(t *testing.T) {
+	t.Parallel()
+
+	prelude := filepath.Join(t.TempDir(), "prelude.sh")
+	if err := os.WriteFile(prelude, []byte("true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := writeAcceptanceBase(t, poolBaseConfig)
+	in := acceptanceInputs{base: base, workspace: t.TempDir(), prefix: "accept-pool",
+		fleet: &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}}
+	first, err := deriveAcceptance(t.Context(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := deriveAcceptance(t.Context(), in); err != nil || again.ConfigSHA256 != first.ConfigSHA256 {
+		t.Fatalf("an unchanged resume: %v, digest %s then %s", err, first.ConfigSHA256, again.ConfigSHA256)
+	}
+	written, err := os.ReadFile(first.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	edited := strings.Replace(poolBaseConfig, "'--site=metal',", "'--site=metal', '--ebs-s3-prefix=other',", 1)
+	if err := os.WriteFile(base, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deriveAcceptance(t.Context(), in); err == nil || !strings.Contains(err.Error(), "derives differently") {
+		t.Fatalf("a resume of an edited base answered %v", err)
+	}
+	if after, err := os.ReadFile(first.ConfigPath); err != nil || !bytes.Equal(after, written) {
+		t.Errorf("the refused resume replaced the derived config (%v)", err)
 	}
 }
 

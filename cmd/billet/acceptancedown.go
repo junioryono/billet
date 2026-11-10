@@ -297,7 +297,11 @@ func cmdAcceptanceSweep(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 	if isPool {
-		return pool.sweep(ctx, env, ws.DeploymentID, orders, nil)
+		if err := pool.sweep(ctx, env, ws.DeploymentID, orders, nil); err != nil {
+			return err
+		}
+
+		return sameAcceptancePoolOrders(ctx, ws, orders)
 	}
 
 	// A STANDALONE SWEEP HAS NO BARRIER BEHIND IT. `run` proves the fleet clear
