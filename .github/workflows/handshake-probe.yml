@@ -1,0 +1,81 @@
+name: Handshake probe
+
+# THE GUEST'S SIDE OF #818, dispatched by hand. It runs on one tier for a number
+# of minutes and times a fresh connection to each origin below once a second
+# (DNS, connect, TLS done, first byte), with one ping to 1.1.1.1 whose time rises
+# when the site's line queues. Lined up with the node's per-second series of the
+# jobs that ran beside it (`billet jobs show --json --window`), a stall it records
+# names the downloads it happened under.
+#
+# ORIGINS A GUEST REACHES DIRECTLY: the Go module proxy, which a consumer's
+# `go mod download` timed out against on 2026-11-09, and two other CDNs. Not the
+# npm registry or the Actions results host, which a guest's resolver can send to
+# its node; remote_ip in the record says where each name resolved.
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: The tier to run on
+        required: false
+        default: billet-1vcpu-ubuntu-2404
+        type: string
+      minutes:
+        description: How long to probe
+        required: false
+        default: "120"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 360
+    steps:
+      - name: Fetch the probe from this run's revision
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/handshake-probe.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Probe
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          case $MINUTES in '' | *[!0-9]*) echo "minutes must be a whole number, not '$MINUTES'" >&2; exit 2 ;; esac
+          scripts/handshake-probe.sh "$RUNNER_TEMP/probe" "$((MINUTES * 60))" \
+            https://proxy.golang.org/github.com/jackc/pgx/v5/@v/list \
+            https://dl.google.com/go/go1.26.0.linux-amd64.tar.gz.sha256 \
+            https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Handshakes (TLS done minus connect, seconds)"
+            echo
+            echo "| URL | requests | failed | over 1 s | slowest |"
+            echo "|---|---|---|---|---|"
+            awk -F, 'NR > 1 {
+                n[$2]++
+                if ($3 != 0) failed[$2]++
+                tls = $8 - $7
+                if ($3 == 0 && tls > 1) slow[$2]++
+                if (tls > worst[$2]) worst[$2] = tls
+              }
+              END { for (u in n) printf "| %s | %d | %d | %d | %.3f |\n", u, n[u], failed[u] + 0, slow[u] + 0, worst[u] }' \
+              "$RUNNER_TEMP/probe/handshakes.csv"
+            echo
+            echo "## Ping to 1.1.1.1 (ms)"
+            echo
+            awk -F, 'NR > 1 && $4 != "" { n++; s += $4; if ($4 > m) m = $4 } NR > 1 && $4 == "" { lost++ }
+              END { printf "replies %d, lost %d, mean %.1f, worst %.1f\n", n, lost + 0, (n ? s / n : 0), m }' \
+              "$RUNNER_TEMP/probe/ping.csv"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the record
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: handshake-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/probe/
+          if-no-files-found: error
