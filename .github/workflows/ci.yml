@@ -19,6 +19,20 @@ on:
 permissions:
   contents: read
 
+# A MODULE FETCH THAT STALLS IS TRIED AGAIN ON A NEW CONNECTION. Go falls back to
+# the next entry of GOPROXY on any error after `|` (only on a 404 or 410 after
+# `,`), so naming the proxy twice turns one stalled TLS handshake into a second
+# attempt; `direct` stays where the default has it. The fleet's uplink drops about
+# one connection in 1,700 after its TCP handshake (#818), and Go's fetch has no
+# retry of its own: lint, release-config, terraform, test-postgres and
+# host-lifecycle each failed on `net/http: TLS handshake timeout` or a reset
+# stream from proxy.golang.org. Measured 2026-11-10 with Go 1.26: a black-holed
+# first entry fell through to the second for the module, while the checksum
+# database's lookup through the proxy did not, which only a module missing from
+# go.sum (`go install tool@version`) needs.
+env:
+  GOPROXY: https://proxy.golang.org|https://proxy.golang.org,direct
+
 concurrency:
   group: ci-${{ github.ref }}
   # A PULL REQUEST'S OLDER RUN IS CANCELLED; main's is let finish. Cancelling on
