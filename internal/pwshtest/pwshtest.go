@@ -23,8 +23,14 @@ import (
 
 // Isolate puts a pwsh first on PATH that runs the real one with a cache
 // directory of its own, and returns what removes it. Every test that finds pwsh
-// through PATH, and every script one of them runs that does, then starts that
-// one. On a machine with no pwsh it changes nothing.
+// through PATH, and every shell script one of them runs that does, then starts
+// that one. On a machine with no pwsh it changes nothing.
+//
+// NOT A pwsh STARTED BY NAME FROM INSIDE POWERSHELL: pwsh puts its own directory
+// first on PATH as it starts, so a PowerShell script that starts `pwsh` runs the
+// real one and shares its parent's cache. A test whose PowerShell starts pwsh
+// hands it the wrapper's path, which exec.LookPath("pwsh") returns once this has
+// run (scripts' runWindowsDriverAt does, for build-ami.ps1's steps).
 //
 // FOR TestMain, BEFORE ANY TEST RUNS: it changes the process's PATH, which no
 // test running beside it may read meanwhile, and it writes an executable, which
