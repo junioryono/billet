@@ -188,6 +188,37 @@ jobs:
           sudo apt-get install -y --no-install-recommends haproxy
           sudo systemctl stop haproxy || true
 
+      # /tmp IS MEMORY FOR THE SUITE, NOT THE GUEST'S DISK. Every t.TempDir, every
+      # fixture that names /tmp, and every test binary go test links live there,
+      # and they went to the runner's root disk, a Ceph image on storage the whole
+      # fleet shares: 12 to 16 GB of writes a run. Twenty-three test jobs between
+      # 2026-10-11 and 2026-11-10 failed with test ledgers that could not open
+      # inside their 30 s budget, often dozens of tests at once; on 2026-11-10 the
+      # guest's CPU fell to half a core while they waited and its writes stopped,
+      # as other guests' did in the same ten seconds. A mount over /tmp itself,
+      # rather than TMPDIR elsewhere, keeps every temporary path its length,
+      # keeps the default temporary paths together, and stays a filesystem apart
+      # from /dev/shm: a socket path near Linux's limit, a helper that checks its
+      # fixture is under os.TempDir, and a test that needs /dev/shm to be another
+      # filesystem each depend on one of those. The guest has 62 GiB and go test
+      # removes each package's binary once it has run; the high-water mark is
+      # sampled and reported after the suite, so the ceiling is read, not assumed.
+      - name: Give /tmp to memory
+        run: |
+          sudo mount -t tmpfs -o mode=1777,nosuid,nodev,size=32g billet-test-tmp /tmp
+          findmnt /tmp
+          # EVERY GOOD SAMPLE IS KEPT, stamped and ended, and nothing else: the
+          # report reads only whole records and finds the maximum, the count and the
+          # newest sample's age, so a sampler that stopped shows as one.
+          (
+            set +e
+            while sleep 5; do
+              used=$(df --output=used -B1M /tmp 2>/dev/null | tail -n 1 | tr -d ' ')
+              case "$used" in '' | *[!0-9]*) continue ;; esac
+              echo "$(date +%s) $used end" >>"$RUNNER_TEMP/tmp-usage"
+            done
+          ) >/dev/null 2>&1 &
+
       # -race matters more than usual here: the control plane is a capacity
       # allocator with concurrent scale-set listeners, and a data race in that
       # code double-admits jobs onto a machine that cannot hold them.
@@ -210,6 +241,18 @@ jobs:
           go test -race -count=1 -timeout 35m -vet=off -coverprofile=coverage.out -covermode=atomic -json ./... \
             | tee test-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
+
+      # A DIAGNOSTIC, so nothing here can fail the job.
+      - name: Report how much of /tmp the suite used
+        if: always()
+        run: |
+          awk -v now="$(date +%s)" '
+            NF == 3 && $3 == "end" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { n++; if ($2 > max) max = $2; if ($1 > last) last = $1 }
+            END {
+              if (n == 0) { print "the suite'"'"'s use of /tmp was not sampled"; exit }
+              printf "the suite'"'"'s /tmp: at most %d MiB of 32768 in %d recorded samples, attempted about every 5 s; the newest was %d s before this step\n", max, n, now - last
+            }' "$RUNNER_TEMP/tmp-usage" 2>/dev/null || echo "the suite's use of /tmp could not be read"
+          df -h /tmp || echo "could not read /tmp's use now"
 
       - name: Report the slowest tests
         if: always()
