@@ -1498,10 +1498,13 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			custody.Lock()
 			err := compute.Sweep(ctx)
 			custody.Unlock()
-			if err != nil {
-				// NOT FATAL. A sweep that fails leaves orphans for the next one; a
-				// node that stopped serving because of it would leave every job
-				// queued instead.
+			// NOT FATAL. A sweep that fails leaves orphans for the next one; a node
+			// that stopped serving because of it would leave every job queued
+			// instead. AND NOT A FAILURE WHEN THE NODE IS STOPPING: a sweep or a
+			// Tend still running when the signal lands returns the cancellation,
+			// and logging that as a failure puts a broken-looking line in front of
+			// whoever is watching the stop. The drain's Tend keeps the same rule.
+			if err != nil && ctx.Err() == nil {
 				log.Error("sweep failed; orphaned compute may be left behind", "error", err)
 			}
 
@@ -1509,7 +1512,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// lease once the compute behind it is confirmed gone; without this the
 			// janitor renews them forever and the capacity is never returned. The
 			// keepalive goroutine only holds them — this is what ends them.
-			if err := tend(); err != nil {
+			if err := tend(); err != nil && ctx.Err() == nil {
 				log.Error("could not advance custody; leases for compute that may already be "+
 					"gone will keep being renewed until this succeeds", "error", err)
 			}
@@ -1568,7 +1571,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// for the next five-minute sweep keeps a slot charged after its instance is
 			// already gone.
 			if compute.Holding() {
-				if err := tend(); err != nil {
+				if err := tend(); err != nil && ctx.Err() == nil {
 					log.Error("could not advance custody after the command poll; leases for "+
 						"compute that may already be gone will keep being renewed until this succeeds",
 						"error", err)
