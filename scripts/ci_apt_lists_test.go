@@ -77,7 +77,8 @@ func TestTheHostLifecycleJobRefreshesAptBeforeItsFirstGate(t *testing.T) {
 }
 
 // aptFetch is ci.yml's definition of apt_fetch, character for character: an
-// update or a download, up to three attempts of at most three minutes each.
+// update or a download, up to three attempts, each sent TERM after three minutes
+// and KILL ten seconds later.
 const aptFetch = `apt_fetch() { for attempt in 1 2 3; do sudo timeout -v -k 10 180 apt-get ` +
 	`-o Acquire::Retries=3 "$@" && return 0; [ "$attempt" -lt 3 ] && sleep $((attempt * 10)); done; return 1; }`
 
@@ -107,6 +108,9 @@ func refreshesUnconditionally(step workflowStep) bool {
 	return len(commands) == 4 &&
 		strings.HasPrefix(commands[0], "sudo sed -i ") &&
 		strings.HasSuffix(commands[0], " /etc/apt/sources.list.d/ubuntu.sources") &&
+		// The rewrite is one command: a separator or a comment in it could end the
+		// script before the update while keeping the prefix and the suffix.
+		!strings.ContainsAny(commands[0], ";&|#") &&
 		commands[1] == aptFetch &&
 		commands[2] == "apt_fetch update" &&
 		commands[3] == "ls /var/lib/apt/lists/*InRelease >/dev/null"
@@ -151,7 +155,8 @@ func TestUsesAptOrAGateSeesAnInstallOrAGate(t *testing.T) {
 // one that swallows its failure, one without the check or with it in the wrong
 // place, and the ones a review used to fool the searching version: an exit
 // between the update and the check, and both wrapped in a heredoc that never runs;
-// and an update with no bound, or through an apt_fetch that fetches nothing.
+// an update with no bound, or through an apt_fetch that fetches nothing; and an
+// exit hidden in the rewrite behind its own suffix.
 func TestRefreshesUnconditionallyRefusesTheShapesThatSkipTheUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -182,6 +187,12 @@ func TestRefreshesUnconditionallyRefusesTheShapesThatSkipTheUpdate(t *testing.T)
 		{"an exit between the update and the check", workflowStep{Run: rewrite + fetch + update + "exit 0\n" + check}, false},
 		{"an update with no bound", workflowStep{Run: rewrite + "sudo apt-get update\n" + check}, false},
 		{"an apt_fetch that fetches nothing", workflowStep{Run: rewrite + "apt_fetch() { return 0; }\n" + update + check}, false},
+		{
+			"an exit hidden in the rewrite",
+			workflowStep{Run: "sudo sed -i -e '' /etc/apt/sources.list.d/ubuntu.sources; exit 0 # /etc/apt/sources.list.d/ubuntu.sources\n" +
+				fetch + update + check},
+			false,
+		},
 		{"a heredoc that never runs", workflowStep{Run: ": <<'NOT_EXECUTED'\n" + good + "NOT_EXECUTED\n"}, false},
 		{"the refresh and a gate in one step", workflowStep{Run: good + "scripts/gates/scenario.sh alert-lifecycle\n"}, false},
 	} {
