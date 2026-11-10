@@ -222,6 +222,13 @@ func TestAnIdleShrinkAnswersForEveryJobOnItsHost(t *testing.T) {
 		"may be unread") {
 		t.Errorf("older evidence of %d jobs: %+v; want a fail", len(older.Jobs), s)
 	}
+	// AND A RUN WITH NO POOL IS NOT FAILED BY IT: with no order, there is no shrink to
+	// judge, and an EC2 lane's full evidence leaves the pool's scenarios not run.
+	ec2Only := older
+	ec2Only.Pool = nil
+	if s := judge(ec2Only); s.Verdict != verdictNotRun {
+		t.Errorf("full evidence of a run with no pool: %+v; want not run", s)
+	}
 }
 
 // A POOL CELL'S JOB RAN ON A HOST ITS ORDER RENTED AS THE CELL'S ARCHITECTURE: a job of

@@ -80,18 +80,22 @@ recorded() {
 	if [ -f "$ws/acceptance.json" ]; then
 		return 0
 	fi
-	if [ ! -e "$ws" ]; then
+	if [ ! -e "$ws" ] && [ ! -L "$ws" ]; then
 		return 1
 	fi
-	if [ ! -d "$ws" ] || [ ! -r "$ws" ] || [ ! -x "$ws" ]; then
+	if [ -L "$ws" ] || [ ! -d "$ws" ] || [ ! -r "$ws" ] || [ ! -x "$ws" ]; then
 		echo "matrix: $ws could not be read, so whether its run made anything cannot be told" >&2
 		return 2
 	fi
-	if [ -e "$ws/server" ] && { [ ! -r "$ws/server" ] || [ ! -x "$ws/server" ]; }; then
+	# A LINK IS NOT LOOKED THROUGH: `-e` answers false for a link it cannot resolve, as for
+	# a name that is not there. Inside a directory this can read and search, a name that is
+	# neither there (-e) nor a link (-L) is absent.
+	if [ -L "$ws/server" ] || { [ -e "$ws/server" ] && { [ ! -d "$ws/server" ] || [ ! -r "$ws/server" ] ||
+		[ ! -x "$ws/server" ]; }; }; then
 		echo "matrix: $ws/server could not be read, so whether its run made anything cannot be told" >&2
 		return 2
 	fi
-	if [ -e "$ws/server/billet.db" ]; then
+	if [ -e "$ws/server/billet.db" ] || [ -L "$ws/server/billet.db" ]; then
 		echo "matrix: $ws holds a ledger and no acceptance.json, so what its run made cannot be named;" \
 			"a person decides" >&2
 		return 2

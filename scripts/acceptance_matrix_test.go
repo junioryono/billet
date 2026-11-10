@@ -690,6 +690,32 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 			t.Fatalf("%s of a workspace with a ledger and no record: exit %d\n%s", phase, code, out)
 		}
 	}
+	// A LINK IS NEVER READ AS ABSENCE: a server directory linked to where nothing resolves,
+	// or a ledger name that is a dangling link, is a workspace whose run may have made
+	// something.
+	if err := os.RemoveAll(filepath.Join(dir, "ws", "server")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "gone"), filepath.Join(dir, "ws", "server")); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code == 0 ||
+		!strings.Contains(out, "could not be read") {
+		t.Fatalf("down of a workspace whose server is a dangling link: exit %d\n%s", code, out)
+	}
+	if err := os.Remove(filepath.Join(dir, "ws", "server")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "ws", "server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "gone"), filepath.Join(dir, "ws", "server", "billet.db")); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code == 0 ||
+		!strings.Contains(out, "a person decides") {
+		t.Fatalf("down of a workspace whose ledger is a dangling link: exit %d\n%s", code, out)
+	}
 	if err := os.RemoveAll(filepath.Join(dir, "ws", "server")); err != nil {
 		t.Fatal(err)
 	}

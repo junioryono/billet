@@ -148,9 +148,14 @@ func judgeBurst(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixScope)
 // source's word, with no job on it disrupted; and at least one of them ran a job of this
 // run. One host's shrink does not stand for another's that never came.
 func judgeShrinkIdle(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixScope) {
+	orders := scenarioOrders(s, doc)
+	if len(orders) == 0 {
+		s.Reason = "the pool placed no order on " + string(s.Arch)
+
+		return
+	}
 	// EVERY JOB ON A HOST IS ITS TO ANSWER FOR, so evidence that may hold only some of
-	// them cannot pass it.
-	// Evidence written before the flag existed says so by its count alone.
+	// them cannot pass it. Evidence written before the flag existed says so by its count.
 	if doc.JobsMayBeMissing || len(doc.Jobs) >= acceptanceJobLimit {
 		s.Verdict = verdictFail
 		s.Reason = fmt.Sprintf("the evidence holds the first %d jobs only, so a job on a released host may be "+
@@ -158,7 +163,6 @@ func judgeShrinkIdle(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixS
 
 		return
 	}
-	orders := scenarioOrders(s, doc)
 	var joined, wrong []string
 	witnessed := false
 	for i := range orders {
