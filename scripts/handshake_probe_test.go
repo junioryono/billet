@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // THE PROBE RECORDS EVERY REQUEST, A FAILED ONE INCLUDED, AND KEEPS GOING. It is
-// executed, against a server that answers and an address that refuses, for two
-// seconds: both URLs have rows, the refused one with curl's connect failure (7)
-// and the answered one with its status and timings.
+// executed, against an address that refuses and a server that answers, for three
+// seconds: the refused URL is asked again after it failed, in later seconds, with
+// curl's connect failure (7) each time, and the answered one has its status and
+// timings.
 func TestTheHandshakeProbeRecordsEveryRequestAndKeepsGoing(t *testing.T) {
 	t.Parallel()
 
@@ -40,7 +42,7 @@ func TestTheHandshakeProbeRecordsEveryRequestAndKeepsGoing(t *testing.T) {
 	}
 
 	out := t.TempDir()
-	cmd := exec.CommandContext(t.Context(), "bash", "handshake-probe.sh", out, "2", server.URL+"/", refused)
+	cmd := exec.CommandContext(t.Context(), "bash", "handshake-probe.sh", out, "3", refused, server.URL+"/")
 	cmd.Env = append(os.Environ(), "PING_HOST=")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("the probe failed: %v\n%s", err, output)
@@ -52,7 +54,8 @@ func TestTheHandshakeProbeRecordsEveryRequestAndKeepsGoing(t *testing.T) {
 		t.Fatalf("handshakes.csv = %v, want its header and rows", rows)
 	}
 
-	answered, failed := 0, 0
+	answered := 0
+	refusedSeconds := map[string]bool{}
 	for _, row := range rows[1:] {
 		if len(row) != 10 {
 			t.Fatalf("a row has %d fields, want 10: %v", len(row), row)
@@ -67,16 +70,51 @@ func TestTheHandshakeProbeRecordsEveryRequestAndKeepsGoing(t *testing.T) {
 			if row[2] != "7" {
 				t.Errorf("the refused request recorded exit %s, want curl's connect failure (7): %v", row[2], row)
 			}
-			failed++
+			// THE SECOND IT BEGAN IN, from its millisecond stamp.
+			refusedSeconds[row[0][:19]] = true
 		}
 	}
-	if answered == 0 || failed == 0 || answered != failed {
-		t.Fatalf("recorded %d answered and %d refused request(s); want both, one each per tick", answered, failed)
+	if answered < 2 {
+		t.Fatalf("recorded %d answered request(s) over three seconds, want one a second", answered)
+	}
+	if len(refusedSeconds) < 2 {
+		t.Fatalf("the refused URL was asked in %d second(s) over three, so its loop did not keep going after "+
+			"its failure", len(refusedSeconds))
 	}
 
 	if pings := readCSV(t, filepath.Join(out, "ping.csv")); len(pings) != 1 {
 		t.Fatalf("ping.csv has %d rows with the ping off, want only its header", len(pings))
 	}
+}
+
+// A LEADING ZERO IS NOT OCTAL: "08", which bash's arithmetic refuses as octal,
+// runs.
+func TestTheHandshakeProbeReadsItsDurationInBaseTen(t *testing.T) {
+	t.Parallel()
+
+	out := t.TempDir()
+	cmd := exec.CommandContext(t.Context(), "bash", "handshake-probe.sh", out, "01", "http://127.0.0.1:1/")
+	cmd.Env = append(os.Environ(), "PING_HOST=")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("a duration of 01 failed: %v\n%s", err, output)
+	}
+	cmd = exec.CommandContext(t.Context(), "bash", "handshake-probe.sh", out, "08", "http://127.0.0.1:1/")
+	cmd.Env = append(os.Environ(), "PING_HOST=")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// "08" READ AS OCTAL fails at once; read as eight seconds it is still running.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		t.Fatalf("a duration of 08 ended at once: %v", err)
+	case <-time.After(2 * time.Second):
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
 }
 
 // A DURATION THAT IS NOT A WHOLE NUMBER IS REFUSED, before anything is written.

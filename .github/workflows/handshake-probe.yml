@@ -20,7 +20,7 @@ on:
         default: billet-1vcpu-ubuntu-2404
         type: string
       minutes:
-        description: How long to probe
+        description: How long to probe, 1 to 300 (the job's limit is 360, and the summary and upload follow)
         required: false
         default: "120"
         type: string
@@ -44,7 +44,12 @@ jobs:
           MINUTES: ${{ inputs.minutes }}
         run: |
           case $MINUTES in '' | *[!0-9]*) echo "minutes must be a whole number, not '$MINUTES'" >&2; exit 2 ;; esac
-          scripts/handshake-probe.sh "$RUNNER_TEMP/probe" "$((MINUTES * 60))" \
+          minutes=$((10#$MINUTES))
+          if [ "$minutes" -lt 1 ] || [ "$minutes" -gt 300 ]; then
+            echo "minutes must be 1 to 300, not $minutes" >&2
+            exit 2
+          fi
+          scripts/handshake-probe.sh "$RUNNER_TEMP/probe" "$((minutes * 60))" \
             https://proxy.golang.org/github.com/jackc/pgx/v5/@v/list \
             https://dl.google.com/go/go1.26.0.linux-amd64.tar.gz.sha256 \
             https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
@@ -56,12 +61,16 @@ jobs:
             echo
             echo "| URL | requests | failed | over 1 s | slowest |"
             echo "|---|---|---|---|---|"
+            # A HANDSHAKE THAT FINISHED IS COUNTED whatever became of the request
+            # after it; time_appconnect is zero for one that never finished.
             awk -F, 'NR > 1 {
                 n[$2]++
                 if ($3 != 0) failed[$2]++
-                tls = $8 - $7
-                if ($3 == 0 && tls > 1) slow[$2]++
-                if (tls > worst[$2]) worst[$2] = tls
+                if ($8 > 0) {
+                  tls = $8 - $7
+                  if (tls > 1) slow[$2]++
+                  if (tls > worst[$2]) worst[$2] = tls
+                }
               }
               END { for (u in n) printf "| %s | %d | %d | %d | %.3f |\n", u, n[u], failed[u] + 0, slow[u] + 0, worst[u] }' \
               "$RUNNER_TEMP/probe/handshakes.csv"
