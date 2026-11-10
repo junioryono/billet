@@ -719,6 +719,30 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(dir, "ws", "server")); err != nil {
 		t.Fatal(err)
 	}
+	// A LOOKUP THAT FAILS IS NOT AN ABSENCE: a server directory that cannot be searched
+	// hides whether a ledger is in it, which the shell's -e reads as none.
+	if os.Geteuid() != 0 {
+		server := filepath.Join(dir, "ws", "server")
+		if err := os.MkdirAll(server, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(server, "billet.db"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(server, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir)
+		if err := os.Chmod(server, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if code == 0 || !strings.Contains(out, "could not be read") {
+			t.Fatalf("down of a workspace whose server directory cannot be searched: exit %d\n%s", code, out)
+		}
+		if err := os.RemoveAll(server); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := os.WriteFile(filepath.Join(dir, "ws", "acceptance.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}

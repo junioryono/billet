@@ -71,37 +71,57 @@ usage() {
 	exit 2
 }
 
+# lstat_kind PATH prints what lstat says PATH is (dir, file, link or other) and exits 0,
+# exits 1 when lstat answers ENOENT, and exits 2 on any other answer. Only ENOENT is a
+# name that is not there: the shell's -e and -L answer false for an I/O error as well.
+lstat_kind() {
+	python3 -I -c 'import errno, os, stat, sys
+try:
+    m = os.lstat(sys.argv[1]).st_mode
+except OSError as e:
+    sys.exit(1 if e.errno == errno.ENOENT else 2)
+print("link" if stat.S_ISLNK(m) else "dir" if stat.S_ISDIR(m) else "file" if stat.S_ISREG(m) else "other")' "$1"
+}
+
 # recorded answers 0 when the workspace holds its record, 1 when it holds none and
 # nothing ever ran in it (no workspace, or no ledger: neither a control plane nor a
 # pool's `up` made one), and anything else, said, when it could not tell or the record
 # is missing beside a ledger, whose deployment nothing here can then name. A missing
-# record is never on its own a run with nothing to take down.
+# record is never on its own a run with nothing to take down, and a name is absent only
+# when lstat says so of it inside a directory that is one: a link is not looked through.
 recorded() {
-	if [ -f "$ws/acceptance.json" ]; then
-		return 0
-	fi
-	if [ ! -e "$ws" ] && [ ! -L "$ws" ]; then
-		return 1
-	fi
-	if [ -L "$ws" ] || [ ! -d "$ws" ] || [ ! -r "$ws" ] || [ ! -x "$ws" ]; then
-		echo "matrix: $ws could not be read, so whether its run made anything cannot be told" >&2
+	local kind
+	kind=$(lstat_kind "$ws/acceptance.json")
+	case $?:$kind in
+	0:file) return 0 ;;
+	1:) ;;
+	*)
+		echo "matrix: $ws/acceptance.json could not be read, so whether its run made anything cannot be told" >&2
 		return 2
-	fi
-	# A LINK IS NOT LOOKED THROUGH: `-e` answers false for a link it cannot resolve, as for
-	# a name that is not there. Inside a directory this can read and search, a name that is
-	# neither there (-e) nor a link (-L) is absent.
-	if [ -L "$ws/server" ] || { [ -e "$ws/server" ] && { [ ! -d "$ws/server" ] || [ ! -r "$ws/server" ] ||
-		[ ! -x "$ws/server" ]; }; }; then
-		echo "matrix: $ws/server could not be read, so whether its run made anything cannot be told" >&2
-		return 2
-	fi
-	if [ -e "$ws/server/billet.db" ] || [ -L "$ws/server/billet.db" ]; then
+		;;
+	esac
+	for dir in "$ws" "$ws/server"; do
+		kind=$(lstat_kind "$dir")
+		case $?:$kind in
+		1:) return 1 ;;
+		0:dir) ;;
+		*)
+			echo "matrix: $dir could not be read, so whether its run made anything cannot be told" >&2
+			return 2
+			;;
+		esac
+	done
+	kind=$(lstat_kind "$ws/server/billet.db")
+	case $? in
+	1) return 1 ;;
+	0)
 		echo "matrix: $ws holds a ledger and no acceptance.json, so what its run made cannot be named;" \
 			"a person decides" >&2
-		return 2
-	fi
+		;;
+	*) echo "matrix: $ws/server/billet.db could not be read, so whether its run made anything cannot be told" >&2 ;;
+	esac
 
-	return 1
+	return 2
 }
 
 phase=${1:-}
