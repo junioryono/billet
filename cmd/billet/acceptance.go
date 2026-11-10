@@ -322,6 +322,9 @@ type acceptanceInputs struct {
 	// stsEndpoint points the account assertion at a test server. Empty is the
 	// real regional endpoint.
 	stsEndpoint string
+	// seedLedger, in a test, puts a migrated ledger in the state directory before a
+	// pool's run first opens it, which then only proves its schema; nil in production.
+	seedLedger func(stateDir string)
 }
 
 // deriveAcceptance is `up` without the printing, so a test can reach it.
@@ -520,6 +523,9 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 	// anything, so a ledger missing from a recorded workspace is a lost one, never a pool
 	// that ordered nothing. Created once, by the `up` that writes the record.
 	if in.fleet != nil {
+		if in.seedLedger != nil && !found {
+			in.seedLedger(serverDir)
+		}
 		if err := prepareAcceptancePoolLedger(ctx, ws.ConfigPath, found); err != nil {
 			return acceptanceWorkspace{}, err
 		}

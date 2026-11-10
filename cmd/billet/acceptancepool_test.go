@@ -613,7 +613,7 @@ func TestAPoolsDerivationServesItsFleet(t *testing.T) {
 	dir := t.TempDir()
 
 	ws, err := deriveAcceptance(t.Context(), acceptanceInputs{base: base, workspace: dir, prefix: "accept-pool",
-		fleet: fleet})
+		fleet: fleet, seedLedger: seedTemplate(t)})
 	if err != nil {
 		t.Fatalf("derive a pool's run: %v", err)
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/junioryono/billet/internal/ops/setup"
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/store/ebss3"
 )
 
@@ -274,6 +275,14 @@ func TestAPoolsRunOwesItsBackendAndNoneIsRefused(t *testing.T) {
 	}
 }
 
+// seedTemplate seeds a pool's run's state directory from the migrated template, so its
+// first open proves a schema rather than applying every migration under the suite's load.
+func seedTemplate(t *testing.T) func(string) {
+	t.Helper()
+
+	return func(dir string) { ledgertest.Seed(t, dir) }
+}
+
 // writePoolBase writes poolBaseConfig with these replacements, and loads it.
 func writePoolBase(t *testing.T, replace ...string) (string, *config.Config) {
 	t.Helper()
@@ -523,7 +532,7 @@ func TestATeardownKnowsAPoolsRunFromItsConfig(t *testing.T) {
 	base := writeAcceptanceBase(t, poolBaseConfig)
 	ws, err := deriveAcceptance(t.Context(), acceptanceInputs{base: base,
 		workspace: t.TempDir(), prefix: "accept-pool",
-		fleet: &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}})
+		fleet: &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}, seedLedger: seedTemplate(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +595,7 @@ func TestAResumeOfAnEditedBaseIsRefused(t *testing.T) {
 	}
 	base := writeAcceptanceBase(t, poolBaseConfig)
 	in := acceptanceInputs{base: base, workspace: t.TempDir(), prefix: "accept-pool",
-		fleet: &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}}
+		fleet: &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}, seedLedger: seedTemplate(t)}
 	first, err := deriveAcceptance(t.Context(), in)
 	if err != nil {
 		t.Fatal(err)
@@ -639,7 +648,7 @@ func TestAnOrderPlacedDuringTheTeardownFailsIt(t *testing.T) {
 	}
 	ws, err := deriveAcceptance(t.Context(), acceptanceInputs{base: writeAcceptanceBase(t, poolBaseConfig),
 		workspace: t.TempDir(), prefix: "accept-pool",
-		fleet: &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}})
+		fleet: &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}, seedLedger: seedTemplate(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
