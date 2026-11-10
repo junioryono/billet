@@ -770,13 +770,17 @@ jobs:
           path: ${{ runner.temp }}/gate-binaries
           if-no-files-found: error
           retention-days: 1
-      # THE GROUPS READ THE BINARIES FROM THE SITE, NOT FROM GITHUB. Each of about
-      # twenty groups downloaded this artifact, 175 MB, over the one line the
-      # site's CI shares, 3.7 GB a run. The Actions cache is served by the
-      # runner's own node from the site's store (every host-lifecycle group's
-      # cache was `served` on run 42908871674, a pull request), so the groups
-      # restore it from there and fall back to the artifact only on a miss. The
-      # key is this run's, so no other run reads it.
+      # THE GROUPS PREFER THE SITE'S COPY OF THE BINARIES. Each of about twenty
+      # groups downloaded this artifact, 175 MB, over the one line the site's CI
+      # shares, 3.7 GB a run. The Actions cache is served by the runner's own
+      # node from the site's store (every host-lifecycle group's cache was
+      # `served` on run 42908871674, a pull request), so the groups restore it
+      # from there and download the artifact only without an exact hit. A call
+      # the node cannot serve goes to GitHub's cache instead, as on a hosted
+      # runner. The key is this run's, so no other run reads it, and an entry
+      # that reaches GitHub is never read again after its run: GitHub evicts the
+      # least recently read first, so it goes before the Go and Terraform
+      # caches every run reads.
       - uses: actions/cache/save@v5
         with:
           path: ${{ runner.temp }}/gate-binaries
