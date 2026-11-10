@@ -317,15 +317,6 @@ tiers:
 	}
 }
 
-// requireBackupPostgres returns a DSN pointing at a schema of this test's own,
-// or skips — and refuses to skip under CI.
-//
-// A SKIP THAT QUIETLY PASSES IS THE FAILURE THIS FILE IS ABOUT, one level up: the
-// defect being guarded is a command that captured nothing while reporting
-// success, so a gate that reports success while exercising nothing is the same
-// shape. internal/state states the rule for its own suite; this is the command
-// layer's copy of it, and the duplication is deliberate — a shared helper would
-// have to be exported from a package that has no business exporting one.
 // backupSchemaName is the PostgreSQL schema a test named name runs in, as
 // internal/state's testSchemaName names its own: lowercase, at most 60 bytes, and
 // a name too long keeps a hash of itself rather than only its first 60 bytes,
@@ -365,6 +356,15 @@ func TestABackupTestSchemaIsTheTestsOwn(t *testing.T) {
 	}
 }
 
+// requireBackupPostgres returns a DSN pointing at a schema of this test's own,
+// or skips — and refuses to skip under CI.
+//
+// A SKIP THAT QUIETLY PASSES IS THE FAILURE THIS FILE IS ABOUT, one level up: the
+// defect being guarded is a command that captured nothing while reporting
+// success, so a gate that reports success while exercising nothing is the same
+// shape. internal/state states the rule for its own suite; this is the command
+// layer's copy of it, and the duplication is deliberate — a shared helper would
+// have to be exported from a package that has no business exporting one.
 func requireBackupPostgres(t *testing.T) string {
 	t.Helper()
 
