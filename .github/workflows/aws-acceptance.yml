@@ -226,10 +226,17 @@ jobs:
           set -euo pipefail
           aws iam put-role-policy --role-name "$HOST_ROLE" \
             --policy-name "billet-matrix-$RUN" --policy-document file://out/iam.json
-          # AND THE POOL'S HOSTS THEIRS, before the pool orders one.
+          # AND THE POOL'S HOSTS THEIRS, before the pool orders one, with the read of this
+          # run's own artifacts its prelude fetches billet and the collection by: the role
+          # carries nothing of its own but the SSM agent's, and its boundary only permits
+          # the read, so without the grant every fetch is refused and the prelude ends
+          # before the join (run 42840609317, 2026-11-10).
           if [ "$LANE" = pool ]; then
+            jq --arg r "arn:aws:s3:::$BUCKET/runs/$RUN/*" \
+              '.Statement += [{Sid: "BilletMatrixRunArtifacts", Effect: "Allow", Action: ["s3:GetObject"], Resource: [$r]}]' \
+              out/pool-host.json >out/pool-host-run.json
             aws iam put-role-policy --role-name "$POOL_HOST_ROLE" \
-              --policy-name "billet-matrix-$RUN" --policy-document file://out/pool-host.json
+              --policy-name "billet-matrix-$RUN" --policy-document file://out/pool-host-run.json
           fi
           # IAM is eventually consistent: a grant can take seconds to reach EC2's checks.
           sleep 20
