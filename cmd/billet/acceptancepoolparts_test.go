@@ -13,9 +13,13 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awspolicy"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/ops/setup"
+	"github.com/junioryono/billet/internal/provider/ec2"
+	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/store/ebss3"
 )
 
 // THE LEDGER'S ORDERS ARE THE EVIDENCE THE JUDGE READS, field for field: the node a pool
@@ -224,13 +228,14 @@ func TestAPoolsTeardownIsGrantedItsCachesPurge(t *testing.T) {
 	for _, st := range policy.Statement {
 		sids = append(sids, st.Sid)
 	}
-	for _, want := range []string{"BilletMatrixDecommissionState", "BilletCacheDelete", "BilletCacheList",
-		"BilletCacheObjectsEvict"} {
+	for _, want := range []string{"BilletMatrixDecommissionState", "BilletCacheDelete", "BilletPurgeObjects",
+		"BilletPurgeList"} {
 		if !slices.Contains(sids, want) {
 			t.Errorf("the teardown's policy has %q, and no %s", sids, want)
 		}
 	}
-	for _, refused := range []string{"BilletCacheCreateVolume", "BilletCacheAttach", "BilletCacheSnapshotCreate"} {
+	for _, refused := range []string{"BilletCacheCreateVolume", "BilletCacheAttach", "BilletCacheSnapshotCreate",
+		"BilletCacheObjects", "BilletCacheList", "BilletCacheObjectsEvict"} {
 		if slices.Contains(sids, refused) {
 			t.Errorf("a teardown is granted %s", refused)
 		}
@@ -239,8 +244,23 @@ func TestAPoolsTeardownIsGrantedItsCachesPurge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), deployment) || !strings.Contains(string(body), "billet-cache-example") {
-		t.Errorf("the purge is not scoped to the deployment and the bucket: %s", body)
+	if strings.Contains(string(body), "s3:PutObject") {
+		t.Errorf("a purge is granted a write: %s", body)
+	}
+	// EVERY OBJECT GRANT IS THIS RUN'S OWN NAMESPACE, never the prefix every store in the
+	// bucket shares.
+	site, store := cfg.Server.Pool.SiteStore()
+	own := ebss3.OwnerPrefix(*store, app.CacheNamespace(deployment, site))
+	for _, st := range policy.Statement {
+		for _, r := range st.Resource {
+			if strings.Contains(r, ":s3:::") && strings.Contains(r, "/") &&
+				!strings.HasPrefix(r, "arn:aws:s3:::billet-cache-example/"+own) {
+				t.Errorf("%s reaches %s, outside this run's %s", st.Sid, r, own)
+			}
+		}
+	}
+	if !strings.Contains(string(body), deployment) {
+		t.Errorf("the purge's deletes are not scoped to the deployment's tag: %s", body)
 	}
 
 	// The control plane's own policy beside it, compacted as IAM counts it.
@@ -262,8 +282,21 @@ func TestAPoolsTeardownIsGrantedItsCachesPurge(t *testing.T) {
 		t.Errorf("the control plane's run and teardown policies are %d characters, past a role's 10,240", size)
 	}
 
-	if _, err := awspolicy.CachePurge("us-west-2", "", awspolicy.Cache{Bucket: "b", Prefix: "p"}); err == nil {
+	one := "p/owners/" + strings.Repeat("a", 64) + "/"
+	if _, err := awspolicy.CachePurge("us-west-2", deployment, awspolicy.Cache{Bucket: "b", Prefix: "p"},
+		one); err != nil {
+		t.Errorf("a purge over one owner's prefix: %v", err)
+	}
+	if _, err := awspolicy.CachePurge("us-west-2", "", awspolicy.Cache{Bucket: "b", Prefix: "p"},
+		one); err == nil {
 		t.Error("a purge for no deployment was rendered")
+	}
+	for _, wide := range []string{"p/", "p/owners/", "p/owners/*/", "q/owners/" + strings.Repeat("a", 64) + "/",
+		strings.TrimSuffix(one, "/"), "p/owners/" + strings.Repeat("a", 63) + "*/"} {
+		if _, err := awspolicy.CachePurge("us-west-2", deployment, awspolicy.Cache{Bucket: "b", Prefix: "p"},
+			wide); err == nil {
+			t.Errorf("a purge over %q was rendered", wide)
+		}
 	}
 }
 
@@ -329,6 +362,31 @@ func TestThePoolsTierIsDispatchedWhereItsPoolOrders(t *testing.T) {
 	}
 }
 
+// A HOST EC2 DOES NOT DESCRIBE AT FIRST IS ENDED WHEN IT IS, ON WHICHEVER POLL THAT IS:
+// not found is not gone, and a host that then reads running is not left running through
+// the wait.
+func TestAHostEC2FindsLateIsEndedWhenItIs(t *testing.T) {
+	t.Parallel()
+
+	hosts := newFakePoolHosts(1, ec2.HostRecord{ID: "i-5", State: "running", Order: "p5"})
+	hosts.unlisted["i-5"] = true
+	hosts.hiddenUntil = map[string]int{"i-5": 4}
+	cache := &fakePoolCache{hosts: hosts}
+	p := acceptancePool{hosts: hosts, cache: cache, gone: time.Minute, poll: time.Millisecond}
+
+	var out bytes.Buffer
+	if err := p.decommission(t.Context(), quietEnv(&out),
+		[]acceptancePoolOrder{order("p5", alloc.PoolPlaced, "i-5")}); err != nil {
+		t.Fatalf("decommission: %v\n%s", err, out.String())
+	}
+	if len(hosts.ended) != 1 || hosts.ended[0] != "i-5" || hosts.endedAt["i-5"] < 4 {
+		t.Errorf("ended %v at read %d; want i-5 once, once EC2 described it", hosts.ended, hosts.endedAt["i-5"])
+	}
+	if cache.purged != 1 {
+		t.Errorf("purged %d time(s), want once", cache.purged)
+	}
+}
+
 // A POOL'S WORKSPACE IS TORN DOWN AS A POOL'S, and one with a node as before: the
 // teardown asks the pool's hosts and orders only of a pool's run.
 func TestATeardownKnowsAPoolsRunFromItsConfig(t *testing.T) {
@@ -338,7 +396,8 @@ func TestATeardownKnowsAPoolsRunFromItsConfig(t *testing.T) {
 	if err := os.WriteFile(prelude, []byte("true\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ws, err := deriveAcceptance(t.Context(), acceptanceInputs{base: writeAcceptanceBase(t, poolBaseConfig),
+	base := writeAcceptanceBase(t, poolBaseConfig)
+	ws, err := deriveAcceptance(t.Context(), acceptanceInputs{base: base,
 		workspace: t.TempDir(), prefix: "accept-pool",
 		fleet: &acceptanceFleet{Listen: "10.77.0.10:7717", Bootstrap: "10.77.0.10:7718", Prelude: prelude}})
 	if err != nil {
@@ -347,6 +406,27 @@ func TestATeardownKnowsAPoolsRunFromItsConfig(t *testing.T) {
 	_, orders, isPool, err := acceptancePoolFor(t.Context(), ws)
 	if !isPool || err != nil || len(orders) != 0 {
 		t.Errorf("a pool's run that ordered nothing: pool %v, orders %v, %v", isPool, orders, err)
+	}
+
+	// A LOST LEDGER IS NOT A POOL THAT ORDERED NOTHING, and no read of it makes one.
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := filepath.Join(cfg.Server.StateDir, "billet.db")
+	if err := os.Remove(ledger); err != nil {
+		t.Fatalf("remove the run's ledger: %v", err)
+	}
+	if _, _, isPool, err := acceptancePoolFor(t.Context(), ws); !isPool || !errors.Is(err, state.ErrNoLedger) {
+		t.Errorf("a pool's run whose ledger is gone: pool %v, %v; want could-not-tell", isPool, err)
+	}
+	if _, err := os.Stat(ledger); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("reading the orders made a ledger in place of the lost one (%v)", err)
+	}
+	if _, err := deriveAcceptance(t.Context(), acceptanceInputs{base: base,
+		workspace: filepath.Dir(ws.ConfigPath), prefix: "accept-pool", fleet: ws.Fleet}); !errors.Is(err,
+		state.ErrNoLedger) {
+		t.Errorf("a resumed pool's run whose ledger is gone answered %v", err)
 	}
 
 	node := deriveForTest(t, writeAcceptanceBase(t, acceptanceBaseConfig), t.TempDir())

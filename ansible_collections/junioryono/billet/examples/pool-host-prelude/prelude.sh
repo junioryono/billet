@@ -41,8 +41,10 @@ trap 'echo "prelude: stopped at line $LINENO; its logs are in /var/lib/billet-po
 
 # A HOST NOTHING WATCHES STILL STOPS BILLING: a halted instance is stopped, and a stopped
 # one bills no compute. First, so a prelude that fails later is bounded too. FORCED, so
-# the halt waits on no unit's stop: the node's own may wait a day for a drain. A run again
-# leaves the deadline the first run set.
+# the halt waits on no unit's stop: the node's own may wait a day for a drain. The
+# deadline is absolute and recorded once, by the first run, and a timer installed on
+# disk checks it a minute after every boot as well as firing at it, so neither a reboot
+# nor a run again moves it.
 if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
 	case $PRELUDE_MAX_LIFETIME_MINUTES in
 	*[!0-9]* | 0*)
@@ -50,10 +52,23 @@ if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
 		exit 1
 		;;
 	esac
-	if ! systemctl is-active --quiet billet-pool-lifetime.timer; then
-		systemd-run --unit billet-pool-lifetime --on-active="${PRELUDE_MAX_LIFETIME_MINUTES}m" \
-			/usr/bin/systemctl poweroff --force >>"$work/lifetime.log" 2>&1
+	if [ ! -s /etc/billet-pool-lifetime ]; then
+		echo $(($(date +%s) + PRELUDE_MAX_LIFETIME_MINUTES * 60)) >/etc/billet-pool-lifetime.new
+		sync /etc/billet-pool-lifetime.new
+		mv /etc/billet-pool-lifetime.new /etc/billet-pool-lifetime
 	fi
+	deadline=$(cat /etc/billet-pool-lifetime)
+	printf '%s\n' '[Unit]' 'Description=Power this pool host off once its lifetime has passed' \
+		'[Service]' 'Type=oneshot' \
+		'ExecStart=/bin/sh -c '\''[ "$(date +%%s)" -lt "$(cat /etc/billet-pool-lifetime)" ] || exec /usr/bin/systemctl poweroff --force'\''' \
+		>/etc/systemd/system/billet-pool-lifetime.service
+	printf '%s\n' '[Unit]' 'Description=Check this pool host'\''s lifetime at boot and at its end' '[Timer]' \
+		'OnBootSec=1min' "OnCalendar=$(date -u -d "@$deadline" '+%Y-%m-%d %H:%M:%S') UTC" 'AccuracySec=1min' \
+		'[Install]' 'WantedBy=timers.target' >/etc/systemd/system/billet-pool-lifetime.timer
+	{
+		systemctl daemon-reload
+		systemctl enable --now billet-pool-lifetime.timer
+	} >>"$work/lifetime.log" 2>&1
 fi
 
 # The image by its name alone: a pull assigns the generation and refuses a name that

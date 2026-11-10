@@ -1049,19 +1049,24 @@ func cacheStatements(partition, suffix, region, owner string, c Cache) ([]Statem
 	return stmts, nil
 }
 
-// cachePurgeSids are the cache statements a purge exercises: it describes, lists, reads
-// and deletes, and never creates, attaches or encrypts.
-var cachePurgeSids = []string{
-	"BilletCacheDescribe", "BilletCacheDelete", "BilletCacheObjects", "BilletCacheList",
-	"BilletCacheObjectsEvict", "BilletCacheUploads",
-}
+// cachePurgeSids are the EC2 cache statements a purge exercises: it describes and
+// deletes, and never creates, attaches or encrypts.
+var cachePurgeSids = []string{"BilletCacheDescribe", "BilletCacheDelete"}
 
 // CachePurge is what a teardown needs to purge one deployment's ebs-s3 cache when it
-// does not run as that cache's node: the purge's statements of the node's own policy,
-// for owner alone. A state object's delete is not among them, as it is not in a node's.
-func CachePurge(region, owner string, c Cache) ([]Statement, error) {
-	if owner == "" {
+// does not run as that cache's node: a node's own describe and owner-tagged delete of its
+// volumes and snapshots, for owner alone, and reading, deleting and listing the objects
+// under ownerPrefix (ebss3.OwnerPrefix), that store's own keys and no other store's
+// sharing the bucket. Nothing is written.
+func CachePurge(region, owner string, c Cache, ownerPrefix string) ([]Statement, error) {
+	// ONE OWNER'S, EXACTLY: the cache's prefix, `owners/` and one owner's digest, as
+	// ebss3.OwnerPrefix lays it out, so no shorter prefix reaches every store's keys.
+	own := regexp.MustCompile(`^` + regexp.QuoteMeta(strings.TrimSuffix(c.Prefix, "/")) + `/owners/[0-9a-f]{64}/$`)
+	switch {
+	case owner == "":
 		return nil, errors.New("awspolicy: a cache purge is granted for one deployment, and none was named")
+	case !own.MatchString(ownerPrefix):
+		return nil, fmt.Errorf("awspolicy: %q is not one owner's prefix under the cache's %q", ownerPrefix, c.Prefix)
 	}
 	partition := PartitionForRegion(region)
 	stmts, err := cacheStatements(partition, dnsSuffix(partition), region, owner, c)
@@ -1069,7 +1074,7 @@ func CachePurge(region, owner string, c Cache) ([]Statement, error) {
 		return nil, err
 	}
 
-	out := make([]Statement, 0, len(cachePurgeSids))
+	out := make([]Statement, 0, len(cachePurgeSids)+3)
 	for _, st := range stmts {
 		if slices.Contains(cachePurgeSids, st.Sid) {
 			out = append(out, st)
@@ -1079,6 +1084,30 @@ func CachePurge(region, owner string, c Cache) ([]Statement, error) {
 		return nil, fmt.Errorf("awspolicy: the cache policy carries %d of the purge's %d statements",
 			len(out), len(cachePurgeSids))
 	}
+
+	bucketARN := fmt.Sprintf("arn:%s:s3:::%s", partition, c.Bucket)
+	out = append(out,
+		Statement{
+			Sid: "BilletPurgeObjects", Effect: "Allow",
+			Action: []string{ebss3.IAMS3GetObject, ebss3.IAMS3DeleteObject, ebss3.IAMS3AbortMultipart,
+				ebss3.IAMS3ListMultipartOne},
+			Resource: []string{bucketARN + "/" + ownerPrefix + "*"},
+		},
+		Statement{
+			Sid: "BilletPurgeList", Effect: "Allow",
+			Action: ebss3.S3ListIAMActions(), Resource: []string{bucketARN},
+			Condition: map[string]any{
+				"StringLike": map[string]any{"s3:prefix": []string{ownerPrefix + "*"}},
+			},
+		},
+		// THE UNFINISHED UPLOADS' LISTING IS BUCKET-WIDE, as a node's is: S3 evaluates
+		// s3:prefix for an object listing only. It names keys; their parts and their abort
+		// stay under ownerPrefix above.
+		Statement{
+			Sid: "BilletPurgeUploads", Effect: "Allow",
+			Action: ebss3.S3ListMultipartIAMActions(), Resource: []string{bucketARN},
+		},
+	)
 
 	return out, nil
 }

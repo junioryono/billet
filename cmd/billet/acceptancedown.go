@@ -95,6 +95,10 @@ func tearDownAcceptanceWithin(
 
 	var problems []error
 
+	// A POOL'S ORDERS ARE READ FIRST, before the drain's open of the ledger, which would
+	// create a lost one empty: the orders name the hosts step 3 must prove gone.
+	pool, orders, isPool, poolErr := acceptancePoolFor(ctx, ws)
+
 	// 1. SEAL AND WAIT. Every later step assumes nothing new is starting, and a
 	// seal is what makes that true — but only for ADMISSION, so the wait is what
 	// covers the work already in flight.
@@ -126,7 +130,6 @@ func tearDownAcceptanceWithin(
 	// A POOL'S RUN (#829) HAS NO NODE TO DECOMMISSION FROM: its hosts are its pool's,
 	// and what the pool did not release is ended here, then the site's cache its
 	// init_args name is purged.
-	pool, orders, isPool, poolErr := acceptancePoolFor(ctx, ws)
 	switch {
 	case poolErr != nil:
 		problems = append(problems, poolErr)

@@ -268,6 +268,13 @@ func StatePrefix(cfg config.EBSS3Config, owner string) string {
 	return cfg.Prefix + "/owners/" + hex.EncodeToString(digest[:]) + "/state/"
 }
 
+// OwnerPrefix is the one prefix under which a store for owner keeps every object it
+// writes, its state objects and its object half alike: what a purge reaches, and nothing
+// another owner's store does.
+func OwnerPrefix(cfg config.EBSS3Config, owner string) string {
+	return strings.TrimSuffix(StatePrefix(cfg, owner), "state/")
+}
+
 func (s Store) requestToken(parts ...string) string {
 	digest := sha256.Sum256([]byte(s.owner + "\x00" + strings.Join(parts, "\x00")))
 

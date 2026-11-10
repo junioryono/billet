@@ -461,10 +461,18 @@ func acceptancePoolOrders(orders []alloc.PoolOrder) []acceptancePoolOrder {
 }
 
 // readAcceptancePool reads the run's pool orders from its ledger.
+//
+// AN INSPECTION, WHICH CREATES NOTHING: the orders name the hosts a teardown must prove
+// gone, and an open that made a fresh ledger in place of a lost one would read as a pool
+// that ordered nothing. A missing ledger is state.ErrNoLedger.
 func readAcceptancePool(ctx context.Context, ws acceptanceWorkspace) ([]acceptancePoolOrder, error) {
-	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
+	cfg, err := config.Load(ws.ConfigPath)
 	if err != nil {
 		return nil, err
+	}
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerInspect)
+	if err != nil {
+		return nil, fmt.Errorf("read this run's ledger: %w", err)
 	}
 
 	defer db.Close()

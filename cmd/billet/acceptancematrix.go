@@ -601,7 +601,8 @@ func matrixTeardownPolicy(cfg *config.Config, deployment string) (awspolicy.Poli
 	// purge's half of a node's for this deployment as well.
 	if pool {
 		purge, err := awspolicy.CachePurge(store.Region, deployment,
-			awspolicy.Cache{Bucket: store.Bucket, Prefix: store.Prefix})
+			awspolicy.Cache{Bucket: store.Bucket, Prefix: store.Prefix},
+			ebss3.OwnerPrefix(*store, app.CacheNamespace(deployment, site)))
 		if err != nil {
 			return awspolicy.Policy{}, false, fmt.Errorf("the pool's cache purge: %w", err)
 		}

@@ -71,9 +71,7 @@ var (
 	_ storecontract.BlobStore    = (*Store)(nil)
 )
 
-func (s Store) ownerPrefix() string {
-	return strings.TrimSuffix(s.statePrefix(), "state/")
-}
+func (s Store) ownerPrefix() string { return OwnerPrefix(s.cfg, s.owner) }
 
 func keyDigest(key string) string {
 	digest := sha256.Sum256([]byte(key))

@@ -141,69 +141,94 @@ func judgeBurst(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixScope)
 	s.Reason = "the pool ordered, and no host it ordered ran a job the run dispatched to success"
 }
 
-// judgeShrinkIdle: the pool itself asked for an idle host's release after the newest job
-// on it ended, the release completed, and no job on the host was disrupted.
+// judgeShrinkIdle: EVERY HOST THE POOL HELD IT LET GO ITSELF. No order of the source and
+// architecture still holds a host when the evidence is read; every host that joined was
+// released by the pool's own shrink after the newest job on it ended, taken back on its
+// source's word, with no job on it disrupted; and at least one of them ran a job of this
+// run. One host's shrink does not stand for another's that never came.
 func judgeShrinkIdle(s *matrixScenario, doc acceptanceEvidenceDoc, scope matrixScope) {
 	orders := scenarioOrders(s, doc)
-	var released []acceptancePoolOrder
+	var joined, wrong []string
+	witnessed := false
 	for i := range orders {
-		if orders[i].ReleaseRequested != "" && strings.HasPrefix(orders[i].ReleaseReason, alloc.PoolShrinkReason) {
-			released = append(released, orders[i])
+		o := &orders[i]
+		shrunk := o.ReleaseRequested != "" && strings.HasPrefix(o.ReleaseReason, alloc.PoolShrinkReason)
+		switch {
+		case shrunk:
+		case poolOrderHolds(o.State):
+			wrong = append(wrong, fmt.Sprintf("%s: still %s, holding a host the pool did not let go", o.ID, o.State))
+		case o.Node != "":
+			wrong = append(wrong, fmt.Sprintf("%s: let go other than by the pool's own shrink (%s)", o.ID,
+				o.ReleaseReason))
 		}
-	}
-	if len(released) == 0 {
-		s.Reason = "no order of the pool was released by its own shrink"
-
-		return
-	}
-
-	var wrong []string
-	for i := range released {
-		o := &released[i]
+		if o.Node == "" {
+			continue
+		}
+		joined = append(joined, o.ID)
 		s.Orders = append(s.Orders, o.ID)
-		asked, err := time.Parse(time.RFC3339Nano, o.ReleaseRequested)
+		if !shrunk {
+			continue
+		}
+		if len(nodeJobs(o.Node, doc, scope)) > 0 {
+			witnessed = true
+		}
+		wrong = append(wrong, judgeShrunkOrder(o, doc, scope)...)
+	}
+	switch {
+	case len(wrong) > 0:
+		s.Verdict, s.Reason = verdictFail, strings.Join(wrong, "; ")
+	case len(joined) == 0:
+		s.Reason = "no host the pool ordered joined"
+	case !witnessed:
+		s.Verdict = verdictFail
+		s.Reason = "the pool released its hosts itself, and none had run a job of this run"
+	default:
+		s.Verdict = verdictPass
+		s.Reason = "every host the pool held was released by its own shrink after its last job ended, no job " +
+			"disrupted"
+	}
+}
+
+// judgeShrunkOrder is what is wrong with one order the pool's own shrink released: its
+// release not completed on its source's word, a job on its host disrupted, or one that
+// ended after the release was asked.
+func judgeShrunkOrder(o *acceptancePoolOrder, doc acceptanceEvidenceDoc, scope matrixScope) []string {
+	var wrong []string
+	asked, err := time.Parse(time.RFC3339Nano, o.ReleaseRequested)
+	if err != nil {
+		return append(wrong, fmt.Sprintf("%s: its release time %q does not read", o.ID, o.ReleaseRequested))
+	}
+	// THE SOURCE TOOK IT BACK, ON ITS OWN WORD: released, or gone as its source said, and
+	// never closed by a person, whose close a stalled release could otherwise end in.
+	switch {
+	case o.State == alloc.PoolReleased:
+	case o.State == alloc.PoolGone && o.Reason == alloc.PoolGoneBySource:
+	case o.State == alloc.PoolGone:
+		wrong = append(wrong, fmt.Sprintf("%s: released by the shrink and closed other than by its source (%s)",
+			o.ID, o.Reason))
+	default:
+		wrong = append(wrong, fmt.Sprintf("%s: released by the shrink and still %s", o.ID, o.State))
+	}
+	jobs := nodeJobs(o.Node, doc, scope)
+	for k := range jobs {
+		j := &jobs[k]
+		if j.Disruption != "" {
+			wrong = append(wrong, fmt.Sprintf("%s: job %s on its host was disrupted (%s)", o.ID, j.LeaseID,
+				j.Disruption))
+		}
+		finished, err := time.Parse(time.RFC3339Nano, j.FinishedAt)
 		if err != nil {
-			wrong = append(wrong, fmt.Sprintf("%s: its release time %q does not read", o.ID, o.ReleaseRequested))
+			wrong = append(wrong, fmt.Sprintf("%s: job %s's end %q does not read", o.ID, j.LeaseID, j.FinishedAt))
 
 			continue
 		}
-		// THE SOURCE TOOK IT BACK, ON ITS OWN WORD: released, or gone as its source said, and
-		// never closed by a person, whose close a stalled release could otherwise end in.
-		switch {
-		case o.State == alloc.PoolReleased:
-		case o.State == alloc.PoolGone && o.Reason == alloc.PoolGoneBySource:
-		case o.State == alloc.PoolGone:
-			wrong = append(wrong, fmt.Sprintf("%s: released by the shrink and closed other than by its source (%s)",
-				o.ID, o.Reason))
-		default:
-			wrong = append(wrong, fmt.Sprintf("%s: released by the shrink and still %s", o.ID, o.State))
-		}
-		jobs := nodeJobs(o.Node, doc, scope)
-		for k := range jobs {
-			j := &jobs[k]
-			if j.Disruption != "" {
-				wrong = append(wrong, fmt.Sprintf("%s: job %s on its host was disrupted (%s)", o.ID, j.LeaseID,
-					j.Disruption))
-			}
-			finished, err := time.Parse(time.RFC3339Nano, j.FinishedAt)
-			if err != nil {
-				wrong = append(wrong, fmt.Sprintf("%s: job %s's end %q does not read", o.ID, j.LeaseID, j.FinishedAt))
-
-				continue
-			}
-			if !finished.Before(asked) {
-				wrong = append(wrong, fmt.Sprintf("%s: job %s ended %s, not before the release was asked %s", o.ID,
-					j.LeaseID, j.FinishedAt, o.ReleaseRequested))
-			}
+		if !finished.Before(asked) {
+			wrong = append(wrong, fmt.Sprintf("%s: job %s ended %s, not before the release was asked %s", o.ID,
+				j.LeaseID, j.FinishedAt, o.ReleaseRequested))
 		}
 	}
-	if len(wrong) > 0 {
-		s.Verdict, s.Reason = verdictFail, strings.Join(wrong, "; ")
 
-		return
-	}
-	s.Verdict = verdictPass
-	s.Reason = "released by the pool's own shrink after its host's last job ended, no job disrupted"
+	return wrong
 }
 
 // matrixPoolFloors is the floor the config's pool keeps on each architecture.

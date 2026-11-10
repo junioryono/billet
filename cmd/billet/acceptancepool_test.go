@@ -131,8 +131,29 @@ func TestTheIdleShrinkIsThePoolsOwnReleaseAfterTheLastJob(t *testing.T) {
 
 	byHand := poolEvidence(poolJob())
 	byHand.Pool[0].ReleaseReason = "rotating the fleet"
-	if s := judge(byHand); s.Verdict != verdictNotRun {
-		t.Errorf("a person's release: %+v; want not run", s)
+	if s := judge(byHand); s.Verdict != verdictFail || !strings.Contains(s.Reason, "other than by the pool's own") {
+		t.Errorf("a person's release: %+v; want a fail", s)
+	}
+
+	// ONE HOST'S SHRINK DOES NOT STAND FOR ANOTHER'S THAT NEVER CAME: a second host that
+	// ran the later jobs and is still placed fails it, and so does an order whose host never
+	// joined and is still being ordered.
+	for name, o := range map[string]acceptancePoolOrder{
+		"a second host still placed": {ID: "p2", Source: config.PoolSourceAWSMetal, Arch: "x64",
+			State: alloc.PoolPlaced, Node: "pool-p2"},
+		"an order still being ordered": {ID: "p3", Source: config.PoolSourceAWSMetal, Arch: "x64",
+			State: alloc.PoolOrdering},
+	} {
+		doc := poolEvidence(poolJob())
+		doc.Pool = append(doc.Pool, o)
+		if s := judge(doc); s.Verdict != verdictFail || !strings.Contains(s.Reason, o.ID+": still "+o.State) {
+			t.Errorf("%s: %+v; want a fail naming it", name, s)
+		}
+	}
+
+	// A RELEASE THAT WITNESSED NO JOB OF THIS RUN IS NOT ONE: the host ran nothing.
+	if s := judge(poolEvidence()); s.Verdict != verdictFail || !strings.Contains(s.Reason, "none had run a job") {
+		t.Errorf("a released host that ran no job: %+v; want a fail", s)
 	}
 
 	late := poolJob()
@@ -213,6 +234,8 @@ type fakePoolHosts struct {
 	ended    []string
 	// purgedAt is the read count when the cache was purged, -1 before.
 	purgedAt int
+	// hiddenUntil is, by id, the read before which EC2 does not describe a host at all.
+	hiddenUntil map[string]int
 }
 
 func newFakePoolHosts(shutdown int, hosts ...ec2.HostRecord) *fakePoolHosts {
@@ -248,6 +271,9 @@ func (f *fakePoolHosts) PoolHosts(context.Context) ([]ec2.HostRecord, error) {
 
 func (f *fakePoolHosts) PoolHost(_ context.Context, id string) (ec2.HostRecord, error) {
 	f.reads++
+	if f.reads < f.hiddenUntil[id] {
+		return ec2.HostRecord{}, ec2.ErrHostNotFound
+	}
 	for _, h := range f.hosts {
 		if h.ID == id {
 			return f.state(h), nil

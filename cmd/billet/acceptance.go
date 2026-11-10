@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssts"
 	"github.com/junioryono/billet/internal/cli"
@@ -489,11 +490,40 @@ func deriveAcceptance(ctx context.Context, in acceptanceInputs) (acceptanceWorks
 
 	ws.DeploymentID = deployment
 
+	// A POOL'S LEDGER EXISTS BEFORE ITS RECORD DOES: its orders are what name the hosts
+	// the teardown must prove gone, and the teardown reads them without creating
+	// anything, so a ledger missing from a recorded workspace is a lost one, never a pool
+	// that ordered nothing. Created once, by the `up` that writes the record.
+	if in.fleet != nil {
+		if err := prepareAcceptancePoolLedger(ctx, ws.ConfigPath, found); err != nil {
+			return acceptanceWorkspace{}, err
+		}
+	}
+
 	if err := writeAcceptanceWorkspace(dir, ws); err != nil {
 		return acceptanceWorkspace{}, err
 	}
 
 	return ws, nil
+}
+
+// prepareAcceptancePoolLedger creates a pool's run's ledger, or for a workspace already
+// recorded, requires the one its first `up` created.
+func prepareAcceptancePoolLedger(ctx context.Context, configPath string, recorded bool) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("read the derived config: %w", err)
+	}
+	mode := app.LedgerOperator
+	if recorded {
+		mode = app.LedgerInspect
+	}
+	db, err := app.OpenLedger(ctx, cfg, mode)
+	if err != nil {
+		return fmt.Errorf("this run's ledger, which its pool's orders are read from: %w", err)
+	}
+
+	return db.Close()
 }
 
 // requireEmptyWorkspace refuses a directory that already holds something.

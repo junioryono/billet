@@ -113,24 +113,6 @@ func (p acceptancePool) decommission(ctx context.Context, env cli.Env, orders []
 		return err
 	}
 
-	for _, id := range ids {
-		h, err := p.hosts.PoolHost(ctx, id)
-		switch {
-		case errors.Is(err, ec2.ErrHostNotFound):
-			// NOT FOUND IS NOT GONE: a terminated instance stays described for about an
-			// hour, so the wait below decides.
-			continue
-		case err != nil:
-			return fmt.Errorf("describe pool host %s: %w", id, err)
-		case h.State == "terminated" || h.State == "shutting-down":
-			continue
-		}
-		if err := p.hosts.TerminatePoolHost(ctx, h.ID); err != nil {
-			return fmt.Errorf("end pool host %s (order %s): %w", h.ID, h.Order, err)
-		}
-		fmt.Fprintf(env.Stdout, "pool     ended host %s (order %s), which the pool had not released\n", h.ID, h.Order)
-	}
-
 	if err := p.awaitGone(ctx, env, ids); err != nil {
 		return err
 	}
@@ -196,15 +178,31 @@ func (p acceptancePool) orderHosts(ctx context.Context, orders []acceptancePoolO
 	return ids, nil
 }
 
-// awaitGone waits, bounded, until EC2 describes every one of ids as terminated and lists
-// no other host of the run's pool that is not.
+// awaitGone ends every host of the run's pool EC2 describes as live and waits, bounded,
+// until it describes every one of ids as terminated and lists no other host of the pool
+// that is not. A host is ended the first time EC2 describes it live, on whichever poll
+// that is: one EC2 could not find at first may be found running at the next.
 func (p acceptancePool) awaitGone(ctx context.Context, env cli.Env, ids []string) error {
 	deadline := time.Now().Add(p.gone)
 	ticker := time.NewTicker(p.poll)
 	defer ticker.Stop()
 
+	ended := map[string]bool{}
+	end := func(h ec2.HostRecord) error {
+		if ended[h.ID] || h.State == "shutting-down" {
+			return nil
+		}
+		if err := p.hosts.TerminatePoolHost(ctx, h.ID); err != nil {
+			return fmt.Errorf("end pool host %s (order %s): %w", h.ID, h.Order, err)
+		}
+		ended[h.ID] = true
+		fmt.Fprintf(env.Stdout, "pool     ended host %s (order %s), which the pool had not released\n", h.ID, h.Order)
+
+		return nil
+	}
+
 	for {
-		left, err := p.notTerminated(ctx, ids)
+		left, err := p.notTerminated(ctx, ids, end)
 		if err != nil {
 			return err
 		}
@@ -228,15 +226,28 @@ func (p acceptancePool) awaitGone(ctx context.Context, env cli.Env, ids []string
 
 // notTerminated is each of the run's pool hosts EC2 does not describe as terminated,
 // with what it said instead: every host the listing returns, and each of ids EC2
-// describes in another state or cannot find.
-func (p acceptancePool) notTerminated(ctx context.Context, ids []string) ([]string, error) {
+// describes in another state or cannot find. Each it describes as neither terminated nor
+// shutting down is handed to end, when there is one.
+func (p acceptancePool) notTerminated(ctx context.Context, ids []string, end func(ec2.HostRecord) error) (
+	[]string, error,
+) {
 	live, err := p.hosts.PoolHosts(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list this run's pool hosts: %w", err)
 	}
 	left := make([]string, 0, len(live)+len(ids))
-	for _, h := range live {
+	stillUp := func(h ec2.HostRecord) error {
 		left = append(left, h.ID+" "+h.State)
+		if end == nil {
+			return nil
+		}
+
+		return end(h)
+	}
+	for _, h := range live {
+		if err := stillUp(h); err != nil {
+			return nil, err
+		}
 	}
 	for _, id := range ids {
 		if slices.ContainsFunc(live, func(l ec2.HostRecord) bool { return l.ID == id }) {
@@ -245,11 +256,15 @@ func (p acceptancePool) notTerminated(ctx context.Context, ids []string) ([]stri
 		h, err := p.hosts.PoolHost(ctx, id)
 		switch {
 		case errors.Is(err, ec2.ErrHostNotFound):
+			// NOT FOUND IS NOT GONE: a terminated instance stays described for about an
+			// hour, and one just launched may not be described yet.
 			left = append(left, id+" not found")
 		case err != nil:
 			return nil, fmt.Errorf("describe pool host %s: %w", id, err)
 		case h.State != "terminated":
-			left = append(left, id+" "+h.State)
+			if err := stillUp(h); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -271,7 +286,7 @@ func (p acceptancePool) sweep(ctx context.Context, env cli.Env, deployment strin
 	if err != nil {
 		return err
 	}
-	left, err := p.notTerminated(ctx, ids)
+	left, err := p.notTerminated(ctx, ids, nil)
 	if err != nil {
 		return fmt.Errorf("the sweep could not read this run's pool hosts, so nothing here establishes whether "+
 			"it left one running: %w", err)
