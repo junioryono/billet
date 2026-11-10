@@ -24,6 +24,8 @@
 #                                      words (the site, its store, the cache listener)
 #   PRELUDE_STAGING_GB                 optional: the free room the image's staging
 #                                      needs, in 10^9 bytes (default 100)
+#   PRELUDE_MAX_LIFETIME_MINUTES       optional: halt the host this many minutes after
+#                                      the prelude starts, whatever else happens
 #
 # It runs under the pool's `bash -euo pipefail`, and its output reaches the console the
 # source reads, so it prints nothing a network answered and no line of the join's form:
@@ -36,6 +38,18 @@ work=/var/lib/billet-pool-prelude
 mkdir -p "$work"
 cd "$work"
 trap 'echo "prelude: stopped at line $LINENO; its logs are in /var/lib/billet-pool-prelude" >&2' ERR
+
+# A HOST NOTHING WATCHES STILL STOPS BILLING: a halted instance is stopped, and a stopped
+# one bills no compute. First, so a prelude that fails later is bounded too.
+if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
+	case $PRELUDE_MAX_LIFETIME_MINUTES in
+	*[!0-9]* | 0*)
+		echo "prelude: PRELUDE_MAX_LIFETIME_MINUTES is a whole number of minutes" >&2
+		exit 1
+		;;
+	esac
+	shutdown -h "+$PRELUDE_MAX_LIFETIME_MINUTES" >>"$work/lifetime.log" 2>&1
+fi
 
 # The image by its name alone: a pull assigns the generation and refuses a name that
 # names one, and it would refuse it on every attempt until the budget was spent.

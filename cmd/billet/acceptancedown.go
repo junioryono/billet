@@ -13,6 +13,7 @@ import (
 	"github.com/junioryono/billet/internal/store/ebss3"
 
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/config"
 )
 
 // The teardown, which is the half of `billet acceptance` that has to work when
@@ -121,16 +122,38 @@ func tearDownAcceptanceWithin(
 	// a config with no ec2 node, correctly, because there is nothing for it to
 	// remove — and an acceptance run against a docker or firecracker deployment is
 	// an ordinary thing to do.
-	if err := decommissionAcceptance(ctx, env, ws); err != nil {
-		problems = append(problems, err)
+	//
+	// A POOL'S RUN (#829) HAS NO NODE TO DECOMMISSION FROM: its hosts are its pool's,
+	// and what the pool did not release is ended here, then the site's cache its
+	// init_args name is purged.
+	pool, isPool, poolErr := acceptancePoolFor(ws)
+	switch {
+	case poolErr != nil:
+		problems = append(problems, poolErr)
+	case isPool:
+		if err := pool.decommission(ctx, env); err != nil {
+			problems = append(problems, err)
+		}
+	default:
+		if err := decommissionAcceptance(ctx, env, ws); err != nil {
+			problems = append(problems, err)
+		}
 	}
 
 	// 4. AND THE SWEEP, which is the step that turns "the commands ran" into "there
 	// is nothing left". Everything above can succeed while something survives —
 	// a destroy that raced a launch, an instance whose lease had already gone —
 	// so the teardown ends by ASKING rather than by assuming.
-	if err := sweepAcceptance(ctx, env, ws, computeProved); err != nil {
-		problems = append(problems, err)
+	switch {
+	case poolErr != nil:
+	case isPool:
+		if err := pool.sweep(ctx, env, ws.DeploymentID); err != nil {
+			problems = append(problems, err)
+		}
+	default:
+		if err := sweepAcceptance(ctx, env, ws, computeProved); err != nil {
+			problems = append(problems, err)
+		}
 	}
 
 	if len(problems) > 0 {
@@ -256,11 +279,38 @@ func cmdAcceptanceSweep(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	pool, isPool, err := acceptancePoolFor(ws)
+	if err != nil {
+		return err
+	}
+	if isPool {
+		return pool.sweep(ctx, env, ws.DeploymentID)
+	}
+
 	// A STANDALONE SWEEP HAS NO BARRIER BEHIND IT. `run` proves the fleet clear
 	// while the control plane is still up and hands that fact to the teardown;
 	// invoked on its own, this has only the provider inventory — which for a
 	// backend `decommission` does not know is nothing at all, and says so.
 	return sweepAcceptance(ctx, env, ws, false)
+}
+
+// acceptancePoolFor is the teardown of a workspace whose deployment is a pool's run, and
+// false for any other.
+func acceptancePoolFor(ws acceptanceWorkspace) (acceptancePool, bool, error) {
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return acceptancePool{}, false, fmt.Errorf("read this run's config: %w", err)
+	}
+	if !poolOnly(cfg) {
+		return acceptancePool{}, false, nil
+	}
+
+	pool, err := newAcceptancePool(cfg, ws.DeploymentID)
+	if err != nil {
+		return acceptancePool{}, true, err
+	}
+
+	return pool, true, nil
 }
 
 // sweepAcceptance is the final ASK: does anything still carry this deployment.

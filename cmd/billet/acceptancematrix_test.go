@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -526,16 +527,16 @@ func TestARunFailsOnAFailedCellOrOneThatShouldHaveRun(t *testing.T) {
 			t.Errorf("%s/%s/%s passed with no job", r.Arch, r.Cache, r.Case)
 		}
 	}
-	if err := matrixOutcome(doc, nil); err != nil {
+	if err := matrixOutcome(doc, nil, []string{"ec2"}); err != nil {
 		t.Errorf("a run covering no architecture failed on cells not run: %v", err)
 	}
-	if err := matrixOutcome(doc, []config.Arch{config.ArchX64}); err == nil ||
+	if err := matrixOutcome(doc, []config.Arch{config.ArchX64}, []string{"ec2"}); err == nil ||
 		!strings.Contains(err.Error(), "should have run did not") {
 		t.Errorf("a run covering x64 with its cells unrun answered %v", err)
 	}
 	job.GitHub = "failed"
 	doc = judgeMatrix(matrixCells(), acceptanceEvidenceDoc{Jobs: []acceptanceJob{job}}, matrixScope{tiers: matrixTestTiers()})
-	if err := matrixOutcome(doc, nil); err == nil || !strings.Contains(err.Error(), "1 cell(s) failed") {
+	if err := matrixOutcome(doc, nil, []string{"ec2"}); err == nil || !strings.Contains(err.Error(), "1 cell(s) failed") {
 		t.Errorf("a failed cell answered %v", err)
 	}
 }
@@ -596,7 +597,7 @@ func TestTheDispatcherIsGivenOneTierPerBackendAndArchitecture(t *testing.T) {
 		"accept-mixed": {providers: []config.ProviderKind{config.ProviderEC2, config.ProviderFirecracker}, arch: config.ArchX64},
 		"accept-arm-1": {providers: []config.ProviderKind{config.ProviderEC2}, arch: config.ArchARM64},
 		"accept-arm-2": {providers: []config.ProviderKind{config.ProviderEC2}, arch: config.ArchARM64},
-	})
+	}, nil)
 	if !slices.Equal(got, []string{"ec2 x64 accept-x64"}) {
 		t.Fatalf("tiers = %q, want only the x64 tier of its own", got)
 	}
@@ -615,23 +616,40 @@ func TestMatrixTiersReadEveryProviderATierNames(t *testing.T) {
 	}
 }
 
-// A POOL'S CELLS ARE DECLARED, AND SAY WHY THEY ARE NOT RUN. Firecracker hosts rented from
-// either source (ADR-030), on both architectures, for every cache and case: each is a
-// cell billet will serve, not run until the lane runs it (AWS metal, #829) or its source
-// has a store and an order (phoenixNAP), so the matrix says so rather than leaving the
-// pool out.
-func TestAPoolsCellsAreDeclaredAndNotRun(t *testing.T) {
+// A POOL'S CELLS ARE DECLARED FOR EVERY CACHE AND CASE. AWS metal's are run as EC2's are,
+// by the same workflows (#829), and phoenixNAP's say they wait on its first order (#828);
+// a pool's tier is dispatched to only where the config's pool orders from that source on
+// that architecture, as only then are its hosts the pool's.
+func TestAPoolsCellsAreDeclaredAndRunWhereTheLaneOrders(t *testing.T) {
 	t.Parallel()
-	waits := map[string]string{config.PoolSourceAWSMetal: "#829", config.PoolSourcePhoenixNAP: "#828"}
+	ec2Run := map[string]*matrixRun{}
 	per := map[string]int{}
-	for _, c := range matrixCells() {
+	cells := matrixCells()
+	for i := range cells {
+		c := &cells[i]
+		key := string(c.Arch) + "/" + c.Cache + "/" + c.Case
+		if c.Backend == config.ProviderEC2 {
+			ec2Run[key] = c.Run
+		}
+	}
+	for i := range cells {
+		c := &cells[i]
 		if c.Backend != config.ProviderFirecracker {
 			continue
 		}
 		per[c.Source+"/"+string(c.Arch)]++
-		if c.Run != nil || c.Unsupported || waits[c.Source] == "" || !strings.Contains(c.Why, waits[c.Source]) {
-			t.Errorf("%s %s %s %s: %+v; want not run, saying it waits on %s", matrixBackendName(&c), c.Arch,
-				c.Cache, c.Case, c, dashIfEmpty(waits[c.Source]))
+		key := string(c.Arch) + "/" + c.Cache + "/" + c.Case
+		switch c.Source {
+		case config.PoolSourceAWSMetal:
+			if !reflect.DeepEqual(c.Run, ec2Run[key]) {
+				t.Errorf("aws-metal %s runs %+v, want EC2's %+v", key, c.Run, ec2Run[key])
+			}
+		case config.PoolSourcePhoenixNAP:
+			if c.Run != nil || c.Unsupported || !strings.Contains(c.Why, "#828") {
+				t.Errorf("phoenixnap %s: %+v; want not run, waiting on #828", key, c)
+			}
+		default:
+			t.Errorf("a cell of source %q", c.Source)
 		}
 	}
 	want := len(matrixCaches) * len(matrixCases)
@@ -642,40 +660,48 @@ func TestAPoolsCellsAreDeclaredAndNotRun(t *testing.T) {
 			}
 		}
 	}
-	for _, line := range matrixTierLines(map[string]matrixTier{
+
+	tiers := map[string]matrixTier{
 		"pool": {arch: config.ArchX64, providers: []config.ProviderKind{config.ProviderFirecracker}},
-	}) {
-		t.Errorf("a pool tier is dispatched to while its cells are not run: %s", line)
+	}
+	if lines := matrixTierLines(tiers, nil); len(lines) != 0 {
+		t.Errorf("a Firecracker tier with no pool ordering for it was dispatched to: %q", lines)
+	}
+	pools := map[string]map[config.Arch]bool{config.PoolSourceAWSMetal: {config.ArchX64: true}}
+	if lines := matrixTierLines(tiers, pools); !slices.Equal(lines, []string{"firecracker/aws-metal x64 pool"}) {
+		t.Errorf("the pool's tier was dispatched as %q, want firecracker/aws-metal x64 pool", lines)
+	}
+	pools = map[string]map[config.Arch]bool{config.PoolSourceAWSMetal: {config.ArchARM64: true}}
+	if lines := matrixTierLines(tiers, pools); len(lines) != 0 {
+		t.Errorf("an x64 tier was dispatched for a pool ordering arm64 alone: %q", lines)
 	}
 }
 
-// NO POOL CELL IS EVER ONE THAT SHOULD HAVE RUN. Judged over a run that covered both
-// architectures and ran nothing at all, the "should have run" count is exactly the EC2
-// cells that are run, so a pool cell counted among them, which would fail every run of
-// the matrix, is caught by the number.
-func TestAPoolCellIsNeverOneThatShouldHaveRun(t *testing.T) {
+// A CELL OR SCENARIO IS OWED ONLY BY A RUN SERVING ITS BACKEND. Judged over a run that
+// covered both architectures and ran nothing, the "should have run" count is exactly the
+// served backend's run cells, and for a pool its burst and idle shrink on each, so an EC2
+// run never owes the pool's and the pool's run never owes EC2's.
+func TestAPoolCellIsOwedOnlyByAPoolsRun(t *testing.T) {
 	t.Parallel()
 	cells := matrixCells()
-	runnable := 0
+	runnable := map[string]int{}
 	for i := range cells {
 		if cells[i].Run != nil {
-			runnable++
-			if cells[i].Backend != config.ProviderEC2 {
-				t.Errorf("%s %s %s %s is run", matrixBackendName(&cells[i]), cells[i].Arch, cells[i].Cache,
-					cells[i].Case)
-			}
+			runnable[matrixBackendName(&cells[i])]++
+		}
+		if cells[i].Run != nil && cells[i].Source == config.PoolSourcePhoenixNAP {
+			t.Errorf("phoenixnap %s %s %s is run", cells[i].Arch, cells[i].Cache, cells[i].Case)
 		}
 	}
 	doc := judgeMatrix(cells, acceptanceEvidenceDoc{DeploymentID: "d1"}, matrixScope{tiers: matrixTestTiers()})
-	err := matrixOutcome(doc, matrixArchs)
-	if want := strconv.Itoa(runnable) + " cell(s) that should have run did not"; err == nil || err.Error() != want {
-		t.Errorf("a run of both architectures that ran nothing answered %v; want %q", err, want)
+	err := matrixOutcome(doc, matrixArchs, []string{"ec2"})
+	if want := strconv.Itoa(runnable["ec2"]) + " cell(s) that should have run did not"; err == nil || err.Error() != want {
+		t.Errorf("an EC2 run of both architectures that ran nothing answered %v; want %q", err, want)
 	}
-	for i := range doc.Results {
-		r := &doc.Results[i]
-		if r.Backend == config.ProviderFirecracker && r.Verdict != verdictNotRun {
-			t.Errorf("pool cell %s %s %s %s judged %s", matrixBackendName(&r.matrixCell), r.Arch, r.Cache, r.Case,
-				r.Verdict)
-		}
+	owedScenarios := 2 * len(matrixArchs)
+	err = matrixOutcome(doc, matrixArchs, []string{"firecracker/aws-metal"})
+	if want := strconv.Itoa(runnable["firecracker/aws-metal"]+owedScenarios) + " cell(s) that should have run did not"; err == nil ||
+		err.Error() != want {
+		t.Errorf("a pool run of both architectures that ran nothing answered %v; want %q", err, want)
 	}
 }

@@ -165,6 +165,12 @@ func (r Reader) Jobs(ctx context.Context) ([]*provider.Instance, error) { return
 // PoolHosts lists the deployment's pool hosts that are not terminated (Hosts.Live).
 func (r Reader) PoolHosts(ctx context.Context) ([]HostRecord, error) { return r.p.Hosts().Live(ctx) }
 
+// TerminatePoolHost ends one of the deployment's pool hosts, as Hosts.Terminate does:
+// only an instance described as this deployment's pool host.
+func (r Reader) TerminatePoolHost(ctx context.Context, id string) error {
+	return r.p.Hosts().Terminate(ctx, id)
+}
+
 // build is New, and NewReader when launches is false: the one rule a provider that
 // launches nothing is spared is the launch network's.
 func build(owner string, cfg config.EC2Config, launches bool, opts ...Option) (*Provider, error) {

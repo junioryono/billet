@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/ops/fleetops"
@@ -57,6 +59,9 @@ func cmdAcceptanceRun(ctx context.Context, env cli.Env, args []string) error {
 	noTeardown := fs.Bool("no-teardown", false,
 		"stop the services and write the evidence, but DESTROY NOTHING — this run's scale "+
 			"sets and compute are left for `billet acceptance down`, which you then own")
+	poolReleased := fs.Duration("pool-released", 0,
+		"for a pool's run: once the jobs are done, keep the control plane up this long for the pool to "+
+			"release its idle hosts itself, by drain on proof, before the seal (0 waits for nothing)")
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -94,10 +99,15 @@ func cmdAcceptanceRun(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	if *poolReleased < 0 {
+		return fmt.Errorf("--pool-released %s: a wait is not negative", *poolReleased)
+	}
+
 	return runAcceptance(ctx, env, ws, acceptanceRunOptions{
-		jobs:       *jobs,
-		wait:       *wait,
-		noTeardown: *noTeardown,
+		jobs:         *jobs,
+		wait:         *wait,
+		noTeardown:   *noTeardown,
+		poolReleased: *poolReleased,
 	})
 }
 
@@ -108,6 +118,9 @@ type acceptanceRunOptions struct {
 	// the evidence is written either way, because the evidence has to be read off
 	// a ledger nothing is still writing to.
 	noTeardown bool
+	// poolReleased is how long a pool's run keeps its control plane up after the jobs
+	// for the pool to release its idle hosts itself, zero for none.
+	poolReleased time.Duration
 }
 
 func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opts acceptanceRunOptions) error {
@@ -120,6 +133,13 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 
 	if err := refuseASealedWorkspace(ctx, env, ws); err != nil {
 		return err
+	}
+
+	// A POOL'S RUN HAS NO NODE OF ITS OWN: its only node is a pool host's, which the pool
+	// orders and the host's own boot starts.
+	cfg, err := config.Load(ws.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read this run's config: %w", err)
 	}
 
 	server, err := startAcceptanceService(ctx, env, self, "server", ws.ConfigPath, dir)
@@ -137,11 +157,25 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 	// node-start failure below used to be exactly such a return.
 	var waitErr error
 
-	node, nodeErr := startAcceptanceService(ctx, env, self, "node", ws.ConfigPath, dir)
+	var node *acceptanceService
+	var nodeErr error
+	if cfg.Node != nil {
+		node, nodeErr = startAcceptanceService(ctx, env, self, "node", ws.ConfigPath, dir)
+	}
 	if nodeErr != nil {
 		waitErr = nodeErr
 	} else {
 		waitErr = waitForAcceptanceJobs(ctx, env, ws, opts)
+	}
+
+	// THE POOL'S OWN SHRINK, BEFORE THE SEAL: a pool releases an idle host only while
+	// its control plane runs and its tiers' demand is read, and a seal is not the pool's
+	// way of letting a host go. What it did is the evidence's to judge, so a pool that
+	// held on is said here and fails nothing; the teardown takes its hosts back anyway.
+	if waitErr == nil && opts.poolReleased > 0 {
+		if err := waitForPoolReleased(ctx, env, ws, opts.poolReleased); err != nil {
+			fmt.Fprintf(env.Stderr, "acceptance: the pool did not release its hosts: %v\n", err)
+		}
 	}
 
 	// THE COMPUTE PROOF IS TAKEN WHILE THE SERVICES ARE STILL UP, and that is the
@@ -449,6 +483,60 @@ func stopAcceptanceService(env cli.Env, s *acceptanceService) {
 // result beside billet's own conclusion, and the two disagreeing is exactly the
 // finding worth having. Asking GitHub instead would answer a question about
 // GitHub.
+// acceptancePoolPoll is how often a pool's run asks whether its pool has released its
+// hosts; a release waits on two empty answers five minutes apart.
+const acceptancePoolPoll = 30 * time.Second
+
+// waitForPoolReleased waits, bounded, until no order of the run's pool still holds a
+// host: every one released, gone, refused or abandoned. An order being ordered or
+// uncertain may hold one, so it holds the wait too.
+func waitForPoolReleased(ctx context.Context, env cli.Env, ws acceptanceWorkspace, bound time.Duration) error {
+	fmt.Fprintf(env.Stdout, "\nWaiting up to %s for the pool to release its hosts itself.\n", bound)
+
+	deadline := time.Now().Add(bound)
+	ticker := time.NewTicker(acceptancePoolPoll)
+	defer ticker.Stop()
+
+	for {
+		orders, err := readAcceptancePool(ctx, ws)
+		if err != nil {
+			return err
+		}
+
+		var holding []string
+		for i := range orders {
+			if poolOrderHolds(orders[i].State) {
+				holding = append(holding, orders[i].ID+" ("+orders[i].State+")")
+			}
+		}
+		if len(holding) == 0 {
+			fmt.Fprintf(env.Stdout, "the pool holds no host (%d order(s))\n", len(orders))
+
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("after %s the pool still holds %s", bound, strings.Join(holding, ", "))
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// poolOrderHolds says whether an order in this state may still hold a host: placed or
+// sealed holds one, and an order being ordered or uncertain may.
+func poolOrderHolds(phase string) bool {
+	switch phase {
+	case alloc.PoolReleased, alloc.PoolGone, alloc.PoolRefused, alloc.PoolAbandoned:
+		return false
+	}
+
+	return true
+}
+
 func waitForAcceptanceJobs(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opts acceptanceRunOptions) error {
 	deadline := time.Now().Add(opts.wait)
 
