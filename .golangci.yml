@@ -1139,6 +1139,16 @@ linters:
           - gosec
         text: G703
 
+      # THE ONLY TAINT IS A TEST'S ENVIRONMENT. G704 reports the S3 client's Do because
+      # realattach_test.go, the opt-in live test, reads the bucket and region an operator
+      # names from its environment into the store's config, which builds the request's
+      # URL. Linted without tests the package has no such finding (2026-11-10), and gosec
+      # is already off in _test.go files, but a finding lands at the sink, in this file.
+      - path: (^|/)internal/store/ebss3/aws\.go$
+        linters:
+          - gosec
+        text: G704
+
       # `configuredKeyPath` reads the file `--config` names, which is the
       # operator's own pathname handed to the command they ran, and the same
       # read every command makes through config.Load. gosec's taint analysis

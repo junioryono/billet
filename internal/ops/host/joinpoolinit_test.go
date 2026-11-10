@@ -3,6 +3,7 @@ package host
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -66,6 +67,67 @@ func TestAPoolHostsBootGeneratesAFirecrackerNodeWithItsKernelAndCeph(t *testing.
 		t.Errorf("the node's kernel image is %+v; want init_args' /var/lib/billet/vmlinux", n.Firecracker)
 	case n.Ceph == nil || n.Ceph.User != "pool-worker" || n.Ceph.KeyringPath != "/etc/ceph/ceph.client.billet.keyring":
 		t.Errorf("the node's Ceph identity is %+v; want init_args' pool-worker and its keyring", n.Ceph)
+	}
+}
+
+// A METAL POOL HOST'S BOOT GENERATES A NODE AT ITS SITE, WITH THE SITE'S EBS-S3 STORE AND
+// THE CACHE LISTENER ITS GUESTS REACH (ADR-030): every flag server.pool.init_args may
+// name for it reaches the real init through the boot's join, so a flag init spells
+// otherwise is a host rented that joins with no cache.
+func TestAMetalPoolHostsBootGeneratesANodeAtItsEBSSite(t *testing.T) {
+	t.Parallel()
+	pool := &config.Config{
+		GitHub: &config.GitHubConfig{Org: "acme"},
+		Server: &config.ServerConfig{Pool: &config.PoolConfig{
+			JoinServer: "10.77.0.10:7717", BootstrapAddr: "10.77.0.10:7718",
+			InitArgs: []string{
+				"--kernel-image=/var/lib/billet/kernels/vmlinux", "--ceph-user=billet",
+				"--ceph-keyring=/etc/ceph/ceph.client.billet.keyring", "--site=aws-us-west-2a",
+				"--ebs-s3-region=us-west-2", "--ebs-s3-availability-zone=us-west-2a",
+				"--ebs-s3-bucket=billet-cache-example", "--ebs-s3-prefix=cache",
+				"--ebs-s3-kms-key-id=alias/billet-cache", "--cache-listen=10.240.0.1:7718",
+				"--cache-guest-endpoint=http://10.240.0.1:7718",
+			},
+		}},
+	}
+	for _, flag := range pool.Server.Pool.InitArgs {
+		name := strings.TrimPrefix(strings.SplitN(flag, "=", 2)[0], "--")
+		if !slices.Contains(config.PoolInitFlags, name) {
+			t.Fatalf("--%s is not a flag server.pool.init_args may name", name)
+		}
+	}
+	boot, err := app.PoolBoot(pool, "true\n", "SHA256:"+strings.Repeat("a", 64), "p01", "tok")
+	if err != nil {
+		t.Fatalf("PoolBoot: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(boot), "\n"), "\n")
+	req, err := parseJoin(processEnv(), singleQuotedWords(t, lines[len(lines)-1])[2:])
+	if err != nil {
+		t.Fatalf("the join refused the words the boot handed it: %v", err)
+	}
+	req.cfgPath = filepath.Join(t.TempDir(), "billet.yaml")
+	if err := joinGenerate(t.Context(), processEnv(), joinInitArgs(req, testJoinDeployment)); err != nil {
+		t.Fatalf("billet init refused what the join handed it: %v", err)
+	}
+	cfg, err := config.Load(req.cfgPath)
+	if err != nil {
+		t.Fatalf("the generated config does not load: %v", err)
+	}
+
+	n := cfg.Node
+	want := config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a", Bucket: "billet-cache-example",
+		Prefix: "cache", KMSKeyID: "alias/billet-cache"}
+	if n.Site != "aws-us-west-2a" {
+		t.Errorf("the node is at site %q, want init_args' aws-us-west-2a", n.Site)
+	}
+	if n.EBSS3 == nil || *n.EBSS3 != want {
+		t.Errorf("the node's store is %+v, want %+v", n.EBSS3, want)
+	}
+	if n.Cache == nil || n.Cache.Listen != "10.240.0.1:7718" || n.Cache.GuestEndpoint != "http://10.240.0.1:7718" {
+		t.Errorf("the node's cache listener is %+v, want init_args'", n.Cache)
+	}
+	if app.NodeSiteStore(cfg) != config.SiteStoreEBSS3 {
+		t.Errorf("the generated node would not say it uses its site's ebs-s3 store")
 	}
 }
 

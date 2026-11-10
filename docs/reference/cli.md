@@ -384,7 +384,7 @@ Remove what the record under `/run/billet-uplink/` says a `billet uplink shape` 
 | Command | Meaning |
 |---|---|
 | `billet teardown --tier <name>\|--all [--target NAME] [--runner-group] [--force] [--yes]` | delete the scale sets billet created on GitHub; `--all` walks every target with that target's credential, a declared tier's target comes from the config, and `--target` names it for a tier the config no longer declares; `--tier` is the scale set's name (a tier's `runs_on`, else its label), and matches that tier on every target that declares it |
-| `billet decommission [--yes] [--terminate-instances]` | delete the EC2 instances and EBS+S3 cache billet made outside Terraform; without `--yes` it reports. From a Firecracker node's config with `node.ebs_s3` (AWS metal) it purges the site's cache alone, since the host is its pool's, and refuses `--terminate-instances` |
+| `billet decommission [--yes] [--terminate-instances]` | delete the EC2 instances and EBS+S3 cache billet made outside Terraform; without `--yes` it reports. From a Firecracker node's config with `node.ebs_s3` (AWS metal) it purges the site's cache alone, since the host is its pool's: it refuses while any of the deployment's pool hosts is not terminated (release them with `billet pool release` first), and refuses `--terminate-instances` |
 
 ## Acceptance
 

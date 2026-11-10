@@ -137,18 +137,25 @@ func TestAFirecrackerNodeServesAnEBSSiteOnlyOnItsWord(t *testing.T) {
 		uses    config.SiteStoreKind
 		version int
 		ok      bool
+		// refusal is what the refusal must say, so each is proved by its own check.
+		refusal string
 	}{
 		{name: "says ebs-s3 at an ebs-s3 site", store: config.SiteStoreEBSS3, uses: config.SiteStoreEBSS3,
 			version: nodeapi.Version, ok: true},
-		{name: "says nothing at an ebs-s3 site", store: config.SiteStoreEBSS3, version: nodeapi.Version},
+		{name: "says nothing at an ebs-s3 site", store: config.SiteStoreEBSS3, version: nodeapi.Version,
+			refusal: "would split one site"},
 		{name: "says ebs-s3 below the version that carries it", store: config.SiteStoreEBSS3,
-			uses: config.SiteStoreEBSS3, version: nodeapi.VersionSiteStore - 1},
+			uses: config.SiteStoreEBSS3, version: nodeapi.VersionSiteStore - 1, refusal: "cannot carry that"},
+		// NOT READ AS SILENCE BELOW THE VERSION: dropped, the word would leave "the
+		// provider's own store", which a Ceph site accepts from a Firecracker node.
+		{name: "says ebs-s3 at a Ceph site below the version that carries it", store: config.SiteStoreCeph,
+			uses: config.SiteStoreEBSS3, version: nodeapi.VersionSiteStore - 1, refusal: "cannot carry that"},
 		{name: "says ebs-s3 at a Ceph site", store: config.SiteStoreCeph, uses: config.SiteStoreEBSS3,
-			version: nodeapi.Version},
+			version: nodeapi.Version, refusal: "would split one site"},
 		{name: "says ceph at a Ceph site", store: config.SiteStoreCeph, uses: config.SiteStoreCeph,
 			version: nodeapi.Version, ok: true},
 		{name: "says a store that is not one", store: config.SiteStoreEBSS3, uses: "magic-disk",
-			version: nodeapi.Version},
+			version: nodeapi.Version, refusal: "which is not a store"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -166,10 +173,25 @@ func TestAFirecrackerNodeServesAnEBSSiteOnlyOnItsWord(t *testing.T) {
 
 				return
 			}
-			if err == nil || !errors.Is(err, ErrRefused) {
-				t.Fatalf("a Firecracker node whose caches are not the site's was answered %v", err)
+			if err == nil || !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), tc.refusal) {
+				t.Fatalf("a Firecracker node whose caches are not the site's was answered %v; want a "+
+					"refusal saying %q", err, tc.refusal)
 			}
 		})
+	}
+}
+
+// A WORD ABOUT A SITE'S STORE FROM A NODE AT NO SITE is refused, not ignored: a config
+// with node.ebs_s3 names its site, so this one is not what it says it is.
+func TestAStoreWordWithNoSiteIsRefused(t *testing.T) {
+	t.Parallel()
+
+	p := testPlaneWithSites(t, site("metal", config.SiteStoreEBSS3))
+	req := registerAt("")
+	req.SiteStore = config.SiteStoreEBSS3
+	if _, err := p.Register(t.Context(), req); !errors.Is(err, ErrRefused) ||
+		!strings.Contains(err.Error(), "names no site") {
+		t.Fatalf("a store word with no site was answered %v", err)
 	}
 }
 

@@ -329,6 +329,68 @@ func TestACancelledEvictionPassEndsAfterTheSweep(t *testing.T) {
 	}
 }
 
+// attachmentRecorder is a store that attaches volumes to this instance: it records the
+// order a pass asks it things in, and whether its sweep held the stop's slot.
+type attachmentRecorder struct {
+	calls    []string
+	removed  []string
+	sweepErr error
+	sweeping chan struct{}
+	held     bool
+}
+
+func (a *attachmentRecorder) SweepAttachments(context.Context) ([]string, error) {
+	a.calls = append(a.calls, "attachments")
+	a.held = len(a.sweeping) == 1
+
+	return a.removed, a.sweepErr
+}
+
+func (a *attachmentRecorder) Evict(context.Context, time.Duration) error {
+	a.calls = append(a.calls, "evict")
+
+	return nil
+}
+
+// A METAL NODE'S UNCLAIMED ATTACHMENTS ARE SWEPT BEFORE EVICTION, under the stop's slot,
+// since eviction keeps every volume attached to an instance; what was taken off is said by
+// name and what was kept is warned about. A pass a stop cancelled sweeps nothing.
+func TestAnEvictionPassSweepsTheAttachmentsFirst(t *testing.T) {
+	t.Parallel()
+
+	sweeping := make(chan struct{}, 1)
+	store := &attachmentRecorder{removed: []string{"vol-orphan"}, sweeping: sweeping,
+		sweepErr: errors.New("ebs-s3: cache volume vol-held (/dev/nvme3n1) is not detached")}
+	logs := &logLines{}
+
+	evictPass(t.Context(), store, func(context.Context) error {
+		store.calls = append(store.calls, "mirrors")
+
+		return nil
+	}, sweeping, slog.New(logs))
+
+	if got := strings.Join(store.calls, ","); got != "attachments,evict,mirrors" {
+		t.Errorf("an eviction pass asked %s, want attachments,evict,mirrors", got)
+	}
+	if !store.held || len(sweeping) != 0 {
+		t.Errorf("the sweep held the stop's slot %v while it ran, and it is %d full after", store.held, len(sweeping))
+	}
+	if line := logs.find("INFO detached and deleted"); !strings.Contains(line, "vol-orphan") {
+		t.Errorf("the removed volume was not named: %q", line)
+	}
+	if line := logs.find("WARN kept cache volumes"); !strings.Contains(line, "vol-held") {
+		t.Errorf("the kept volume was not warned about: %q", line)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	store = &attachmentRecorder{sweeping: sweeping}
+	evictPass(ctx, store, func(context.Context) error { return nil }, sweeping, slog.New(&logLines{}))
+	if len(store.calls) != 0 {
+		t.Errorf("a cancelled pass asked %v, want nothing", store.calls)
+	}
+}
+
 // AND A STORE THAT MAPS NOTHING INTO THE KERNEL IS EVICTED AND ITS MIRRORS
 // REAPED, with no slot taken.
 func TestAnEvictionPassOfAStoreWithoutMappingsOnlyEvicts(t *testing.T) {
@@ -606,11 +668,24 @@ func TestTheSweepWaitFitsTheStopPolicy(t *testing.T) {
 	}
 }
 
-// ONLY THE NODE'S EVICTION PASS UNMAPS: `billet check` and the gauge read the
-// mappings, and a read that swept would unmap from a command an operator runs to
-// look.
+// ONLY THE NODE'S EVICTION PASS UNMAPS OR DETACHES: `billet check` and the gauge read
+// the mappings, and a read that swept would unmap, or take a volume off this instance,
+// from a command an operator runs to look.
 func TestOnlyTheEvictionPassSweepsTheKernelMappings(t *testing.T) {
 	t.Parallel()
+
+	for _, method := range []string{"SweepKernelMappings", "SweepAttachments"} {
+		callers := callersOf(t, method)
+		if len(callers) != 1 || !strings.HasSuffix(callers[0], "internal/app/nodecache.go:evictPass") {
+			t.Errorf("%s is called from %v, want only evictPass", method, callers)
+		}
+	}
+}
+
+// callersOf names each production function in the module that calls a method of this
+// name, as path:function.
+func callersOf(t *testing.T, method string) []string {
+	t.Helper()
 
 	root := filepath.Join("..", "..")
 	var callers []string
@@ -635,7 +710,7 @@ func TestOnlyTheEvictionPassSweepsTheKernelMappings(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if !strings.Contains(string(source), "SweepKernelMappings(") {
+		if !strings.Contains(string(source), method+"(") {
 			return nil
 		}
 
@@ -650,7 +725,7 @@ func TestOnlyTheEvictionPassSweepsTheKernelMappings(t *testing.T) {
 			}
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				if call, ok := n.(*ast.CallExpr); ok {
-					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "SweepKernelMappings" {
+					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == method {
 						callers = append(callers, filepath.ToSlash(path)+":"+fn.Name.Name)
 					}
 				}
@@ -665,9 +740,7 @@ func TestOnlyTheEvictionPassSweepsTheKernelMappings(t *testing.T) {
 		t.Fatalf("walk the module: %v", err)
 	}
 
-	if len(callers) != 1 || !strings.HasSuffix(callers[0], "internal/app/nodecache.go:evictPass") {
-		t.Errorf("SweepKernelMappings is called from %v, want only evictPass", callers)
-	}
+	return callers
 }
 
 // THE DRAIN REQUEST IS ANSWERED ONCE FOR THE WHOLE STOP: the node loop reads it

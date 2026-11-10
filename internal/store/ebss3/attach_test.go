@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -31,7 +32,9 @@ type fakeAttach struct {
 	// asked are the device names AttachVolume was asked for, in order.
 	asked    []string
 	detached []string
-	now      *time.Time
+	// awaited are the volumes AwaitDetached was asked about, after their detach.
+	awaited []string
+	now     *time.Time
 }
 
 func newFakeAttach(now *time.Time) *fakeAttach {
@@ -53,19 +56,39 @@ func (f *fakeAttach) AttachVolume(_ context.Context, id, instance, point string)
 	return nil
 }
 
-func (f *fakeAttach) DetachVolume(_ context.Context, id, _ string) error {
+func (f *fakeAttach) DetachVolume(ctx context.Context, id, _ string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.detached = append(f.detached, id)
 	delete(f.on, id)
 
 	return nil
 }
 
-func (f *fakeAttach) Attachment(_ context.Context, id string) (volumeAttachment, bool, error) {
+func (f *fakeAttach) Attachment(ctx context.Context, id string) (volumeAttachment, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return volumeAttachment{}, false, err
+	}
 	if f.gone[id] {
 		return volumeAttachment{}, false, nil
 	}
 
 	return f.on[id], true, nil
+}
+
+// AwaitDetached is answered from the fake's own attachments, and honours its context, so
+// a cleanup on a context that has ended fails visibly.
+func (f *fakeAttach) AwaitDetached(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.awaited = append(f.awaited, id)
+	if a, ok := f.on[id]; ok && a.Instance != "" {
+		return fmt.Errorf("volume %s is still attached to %s", id, a.Instance)
+	}
+
+	return nil
 }
 
 func (f *fakeAttach) AttachedTo(_ context.Context, instance string) (map[string]time.Time, error) {
@@ -211,8 +234,9 @@ func TestARefusedAttachReleasesTheVolume(t *testing.T) {
 	attach.attachErr = &awsAPIError{Code: "InvalidParameterValue", Status: 400,
 		message: "Value (/dev/sdf) for parameter device is invalid. /dev/sdf is not a valid EBS device name."}
 
-	if _, err := s.Create(t.Context(), "sticky/a", 1<<30); err == nil {
-		t.Fatal("a refused attach answered a volume")
+	if _, err := s.Create(t.Context(), "sticky/a", 1<<30); err == nil ||
+		!strings.Contains(err.Error(), "attach cache volume vol-1 to this instance") {
+		t.Fatalf("a refused attach answered %v", err)
 	}
 	if len(attach.asked) != 1 {
 		t.Fatalf("a refusal that is not \"in use\" was retried under %v", attach.asked)
@@ -228,19 +252,52 @@ func TestARefusedAttachReleasesTheVolume(t *testing.T) {
 func TestAVolumeThatNeverAppearsIsDetachedAndDeleted(t *testing.T) {
 	t.Parallel()
 
-	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
-	s, blocks, attach, disks := localTestStore(&now)
-	disks.hidden["vol-1"] = true
+	// THE WAIT'S OWN BOUND: no context deadline, so only deviceWait can end it.
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+		s, blocks, attach, disks := localTestStore(&now)
+		disks.hidden["vol-1"] = true
 
-	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	defer cancel()
+		_, err := s.Create(t.Context(), "sticky/a", 1<<30)
+		if err == nil || !strings.Contains(err.Error(), "no device here reported its serial within") {
+			t.Fatalf("a volume no device showed was answered %v; want the device wait's bound", err)
+		}
+		assertReleased(t, s, blocks, attach)
+	})
+}
 
-	if _, err := s.Create(ctx, "sticky/a", 1<<30); err == nil {
-		t.Fatal("a volume no device showed was answered")
+// A CALLER WHOSE CONTEXT ENDS WHILE THE DEVICE IS WAITED FOR still has the volume taken off
+// this instance, deleted and its record dropped: the cleanup runs on a context of its own,
+// and the fakes refuse an ended one.
+func TestAnAttachWhoseCallerGaveUpIsStillReleased(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+		s, blocks, attach, disks := localTestStore(&now)
+		disks.hidden["vol-1"] = true
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		_, err := s.Create(ctx, "sticky/a", 1<<30)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("an attach whose caller gave up answered %v", err)
+		}
+		assertReleased(t, s, blocks, attach)
+	})
+}
+
+// assertReleased holds that vol-1 was detached, waited off, deleted, and its record dropped.
+func assertReleased(t *testing.T, s *Store, blocks *fakeBlocks, attach *fakeAttach) {
+	t.Helper()
+
+	if !slices.Equal(attach.detached, []string{"vol-1"}) || !slices.Equal(attach.awaited, []string{"vol-1"}) ||
+		!slices.Equal(blocks.deletedVolume, []string{"vol-1"}) {
+		t.Fatalf("detached %v, awaited %v, deleted %v; want the volume detached, waited off and deleted",
+			attach.detached, attach.awaited, blocks.deletedVolume)
 	}
-	if !slices.Equal(attach.detached, []string{"vol-1"}) || !slices.Equal(blocks.deletedVolume, []string{"vol-1"}) {
-		t.Fatalf("detached %v, deleted %v; want the volume detached and then deleted", attach.detached, blocks.deletedVolume)
-	}
+	assertNoActive(t, s, "sticky/a")
 }
 
 // A HELD DEVICE IS NEVER DETACHED. EBS detaches a volume in use without refusing, so a
@@ -289,6 +346,8 @@ func TestASnapshotIsProvedHereAndDetachedFirst(t *testing.T) {
 	}
 	// What the guest said, which is not what is published.
 	volume.Filesystem = storecontract.Filesystem{Type: "ext4", UUID: "guest-uuid", Clean: true}
+	stillHere := false
+	blocks.beforeSnapshot = func(id string) { _, stillHere = attach.on[id] }
 
 	candidate, err := s.Snapshot(t.Context(), volume)
 	if err != nil {
@@ -301,11 +360,88 @@ func TestASnapshotIsProvedHereAndDetachedFirst(t *testing.T) {
 	if candidate.Filesystem.UUID != "host-uuid" {
 		t.Fatalf("the candidate carries %q, not the host's proof", candidate.Filesystem.UUID)
 	}
-	if !slices.Equal(attach.detached, []string{volume.Handle}) {
-		t.Fatalf("the volume was not detached before its snapshot: %v", attach.detached)
+	if !slices.Equal(attach.detached, []string{volume.Handle}) || stillHere {
+		t.Fatalf("the volume was not detached before its snapshot was asked for: detached %v, attached "+
+			"then %v", attach.detached, stillHere)
 	}
 	if len(blocks.snapshotTokens) != 1 || !slices.Equal(blocks.deletedVolume, []string{volume.Handle}) {
 		t.Fatalf("snapshots %v, deleted %v", blocks.snapshotTokens, blocks.deletedVolume)
+	}
+}
+
+// A PUBLICATION THAT FAILED AFTER ITS DETACH IS RETRIED BY ATTACHING AND PROVING AGAIN:
+// the volume is attached to nothing then, and the retry neither fails for want of its
+// device nor publishes on the first proof.
+func TestASnapshotRetriedAfterItsDetachProvesTheVolumeAgain(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	s, blocks, attach, disks := localTestStore(&now)
+
+	volume, err := s.Create(t.Context(), "sticky/a", 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks.snapshotErr = errors.New("ec2: SnapshotCreationPerVolumeRateExceeded")
+	if _, err := s.Snapshot(t.Context(), volume); err == nil {
+		t.Fatal("a refused snapshot was answered a candidate")
+	}
+	if _, attached := attach.on[volume.Handle]; attached {
+		t.Fatal("the volume was not detached before its snapshot was asked for")
+	}
+
+	blocks.snapshotErr = nil
+	if _, err := s.Snapshot(t.Context(), volume); err != nil {
+		t.Fatalf("the retry answered %v", err)
+	}
+	if len(disks.verified) != 2 {
+		t.Fatalf("the volume was proved %d times, want once for each attempt", len(disks.verified))
+	}
+	if len(blocks.snapshotTokens) != 1 {
+		t.Fatalf("snapshots %v, want the retry's one", blocks.snapshotTokens)
+	}
+}
+
+// A FILESYSTEM THE HOST CANNOT PROVE CLEAN IS NOT PUBLISHED, and the volume stays attached.
+func TestASnapshotOfAnUncleanFilesystemIsRefused(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	s, blocks, attach, disks := localTestStore(&now)
+
+	volume, err := s.Create(t.Context(), "sticky/a", 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disks.verify = storecontract.Filesystem{Type: "ext4", UUID: "host-uuid"}
+
+	if _, err := s.Snapshot(t.Context(), volume); err == nil || !strings.Contains(err.Error(), "proved clean") {
+		t.Fatalf("an unclean filesystem's snapshot answered %v", err)
+	}
+	if len(blocks.snapshotTokens) != 0 || len(attach.detached) != 0 {
+		t.Fatalf("an unclean filesystem was snapshotted %v or detached %v", blocks.snapshotTokens, attach.detached)
+	}
+}
+
+// A DEVICE THE HOST CANNOT LOOK FOR IS NOT DETACHED: a failed read is not an absent device.
+func TestADetachThatCannotFindTheDeviceIsRefused(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	s, blocks, attach, disks := localTestStore(&now)
+
+	volume, err := s.Create(t.Context(), "sticky/a", 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disks.findErr = errors.New("read /sys/block: permission denied")
+
+	if err := s.Discard(t.Context(), volume); err == nil || !strings.Contains(err.Error(), "before detaching it") {
+		t.Fatalf("a discard whose device could not be looked for answered %v", err)
+	}
+	if len(attach.detached) != 0 || len(blocks.deletedVolume) != 0 {
+		t.Fatalf("a volume whose device could not be looked for was detached %v or deleted %v",
+			attach.detached, blocks.deletedVolume)
 	}
 }
 
@@ -405,6 +541,8 @@ func TestTheSweepTakesOnlyOldUnclaimedVolumes(t *testing.T) {
 	}
 	attach.on["vol-young"] = volumeAttachment{Instance: testInstance, State: "attached", Attached: now.Add(-time.Minute)}
 	attach.on["vol-elsewhere"] = volumeAttachment{Instance: "i-0fffffffffffffff0", State: "attached", Attached: old}
+	// UNKNOWN AGE IS NOT OLD: a zero time is as far back as a time can be.
+	attach.on["vol-unknown-age"] = volumeAttachment{Instance: testInstance, State: "attached"}
 	disks.held["/dev/nvme-vol-held"] = true
 
 	removed, err := s.SweepAttachments(t.Context())

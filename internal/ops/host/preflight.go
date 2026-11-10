@@ -972,17 +972,20 @@ var iamEndpointOverride = ""
 // checkMetalCacheStore checks what a Firecracker node on AWS metal needs of its site's
 // ebs-s3 store: an instance of its own to attach the volumes to, in the store's zone, and
 // a bucket that answers under this deployment's prefix.
-func checkMetalCacheStore(ctx context.Context, env cli.Env, cfg *config.Config, bundle *wirecert.Bundle) error {
-	host, err := app.ThisInstance(ctx)
+//
+// instance is how it learns which instance it is on: app.ThisInstance, or a test's.
+func checkMetalCacheStore(
+	ctx context.Context, env cli.Env, cfg *config.Config, bundle *wirecert.Bundle,
+	instance func(context.Context) (ebss3.Host, error),
+) error {
+	host, err := instance(ctx)
 	if err != nil {
 		return fmt.Errorf("node.ebs_s3: this node attaches its cache volumes to its own instance, and "+
 			"could not read which instance that is: %w", err)
 	}
 
-	if host.AvailabilityZone != cfg.Node.EBSS3.AvailabilityZone {
-		return fmt.Errorf("node.ebs_s3.availability_zone is %s, but this instance (%s) is in %s; a "+
-			"volume attaches only in its own zone", cfg.Node.EBSS3.AvailabilityZone, host.InstanceID,
-			host.AvailabilityZone)
+	if err := ebss3.CheckHost(*cfg.Node.EBSS3, host); err != nil {
+		return err
 	}
 
 	fmt.Fprintf(env.Stdout, "cache    ebs-s3 volumes attach to this instance, %s in %s\n",

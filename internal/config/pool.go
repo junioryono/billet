@@ -131,6 +131,15 @@ func readPoolInitArgs(args []string) (map[string]string, []error) {
 	if (values["cache-listen"] == "") != (values["cache-guest-endpoint"] == "") {
 		errs = append(errs, errors.New("server.pool.init_args gives --cache-listen and --cache-guest-endpoint "+
 			"together or not at all"))
+	} else if values["cache-listen"] != "" {
+		// BY THE NODE'S OWN RULE, on the Firecracker node init will write: a listener the
+		// host's config would refuse is a host rented that cannot join.
+		cache := &NodeCacheConfig{Listen: values["cache-listen"], GuestEndpoint: values["cache-guest-endpoint"]}
+		cache.normalize()
+		host := &Config{Node: &NodeConfig{Provider: ProviderFirecracker, Cache: cache}}
+		for _, err := range host.validateCacheNode() {
+			errs = append(errs, fmt.Errorf("server.pool.init_args: %w", err))
+		}
 	}
 	if store := poolStore(values); store != nil {
 		if values["site"] == "" {

@@ -440,8 +440,7 @@ func (s Store) Create(
 	device := volume
 	if s.local() {
 		if device, err = s.attachLocal(ctx, volume); err != nil {
-			return storecontract.Volume{}, errors.Join(err, s.releaseLocal(ctx, volume),
-				s.dropActive(ctx, key, leaseID))
+			return storecontract.Volume{}, errors.Join(err, s.releaseLocal(ctx, key, leaseID, volume))
 		}
 	}
 
@@ -602,6 +601,15 @@ func (s Store) candidateFilesystem(
 	}
 
 	device, err := s.MappedDevice(ctx, volume)
+	if errors.Is(err, storecontract.ErrDeviceUnknown) {
+		// A PUBLICATION THAT FAILED AFTER ITS DETACH, retried: the volume is attached to
+		// nothing, so it is attached here again and proved again, never published on the
+		// earlier proof, which said nothing of what happened to it since.
+		attachment, found, readErr := s.attach.Attachment(ctx, volume.Handle)
+		if readErr == nil && found && attachment.Instance == "" {
+			device, err = s.attachLocal(ctx, volume.Handle)
+		}
+	}
 	if err != nil {
 		return storecontract.Filesystem{}, fmt.Errorf("ebs-s3: find the device of cache %q before "+
 			"publication: %w", volume.Key, err)
@@ -744,8 +752,7 @@ func (s Store) Clone(
 	device := volume
 	if s.local() {
 		if device, err = s.attachLocal(ctx, volume); err != nil {
-			return storecontract.Volume{}, errors.Join(err, s.releaseLocal(ctx, volume),
-				s.dropActive(ctx, key, leaseID))
+			return storecontract.Volume{}, errors.Join(err, s.releaseLocal(ctx, key, leaseID, volume))
 		}
 	}
 

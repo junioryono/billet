@@ -3,13 +3,16 @@ package fleetops
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -110,10 +113,19 @@ node:
 // own to list: its host is the pool's. Without --yes it reports and touches nothing.
 func TestDecommissionPurgesAMetalSitesCacheAlone(t *testing.T) {
 	configPath := metalDecommissionConfig(t)
+	asked := 0
+	none := func(_ context.Context, owner, region string, _ awscreds.Source) ([]ec2.HostRecord, error) {
+		asked++
+		if owner == "" || region != "us-west-2" {
+			return nil, fmt.Errorf("the pool hosts were listed for owner %q in %q", owner, region)
+		}
+
+		return []ec2.HostRecord{}, nil
+	}
 
 	var err error
 	out := capture(t, func() {
-		err = Decommission(t.Context(), processEnv(), []string{"--config", configPath})
+		err = decommission(t.Context(), processEnv(), []string{"--config", configPath}, none)
 	})
 	if err != nil {
 		t.Fatalf("decommission of a metal node's config: %v", err)
@@ -121,13 +133,47 @@ func TestDecommissionPurgesAMetalSitesCacheAlone(t *testing.T) {
 	if !strings.Contains(out, "would purge the ebs-s3 cache") {
 		t.Errorf("the metal node's cache was not reported:\n%s", out)
 	}
+	if asked != 1 {
+		t.Errorf("the pool hosts were asked about %d times before the purge, want once", asked)
+	}
 	if strings.Contains(out, "instance") {
 		t.Errorf("a metal node's decommission spoke of instances:\n%s", out)
 	}
 
-	err = Decommission(t.Context(), processEnv(), []string{"--config", configPath, "--terminate-instances", "--yes"})
+	// WITHOUT --yes, so a mutant that dropped the refusal reports a dry run rather than
+	// purging a real bucket under this machine's own credentials.
+	err = decommission(t.Context(), processEnv(), []string{"--config", configPath, "--terminate-instances"}, none)
 	if err == nil || !strings.Contains(err.Error(), "--terminate-instances") {
 		t.Fatalf("--terminate-instances on a metal node was answered %v", err)
+	}
+}
+
+// A METAL SITE'S CACHE IS NOT PURGED WHILE ANY OF ITS POOL HOSTS IS LEFT: a job there may
+// be reading objects no clone lease names. A list that could not be read refuses too.
+func TestDecommissionRefusesAMetalSiteWithAPoolHostLeft(t *testing.T) {
+	configPath := metalDecommissionConfig(t)
+
+	for name, tc := range map[string]struct {
+		hosts poolHostLister
+		want  string
+	}{
+		"a host left": {func(context.Context, string, string, awscreds.Source) ([]ec2.HostRecord, error) {
+			return []ec2.HostRecord{{ID: "i-0123456789abcdef0", State: "stopped", Order: "p1"}}, nil
+		}, "1 pool host(s) of this deployment are not terminated"},
+		"a list that failed": {func(context.Context, string, string, awscreds.Source) ([]ec2.HostRecord, error) {
+			return nil, errors.New("UnauthorizedOperation")
+		}, "must all be gone before its cache is purged"},
+	} {
+		var err error
+		out := capture(t, func() {
+			err = decommission(t.Context(), processEnv(), []string{"--config", configPath, "--yes"}, tc.hosts)
+		})
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: decommission answered %v; want a refusal saying %q", name, err, tc.want)
+		}
+		if strings.Contains(out, "purge") {
+			t.Errorf("%s: the cache was reached with a pool host unaccounted for:\n%s", name, out)
+		}
 	}
 }
 

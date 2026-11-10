@@ -615,6 +615,15 @@ func (in Inputs) Build() (Policy, error) {
 				"only for a cache; this policy has none")
 		}
 
+		// THE VOLUME HALF ONLY, from the cache's attach statement. On "*" it would also
+		// allow any instance carrying billet's owner tag, an ec2 node's job among them, and
+		// a narrower Allow beside it constrains nothing: the instance is this statement's.
+		for i := range p.Statement {
+			if p.Statement[i].Sid == "BilletCacheAttach" {
+				p.Statement[i].Resource = []string{"arn:" + partition + ":ec2:*:*:volume/*"}
+			}
+		}
+
 		// THE INSTANCE HALF. AttachVolume and DetachVolume authorize the volume and the
 		// instance each, and the cache's attach statement scopes the volume by billet's
 		// owner tag, which a pool host does not carry: it is launched with the pool's.
@@ -632,8 +641,7 @@ func (in Inputs) Build() (Policy, error) {
 		// creates the store makes, only on the volumes and snapshots they make, and only
 		// with this deployment's owner tag.
 		if in.NoCompute {
-			tags := createTagCondition(in.Owner, false)
-			tags["StringEquals"].(map[string]any)["ec2:CreateAction"] = []string{"CreateVolume", "CreateSnapshot"}
+			tags := createTagConditionFor(in.Owner, false, []string{"CreateVolume", "CreateSnapshot"})
 			p.Statement = append(p.Statement, Statement{
 				Sid: "BilletCacheTag", Effect: "Allow",
 				Action: ec2.RuntimeTagIAMActions(),
@@ -1908,6 +1916,12 @@ func createTagCondition(owner string, builder bool) map[string]any {
 		actions = append(actions, "CreateImage")
 	}
 
+	return createTagConditionFor(owner, builder, actions)
+}
+
+// createTagConditionFor is createTagCondition for the create actions named: a role that
+// makes only some of the resources a runtime role does is allowed to tag only those.
+func createTagConditionFor(owner string, builder bool, actions []string) map[string]any {
 	stringEquals := map[string]any{"ec2:CreateAction": actions}
 	cond := map[string]any{"StringEquals": stringEquals}
 	if owner == "" {

@@ -1014,6 +1014,25 @@ func (p *Plane) checkRegistration(req nodeapi.RegisterRequest) (int, nodeapi.Ran
 	// PERMANENT, like the version and deployment checks above it. The same node
 	// with the same config will be refused forever, so a node that treated this as
 	// an outage would retry until someone read a log.
+	// THE NODE'S WORD ABOUT ITS STORE IS CHECKED WHEREVER IT APPEARS: a word the wire it
+	// negotiated cannot carry, one that names no store, or one with no site to be about is
+	// refused, never dropped. Dropped, it would read as "the provider's own store", which a
+	// Ceph site accepts from a Firecracker node that said it uses ebs-s3.
+	if req.SiteStore != "" {
+		switch {
+		case negotiated < nodeapi.VersionSiteStore:
+			return 0, nodeWire, fmt.Errorf("%w: node %q says its caches use %q on wire version %d, which "+
+				"cannot carry that (it is %d's)", ErrRefused, req.Node, req.SiteStore, negotiated,
+				nodeapi.VersionSiteStore)
+		case !req.SiteStore.Valid():
+			return 0, nodeWire, fmt.Errorf("%w: node %q says its caches use %q, which is not a store",
+				ErrRefused, req.Node, req.SiteStore)
+		case req.Site == "":
+			return 0, nodeWire, fmt.Errorf("%w: node %q says its caches use its site's %s store, and "+
+				"names no site", ErrRefused, req.Node, req.SiteStore)
+		}
+	}
+
 	if req.Site != "" {
 		store, declared := p.sites[req.Site]
 		if !declared {
@@ -1028,16 +1047,7 @@ func (p *Plane) checkRegistration(req nodeapi.RegisterRequest) (int, nodeapi.Ran
 				"%w: node %q is at site %q, which this control plane does not declare (have %s)",
 				ErrRefused, req.Node, req.Site, strings.Join(sortedSites(p.sites), ", "))
 		}
-		// THE NODE'S WORD ABOUT ITS STORE ONLY ON A WIRE THAT CARRIES IT: below
-		// VersionSiteStore it is dropped, and a pairing that needs it is refused below.
 		uses := req.SiteStore
-		if negotiated < nodeapi.VersionSiteStore {
-			uses = ""
-		}
-		if uses != "" && !uses.Valid() {
-			return 0, nodeWire, fmt.Errorf("%w: node %q says its caches use %q, which is not a store",
-				ErrRefused, req.Node, uses)
-		}
 		if !siteAcceptsProvider(store, req.Provider, uses) {
 			return 0, nodeWire, fmt.Errorf(
 				"%w: node %q reports provider %s at site %q, whose authoritative store is %s, and "+

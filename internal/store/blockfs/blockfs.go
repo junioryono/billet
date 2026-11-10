@@ -181,19 +181,22 @@ var ErrHeld = errors.New("blockfs: the device is still held")
 // could-not-tell, and both refuse: a caller about to take a device away from the host
 // does it only on this proof.
 //
-// THREE WAYS A DEVICE IS HELD, and an exclusive open answers only two of them. A mount,
+// FOUR WAYS A DEVICE IS HELD, and an exclusive open answers only two of them. A mount,
 // in any mount namespace, and a device mapper or md array stacked on it each claim the
 // device, so an O_EXCL open of it fails with EBUSY. A process that opened it without
 // O_EXCL — a VMM serving it to a guest — claims nothing, so every process's open files
-// are read for a file whose device number is this one. EBS DETACHES A MOUNTED VOLUME
+// are read for a file whose device number is this one. And a loop device backed by it
+// keeps the kernel's own reference after the process that set it up has closed its
+// descriptor, claiming nothing either, so every configured loop device's backing file is
+// read too. EBS DETACHES A MOUNTED VOLUME
 // WITHOUT REFUSING: measured on 2026-11-09 (us-west-2, t3.small), a detach of an ext4
 // volume mounted on the host completed in 4.4 s, and the kernel aborted its journal on
 // the I/O errors that followed. Nothing on AWS's side stops it, so this is what does.
 func Unheld(device string) error {
-	return unheld(device, "/proc")
+	return unheld(device, "/proc", "/sys/block")
 }
 
-func unheld(device, procRoot string) error {
+func unheld(device, procRoot, sysBlock string) error {
 	var st unix.Stat_t
 	if err := unix.Stat(device, &st); err != nil {
 		return fmt.Errorf("blockfs: stat %s: %w", device, err)
@@ -227,7 +230,59 @@ func unheld(device, procRoot string) error {
 		return fmt.Errorf("%w: process %s has %s open", ErrHeld, holder, device)
 	}
 
+	loop, err := loopBackedBy(sysBlock, rdev)
+	if err != nil {
+		return err
+	}
+
+	if loop != "" {
+		return fmt.Errorf("%w: %s is backed by %s", ErrHeld, loop, device)
+	}
+
 	return nil
+}
+
+// loopBackedBy names a configured loop device whose backing file is the block device
+// with device number rdev, or "" when none is. A loop device that is not configured has
+// no backing_file; any other failure to read one is could-not-tell.
+func loopBackedBy(sysBlock string, rdev uint64) (string, error) {
+	entries, err := os.ReadDir(sysBlock)
+	if err != nil {
+		return "", fmt.Errorf("blockfs: list block devices: %w", err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "loop") {
+			continue
+		}
+
+		body, err := os.ReadFile(filepath.Join(sysBlock, name, "loop", "backing_file"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+
+			return "", fmt.Errorf("blockfs: read %s's backing file: %w", name, err)
+		}
+
+		var st unix.Stat_t
+		if err := unix.Stat(strings.TrimSpace(string(body)), &st); err != nil {
+			// A BACKING FILE THAT IS GONE ("… (deleted)") or a path no longer there is
+			// not this device's node, which this host still has.
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+
+			return "", fmt.Errorf("blockfs: stat %s's backing file: %w", name, err)
+		}
+
+		if st.Mode&unix.S_IFMT == unix.S_IFBLK && rdevOf(&st) == rdev {
+			return name, nil
+		}
+	}
+
+	return "", nil
 }
 
 // openedBy names a process that has a block device with device number rdev open,

@@ -195,6 +195,24 @@ func TestADetachIsNeverForcedAndTakesAnAlreadyDetachedVolume(t *testing.T) {
 	if err := api.DetachVolume(t.Context(), "vol-9", testInstance); err != nil {
 		t.Fatalf("a detach of a volume that is gone answered %v", err)
 	}
+
+	// GONE BETWEEN THE OWNERSHIP READ AND THE DETACH, by EC2's answer to the detach itself.
+	f.refuse["DetachVolume"] = [2]string{"InvalidVolume.NotFound", "The volume 'vol-1' does not exist."}
+	if err := api.DetachVolume(t.Context(), "vol-1", testInstance); err != nil {
+		t.Fatalf("a detach EC2 answered not-found answered %v", err)
+	}
+	delete(f.refuse, "DetachVolume")
+
+	// A VOLUME THIS STORE DOES NOT OWN IS NEVER DETACHED, wherever it is attached.
+	f.owned["vol-2"] = false
+	f.attachedTo["vol-2"] = testInstance
+	before := len(f.sent("DetachVolume"))
+	if err := api.DetachVolume(t.Context(), "vol-2", testInstance); !errors.Is(err, errNotOwned) {
+		t.Fatalf("a detach of another store's volume answered %v", err)
+	}
+	if got := len(f.sent("DetachVolume")); got != before {
+		t.Fatalf("DetachVolume was sent for another store's volume")
+	}
 }
 
 // THE ATTACHMENTS LISTED ARE THIS STORE'S, on this instance, with when each began.
@@ -215,6 +233,12 @@ func TestAttachedToListsOnlyThisStoresVolumesHere(t *testing.T) {
 	}
 	if len(attached) != 1 || attached["vol-1"].IsZero() {
 		t.Fatalf("AttachedTo answered %v, want vol-1 alone with its time", attached)
+	}
+	// THE INSTANCE IS ASKED OF EC2, not only filtered here.
+	listed := f.sent("DescribeVolumes")
+	if len(listed) == 0 || listed[0].Get("Filter.1.Name") != "attachment.instance-id" ||
+		listed[0].Get("Filter.1.Value.1") != testInstance {
+		t.Fatalf("AttachedTo asked %v, want this instance's attachments", listed)
 	}
 
 	attachment, found, err := api.Attachment(t.Context(), "vol-1")

@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -81,15 +82,36 @@ func TestInitIAMPrintsAMetalNodesCacheRole(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stmt := range policy.Statement {
-		if stmt.Sid != "BilletCacheSelfAttach" {
-			continue
-		}
-		if !slices.Equal(stmt.Action, []string{"ec2:AttachVolume", "ec2:DetachVolume"}) ||
-			!slices.Equal(stmt.Resource, []string{"arn:aws:ec2:*:*:instance/*"}) {
-			t.Fatalf("the self-attach grant is %+v", stmt)
-		}
-		if owner := stmt.Condition["StringEquals"]["aws:ResourceTag/sh.billet.pool-owner"]; owner != testDeployID {
-			t.Fatalf("the self-attach grant reaches instances whose pool owner is %v, not this deployment's", owner)
+		switch stmt.Sid {
+		case "BilletCacheSelfAttach":
+			if !slices.Equal(stmt.Action, []string{"ec2:AttachVolume", "ec2:DetachVolume"}) ||
+				!slices.Equal(stmt.Resource, []string{"arn:aws:ec2:*:*:instance/*"}) {
+				t.Fatalf("the self-attach grant is %+v", stmt)
+			}
+			if owner := stmt.Condition["StringEquals"]["aws:ResourceTag/sh.billet.pool-owner"]; owner != testDeployID {
+				t.Fatalf("the self-attach grant reaches instances whose pool owner is %v, not this deployment's", owner)
+			}
+		case "BilletCacheAttach":
+			// THE VOLUME ALONE: on "*" this grant would let the node attach to any instance
+			// carrying billet's owner tag, an ec2 node's job among them, whatever the
+			// self-attach grant's pool-owner condition says.
+			if !slices.Equal(stmt.Resource, []string{"arn:aws:ec2:*:*:volume/*"}) {
+				t.Fatalf("the cache's attach grant reaches %v, want volumes alone", stmt.Resource)
+			}
+		case "BilletCacheTag":
+			// THE TWO CREATES THE STORE MAKES, AND NO LAUNCH: a node that launches nothing
+			// may not tag a launch either.
+			if !slices.Equal(stmt.Action, []string{"ec2:CreateTags"}) ||
+				!slices.Equal(stmt.Resource, []string{"arn:aws:ec2:*:*:volume/*", "arn:aws:ec2:*::snapshot/*"}) {
+				t.Fatalf("the tag grant is %+v", stmt)
+			}
+			creates, err := json.Marshal(stmt.Condition["StringEquals"]["ec2:CreateAction"])
+			if err != nil || string(creates) != `["CreateVolume","CreateSnapshot"]` {
+				t.Fatalf("the tag grant is for creates %s, want the store's two alone", creates)
+			}
+			if owner := stmt.Condition["StringEquals"]["aws:RequestTag/sh.billet.owner"]; owner != testDeployID {
+				t.Fatalf("the tag grant tags for owner %v, not this deployment", owner)
+			}
 		}
 	}
 }
@@ -98,15 +120,42 @@ func TestInitIAMPrintsAMetalNodesCacheRole(t *testing.T) {
 // cache store is refused as before.
 func TestInitIAMRefusesWhatAMetalNodeDoesNotDo(t *testing.T) {
 	path := metalNodeConfig(t, "")
-	for name, args := range map[string][]string{
-		"a builder": {"--config", path, "--deployment", testDeployID, "--builder"},
-		"a role":    {"--config", path, "--deployment", testDeployID, "--role-arn", "arn:aws:iam::123456789012:role/x"},
-		"no owner":  {"--config", path},
+	for name, tc := range map[string]struct {
+		args []string
+		want string
+	}{
+		"a builder": {[]string{"--config", path, "--deployment", testDeployID, "--builder"},
+			"holds its cache store alone"},
+		"a role": {[]string{"--config", path, "--deployment", testDeployID, "--role-arn",
+			"arn:aws:iam::123456789012:role/x"}, "holds its cache store alone"},
+		"an account": {[]string{"--config", path, "--deployment", testDeployID, "--account", "123456789012"},
+			"holds its cache store alone"},
+		"no owner": {[]string{"--config", path}, "could not determine this deployment's identity"},
+		"a key that is not an ARN": {[]string{"--config", metalNodeConfig(t, "    kms_key_id: alias/cache\n"),
+			"--deployment", testDeployID}, "not a key ARN"},
 	} {
 		var err error
-		capture(t, func() { err = Init(t.Context(), processEnv(), append([]string{"iam"}, args...)) })
-		if err == nil {
-			t.Errorf("init iam for a metal node with %s printed a policy", name)
+		capture(t, func() { err = Init(t.Context(), processEnv(), append([]string{"iam"}, tc.args...)) })
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("init iam for a metal node with %s answered %v; want a refusal saying %q", name, err, tc.want)
 		}
+	}
+
+	// A HOST PROVIDER WITH NO CACHE STORE IS REFUSED AS BEFORE: it calls no AWS API.
+	plain := filepath.Join(t.TempDir(), "billet.yaml")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut := bytes.Index(body, []byte("  ebs_s3:"))
+	rest := bytes.Index(body, []byte("  firecracker:"))
+	if err := os.WriteFile(plain, append(body[:cut:cut], body[rest:]...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	capture(t, func() {
+		err = Init(t.Context(), processEnv(), []string{"iam", "--config", plain, "--deployment", testDeployID})
+	})
+	if err == nil || !strings.Contains(err.Error(), "describes a REMOTE node's role") {
+		t.Errorf("init iam for a Firecracker node with no store answered %v", err)
 	}
 }

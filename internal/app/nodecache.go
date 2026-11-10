@@ -82,14 +82,24 @@ const (
 // guardNodeStore puts the store a node's provider uses behind a breaker. Only a store
 // that stands between a job and its start has one to guard.
 func guardNodeStore(cfg *config.Config, service *node.CacheService) {
+	if name, deadline := nodeStoreGuard(cfg); name != "" {
+		service.GuardStore(name, deadline)
+	}
+}
+
+// nodeStoreGuard is the store a node's breaker names and how long a job waits for it,
+// or no name for a node whose jobs wait on no store.
+func nodeStoreGuard(cfg *config.Config) (string, time.Duration) {
 	switch {
 	case cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.EBSS3 != nil:
-		service.GuardStore("ebs-s3", ebsS3StoreDeadline)
+		return string(config.SiteStoreEBSS3), ebsS3StoreDeadline
 	case cfg.Node.Provider == config.ProviderFirecracker:
-		service.GuardStore("ceph", cephStoreDeadline)
+		return string(config.SiteStoreCeph), cephStoreDeadline
 	case cfg.Node.Provider == config.ProviderEC2:
-		service.GuardStore("ebs-s3", ebsS3StoreDeadline)
+		return string(config.SiteStoreEBSS3), ebsS3StoreDeadline
 	}
+
+	return "", 0
 }
 
 // NodeSiteStore is the store a node's registration names, when its caches use one its
@@ -140,14 +150,19 @@ func NewNodeCacheService(
 // nodeCacheStore is the site store a node.cache block's provider reads and
 // writes: the value the node's cache service is handed, so what it offers
 // beyond the contract (the generation check among it) is proved on it.
-func nodeCacheStore(ctx context.Context, cfg *config.Config, deployment string) (storecontract.Store, error) {
+//
+// instance is how a node on AWS metal learns its own instance: ThisInstance, or a test's.
+func nodeCacheStore(
+	ctx context.Context, cfg *config.Config, deployment string,
+	instance func(context.Context) (ebss3.Host, error),
+) (storecontract.Store, error) {
 	switch cfg.Node.Provider {
 	case config.ProviderFirecracker:
 		// ON AWS METAL, THE SITE'S STORE IS EBS AND S3 (ADR-030): the guests' root disks
 		// stay on the host's own Ceph, and the caches go where a shrinking pool cannot
 		// take them, on volumes this node attaches to its own instance.
 		if cfg.Node.EBSS3 != nil {
-			host, err := ThisInstance(ctx)
+			host, err := instance(ctx)
 			if err != nil {
 				return nil, fmt.Errorf("billet: a Firecracker node.ebs_s3 attaches its cache volumes to "+
 					"its own instance, which it could not identify: %w", err)
@@ -200,7 +215,7 @@ func startNodeCache(
 		return nil, nil, nil, fmt.Errorf("billet: provider %s cannot attach node.cache volumes",
 			cfg.Node.Provider)
 	}
-	storage, err := nodeCacheStore(ctx, cfg, deployment)
+	storage, err := nodeCacheStore(ctx, cfg, deployment, ThisInstance)
 	if err != nil {
 		return nil, nil, nil, err
 	}

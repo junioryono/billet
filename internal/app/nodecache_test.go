@@ -1,12 +1,15 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"go/types"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +17,39 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 	storecontract "github.com/junioryono/billet/internal/store"
+	"github.com/junioryono/billet/internal/store/ebss3"
 )
+
+// ONLY A FIRECRACKER NODE WITH NODE.EBS_S3 NAMES ITS SITE'S STORE AT REGISTRATION. Every
+// other node must send nothing, because a plane older than wire version 48 refuses a
+// registration carrying the word, and an EC2 or plain Firecracker node naming it would
+// be refused by such a plane at its next reconnect.
+func TestOnlyAMetalFirecrackerNodeNamesItsSiteStore(t *testing.T) {
+	t.Parallel()
+
+	store := &config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a", Bucket: "b"}
+	for _, tc := range []struct {
+		provider config.ProviderKind
+		ebs      *config.EBSS3Config
+		want     config.SiteStoreKind
+	}{
+		{provider: config.ProviderFirecracker, ebs: store, want: config.SiteStoreEBSS3},
+		{provider: config.ProviderFirecracker},
+		{provider: config.ProviderEC2, ebs: store},
+		{provider: config.ProviderEC2},
+		{provider: config.ProviderDocker},
+		{provider: config.ProviderTart},
+		{provider: config.ProviderCodeBuild},
+	} {
+		cfg := &config.Config{Node: &config.NodeConfig{Provider: tc.provider, EBSS3: tc.ebs}}
+		if got := NodeSiteStore(cfg); got != tc.want {
+			t.Errorf("%s with ebs_s3 %v names %q, want %q", tc.provider, tc.ebs != nil, got, tc.want)
+		}
+	}
+	if got := NodeSiteStore(&config.Config{}); got != "" {
+		t.Errorf("a config with no node names %q", got)
+	}
+}
 
 func TestCacheNamespacesIncludeTheSite(t *testing.T) {
 	t.Parallel()
@@ -66,6 +101,88 @@ func TestEvictionReadsTheNodesCacheSessionsEachTime(t *testing.T) {
 	}
 }
 
+// noInstance is an instance lookup a node whose store does not attach to itself must
+// never make.
+func noInstance(t *testing.T) func(context.Context) (ebss3.Host, error) {
+	t.Helper()
+
+	return func(context.Context) (ebss3.Host, error) {
+		t.Error("a node that attaches nothing to its own instance asked which instance it is")
+
+		return ebss3.Host{}, errors.New("not an instance")
+	}
+}
+
+// A FIRECRACKER NODE WITH NODE.EBS_S3 IS HANDED THE STORE THAT ATTACHES TO ITS OWN
+// INSTANCE, the one the eviction pass sweeps attachments of and maps nothing into the
+// kernel, behind the ebs-s3 breaker; and a node that cannot say which instance it is, or
+// is in another zone, has no store at all.
+func TestAMetalFirecrackerNodesCacheStoreAttachesToItsOwnInstance(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{Node: &config.NodeConfig{
+		Provider: config.ProviderFirecracker, Site: "aws-us-west-2a", StateDir: t.TempDir(),
+		Ceph: &config.CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache"},
+		EBSS3: &config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a",
+			Bucket: "billet-cache-example", Prefix: "billet-cache"},
+	}}
+	here := func(context.Context) (ebss3.Host, error) {
+		return ebss3.Host{InstanceID: "i-0123456789abcdef0", AvailabilityZone: "us-west-2a"}, nil
+	}
+
+	storage, err := nodeCacheStore(t.Context(), cfg, "test-deployment", here)
+	if err != nil {
+		t.Fatalf("nodeCacheStore: %v", err)
+	}
+	if _, ok := storage.(attachmentSweeper); !ok {
+		t.Fatalf("the metal node's cache store, a %T, sweeps no attachments", storage)
+	}
+	if _, ok := storage.(kernelMappingSweeper); ok {
+		t.Fatalf("the metal node's cache store, a %T, is the Ceph one", storage)
+	}
+	if name, deadline := nodeStoreGuard(cfg); name != "ebs-s3" || deadline != ebsS3StoreDeadline {
+		t.Errorf("the metal node's breaker guards %q for %s, want ebs-s3's", name, deadline)
+	}
+
+	lost := func(context.Context) (ebss3.Host, error) { return ebss3.Host{}, errors.New("no metadata service") }
+	if _, err := nodeCacheStore(t.Context(), cfg, "test-deployment", lost); err == nil ||
+		!strings.Contains(err.Error(), "could not identify") {
+		t.Errorf("a node that could not say which instance it is answered %v", err)
+	}
+
+	elsewhere := func(context.Context) (ebss3.Host, error) {
+		return ebss3.Host{InstanceID: "i-0123456789abcdef0", AvailabilityZone: "us-west-2b"}, nil
+	}
+	if _, err := nodeCacheStore(t.Context(), cfg, "test-deployment", elsewhere); err == nil ||
+		!strings.Contains(err.Error(), "us-west-2b") {
+		t.Errorf("a node in another zone answered %v", err)
+	}
+}
+
+// EACH PROVIDER'S BREAKER NAMES THE STORE ITS JOBS WAIT ON, and a node whose jobs wait on
+// none has none.
+func TestEachNodesBreakerGuardsItsOwnStore(t *testing.T) {
+	t.Parallel()
+
+	store := &config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a", Bucket: "b"}
+	for _, tc := range []struct {
+		provider config.ProviderKind
+		ebs      *config.EBSS3Config
+		want     string
+	}{
+		{provider: config.ProviderFirecracker, ebs: store, want: "ebs-s3"},
+		{provider: config.ProviderFirecracker, want: "ceph"},
+		{provider: config.ProviderEC2, ebs: store, want: "ebs-s3"},
+		{provider: config.ProviderDocker},
+		{provider: config.ProviderTart},
+	} {
+		name, _ := nodeStoreGuard(&config.Config{Node: &config.NodeConfig{Provider: tc.provider, EBSS3: tc.ebs}})
+		if name != tc.want {
+			t.Errorf("%s with ebs_s3 %v guards %q, want %q", tc.provider, tc.ebs != nil, name, tc.want)
+		}
+	}
+}
+
 // THE STORE A FIRECRACKER NODE'S CACHE IS HANDED CHECKS GENERATIONS. The node
 // finds the check by asserting the value it is given, and a damaged generation
 // stays in place without it, so it is proved on that value and not on a fake.
@@ -86,7 +203,7 @@ func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
 		LockDir:  lockDir,
 		Ceph:     &config.CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache"},
 	}}
-	storage, err := nodeCacheStore(t.Context(), cfg, "test-deployment")
+	storage, err := nodeCacheStore(t.Context(), cfg, "test-deployment", noInstance(t))
 	if err != nil {
 		t.Fatalf("nodeCacheStore: %v", err)
 	}

@@ -141,7 +141,13 @@ func TestAPoolMayHandItsHostsAnEBSSite(t *testing.T) {
 		"a store with no site":     {"'--site=metal', ", "", "no --site"},
 		"a store with no listener": {"'--cache-listen=10.240.0.1:7718', '--cache-guest-endpoint=http://10.240.0.1:7718'", "", "no --cache-listen"},
 		"half a listener":          {", '--cache-guest-endpoint=http://10.240.0.1:7718'", "", "together or not at all"},
-		"a store with no bucket":   {"'--ebs-s3-bucket=billet-cache-example', ", "", "bucket"},
+		"a loopback listener": {"'--cache-listen=10.240.0.1:7718', '--cache-guest-endpoint=http://10.240.0.1:7718'",
+			"'--cache-listen=127.0.0.1:7718', '--cache-guest-endpoint=http://127.0.0.1:7718'", "non-loopback"},
+		"an endpoint elsewhere": {"'--cache-guest-endpoint=http://10.240.0.1:7718'",
+			"'--cache-guest-endpoint=http://10.240.0.2:7718'", "name exactly the address in"},
+		"an https endpoint": {"'--cache-guest-endpoint=http://10.240.0.1:7718'",
+			"'--cache-guest-endpoint=https://10.240.0.1:7718'", "must use http on the isolated Firecracker bridge"},
+		"a store with no bucket": {"'--ebs-s3-bucket=billet-cache-example', ", "", "bucket"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -165,6 +171,15 @@ func TestAPoolMayHandItsHostsAnEBSSite(t *testing.T) {
 		"    init_args: ['--site=metal']\n    boot_prelude:", 1)) + metalSites
 	if _, err := loadServer(t, noStore); err == nil || !strings.Contains(err.Error(), "must name it") {
 		t.Fatalf("a pool at an ebs-s3 site with no store was answered %v", err)
+	}
+
+	// AND A CEPH SITE WITHOUT ONE IS A POOL AS IT ALWAYS WAS.
+	cephSite := strings.Replace(noStore, "    store: ebs-s3\n", "    store: ceph\n", 1)
+	if cephSite == noStore {
+		t.Fatal("the config has no ebs-s3 site to make a Ceph one")
+	}
+	if _, err := loadServer(t, cephSite); err != nil {
+		t.Fatalf("a pool whose hosts are at a Ceph site, naming no store, was refused: %v", err)
 	}
 }
 

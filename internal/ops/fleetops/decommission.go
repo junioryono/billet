@@ -24,6 +24,24 @@ import (
 // instance may still be serving a job, so the cache it depends on must not be
 // pulled out from under it.
 func Decommission(ctx context.Context, env cli.Env, args []string) error {
+	return decommission(ctx, env, args, livePoolHosts)
+}
+
+// poolHostLister lists a deployment's pool hosts EC2 has not terminated, in a region.
+type poolHostLister func(ctx context.Context, owner, region string, creds awscreds.Source) ([]ec2.HostRecord, error)
+
+// livePoolHosts is EC2's own list.
+func livePoolHosts(ctx context.Context, owner, region string, creds awscreds.Source) ([]ec2.HostRecord, error) {
+	hosts, err := ec2.NewPoolHosts(owner, region, ec2.WithCredentials(creds))
+	if err != nil {
+		return nil, err
+	}
+
+	return hosts.Live(ctx)
+}
+
+// decommission is Decommission, with the pool hosts listed by poolHosts.
+func decommission(ctx context.Context, env cli.Env, args []string, poolHosts poolHostLister) error {
 	fs := cli.NewFlagSet("billet decommission", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	yes := fs.Bool("yes", false, "actually delete (without this, only report what would be removed)")
@@ -61,10 +79,12 @@ func Decommission(ctx context.Context, env cli.Env, args []string) error {
 
 	creds := awscreds.Default()
 
-	if !metal {
-		if err := decommissionInstances(ctx, env, cfg, owner, creds, *yes, *terminateInstances); err != nil {
+	if metal {
+		if err := refuseLivePoolHosts(ctx, env, cfg, owner, creds, poolHosts); err != nil {
 			return err
 		}
+	} else if err := decommissionInstances(ctx, env, cfg, owner, creds, *yes, *terminateInstances); err != nil {
+		return err
 	}
 
 	if err := decommissionCache(ctx, env, cfg, owner, creds, *yes); err != nil {
@@ -136,6 +156,34 @@ func CacheResidue(ctx context.Context, cfgPath string) (ebss3.Residue, error) {
 	}
 
 	return residue, nil
+}
+
+// refuseLivePoolHosts refuses a metal site's purge while any of the deployment's pool
+// hosts is not terminated: a host that runs, or could start again, may be running a job
+// whose Actions, Go or Bazel objects hold no clone lease a purge would see, and a node
+// that publishes after the purge undoes it. A host is the pool's to release, by drain
+// on proof (`billet pool release`), never this command's to terminate.
+func refuseLivePoolHosts(
+	ctx context.Context, env cli.Env, cfg *config.Config, owner string, creds awscreds.Source,
+	poolHosts poolHostLister,
+) error {
+	live, err := poolHosts(ctx, owner, cfg.Node.EBSS3.Region, creds)
+	if err != nil {
+		return fmt.Errorf("node.ebs_s3: list this deployment's pool hosts, which must all be gone before its "+
+			"cache is purged: %w", err)
+	}
+	if len(live) == 0 {
+		fmt.Fprintf(env.Stdout, "hosts    no pool host of this deployment is left\n")
+
+		return nil
+	}
+
+	for _, host := range live {
+		fmt.Fprintf(env.Stdout, "host     %s (%s, order %s)\n", host.ID, host.State, host.Order)
+	}
+
+	return fmt.Errorf("%d pool host(s) of this deployment are not terminated, and a job on one may be using "+
+		"the cache; release them (`billet pool release`) and re-run once they are gone", len(live))
 }
 
 // decommissionInstances lists the deployment's instances and, with --yes and

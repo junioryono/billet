@@ -141,6 +141,24 @@ const apiTimeout = 30 * time.Second
 // New builds an EC2 provider. owner names this billet deployment and is written
 // onto every instance it starts.
 func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) {
+	return build(owner, cfg, true, opts...)
+}
+
+// NewPoolHosts reads a deployment's pool hosts in region, and launches nothing: what a
+// command that must know whether any is left (a metal site's decommission) needs, from a
+// config that names no launch network.
+func NewPoolHosts(owner, region string, opts ...Option) (*Hosts, error) {
+	p, err := build(owner, config.EC2Config{Region: region}, false, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return p.Hosts(), nil
+}
+
+// build is New, and NewPoolHosts when launches is false: the one rule a provider that
+// launches nothing is spared is the launch network's.
+func build(owner string, cfg config.EC2Config, launches bool, opts ...Option) (*Provider, error) {
 	if strings.TrimSpace(owner) == "" {
 		return nil, errors.New("ec2: a provider needs the deployment identity that tags its " +
 			"instances, or it cannot tell its own compute from another billet's")
@@ -192,7 +210,7 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 		{"security_group_ids", cfg.SecurityGroupIDs, true},
 		{"untrusted_security_group_ids", cfg.UntrustedSecurityGroupIDs, false},
 	} {
-		if errs := config.CheckEC2SecurityGroups(check.field, check.groups, check.required); len(errs) > 0 {
+		if errs := config.CheckEC2SecurityGroups(check.field, check.groups, check.required && launches); len(errs) > 0 {
 			return nil, fmt.Errorf("ec2: %w", errors.Join(errs...))
 		}
 	}

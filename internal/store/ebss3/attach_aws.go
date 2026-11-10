@@ -113,6 +113,12 @@ func (e ebsAPI) DetachVolume(ctx context.Context, id, instance string) error {
 	return err
 }
 
+// AwaitDetached waits until EC2 describes the volume as available, as every create and
+// clone does.
+func (e ebsAPI) AwaitDetached(ctx context.Context, id string) error {
+	return e.waitVolume(ctx, id, "available")
+}
+
 // AttachedTo lists this store's volumes attached or attaching to instance, with when
 // each attachment began.
 func (e ebsAPI) AttachedTo(ctx context.Context, instance string) (map[string]time.Time, error) {

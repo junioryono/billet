@@ -28,6 +28,9 @@ type attachAPI interface {
 	DetachVolume(ctx context.Context, id, instance string) error
 	Attachment(ctx context.Context, id string) (volumeAttachment, bool, error)
 	AttachedTo(ctx context.Context, instance string) (map[string]time.Time, error)
+	// AwaitDetached waits until EC2 describes a volume it was asked to detach as
+	// available.
+	AwaitDetached(ctx context.Context, id string) error
 }
 
 // hostDisks is what a self-attaching store asks of this host's own block devices.
@@ -86,8 +89,8 @@ func NewAttached(
 	host Host,
 	sessions func() (func(name string) bool, error),
 ) (*Store, error) {
-	if !strings.HasPrefix(host.InstanceID, "i-") {
-		return nil, fmt.Errorf("ebs-s3: %q is not an EC2 instance to attach cache volumes to", host.InstanceID)
+	if err := CheckHost(cfg, host); err != nil {
+		return nil, err
 	}
 	if sessions == nil {
 		return nil, errors.New("ebs-s3: a self-attaching store needs to know which volumes its sessions hold")
@@ -96,14 +99,6 @@ func NewAttached(
 	store, err := New(cfg, owner, credentials)
 	if err != nil {
 		return nil, err
-	}
-
-	// THE ZONE THE VOLUMES ARE MADE IN IS THE INSTANCE'S, or none of them attaches: EC2
-	// answers InvalidVolume.ZoneMismatch (2026-11-09).
-	if host.AvailabilityZone != store.cfg.AvailabilityZone {
-		return nil, fmt.Errorf("ebs-s3: node.ebs_s3.availability_zone is %s, but this instance is in %s; a "+
-			"volume attaches only in its own zone, so order this pool's hosts in %s or name the zone they are in",
-			store.cfg.AvailabilityZone, host.AvailabilityZone, store.cfg.AvailabilityZone)
 	}
 
 	blocks, ok := store.blocks.(*ebsAPI)
@@ -117,6 +112,25 @@ func NewAttached(
 	store.sessions = sessions
 
 	return store, nil
+}
+
+// CheckHost says whether a store of cfg can attach its volumes to host: an EC2 instance,
+// in the zone the volumes are made in. `billet check` asks it too.
+func CheckHost(cfg config.EBSS3Config, host Host) error {
+	if !strings.HasPrefix(host.InstanceID, "i-") {
+		return fmt.Errorf("ebs-s3: %q is not an EC2 instance to attach cache volumes to", host.InstanceID)
+	}
+
+	// THE ZONE THE VOLUMES ARE MADE IN IS THE INSTANCE'S, or none of them attaches: EC2
+	// answers InvalidVolume.ZoneMismatch (2026-11-09).
+	zone := strings.TrimSpace(cfg.AvailabilityZone)
+	if host.AvailabilityZone != zone {
+		return fmt.Errorf("ebs-s3: node.ebs_s3.availability_zone is %s, but this instance (%s) is in %s; a "+
+			"volume attaches only in its own zone, so order this pool's hosts in %s or name the zone they are in",
+			zone, host.InstanceID, host.AvailabilityZone, zone)
+	}
+
+	return nil
 }
 
 // local reports whether this store attaches its volumes to its own instance.
@@ -220,48 +234,25 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 		return fmt.Errorf("ebs-s3: detach cache volume %s: %w", volume, err)
 	}
 
-	blocks, ok := s.blocks.(*ebsAPI)
-	if !ok {
-		return s.awaitDetached(ctx, volume)
-	}
-
-	return blocks.waitVolume(ctx, volume, "available")
-}
-
-// awaitDetached waits until a volume is attached to nothing, for a store whose EC2
-// client is a test's.
-func (s Store) awaitDetached(ctx context.Context, volume string) error {
-	poll := time.NewTicker(devicePoll)
-	defer poll.Stop()
-
-	for {
-		attachment, found, err := s.attach.Attachment(ctx, volume)
-		if err != nil {
-			return err
-		}
-		if !found || attachment.Instance == "" {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-poll.C:
-		}
-	}
+	return s.attach.AwaitDetached(ctx, volume)
 }
 
 // releaseLocal is a failed attach's cleanup: the volume off this instance, if it got
-// there, and deleted.
-func (s Store) releaseLocal(ctx context.Context, volume string) error {
+// there, and deleted, and the lease's active record dropped.
+//
+// ON A CONTEXT OF ITS OWN, bounded, because the attach most often fails by its caller's
+// context ending while the device is waited for, and a cleanup on that context would
+// leave the volume attached and the record naming it until it expired.
+func (s Store) releaseLocal(ctx context.Context, key, leaseID, volume string) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unansweredVolumeLimit)
 	defer cancel()
 
 	if err := s.detachLocal(cleanupCtx, volume); err != nil {
-		return fmt.Errorf("ebs-s3: cache volume %s is left attached for the sweep: %w", volume, err)
+		return errors.Join(fmt.Errorf("ebs-s3: cache volume %s is left attached for the sweep: %w", volume, err),
+			s.dropActive(cleanupCtx, key, leaseID))
 	}
 
-	return s.blocks.DeleteVolume(cleanupCtx, volume)
+	return errors.Join(s.blocks.DeleteVolume(cleanupCtx, volume), s.dropActive(cleanupCtx, key, leaseID))
 }
 
 // MappedDevice is the device a volume is on now. A remote store's volume is attached to
