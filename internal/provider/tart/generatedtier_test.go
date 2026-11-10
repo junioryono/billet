@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
@@ -75,6 +76,12 @@ func TestEveryGeneratedTartTierLaunchesOnThisBackend(t *testing.T) {
 
 					p := newProvider(t, s)
 					WithConfig(tartCfg)(p)
+
+					// A FAILURE GUARD, NOT A CONDITION, and inside the fake runner's
+					// five minutes: what is under test is whether the tier launches,
+					// and a dead runner fails at its first sample whatever this is.
+					// The proof's own deadline has tests of its own.
+					p.proveWindow = 2 * time.Minute
 
 					spec := specForTier(tier, fmt.Sprintf("billet-lease%d", i+1))
 

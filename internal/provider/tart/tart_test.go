@@ -148,6 +148,9 @@ type stub struct {
 	// probeSays is a guest whose shell answers the agent probe with these
 	// bytes on stderr and a failure: what billet must never quote.
 	probeSays string
+	// runnersAllowed exists while the stub lives; a fake runner starts only
+	// after recording itself and finding it (killRunner).
+	runnersAllowed string
 }
 
 func newStub(t *testing.T) *stub {
@@ -207,6 +210,7 @@ func newStub(t *testing.T) *stub {
 		guestSaysRefusal:  filepath.Join(dir, "guest-says-refusal"),
 		guestAsked:        filepath.Join(dir, "guest-asked"),
 		probeSays:         filepath.Join(dir, "probe-says"),
+		runnersAllowed:    filepath.Join(dir, "runners-allowed"),
 	}
 
 	if err := os.MkdirAll(filepath.Join(s.home, "vms"), 0o755); err != nil {
@@ -224,13 +228,22 @@ func newStub(t *testing.T) *stub {
 	// Five minutes, so no launch on a loaded runner outlives it: at thirty seconds
 	// a slow one proved a runner that had already exited (#814). The cleanup below
 	// kills it, so the length bounds only a runner a killed test binary leaves.
+	//
+	// RECORDED, THEN ALLOWED, THEN RUNNING, in that order, so the cleanup cannot
+	// miss one: it removes the marker before it reads the record, and a runner
+	// that recorded itself too late to be read finds no marker and does not start.
 	runner := filepath.Join(s.guestHome, "run.sh")
 	body := "#!/bin/sh\n" +
-		"printf '%s %s\\n' \"$$\" \"$(ps -p $$ -o lstart=)\" >> \"$HOME/" + spawnedPIDs + "\"\n" +
+		"printf '%s %s\\n' \"$$\" \"$(ps -p $$ -o lstart=)\" >> \"$HOME/" + spawnedPIDs + "\" || exit 1\n" +
+		"[ -e " + shellQuote(s.runnersAllowed) + " ] || exit 1\n" +
 		"exec sleep 300\n"
 
 	if err := forkSafeWriteFile(runner, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake runner: %v", err)
+	}
+
+	if err := os.WriteFile(s.runnersAllowed, nil, 0o600); err != nil {
+		t.Fatalf("allow the fake runners: %v", err)
 	}
 
 	// Those sleeps are real host processes: without this they outlive the test
@@ -627,6 +640,12 @@ func (s *stub) vm(t *testing.T, name, state, owner string) {
 // unrelated process on the developer's machine.
 func (s *stub) killRunner(t *testing.T) {
 	t.Helper()
+
+	// BEFORE THE READ: a runner that records itself after this finds no marker and
+	// exits rather than sleeping where nothing will kill it.
+	if err := os.Remove(s.runnersAllowed); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stop allowing fake runners: %v", err)
+	}
 
 	b, err := os.ReadFile(filepath.Join(s.guestHome, spawnedPIDs))
 	if err != nil {
