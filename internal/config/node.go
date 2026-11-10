@@ -222,8 +222,10 @@ type NodeConfig struct {
 	// project, a fleet and a parameter path that look configured and are consulted
 	// by nothing.
 	CodeBuild *CodeBuildConfig `yaml:"codebuild,omitempty"`
-	// EBSS3 is the cache store local to an EC2 site's instances. EBS carries
-	// block generations and S3 carries the fenced per-key state.
+	// EBSS3 is the cache store of an AWS site: an ec2 node's, whose volumes it attaches
+	// to its jobs' instances, or a firecracker node's on AWS metal, which attaches them to
+	// its own instance and hands them to its guests (ADR-030). EBS carries block
+	// generations and S3 carries the fenced per-key state and the object caches.
 	EBSS3 *EBSS3Config `yaml:"ebs_s3,omitempty"`
 	// Ceph is the site's storage, required when Provider is ProviderFirecracker
 	// and refused for every other backend.

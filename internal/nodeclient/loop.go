@@ -135,6 +135,9 @@ type LoopOptions struct {
 	Deployment string
 	// Site is where this machine is, or empty in a deployment with one place.
 	Site string
+	// SiteStore is the store this node's caches use when its provider's own is not
+	// the one (nodeapi.VersionSiteStore), empty otherwise.
+	SiteStore config.SiteStoreKind
 	// VCPU and Memory are what this host CONTRIBUTES, which is what it detected
 	// unless its own config said otherwise.
 	//
@@ -253,6 +256,7 @@ func (o LoopOptions) registration() Registration {
 		GuestOS:    o.GuestOS,
 		Deployment: o.Deployment,
 		Site:       o.Site,
+		SiteStore:  o.SiteStore,
 		VCPU:       o.VCPU,
 		Memory:     o.Memory,
 		EC2Shapes:  o.EC2Shapes,

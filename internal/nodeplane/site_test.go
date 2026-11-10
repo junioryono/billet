@@ -125,6 +125,74 @@ func TestANodeCannotSplitASitesStorageAuthority(t *testing.T) {
 	}
 }
 
+// A FIRECRACKER NODE SERVES AN EBS-S3 SITE ON ITS WORD THAT ITS CACHES ARE THERE (ADR-030),
+// and only on a wire that carries that word: on AWS metal its guests' root disks stay on
+// its own Ceph, so its provider alone does not say where its caches go.
+func TestAFirecrackerNodeServesAnEBSSiteOnlyOnItsWord(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		store   config.SiteStoreKind
+		uses    config.SiteStoreKind
+		version int
+		ok      bool
+	}{
+		{name: "says ebs-s3 at an ebs-s3 site", store: config.SiteStoreEBSS3, uses: config.SiteStoreEBSS3,
+			version: nodeapi.Version, ok: true},
+		{name: "says nothing at an ebs-s3 site", store: config.SiteStoreEBSS3, version: nodeapi.Version},
+		{name: "says ebs-s3 below the version that carries it", store: config.SiteStoreEBSS3,
+			uses: config.SiteStoreEBSS3, version: nodeapi.VersionSiteStore - 1},
+		{name: "says ebs-s3 at a Ceph site", store: config.SiteStoreCeph, uses: config.SiteStoreEBSS3,
+			version: nodeapi.Version},
+		{name: "says ceph at a Ceph site", store: config.SiteStoreCeph, uses: config.SiteStoreCeph,
+			version: nodeapi.Version, ok: true},
+		{name: "says a store that is not one", store: config.SiteStoreEBSS3, uses: "magic-disk",
+			version: nodeapi.Version},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := testPlaneWithSites(t, site("metal", tc.store))
+			req := registerAt("metal")
+			req.Version = tc.version
+			req.SiteStore = tc.uses
+
+			_, err := p.Register(t.Context(), req)
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+
+				return
+			}
+			if err == nil || !errors.Is(err, ErrRefused) {
+				t.Fatalf("a Firecracker node whose caches are not the site's was answered %v", err)
+			}
+		})
+	}
+}
+
+// AN EC2 NODE AT AN EBS-S3 SITE NEEDS NO WORD, as it never has, and one saying Ceph is
+// refused.
+func TestAnEC2NodeAtAnEBSSiteIsAsBefore(t *testing.T) {
+	t.Parallel()
+
+	p := testPlaneWithSites(t, site("cloud", config.SiteStoreEBSS3))
+	req := registerAt("cloud")
+	req.Provider = config.ProviderEC2
+	req.EC2Shapes = []config.RemoteShape{{Type: "c7i.large", VCPU: 2, Memory: 4 * config.GiB, PriceUSDPerHour: 89_000}}
+	if _, err := p.Register(t.Context(), req); err != nil {
+		t.Fatalf("an EC2 node at an ebs-s3 site was refused: %v", err)
+	}
+
+	req.Node = "n2"
+	req.SiteStore = config.SiteStoreCeph
+	if _, err := p.Register(t.Context(), req); !errors.Is(err, ErrRefused) {
+		t.Fatalf("an EC2 node saying its caches use Ceph was answered %v", err)
+	}
+}
+
 // testPlaneWithSites is a plane whose deployment declares these places.
 func testPlaneWithSites(t *testing.T, sites ...config.SiteConfig) *Plane {
 	t.Helper()

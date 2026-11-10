@@ -350,10 +350,43 @@ func TestAnEBSAndS3StoreMustBeUsableByThisCloudNode(t *testing.T) {
 		})
 	}
 
+	// A FIRECRACKER NODE ON AWS METAL keeps its caches there too (ADR-030), attaching
+	// the volumes to its own instance; its guests' root disks stay on node.ceph.
 	body := strings.Replace(validConfig, "  provider: firecracker\n",
 		"  provider: firecracker\n"+valid, 1)
-	if _, err := Load(writeConfig(t, body)); err == nil {
-		t.Fatal("Load accepted EBS/S3 storage on a host-backed provider")
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("a Firecracker node with its site's EBS/S3 store was refused: %v", err)
+	}
+	if cfg.Node.EBSS3 == nil || cfg.Node.Ceph == nil {
+		t.Fatalf("the Firecracker node kept ebs_s3 %+v and ceph %+v", cfg.Node.EBSS3, cfg.Node.Ceph)
+	}
+
+	cephBlock := "  ceph:\n    image_pool: billet-images\n    cache_pool: billet-cache\n"
+	if !strings.Contains(body, cephBlock) {
+		t.Fatal("the base config's node.ceph is not the block this case removes, so it proves nothing")
+	}
+	noCeph := strings.Replace(body, cephBlock, "", 1)
+	if got := loadErr(t, noCeph); !strings.Contains(got, "node.ceph is required when provider is firecracker") {
+		t.Fatalf("a Firecracker node with node.ebs_s3 and no node.ceph was answered %q; its guests' root "+
+			"disks are RBD images", got)
+	}
+
+	// AND THE OTHER DIRECTION: a Firecracker node at an ebs-s3 site this file declares,
+	// without the store, would keep its caches on its own Ceph.
+	sited := strings.Replace(validConfig, "  provider: firecracker\n",
+		"  provider: firecracker\n  site: aws-us-west-2\n", 1) +
+		"sites:\n  - name: aws-us-west-2\n    store: ebs-s3\n"
+	if got := loadErr(t, sited); !strings.Contains(got, "needs node.ebs_s3") {
+		t.Fatalf("a Firecracker node at an ebs-s3 site with no node.ebs_s3 was answered %q", got)
+	}
+	if _, err := Load(writeConfig(t, strings.Replace(sited, "    store: ebs-s3\n", "    store: ceph\n", 1))); err != nil {
+		t.Fatalf("the same node at a Ceph site was refused: %v", err)
+	}
+
+	docker := strings.Replace(validConfig, "  provider: firecracker\n", "  provider: docker\n"+valid, 1)
+	if got := loadErr(t, docker); !strings.Contains(got, "node.ebs_s3 is set but this node's provider is docker") {
+		t.Fatalf("a docker node with node.ebs_s3 was answered %q", got)
 	}
 }
 

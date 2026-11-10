@@ -86,7 +86,7 @@ func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
 		LockDir:  lockDir,
 		Ceph:     &config.CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache"},
 	}}
-	storage, err := nodeCacheStore(cfg, "test-deployment")
+	storage, err := nodeCacheStore(t.Context(), cfg, "test-deployment")
 	if err != nil {
 		t.Fatalf("nodeCacheStore: %v", err)
 	}

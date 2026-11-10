@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 47
+	Version = 48
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -630,6 +630,19 @@ const (
 	// that was with another controller and the answer settles it with this one. An
 	// older node never asks, and the plane needs no gate.
 	VersionCustodyClaim = 47
+
+	// VersionSiteStore is the version from which a registration says which store the
+	// node's caches use (RegisterRequest.SiteStore), and from which a Firecracker node
+	// may serve an ebs-s3 site: on AWS metal, its caches on volumes it attaches to its
+	// own instance (ADR-030).
+	//
+	// REFUSED, NOT REPORTED, because the pairing it proves is otherwise a node at an
+	// ebs-s3 site keeping its caches on its own Ceph, which splits one site across two
+	// cache authorities, and one of them on an elastic host. CHECKED BY THE PLANE AFTER
+	// NEGOTIATION, as a registration field is; only a Firecracker node that uses ebs-s3
+	// sends it, so no node that registers today sends anything new, and an older plane's
+	// strict decoder refuses only the new pairing, which needs this plane first.
+	VersionSiteStore = 48
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -811,6 +824,11 @@ type RegisterRequest struct {
 	Architectures []config.Arch `json:"architectures,omitempty"`
 	// Site is where this machine is, or empty in a deployment that has one place.
 	Site string `json:"site,omitempty"`
+	// SiteStore is the store this node's caches use, sent from VersionSiteStore by a
+	// Firecracker node that uses ebs-s3 and by no other; empty is the store its
+	// provider has always used (Ceph for Firecracker, ebs-s3 for EC2). The plane
+	// accepts a Firecracker node at an ebs-s3 site only on this word.
+	SiteStore config.SiteStoreKind `json:"site_store,omitempty"`
 	// VCPU and Memory are what this host CONTRIBUTES, which is what it detected
 	// unless its own config said otherwise.
 	//
