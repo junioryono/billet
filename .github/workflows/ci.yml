@@ -770,6 +770,17 @@ jobs:
           path: ${{ runner.temp }}/gate-binaries
           if-no-files-found: error
           retention-days: 1
+      # THE GROUPS READ THE BINARIES FROM THE SITE, NOT FROM GITHUB. Each of about
+      # twenty groups downloaded this artifact, 175 MB, over the one line the
+      # site's CI shares, 3.7 GB a run. The Actions cache is served by the
+      # runner's own node from the site's store (every host-lifecycle group's
+      # cache was `served` on run 42908871674, a pull request), so the groups
+      # restore it from there and fall back to the artifact only on a miss. The
+      # key is this run's, so no other run reads it.
+      - uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/gate-binaries
+          key: gate-binaries-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
       - name: Report what this job used of its runner
         if: always()
         continue-on-error: true
@@ -918,7 +929,17 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # From the site's store when the node has them, from GitHub when it does not
+      # (gate-binaries says why).
+      - name: Restore the binaries built once for this run
+        id: gate-binaries
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/gate-binaries
+          key: gate-binaries-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+
       - uses: actions/download-artifact@v8
+        if: steps.gate-binaries.outputs.cache-hit != 'true'
         with:
           name: gate-binaries
           path: ${{ runner.temp }}/gate-binaries
