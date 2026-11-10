@@ -11,8 +11,9 @@ import (
 //
 // PROVING THE MECHANISM IS NOT PROVING IT IS USED. The verdict above is a plain
 // function; what turns it into something an operator meets is one call in
-// ec2Preflight. Delete it and the table stays green while the probe prints that a
-// bucket S3 has never heard of answered.
+// probeCacheBucket, which both an ec2 node's preflight and a metal node's cache check
+// call. Delete either and the table stays green while the probe prints that a bucket S3
+// has never heard of answered.
 //
 // A STRUCTURAL TEST BECAUSE THE CALL SITE CANNOT BE REACHED. ebss3.New builds its
 // endpoint from the region and the bucket with no override, so nothing in a unit
@@ -26,19 +27,40 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 		t.Fatalf("parse preflight.go: %v", err)
 	}
 
-	var preflight *ast.FuncDecl
+	funcs := map[string]*ast.FuncDecl{}
 
 	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Recv == nil && fn.Name.Name == "ec2Preflight" {
-			preflight = fn
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil {
+			funcs[fn.Name.Name] = fn
 		}
 	}
 
 	// A WALK THAT FOUND NOTHING PASSES FOR THE WRONG REASON, which is the failure
 	// every structural test in this repository is arranged against.
+	preflight := funcs["probeCacheBucket"]
 	if preflight == nil {
-		t.Fatal("ec2Preflight is gone from preflight.go; this guard is checking nothing")
+		t.Fatal("probeCacheBucket is gone from preflight.go; this guard is checking nothing")
+	}
+
+	// AND BOTH NODES THAT READ THE BUCKET ASK IT.
+	for _, caller := range []string{"ec2Preflight", "checkMetalCacheStore"} {
+		fn := funcs[caller]
+		if fn == nil {
+			t.Fatalf("%s is gone from preflight.go; this guard is checking nothing", caller)
+		}
+		calls := false
+		ast.Inspect(fn, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "probeCacheBucket" {
+					calls = true
+				}
+			}
+
+			return true
+		})
+		if !calls {
+			t.Errorf("%s does not call probeCacheBucket, so its bucket is never probed", caller)
+		}
 	}
 
 	// THE CALL MUST BE THE SWITCH'S SUBJECT, not merely present. `_ =
@@ -75,7 +97,7 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 	})
 
 	if verdict == nil {
-		t.Fatal("ec2Preflight does not switch on cache.JudgeProbe(probeErr), so a refused " +
+		t.Fatal("probeCacheBucket does not switch on cache.JudgeProbe(probeErr), so a refused " +
 			"identity and a bucket that does not exist are not told apart by the judgement " +
 			"that knows the difference")
 	}

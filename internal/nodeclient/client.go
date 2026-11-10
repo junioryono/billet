@@ -662,6 +662,9 @@ type Registration struct {
 	GuestOS    []config.GuestOS
 	Deployment string
 	Site       string
+	// SiteStore is the store this node's caches use, sent only when it is not the one
+	// its provider has always used.
+	SiteStore config.SiteStoreKind
 	// VCPU and Memory are what this host contributes.
 	VCPU      int
 	Memory    config.ByteSize
@@ -785,6 +788,7 @@ func (c *Client) registerWith(ctx context.Context, at int, reg Registration) err
 		Instances:       reg.Instances,
 		InventoryKnown:  reg.InventoryKnown,
 		Site:            reg.Site,
+		SiteStore:       reg.SiteStore,
 		VCPU:            reg.VCPU,
 		Memory:          reg.Memory,
 		EC2Shapes:       reg.EC2Shapes,

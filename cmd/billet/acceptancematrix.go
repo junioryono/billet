@@ -118,7 +118,7 @@ func matrixCells() []matrixCell {
 				for _, k := range matrixCases {
 					cell := matrixCellFor(c, k)
 					if b.source != "" {
-						cell = poolCell
+						cell = poolCells[b.source]
 					}
 					cell.Backend, cell.Source, cell.Arch, cell.Cache, cell.Case = b.kind, b.source, a, c, k
 					out = append(out, cell)
@@ -130,10 +130,15 @@ func matrixCells() []matrixCell {
 	return out
 }
 
-// poolCell is every cell of a pool's Firecracker hosts, on either source: supported,
-// and not run, until a pool site has a store and the pool has had its real run (#553).
-var poolCell = matrixCell{Why: "a pool's Firecracker hosts run with every cache off until a pool site has a " +
-	"store (#553's plan change of 2026-11-08), and the pool's cells run after its real growth and drain run"}
+// poolCells is every cell of a pool's Firecracker hosts, by source: supported, and not
+// run until the lane runs them. AWS metal has its site store and has run every cache
+// cold and warm by hand (the bare-metal hosts record, 2026-11-10); phoenixNAP has no store.
+var poolCells = map[string]matrixCell{
+	config.PoolSourceAWSMetal: {Why: "the lane does not yet order AWS metal hosts (#829); their caches ran " +
+		"cold and warm by hand on 2026-11-10 (docs/reference/records/bare-metal-hosts.md)"},
+	config.PoolSourcePhoenixNAP: {Why: "a phoenixNAP pool runs with every cache off until its site store is " +
+		"bought (#553), and the source has not taken an order through its API (#828)"},
+}
 
 // matrixBackendName is a cell's backend as the tables print it: the source beside a
 // pool's.

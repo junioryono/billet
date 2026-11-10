@@ -29,10 +29,18 @@ const (
 )
 
 // PoolInitFlags are the only `billet init` flags a pool host's join may be handed: what
-// a Firecracker node's config needs and the join cannot know. Every other flag init
-// takes is the join's to decide (its config path, its node name, its provider, --force),
-// and init takes a flag's last value, so one more here would override it.
-var PoolInitFlags = []string{"kernel-image", "ceph-user", "ceph-keyring"}
+// a Firecracker node's config needs and the join cannot know. On AWS metal that includes
+// its site, the site's ebs-s3 store and the cache listener its guests reach (ADR-030).
+// Every other flag init takes is the join's to decide (its config path, its node name, its
+// provider, --force), and init takes a flag's last value, so one more here would
+// override it.
+var PoolInitFlags = []string{"kernel-image", "ceph-user", "ceph-keyring", "site", "ebs-s3-region",
+	"ebs-s3-availability-zone", "ebs-s3-bucket", "ebs-s3-prefix", "ebs-s3-kms-key-id", "cache-listen",
+	"cache-guest-endpoint"}
+
+// poolStoreFlags are the PoolInitFlags that ask for the site's ebs-s3 store.
+var poolStoreFlags = []string{"ebs-s3-region", "ebs-s3-availability-zone", "ebs-s3-bucket", "ebs-s3-prefix",
+	"ebs-s3-kms-key-id"}
 
 // checkPoolInitArgs refuses init_args that are not PoolInitFlags, each at most once,
 // as `--flag value` or `--flag=value` with one dash or two as init's parser reads them,
@@ -44,6 +52,13 @@ var PoolInitFlags = []string{"kernel-image", "ceph-user", "ceph-keyring"}
 // AND EACH VALUE IS ONE THE NODE'S CONFIG WILL TAKE, by the node's own rules, because
 // a value only the host's init refuses is a host rented that cannot join.
 func checkPoolInitArgs(args []string) []error {
+	_, errs := readPoolInitArgs(args)
+
+	return errs
+}
+
+// readPoolInitArgs is checkPoolInitArgs, answering the values it read as well, by flag.
+func readPoolInitArgs(args []string) (map[string]string, []error) {
 	var errs []error
 	seen := map[string]bool{}
 	values := map[string]string{}
@@ -109,6 +124,117 @@ func checkPoolInitArgs(args []string) []error {
 		for _, err := range CheckCeph(ceph) {
 			errs = append(errs, fmt.Errorf("server.pool.init_args: %w", err))
 		}
+	}
+
+	// THE CACHE AND THE STORE, by the rules init holds them to on the host, which would
+	// otherwise refuse them there, on a host rented and unable to join.
+	if (values["cache-listen"] == "") != (values["cache-guest-endpoint"] == "") {
+		errs = append(errs, errors.New("server.pool.init_args gives --cache-listen and --cache-guest-endpoint "+
+			"together or not at all"))
+	} else if values["cache-listen"] != "" {
+		// BY THE NODE'S OWN RULE, on the Firecracker node init will write: a listener the
+		// host's config would refuse is a host rented that cannot join.
+		cache := &NodeCacheConfig{Listen: values["cache-listen"], GuestEndpoint: values["cache-guest-endpoint"]}
+		cache.normalize()
+		host := &Config{Node: &NodeConfig{Provider: ProviderFirecracker, Cache: cache}}
+		for _, err := range host.validateCacheNode() {
+			errs = append(errs, fmt.Errorf("server.pool.init_args: %w", err))
+		}
+	}
+	if store := poolStore(values); store != nil {
+		if values["site"] == "" {
+			errs = append(errs, errors.New("server.pool.init_args names an ebs-s3 store and no --site: cache keys "+
+				"are scoped by site"))
+		}
+		if values["cache-listen"] == "" {
+			errs = append(errs, errors.New("server.pool.init_args names an ebs-s3 store and no --cache-listen: the "+
+				"store backs the guest cache and nothing else"))
+		}
+		for _, err := range CheckEBSS3(*store) {
+			errs = append(errs, fmt.Errorf("server.pool.init_args: %w", err))
+		}
+	}
+
+	return values, errs
+}
+
+// poolStore is the ebs-s3 store init_args name, as the node's config will hold it, or nil
+// when they name none.
+func poolStore(values map[string]string) *EBSS3Config {
+	named := false
+	for _, flag := range poolStoreFlags {
+		if _, ok := values[flag]; ok {
+			named = true
+		}
+	}
+	if !named {
+		return nil
+	}
+
+	store := &EBSS3Config{
+		Region: values["ebs-s3-region"], AvailabilityZone: values["ebs-s3-availability-zone"],
+		Bucket: values["ebs-s3-bucket"], Prefix: values["ebs-s3-prefix"], KMSKeyID: values["ebs-s3-kms-key-id"],
+	}
+	store.normalize()
+
+	return store
+}
+
+// validatePoolSite checks what init_args say about a site against what this control
+// plane declares: a site it does not declare, or one whose store is not ebs-s3 beside a
+// store init_args name, is a host that registers and is refused; and an ebs-s3 store in
+// another zone than the pool orders in is one whose volumes no host can attach.
+func (c *Config) validatePoolSite() []error {
+	if c.Server == nil || c.Server.Pool == nil {
+		return nil
+	}
+
+	values, _ := readPoolInitArgs(c.Server.Pool.InitArgs)
+	store := poolStore(values)
+	var errs []error
+
+	if site := values["site"]; site != "" {
+		var declared *SiteConfig
+		for i := range c.Sites {
+			if c.Sites[i].Name == site {
+				declared = &c.Sites[i]
+			}
+		}
+		switch {
+		case declared == nil:
+			errs = append(errs, fmt.Errorf("server.pool.init_args' --site %q is not a site this control plane "+
+				"declares, so every host the pool orders would be refused at registration", site))
+		case store != nil && declared.Store != SiteStoreEBSS3:
+			errs = append(errs, fmt.Errorf("server.pool.init_args name an ebs-s3 store, and site %q's store is %s",
+				site, declared.Store))
+		case store == nil && declared.Store == SiteStoreEBSS3:
+			errs = append(errs, fmt.Errorf("site %q's store is ebs-s3, so server.pool.init_args must name it "+
+				"(--ebs-s3-*) for the hosts the pool puts there", site))
+		}
+	}
+
+	// THE STORE IS AWS'S, and init_args go to every host the pool orders: a phoenixNAP
+	// host handed it would start a node that attaches volumes to an EC2 instance it is not.
+	if store != nil {
+		archs := make([]Arch, 0, len(c.Server.Pool.Architectures))
+		for a := range c.Server.Pool.Architectures {
+			archs = append(archs, a)
+		}
+		slices.Sort(archs)
+		for _, a := range archs {
+			for _, choice := range c.Server.Pool.Architectures[a].Order {
+				if choice.Source != PoolSourceAWSMetal {
+					errs = append(errs, fmt.Errorf("server.pool.init_args name an ebs-s3 store, which only a host "+
+						"on AWS metal can attach, and server.pool.architectures.%s orders from %s", a, choice.Source))
+				}
+			}
+		}
+	}
+
+	if m := c.Server.Pool.AWSMetal; store != nil && m != nil && store.AvailabilityZone != m.AvailabilityZone {
+		errs = append(errs, fmt.Errorf("server.pool.init_args' --ebs-s3-availability-zone %q is not %q, where "+
+			"server.pool.aws_metal orders its hosts: a volume attaches only in its own zone",
+			store.AvailabilityZone, m.AvailabilityZone))
 	}
 
 	return errs

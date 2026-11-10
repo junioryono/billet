@@ -453,6 +453,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		Provider:       cfg.Node.Provider,
 		Deployment:     n.deployment,
 		Site:           cfg.Node.Site,
+		SiteStore:      NodeSiteStore(cfg),
 		VCPU:           contribution.VCPU,
 		Memory:         contribution.Memory,
 		GuestOS:        nodeGuestOS(cfg),

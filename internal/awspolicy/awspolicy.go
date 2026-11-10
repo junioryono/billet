@@ -414,6 +414,12 @@ type Inputs struct {
 	Network *Network
 	// Cache, when non-nil, adds the sticky-disk cache statements.
 	Cache *Cache
+	// SelfAttach adds what a node on AWS metal needs to attach its cache volumes to its
+	// own instance (ADR-030): the instance half of AttachVolume and DetachVolume, on an
+	// instance carrying this deployment's pool-owner tag, which every pool host and no
+	// job instance carries. The volume half is the cache's own attach statement. It
+	// needs Cache.
+	SelfAttach bool
 	// CodeBuild, when non-nil, adds the statements a codebuild NODE needs.
 	//
 	// A DIFFERENT PRINCIPAL FROM THE BUILD ITSELF, and that split is the whole
@@ -601,6 +607,49 @@ func (in Inputs) Build() (Policy, error) {
 		}
 
 		p.Statement = append(p.Statement, stmts...)
+	}
+
+	if in.SelfAttach {
+		if in.Cache == nil {
+			return Policy{}, errors.New("awspolicy: a node attaches cache volumes to its own instance " +
+				"only for a cache; this policy has none")
+		}
+
+		// THE VOLUME HALF ONLY, from the cache's attach statement. On "*" it would also
+		// allow any instance carrying billet's owner tag, an ec2 node's job among them, and
+		// a narrower Allow beside it constrains nothing: the instance is this statement's.
+		for i := range p.Statement {
+			if p.Statement[i].Sid == "BilletCacheAttach" {
+				p.Statement[i].Resource = []string{"arn:" + partition + ":ec2:*:*:volume/*"}
+			}
+		}
+
+		// THE INSTANCE HALF. AttachVolume and DetachVolume authorize the volume and the
+		// instance each, and the cache's attach statement scopes the volume by billet's
+		// owner tag, which a pool host does not carry: it is launched with the pool's.
+		p.Statement = append(p.Statement, Statement{
+			Sid: "BilletCacheSelfAttach", Effect: "Allow",
+			Action:    ebss3.SelfAttachIAMActions(),
+			Resource:  []string{"arn:" + partition + ":ec2:*:*:instance/*"},
+			Condition: ownerTagCondition("aws:ResourceTag/"+ec2.PoolOwnerTagKey, in.Owner),
+		})
+
+		// AND THE TAGS A CREATE CARRIES, which EC2 authorizes as ec2:CreateTags of its
+		// own. An ec2 node's runtime statement grants that; a metal node's role launches
+		// nothing and has none, and its first CreateVolume was refused UnauthorizedOperation
+		// under exactly this policy without this statement (2026-11-09). Only the two
+		// creates the store makes, only on the volumes and snapshots they make, and only
+		// with this deployment's owner tag.
+		if in.NoCompute {
+			tags := createTagConditionFor(in.Owner, false, []string{"CreateVolume", "CreateSnapshot"})
+			p.Statement = append(p.Statement, Statement{
+				Sid: "BilletCacheTag", Effect: "Allow",
+				Action: ec2.RuntimeTagIAMActions(),
+				Resource: []string{"arn:" + partition + ":ec2:*:*:volume/*",
+					"arn:" + partition + ":ec2:*::snapshot/*"},
+				Condition: tags,
+			})
+		}
 	}
 
 	if in.CodeBuild != nil {
@@ -1867,6 +1916,12 @@ func createTagCondition(owner string, builder bool) map[string]any {
 		actions = append(actions, "CreateImage")
 	}
 
+	return createTagConditionFor(owner, builder, actions)
+}
+
+// createTagConditionFor is createTagCondition for the create actions named: a role that
+// makes only some of the resources a runtime role does is allowed to tag only those.
+func createTagConditionFor(owner string, builder bool, actions []string) map[string]any {
 	stringEquals := map[string]any{"ec2:CreateAction": actions}
 	cond := map[string]any{"StringEquals": stringEquals}
 	if owner == "" {

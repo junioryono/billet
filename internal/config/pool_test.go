@@ -114,6 +114,83 @@ func TestAPoolMayHandInitItsKernelAndCephIdentity(t *testing.T) {
 	}
 }
 
+// metalArgs are the init_args a pool on AWS metal hands its hosts for an ebs-s3 site
+// (ADR-030), and metalSites declares that site.
+const (
+	metalArgs = "    init_args: ['--site=metal', '--ebs-s3-region=us-west-2', '--ebs-s3-availability-zone=us-west-2a', " +
+		"'--ebs-s3-bucket=billet-cache-example', '--cache-listen=10.240.0.1:7718', " +
+		"'--cache-guest-endpoint=http://10.240.0.1:7718']\n    boot_prelude:"
+	metalSites = "sites:\n  - name: metal\n    store: ebs-s3\n"
+)
+
+// A POOL ON AWS METAL HANDS ITS HOSTS THEIR SITE, ITS STORE AND THE CACHE LISTENER, and
+// each change that would leave a host rented and unable to join or register is refused.
+func TestAPoolMayHandItsHostsAnEBSSite(t *testing.T) {
+	t.Parallel()
+
+	// AWS METAL ALONE: the store is attached by the host's own instance.
+	metalOnly := strings.Replace(poolBlock, "          - {source: phoenixnap, shape: s2.c2.small, location: PHX}\n", "", 1)
+	if metalOnly == poolBlock {
+		t.Fatal("the pool block has no phoenixNAP choice to leave out")
+	}
+	valid := poolConfig(strings.Replace(metalOnly, "    boot_prelude:", metalArgs, 1)) + metalSites
+	if _, err := loadServer(t, valid); err != nil {
+		t.Fatalf("a pool handing its hosts an ebs-s3 site was refused: %v", err)
+	}
+
+	for name, c := range map[string]struct{ from, to, want string }{
+		"an undeclared site":        {"    store: ebs-s3\n", "    store: ebs-s3\n  - name: other\n    store: ceph\n", ""},
+		"a site that is not ebs-s3": {"    store: ebs-s3\n", "    store: ceph\n", "site \"metal\"'s store is ceph"},
+		"the store in another zone": {"--ebs-s3-availability-zone=us-west-2a", "--ebs-s3-availability-zone=us-west-2b",
+			"where server.pool.aws_metal orders its hosts"},
+		"a store with no site":     {"'--site=metal', ", "", "no --site"},
+		"a store with no listener": {"'--cache-listen=10.240.0.1:7718', '--cache-guest-endpoint=http://10.240.0.1:7718'", "", "no --cache-listen"},
+		"half a listener":          {", '--cache-guest-endpoint=http://10.240.0.1:7718'", "", "together or not at all"},
+		"a loopback listener": {"'--cache-listen=10.240.0.1:7718', '--cache-guest-endpoint=http://10.240.0.1:7718'",
+			"'--cache-listen=127.0.0.1:7718', '--cache-guest-endpoint=http://127.0.0.1:7718'", "non-loopback"},
+		"an endpoint elsewhere": {"'--cache-guest-endpoint=http://10.240.0.1:7718'",
+			"'--cache-guest-endpoint=http://10.240.0.2:7718'", "name exactly the address in"},
+		"an https endpoint": {"'--cache-guest-endpoint=http://10.240.0.1:7718'",
+			"'--cache-guest-endpoint=https://10.240.0.1:7718'", "must use http on the isolated Firecracker bridge"},
+		"a store with no bucket": {"'--ebs-s3-bucket=billet-cache-example', ", "", "server.pool.init_args: "},
+		"a phoenixNAP fallback": {"          - {source: aws-metal, shape: z1d.metal}\n",
+			"          - {source: aws-metal, shape: z1d.metal}\n          - {source: phoenixnap, shape: s2.c2.small, location: PHX}\n",
+			"which only a host on AWS metal can attach"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if !strings.Contains(valid, c.from) {
+				t.Fatalf("the valid config has no %q to change", c.from)
+			}
+			body := strings.Replace(valid, c.from, c.to, 1)
+			if name == "an undeclared site" {
+				body = strings.Replace(valid, "  - name: metal\n", "  - name: elsewhere\n", 1)
+				c.want = "is not a site this control plane declares"
+			}
+			_, err := loadServer(t, body)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("%s was answered %v, want a refusal saying %q", name, err, c.want)
+			}
+		})
+	}
+
+	// AN EBS-S3 SITE THE POOL'S HOSTS ARE AT WITHOUT THE STORE keeps caches on the hosts.
+	noStore := poolConfig(strings.Replace(poolBlock, "    boot_prelude:",
+		"    init_args: ['--site=metal']\n    boot_prelude:", 1)) + metalSites
+	if _, err := loadServer(t, noStore); err == nil || !strings.Contains(err.Error(), "must name it") {
+		t.Fatalf("a pool at an ebs-s3 site with no store was answered %v", err)
+	}
+
+	// AND A CEPH SITE WITHOUT ONE IS A POOL AS IT ALWAYS WAS.
+	cephSite := strings.Replace(noStore, "    store: ebs-s3\n", "    store: ceph\n", 1)
+	if cephSite == noStore {
+		t.Fatal("the config has no ebs-s3 site to make a Ceph one")
+	}
+	if _, err := loadServer(t, cephSite); err != nil {
+		t.Fatalf("a pool whose hosts are at a Ceph site, naming no store, was refused: %v", err)
+	}
+}
+
 func TestAPoolBlockThatCannotWorkIsRefused(t *testing.T) {
 	t.Parallel()
 	for name, c := range map[string]struct{ from, to, want string }{

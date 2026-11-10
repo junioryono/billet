@@ -857,7 +857,7 @@ func TestARealFailureSurvivesAnExpiredContext(t *testing.T) {
 func TestStderrIsBoundedAsItArrives(t *testing.T) {
 	t.Parallel()
 
-	w := &tailWriter{limit: 8}
+	w := &tailWriter{Limit: 8}
 
 	for _, chunk := range []string{"aaaa", "bbbb", "cccc"} {
 		n, err := w.Write([]byte(chunk))
@@ -877,7 +877,7 @@ func TestStderrIsBoundedAsItArrives(t *testing.T) {
 	}
 
 	// One write larger than the whole budget must not grow the buffer either.
-	big := &tailWriter{limit: 4}
+	big := &tailWriter{Limit: 4}
 	oversized := []byte(strings.Repeat("x", 10000) + "END")
 
 	n, err := big.Write(oversized)
@@ -902,7 +902,7 @@ func TestStderrIsBoundedAsItArrives(t *testing.T) {
 	// a runtime panic, and a control plane must not carry one waiting for the next
 	// caller who constructs this type.
 	for _, limit := range []int{0, -1, -2} {
-		none := &tailWriter{limit: limit}
+		none := &tailWriter{Limit: limit}
 
 		const payload = "anything at all"
 

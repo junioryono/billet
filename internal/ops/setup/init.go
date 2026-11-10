@@ -198,6 +198,18 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 	cacheGuestEndpoint := fs.String("cache-guest-endpoint", "",
 		"the HTTP origin placed in guest metadata; it must name the same address as "+
 			"--cache-listen, and the two are given together or not at all")
+	site := fs.String("site", "",
+		"the control plane's site this host is at (firecracker); required with --ebs-s3-bucket")
+	ebsRegion := fs.String("ebs-s3-region", "",
+		"on AWS metal, the region of the site's ebs-s3 store (firecracker, with --ebs-s3-bucket)")
+	ebsZone := fs.String("ebs-s3-availability-zone", "",
+		"the zone the store's volumes are made in, which must be this instance's")
+	ebsBucket := fs.String("ebs-s3-bucket", "",
+		"the store's bucket: keeps this host's caches off it, on volumes it attaches to its own "+
+			"instance and objects in the bucket, while golden images and root disks stay on Ceph")
+	ebsPrefix := fs.String("ebs-s3-prefix", "", "the store's object prefix (default billet-cache)")
+	ebsKMS := fs.String("ebs-s3-kms-key-id", "",
+		"a customer-managed key for the store's volumes and snapshots; empty is the account's default")
 
 	// --- codebuild ---
 	cbProject := fs.String("codebuild-project", "",
@@ -392,6 +404,17 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 			return fmt.Errorf("--join-deployment: %w", err)
 		}
 	}
+	// A SITE IS THE CONTROL PLANE'S TO DECLARE, so a host names one only when it joins a
+	// control plane that does: a whole deployment written here would name a site its
+	// own control plane does not declare, and refuse its node's registration for good.
+	if !joining {
+		for _, name := range []string{"site", "ebs-s3-region", "ebs-s3-availability-zone", "ebs-s3-bucket",
+			"ebs-s3-prefix", "ebs-s3-kms-key-id"} {
+			if setFlags[name] {
+				return fmt.Errorf("--%s names this host's place in a control plane's sites; pass it with --join", name)
+			}
+		}
+	}
 	if joining && emitValue == emitAnsible {
 		return errors.New("--join writes this machine's node config and prints the control " +
 			"plane's half; it has no inventory form, so it cannot be combined with --emit ansible")
@@ -568,6 +591,9 @@ func Init(ctx context.Context, env cli.Env, args []string) error {
 			CephKeyringPath:    *cephKeyring,
 			CacheListen:        *cacheListen,
 			CacheGuestEndpoint: *cacheGuestEndpoint,
+			Site:               *site,
+			EBSS3: ebsS3Inputs(*ebsRegion, *ebsZone, *ebsBucket, *ebsPrefix, *ebsKMS,
+				setFlags),
 		},
 	}
 
@@ -1357,6 +1383,27 @@ func serviceOwnership(env cli.Env, path string) {
 		"unit reads it with). Install the billet package — its postinstall creates the user and "+
 		"group — or run `chown root:%s %s %s` before `billet local up`.\n\n",
 		path, initconfig.ServiceGroup, initconfig.ServiceGroup, filepath.Dir(path), path)
+}
+
+// ebsS3Inputs is node.ebs_s3 from its flags, nil when none was passed. Passing any of
+// them asks for the store, so a partial set reaches validation as one rather than
+// being dropped as if absent.
+//
+// TRIMMED, AS LOADING THE CONFIG TRIMS THEM: a pool's init_args are checked as the
+// config will hold them, so a padded bucket the pool accepted must not be one the host
+// refuses after it was rented.
+func ebsS3Inputs(region, zone, bucket, prefix, kms string, set map[string]bool) *config.EBSS3Config {
+	for _, name := range []string{"ebs-s3-region", "ebs-s3-availability-zone", "ebs-s3-bucket",
+		"ebs-s3-prefix", "ebs-s3-kms-key-id"} {
+		if set[name] {
+			return &config.EBSS3Config{
+				Region: strings.TrimSpace(region), AvailabilityZone: strings.TrimSpace(zone),
+				Bucket: strings.TrimSpace(bucket), Prefix: strings.TrimSpace(prefix), KMSKeyID: strings.TrimSpace(kms),
+			}
+		}
+	}
+
+	return nil
 }
 
 // printInitNextFor is printInitNext, except when the App identity was carried

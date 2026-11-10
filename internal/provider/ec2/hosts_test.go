@@ -260,6 +260,65 @@ func TestFindReadsAnOrderBack(t *testing.T) {
 	}
 }
 
+// LIVE IS EVERY POOL HOST OF THIS DEPLOYMENT EC2 HAS NOT TERMINATED, asked of EC2 by the
+// deployment's pool tag; a stopped one can start again, so it is live; and an instance the
+// filter returned that is not a well-formed pool host is an error, never left out.
+func TestLiveListsEveryPoolHostNotTerminated(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusOK, describeReply("", poolHostXML("i-1", "dep-1", "o-1", "running"),
+			poolHostXML("i-2", "dep-1", "o-2", "stopped"), poolHostXML("i-3", "dep-1", "o-3", "terminated"))
+	}
+	live, err := newTestProvider(t, f, nil).Hosts().Live(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 2 || live[0].ID != "i-1" || live[1].ID != "i-2" {
+		t.Fatalf("live = %+v, want i-1 and i-2", live)
+	}
+	params := f.paramsFor(t, "DescribeInstances")
+	if params.Get("Filter.1.Name") != "tag:"+poolOwnerTag || params.Get("Filter.1.Value.1") != "dep-1" {
+		t.Errorf("filters = %v", params)
+	}
+
+	g := newFakeEC2(t)
+	g.respond = func(string, url.Values) (int, string) {
+		return http.StatusOK, describeReply("", poolHostXML("i-1", "dep-1", "o-1", "running"), poolOwnerOnlyXML("i-2"))
+	}
+	if live, err := newTestProvider(t, g, nil).Hosts().Live(t.Context()); !errors.Is(err, ErrNotAPoolHost) {
+		t.Errorf("a list with a malformed pool host answered %+v, %v", live, err)
+	}
+}
+
+// A READER NEEDS NO LAUNCH NETWORK, and still the region and endpoint rules and an owner;
+// it lists the deployment's jobs and its pool hosts apart.
+func TestNewReaderNeedsARegionAndAnOwnerAlone(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewReader("dep-1", "us-west-2", ""); err != nil {
+		t.Errorf("a reader with a region and an owner was refused: %v", err)
+	}
+	if _, err := NewReader("dep-1", "x@attacker.example/?", ""); err == nil {
+		t.Error("a reader took a region that chooses another host")
+	}
+	if _, err := NewReader("dep-1", "us-west-2", "http://attacker.example"); err == nil {
+		t.Error("a reader took an endpoint the provider's rule refuses")
+	}
+	if _, err := NewReader("", "us-west-2", ""); err == nil {
+		t.Error("a reader took no owner")
+	}
+
+	// AND A PROVIDER THAT LAUNCHES IS NOT SPARED THE GROUPS.
+	f := newFakeEC2(t)
+	cfg := validEC2Config(f.URL)
+	cfg.SecurityGroupIDs = nil
+	if _, err := New("dep-1", cfg); err == nil || !strings.Contains(err.Error(), "security_group_ids") {
+		t.Errorf("a launching provider with no security group answered %v", err)
+	}
+}
+
 // AN INSTANCE THAT IS NOT THIS DEPLOYMENT'S POOL HOST is neither described as one nor
 // terminated, whatever id the caller names.
 func TestOnlyThisDeploymentsPoolHostsAreTerminated(t *testing.T) {

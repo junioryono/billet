@@ -34,6 +34,11 @@ type fakeBlocks struct {
 	// deleteErr ids fail deletion with a NON-ownership error (a transport or
 	// authorization failure), which eviction must never swallow.
 	deleteErr map[string]bool
+	// beforeSnapshot, when set, is told each volume CreateSnapshot is asked for, before
+	// the snapshot is taken.
+	beforeSnapshot func(volume string)
+	// snapshotErr, when set, refuses every CreateSnapshot.
+	snapshotErr error
 }
 
 // errFakeDelete is a stand-in for a real (non-ownership) delete failure.
@@ -53,7 +58,10 @@ func (f *fakeBlocks) CreateVolume(
 	return id, nil
 }
 
-func (f *fakeBlocks) DeleteVolume(_ context.Context, id string) error {
+func (f *fakeBlocks) DeleteVolume(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.deleteErr[id] {
 		return errFakeDelete
 	}
@@ -93,6 +101,12 @@ func (f *fakeBlocks) CreateSnapshot(
 ) (string, error) {
 	if !strings.HasPrefix(volume, "vol-") {
 		return "", errors.New("not a volume")
+	}
+	if f.beforeSnapshot != nil {
+		f.beforeSnapshot(volume)
+	}
+	if f.snapshotErr != nil {
+		return "", f.snapshotErr
 	}
 	f.snapshotTokens = append(f.snapshotTokens, token)
 	f.nextSnapshot++
@@ -153,7 +167,10 @@ type fakeObjects struct {
 
 func newFakeObjects() *fakeObjects { return &fakeObjects{objects: map[string]fakeObject{}} }
 
-func (f *fakeObjects) Get(_ context.Context, key string) ([]byte, string, bool, error) {
+func (f *fakeObjects) Get(ctx context.Context, key string) ([]byte, string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", false, err
+	}
 	f.lastGetKey = key
 	if f.getErr != nil {
 		return nil, "", false, f.getErr
@@ -168,11 +185,14 @@ func (f *fakeObjects) Get(_ context.Context, key string) ([]byte, string, bool, 
 }
 
 func (f *fakeObjects) Put(
-	_ context.Context,
+	ctx context.Context,
 	key string,
 	body []byte,
 	expected string,
 ) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if f.putErr != nil {
 		return "", f.putErr
 	}

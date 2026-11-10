@@ -617,19 +617,21 @@ func TestMatrixTiersReadEveryProviderATierNames(t *testing.T) {
 
 // A POOL'S CELLS ARE DECLARED, AND SAY WHY THEY ARE NOT RUN. Firecracker hosts rented from
 // either source (ADR-030), on both architectures, for every cache and case: each is a
-// cell billet will serve, not run until a pool site has a store and the pool has had its
-// real run, so the matrix says so rather than leaving the pool out.
+// cell billet will serve, not run until the lane runs it (AWS metal, #829) or its source
+// has a store and an order (phoenixNAP), so the matrix says so rather than leaving the
+// pool out.
 func TestAPoolsCellsAreDeclaredAndNotRun(t *testing.T) {
 	t.Parallel()
+	waits := map[string]string{config.PoolSourceAWSMetal: "#829", config.PoolSourcePhoenixNAP: "#828"}
 	per := map[string]int{}
 	for _, c := range matrixCells() {
 		if c.Backend != config.ProviderFirecracker {
 			continue
 		}
 		per[c.Source+"/"+string(c.Arch)]++
-		if c.Run != nil || c.Unsupported || !strings.Contains(c.Why, "#553") {
-			t.Errorf("%s %s %s %s: %+v; want not run, saying it waits on #553", matrixBackendName(&c), c.Arch,
-				c.Cache, c.Case, c)
+		if c.Run != nil || c.Unsupported || waits[c.Source] == "" || !strings.Contains(c.Why, waits[c.Source]) {
+			t.Errorf("%s %s %s %s: %+v; want not run, saying it waits on %s", matrixBackendName(&c), c.Arch,
+				c.Cache, c.Case, c, dashIfEmpty(waits[c.Source]))
 		}
 	}
 	want := len(matrixCaches) * len(matrixCases)

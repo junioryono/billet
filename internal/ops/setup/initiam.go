@@ -121,10 +121,23 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 	// backend: it asks whether the node's compute runs on this machine, and an
 	// operator who reaches it needs to know which providers it is asking about rather
 	// than being told what theirs is not.
+	// A FIRECRACKER NODE ON AWS METAL CALLS ONE AWS API, its site's ebs-s3 store, which
+	// it reaches with its pool host's instance profile (ADR-030).
+	if cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.EBSS3 != nil {
+		if *builder || *payloadBucket != "" || *builderSubnet != "" || *builderGroup != "" ||
+			*roleARN != "" || *buildRole || *controllerSweep || *account != "" {
+			return errors.New("a Firecracker node's role holds its cache store alone; it takes " +
+				"--kms-key-arn, --deployment and --account-wide, and no flag of an ec2 node's or a builder's")
+		}
+
+		return printMetalCacheIAM(env, cfg, *kmsKeyARN, *deployment, *accountWide)
+	}
+
 	if cfg.Node.Provider.RunsOnHost() {
 		return fmt.Errorf("`billet init iam` describes a REMOTE node's role, but node.provider "+
 			"is %s, which runs work on this host — an IAM policy is only meaningful for a "+
-			"backend that calls an AWS API, which means %s or %s",
+			"backend that calls an AWS API, which means %s or %s, or a firecracker node "+
+			"with node.ebs_s3 on AWS metal",
 			cfg.Node.Provider, config.ProviderEC2, config.ProviderCodeBuild)
 	}
 
@@ -166,6 +179,50 @@ func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 	}
 
 	in.Owner = owner
+
+	policy, err := in.Build()
+	if err != nil {
+		return err
+	}
+
+	body, err := policy.JSON()
+	if err != nil {
+		return fmt.Errorf("render the policy: %w", err)
+	}
+
+	fmt.Fprintln(env.Stdout, string(body))
+
+	return nil
+}
+
+// printMetalCacheIAM prints the role a pool host's instance profile carries for a
+// Firecracker node on AWS metal: its site's ebs-s3 store, and attaching that store's
+// volumes to its own instance (ADR-030). It launches nothing, so it is NoCompute.
+func printMetalCacheIAM(env cli.Env, cfg *config.Config, kmsKeyARN, deployment string, accountWide bool) error {
+	owner, err := resolveDeploymentOwner(cfg, deployment, accountWide)
+	if err != nil {
+		return err
+	}
+
+	store := cfg.Node.EBSS3
+	key := kmsKeyARN
+	if key == "" {
+		key = store.KMSKeyID
+	}
+	if key != "" && !strings.HasPrefix(key, "arn:") {
+		return fmt.Errorf("node.ebs_s3.kms_key_id is %q, which is not a key ARN; IAM resource "+
+			"scoping needs the full ARN, so pass --kms-key-arn arn:aws:kms:<region>:<account>:key/<id> "+
+			"(the EBS config may keep the short form)", key)
+	}
+
+	in := awspolicy.Inputs{
+		Owner:      owner,
+		Partition:  awspolicy.PartitionForRegion(store.Region),
+		Region:     store.Region,
+		NoCompute:  true,
+		Cache:      &awspolicy.Cache{Bucket: store.Bucket, Prefix: store.Prefix, KMSKeyARN: key},
+		SelfAttach: true,
+	}
 
 	policy, err := in.Build()
 	if err != nil {

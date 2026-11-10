@@ -338,51 +338,8 @@ func ec2Preflight(
 		}
 	}
 
-	// The cache bucket, probed under the deployment's own prefix — the grant a
-	// job will actually use. Skipped when no identity is minted yet, because
-	// the prefix is derived from it.
-	if cfg.Node.EBSS3 != nil {
-		owner, err := app.AuthorizeOwner(cfg, bundle)
-		switch {
-		case err != nil:
-			return fmt.Errorf("node.ebs_s3: resolve the deployment identity: %w", err)
-		case owner == "":
-			fmt.Fprintf(env.Stdout, "cache    bucket probe skipped: no deployment identity minted yet "+
-				"(it is minted on the server's first start)\n")
-		default:
-			// The SAME namespace the runtime and decommission use, or the probe
-			// reads a prefix no job ever touches.
-			store, err := ebss3.New(*cfg.Node.EBSS3, app.CacheNamespace(owner, cfg.Node.Site), creds)
-			if err != nil {
-				return fmt.Errorf("node.ebs_s3: %w", err)
-			}
-			// THE VERDICT IS judgeCacheProbe's, not this switch's. What each
-			// answer means is in cacheprobe.go, where a test can reach it.
-			probeErr := store.CheckAccess(ctx)
-			switch cache.JudgeProbe(probeErr) {
-			case cache.ProbeAnswered:
-				// A BUCKET THAT ANSWERS IS NOT A CACHE. Without a node.cache
-				// listener nothing on this host ever reads or writes that prefix,
-				// and this line read as though the cache were working — which is
-				// most of why the whole shape was silent. The refusal is above;
-				// this stops the report contradicting it three lines later.
-				reachable := ""
-				if cfg.Node.Cache == nil {
-					reachable = " (but nothing on this node serves it — see the cache " +
-						"line above)"
-				}
-
-				fmt.Fprintf(env.Stdout, "cache    bucket %s answers under this deployment's prefix%s\n",
-					cfg.Node.EBSS3.Bucket, reachable)
-			case cache.ProbeInconclusive:
-				fmt.Fprintf(env.Stdout, "cache    bucket probe INCONCLUSIVE: %v\n", probeErr)
-				fmt.Fprintf(env.Stdout, "         (a 403 here is EITHER a refused identity OR a healthy miss "+
-					"under billet's minimal grant, whose prefix-conditioned ListBucket cannot "+
-					"match a GetObject; a real job read will settle it)\n")
-			case cache.ProbeFailed:
-				return fmt.Errorf("node.ebs_s3: %w", probeErr)
-			}
-		}
+	if err := probeCacheBucket(ctx, env, cfg, creds, bundle); err != nil {
+		return err
 	}
 
 	if !authorize {
@@ -1011,3 +968,84 @@ func printCephReport(env cli.Env, cfg *config.CephConfig, report ceph.Report) {
 // iamEndpointOverride points the instance-profile probe at a fake for tests —
 // production always derives the partition-global IAM endpoint from the region.
 var iamEndpointOverride = ""
+
+// checkMetalCacheStore checks what a Firecracker node on AWS metal needs of its site's
+// ebs-s3 store: an instance of its own to attach the volumes to, in the store's zone, and
+// a bucket that answers under this deployment's prefix.
+//
+// instance is how it learns which instance it is on: app.ThisInstance, or a test's.
+func checkMetalCacheStore(
+	ctx context.Context, env cli.Env, cfg *config.Config, bundle *wirecert.Bundle,
+	instance func(context.Context) (ebss3.Host, error),
+) error {
+	host, err := instance(ctx)
+	if err != nil {
+		return fmt.Errorf("node.ebs_s3: this node attaches its cache volumes to its own instance, and "+
+			"could not read which instance that is: %w", err)
+	}
+
+	if err := ebss3.CheckHost(*cfg.Node.EBSS3, host); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(env.Stdout, "cache    ebs-s3 volumes attach to this instance, %s in %s\n",
+		host.InstanceID, host.AvailabilityZone)
+
+	return probeCacheBucket(ctx, env, cfg, awscreds.Default(), bundle)
+}
+
+// probeCacheBucket reads the site's ebs-s3 bucket under this deployment's own prefix,
+// the grant a job will actually use: an ec2 node's, and a Firecracker node's on AWS
+// metal (ADR-030). Skipped when no identity is minted yet, because the prefix is
+// derived from it.
+func probeCacheBucket(
+	ctx context.Context, env cli.Env, cfg *config.Config, creds awscreds.Source, bundle *wirecert.Bundle,
+) error {
+	if cfg.Node.EBSS3 == nil {
+		return nil
+	}
+
+	owner, err := app.AuthorizeOwner(cfg, bundle)
+	switch {
+	case err != nil:
+		return fmt.Errorf("node.ebs_s3: resolve the deployment identity: %w", err)
+	case owner == "":
+		fmt.Fprintf(env.Stdout, "cache    bucket probe skipped: no deployment identity minted yet "+
+			"(it is minted on the server's first start)\n")
+	default:
+		// The SAME namespace the runtime and decommission use, or the probe
+		// reads a prefix no job ever touches.
+		store, err := ebss3.New(*cfg.Node.EBSS3, app.CacheNamespace(owner, cfg.Node.Site), creds)
+		if err != nil {
+			return fmt.Errorf("node.ebs_s3: %w", err)
+		}
+		// THE VERDICT IS judgeCacheProbe's, not this switch's. What each
+		// answer means is in cacheprobe.go, where a test can reach it.
+		probeErr := store.CheckAccess(ctx)
+		switch cache.JudgeProbe(probeErr) {
+		case cache.ProbeAnswered:
+			// A BUCKET THAT ANSWERS IS NOT A CACHE. Without a node.cache
+			// listener nothing on this host ever reads or writes that prefix,
+			// and this line read as though the cache were working — which is
+			// most of why the whole shape was silent. The refusal is above;
+			// this stops the report contradicting it three lines later.
+			reachable := ""
+			if cfg.Node.Cache == nil {
+				reachable = " (but nothing on this node serves it — see the cache " +
+					"line above)"
+			}
+
+			fmt.Fprintf(env.Stdout, "cache    bucket %s answers under this deployment's prefix%s\n",
+				cfg.Node.EBSS3.Bucket, reachable)
+		case cache.ProbeInconclusive:
+			fmt.Fprintf(env.Stdout, "cache    bucket probe INCONCLUSIVE: %v\n", probeErr)
+			fmt.Fprintf(env.Stdout, "         (a 403 here is EITHER a refused identity OR a healthy miss "+
+				"under billet's minimal grant, whose prefix-conditioned ListBucket cannot "+
+				"match a GetObject; a real job read will settle it)\n")
+		case cache.ProbeFailed:
+			return fmt.Errorf("node.ebs_s3: %w", probeErr)
+		}
+	}
+
+	return nil
+}

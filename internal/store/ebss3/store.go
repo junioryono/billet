@@ -82,6 +82,14 @@ type Store struct {
 	// rejoining is a slot per commit allowed to hold a part in memory.
 	rejoining chan struct{}
 	now       func() time.Time
+
+	// host is set for a store that attaches its volumes to its own instance and hands
+	// them to its guests as block devices (attach.go, NewAttached); nil for one whose
+	// volumes a provider attaches to a job's instance.
+	host     *Host
+	attach   attachAPI
+	disks    hostDisks
+	sessions func() (func(name string) bool, error)
 }
 
 var _ storecontract.Store = (*Store)(nil)
@@ -429,8 +437,15 @@ func (s Store) Create(
 		return storecontract.Volume{}, errors.Join(err, s.blocks.DeleteVolume(ctx, volume))
 	}
 
+	device := volume
+	if s.local() {
+		if device, err = s.attachLocal(ctx, volume); err != nil {
+			return storecontract.Volume{}, errors.Join(err, s.releaseLocal(ctx, key, leaseID, volume))
+		}
+	}
+
 	return storecontract.Volume{
-		Key: key, Handle: volume, Device: volume, Lease: lease,
+		Key: key, Handle: volume, Device: device, Lease: lease,
 	}, nil
 }
 
@@ -520,12 +535,14 @@ func (s Store) Snapshot(
 	if err := checkKey(volume.Key); err != nil {
 		return storecontract.Candidate{}, err
 	}
-	if !strings.HasPrefix(volume.Handle, "vol-") || volume.Handle != volume.Device {
+	if !strings.HasPrefix(volume.Handle, "vol-") || (!s.local() && volume.Handle != volume.Device) {
 		return storecontract.Candidate{}, errors.New("ebs-s3: a candidate must come from an EBS volume")
 	}
-	if err := volume.Filesystem.Valid(); err != nil {
-		return storecontract.Candidate{}, fmt.Errorf("ebs-s3: remote filesystem proof: %w", err)
+	filesystem, err := s.candidateFilesystem(ctx, volume)
+	if err != nil {
+		return storecontract.Candidate{}, err
 	}
+	volume.Filesystem = filesystem
 	if err := s.ensureState(ctx, volume.Key); err != nil {
 		return storecontract.Candidate{}, err
 	}
@@ -562,6 +579,56 @@ func (s Store) Snapshot(
 	}
 
 	return candidate, nil
+}
+
+// candidateFilesystem is the filesystem proof a candidate is published under.
+//
+// A REMOTE VOLUME'S IS THE GUEST'S, collected after it unmounted the volume, because the
+// node has no block path to it. A SELF-ATTACHED VOLUME'S IS THIS HOST'S, as a Ceph
+// volume's is: the device is proved by its serial, checked read-only, and then taken off
+// the instance only on proof that nothing on the host holds it, since EBS detaches a
+// volume in use without refusing. What the guest said about it is not used.
+func (s Store) candidateFilesystem(
+	ctx context.Context,
+	volume storecontract.Volume,
+) (storecontract.Filesystem, error) {
+	if !s.local() {
+		if err := volume.Filesystem.Valid(); err != nil {
+			return storecontract.Filesystem{}, fmt.Errorf("ebs-s3: remote filesystem proof: %w", err)
+		}
+
+		return volume.Filesystem, nil
+	}
+
+	device, err := s.MappedDevice(ctx, volume)
+	if errors.Is(err, storecontract.ErrDeviceUnknown) {
+		// A PUBLICATION THAT FAILED AFTER ITS DETACH, retried: the volume is attached to
+		// nothing, so it is attached here again and proved again, never published on the
+		// earlier proof, which said nothing of what happened to it since.
+		attachment, found, readErr := s.attach.Attachment(ctx, volume.Handle)
+		if readErr == nil && found && attachment.Instance == "" {
+			device, err = s.attachLocal(ctx, volume.Handle)
+		}
+	}
+	if err != nil {
+		return storecontract.Filesystem{}, fmt.Errorf("ebs-s3: find the device of cache %q before "+
+			"publication: %w", volume.Key, err)
+	}
+
+	filesystem, err := s.disks.Verify(ctx, device)
+	if err != nil {
+		return storecontract.Filesystem{}, fmt.Errorf("ebs-s3: verify cache %q before publication: %w",
+			volume.Key, err)
+	}
+	if err := filesystem.Valid(); err != nil {
+		return storecontract.Filesystem{}, err
+	}
+
+	if err := s.detachLocal(ctx, volume.Handle); err != nil {
+		return storecontract.Filesystem{}, err
+	}
+
+	return filesystem, nil
 }
 
 // PublishCAS advances a pointer in the same conditional S3 write that consumes its writer.
@@ -682,8 +749,15 @@ func (s Store) Clone(
 			s.dropActive(ctx, key, leaseID))
 	}
 
+	device := volume
+	if s.local() {
+		if device, err = s.attachLocal(ctx, volume); err != nil {
+			return storecontract.Volume{}, errors.Join(err, s.releaseLocal(ctx, key, leaseID, volume))
+		}
+	}
+
 	return storecontract.Volume{
-		Key: key, Generation: selected, Handle: volume, Device: volume, Lease: lease,
+		Key: key, Generation: selected, Handle: volume, Device: device, Lease: lease,
 	}, nil
 }
 
@@ -745,6 +819,11 @@ func (s Store) Discard(ctx context.Context, volume storecontract.Volume) error {
 	}
 	if err := s.ensureState(ctx, volume.Key); err != nil {
 		return err
+	}
+	if s.local() {
+		if err := s.detachLocal(ctx, volume.Handle); err != nil {
+			return err
+		}
 	}
 	if err := s.blocks.DeleteVolume(ctx, volume.Handle); err != nil {
 		return err

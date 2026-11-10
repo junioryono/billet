@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -81,12 +82,36 @@ const (
 // guardNodeStore puts the store a node's provider uses behind a breaker. Only a store
 // that stands between a job and its start has one to guard.
 func guardNodeStore(cfg *config.Config, service *node.CacheService) {
-	switch cfg.Node.Provider {
-	case config.ProviderFirecracker:
-		service.GuardStore("ceph", cephStoreDeadline)
-	case config.ProviderEC2:
-		service.GuardStore("ebs-s3", ebsS3StoreDeadline)
+	if name, deadline := nodeStoreGuard(cfg); name != "" {
+		service.GuardStore(name, deadline)
 	}
+}
+
+// nodeStoreGuard is the store a node's breaker names and how long a job waits for it,
+// or no name for a node whose jobs wait on no store.
+func nodeStoreGuard(cfg *config.Config) (string, time.Duration) {
+	switch {
+	case cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.EBSS3 != nil:
+		return string(config.SiteStoreEBSS3), ebsS3StoreDeadline
+	case cfg.Node.Provider == config.ProviderFirecracker:
+		return string(config.SiteStoreCeph), cephStoreDeadline
+	case cfg.Node.Provider == config.ProviderEC2:
+		return string(config.SiteStoreEBSS3), ebsS3StoreDeadline
+	}
+
+	return "", 0
+}
+
+// NodeSiteStore is the store a node's registration names, when its caches use one its
+// provider has not always used: ebs-s3 for a Firecracker node on AWS metal, whose guests'
+// root disks stay on its own Ceph (ADR-030). Empty for every other node, which then
+// sends nothing a plane has not always read.
+func NodeSiteStore(cfg *config.Config) config.SiteStoreKind {
+	if cfg.Node != nil && cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.EBSS3 != nil {
+		return config.SiteStoreEBSS3
+	}
+
+	return ""
 }
 
 // NewNodeCacheService is the guest cache service a node.cache block describes,
@@ -125,9 +150,27 @@ func NewNodeCacheService(
 // nodeCacheStore is the site store a node.cache block's provider reads and
 // writes: the value the node's cache service is handed, so what it offers
 // beyond the contract (the generation check among it) is proved on it.
-func nodeCacheStore(cfg *config.Config, deployment string) (storecontract.Store, error) {
+//
+// instance is how a node on AWS metal learns its own instance: ThisInstance, or a test's.
+func nodeCacheStore(
+	ctx context.Context, cfg *config.Config, deployment string,
+	instance func(context.Context) (ebss3.Host, error),
+) (storecontract.Store, error) {
 	switch cfg.Node.Provider {
 	case config.ProviderFirecracker:
+		// ON AWS METAL, THE SITE'S STORE IS EBS AND S3 (ADR-030): the guests' root disks
+		// stay on the host's own Ceph, and the caches go where a shrinking pool cannot
+		// take them, on volumes this node attaches to its own instance.
+		if cfg.Node.EBSS3 != nil {
+			host, err := instance(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("billet: a Firecracker node.ebs_s3 attaches its cache volumes to "+
+					"its own instance, which it could not identify: %w", err)
+			}
+
+			return ebss3.NewAttached(*cfg.Node.EBSS3, CacheNamespace(deployment, cfg.Node.Site),
+				awscreds.Default(), host, CacheSessionNames(cfg))
+		}
 		if cfg.Node.Ceph == nil {
 			return nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
 		}
@@ -172,7 +215,7 @@ func startNodeCache(
 		return nil, nil, nil, fmt.Errorf("billet: provider %s cannot attach node.cache volumes",
 			cfg.Node.Provider)
 	}
-	storage, err := nodeCacheStore(cfg, deployment)
+	storage, err := nodeCacheStore(ctx, cfg, deployment, ThisInstance)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -496,6 +539,30 @@ func sweepSuperseded(ctx context.Context, storage cacheEvictor, log *slog.Logger
 	}
 }
 
+// attachmentSweeper is a store that attaches volumes to this node's own instance and
+// can take off the ones no cache session names: the ebs-s3 store on AWS metal.
+type attachmentSweeper interface {
+	SweepAttachments(ctx context.Context) ([]string, error)
+}
+
+// ThisInstance is the EC2 instance this node runs on, from its own identity document.
+func ThisInstance(ctx context.Context) (ebss3.Host, error) {
+	doc, _, err := awscreds.InstanceIdentity(ctx, "")
+	if err != nil {
+		return ebss3.Host{}, err
+	}
+
+	var identity struct {
+		InstanceID       string `json:"instanceId"`
+		AvailabilityZone string `json:"availabilityZone"`
+	}
+	if err := json.Unmarshal(doc, &identity); err != nil {
+		return ebss3.Host{}, fmt.Errorf("read this instance's identity document: %w", err)
+	}
+
+	return ebss3.Host{InstanceID: identity.InstanceID, AvailabilityZone: identity.AvailabilityZone}, nil
+}
+
 // kernelMappingSweeper is a store that maps volumes into this host's kernel and
 // can release the mappings nothing accounts for: the Ceph store.
 type kernelMappingSweeper interface {
@@ -526,6 +593,23 @@ func evictPass(ctx context.Context, storage cacheEvictor, reapGitMirrors func(co
 		if err != nil && ctx.Err() == nil {
 			log.Warn("kept kernel mappings of cache volumes no cache session names, never forcing one; "+
 				"will retry", "error", err)
+		}
+	}
+
+	// THE ATTACHMENTS NEXT, for the same reason: eviction keeps every volume attached
+	// to an instance, so one released here is the next pass's to reclaim.
+	if sweeper, ok := storage.(attachmentSweeper); ok && ctx.Err() == nil {
+		sweeping <- struct{}{}
+		removed, err := sweeper.SweepAttachments(ctx)
+		<-sweeping
+
+		if len(removed) > 0 {
+			log.Info("detached and deleted cache volumes attached to this instance that no cache "+
+				"session names", "volumes", removed)
+		}
+		if err != nil && ctx.Err() == nil {
+			log.Warn("kept cache volumes attached to this instance that no cache session names, "+
+				"never detaching one that is held; will retry", "error", err)
 		}
 	}
 

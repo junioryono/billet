@@ -9,6 +9,7 @@ import (
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/store/ebss3"
 )
@@ -24,6 +25,39 @@ import (
 // instance may still be serving a job, so the cache it depends on must not be
 // pulled out from under it.
 func Decommission(ctx context.Context, env cli.Env, args []string) error {
+	return decommission(ctx, env, args, liveCompute)
+}
+
+// computeReader lists a deployment's compute EC2 has not terminated, in a region at an
+// endpoint (the region's own when empty): its job instances and its pool's hosts.
+type computeReader func(
+	ctx context.Context, owner, region, endpoint string, creds awscreds.Source,
+) ([]*provider.Instance, []ec2.HostRecord, error)
+
+// liveCompute is EC2's own lists.
+func liveCompute(
+	ctx context.Context, owner, region, endpoint string, creds awscreds.Source,
+) ([]*provider.Instance, []ec2.HostRecord, error) {
+	reader, err := ec2.NewReader(owner, region, endpoint, ec2.WithCredentials(creds))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	jobs, err := reader.Jobs(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	hosts, err := reader.PoolHosts(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return jobs, hosts, nil
+}
+
+// decommission is Decommission, with the deployment's compute read by compute.
+func decommission(ctx context.Context, env cli.Env, args []string, compute computeReader) error {
 	fs := cli.NewFlagSet("billet decommission", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	yes := fs.Bool("yes", false, "actually delete (without this, only report what would be removed)")
@@ -40,9 +74,18 @@ func Decommission(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if cfg.Node == nil || cfg.Node.Provider != config.ProviderEC2 || cfg.Node.EC2 == nil {
+	// A FIRECRACKER NODE ON AWS METAL HAS THE SITE'S CACHE AND NO INSTANCES OF ITS OWN:
+	// its host is the pool's, which releases it by drain (ADR-030). So its decommission
+	// is the cache's purge alone, which refuses while a clone lease is live.
+	metal := cfg.Node != nil && cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.EBSS3 != nil
+	if !metal && (cfg.Node == nil || cfg.Node.Provider != config.ProviderEC2 || cfg.Node.EC2 == nil) {
 		return errors.New("decommission tears down the ec2 backend's out-of-Terraform " +
-			"resources; this config has no ec2 node, so there is nothing for it to remove")
+			"resources, or a metal site's ebs-s3 cache; this config has neither, so there is " +
+			"nothing for it to remove")
+	}
+	if metal && *terminateInstances {
+		return errors.New("--terminate-instances is for an ec2 node's instances; a Firecracker node's " +
+			"host is its pool's, which releases it by drain")
 	}
 
 	owner, err := decommissionOwner(cfg)
@@ -52,18 +95,37 @@ func Decommission(ctx context.Context, env cli.Env, args []string) error {
 
 	creds := awscreds.Default()
 
-	if err := decommissionInstances(ctx, env, cfg, owner, creds, *yes, *terminateInstances); err != nil {
-		return err
+	// A SITE'S CACHE IS EVERY NODE'S AT IT, an ec2 node's jobs and a pool's hosts alike,
+	// so none of the deployment's compute may be left before it is purged: a job may read
+	// Actions, Go or Bazel objects that no volume lease names.
+	if metal {
+		if err := refuseLiveCompute(ctx, env, owner, cfg.Node.EBSS3.Region, "", creds, compute, true); err != nil {
+			return err
+		}
+	} else {
+		if err := decommissionInstances(ctx, env, cfg, owner, creds, *yes, *terminateInstances); err != nil {
+			return err
+		}
+		if cfg.Node.EBSS3 != nil {
+			if err := refuseLiveCompute(ctx, env, owner, cfg.Node.EC2.Region, cfg.Node.EC2.Endpoint, creds,
+				compute, false); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := decommissionCache(ctx, env, cfg, owner, creds, *yes); err != nil {
 		return err
 	}
 
-	if *yes {
+	switch {
+	case *yes && metal:
+		fmt.Fprintf(env.Stdout, "decommission complete — the site's bucket and key can now be removed "+
+			"without leaving billet resources behind\n")
+	case *yes:
 		fmt.Fprintf(env.Stdout, "decommission complete — `terraform destroy` can now remove the module's "+
 			"VPC, IAM role, bucket and queue without leaving billet resources behind\n")
-	} else {
+	default:
 		fmt.Fprintf(env.Stdout, "(nothing was deleted — re-run with --yes to remove the above)\n")
 	}
 
@@ -121,6 +183,45 @@ func CacheResidue(ctx context.Context, cfgPath string) (ebss3.Residue, error) {
 	}
 
 	return residue, nil
+}
+
+// refuseLiveCompute refuses a site's purge while any of the deployment's compute is
+// not terminated, as the inventories read now say; a control plane still running can
+// order more, so it is stopped first, as an ec2 node is (the operator's order, which the
+// docs and the refusal state): its pool's hosts, and with jobs its job instances too (an ec2 node's
+// own path has just accounted for those). Anything running, or able to start again, may
+// run a job reading the cache, and a node that publishes after the purge undoes it. A
+// pool host is the pool's to release, by drain on proof (`billet pool release`), never
+// this command's to terminate.
+func refuseLiveCompute(
+	ctx context.Context, env cli.Env, owner, region, endpoint string, creds awscreds.Source,
+	compute computeReader, jobs bool,
+) error {
+	instances, hosts, err := compute(ctx, owner, region, endpoint, creds)
+	if err != nil {
+		return fmt.Errorf("list this deployment's compute, which must all be gone before its site's cache "+
+			"is purged: %w", err)
+	}
+	if !jobs {
+		instances = nil
+	}
+	if len(instances) == 0 && len(hosts) == 0 {
+		fmt.Fprintf(env.Stdout, "compute  none of this deployment's is left in %s\n", region)
+
+		return nil
+	}
+
+	for _, instance := range instances {
+		fmt.Fprintf(env.Stdout, "instance %s (%s)\n", instance.ID, instance.Name)
+	}
+	for _, host := range hosts {
+		fmt.Fprintf(env.Stdout, "host     %s (%s, order %s)\n", host.ID, host.State, host.Order)
+	}
+
+	return fmt.Errorf("%d job instance(s) and %d pool host(s) of this deployment are not terminated, and a "+
+		"job on one may be using the site's cache; stop the ec2 node so its jobs drain, release the pool's "+
+		"hosts (`billet pool release`), stop the control plane so the pool orders no more, and re-run once "+
+		"they are gone", len(instances), len(hosts))
 }
 
 // decommissionInstances lists the deployment's instances and, with --yes and

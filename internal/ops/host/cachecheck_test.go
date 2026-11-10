@@ -191,6 +191,35 @@ func TestJudgeNodeCache(t *testing.T) {
 			want:   []string{"guests are handed http://10.200.0.1:7719, served from the ceph pool billet-cache"},
 			unwant: []string{"nothing can reach"},
 		},
+		"a metal node's ebs-s3 store with no listener is refused in its own words": {
+			cfg: func() *config.Config {
+				n := cephNode()
+				n.EBSS3 = ebsNode().EBSS3
+
+				return &config.Config{Node: n, Tiers: tiers}
+			}(),
+			fatal: true,
+			want: []string{
+				"node.ebs_s3 names this site's cache store and this node offers no node.cache endpoint",
+				"its guests still boot from node.ceph's images",
+				"listen and guest_endpoint on the guest bridge",
+			},
+			// AN EC2 NODE'S WORDS ARE FALSE HERE: a Firecracker guest has no instance
+			// root volume, and its listener takes no TLS pair.
+			unwant:  []string{"ROOT VOLUME", "AMI", "tls_cert"},
+			wantErr: []string{"node.ebs_s3", "node.cache", "guest bridge"},
+		},
+		"a metal node's listener is served from its ebs-s3 store": {
+			cfg: func() *config.Config {
+				n := cephNode()
+				n.EBSS3 = ebsNode().EBSS3
+				n.Cache = &config.NodeCacheConfig{Listen: "10.240.0.1:7718", GuestEndpoint: "http://10.240.0.1:7718"}
+
+				return &config.Config{Node: n}
+			}(),
+			want:   []string{"guests are handed http://10.240.0.1:7718, served from the ebs-s3 store in us-west-2a"},
+			unwant: []string{"ceph pool", "nothing can reach"},
+		},
 		"a node with no store at all says nothing about caches": {
 			cfg: &config.Config{Node: &config.NodeConfig{
 				Name: "trial", Provider: config.ProviderDocker,

@@ -961,6 +961,12 @@ type HostInputs struct {
 	// or not at all.
 	CacheListen        string
 	CacheGuestEndpoint string
+	// Site is node.site, and EBSS3 node.ebs_s3: on AWS metal, the site's store, which
+	// keeps this host's caches on volumes it attaches to its own instance while golden
+	// images and the guests' root disks stay on its Ceph (ADR-030). EBSS3 needs the site
+	// and the cache endpoint, since that store backs nothing else.
+	Site  string
+	EBSS3 *config.EBSS3Config
 }
 
 // empty reports whether the operator supplied nothing.
@@ -975,7 +981,76 @@ func checkHostInputs(h HostInputs) error {
 			"that is configured and unreachable")
 	}
 
+	if h.EBSS3 != nil {
+		if h.Site == "" {
+			return errors.New("--ebs-s3-bucket needs --site: cache keys are scoped by site, and the " +
+				"control plane accepts a Firecracker node at an ebs-s3 site only")
+		}
+		if h.CacheListen == "" {
+			return errors.New("--ebs-s3-bucket needs --cache-listen and --cache-guest-endpoint: the " +
+				"store backs the guest cache and nothing else, so without the listener it is a store " +
+				"no job can reach")
+		}
+		// AS THE CONFIG WILL READ IT, the default prefix applied: CheckEBSS3 is the rule
+		// the loaded file is held to, after normalisation.
+		checked := *h.EBSS3
+		if checked.Prefix == "" {
+			checked.Prefix = "billet-cache"
+		}
+		if err := errors.Join(config.CheckEBSS3(checked)...); err != nil {
+			return fmt.Errorf("--ebs-s3-*: %w", err)
+		}
+	}
+
 	return nil
+}
+
+// siteYAML renders node.site and node.ebs_s3 when a host supplied them.
+func siteYAML(h HostInputs) string {
+	var b strings.Builder
+
+	if h.Site != "" {
+		fmt.Fprintf(&b, `
+  # WHERE THIS HOST IS. The control plane declares its sites, and refuses a node at
+  # one it does not, or at one whose store this node's caches do not use.
+  site: %s
+`, yamlScalar(h.Site))
+	}
+
+	if e := h.EBSS3; e != nil {
+		fmt.Fprintf(&b, `
+  # THE SITE'S STORE ON AWS METAL (ADR-030). The caches live where a shrinking pool
+  # cannot take them: the Actions, Go and Bazel caches as objects in the bucket, and a
+  # sticky disk or image store on an EBS volume this node attaches to its own
+  # instance. The volumes are made in this zone, which must be the instance's.
+  ebs_s3:
+    region: %s
+    availability_zone: %s
+    bucket: %s
+`, yamlScalar(e.Region), yamlScalar(e.AvailabilityZone), yamlScalar(e.Bucket))
+		if e.Prefix != "" {
+			fmt.Fprintf(&b, "    prefix: %s\n", yamlScalar(e.Prefix))
+		}
+		if e.KMSKeyID != "" {
+			fmt.Fprintf(&b, "    kms_key_id: %s\n", yamlScalar(e.KMSKeyID))
+		}
+	}
+
+	return b.String()
+}
+
+// cephPurposeComment says what the host's Ceph holds: every cache too, unless the site's
+// store is ebs-s3.
+func cephPurposeComment(h HostInputs) string {
+	if h.EBSS3 != nil {
+		return `  # THE HOST'S OWN STORAGE. Golden images and the guests' root disks are RBD
+  # images in a Ceph cluster on this host's NVMe; the caches are in the site's ebs-s3
+  # store above, so nothing on it is lost when the host goes.`
+	}
+
+	return `  # THE SITE'S STORAGE. Golden images and every cache are RBD images in one Ceph
+  # cluster on this host's NVMe. Two pools, because a cache is disposable and a
+  # golden image is not.`
 }
 
 // cephIdentityYAML renders the identity lines a host supplied.
@@ -1025,7 +1100,7 @@ func firecrackerNodeBlocks(trusted bool, h HostInputs) string {
 		kernel = filepath.Join(config.DefaultKernelDir, "vmlinux")
 	}
 
-	return fmt.Sprintf(`
+	return siteYAML(h) + fmt.Sprintf(`
   # THE MICROVM BACKEND. These name what the HOST must provide; billet does not
   # create them. The junioryono.billet.host Ansible role installs the bridges and
   # bootstraps Ceph; the guest kernel below is yours to place. `+"`billet check`"+`
@@ -1041,15 +1116,13 @@ func firecrackerNodeBlocks(trusted bool, h HostInputs) string {
     bridge: %s
 %s    untrusted_bridge: %s
 
-  # THE SITE'S STORAGE. Golden images and every cache are RBD images in one Ceph
-  # cluster on this host's NVMe. Two pools, because a cache is disposable and a
-  # golden image is not.
+%s
   ceph:
     image_pool: %s
     cache_pool: %s
 %s`, yamlScalar(kernel),
 		defaultBridge, untrustedBridgeComment(trusted), defaultUntrustedBridge,
-		defaultImagePool, defaultCachePool, cephIdentityYAML(h)) + cacheBlockYAML(h)
+		cephPurposeComment(h), defaultImagePool, defaultCachePool, cephIdentityYAML(h)) + cacheBlockYAML(h)
 }
 
 // renderConfig writes the config as commented text.

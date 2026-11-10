@@ -809,12 +809,42 @@ func WithSites(sites []config.SiteConfig) Option {
 	}
 }
 
-func siteAcceptsProvider(store config.SiteStoreKind, provider config.ProviderKind) bool {
+// usedStore names the store a node's caches use, for a refusal: its own word, or what its
+// provider has always used.
+func usedStore(provider config.ProviderKind, uses config.SiteStoreKind) string {
+	switch {
+	case uses != "":
+		return string(uses)
+	case provider == config.ProviderFirecracker:
+		return string(config.SiteStoreCeph) + ", its provider's own"
+	case provider == config.ProviderEC2:
+		return string(config.SiteStoreEBSS3) + ", its provider's own"
+	default:
+		return "none"
+	}
+}
+
+// siteAcceptsProvider is whether a node of provider, whose caches use uses, may serve a
+// site whose store is store. uses is the registration's own word (SiteStore), empty for
+// a node whose caches use what its provider always has.
+//
+// A FIRECRACKER NODE AT AN EBS-S3 SITE ONLY ON ITS WORD THAT ITS CACHES ARE THERE. Its
+// guests' root disks stay on its own Ceph on AWS metal (ADR-030), so its provider alone
+// says nothing about where its caches go, and one that kept them on that Ceph would split
+// the site, with one half on a host the pool may release.
+func siteAcceptsProvider(store config.SiteStoreKind, provider config.ProviderKind, uses config.SiteStoreKind) bool {
 	switch store {
 	case config.SiteStoreCeph:
-		return provider == config.ProviderFirecracker
+		return provider == config.ProviderFirecracker && (uses == "" || uses == config.SiteStoreCeph)
 	case config.SiteStoreEBSS3:
-		return provider == config.ProviderEC2
+		switch provider {
+		case config.ProviderEC2:
+			return uses == "" || uses == config.SiteStoreEBSS3
+		case config.ProviderFirecracker:
+			return uses == config.SiteStoreEBSS3
+		}
+
+		return false
 	default:
 		return false
 	}
@@ -984,6 +1014,25 @@ func (p *Plane) checkRegistration(req nodeapi.RegisterRequest) (int, nodeapi.Ran
 	// PERMANENT, like the version and deployment checks above it. The same node
 	// with the same config will be refused forever, so a node that treated this as
 	// an outage would retry until someone read a log.
+	// THE NODE'S WORD ABOUT ITS STORE IS CHECKED WHEREVER IT APPEARS: a word the wire it
+	// negotiated cannot carry, one that names no store, or one with no site to be about is
+	// refused, never dropped. Dropped, it would read as "the provider's own store", which a
+	// Ceph site accepts from a Firecracker node that said it uses ebs-s3.
+	if req.SiteStore != "" {
+		switch {
+		case negotiated < nodeapi.VersionSiteStore:
+			return 0, nodeWire, fmt.Errorf("%w: node %q says its caches use %q on wire version %d, which "+
+				"cannot carry that (it is %d's)", ErrRefused, req.Node, req.SiteStore, negotiated,
+				nodeapi.VersionSiteStore)
+		case !req.SiteStore.Valid():
+			return 0, nodeWire, fmt.Errorf("%w: node %q says its caches use %q, which is not a store",
+				ErrRefused, req.Node, req.SiteStore)
+		case req.Site == "":
+			return 0, nodeWire, fmt.Errorf("%w: node %q says its caches use its site's %s store, and "+
+				"names no site", ErrRefused, req.Node, req.SiteStore)
+		}
+	}
+
 	if req.Site != "" {
 		store, declared := p.sites[req.Site]
 		if !declared {
@@ -998,11 +1047,13 @@ func (p *Plane) checkRegistration(req nodeapi.RegisterRequest) (int, nodeapi.Ran
 				"%w: node %q is at site %q, which this control plane does not declare (have %s)",
 				ErrRefused, req.Node, req.Site, strings.Join(sortedSites(p.sites), ", "))
 		}
-		if !siteAcceptsProvider(store, req.Provider) {
+		uses := req.SiteStore
+		if !siteAcceptsProvider(store, req.Provider, uses) {
 			return 0, nodeWire, fmt.Errorf(
-				"%w: node %q reports provider %s at site %q, whose authoritative store is %s; "+
-					"that pairing would split one site across independent cache authorities",
-				ErrRefused, req.Node, req.Provider, req.Site, store)
+				"%w: node %q reports provider %s at site %q, whose authoritative store is %s, and "+
+					"says its caches use %s; that pairing would split one site across independent "+
+					"cache authorities", ErrRefused, req.Node, req.Provider, req.Site, store,
+				usedStore(req.Provider, uses))
 		}
 	}
 

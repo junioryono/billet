@@ -157,6 +157,89 @@ func TestHostInputsOnAnotherBackendAreRefused(t *testing.T) {
 	}
 }
 
+// A HOST ON AWS METAL NAMES ITS SITE AND THE SITE'S EBS-S3 STORE (ADR-030), and the file
+// it is given loads with them, its caches there and its Ceph still holding golden images
+// and root disks. This is what a pool's init_args hand the join.
+func TestAMetalHostIsGivenItsSitesEBSStore(t *testing.T) {
+	t.Parallel()
+
+	p := firecrackerParams()
+	p.Host = initconfig.HostInputs{
+		CacheListen:        "10.240.0.1:7718",
+		CacheGuestEndpoint: "http://10.240.0.1:7718",
+		Site:               "aws-us-west-2a",
+		EBSS3: &config.EBSS3Config{
+			Region: "us-west-2", AvailabilityZone: "us-west-2a", Bucket: "billet-cache-example",
+			Prefix: "deployments/example", KMSKeyID: "alias/billet-cache",
+		},
+	}
+
+	body := generateAny(t, p)
+	cfg := parseGenerated(t, body)
+
+	switch {
+	case cfg.Node.Site != "aws-us-west-2a":
+		t.Errorf("node.site is %q", cfg.Node.Site)
+	case cfg.Node.EBSS3 == nil:
+		t.Fatal("no ebs_s3 block")
+	case *cfg.Node.EBSS3 != *p.Host.EBSS3:
+		t.Errorf("node.ebs_s3 is %+v, want %+v", *cfg.Node.EBSS3, *p.Host.EBSS3)
+	case cfg.Node.Ceph == nil:
+		t.Error("the Ceph block went with the store, and the guests' root disks are RBD images")
+	}
+
+	if strings.Contains(body, "Golden images and every cache are RBD images") {
+		t.Error("the file still says the caches are RBD images on this host")
+	}
+}
+
+// AN EBS-S3 STORE WITHOUT WHAT IT NEEDS IS REFUSED: a site, since its keys are scoped by
+// one; the cache listener, since it backs nothing else; and a store config can address.
+func TestAnIncompleteEBSStoreIsRefused(t *testing.T) {
+	t.Parallel()
+
+	store := config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a", Bucket: "billet-cache-example"}
+	complete := initconfig.HostInputs{
+		CacheListen: "10.240.0.1:7718", CacheGuestEndpoint: "http://10.240.0.1:7718",
+		Site: "metal", EBSS3: &store,
+	}
+	if _, _, err := initconfig.Generate(func() initconfig.Params {
+		p := firecrackerParams()
+		p.Host = complete
+
+		return p
+	}()); err != nil {
+		t.Fatalf("the complete inputs were refused: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		edit func(*initconfig.HostInputs)
+		want string
+	}{
+		"no site":   {func(h *initconfig.HostInputs) { h.Site = "" }, "--site"},
+		"no cache":  {func(h *initconfig.HostInputs) { h.CacheListen, h.CacheGuestEndpoint = "", "" }, "--cache-listen"},
+		"no bucket": {func(h *initconfig.HostInputs) { s := store; s.Bucket = ""; h.EBSS3 = &s }, "bucket"},
+		"another region's zone": {func(h *initconfig.HostInputs) {
+			s := store
+			s.AvailabilityZone = "us-east-1a"
+			h.EBSS3 = &s
+		}, "availability_zone"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			p := firecrackerParams()
+			p.Host = complete
+			tc.edit(&p.Host)
+
+			_, _, err := initconfig.Generate(p)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%s was answered %v, want a refusal naming %s", name, err, tc.want)
+			}
+		})
+	}
+}
+
 // generateAny is `generate` without the trusted assertion, since a firecracker
 // generation is legitimately untrusted: a microVM isolates the kernel, so this
 // is the backend that runs work billet cannot vouch for.

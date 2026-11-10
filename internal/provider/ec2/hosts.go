@@ -208,6 +208,32 @@ func (h *Hosts) Find(ctx context.Context, order string) (HostRecord, bool, error
 	return HostRecord{}, false, nil
 }
 
+// Live lists this deployment's pool hosts that EC2 has not terminated: running,
+// starting, stopping or stopped, any of which can still run a job or start again. An
+// instance the filter returned that is not a well-formed pool host is an error, never
+// left out, because a short list reads as no compute.
+func (h *Hosts) Live(ctx context.Context) ([]HostRecord, error) {
+	items, err := h.describe(ctx, url.Values{
+		"Filter.1.Name":    {"tag:" + poolOwnerTag},
+		"Filter.1.Value.1": {h.p.owner},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var live []HostRecord
+	for _, item := range items {
+		if !h.isPoolHost(item) {
+			return nil, fmt.Errorf("%w: an instance listed as this deployment's pool host", ErrNotAPoolHost)
+		}
+		if rec := hostRecord(item); rec.State != "terminated" {
+			live = append(live, rec)
+		}
+	}
+
+	return live, nil
+}
+
 // Describe reads one pool host by its instance id.
 func (h *Hosts) Describe(ctx context.Context, id string) (HostRecord, error) {
 	if id == "" {

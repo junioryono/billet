@@ -141,6 +141,33 @@ const apiTimeout = 30 * time.Second
 // New builds an EC2 provider. owner names this billet deployment and is written
 // onto every instance it starts.
 func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) {
+	return build(owner, cfg, true, opts...)
+}
+
+// Reader lists a deployment's compute in one region, its jobs' instances and its pool's
+// hosts, and launches nothing: what a command that must know whether any is left (a
+// site's decommission) needs, from a config that may name no launch network.
+type Reader struct{ p *Provider }
+
+// NewReader is a Reader for owner in region, at endpoint, or the region's own when empty.
+func NewReader(owner, region, endpoint string, opts ...Option) (Reader, error) {
+	p, err := build(owner, config.EC2Config{Region: region, Endpoint: endpoint}, false, opts...)
+	if err != nil {
+		return Reader{}, err
+	}
+
+	return Reader{p: p}, nil
+}
+
+// Jobs lists the deployment's job instances that are not terminated, as List does.
+func (r Reader) Jobs(ctx context.Context) ([]*provider.Instance, error) { return r.p.List(ctx) }
+
+// PoolHosts lists the deployment's pool hosts that are not terminated (Hosts.Live).
+func (r Reader) PoolHosts(ctx context.Context) ([]HostRecord, error) { return r.p.Hosts().Live(ctx) }
+
+// build is New, and NewReader when launches is false: the one rule a provider that
+// launches nothing is spared is the launch network's.
+func build(owner string, cfg config.EC2Config, launches bool, opts ...Option) (*Provider, error) {
 	if strings.TrimSpace(owner) == "" {
 		return nil, errors.New("ec2: a provider needs the deployment identity that tags its " +
 			"instances, or it cannot tell its own compute from another billet's")
@@ -192,7 +219,7 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 		{"security_group_ids", cfg.SecurityGroupIDs, true},
 		{"untrusted_security_group_ids", cfg.UntrustedSecurityGroupIDs, false},
 	} {
-		if errs := config.CheckEC2SecurityGroups(check.field, check.groups, check.required); len(errs) > 0 {
+		if errs := config.CheckEC2SecurityGroups(check.field, check.groups, check.required && launches); len(errs) > 0 {
 			return nil, fmt.Errorf("ec2: %w", errors.Join(errs...))
 		}
 	}

@@ -72,6 +72,20 @@ func StorageDescribeIAMActions() []string {
 	return []string{IAMDescribeVolumes, IAMDescribeSnapshots}
 }
 
+// IAMAttachVolume and IAMDetachVolume are what a self-attaching store does with its
+// volumes on its own instance (attach.go).
+const (
+	IAMAttachVolume = "ec2:AttachVolume"
+	IAMDetachVolume = "ec2:DetachVolume"
+)
+
+// SelfAttachIAMActions are the attach and detach a node on AWS metal makes of its own
+// cache volumes to its own instance. Each authorizes the volume and the instance, and a
+// bundled policy scopes the volume by billet's owner tag and the instance by the pool's.
+func SelfAttachIAMActions() []string {
+	return []string{IAMAttachVolume, IAMDetachVolume}
+}
+
 // StorageDeleteIAMActions are the destructive EBS permissions a bundled policy
 // scopes with the owner-tag condition on the RESOURCE.
 func StorageDeleteIAMActions() []string {

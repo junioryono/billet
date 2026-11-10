@@ -72,10 +72,26 @@ var (
 
 func (c *Config) validateEBSS3Node() []error {
 	if c.Node.EBSS3 == nil {
+		// THE OTHER DIRECTION, where this file declares the node's site too: a
+		// firecracker node at an ebs-s3 site without the store would keep its caches
+		// on its own Ceph, which the control plane refuses at every registration.
+		if c.Node.Provider == ProviderFirecracker && c.Node.Site != "" {
+			for _, site := range c.Sites {
+				if site.Name == c.Node.Site && site.Store == SiteStoreEBSS3 {
+					return []error{fmt.Errorf("node.site %q selects ebs-s3 storage, so this firecracker "+
+						"node needs node.ebs_s3 for its caches", site.Name)}
+				}
+			}
+		}
+
 		return nil
 	}
-	if c.Node.Provider != ProviderEC2 {
-		return []error{fmt.Errorf("node.ebs_s3 is set but this node's provider is %s; EBS volumes can attach only to EC2 instances in their availability zone", c.Node.Provider)}
+	// AN EC2 NODE, whose volumes it attaches to its jobs' instances, OR A FIRECRACKER NODE
+	// ON AWS METAL, which attaches them to its own instance and hands them to its guests
+	// (ADR-030). Its guests' root disks stay on node.ceph, which it still requires. Either
+	// way the volumes attach only to EC2 instances in their availability zone.
+	if c.Node.Provider != ProviderEC2 && c.Node.Provider != ProviderFirecracker {
+		return []error{fmt.Errorf("node.ebs_s3 is set but this node's provider is %s; EBS volumes attach only to EC2 instances in their availability zone, which an ec2 node launches and a firecracker node on AWS metal runs on", c.Node.Provider)}
 	}
 
 	e := c.Node.EBSS3

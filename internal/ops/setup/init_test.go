@@ -98,6 +98,25 @@ func TestInitWritesAConfigThatLoads(t *testing.T) {
 // What it needs instead is on the host — a kernel, two bridges, a Ceph cluster —
 // which the generated config names in node.firecracker and node.ceph so an
 // operator (and `billet check`) sees exactly what to prepare.
+func TestInitRefusesASiteWithoutAJoin(t *testing.T) {
+	for _, flag := range [][]string{
+		{"--site", "aws-us-west-2a"},
+		{"--ebs-s3-bucket", "billet-cache-example"},
+		{"--ebs-s3-region", "us-west-2"},
+	} {
+		path := filepath.Join(t.TempDir(), "billet.yaml")
+		err := Init(t.Context(), processEnv(), append([]string{
+			"--config", path, "--org", "acme", "--provider", "firecracker",
+		}, flag...))
+		if err == nil || !strings.Contains(err.Error(), "pass it with --join") {
+			t.Errorf("init with %s and no --join answered %v", flag[0], err)
+		}
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("init with %s and no --join wrote a config (%v)", flag[0], statErr)
+		}
+	}
+}
+
 func TestInitFirecrackerWritesAnUntrustedConfigThatLoads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
