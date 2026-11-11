@@ -656,14 +656,13 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 		t.Errorf("the failure is not the deadline: %v", got.err)
 	}
 
-	// AGAINST THE CONFIGURED BOUND, not a round number: a WaitDelay raised to nine
-	// seconds would slip under a flat ten-second assertion while making every
-	// unreachable cluster take nine seconds longer than it should. The slack is for
-	// scheduling, not for a different constant.
-	// AN INDEPENDENT THRESHOLD. Deriving the budget from waitDelay means raising
-	// waitDelay raises the budget with it, so the mutation the comment claims to
-	// catch stays green; the policy is asserted separately, below.
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
+	// BOUNDED AT ALL, NOT HOW FAST. Unbounded, the call waits out the 30 s sleep;
+	// bounded, it returns about waitDelay after the 200 ms deadline. The threshold
+	// sits between the two with room for a loaded runner, which took 5.9 s on main
+	// (run 42951763808, 2026-11-10) against a 5 s threshold. A waitDelay raised
+	// toward the threshold is caught by the policy assertion below, not by this
+	// one, so this one does not have to be tight to catch it.
+	if elapsed := time.Since(start); elapsed > 12*time.Second {
 		t.Errorf("execRunner took %s to give up on a process it had killed", elapsed)
 	}
 

@@ -335,11 +335,15 @@ jobs:
     needs: changes
     if: needs.changes.outputs.postgres == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
-    # 30: the command suite moved to test-postgres-command, so this job is the
-    # ledger backend (283.4s on main at d4d4e2e) and the capacity suite (204.2s)
-    # with their own 20m bounds; the sibling job's note applies here too -- raise
-    # it when the suite grows, do not trim tests to fit it.
-    timeout-minutes: 30
+    # 45: the command suite moved to test-postgres-command, so this job is the
+    # ledger backend and the capacity suite with their own 20m bounds; the
+    # sibling job's note applies here too -- raise it when the suite grows, do not
+    # trim tests to fit it. At 30 it was outgrown: the two took 283.4s and 204.2s
+    # at d4d4e2e, 11.3 and 7.3 minutes on 2026-11-06, and 13.5 to 14.3 and 8.8 to
+    # 9.6 minutes on main through 2026-11-11, the job 27 to 28 minutes of its 30
+    # with setup, and a PostgreSQL client install of 3.1 minutes rather than 1
+    # took run 43014347169 past it, cancelled inside the capacity suite.
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:18-alpine
