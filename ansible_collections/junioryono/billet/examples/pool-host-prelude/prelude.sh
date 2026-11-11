@@ -433,6 +433,32 @@ if [ "$converged" -ne 0 ]; then
 fi
 billet converge-guard release --holder pool-prelude >"$work/guard-release.log" 2>&1
 
+# THE NODE'S CACHES ON THE SCRATCH DISK, as Docker's and Ceph's data are: its git
+# mirrors, its npm registry and its content-addressed cache grow with the jobs, and the
+# image's root holds 6.8 GB, which the host's own software fills past 75%. A git mirror
+# is refreshed only while its filesystem is under 80% full, so on the root every git job
+# read the cache unavailable (run 42888123208, 2026-11-10). Bound from /etc/fstab, as
+# Docker's and Ceph's data are, so every process sees one directory, and the node's unit
+# waits for the binds: a bind under its ReadWritePaths stays writable inside its
+# ProtectSystem=strict sandbox (systemd 255, 2026-11-10).
+if [ -n "$scratch" ]; then
+	# The node's state_dir, which config validates absolute.
+	ns=$(venv/bin/python3 -I -c 'import sys,yaml;print(yaml.safe_load(open(sys.argv[1]))["node"]["state_dir"])' \
+		"$work/preview/billet.yaml")
+	r=""
+	for d in git-mirrors npm-registry cas-cache; do
+		s=/var/lib/pool-scratch/node/$d t=$ns/$d
+		install -d -m 0700 "$s" "$t"
+		grep -q "[[:space:]]$t[[:space:]]" /etc/fstab ||
+			echo "$s $t none bind,nofail,x-systemd.requires-mounts-for=/var/lib/pool-scratch 0 0" >>/etc/fstab
+		mountpoint -q "$t" || mount "$t"
+		r+=" $t"
+	done
+	mkdir -p /etc/systemd/system/billet-node.service.d
+	printf '[Unit]\nRequiresMountsFor=%s\n' "$r" >/etc/systemd/system/billet-node.service.d/billet-pool-scratch.conf
+	systemctl daemon-reload
+fi
+
 # A SINGLE OSD HOLDS NO REPLICA, BY DESIGN (#553's plan change of 2026-11-08): its pools
 # hold golden images, pulled again from the signed source, and per-job clones. The
 # managers are restarted to read it: one of the two cephadm starts kept the size it
