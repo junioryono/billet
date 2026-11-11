@@ -5,12 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -656,21 +660,125 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 		t.Errorf("the failure is not the deadline: %v", got.err)
 	}
 
-	// AGAINST THE CONFIGURED BOUND, not a round number: a WaitDelay raised to nine
-	// seconds would slip under a flat ten-second assertion while making every
-	// unreachable cluster take nine seconds longer than it should. The slack is for
-	// scheduling, not for a different constant.
-	// AN INDEPENDENT THRESHOLD. Deriving the budget from waitDelay means raising
-	// waitDelay raises the budget with it, so the mutation the comment claims to
-	// catch stays green; the policy is asserted separately, below.
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
+	// BOUNDED AT ALL, NOT HOW FAST. Unbounded, the call waits out the 30 s sleep;
+	// bounded, it returns about waitDelay after the 200 ms deadline. The threshold
+	// sits between the two with room for a loaded runner, which took 5.9 s on main
+	// (run 42951763808, 2026-11-10) against a 5 s threshold. HOW LONG the bound is,
+	// and that the process is killed rather than waited out, is read from the
+	// command itself below, which a duration on a loaded runner cannot tell apart.
+	if elapsed := time.Since(start); elapsed > 12*time.Second {
 		t.Errorf("execRunner took %s to give up on a process it had killed", elapsed)
+	}
+
+	cmd := rbdCommand(ctx, "/bin/true", nil)
+	if cmd.WaitDelay != waitDelay {
+		t.Errorf("rbd runs with its pipes held %s past its deadline, want waitDelay (%s)",
+			cmd.WaitDelay, waitDelay)
+	}
+
+	// KILLED WHEN ITS CONTEXT ENDS, NOT ABANDONED AT WAITDELAY. The child is
+	// started and running before its context is cancelled, and its own wait status
+	// must say SIGKILL. Its fallback is a minute here (the production waitDelay is
+	// read above) and the sleep ends by itself at 30 s, so nothing but Cancel can
+	// kill it: a Cancel that does nothing lets it exit 0. No clock is read after the
+	// kill, so a test descheduled once the child is dead cannot fail; only one held
+	// off for the whole 30 s between the start and the cancellation could.
+	killCtx, killCancel := context.WithCancel(t.Context())
+	defer killCancel()
+
+	sleeper := rbdCommand(killCtx, "/bin/sh", []string{"-c", "exec sleep 30"})
+	sleeper.WaitDelay = time.Minute
+
+	if err := sleeper.Start(); err != nil {
+		t.Fatalf("start the child to kill: %v", err)
+	}
+
+	killCancel()
+
+	// THE WAIT STATUS IS WHAT IS JUDGED, not Wait's wording of it, which is the
+	// context's error once Cancel has run.
+	waitErr := sleeper.Wait()
+
+	if status, ok := sleeper.ProcessState.Sys().(syscall.WaitStatus); !ok || !status.Signaled() ||
+		status.Signal() != syscall.SIGKILL {
+		t.Errorf("rbd ended %v (%v) when its context ended, want killed", sleeper.ProcessState, waitErr)
 	}
 
 	if waitDelay > 3*time.Second {
 		t.Errorf("waitDelay is %s: it bounds how long a dead process's pipes may hold `billet "+
 			"check` open, and it is meant to be a couple of seconds", waitDelay)
 	}
+
+	requireExecRunnerRunsRBDCommand(t)
+}
+
+// requireExecRunnerRunsRBDCommand reads execRunner's syntax: its command is
+// rbdCommand's, assigned once, and nothing in it builds a process or sets a
+// WaitDelay or Cancel of its own, through cmd or any other name. Without this the
+// reads of rbdCommand above judge a command nothing runs.
+func requireExecRunnerRunsRBDCommand(t *testing.T) {
+	t.Helper()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "ceph.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var body *ast.BlockStmt
+
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "execRunner" {
+			body = fn.Body
+		}
+	}
+
+	if body == nil || len(body.List) == 0 {
+		t.Fatal("ceph.go has no execRunner to read")
+	}
+
+	first, ok := body.List[0].(*ast.AssignStmt)
+	if !ok || first.Tok != token.DEFINE || len(first.Lhs) != 1 || len(first.Rhs) != 1 ||
+		!isIdent(first.Lhs[0], "cmd") || !isCallTo(first.Rhs[0], "rbdCommand") {
+		t.Error("execRunner does not begin by taking its command from rbdCommand")
+	}
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if n == first {
+				return true
+			}
+
+			for _, lhs := range n.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok &&
+					(sel.Sel.Name == "WaitDelay" || sel.Sel.Name == "Cancel") {
+					t.Errorf("execRunner sets %s itself, beside rbdCommand", sel.Sel.Name)
+				}
+
+				if isIdent(lhs, "cmd") {
+					t.Error("execRunner replaces the command rbdCommand built")
+				}
+			}
+		case *ast.SelectorExpr:
+			if isIdent(n.X, "exec") && strings.HasPrefix(n.Sel.Name, "Command") {
+				t.Errorf("execRunner builds a process itself, with exec.%s", n.Sel.Name)
+			}
+		}
+
+		return true
+	})
+}
+
+func isIdent(expr ast.Expr, name string) bool {
+	id, ok := expr.(*ast.Ident)
+
+	return ok && id.Name == name
+}
+
+func isCallTo(expr ast.Expr, name string) bool {
+	call, ok := expr.(*ast.CallExpr)
+
+	return ok && isIdent(call.Fun, name)
 }
 
 // A DIAGNOSTIC IS ONE LINE AND IT IS BOUNDED.
