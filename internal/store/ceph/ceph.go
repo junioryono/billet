@@ -994,14 +994,23 @@ func (c *Client) identity() []string {
 // false of the function.
 const waitDelay = 2 * time.Second
 
+// rbdCommand is the process execRunner starts: killed when ctx ends, with its
+// pipes closed waitDelay after that. Built apart from the run so a test can read
+// what it was given, which a measured duration cannot tell to the second.
+func rbdCommand(ctx context.Context, bin string, args []string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.WaitDelay = waitDelay
+
+	return cmd
+}
+
 // execRunner runs rbd and returns its standard output.
 //
 // STDERR IS DROPPED INTO THE ERROR, not into the result. librados logs to stderr
 // on every connection — a successful listing is routinely accompanied by warnings
 // — so folding the two together makes valid JSON unparseable.
 func execRunner(ctx context.Context, bin string, args []string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.WaitDelay = waitDelay
+	cmd := rbdCommand(ctx, bin, args)
 
 	// BOUNDED AS IT ARRIVES, not capped afterwards. A strings.Builder here would
 	// bound the TIME an invocation may take and not the MEMORY, so a wrong or broken

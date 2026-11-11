@@ -659,11 +659,41 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 	// BOUNDED AT ALL, NOT HOW FAST. Unbounded, the call waits out the 30 s sleep;
 	// bounded, it returns about waitDelay after the 200 ms deadline. The threshold
 	// sits between the two with room for a loaded runner, which took 5.9 s on main
-	// (run 42951763808, 2026-11-10) against a 5 s threshold. A waitDelay raised
-	// toward the threshold is caught by the policy assertion below, not by this
-	// one, so this one does not have to be tight to catch it.
+	// (run 42951763808, 2026-11-10) against a 5 s threshold. HOW LONG the bound is,
+	// and that the process is killed rather than waited out, is read from the
+	// command itself below, which a duration on a loaded runner cannot tell apart.
 	if elapsed := time.Since(start); elapsed > 12*time.Second {
 		t.Errorf("execRunner took %s to give up on a process it had killed", elapsed)
+	}
+
+	cmd := rbdCommand(ctx, "/bin/true", nil)
+	if cmd.WaitDelay != waitDelay {
+		t.Errorf("rbd runs with its pipes held %s past its deadline, want waitDelay (%s)",
+			cmd.WaitDelay, waitDelay)
+	}
+
+	if cmd.Cancel == nil {
+		t.Error("rbd is not killed when its deadline passes, only abandoned after waitDelay")
+	}
+
+	// AND THE RUN STARTS WHAT rbdCommand BUILT, or the two reads above judge a
+	// command nothing runs.
+	source, err := os.ReadFile("ceph.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, body, found := strings.Cut(string(source), "\nfunc execRunner(")
+	body, _, closed := strings.Cut(body, "\n}\n")
+
+	switch {
+	case !found || !closed:
+		t.Fatal("ceph.go has no execRunner to read")
+	case !strings.Contains(body, "cmd := rbdCommand(ctx, bin, args)"):
+		t.Error("execRunner does not run the command rbdCommand builds")
+	case strings.Contains(body, "exec.Command(") || strings.Contains(body, "exec.CommandContext(") ||
+		strings.Contains(body, "cmd.WaitDelay") || strings.Contains(body, "cmd.Cancel"):
+		t.Error("execRunner builds or bounds its own command beside rbdCommand's")
 	}
 
 	if waitDelay > 3*time.Second {
