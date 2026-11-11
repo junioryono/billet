@@ -1459,6 +1459,11 @@ mkdir -p "$origin/v0.10.1"
 arch=$(uname -m); case $arch in x86_64) rel_arch=amd64 ;; aarch64|arm64) rel_arch=arm64 ;; *) rel_arch=$arch ;; esac
 (cd "$bins" && cp wrap-candidate-v0.10.1 billet && tar -czf "$origin/v0.10.1/billet_0.10.1_linux_${rel_arch}.tar.gz" billet && rm -f billet)
 (cd "$origin/v0.10.1" && sha256sum "billet_0.10.1_linux_${rel_arch}.tar.gz" >checksums.txt)
+# THE LOG EXISTS BEFORE THE SERVER DOES. A background command's redirection is
+# opened by the child it forks, so the loop below can read before the file is
+# there, and under pipefail sed's "can't read" ends the gate (exit 2, main's
+# retirement-recovery group, run 43062588249, 2026-11-11).
+: >"$work/origin.log"
 "$python" -u -m http.server --bind 127.0.0.1 --directory "$origin" 0 >"$work/origin.log" 2>&1 &
 origin_pid=$!
 port=""
