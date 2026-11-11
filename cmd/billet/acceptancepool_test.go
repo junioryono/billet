@@ -425,8 +425,10 @@ func TestAPoolHostThatWillNotGoIsResidueAndTheCacheIsKept(t *testing.T) {
 		orders []acceptancePoolOrder
 		want   string
 	}{
+		// NAMED WHATEVER IT LAST READ: under a loaded suite the deadline can pass on the
+		// poll that ends it, before EC2 has said it is shutting down.
 		"a host that stays up": {newFakePoolHosts(1<<30, ec2.HostRecord{ID: "i-1", State: "running", Order: "p1"}),
-			[]acceptancePoolOrder{order("p1", alloc.PoolPlaced, "i-1")}, "i-1 shutting-down"},
+			[]acceptancePoolOrder{order("p1", alloc.PoolPlaced, "i-1")}, "i-1 "},
 		"a host EC2 does not describe": {newFakePoolHosts(0),
 			[]acceptancePoolOrder{order("p1", alloc.PoolReleased, "i-9")}, "i-9 not found"},
 	} {
@@ -440,6 +442,9 @@ func TestAPoolHostThatWillNotGoIsResidueAndTheCacheIsKept(t *testing.T) {
 		}
 		if cache.purged != 0 {
 			t.Errorf("%s: the cache was purged under a pool host not proved terminated", name)
+		}
+		if live := c.orders[0].HostID == "i-1"; live && (len(c.hosts.ended) != 1 || c.hosts.ended[0] != "i-1") {
+			t.Errorf("%s: ended %v, want the host that stays up ended once", name, c.hosts.ended)
 		}
 	}
 }
