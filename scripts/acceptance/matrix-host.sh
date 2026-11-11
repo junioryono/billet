@@ -187,8 +187,11 @@ prelude)
 		tail -n +2 "$run_dir/prelude-template.sh" | sed '/^[[:space:]]*#/d'
 	} >"$run_dir/prelude.sh" || exit 1
 	size=$(wc -c <"$run_dir/prelude.sh")
-	# THE CONTROL PLANE ADDS THE JOIN'S LINE AND A FEW AROUND IT, under 1 KB, to EC2's 16384.
-	if [ "$size" -gt 15000 ]; then
+	# THE CONTROL PLANE ADDS ITS WRAPPER AND THE JOIN'S LINE to EC2's 16384: about 310
+	# bytes of its own, then the token, the order and every init_arg quoted again, about
+	# 1,120 bytes in all with this lane's init_args, and it refuses the order past 16384
+	# itself (app.PoolBoot).
+	if [ "$size" -gt 15200 ]; then
 		echo "matrix: the rendered prelude is $size bytes, past what fits beside the join in EC2's user data" >&2
 		exit 1
 	fi

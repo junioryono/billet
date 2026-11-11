@@ -386,6 +386,37 @@ func TestTheMatrixHostRendersAPoolsPrelude(t *testing.T) {
 	}
 }
 
+// THE COLLECTION'S OWN PRELUDE FITS, rendered as the lane renders it with init_args and a
+// bucket and run as long as the lane's: a prelude that grew past the limit would fail the
+// pool lane's preparation, which only a dispatch from main runs.
+func TestTheCollectionsPreludeFitsTheLane(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "sha256sum")
+	f.command(t, "billet", fakeBillet)
+	f.fixture(t, "init-args", "--site=aws-us-west-2a\n--ebs-s3-region=us-west-2\n"+
+		"--ebs-s3-availability-zone=us-west-2a\n--ebs-s3-bucket=acceptance-cache-123456789012\n"+
+		"--ebs-s3-prefix=billet-cache\n"+
+		"--ebs-s3-kms-key-id=arn:aws:kms:us-west-2:123456789012:key/00000000-0000-0000-0000-000000000000\n"+
+		"--cache-listen=10.240.0.1:7718\n--cache-guest-endpoint=http://10.240.0.1:7718\n")
+	dir := hostRunDir(t, f)
+	template, err := os.ReadFile("../ansible_collections/junioryono/billet/examples/pool-host-prelude/prelude.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for file, body := range map[string][]byte{"collection.tar.gz": []byte("a collection"),
+		"prelude-template.sh": template} {
+		if err := os.WriteFile(filepath.Join(dir, file), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prelude", dir, "/pool.yaml", "10.77.0.10:7717",
+		"acceptance-runs-123456789012", "us-west-2", "42888123208-1-pool", "390")
+	if code != 0 {
+		t.Fatalf("the collection's prelude does not fit the lane: exit %d\n%s", code, out)
+	}
+	t.Log(strings.TrimSpace(out))
+}
+
 // A POOL'S DEPLOYMENT IS STOOD UP ON ITS FLEET WIRE WITH THE RUN'S PRELUDE, AND BOTH ITS
 // POLICIES ARE RENDERED FOR THE RUN'S DEPLOYMENT: the control plane's pool, passing the
 // pool hosts' role, and the hosts'.
