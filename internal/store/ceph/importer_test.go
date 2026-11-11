@@ -782,6 +782,7 @@ func TestImportGenerationBreaksALockNoRunCouldStillBeHolding(t *testing.T) {
 	if !f.ranWith("lock", "rm", "billet-build-deadhost-9") {
 		t.Errorf("the stale lock was not broken; billet ran %v", f.calls)
 	}
+	requireLockRemovalsBlocklistNobody(t, f.calls)
 }
 
 // BREAKING A LIVE HOLDER'S LOCK PUTS TWO WRITERS ON ONE IMAGE, so the bound is

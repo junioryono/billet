@@ -2824,7 +2824,9 @@ INFO
 # MEASURED SEMANTICS: `lock add` returns 0 when taken and 16 when anyone holds it,
 # including the same cookie, so it is not re-entrant; `lock rm` returns 0, or 2 when
 # there was nothing to release; and the lock is NOT a lease -- it outlives the process
-# that took it, and breaking it fences nothing.
+# that took it, and breaking it fences nothing. So every `lock rm` passes
+# --rbd_blocklist_on_break_lock false: by default Ceph blocklists the locker, which is
+# the `lock add` that already exited, for an OSD map epoch and nothing else (#845).
 LOCK_IMAGE="${LOCK_IMAGE:-$IMAGE_POOL/.publish-lock}"
 LOCK_COOKIE="billet-build-$(hostname -s 2>/dev/null || echo unknown)-$$-$(date -u +%s)"
 
@@ -2869,7 +2871,7 @@ take_publish_lock() {
 		echo "the publish lock has been held by $id for ${age}s, which is longer than any" >&2
 		echo "build can run; breaking it and taking it" >&2
 
-		rbd --id "$CEPH_USER" lock rm "$LOCK_IMAGE" "$id" "$locker" >/dev/null 2>&1 || true
+		rbd --id "$CEPH_USER" --rbd_blocklist_on_break_lock false lock rm "$LOCK_IMAGE" "$id" "$locker" >/dev/null 2>&1 || true
 
 		if rbd --id "$CEPH_USER" lock add "$LOCK_IMAGE" "$LOCK_COOKIE" >/dev/null 2>&1; then
 			install_publish_traps
@@ -2885,7 +2887,7 @@ take_publish_lock() {
 	echo "another node is already publishing to $IMAGE_POOL/$IMAGE_NAME: ${holder:-unknown holder}." >&2
 	echo "This build is stopping rather than writing the same image concurrently. If that" >&2
 	echo "holder is gone and this persists, clear it with:" >&2
-	echo "  rbd --id $CEPH_USER lock rm $LOCK_IMAGE '<id>' '<locker>'" >&2
+	echo "  rbd --id $CEPH_USER --rbd_blocklist_on_break_lock false lock rm $LOCK_IMAGE '<id>' '<locker>'" >&2
 
 	exit 1
 }
@@ -2940,7 +2942,7 @@ release_publish_lock() {
 		jq -r --arg c "$LOCK_COOKIE" '.[] | select(.id == $c) | .locker' 2>/dev/null || true)
 
 	if [ -n "$locker" ]; then
-		rbd --id "$CEPH_USER" lock rm "$LOCK_IMAGE" "$LOCK_COOKIE" "$locker" >/dev/null 2>&1 || true
+		rbd --id "$CEPH_USER" --rbd_blocklist_on_break_lock false lock rm "$LOCK_IMAGE" "$LOCK_COOKIE" "$locker" >/dev/null 2>&1 || true
 	fi
 }
 

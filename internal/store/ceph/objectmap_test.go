@@ -56,6 +56,32 @@ func imageBase(spec string) string {
 	return name
 }
 
+// requireLockRemovalsBlocklistNobody holds that a flow removed an advisory lock at
+// least once and that every removal kept Ceph from blocklisting the locker, which
+// is the `rbd lock add` that already exited (#845).
+func requireLockRemovalsBlocklistNobody(t *testing.T, calls [][]string) {
+	t.Helper()
+
+	removals := 0
+
+	for _, call := range calls {
+		i := slices.Index(call, "lock")
+		if i < 0 || i+1 >= len(call) || call[i+1] != "rm" {
+			continue
+		}
+		removals++
+
+		flag := slices.Index(call, "--rbd_blocklist_on_break_lock")
+		if flag < 0 || flag+1 >= len(call) || call[flag+1] != "false" {
+			t.Errorf("a lock removal would blocklist a locker that already exited: %v", call)
+		}
+	}
+
+	if removals == 0 {
+		t.Error("the flow removed no lock, so no removal was judged")
+	}
+}
+
 // requireCacheImageRules holds #394's two rules over every recorded call, and
 // that each verb in want ran on a cache image at least once.
 //
@@ -66,11 +92,12 @@ func imageBase(spec string) string {
 // trash purge kept both OSDs saturated for hours (2026-10-05). Object-map brings
 // exclusive-lock, which the kernel holds while a volume is mapped, so a change
 // must not blocklist the kernel client when it breaks a lock an interrupted
-// unmap left. The lock images, the publish lock and the cache index, are the
-// other way round: `layering` alone, because Ceph documents exclusive-lock as
-// incompatible with the advisory locks taken on them, and their `lock rm` keeps
-// the blocklist that is its fence. The feature names are checked one by one, so
-// an edit to cacheImageFeatures cannot quietly drop them.
+// unmap left. The lock images, the publish lock and the cache index, carry
+// `layering` alone, because Ceph documents exclusive-lock as incompatible with the
+// advisory locks taken on them, and their `lock rm` blocklists nobody either: the
+// locker is the `rbd lock add` that already exited, so an entry fences nothing and
+// costs an OSD map epoch per removal (#845). The feature names are checked one by
+// one, so an edit to cacheImageFeatures cannot quietly drop them.
 func requireCacheImageRules(t *testing.T, calls [][]string, want ...string) {
 	t.Helper()
 
@@ -104,8 +131,8 @@ func requireCacheImageRules(t *testing.T, calls [][]string, want ...string) {
 			if verb == "create" && !slices.Equal(features(call), []string{"layering"}) {
 				t.Errorf("a lock image was not created with layering alone: %v", call)
 			}
-			if verb == "lock rm" && keepsClient(call) {
-				t.Errorf("a lock image's lock rm lost its blocklist fence: %v", call)
+			if verb == "lock rm" && !keepsClient(call) {
+				t.Errorf("a lock image's lock rm would blocklist a locker that already exited: %v", call)
 			}
 
 		default:

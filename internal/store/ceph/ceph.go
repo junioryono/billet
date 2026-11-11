@@ -900,19 +900,26 @@ func (c *Client) rbdMap(ctx context.Context, spec string, options ...string) ([]
 	return c.run(ctx, c.bin, append(args, spec))
 }
 
-// keepKernelClient prefixes a command that may take a root disk's exclusive lock
-// so that breaking a stale owner does not blocklist it.
+// noBlocklist prefixes a command that may break a lock so that Ceph does not
+// blocklist the lock's owner, which it does by default.
 //
-// THE OWNER IS THE HOST'S ONE KERNEL CLIENT. Every device mapped on a host shares
-// it, so the blocklist Ceph adds by default when a lock is broken takes every disk
-// on the host with it, not the one image being removed (measured 2026-10-03, after
-// an interrupted unmap left a root disk's lock behind). These commands run only
-// once the image is billet's to dispose of and this host lists no mapping of it,
-// either because its unmaps succeeded or because none was listed, so the owner
-// whose lock they break is an orphan of an earlier unmap, not a guest. The
-// advisory cache-index lock keeps its blocklist: there the broken holder may be
-// live and the blocklist is the fence.
-func keepKernelClient(command ...string) []string {
+// AN IMAGE'S EXCLUSIVE LOCK IS OWNED BY THE HOST'S ONE KERNEL CLIENT. Every device
+// mapped on a host shares it, so blocklisting it takes every disk on the host with
+// it, not the one image being removed (measured 2026-10-03, after an interrupted
+// unmap left a root disk's lock behind). These commands run only once the image is
+// billet's to dispose of and this host lists no mapping of it, either because its
+// unmaps succeeded or because none was listed, so the owner whose lock they break
+// is an orphan of an earlier unmap, not a guest.
+//
+// AN ADVISORY LOCK IS OWNED BY THE `rbd lock add` THAT TOOK IT, which exited the
+// moment it did. Blocklisting that client fences nothing: the holder is a billet
+// process or a build script, not a Ceph client, and each command it runs after the
+// add is a new client the entry does not name, so who holds the lock is decided by
+// its cookie, its age and its heartbeat alone. With the blocklist, every removal of
+// the cache index's lock added an entry and an OSD map epoch: 54 removals and 56
+// entries in 150 s on ubuntu-01 (2026-11-10, Ceph 20.2.0), where `lock rm` with
+// this prefix removed the lock and added none (#845).
+func noBlocklist(command ...string) []string {
 	return append([]string{"--rbd_blocklist_on_break_lock", "false"}, command...)
 }
 

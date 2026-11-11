@@ -795,6 +795,7 @@ func TestCacheIndexLockReleasesAPostBreakAddCommittedAsItsCallerCancels(t *testi
 	if !f.ranWith("lock", "rm", holder) {
 		t.Fatal("the stale holder was not removed before the canceled reacquisition")
 	}
+	requireLockRemovalsBlocklistNobody(t, f.calls)
 }
 
 func TestCacheIndexLockPreservesReleaseFailureAfterCanceledAmbiguousAdds(t *testing.T) {
@@ -920,6 +921,7 @@ func TestACacheIndexLockThisProcessAbandonedIsRemovedByItsNextAttempt(t *testing
 			if !f.ranWith("lock", "rm", first) {
 				t.Fatalf("the abandoned lock %q was never removed", first)
 			}
+			requireLockRemovalsBlocklistNobody(t, f.calls)
 			if f.lockCookie != "" || f.pendingCookie != "" {
 				t.Fatalf("a lock is still held after both callers finished: %q %q",
 					f.lockCookie, f.pendingCookie)
@@ -1064,6 +1066,7 @@ func TestCacheIndexLockReclaimsAHolderThatWasFreshWhenWaitingBegan(t *testing.T)
 	if !f.ranWith("lock", "rm", holder) {
 		t.Fatalf("the initially fresh leaked holder was not reclaimed; billet ran %v", f.calls)
 	}
+	requireLockRemovalsBlocklistNobody(t, f.calls)
 	if !lockedAt.After(now.Add(CacheLockStaleAfter + c.observation)) {
 		t.Fatalf("cache work began at %s, before the controlled stale recovery completed", lockedAt)
 	}
