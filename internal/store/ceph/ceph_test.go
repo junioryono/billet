@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -675,21 +676,36 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 			cmd.WaitDelay, waitDelay)
 	}
 
-	// KILLED AT THE DEADLINE, NOT ABANDONED AT WAITDELAY. A child holding no pipe
-	// of a descendant ends when it is killed, about 200 ms in; one whose Cancel
-	// does nothing is left to WaitDelay's own kill, past 2 s. The threshold sits
-	// seven times above the first.
-	killCtx, killCancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	// KILLED WHEN ITS CONTEXT ENDS, NOT ABANDONED AT WAITDELAY. The child is
+	// started and running before its context is cancelled, and its own wait status
+	// must say SIGKILL. Its fallback is a minute here (the production waitDelay is
+	// read above), so a Cancel that does nothing leaves it a minute and the 10 s
+	// guard tells the two apart with room for any loaded runner.
+	killCtx, killCancel := context.WithCancel(t.Context())
 	defer killCancel()
 
-	killStart := time.Now()
-	if err := rbdCommand(killCtx, "/bin/sh", []string{"-c", "exec sleep 30"}).Run(); err == nil {
-		t.Error("a command killed at its deadline reported success")
+	sleeper := rbdCommand(killCtx, "/bin/sh", []string{"-c", "exec sleep 30"})
+	sleeper.WaitDelay = time.Minute
+
+	if err := sleeper.Start(); err != nil {
+		t.Fatalf("start the child to kill: %v", err)
 	}
 
-	if elapsed := time.Since(killStart); elapsed > 1500*time.Millisecond {
-		t.Errorf("rbd ran %s past a 200ms deadline: it is not killed when its deadline passes, "+
-			"only abandoned after waitDelay", elapsed)
+	killCancel()
+	cancelled := time.Now()
+
+	// THE WAIT STATUS IS WHAT IS JUDGED, not Wait's wording of it, which is the
+	// context's error once Cancel has run.
+	waitErr := sleeper.Wait()
+
+	if elapsed := time.Since(cancelled); elapsed > 10*time.Second {
+		t.Errorf("rbd ran %s after its context ended: it is not killed then, only abandoned after "+
+			"WaitDelay", elapsed)
+	}
+
+	if status, ok := sleeper.ProcessState.Sys().(syscall.WaitStatus); !ok || !status.Signaled() ||
+		status.Signal() != syscall.SIGKILL {
+		t.Errorf("rbd ended %v (%v) when its context ended, want killed", sleeper.ProcessState, waitErr)
 	}
 
 	if waitDelay > 3*time.Second {
