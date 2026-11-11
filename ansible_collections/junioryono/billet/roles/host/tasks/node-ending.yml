@@ -30,10 +30,18 @@
           else [{'exe': billet_exclusion_answerer | default('', true), 'config': '/etc/billet/billet.yaml'}])
          | selectattr('exe', 'truthy') | list }}
 
+# THE BOUND IS PAST THE COMMAND'S OWN TIMERS, so a slow host gets the command's
+# own could-not-tell and its reason rather than a kill. Each read of systemd is
+# bounded at 30 s with a 10 s grace for systemctl to exit, and the record's lock
+# waits at most 60 s once: admit-start reads systemd up to three times, so its
+# timers allow 180 s, and a check up to twice, 140 s. At 180 s the bound killed an
+# admit-start on a starved runner (retirement-parity-basic, run 42401082231,
+# 2026-11-07). Reading the configuration and the record has no timer, so a stalled
+# filesystem can still reach this bound.
 - name: Ask the node's own record how its last process ended
   ansible.builtin.command:
     argv: >-
-      {{ ['timeout', '-k', '10', '180', item.exe, 'node', 'ending', billet_ending_call, '--config', item.config]
+      {{ ['timeout', '-k', '10', '300', item.exe, 'node', 'ending', billet_ending_call, '--config', item.config]
          + (((['--invocation', billet_ending_invocation | string])
               if (billet_ending_invocation | default('') | string | length > 0) else [])
             + (['--drain'] if billet_ending_drain | default(false) | bool else [])
