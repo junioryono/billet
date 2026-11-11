@@ -679,8 +679,9 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 	// KILLED WHEN ITS CONTEXT ENDS, NOT ABANDONED AT WAITDELAY. The child is
 	// started and running before its context is cancelled, and its own wait status
 	// must say SIGKILL. Its fallback is a minute here (the production waitDelay is
-	// read above), so a Cancel that does nothing leaves it a minute and the 10 s
-	// guard tells the two apart with room for any loaded runner.
+	// read above) and the sleep ends by itself at 30 s, so nothing but Cancel can
+	// kill it: a Cancel that does nothing lets it exit 0. No clock is read, so no
+	// load can fail it.
 	killCtx, killCancel := context.WithCancel(t.Context())
 	defer killCancel()
 
@@ -692,16 +693,10 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 	}
 
 	killCancel()
-	cancelled := time.Now()
 
 	// THE WAIT STATUS IS WHAT IS JUDGED, not Wait's wording of it, which is the
 	// context's error once Cancel has run.
 	waitErr := sleeper.Wait()
-
-	if elapsed := time.Since(cancelled); elapsed > 10*time.Second {
-		t.Errorf("rbd ran %s after its context ended: it is not killed then, only abandoned after "+
-			"WaitDelay", elapsed)
-	}
 
 	if status, ok := sleeper.ProcessState.Sys().(syscall.WaitStatus); !ok || !status.Signaled() ||
 		status.Signal() != syscall.SIGKILL {
