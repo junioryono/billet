@@ -509,6 +509,10 @@ func readProbeWithDebugfs(ctx context.Context, device string) ([]byte, error) {
 	head := &headWriter{limit: elfHeaderBytes}
 	cmd := exec.CommandContext(ctx, debugfs, "-c", "-R", "cat "+archProbePath, device)
 	cmd.Stdout = head
+	// Its output is copied through a pipe, as rbd's is, so the same bound applies:
+	// a killed debugfs whose pipe something else still holds ends the call
+	// waitDelay later rather than never.
+	cmd.WaitDelay = waitDelay
 
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("read %s on %s: %w", archProbePath, device, err)

@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"slices"
@@ -672,34 +675,98 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 			cmd.WaitDelay, waitDelay)
 	}
 
-	if cmd.Cancel == nil {
-		t.Error("rbd is not killed when its deadline passes, only abandoned after waitDelay")
+	// KILLED AT THE DEADLINE, NOT ABANDONED AT WAITDELAY. A child holding no pipe
+	// of a descendant ends when it is killed, about 200 ms in; one whose Cancel
+	// does nothing is left to WaitDelay's own kill, past 2 s. The threshold sits
+	// seven times above the first.
+	killCtx, killCancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer killCancel()
+
+	killStart := time.Now()
+	if err := rbdCommand(killCtx, "/bin/sh", []string{"-c", "exec sleep 30"}).Run(); err == nil {
+		t.Error("a command killed at its deadline reported success")
 	}
 
-	// AND THE RUN STARTS WHAT rbdCommand BUILT, or the two reads above judge a
-	// command nothing runs.
-	source, err := os.ReadFile("ceph.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, body, found := strings.Cut(string(source), "\nfunc execRunner(")
-	body, _, closed := strings.Cut(body, "\n}\n")
-
-	switch {
-	case !found || !closed:
-		t.Fatal("ceph.go has no execRunner to read")
-	case !strings.Contains(body, "cmd := rbdCommand(ctx, bin, args)"):
-		t.Error("execRunner does not run the command rbdCommand builds")
-	case strings.Contains(body, "exec.Command(") || strings.Contains(body, "exec.CommandContext(") ||
-		strings.Contains(body, "cmd.WaitDelay") || strings.Contains(body, "cmd.Cancel"):
-		t.Error("execRunner builds or bounds its own command beside rbdCommand's")
+	if elapsed := time.Since(killStart); elapsed > 1500*time.Millisecond {
+		t.Errorf("rbd ran %s past a 200ms deadline: it is not killed when its deadline passes, "+
+			"only abandoned after waitDelay", elapsed)
 	}
 
 	if waitDelay > 3*time.Second {
 		t.Errorf("waitDelay is %s: it bounds how long a dead process's pipes may hold `billet "+
 			"check` open, and it is meant to be a couple of seconds", waitDelay)
 	}
+
+	requireExecRunnerRunsRBDCommand(t)
+}
+
+// requireExecRunnerRunsRBDCommand reads execRunner's syntax: its command is
+// rbdCommand's, assigned once, and nothing in it builds a process or sets a
+// WaitDelay or Cancel of its own, through cmd or any other name. Without this the
+// reads of rbdCommand above judge a command nothing runs.
+func requireExecRunnerRunsRBDCommand(t *testing.T) {
+	t.Helper()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "ceph.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var body *ast.BlockStmt
+
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "execRunner" {
+			body = fn.Body
+		}
+	}
+
+	if body == nil || len(body.List) == 0 {
+		t.Fatal("ceph.go has no execRunner to read")
+	}
+
+	first, ok := body.List[0].(*ast.AssignStmt)
+	if !ok || first.Tok != token.DEFINE || len(first.Lhs) != 1 || len(first.Rhs) != 1 ||
+		!isIdent(first.Lhs[0], "cmd") || !isCallTo(first.Rhs[0], "rbdCommand") {
+		t.Error("execRunner does not begin by taking its command from rbdCommand")
+	}
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if n == first {
+				return true
+			}
+
+			for _, lhs := range n.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok &&
+					(sel.Sel.Name == "WaitDelay" || sel.Sel.Name == "Cancel") {
+					t.Errorf("execRunner sets %s itself, beside rbdCommand", sel.Sel.Name)
+				}
+
+				if isIdent(lhs, "cmd") {
+					t.Error("execRunner replaces the command rbdCommand built")
+				}
+			}
+		case *ast.SelectorExpr:
+			if isIdent(n.X, "exec") && strings.HasPrefix(n.Sel.Name, "Command") {
+				t.Errorf("execRunner builds a process itself, with exec.%s", n.Sel.Name)
+			}
+		}
+
+		return true
+	})
+}
+
+func isIdent(expr ast.Expr, name string) bool {
+	id, ok := expr.(*ast.Ident)
+
+	return ok && id.Name == name
+}
+
+func isCallTo(expr ast.Expr, name string) bool {
+	call, ok := expr.(*ast.CallExpr)
+
+	return ok && isIdent(call.Fun, name)
 }
 
 // A DIAGNOSTIC IS ONE LINE AND IT IS BOUNDED.
