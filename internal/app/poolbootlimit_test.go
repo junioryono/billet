@@ -23,7 +23,7 @@ func TestTheLanesPreludeLimitLeavesRoomForTheJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`if \[ "\$size" -gt ([0-9]+) \]`).FindSubmatch(script)
+	m := regexp.MustCompile(`if \[ "\$size" -gt (\d+) \]`).FindSubmatch(script)
 	if m == nil {
 		t.Fatal("matrix-host.sh names no limit on the rendered prelude")
 	}
