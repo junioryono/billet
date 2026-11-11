@@ -680,8 +680,9 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 	// started and running before its context is cancelled, and its own wait status
 	// must say SIGKILL. Its fallback is a minute here (the production waitDelay is
 	// read above) and the sleep ends by itself at 30 s, so nothing but Cancel can
-	// kill it: a Cancel that does nothing lets it exit 0. No clock is read, so no
-	// load can fail it.
+	// kill it: a Cancel that does nothing lets it exit 0. No clock is read after the
+	// kill, so a test descheduled once the child is dead cannot fail; only one held
+	// off for the whole 30 s between the start and the cancellation could.
 	killCtx, killCancel := context.WithCancel(t.Context())
 	defer killCancel()
 
