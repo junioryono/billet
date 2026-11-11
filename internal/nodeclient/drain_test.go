@@ -407,10 +407,14 @@ func serveNode(t *testing.T, c *nodeclient.Client, compute *fakeCompute, sweepEv
 	hurry := make(chan struct{})
 	finished := make(chan struct{})
 
+	// What Run returned, read only after finished is closed. A stopped node's
+	// return is not what these tests judge, so it is logged, not asserted.
+	var runErr error
+
 	go func() {
 		defer close(finished)
 
-		_ = nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+		runErr = nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
 			VCPU:       testNodeVCPU,
 			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
@@ -446,6 +450,7 @@ func serveNode(t *testing.T, c *nodeclient.Client, compute *fakeCompute, sweepEv
 
 			select {
 			case <-finished:
+				t.Logf("the node stopped: %v", runErr)
 			case <-time.After(30 * time.Second):
 				t.Fatal("the node never stopped after its signals")
 			}
