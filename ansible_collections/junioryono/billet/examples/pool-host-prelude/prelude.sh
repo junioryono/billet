@@ -452,7 +452,7 @@ if [ -n "$scratch" ]; then
 		s=/var/lib/pool-scratch/node/$d t=$ns/$d
 		install -d -m 0700 "$s" "$t"
 		grep -q "[[:space:]]$t[[:space:]]" /etc/fstab ||
-			echo "$s $t none bind,nofail,x-systemd.requires-mounts-for=/var/lib/pool-scratch,x-systemd.before=billet-node.service 0 0" >>/etc/fstab
+			echo "$s $t none bind,nofail,x-systemd.requires-mounts-for=/var/lib/pool-scratch,x-systemd.before=billet-node.service,x-systemd.required-by=billet-node.service 0 0" >>/etc/fstab
 		mountpoint -q "$t" || mount "$t"
 	done
 	systemctl daemon-reload
