@@ -103,6 +103,9 @@ release v0.16.11 "$billet" late
 
 python=$(ansible --version 2>/dev/null | sed -n 's/.*python version.*(\(.*\)).*/\1/p' | head -n1)
 [ -x "${python:-}" ] || python=$(command -v python3)
+# The log exists before the server does: the child the server is forked into
+# opens its redirection, so the loop below could otherwise read first.
+: >"$work/origin.log"
 "$python" -u -m http.server --bind 127.0.0.1 --directory "$work/origin" 0 >"$work/origin.log" 2>&1 &
 origin_pid=$!
 port=""
