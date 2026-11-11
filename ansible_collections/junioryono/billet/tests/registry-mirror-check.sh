@@ -99,14 +99,18 @@ done
 
 # THE AUTHORITY IS ALL A GUEST NEEDS, and without it the mirror is not trusted: that
 # second half is what proves this was the authority's doing and not the system's.
-waited=0
-until [ "$(status_of "https://$address_a:7740/v2/" || true)" = 200 ]; do
-    waited=$((waited + 1))
-    [ "$waited" -lt 30 ] || fail "the Docker Hub mirror did not answer /v2/ within 30 seconds"
-    sleep 1
-done
-for port in 7741 7742; do
-    [ "$(status_of "https://$address_a:$port/v2/")" = 200 ] || fail "the mirror on $port did not answer /v2/"
+#
+# EVERY MIRROR GETS THE SAME WAIT. systemd reports a unit active once its process
+# has started, before the registry listens: quay.io's, started last, was asked
+# seven seconds after its start and refused the connection (main's roles group,
+# run 43077663592, 2026-11-11), while its listening line had not been logged yet.
+for port in 7740 7741 7742; do
+    waited=0
+    until [ "$(status_of "https://$address_a:$port/v2/" || true)" = 200 ]; do
+        waited=$((waited + 1))
+        [ "$waited" -lt 30 ] || fail "the mirror on $port did not answer /v2/ within 30 seconds"
+        sleep 1
+    done
 done
 if curl -sS -o /dev/null --max-time 10 "https://$address_a:7740/v2/" 2>/dev/null; then
     fail "the mirror was trusted without its authority, so nothing here proved the authority works"
