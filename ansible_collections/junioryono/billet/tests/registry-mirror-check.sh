@@ -108,7 +108,7 @@ for port in 7740 7741 7742; do
     waited=0
     until [ "$(status_of "https://$address_a:$port/v2/" || true)" = 200 ]; do
         waited=$((waited + 1))
-        [ "$waited" -lt 30 ] || fail "the mirror on $port did not answer /v2/ within 30 seconds"
+        [ "$waited" -lt 30 ] || fail "the mirror on $port did not answer /v2/ in 30 tries a second apart"
         sleep 1
     done
 done
