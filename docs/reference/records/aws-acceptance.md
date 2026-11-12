@@ -134,7 +134,7 @@ The workflow first expected a secret only a person can mint, a fine-grained pers
 - A Billet control plane and EC2 node ran as separate services against an isolated acceptance configuration and state directory.
 - The node used an encrypted AMI produced by `billet ami build`; EBS encryption by default was enabled for the account.
 - **The account these measurements now run in is in us-west-2, its id the acceptance environment's secret** — created as a dedicated CI account, because the control plane stores a GitHub App private key and a node-wire CA, and because the EC2 fleet executes arbitrary pull-request code. Earlier acceptance work ran in a different account and left nothing behind there. **It is no longer dedicated** (2026-11-05): it holds a production billet control plane too, so every grant the acceptance matrix makes is scoped to one deployment's identity or capped by a permissions boundary, never account-wide.
-- That account is named here so contributors and automation target the same place rather than improvising, and it is the only consumer-specific fact in this document. It is not a credential; it is an identifier, and it is recorded deliberately rather than by accident.
+- Its id is not written here, nor in any record (`<account>` stands in for it): the acceptance workflow reads it from the environment's secrets, so contributors and automation still target the same place.
 - The AMI contained the GitHub Actions runner, Docker, git and the Billet runner bootstrap, but no Go toolchain.
 - Each workflow used a dedicated EC2 instance and a JIT runner registration.
 
