@@ -71,6 +71,13 @@ if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
 	} >>"$work/lifetime.log" 2>&1
 fi
 
+# THE JOURNAL'S WARNINGS AND ERRORS ON THE SERIAL CONSOLE, which EC2 keeps for a while
+# after the host is gone: the node's own say why a cache was unavailable, and the host's
+# disk with its journal ends with it (#861).
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nForwardToConsole=yes\nMaxLevelConsole=warning\n' >/etc/systemd/journald.conf.d/billet-pool.conf
+systemctl restart systemd-journald
+
 # The image by its name alone: a pull assigns the generation and refuses a name that
 # names one, and it would refuse it on every attempt until the budget was spent.
 image=${PRELUDE_IMAGE:-ubuntu-2404-x64}

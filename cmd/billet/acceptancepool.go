@@ -45,6 +45,7 @@ type acceptancePoolHosts interface {
 	PoolHost(ctx context.Context, id string) (ec2.HostRecord, error)
 	FindPoolHost(ctx context.Context, order string) (ec2.HostRecord, bool, error)
 	TerminatePoolHost(ctx context.Context, id string) error
+	PoolHostConsole(ctx context.Context, id string) (string, error)
 }
 
 // acceptancePoolCache is the site's cache a pool's run used: ebss3.Store, or a test's.
@@ -386,6 +387,79 @@ func cmdMatrixPoolInitArgs(env cli.Env, args []string) error {
 	}
 
 	return nil
+}
+
+// poolConsolesLog is the file in a pool's workspace its hosts' consoles are kept in, a
+// name matrix-supervise.py's keep-logs moves out of the workspace with the services'.
+const poolConsolesLog = "pool-consoles.log"
+
+// cmdMatrixPoolConsoles writes what each host the run's pool ordered last wrote to its
+// serial console into the workspace's pool-consoles.log (#861): the node's warnings
+// and errors reach it, as the collection's prelude forwards the journal's there, and
+// they would otherwise end with the host. A run with no pool has none and writes
+// nothing. A console it could not read is said in the file and fails the command; the
+// others are kept.
+func cmdMatrixPoolConsoles(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet acceptance matrix pool-consoles", env.Stdout)
+	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
+	if err := cli.Parse(fs, args); err != nil {
+		return err
+	}
+	ws, err := requireAcceptanceWorkspace(*workspace)
+	if err != nil {
+		return err
+	}
+	pool, orders, isPool, err := acceptancePoolFor(ctx, ws)
+	switch {
+	case err != nil:
+		return err
+	case !isPool:
+		fmt.Fprintln(env.Stdout, "this run has no pool, so no host's console to keep")
+
+		return nil
+	}
+
+	path := filepath.Join(filepath.Dir(ws.ConfigPath), poolConsolesLog)
+	kept, failed, err := pool.writeConsoles(ctx, path, orders)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "kept %d pool host console(s) in %s\n", kept, path)
+	if failed > 0 {
+		return fmt.Errorf("%d pool host console(s) could not be read; %s says which", failed, path)
+	}
+
+	return nil
+}
+
+// writeConsoles writes each ordered host's console to path, one section a host, and
+// answers how many it kept and how many it could not read.
+func (p acceptancePool) writeConsoles(ctx context.Context, path string, orders []acceptancePoolOrder) (
+	int, int, error,
+) {
+	var b strings.Builder
+	kept, failed := 0, 0
+	for i := range orders {
+		o := &orders[i]
+		if o.HostID == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "=== pool host %s (order %s, %s)\n", o.HostID, o.ID, o.State)
+		text, err := p.hosts.PoolHostConsole(ctx, o.HostID)
+		if err != nil {
+			fmt.Fprintf(&b, "could not read its console: %v\n\n", err)
+			failed++
+
+			continue
+		}
+		b.WriteString(strings.TrimRight(text, "\n") + "\n\n")
+		kept++
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		return kept, failed, fmt.Errorf("write the pool hosts' consoles: %w", err)
+	}
+
+	return kept, failed, nil
 }
 
 // cmdMatrixPoolHostIAM prints the policy a pool's hosts need for the run's deployment:

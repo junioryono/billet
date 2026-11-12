@@ -867,6 +867,7 @@ func TestTheMatrixHostDownKeepsTheServicesLogsOnTheHost(t *testing.T) {
 		dir := hostRunDir(t, f)
 		for name, body := range map[string]string{
 			"acceptance.json": "{}", "server.log": "SERVER-SENTINEL\n", "node.log": "NODE-SENTINEL\n",
+			"pool-consoles.log": "POOL-SENTINEL\n",
 		} {
 			if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
 				t.Fatal(err)
@@ -912,11 +913,20 @@ func TestTheMatrixHostDownKeepsTheServicesLogsOnTheHost(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "ws")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the fake teardown left the workspace, so nothing here proves a log outlived it: %v", err)
 	}
-	for name, want := range map[string]string{"server.log": "SERVER-SENTINEL\n", "node.log": "NODE-SENTINEL\n"} {
+	for name, want := range map[string]string{"server.log": "SERVER-SENTINEL\n", "node.log": "NODE-SENTINEL\n",
+		"pool-consoles.log": "POOL-SENTINEL\n"} {
 		kept, err := os.ReadFile(filepath.Join(dir, "logs", name))
 		if err != nil || string(kept) != want {
 			t.Errorf("down did not keep %s past the teardown: %q, %v", name, kept, err)
 		}
+	}
+	// THE POOL'S CONSOLES ARE ASKED FOR BEFORE THE TEARDOWN, which ends the hosts they
+	// are on and removes the workspace they are written in.
+	log := billetLog(t, f)
+	asked := strings.Index(log, "acceptance matrix pool-consoles --workspace "+dir+"/ws\n")
+	down := strings.Index(log, "acceptance down --workspace "+dir+"/ws")
+	if asked < 0 || down < 0 || asked > down {
+		t.Errorf("down did not ask for the pool's consoles before the teardown:\n%s", log)
 	}
 	if info, err := os.Stat(filepath.Join(dir, "logs")); err != nil || info.Mode().Perm() != 0o700 {
 		t.Errorf("the kept logs' directory is %v, %v; want 0700", info.Mode().Perm(), err)
