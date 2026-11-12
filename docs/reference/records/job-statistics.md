@@ -26,7 +26,7 @@ To check the judgment on real re-runs, the copy was written with the attempts Gi
 
 The same read found what a re-run of failed jobs does to the passed ones. GitHub lists each one again under the new attempt with the same runner, a new id, the same `started_at` and `completed_at`, and a `created_at` of when the re-run was asked for. Run 39813415826's job on one runner is listed as attempt 2, created 17:09:06, and as attempt 3, created 20:03:23, both started 17:22:38; run 40218475152 lists four such pairs. A runner therefore names one job only together with the lowest attempt it is listed under, which is the one that ran it, and that entry's `created_at` is the job's queue time. The sweep's read keeps that entry and drops the copies. It drops a name the attempts cannot separate entirely.
 
-The sweep's read itself was run against GitHub on 2026-11-05 through billet's own client with the test organization's App. `billet-testbed/jobs`' `queue` workflow was dispatched on `ubuntu-latest` as run 42126907753, then re-run whole. `RunJobRecords` read runner `GitHub Actions 1000000006` as attempt 1, queued 23:05:44, and `GitHub Actions 1000000007` as attempt 2, queued 23:06:04, which is what `gh api` lists for the run.
+The sweep's read itself was run against GitHub on 2026-11-05 through billet's own client with the test organization's App. The test organization's private jobs repository's `queue` workflow was dispatched on `ubuntu-latest` as run 42126907753, then re-run whole. `RunJobRecords` read runner `GitHub Actions 1000000006` as attempt 1, queued 23:05:44, and `GitHub Actions 1000000007` as attempt 2, queued 23:06:04, which is what `gh api` lists for the run.
 
 ## What a recommendation can read
 

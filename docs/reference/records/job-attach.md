@@ -6,7 +6,7 @@ The three runs below used an EC2 instance with nested virtualization (m8i.2xlarg
 
 ## A terminal in a running job, and after its runner exited
 
-Measured on 2026-11-05: a real job from `billet-testbed/jobs` ran in the VM, and terminals were opened through the node's `handshakeVsock` and the relay's frames from a test binary on the host, not yet through a control plane.
+Measured on 2026-11-05: a real job from the test organization's private jobs repository ran in the VM, and terminals were opened through the node's `handshakeVsock` and the relay's frames from a test binary on the host, not yet through a control plane.
 
 Both during the job and after the runner had exited, which is the case a hold relies on:
 
@@ -43,7 +43,7 @@ Every assertion of the probe passed, and the test binary still reported `FAIL`: 
 
 Measured on 2026-11-07, from the branch of #794 at `ba6a1da1` (main at `803f1f06` with #794's first four commits). The server first started on the commit before, `a8b613ef`, and was restarted onto `ba6a1da1` at 16:36, before the node registered and before any job; every job ran on `ba6a1da1`. Nothing scripted stood between GitHub and the VM:
 
-- **The control plane was the `billet server` binary**, run on the shared test host with the `billet-testbed` App, a runner group `b1t19-hold` restricted to one workflow in `billet-testbed/jobs`, and one tier, `trusted`, with `debug.attach: true` and `debug.hold_on_failure` of 3 minutes on SQLite and 2 on PostgreSQL. `billet check` verified the App, its permissions and the runner group.
+- **The control plane was the `billet server` binary**, run on the shared test host with the `billet-testbed` App, a runner group `b1t19-hold` restricted to one workflow in that repository, and one tier, `trusted`, with `debug.attach: true` and `debug.hold_on_failure` of 3 minutes on SQLite and 2 on PostgreSQL. `billet check` verified the App, its permissions and the runner group.
 - **The jobs were real**: `workflow_dispatch` runs of that workflow, whose job wrote a marker file into its work directory, slept, and then failed or passed. The runner in each VM registered with GitHub through the JIT configuration billet minted, ran the job and reported it.
 - **The node was the suite's node process** (`startNodeLoop`: `app.NewNodeClient`, `app.NewNodeRunner`, `app.RunNodeLoop`) over the real Firecracker provider under the jailer, on an EC2 instance with nested virtualization, dialing the control plane on loopback through SSH tunnels, since the App's key stays on the shared host. It ran the same runtime a `billet node` runs; its root disk was the device-mapper snapshot above, which is why it was not the `billet node` binary, whose config requires Ceph.
 - **The guest image was `guest-20261102-060005`** with the branch's `billet`, agent, hook and attach unit put in, since no published release carries the attach server yet.

@@ -60,7 +60,7 @@ What the round trip is tested against is a stand-in, not a real bucket: `interna
 
 **This has not been run.** It is written down so that when it is, it is run the same way twice, and its result belongs in `docs/reference/records/aws-acceptance.md` beside the other measurements — as a record of what happened, never as a plan.
 
-1. Stand up an isolated deployment in the acceptance account (`810711872940`, us-west-2) with its own state directory, its own GitHub App and its own ports, and run one real job on it.
+1. Stand up an isolated deployment in the acceptance account (`<account>`, us-west-2) with its own state directory, its own GitHub App and its own ports, and run one real job on it.
 2. `billet local backup --out <dir>` against the live control plane.
 3. On a second host that has never seen it: `billet local restore --from <dir> --dry-run`, then with `--old-controller-fenced` after stopping **and disabling** the original everywhere.
 4. `billet local up`, then a real workflow on the restored deployment, with the node reconnecting on its original certificate.

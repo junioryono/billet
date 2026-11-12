@@ -4,7 +4,7 @@ What the runner and the index actually did, for the facts [ADR-031](../decisions
 
 ## What the runner writes
 
-Measured on 2026-11-04 on the shared Linux test host: one real job of `billet-testbed/jobs` (run 41789737389, one `sleep` step) on an ephemeral runner, actions/runner 2.337.0, with every file the runner wrote kept by a hard link as it appeared, polled every 50 ms.
+Measured on 2026-11-04 on the shared Linux test host: one real job of the test organization's private jobs repository (run 41789737389, one `sleep` step) on an ephemeral runner, actions/runner 2.337.0, with every file the runner wrote kept by a hard link as it appeared, polled every 50 ms.
 
 | Asked | Answer |
 |---|---|
