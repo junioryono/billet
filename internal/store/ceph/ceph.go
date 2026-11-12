@@ -144,8 +144,10 @@ type Client struct {
 	sweepResume string
 	// pressureDeferred is when each generation pressure could not remove may be
 	// tried again, so failures at the front of its order cannot spend every
-	// sweep's budget; under evictMu.
+	// sweep's budget; pressureTried is what the sweep in hand tried and has not
+	// removed, deferred when it ends. Both under evictMu.
 	pressureDeferred map[string]time.Time
+	pressureTried    map[string]bool
 
 	// lockImages holds the advisory-lock images a `lock add` has proved exist, so a
 	// retry skips the `rbd create` that could only fail.
