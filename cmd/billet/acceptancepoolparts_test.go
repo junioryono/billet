@@ -725,6 +725,26 @@ func TestTheRunWaitsForThePoolToLetItsHostsGo(t *testing.T) {
 	}
 }
 
+// A POOL'S RUN WAITS FOR ITS POOL'S RELEASE UNLESS IT WAS STOPPED: a run whose jobs'
+// wait gave up, on a job GitHub skipped, still owes the wait, and a stopped run and a
+// run with no pool do not.
+func TestAPoolsRunWaitsForItsReleaseUnlessItWasStopped(t *testing.T) {
+	t.Parallel()
+
+	pool := acceptanceRunOptions{jobs: 54, wait: time.Minute, poolReleased: time.Minute}
+	if !poolReleaseOwed(t.Context(), pool) {
+		t.Error("a pool's run that was not stopped skipped the pool's release")
+	}
+	stopped, stop := context.WithCancel(t.Context())
+	stop()
+	if poolReleaseOwed(stopped, pool) {
+		t.Error("a stopped run waited for the pool's release")
+	}
+	if poolReleaseOwed(t.Context(), acceptanceRunOptions{jobs: 54, wait: time.Minute}) {
+		t.Error("a run with no pool waited for a pool's release")
+	}
+}
+
 // EVERY ORDERED HOST'S CONSOLE IS KEPT, ONE SECTION A HOST, AND ONE THAT COULD NOT BE READ
 // IS SAID THERE AND COUNTED: a pool host's warnings outlive it in the run's own logs, and
 // an order that named no host has no console to ask for (#861).
