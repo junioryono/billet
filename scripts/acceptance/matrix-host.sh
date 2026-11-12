@@ -179,15 +179,21 @@ prelude)
 		exit 1
 	fi
 	billet_sha=$(sha256sum "$billet" | cut -d' ' -f1) || exit 1
+	# THE POOL ORDERS BOTH ARCHITECTURES, and an arm64 host runs the arm64 build the run
+	# sent beside this host's own.
+	arm_sha=$(sha256sum "$run_dir/billet-arm64" | cut -d' ' -f1) || exit 1
 	collection_sha=$(sha256sum "$run_dir/collection.tar.gz" | cut -d' ' -f1) || exit 1
 	{
 		printf 'export ARTIFACT_BUCKET=%q ARTIFACT_REGION=%q\n' "$bucket" "$region"
 		printf 'export BILLET_KEY=%q BILLET_SHA256=%q\n' "runs/$run/billet" "$billet_sha"
+		printf 'export BILLET_KEY_ARM64=%q BILLET_SHA256_ARM64=%q\n' "runs/$run/billet-arm64" "$arm_sha"
 		printf 'export COLLECTION_KEY=%q COLLECTION_SHA256=%q\n' "runs/$run/collection.tar.gz" "$collection_sha"
 		printf 'export PRELUDE_JOIN_SERVER=%q\n' "$listen"
 		printf 'export PRELUDE_INIT_ARGS=%q\n' "$(echo $args)"
 		printf 'export PRELUDE_MAX_LIFETIME_MINUTES=%q\n' "$lifetime"
-		tail -n +2 "$run_dir/prelude-template.sh" | sed '/^[[:space:]]*#/d'
+		# WITHOUT ITS COMMENTS OR ITS LEADING TABS, neither of which means anything inside
+		# the template's here-documents and quoted lines (its test checks the result parses).
+		tail -n +2 "$run_dir/prelude-template.sh" | sed -e '/^[[:space:]]*#/d' -e $'s/^\t*//'
 	} >"$run_dir/prelude.sh" || exit 1
 	size=$(wc -c <"$run_dir/prelude.sh")
 	# THE CONTROL PLANE ADDS ITS WRAPPER AND THE JOIN'S LINE to EC2's 16384: about 310

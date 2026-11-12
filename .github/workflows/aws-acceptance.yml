@@ -93,6 +93,7 @@ jobs:
         run: |
           set -euo pipefail
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/billet ./cmd/billet
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o dist/billet-arm64 ./cmd/billet
           tar -czf dist/collection.tar.gz ansible_collections
           cp ansible_collections/junioryono/billet/examples/pool-host-prelude/prelude.sh dist/prelude-template.sh
       - id: repo
@@ -159,7 +160,7 @@ jobs:
       - name: Send this run's binary and scripts
         run: |
           set -euo pipefail
-          for f in dist/billet dist/collection.tar.gz dist/prelude-template.sh scripts/acceptance/matrix-host.sh \
+          for f in dist/billet dist/billet-arm64 dist/collection.tar.gz dist/prelude-template.sh scripts/acceptance/matrix-host.sh \
             scripts/acceptance/matrix-supervise.py; do
             aws s3 cp --only-show-errors "$f" "s3://$BUCKET/runs/$RUN/$(basename "$f")"
           done
@@ -208,7 +209,7 @@ jobs:
           fi
           scripts/acceptance/ssm-run.sh run "$HOST" 900 "set -eu
           mkdir -p '$RUN_DIR'
-          for f in billet matrix-host.sh matrix-supervise.py collection.tar.gz prelude-template.sh; do
+          for f in billet billet-arm64 matrix-host.sh matrix-supervise.py collection.tar.gz prelude-template.sh; do
             aws s3 cp --only-show-errors \"s3://$BUCKET/runs/$RUN/\$f\" \"$RUN_DIR/\$f\"
           done
           chmod 0755 '$RUN_DIR/billet'
@@ -251,7 +252,7 @@ jobs:
           # after it is sent, and the wait below waits only for what is left of that
           # (ssm-run.sh adds its own grace to whatever it is given).
           # A POOL'S RUN WAITS AFTER ITS JOBS for the pool to release its host itself, which
-          # its idle_after (10 minutes) and a drain's proof (5) bound.
+          # its idle_after (20 minutes) and a drain's proof (5) bound.
           released=""
           if [ "$LANE" = pool ]; then released=40m; fi
           sent=$(date +%s)
@@ -369,9 +370,31 @@ jobs:
       # THE TWO-WRITER RUNS LAST, ONE ARCHITECTURE AT A TIME, each with a token and a
       # deadline of its own: each writer a holds a runner while it waits for its writer b,
       # so they run with nothing else on the deployment, and two architectures' at once
-      # could hold every slot.
+      # could hold every slot of the one node.
+      #
+      # A POOL'S, BOTH AT ONCE: each architecture's tier is placed only on its own
+      # architecture's host, so neither holds a slot the other could use, and one waiting
+      # for the other would leave its host idle past server.pool.idle_after, to be
+      # released and ordered again mid-run.
+      - id: writers-pool-token
+        if: ${{ env.LANE == 'pool' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Dispatch every architecture's two-writer runs to the pool at once, and wait for them
+        if: ${{ env.LANE == 'pool' }}
+        env:
+          GH_TOKEN: ${{ steps.writers-pool-token.outputs.token }}
+          LABELS: ${{ steps.labels.outputs.labels }}
+        run: |
+          set -euo pipefail
+          read -r -a labels <<<"$LABELS"
+          scripts/acceptance/matrix-dispatch.sh writers-apart "$REPO" "$RUN" out/runs "${labels[@]}"
       - id: writers-x64-token
-        if: ${{ steps.labels.outputs.label_x64 != '' }}
+        if: ${{ env.LANE == 'ec2' && steps.labels.outputs.label_x64 != '' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
@@ -379,13 +402,13 @@ jobs:
           owner: ${{ steps.repo.outputs.owner }}
           repositories: ${{ steps.repo.outputs.name }}
       - name: Dispatch the x64 two-writer runs, alone on the deployment, and wait for them
-        if: ${{ steps.labels.outputs.label_x64 != '' }}
+        if: ${{ env.LANE == 'ec2' && steps.labels.outputs.label_x64 != '' }}
         env:
           GH_TOKEN: ${{ steps.writers-x64-token.outputs.token }}
           LABEL: ${{ steps.labels.outputs.label_x64 }}
         run: scripts/acceptance/matrix-dispatch.sh writers "$REPO" "$RUN" out/runs "$LABEL"
       - id: writers-arm64-token
-        if: ${{ steps.labels.outputs.label_arm64 != '' }}
+        if: ${{ env.LANE == 'ec2' && steps.labels.outputs.label_arm64 != '' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
@@ -393,7 +416,7 @@ jobs:
           owner: ${{ steps.repo.outputs.owner }}
           repositories: ${{ steps.repo.outputs.name }}
       - name: Dispatch the arm64 two-writer runs, alone on the deployment, and wait for them
-        if: ${{ steps.labels.outputs.label_arm64 != '' }}
+        if: ${{ env.LANE == 'ec2' && steps.labels.outputs.label_arm64 != '' }}
         env:
           GH_TOKEN: ${{ steps.writers-arm64-token.outputs.token }}
           LABEL: ${{ steps.labels.outputs.label_arm64 }}

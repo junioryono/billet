@@ -7,6 +7,7 @@
 #   matrix-dispatch.sh cold <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh warm <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh writers <owner/repo> <tag> <runs-file> <label>...
+#   matrix-dispatch.sh writers-apart <owner/repo> <tag> <runs-file> <label>...
 #
 # Dispatches the acceptance matrix's workflows in <owner/repo> for each tier label and
 # appends the id of every run it starts to <runs-file>, which is what `billet acceptance
@@ -24,7 +25,10 @@
 # every run in <runs-file> to finish. `writers` comes last, and sends each label's
 # two-writer run only once the one before it has finished, because each writer a holds a
 # runner while it waits for its writer b, and two architectures' at once could hold every
-# slot (the workflow calls it once per architecture, so each has its own deadline). Every
+# slot (the workflow calls it once per architecture, so each has its own deadline).
+# `writers-apart` sends every label's at once and waits for them all, for tiers that share
+# no host, as a pool's architectures do: one waiting for another would leave its host
+# idle long enough for the pool to release it. Every
 # phase is a step of its own with an installation token of its own, because a token lasts
 # an hour.
 #
@@ -40,7 +44,7 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,9p' "$0" >&2
+	sed -n '2,10p' "$0" >&2
 	exit 2
 }
 
@@ -184,6 +188,15 @@ writers)
 		id=$(dispatch matrix-writers.yml "$label") || exit 1
 		await "$id" || exit 1
 	done
+	echo "the two-writer runs are done"
+	;;
+writers-apart)
+	writers=()
+	for label in "$@"; do
+		id=$(dispatch matrix-writers.yml "$label") || exit 1
+		writers+=("$id")
+	done
+	await "${writers[@]}" || exit 1
 	echo "the two-writer runs are done"
 	;;
 *)

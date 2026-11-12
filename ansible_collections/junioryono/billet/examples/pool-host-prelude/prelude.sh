@@ -14,7 +14,9 @@
 #                                      private bucket, ARTIFACT_BUCKET, ARTIFACT_REGION
 #   COLLECTION_URL, COLLECTION_SHA256  and BILLET_KEY / COLLECTION_KEY, read with the
 #                                      instance profile's own credentials)
-#   PRELUDE_JOIN_SERVER                server.pool.join_server
+#   BILLET_SHA256_ARM64 with           optional: an arm64 host's binary in place of
+#     BILLET_URL_ARM64 or _KEY_ARM64   the three above, for a pool of both architectures
+#   PRELUDE_JOIN_SERVER               server.pool.join_server
 #   PRELUDE_IMAGE                      the tier's image name (default ubuntu-2404-x64,
 #                                      or ubuntu-2404-arm64 on an aarch64 host)
 #   PRELUDE_IMAGE_SOURCE               optional: a guest image release to pull from
@@ -155,8 +157,13 @@ header = "x-amz-security-token: $st"
 EOF
 } >>"$work/fetch.log" 2>&1
 
-# A release's archive (its sha256 is in the release's checksums.txt) or a bare binary.
-fetch "${BILLET_KEY:-${BILLET_URL:-}}" billet.download
+# A release's archive (its sha256 is in the release's checksums.txt) or a bare binary, of
+# this host's architecture: an arm64 host given no binary of its own fetches the one
+# named for both, which then stops the boot at its first run unless it is arm64's.
+if [ $a = arm64 ] && [ -n "${BILLET_SHA256_ARM64:-}" ]; then
+	BILLET_KEY=${BILLET_KEY_ARM64:-} BILLET_URL=${BILLET_URL_ARM64:-} BILLET_SHA256=$BILLET_SHA256_ARM64
+fi
+fetch"${BILLET_KEY:-${BILLET_URL:-}}" billet.download
 echo "$BILLET_SHA256  billet.download" | sha256sum -c - >/dev/null 2>&1
 if tar -tzf billet.download billet >/dev/null 2>&1; then
 	tar -xzf billet.download billet

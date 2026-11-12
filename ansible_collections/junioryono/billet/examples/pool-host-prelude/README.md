@@ -48,13 +48,14 @@ It may be run again on the same host:
 
 ## Rendering it
 
-Write the exports below to a file, append the script's body without its comment lines, and point `server.pool.boot_prelude` at the result:
+Write the exports below to a file, append the script's body without its comment lines or leading tabs, and point `server.pool.boot_prelude` at the result:
 
 ```bash
-{ cat exports.sh; tail -n +2 prelude.sh | sed '/^[[:space:]]*#/d'; } >/etc/billet/pool-prelude.sh
+{ cat exports.sh; tail -n +2 prelude.sh | sed -e '/^[[:space:]]*#/d' -e $'s/^\t*//'; } >/etc/billet/pool-prelude.sh
+bash -n /etc/billet/pool-prelude.sh
 ```
 
-The comments are why each step is there, and they cost room the payload does not have. The script with them is about 22.7 KB, past the 16384 bytes the control plane carries (it refuses a longer boot, naming `boot_prelude`). Without them it is about 12.2 KB. No line the script needs starts with `#`: the full-line comments inside its two YAML heredocs are YAML's own.
+The comments are why each step is there, and they cost room the payload does not have. The script with them is about 28.1 KB, past the 16384 bytes the control plane carries (it refuses a longer boot, naming `boot_prelude`). Without them and its indentation it is about 14.2 KB (2026-11-11). No line the script needs starts with `#`: the full-line comments inside its two YAML heredocs are YAML's own. No line inside a here-document or a quoted string starts with a tab that means anything, which is what lets the indentation go.
 
 The exports:
 
@@ -69,9 +70,16 @@ export PRELUDE_JOIN_SERVER='10.0.0.5:7717'   # server.pool.join_server
 export PRELUDE_IMAGE='ubuntu-2404-x64'       # the tier's image, by its name alone (no @verified)
 ```
 
+A pool of both architectures also names arm64's binary, which an aarch64 host fetches in place of the one above. Without them an aarch64 host fetches `BILLET_URL`'s, and an amd64 binary stops its boot at the first run:
+
+```bash
+export BILLET_URL_ARM64='https://github.com/junioryono/billet/releases/download/v0.36.0/billet_0.36.0_linux_arm64.tar.gz'
+export BILLET_SHA256_ARM64='…'
+```
+
 The collection tarball may hold `ansible_collections/` at its top (a tarball of that directory alone, as the run used) or one directory down (GitHub's source archive of a tag or commit).
 
-Or, for artifacts in a private bucket, set `ARTIFACT_BUCKET`, `ARTIFACT_REGION`, `BILLET_KEY` and `COLLECTION_KEY` instead of the URLs. The script then reads them with the instance profile's own credentials, signed by curl, and the pool's instance profile needs `s3:GetObject` on those keys.
+Or, for artifacts in a private bucket, set `ARTIFACT_BUCKET`, `ARTIFACT_REGION`, `BILLET_KEY` (and `BILLET_KEY_ARM64`) and `COLLECTION_KEY` instead of the URLs. The script then reads them with the instance profile's own credentials, signed by curl, and the pool's instance profile needs `s3:GetObject` on those keys.
 
 **Do not render presigned links signed by a person's session.** The control plane reads `boot_prelude` once, when it starts. Every order after the session expires fails with 400.
 
@@ -89,8 +97,8 @@ export PRELUDE_INIT_ARGS='--site=aws-us-west-2a --ebs-s3-region=us-west-2 --ebs-
 The listener is on the guests' first bridge, the address the role gives the host there (the script moves them to 10.240.0.0/23, above), so only the guests reach it. The words are split on whitespace, so none may contain a space. The control plane checks them against its own `sites` and the pool's zone before it orders anything. The instance profile needs the node's cache policy, which `billet init iam --config <a node config with these flags> --deployment <id>` prints for a Firecracker node with `node.ebs_s3`: the bucket, the key, and attaching and detaching the store's volumes to and from an instance carrying this deployment's pool owner tag.
 
 The whole payload carries a join token, so keep it to the source's API, and within EC2's 16384 bytes of user data. The control plane adds a few lines around the prelude and the join's line, which quotes the join token and every `init_args` word again: about 1.1 KB with the acceptance lane's `init_args`, and it refuses an order whose boot is past 16384 bytes. The sizes:
-- **The body without comments** is about 14.2 KB (2026-11-10).
-- **Exports naming release URLs or S3 keys** add about 800 bytes with `PRELUDE_INIT_ARGS`. The acceptance lane renders it at about 15.0 KB and refuses past 15.2 KB (`scripts/acceptance/matrix-host.sh`), and a test renders this file the same way.
+- **The body without comments or indentation** is about 14.2 KB (2026-11-11).
+- **Exports naming release URLs or S3 keys** add about 950 bytes with `PRELUDE_INIT_ARGS` and both architectures' binaries. The acceptance lane renders it at about 15.1 KB and refuses past 15.2 KB (`scripts/acceptance/matrix-host.sh`), and a test renders this file the same way.
 - **A presigned link** adds about 1.9 KB. Two of them do not fit beside the control plane's lines, so use release URLs or S3 keys.
 
 Check the rendered file's size (`wc -c`) before pointing the pool at it.
