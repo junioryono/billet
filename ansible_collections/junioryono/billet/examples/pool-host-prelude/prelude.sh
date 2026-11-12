@@ -14,8 +14,11 @@
 #                                      private bucket, ARTIFACT_BUCKET, ARTIFACT_REGION
 #   COLLECTION_URL, COLLECTION_SHA256  and BILLET_KEY / COLLECTION_KEY, read with the
 #                                      instance profile's own credentials)
-#   PRELUDE_JOIN_SERVER                server.pool.join_server
-#   PRELUDE_IMAGE                      the tier's image name (default ubuntu-2404-x64)
+#   BILLET_SHA256_ARM64 with           optional: an arm64 host's binary in place of
+#     BILLET_URL_ARM64 or _KEY_ARM64   the three above, for a pool of both architectures
+#   PRELUDE_JOIN_SERVER               server.pool.join_server
+#   PRELUDE_IMAGE                      the tier's image name (default ubuntu-2404-x64,
+#                                      or ubuntu-2404-arm64 on an aarch64 host)
 #   PRELUDE_IMAGE_SOURCE               optional: a guest image release to pull from
 #   PRELUDE_OSD_DEVICE                 optional: the OSD's disk, else the first free one
 #   PRELUDE_BUDGET_SECONDS             optional: how long after it starts the prelude
@@ -71,8 +74,12 @@ if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
 fi
 
 # The image by its name alone: a pull assigns the generation and refuses a name that
-# names one, and it would refuse it on every attempt until the budget was spent.
-image=${PRELUDE_IMAGE:-ubuntu-2404-x64}
+# names one, and it would refuse it on every attempt until the budget was spent. By
+# default the one of this host's architecture, as a pool orders each architecture's
+# hosts from one prelude.
+a=x64
+[ "$(uname -m)" != aarch64 ] || a=arm64
+image=${PRELUDE_IMAGE:-ubuntu-2404-$a}
 case $image in
 *@*)
 	echo "prelude: PRELUDE_IMAGE is an image's name alone, without @ and what follows" >&2
@@ -150,7 +157,12 @@ header = "x-amz-security-token: $st"
 EOF
 } >>"$work/fetch.log" 2>&1
 
-# A release's archive (its sha256 is in the release's checksums.txt) or a bare binary.
+# A release's archive (its sha256 is in the release's checksums.txt) or a bare binary, of
+# this host's architecture: an arm64 host given no binary of its own fetches the one
+# named for both, which then stops the boot at its first run unless it is arm64's.
+if [ $a = arm64 ] && [ -n "${BILLET_SHA256_ARM64:-}" ]; then
+	BILLET_KEY=${BILLET_KEY_ARM64:-} BILLET_URL=${BILLET_URL_ARM64:-} BILLET_SHA256=$BILLET_SHA256_ARM64
+fi
 fetch "${BILLET_KEY:-${BILLET_URL:-}}" billet.download
 echo "$BILLET_SHA256  billet.download" | sha256sum -c - >/dev/null 2>&1
 if tar -tzf billet.download billet >/dev/null 2>&1; then

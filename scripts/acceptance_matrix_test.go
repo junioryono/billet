@@ -342,7 +342,8 @@ func TestTheMatrixHostRendersAPoolsPrelude(t *testing.T) {
 	dir := hostRunDir(t, f)
 	for file, body := range map[string]string{
 		"collection.tar.gz":   "a collection",
-		"prelude-template.sh": "#!/bin/bash\n# a comment\nset -Eeuo pipefail\n\t# an indented comment\necho prepared\n",
+		"billet-arm64":        "arm64's billet",
+		"prelude-template.sh": "#!/bin/bash\n# a comment\nset -Eeuo pipefail\n\t# an indented comment\n\t\techo prepared\n",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, file), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
@@ -364,12 +365,14 @@ func TestTheMatrixHostRendersAPoolsPrelude(t *testing.T) {
 	for _, want := range []string{
 		"export ARTIFACT_BUCKET=runs-bucket ARTIFACT_REGION=us-west-2\n",
 		fmt.Sprintf("export BILLET_KEY=runs/42-1-pool/billet BILLET_SHA256=%x\n", sha256.Sum256(billetBody)),
+		fmt.Sprintf("export BILLET_KEY_ARM64=runs/42-1-pool/billet-arm64 BILLET_SHA256_ARM64=%x\n",
+			sha256.Sum256([]byte("arm64's billet"))),
 		fmt.Sprintf("export COLLECTION_KEY=runs/42-1-pool/collection.tar.gz COLLECTION_SHA256=%x\n",
 			sha256.Sum256([]byte("a collection"))),
 		"export PRELUDE_JOIN_SERVER=10.77.0.10:7717\n",
 		"export PRELUDE_INIT_ARGS=--site=aws-us-west-2a\\ --cache-listen=10.240.0.1:7718\n",
 		"export PRELUDE_MAX_LIFETIME_MINUTES=240\n",
-		"set -Eeuo pipefail\necho prepared\n",
+		"\nset -Eeuo pipefail\necho prepared\n",
 	} {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("the prelude has no %q:\n%s", want, got)
@@ -380,6 +383,18 @@ func TestTheMatrixHostRendersAPoolsPrelude(t *testing.T) {
 	}
 	if !strings.Contains(billetLog(t, f), "acceptance matrix pool-init-args --config /pool.yaml\n") {
 		t.Errorf("billet was run as:\n%s", billetLog(t, f))
+	}
+
+	// No arm64 build beside the host's own: an arm64 host would be handed the wrong one.
+	if err := os.Remove(filepath.Join(dir, "billet-arm64")); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "prelude", dir, "/pool.yaml", "10.77.0.10:7717",
+		"runs-bucket", "us-west-2", "42-1-pool", "240"); code == 0 {
+		t.Errorf("a prelude rendered with no arm64 build: exit %d\n%s", code, out)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "billet-arm64"), []byte("arm64's billet"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
 	big := strings.Repeat("echo 0123456789012345678901234567890123456789\n", 400)
@@ -410,7 +425,7 @@ func TestTheCollectionsPreludeFitsTheLane(t *testing.T) {
 		t.Fatal(err)
 	}
 	for file, body := range map[string][]byte{"collection.tar.gz": []byte("a collection"),
-		"prelude-template.sh": template} {
+		"billet-arm64": []byte("arm64's billet"), "prelude-template.sh": template} {
 		if err := os.WriteFile(filepath.Join(dir, file), body, 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -421,6 +436,10 @@ func TestTheCollectionsPreludeFitsTheLane(t *testing.T) {
 		t.Fatalf("the collection's prelude does not fit the lane: exit %d\n%s", code, out)
 	}
 	t.Log(strings.TrimSpace(out))
+	// WHAT THE RENDER REMOVED, the comments and the leading tabs, left a script bash reads.
+	if out, err := exec.CommandContext(t.Context(), "bash", "-n", filepath.Join(dir, "prelude.sh")).CombinedOutput(); err != nil {
+		t.Errorf("the rendered prelude does not parse: %v\n%s", err, out)
+	}
 }
 
 // A POOL'S DEPLOYMENT IS STOOD UP ON ITS FLEET WIRE WITH THE RUN'S PRELUDE, AND BOTH ITS
@@ -477,7 +496,7 @@ func TestTheMatrixHostRunsAndJudgesAPool(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-host.sh", []string{"MATRIX_POLL=0.1"}, "run", dir, "27", "50m"); code != 0 {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
-	if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 150m "+
+	if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 125m "+
 		"--pool-released 50m --no-teardown\n") {
 		t.Errorf("billet was run as:\n%s", log)
 	}
@@ -1247,6 +1266,45 @@ func TestTheMatrixDispatchersWritersPhaseRunsOneArchitectureAtATime(t *testing.T
 	}
 	if got := dispatchSent(t, f); len(got) != 1 {
 		t.Fatalf("the arm writers run was sent beside a running x64 one: %q", got)
+	}
+}
+
+// A POOL'S ARCHITECTURES SHARE NO HOST, so their two-writer runs are sent together and
+// the phase waits for all of them: the arm one is sent while the x64 one still runs, and
+// that one unfinished fails the phase.
+func TestTheMatrixDispatchersWritersApartPhaseSendsEveryArchitectureAtOnce(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-2", "")
+	runs := filepath.Join(t.TempDir(), "runs")
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "writers-apart", "billet-testbed/m", "t1", runs,
+		"accept-x64", "accept-arm")
+	if code != 1 || !strings.Contains(out, "run 1 did not complete") {
+		t.Fatalf("an x64 writers run still running: exit %d\n%s", code, out)
+	}
+	want := []string{"matrix-writers.yml accept-x64 t1", "matrix-writers.yml accept-arm t1"}
+	if got := dispatchSent(t, f); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", got, want)
+	}
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "1\n2\n" {
+		t.Fatalf("the runs file is %q, %v", got, err)
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-1", "")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "writers-apart", "billet-testbed/m", "t2",
+		filepath.Join(t.TempDir(), "runs"), "accept-x64", "accept-arm"); code != 1 || !strings.Contains(out, "run 2 did not complete") {
+		t.Fatalf("an arm writers run still running: exit %d\n%s", code, out)
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-all", "")
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "writers-apart", "billet-testbed/m", "t3",
+		filepath.Join(t.TempDir(), "runs"), "accept-x64", "accept-arm"); code != 0 || !strings.Contains(out, "the two-writer runs are done") {
+		t.Fatalf("both finished: exit %d\n%s", code, out)
 	}
 }
 
