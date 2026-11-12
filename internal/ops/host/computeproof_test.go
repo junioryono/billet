@@ -274,11 +274,15 @@ func TestDrainStopsIfAdmissionMovesWhileProvingTheFleet(t *testing.T) {
 			}
 
 			if found {
-				// The host answers and is proved, and only THEN does somebody
-				// reopen the deployment and close it again. Nothing touches the
-				// host, so its epoch and dispatch fences both still match.
-				proveHost(t, db, cfg, "drain-host", true)
-
+				// Somebody reopens the deployment and closes it again, and only
+				// THEN does the host's answer for the drain's barrier arrive.
+				// Nothing touches the host, so its epoch and dispatch fences both
+				// still match. The answer goes last because the drain may read the
+				// ledger between any two of these writes: an answer written first
+				// can be read, rightly, as a proof under the generation the drain
+				// sealed, before the reopening exists (a failure on 2026-11-11, run
+				// 42940353479). The barrier stays stored until a control plane
+				// drops it, and none runs here.
 				resumed, err := db.Resume(ctx, state.ResumeRequest{
 					Expect: barrier.Generation, Clears: state.ProvenanceOperator,
 					Actor: "someone else",
@@ -294,7 +298,11 @@ func TestDrainStopsIfAdmissionMovesWhileProvingTheFleet(t *testing.T) {
 					Actor: "someone else",
 				}); err != nil {
 					t.Errorf("Seal: %v", err)
+
+					return
 				}
+
+				proveHost(t, db, cfg, "drain-host", true)
 
 				return
 			}
