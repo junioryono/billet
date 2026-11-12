@@ -148,7 +148,9 @@ jobs:
       # the site's cache store for their seven days, about 4.2 TB of its 4.9 TiB
       # (measured 2026-11-12), and wrote ~20 GB a run into the two OSDs every
       # guest's disk shares. A pull request restores what main saved, as the
-      # provider cache in the terraform job does.
+      # provider cache in the terraform job does. `--` ends the job and the shard
+      # in the key, because `test-` is also the start of `test-postgres-`, so a
+      # single hyphen would let one job's fallback take another job's archive.
       - name: Name today's race+cover cache
         id: race-day
         run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
@@ -159,9 +161,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}-${{ steps.race-day.outputs.day }}
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ steps.race-day.outputs.day }}
           restore-keys: |
-            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}-
+            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--
             go-race-cover-${{ hashFiles('go.sum') }}-
 
       # AN INTERRUPTED MUTATION RUN CANNOT BE COMMITTED: a `.bak` beside a
@@ -401,9 +403,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}-${{ steps.race-day.outputs.day }}
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ steps.race-day.outputs.day }}
           restore-keys: |
-            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}-
+            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--
             go-race-cover-${{ hashFiles('go.sum') }}-
       # THE CLIENT OF THE SERVER'S MAJOR, from apt.postgresql.org. A PostgreSQL
       # ledger travels in the deployment archive as pg_dump's own copy, and
@@ -521,9 +523,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}-${{ matrix.shard }}-${{ steps.race-day.outputs.day }}
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ matrix.shard }}--${{ steps.race-day.outputs.day }}
           restore-keys: |
-            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}-${{ matrix.shard }}-
+            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ matrix.shard }}--
             go-race-cover-${{ hashFiles('go.sum') }}-
       # The backup, restore and recover commands run pg_dump and pg_restore on a
       # PostgreSQL deployment; see test-postgres for why this client and why its
@@ -637,9 +639,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}-${{ matrix.shard }}-${{ steps.race-day.outputs.day }}
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ matrix.shard }}--${{ steps.race-day.outputs.day }}
           restore-keys: |
-            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}-${{ matrix.shard }}-
+            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ matrix.shard }}--
             go-race-cover-${{ hashFiles('go.sum') }}-
       - name: Test the retirement admission suite against PostgreSQL
         run: |
