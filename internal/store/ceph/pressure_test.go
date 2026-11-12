@@ -418,6 +418,28 @@ func TestPressureLeavesACandidateWhosePublicationMayComplete(t *testing.T) {
 
 			return true, 1
 		},
+		"two later generations of its key were published and pressure removed both": func(
+			t *testing.T, f *cacheFake, c *Client, key string, old time.Time,
+		) (bool, int) {
+			t.Helper()
+
+			// B PUBLISHED WITH NO POINTER BEFORE IT, AND C OVER B: removing C proves B
+			// of the same key published, and must prove nothing of the candidate.
+			for i, previous := range []string{"", "gen-b"} {
+				generation := []string{"gen-b", "gen-c"}[i]
+				handle := expiredGeneration(old.Add(time.Duration(i+1)*time.Hour), byte('b'+i))
+				f.addVolume(handle)
+				f.metadata[handle] = map[string]string{cacheMetaPrefix + "used_at": old.Format(time.RFC3339Nano)}
+				record := cachePointer{Key: key, Generation: generation, Handle: handle, UsedAt: old,
+					PublishedAt: old.Add(time.Duration(i+1) * time.Hour), RetentionHours: 7 * 24, Previous: previous}
+				setIndexRecord(t, f, c, generationKey(key, generation), record)
+				if generation == "gen-c" {
+					setIndexRecord(t, f, c, pointerKey(key), record)
+				}
+			}
+
+			return true, 2
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
