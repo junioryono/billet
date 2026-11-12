@@ -2316,6 +2316,29 @@ func (c *Client) evictGenerations(
 		}
 	}
 
+	// A POINTER WHOSE GENERATION IS GONE GOES, under pressure, on every sweep:
+	// pressure removes a generation and then its pointer, and a removal that failed
+	// between the two, or a process stopped there, would otherwise leave Current
+	// and Match handing out a missing generation and every save of the key refused,
+	// with no generation left for a later sweep to try again from. The pointer was
+	// written after its generation existed, and this round holds the lock every
+	// publication takes, so an absent image is a removed one.
+	if mode == evictPressure {
+		for handle, keys := range pointerKeys {
+			if present[handle] {
+				continue
+			}
+			for _, key := range keys {
+				if err := overBudget("pointers to removed generations and every generation"); err != nil {
+					return done(err)
+				}
+				if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+					failures = append(failures, fmt.Errorf("ceph: remove the pointer to removed %s: %w", handle, err))
+				}
+			}
+		}
+	}
+
 	generations := make([]string, 0, len(images))
 	for _, name := range images {
 		kind, _, ok := cacheImageName(name)
@@ -2331,12 +2354,15 @@ func (c *Client) evictGenerations(
 				continue
 			}
 		case evictPressure:
-			// ANY GENERATION UNUSED FOR olderThan AND NOT DEFERRED, named by a pointer
-			// or not: one no pointer names is one no new job can be handed, which is
-			// how the lineage behind a generation pressure took becomes the next
-			// candidate once the purge has deleted the writer between them. One with no
-			// record sorts first, and evictGeneration still asks its own used_at.
-			if now.Sub(lastUsed[handle]) < olderThan || c.pressureDeferredAt(handle) {
+			// ANY PUBLISHED GENERATION UNUSED FOR olderThan AND NOT DEFERRED, named by a
+			// pointer or not: one no pointer names is one no new job can be handed,
+			// which is how the lineage behind a generation pressure took becomes the
+			// next candidate once the purge has deleted the writer between them. NOT
+			// ONE NO RECORD NAMES: that is a candidate not yet published, which an
+			// Actions receipt may still publish after a restart; the full pass judges
+			// those by their age.
+			published := len(pointerKeys[handle]) > 0 || len(generationMetadata[handle]) > 0
+			if !published || now.Sub(lastUsed[handle]) < olderThan || c.pressureDeferredAt(handle) {
 				continue
 			}
 		}

@@ -313,6 +313,89 @@ func TestAGenerationPressureDidNotRemoveWaitsItsTurn(t *testing.T) {
 	}
 }
 
+// A POINTER LEFT NAMING A REMOVED GENERATION IS REMOVED BY THE NEXT SWEEP. Pressure
+// removes a generation and then its pointer; when the second fails, nothing is
+// left for a sweep to try again from but the pointer itself, which would hand out
+// a missing generation and refuse every save of its key.
+func TestAPointerPressureFailedToRemoveGoesAtTheNextSweep(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	f := newCacheFake()
+	f.poolFill = 0.9
+
+	// REFUSED FOR THE WHOLE FIRST SWEEP, whose later rounds would otherwise remove
+	// the pointer already.
+	const key = "acme/api/go"
+	refusing := true
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if refusing && slices.Contains(args, "image-meta") && slices.Contains(args, "remove") &&
+			slices.Contains(args, pointerKey(key)) {
+			return nil, errors.New("exit status 110: rbd: Connection timed out")
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	f.freshVolume(now)
+
+	old := now.Add(-72 * time.Hour)
+	handle := expiredGeneration(old, 'a')
+	f.addVolume(handle)
+	f.metadata[handle] = map[string]string{cacheMetaPrefix + "used_at": old.Format(time.RFC3339Nano)}
+	record := cachePointer{Key: key, Generation: "gen-a", Handle: handle, UsedAt: old, RetentionHours: 7 * 24}
+	setIndexRecord(t, f, c, pointerKey(key), record)
+	setIndexRecord(t, f, c, generationKey(key, "gen-a"), record)
+
+	if _, err := c.EvictUnderPressure(t.Context()); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("EvictUnderPressure = %v, want the pointer's failed removal reported", err)
+	}
+	if f.images[handle] {
+		t.Fatal("pressure kept the generation")
+	}
+	if _, ok := f.metadata[c.cacheIndex()][pointerKey(key)]; !ok {
+		t.Fatal("the pointer's removal did not fail, so this test shows nothing")
+	}
+
+	refusing = false
+
+	if _, err := c.EvictUnderPressure(t.Context()); err != nil {
+		t.Fatalf("the next EvictUnderPressure: %v", err)
+	}
+	if _, ok := f.metadata[c.cacheIndex()][pointerKey(key)]; ok {
+		t.Error("the next sweep left the pointer naming a removed generation")
+	}
+	if _, err := c.Current(t.Context(), key); !errors.Is(err, storecontract.ErrMiss) {
+		t.Errorf("Current after the next sweep = %v, want a miss", err)
+	}
+}
+
+// A CANDIDATE NOT YET PUBLISHED IS NOT PRESSURE'S, however old. No record names
+// it, and an Actions receipt may still publish it after a restart; the full pass
+// judges it by its age.
+func TestPressureLeavesACandidateNoRecordNames(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	f := newCacheFake()
+	f.poolFill = 0.9
+	c := evictingClient(t, f, f.run)
+	f.freshVolume(now)
+
+	old := now.Add(-72 * time.Hour)
+	candidate := expiredGeneration(old, 'a')
+	f.addVolume(candidate)
+	f.metadata[candidate] = map[string]string{cacheMetaPrefix + "used_at": old.Format(time.RFC3339Nano)}
+
+	report, err := c.EvictUnderPressure(t.Context())
+	if err != nil {
+		t.Fatalf("EvictUnderPressure: %v", err)
+	}
+	if !f.images[candidate] || f.ranWith("rm", candidate) || report.Evicted != 0 {
+		t.Errorf("pressure removed a candidate no record names: %+v", report)
+	}
+}
+
 // BELOW ITS THRESHOLD THE POOL KEEPS EVERY GENERATION FOR ITS RETENTION, and past
 // it the sweep frees the room: the generation, and in the same sweep the retired
 // writer it was published from, which holds its data, by the purge between rounds
