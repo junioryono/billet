@@ -67,8 +67,9 @@ export BILLET_SHA256='…'
 export COLLECTION_URL='https://github.com/junioryono/billet/archive/refs/tags/v0.36.0.tar.gz'
 export COLLECTION_SHA256='…'
 export PRELUDE_JOIN_SERVER='10.0.0.5:7717'   # server.pool.join_server
-export PRELUDE_IMAGE='ubuntu-2404-x64'       # the tier's image, by its name alone (no @verified)
 ```
+
+`PRELUDE_IMAGE` names the tier's image by its name alone (no `@verified`) when it is not the host's own architecture's `ubuntu-2404-x64` or `ubuntu-2404-arm64`. Leave it unset for a pool of both architectures, since one name would be every host's.
 
 A pool of both architectures also names arm64's binary, which an aarch64 host fetches in place of the one above. Without them an aarch64 host fetches `BILLET_URL`'s, and an amd64 binary stops its boot at the first run:
 

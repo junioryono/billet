@@ -252,9 +252,14 @@ jobs:
           # after it is sent, and the wait below waits only for what is left of that
           # (ssm-run.sh adds its own grace to whatever it is given).
           # A POOL'S RUN WAITS AFTER ITS JOBS for the pool to release its host itself, which
-          # its idle_after (20 minutes) and a drain's proof (5) bound.
+          # its idle_after (50 minutes) and a drain's proof (5) bound. IDLE_AFTER OUTLASTS
+          # THE GAP A PHASE CAN LEAVE ONE ARCHITECTURE'S HOST while the other's jobs finish:
+          # every phase waits for both, the first under 55 minutes and the rest under 45,
+          # and on 2026-11-11 (run 42974667854) an x64 host took 29 minutes to boot, join and
+          # run its first jobs, and each later phase 3 to 13. A host released mid-run would
+          # be ordered again, and its boot would spend the next phase's deadline.
           released=""
-          if [ "$LANE" = pool ]; then released=40m; fi
+          if [ "$LANE" = pool ]; then released=60m; fi
           sent=$(date +%s)
           id=$(scripts/acceptance/ssm-run.sh send "$HOST" 15000 \
             "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' run '$RUN_DIR' '${{ steps.repo.outputs.jobs }}' $released")

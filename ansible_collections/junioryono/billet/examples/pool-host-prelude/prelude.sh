@@ -163,7 +163,7 @@ EOF
 if [ $a = arm64 ] && [ -n "${BILLET_SHA256_ARM64:-}" ]; then
 	BILLET_KEY=${BILLET_KEY_ARM64:-} BILLET_URL=${BILLET_URL_ARM64:-} BILLET_SHA256=$BILLET_SHA256_ARM64
 fi
-fetch"${BILLET_KEY:-${BILLET_URL:-}}" billet.download
+fetch "${BILLET_KEY:-${BILLET_URL:-}}" billet.download
 echo "$BILLET_SHA256  billet.download" | sha256sum -c - >/dev/null 2>&1
 if tar -tzf billet.download billet >/dev/null 2>&1; then
 	tar -xzf billet.download billet
