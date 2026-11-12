@@ -66,7 +66,12 @@ jobs:
     # (SSM gives it 250), then the judge (15) and the teardown (`stopped` and `down`, at
     # most 30 and 40). Five dispatch phases of at most 45 minutes each (images, cold, warm,
     # and each architecture's two-writer runs) can outlast the host's wait; a run that
-    # does fails its phase or its jobs' count, and never passes.
+    # does fails its phase or its jobs' count, and never passes. A POOL'S run waits 140
+    # minutes for its jobs and 70 more for the pool to release its hosts, inside the same
+    # 250; its first phase waits up to 55 minutes for a host to boot, its writers are one
+    # phase for both architectures, and its `down` waits up to 90 for every host it
+    # terminated, so its worst case runs past six hours: GitHub then ends the job before
+    # its teardown finishes, which leaves the host held by this run for a person.
     timeout-minutes: 360
     env:
       LANE: ${{ matrix.lane }}
@@ -252,14 +257,15 @@ jobs:
           # after it is sent, and the wait below waits only for what is left of that
           # (ssm-run.sh adds its own grace to whatever it is given).
           # A POOL'S RUN WAITS AFTER ITS JOBS for the pool to release its host itself, which
-          # its idle_after (50 minutes) and a drain's proof (5) bound. IDLE_AFTER OUTLASTS
-          # THE GAP A PHASE CAN LEAVE ONE ARCHITECTURE'S HOST while the other's jobs finish:
-          # every phase waits for both, the first under 55 minutes and the rest under 45,
-          # and on 2026-11-11 (run 42974667854) an x64 host took 29 minutes to boot, join and
-          # run its first jobs, and each later phase 3 to 13. A host released mid-run would
-          # be ordered again, and its boot would spend the next phase's deadline.
+          # its idle_after (60 minutes) and a drain's proof (5) bound. IDLE_AFTER OUTLASTS
+          # THE GAP A PHASE CAN LEAVE ONE ARCHITECTURE'S HOST while the other's jobs finish,
+          # whatever the hosts' speeds: every phase waits for both, the first within 55
+          # minutes and the rest within 45, and the next is sent at most 150 seconds later
+          # (on 2026-11-11, run 42974667854, an x64 host took 29 minutes to boot, join and run
+          # its first jobs, and each later phase 3 to 13). A host released mid-run would be
+          # ordered again, and its boot would spend the next phase's deadline.
           released=""
-          if [ "$LANE" = pool ]; then released=60m; fi
+          if [ "$LANE" = pool ]; then released=70m; fi
           sent=$(date +%s)
           id=$(scripts/acceptance/ssm-run.sh send "$HOST" 15000 \
             "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' run '$RUN_DIR' '${{ steps.repo.outputs.jobs }}' $released")

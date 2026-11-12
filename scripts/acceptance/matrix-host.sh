@@ -248,7 +248,7 @@ run)
 	# still ends inside the 250 minutes SSM gives the command.
 	wait=210m released=()
 	if [ "$#" -eq 4 ]; then
-		wait=150m released=(--pool-released "$4")
+		wait=140m released=(--pool-released "$4")
 	fi
 	exec python3 -I "$supervise" run "$run_dir" "$billet" acceptance run --workspace "$ws" --jobs "$3" --wait "$wait" \
 		"${released[@]}" --no-teardown
