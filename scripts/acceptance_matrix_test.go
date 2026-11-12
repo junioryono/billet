@@ -193,6 +193,12 @@ acceptance-up)
 matrix-tiers)
 	cat "$FAKE/tiers" 2>/dev/null
 	;;
+matrix-pool-consoles)
+	ws=""
+	while [ "$#" -gt 0 ]; do [ "$1" = --workspace ] && ws=$2; shift; done
+	[ -f "$FAKE/consoles-fail" ] && exit 1
+	[ -d "$ws" ] && echo "POOL-SENTINEL" >"$ws/pool-consoles.log"
+	;;
 matrix-judge)
 	echo "judged"
 	;;
@@ -697,7 +703,7 @@ func TestTheMatrixHostStopIsHonouredByTheRunOnce(t *testing.T) {
 // status is down's.
 func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 	t.Parallel()
-	f := newMatrixFakes(t, "python3")
+	f := newMatrixFakes(t, "python3", "timeout")
 	f.command(t, "billet", fakeBillet)
 	dir := hostRunDir(t, f)
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", dir); code != 0 || !strings.Contains(out, "nothing to take down") {
@@ -860,7 +866,7 @@ func TestTheMatrixHostDownWaitsForTheRunAndIsIdempotent(t *testing.T) {
 // that would go through a symlink is not kept, and the teardown runs and answers anyway.
 func TestTheMatrixHostDownKeepsTheServicesLogsOnTheHost(t *testing.T) {
 	t.Parallel()
-	f := newMatrixFakes(t, "python3")
+	f := newMatrixFakes(t, "python3", "timeout")
 	f.command(t, "billet", fakeBillet)
 	stage := func() string {
 		t.Helper()
@@ -912,11 +918,34 @@ func TestTheMatrixHostDownKeepsTheServicesLogsOnTheHost(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "ws")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the fake teardown left the workspace, so nothing here proves a log outlived it: %v", err)
 	}
-	for name, want := range map[string]string{"server.log": "SERVER-SENTINEL\n", "node.log": "NODE-SENTINEL\n"} {
+	for name, want := range map[string]string{"server.log": "SERVER-SENTINEL\n", "node.log": "NODE-SENTINEL\n",
+		"pool-consoles.log": "POOL-SENTINEL\n"} {
 		kept, err := os.ReadFile(filepath.Join(dir, "logs", name))
 		if err != nil || string(kept) != want {
 			t.Errorf("down did not keep %s past the teardown: %q, %v", name, kept, err)
 		}
+	}
+	// THE POOL'S CONSOLES ARE ASKED FOR BEFORE THE TEARDOWN, which ends the hosts they
+	// are on and removes the workspace they are written in.
+	log := billetLog(t, f)
+	asked := strings.Index(log, "acceptance matrix pool-consoles --workspace "+dir+"/ws\n")
+	down := strings.Index(log, "acceptance down --workspace "+dir+"/ws")
+	if asked < 0 || down < 0 || asked > down {
+		t.Errorf("down did not ask for the pool's consoles before the teardown:\n%s", log)
+	}
+
+	// CONSOLES THAT COULD NOT BE KEPT ARE SAID, AND THE TEARDOWN RUNS AND ANSWERS anyway.
+	failing := stage()
+	f.fixture(t, "consoles-fail", "")
+	out, code := f.run(t, "acceptance/matrix-host.sh", nil, "down", failing)
+	if code != 0 || !strings.Contains(out, "not every pool host's console was kept") {
+		t.Errorf("down with consoles that could not be kept: exit %d\n%s", code, out)
+	}
+	if !strings.Contains(billetLog(t, f), "acceptance down --workspace "+failing+"/ws") {
+		t.Errorf("the teardown did not run after the consoles failed:\n%s", billetLog(t, f))
+	}
+	if err := os.Remove(filepath.Join(f.dir, "consoles-fail")); err != nil {
+		t.Fatal(err)
 	}
 	if info, err := os.Stat(filepath.Join(dir, "logs")); err != nil || info.Mode().Perm() != 0o700 {
 		t.Errorf("the kept logs' directory is %v, %v; want 0700", info.Mode().Perm(), err)

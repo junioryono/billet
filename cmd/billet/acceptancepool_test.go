@@ -239,6 +239,9 @@ type fakePoolHosts struct {
 	// listedFrom and listedUntil are, by id, the reads before and from which every
 	// listing leaves a host out.
 	listedFrom, listedUntil map[string]int
+	// consoles is each host's console, and consoleErr what reading any other answers.
+	consoles   map[string]string
+	consoleErr error
 }
 
 func newFakePoolHosts(shutdown int, hosts ...ec2.HostRecord) *fakePoolHosts {
@@ -304,6 +307,14 @@ func (f *fakePoolHosts) TerminatePoolHost(_ context.Context, id string) error {
 	}
 
 	return nil
+}
+
+func (f *fakePoolHosts) PoolHostConsole(_ context.Context, id string) (string, error) {
+	if text, ok := f.consoles[id]; ok {
+		return text, nil
+	}
+
+	return "", f.consoleErr
 }
 
 type fakePoolCache struct {

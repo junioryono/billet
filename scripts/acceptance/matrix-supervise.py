@@ -31,7 +31,8 @@ and to its stderr while that still reads, and it echoes the log's tail at the en
 await waits up to <seconds> for the lock to be free, which is the proof no run is
 live in <run-dir>: 0 once it is, 1 if a run still holds it.
 
-keep-logs links the run's services' logs out of the workspace the teardown removes, into
+keep-logs links the run's services' logs, and a pool's run's hosts' consoles, out of the
+workspace the teardown removes, into
 <run-dir>/logs, which it creates 0700; it exits 1 having said what it did not keep.
 
 MATRIX_POLL (seconds, default 2) is how often each looks.
@@ -158,7 +159,7 @@ def await_free(run_dir, seconds, poll):
         time.sleep(poll)
 
 
-KEPT_LOGS = ("server.log", "node.log")
+KEPT_LOGS = ("server.log", "node.log", "pool-consoles.log")
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 

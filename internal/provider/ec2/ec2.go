@@ -182,6 +182,12 @@ func (r Reader) TerminatePoolHost(ctx context.Context, id string) error {
 	return r.p.Hosts().Terminate(ctx, id)
 }
 
+// PoolHostConsole is the latest of what one of the deployment's pool hosts wrote to its
+// serial console (Hosts.Console), which EC2 keeps for a while after it is terminated.
+func (r Reader) PoolHostConsole(ctx context.Context, id string) (string, error) {
+	return r.p.Hosts().Console(ctx, id)
+}
+
 // build is New, and NewReader when launches is false: the one rule a provider that
 // launches nothing is spared is the launch network's.
 func build(owner string, cfg config.EC2Config, launches bool, opts ...Option) (*Provider, error) {

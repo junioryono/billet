@@ -535,10 +535,12 @@ func cmdAcceptanceMatrix(ctx context.Context, env cli.Env, args []string) error 
 		return cmdMatrixPoolInitArgs(env, args[1:])
 	case "pool-host-iam":
 		return cmdMatrixPoolHostIAM(ctx, env, args[1:])
+	case "pool-consoles":
+		return cmdMatrixPoolConsoles(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf("billet acceptance matrix %s: unknown subcommand; it is cells, tiers, jobs, judge, "+
-		"teardown-policy, pool-init-args or pool-host-iam", args[0])
+		"teardown-policy, pool-init-args, pool-host-iam or pool-consoles", args[0])
 }
 
 // cmdMatrixTeardownPolicy prints the IAM policy a run's teardown needs beside the node's

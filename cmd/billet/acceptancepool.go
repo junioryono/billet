@@ -45,6 +45,7 @@ type acceptancePoolHosts interface {
 	PoolHost(ctx context.Context, id string) (ec2.HostRecord, error)
 	FindPoolHost(ctx context.Context, order string) (ec2.HostRecord, bool, error)
 	TerminatePoolHost(ctx context.Context, id string) error
+	PoolHostConsole(ctx context.Context, id string) (string, error)
 }
 
 // acceptancePoolCache is the site's cache a pool's run used: ebss3.Store, or a test's.
@@ -386,6 +387,118 @@ func cmdMatrixPoolInitArgs(env cli.Env, args []string) error {
 	}
 
 	return nil
+}
+
+// poolConsolesLog is the file in a pool's workspace its hosts' consoles are kept in, a
+// name matrix-supervise.py's keep-logs moves out of the workspace with the services'.
+const poolConsolesLog = "pool-consoles.log"
+
+// cmdMatrixPoolConsoles writes what each host the run's pool ordered last wrote to its
+// serial console into the workspace's pool-consoles.log (#861): the node's warnings
+// and errors reach it, as the collection's prelude forwards the journal's there, and
+// they would otherwise end with the host. A run with no pool has none and writes
+// nothing. A console it could not read is said in the file and fails the command; the
+// others are kept.
+func cmdMatrixPoolConsoles(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet acceptance matrix pool-consoles", env.Stdout)
+	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
+	if err := cli.Parse(fs, args); err != nil {
+		return err
+	}
+	ws, err := requireAcceptanceWorkspace(*workspace)
+	if err != nil {
+		return err
+	}
+	pool, orders, isPool, err := acceptancePoolFor(ctx, ws)
+	switch {
+	case err != nil:
+		return err
+	case !isPool:
+		fmt.Fprintln(env.Stdout, "this run has no pool, so no host's console to keep")
+
+		return nil
+	}
+
+	path := filepath.Join(filepath.Dir(ws.ConfigPath), poolConsolesLog)
+	kept, failed, err := pool.writeConsoles(ctx, path, orders)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(env.Stdout, "kept %d pool host console(s) in %s\n", kept, path)
+	if failed > 0 {
+		return fmt.Errorf("%d pool host console(s) could not be read; %s says which", failed, path)
+	}
+
+	return nil
+}
+
+// writeConsoles writes each ordered host's console to path, one section a host, and
+// answers how many it kept and how many it could not read. An order that names no host
+// is asked of EC2 by its tag, as the teardown asks, since a host it holds would be ended
+// with no console kept.
+//
+// INSTALLED BY A RENAME OF A FILE IT CREATED, never written through path: an entry
+// already there, a link into out/ or to a stream, or a FIFO, is replaced, never followed.
+func (p acceptancePool) writeConsoles(ctx context.Context, path string, orders []acceptancePoolOrder) (
+	int, int, error,
+) {
+	var b strings.Builder
+	kept, failed := 0, 0
+	for i := range orders {
+		o := &orders[i]
+		id := o.HostID
+		if id == "" && o.State != alloc.PoolRefused {
+			h, found, err := p.hosts.FindPoolHost(ctx, o.ID)
+			switch {
+			case err != nil:
+				fmt.Fprintf(&b, "=== pool order %s (%s)\ncould not find its host: %v\n\n", o.ID, o.State, err)
+				failed++
+
+				continue
+			case found:
+				id = h.ID
+			default:
+				// NOT FOUND IS NOT NONE: EC2 may not list a host it holds yet, as the
+				// teardown's own lookup knows.
+				fmt.Fprintf(&b, "=== pool order %s (%s)\nEC2 names no host for it\n\n", o.ID, o.State)
+				failed++
+
+				continue
+			}
+		}
+		if id == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "=== pool host %s (order %s, %s)\n", id, o.ID, o.State)
+		text, err := p.hosts.PoolHostConsole(ctx, id)
+		if err != nil {
+			fmt.Fprintf(&b, "could not read its console: %v\n\n", err)
+			failed++
+
+			continue
+		}
+		b.WriteString(strings.TrimRight(text, "\n") + "\n\n")
+		kept++
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return kept, failed, fmt.Errorf("write the pool hosts' consoles: %w", err)
+	}
+	_, werr := tmp.WriteString(b.String())
+	if cerr := tmp.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Rename(tmp.Name(), path)
+	}
+	if werr != nil {
+		_ = os.Remove(tmp.Name())
+
+		return kept, failed, fmt.Errorf("write the pool hosts' consoles: %w", werr)
+	}
+
+	return kept, failed, nil
 }
 
 // cmdMatrixPoolHostIAM prints the policy a pool's hosts need for the run's deployment:

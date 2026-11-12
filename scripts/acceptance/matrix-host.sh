@@ -63,7 +63,10 @@
 # down beside it. It is the step every path ends with. Before the workspace goes, the
 # services' logs are moved to <run-dir>/logs on this host, never to <run-dir>/out, which
 # the workflow uploads: they name the account's resources, and a cell that failed for a
-# reason only the node saw cannot be explained once they are gone (run 42406366812).
+# reason only the node saw cannot be explained once they are gone (run 42406366812). A
+# pool's run keeps its hosts' consoles with them (`billet acceptance matrix
+# pool-consoles`), where the prelude forwards the node's warnings and errors, since the
+# host the node ran on is ended (#861).
 set -uo pipefail
 
 usage() {
@@ -316,8 +319,13 @@ down)
 		;;
 	*) exit 1 ;;
 	esac
-	# WHATEVER IT KEEPS, the teardown runs and answers: a log not kept is said, and costs
-	# only the log.
+	# A POOL'S HOSTS' CONSOLES FIRST, into the workspace, where the node's warnings outlive
+	# a host the teardown ends (#861). WHATEVER IT KEEPS, the teardown runs and answers: a
+	# log not kept is said, and costs only the log.
+	# BOUNDED ON ITS OWN, so a slow console read never spends the teardown's time.
+	if ! timeout --kill-after=30 600 "$billet" acceptance matrix pool-consoles --workspace "$ws"; then
+		echo "matrix: not every pool host's console was kept" >&2
+	fi
 	python3 -I "$supervise" keep-logs "$run_dir"
 	"$billet" acceptance down --workspace "$ws"
 	;;
