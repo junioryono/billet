@@ -10,7 +10,7 @@ One deployment (identity `86565b95…`), three nodes at two sites. The home node
 |---|---|---|---|---|
 | `home-a` | the reference host (`linux-01`, EPYC 7763), a second `billet node` process beside the production one | firecracker | `home` | Ceph, pools `accept-images` / `accept-cache` |
 | `home-b` | a KVM virtual machine on `linux-01` (Ubuntu 24.04, kernel 6.8, 16 vCPU, nested KVM), mapping the same pools over the network as a second kernel client | firecracker | `home` | the same pools |
-| `aws-1` | `t3.small` in the CI account (`810711872940`, us-west-2a), which also runs the control plane | ec2 | `aws` | EBS snapshots and an S3 prefix (`billet-20-cache-810711872940/accept20`) |
+| `aws-1` | `t3.small` in the CI account (`<account>`, us-west-2a), which also runs the control plane | ec2 | `aws` | EBS snapshots and an S3 prefix (`billet-20-cache-<account>/accept20`) |
 
 **`home-b` is a virtual machine on the same chassis as `home-a`, not a second physical server**, because the office has one Linux host and a Mac cannot map RBD or run Firecracker. What the VM shares with a second physical node is everything the site boundary is about — its own kernel, its own RBD client identity, its own jailer, its own bridges and its own node identity and certificate, reaching the mons and OSDs over the network rather than through a local socket. What it does not share is a second power supply and a second NIC; nothing here measures those.
 

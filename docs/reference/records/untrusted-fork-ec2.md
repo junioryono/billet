@@ -4,8 +4,8 @@ A pull request from a fork ran on an untrusted EC2 tier on 2026-10-25, green eac
 
 ## What ran
 
-- **The account:** the CI account (810711872940), us-west-2, the default VPC.
-- **The orchestrator:** a `c7i.large` running `billet acceptance up --account 810711872940` and `billet acceptance run`, built from this change. Its instance role carried exactly the policy `billet init iam --account-wide --builder --payload-bucket` renders, and nothing else.
+- **The account:** the CI account (<account>), us-west-2, the default VPC.
+- **The orchestrator:** a `c7i.large` running `billet acceptance up --account <account>` and `billet acceptance run`, built from this change. Its instance role carried exactly the policy `billet init iam --account-wide --builder --payload-bucket` renders, and nothing else.
 - **The guests:** `c7i.xlarge`, booting `ami-07ba26bf4a1783003`. `billet ami build` made it that day and booted it to stamp contract 3: Docker 29.1.3, runner 2.337.0, and the cache endpoint's issuer in the system trust store.
 - **The tier:** one tier, `trust: untrusted`, with its own runner group and `cache_scope` set to the probe repository, so ADR-013's `default-branch` publication applies. `node.ec2.untrusted_security_group_ids` named a group with no ingress rule, and there was no `instance_profile`. The node served the cache over HTTPS on its private address, from an EBS and S3 store.
 - **The deployment:** `fd0a67a938a132f8fabc26a0524a771a`, tier `b1t12-ec2-untrusted`.
