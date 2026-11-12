@@ -58,11 +58,10 @@ if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
 		mv /etc/billet-pool-lifetime.new /etc/billet-pool-lifetime
 	fi
 	deadline=$(cat /etc/billet-pool-lifetime)
-	printf '%s\n' '[Unit]' 'Description=Power this pool host off once its lifetime has passed' \
-		'[Service]' 'Type=oneshot' \
+	printf '%s\n' '[Unit]' 'Description=Pool host lifetime' '[Service]' 'Type=oneshot' \
 		'ExecStart=/bin/sh -c '\''[ "$(date +%%s)" -lt "$(cat /etc/billet-pool-lifetime)" ] || exec /usr/bin/systemctl poweroff --force'\''' \
 		>/etc/systemd/system/billet-pool-lifetime.service
-	printf '%s\n' '[Unit]' 'Description=Check this pool host'\''s lifetime at boot and at its end' '[Timer]' \
+	printf '%s\n' '[Unit]' 'Description=Pool host lifetime' '[Timer]' \
 		'OnBootSec=1min' "OnCalendar=$(date -u -d "@$deadline" '+%Y-%m-%d %H:%M:%S') UTC" 'AccuracySec=1min' \
 		'[Install]' 'WantedBy=timers.target' >/etc/systemd/system/billet-pool-lifetime.timer
 	{
@@ -70,13 +69,6 @@ if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
 		systemctl enable --now billet-pool-lifetime.timer
 	} >>"$work/lifetime.log" 2>&1
 fi
-
-# THE JOURNAL'S WARNINGS AND ERRORS ON THE SERIAL CONSOLE, which EC2 keeps for a while
-# after the host is gone: the node's own say why a cache was unavailable, and the host's
-# disk with its journal ends with it (#861).
-mkdir -p /etc/systemd/journald.conf.d
-printf '[Journal]\nForwardToConsole=yes\nMaxLevelConsole=warning\n' >/etc/systemd/journald.conf.d/billet-pool.conf
-systemctl restart systemd-journald
 
 # The image by its name alone: a pull assigns the generation and refuses a name that
 # names one, and it would refuse it on every attempt until the budget was spent.
@@ -563,4 +555,13 @@ active | activating | reloading) ;;
 		exit 1" >>"$work/image-unit.log" 2>&1
 	;;
 esac
+# THE NODE'S WARNINGS AND ERRORS ON THE SERIAL CONSOLE, which EC2 keeps for a while after
+# the host is gone: they say why a cache was unavailable, and the journal ends with the
+# host (#861). Its own unit's lines alone, by their level word, since it logs text on
+# stderr, which the journal files as info; and never a line holding the join's marker,
+# which the source reads the host's key from on the same console. A diagnostic, so one
+# that does not start costs the boot nothing.
+systemctl -q is-active billet-pool-console || systemd-run -u billet-pool-console --no-block sh -c \
+	'journalctl -f -n all -o cat -u billet-node|grep --line-buffered -E " (WARN|ERROR) "|grep --line-buffered -v billet-pool-join >/dev/ttyS0' \
+	>>"$work/image-unit.log" 2>&1 || true
 echo "prelude: host prepared"

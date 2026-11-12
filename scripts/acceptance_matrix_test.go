@@ -193,6 +193,11 @@ acceptance-up)
 matrix-tiers)
 	cat "$FAKE/tiers" 2>/dev/null
 	;;
+matrix-pool-consoles)
+	ws=""
+	while [ "$#" -gt 0 ]; do [ "$1" = --workspace ] && ws=$2; shift; done
+	[ -d "$ws" ] && echo "POOL-SENTINEL" >"$ws/pool-consoles.log"
+	;;
 matrix-judge)
 	echo "judged"
 	;;
@@ -867,7 +872,6 @@ func TestTheMatrixHostDownKeepsTheServicesLogsOnTheHost(t *testing.T) {
 		dir := hostRunDir(t, f)
 		for name, body := range map[string]string{
 			"acceptance.json": "{}", "server.log": "SERVER-SENTINEL\n", "node.log": "NODE-SENTINEL\n",
-			"pool-consoles.log": "POOL-SENTINEL\n",
 		} {
 			if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
 				t.Fatal(err)

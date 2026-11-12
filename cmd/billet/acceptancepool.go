@@ -433,7 +433,12 @@ func cmdMatrixPoolConsoles(ctx context.Context, env cli.Env, args []string) erro
 }
 
 // writeConsoles writes each ordered host's console to path, one section a host, and
-// answers how many it kept and how many it could not read.
+// answers how many it kept and how many it could not read. An order that names no host
+// is asked of EC2 by its tag, as the teardown asks, since a host it holds would be ended
+// with no console kept.
+//
+// INSTALLED BY A RENAME OF A FILE IT CREATED, never written through path: an entry
+// already there, a link into out/ or to a stream, or a FIFO, is replaced, never followed.
 func (p acceptancePool) writeConsoles(ctx context.Context, path string, orders []acceptancePoolOrder) (
 	int, int, error,
 ) {
@@ -441,11 +446,24 @@ func (p acceptancePool) writeConsoles(ctx context.Context, path string, orders [
 	kept, failed := 0, 0
 	for i := range orders {
 		o := &orders[i]
-		if o.HostID == "" {
+		id := o.HostID
+		if id == "" && o.State != alloc.PoolRefused {
+			h, found, err := p.hosts.FindPoolHost(ctx, o.ID)
+			switch {
+			case err != nil:
+				fmt.Fprintf(&b, "=== pool order %s (%s)\ncould not find its host: %v\n\n", o.ID, o.State, err)
+				failed++
+
+				continue
+			case found:
+				id = h.ID
+			}
+		}
+		if id == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "=== pool host %s (order %s, %s)\n", o.HostID, o.ID, o.State)
-		text, err := p.hosts.PoolHostConsole(ctx, o.HostID)
+		fmt.Fprintf(&b, "=== pool host %s (order %s, %s)\n", id, o.ID, o.State)
+		text, err := p.hosts.PoolHostConsole(ctx, id)
 		if err != nil {
 			fmt.Fprintf(&b, "could not read its console: %v\n\n", err)
 			failed++
@@ -455,8 +473,22 @@ func (p acceptancePool) writeConsoles(ctx context.Context, path string, orders [
 		b.WriteString(strings.TrimRight(text, "\n") + "\n\n")
 		kept++
 	}
-	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
 		return kept, failed, fmt.Errorf("write the pool hosts' consoles: %w", err)
+	}
+	_, werr := tmp.WriteString(b.String())
+	if cerr := tmp.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Rename(tmp.Name(), path)
+	}
+	if werr != nil {
+		_ = os.Remove(tmp.Name())
+
+		return kept, failed, fmt.Errorf("write the pool hosts' consoles: %w", werr)
 	}
 
 	return kept, failed, nil
