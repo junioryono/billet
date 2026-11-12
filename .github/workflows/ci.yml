@@ -137,21 +137,33 @@ jobs:
           # saved about two minutes of cold race+cover compilation per run.
           cache: false
 
-      # ROLLING KEY: restore-keys falls back to the newest entry for this go.sum
-      # and the sha-suffixed key writes a fresh one each run, so a run inherits
-      # the previous run's warm race+cover objects and recompiles only what
-      # changed. The `race-cover` prefix keeps it apart from the plain build
-      # cache the other jobs share; mixing flavours is what made a shared entry
-      # useless. The fleet's guests start empty, so this download is what stands
-      # between a run and a cold compile of every package under -race.
-      - name: Cache the race+cover Go build
-        uses: actions/cache@v5
+      # ONE ENTRY A JOB A DAY, SAVED FROM MAIN OR A RELEASE BRANCH ALONE. The
+      # restore falls back to this job's newest entry for this go.sum, then any
+      # job's, so a run inherits warm race+cover objects and recompiles only what
+      # changed. The `race-cover` prefix keeps it apart from the plain build cache
+      # the other jobs share; mixing flavours is what made a shared entry useless.
+      # The fleet's guests start empty, so this download is what stands between a
+      # run and a cold compile of every package under -race. A key per commit,
+      # saved by every run of every job, kept about 2,700 entries of ~1.56 GB in
+      # the site's cache store for their seven days, about 4.2 TB of its 4.9 TiB
+      # (measured 2026-11-12), and wrote ~20 GB a run into the two OSDs every
+      # guest's disk shares. A pull request restores what main saved, as the
+      # provider cache in the terraform job does. `--` ends the job and the shard
+      # in the key, because `test-` is also the start of `test-postgres-`, so a
+      # single hyphen would let one job's fallback take another job's archive.
+      - name: Name today's race+cover cache
+        id: race-day
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - name: Restore the race+cover Go build
+        id: race-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ steps.race-day.outputs.day }}
           restore-keys: |
+            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--
             go-race-cover-${{ hashFiles('go.sum') }}-
 
       # AN INTERRUPTED MUTATION RUN CANNOT BE COMMITTED: a `.bak` beside a
@@ -278,6 +290,19 @@ jobs:
             | tee test-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
 
+      # Once a day from main or a release branch, after a passing run (the
+      # restore step says why).
+      - name: Save the race+cover Go build
+        if: >-
+          github.event_name == 'push' && steps.race-cache.outputs.cache-hit != 'true' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ steps.race-cache.outputs.cache-primary-key }}
+
       # A DIAGNOSTIC, so nothing here can fail the job.
       - name: Report how much of /tmp the suite used
         if: always()
@@ -366,14 +391,21 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: Cache the race+cover Go build
-        uses: actions/cache@v5
+      # One entry a job a day, saved from main or a release branch alone (the
+      # test job's restore says why).
+      - name: Name today's race+cover cache
+        id: race-day
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - name: Restore the race+cover Go build
+        id: race-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ steps.race-day.outputs.day }}
           restore-keys: |
+            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--
             go-race-cover-${{ hashFiles('go.sum') }}-
       # THE CLIENT OF THE SERVER'S MAJOR, from apt.postgresql.org. A PostgreSQL
       # ledger travels in the deployment archive as pg_dump's own copy, and
@@ -415,6 +447,16 @@ jobs:
         run: |
           go test -race -count=1 -timeout 20m -vet=off ./internal/deployarchive/ ./internal/pgdump/
           go test -race -count=1 -timeout 20m -vet=off -run '^TestARestored' ./internal/e2e/
+      - name: Save the race+cover Go build
+        if: >-
+          github.event_name == 'push' && steps.race-cache.outputs.cache-hit != 'true' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ steps.race-cache.outputs.cache-primary-key }}
 
   # THE WHOLE COMMAND SUITE, NOT A LIST OF NAMES. Everything in cmd/billet and its
   # command families (internal/ops) that needs a real PostgreSQL -- the backup's
@@ -469,14 +511,21 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: Cache the race+cover Go build
-        uses: actions/cache@v5
+      # One entry a shard a day, saved from main or a release branch alone (the
+      # test job's restore says why).
+      - name: Name today's race+cover cache
+        id: race-day
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - name: Restore the race+cover Go build
+        id: race-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}-${{ matrix.shard }}
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ matrix.shard }}--${{ steps.race-day.outputs.day }}
           restore-keys: |
+            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ matrix.shard }}--
             go-race-cover-${{ hashFiles('go.sum') }}-
       # The backup, restore and recover commands run pg_dump and pg_restore on a
       # PostgreSQL deployment; see test-postgres for why this client and why its
@@ -501,6 +550,16 @@ jobs:
           go test -race -count=1 -timeout 40m -vet=off -run '${{ matrix.run }}' -skip '^TestRetirement' -json ./cmd/billet/ ./internal/ops/... \
             | tee command-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
+      - name: Save the race+cover Go build
+        if: >-
+          github.event_name == 'push' && steps.race-cache.outputs.cache-hit != 'true' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ steps.race-cache.outputs.cache-primary-key }}
 
       - name: Report the slowest command tests
         if: always()
@@ -568,14 +627,21 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: Cache the race+cover Go build
-        uses: actions/cache@v5
+      # One entry a shard a day, saved from main or a release branch alone (the
+      # test job's restore says why).
+      - name: Name today's race+cover cache
+        id: race-day
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - name: Restore the race+cover Go build
+        id: race-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.sha }}-${{ github.job }}-${{ matrix.shard }}
+          key: go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ matrix.shard }}--${{ steps.race-day.outputs.day }}
           restore-keys: |
+            go-race-cover-${{ hashFiles('go.sum') }}-${{ github.job }}--${{ matrix.shard }}--
             go-race-cover-${{ hashFiles('go.sum') }}-
       - name: Test the retirement admission suite against PostgreSQL
         run: |
@@ -583,6 +649,16 @@ jobs:
           python3 scripts/check-retirement-shards.py --run '${{ matrix.shard }}' \
             | tee retirement-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
+      - name: Save the race+cover Go build
+        if: >-
+          github.event_name == 'push' && steps.race-cache.outputs.cache-hit != 'true' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ steps.race-cache.outputs.cache-primary-key }}
 
       - name: Report the slowest retirement tests
         if: always()
