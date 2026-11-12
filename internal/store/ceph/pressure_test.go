@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -128,42 +129,43 @@ func TestPressureUnwindsTheLineageBehindTheGenerationItTakes(t *testing.T) {
 	twoHours := now.Add(-2 * time.Hour)
 	key := "acme/api/go-chain"
 
-	volume, err := c.Create(t.Context(), key, 1<<30)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	lease, fence, err := c.acquireWriterAt(t.Context(), key, "lease-1", time.Minute, now)
-	if err != nil {
-		t.Fatalf("AcquireWriter first: %v", err)
-	}
-	first, err := c.snapshotAt(t.Context(), volume, now)
-	if err != nil {
-		t.Fatalf("Snapshot first: %v", err)
-	}
-	if err := c.publishCASAt(t.Context(), key, "", first, lease, fence, now); err != nil {
-		t.Fatalf("PublishCAS first: %v", err)
-	}
+	// THREE PUBLICATIONS, each cloned from the one before: the middle one, which
+	// pressure removes with no pointer naming it, is what proves the first.
+	var handles []string
+	expected := ""
+	for i := range 3 {
+		at := now.Add(time.Duration(i) * time.Second)
 
-	volume, err = c.Clone(t.Context(), key, "")
-	if err != nil {
-		t.Fatalf("Clone first: %v", err)
-	}
-	later := now.Add(time.Second)
-	lease, fence, err = c.acquireWriterAt(t.Context(), key, "lease-2", time.Minute, later)
-	if err != nil {
-		t.Fatalf("AcquireWriter second: %v", err)
-	}
-	second, err := c.snapshotAt(t.Context(), volume, later)
-	if err != nil {
-		t.Fatalf("Snapshot second: %v", err)
-	}
-	if err := c.publishCASAt(t.Context(), key, first.Generation, second, lease, fence, later); err != nil {
-		t.Fatalf("PublishCAS second: %v", err)
+		var volume storecontract.Volume
+		var err error
+		if i == 0 {
+			volume, err = c.Create(t.Context(), key, 1<<30)
+		} else {
+			volume, err = c.Clone(t.Context(), key, "")
+		}
+		if err != nil {
+			t.Fatalf("publication %d: open its volume: %v", i, err)
+		}
+
+		lease, fence, err := c.acquireWriterAt(t.Context(), key, fmt.Sprintf("lease-%d", i), time.Minute, at)
+		if err != nil {
+			t.Fatalf("publication %d: AcquireWriter: %v", i, err)
+		}
+		candidate, err := c.snapshotAt(t.Context(), volume, at)
+		if err != nil {
+			t.Fatalf("publication %d: Snapshot: %v", i, err)
+		}
+		if err := c.publishCASAt(t.Context(), key, expected, candidate, lease, fence, at); err != nil {
+			t.Fatalf("publication %d: PublishCAS: %v", i, err)
+		}
+
+		handles = append(handles, candidate.Handle)
+		expected = candidate.Generation
 	}
 
 	// EVERY USE TWO HOURS AGO: past pressureIdle and the superseded grace, inside
 	// the seven-day retention.
-	for _, candidate := range []string{first.Handle, second.Handle} {
+	for _, candidate := range handles {
 		f.metadata[candidate][cacheMetaPrefix+"used_at"] = twoHours.Format(time.RFC3339Nano)
 	}
 	for metadataKey, value := range f.metadata[c.cacheIndex()] {
@@ -187,7 +189,7 @@ func TestPressureUnwindsTheLineageBehindTheGenerationItTakes(t *testing.T) {
 		t.Fatalf("EvictUnderPressure: %v", err)
 	}
 
-	for _, candidate := range []string{first.Handle, second.Handle} {
+	for _, candidate := range handles {
 		if f.images[candidate] {
 			t.Errorf("one pressure sweep kept %s of a lineage it had taken the head of (%+v)", candidate, report)
 		}
@@ -384,30 +386,37 @@ func TestAPointerPressureFailedToRemoveGoesAtTheNextSweep(t *testing.T) {
 // A CANDIDATE WHOSE PUBLICATION MAY STILL COMPLETE IS NOT PRESSURE'S, however old:
 // one no record names, and one whose generation record PublishCAS wrote before a
 // pointer it never wrote, whose Actions receipt may publish it after a restart.
-// Nor is one whose record was written after pressure removed its key's pointer,
-// which is a publication begun since and not the lineage behind that pointer. The
-// full pass judges each by its age.
+// That stays so when a later generation of its key was published, with no pointer
+// before it, and pressure then removed that one: the key has no pointer again, so
+// the receipt's retry expects what it finds. The full pass judges each by its age.
 func TestPressureLeavesACandidateWhosePublicationMayComplete(t *testing.T) {
 	t.Parallel()
 
-	for name, recorded := range map[string]func(c *Client, key string, old time.Time) (cachePointer, bool){
-		"no record names it": func(*Client, string, time.Time) (cachePointer, bool) {
-			return cachePointer{}, false
+	type setup func(t *testing.T, f *cacheFake, c *Client, key string, old time.Time) (record bool, evicted int)
+
+	for name, staged := range map[string]setup{
+		"no record names it": func(*testing.T, *cacheFake, *Client, string, time.Time) (bool, int) {
+			return false, 0
 		},
 		"its publication stopped between its record and its pointer": func(
-			_ *Client, key string, old time.Time,
-		) (cachePointer, bool) {
-			return cachePointer{Key: key, UsedAt: old, PublishedAt: old, RetentionHours: 7 * 24}, true
+			*testing.T, *cacheFake, *Client, string, time.Time,
+		) (bool, int) {
+			return true, 0
 		},
-		"its record was written after pressure removed its key's pointer": func(
-			c *Client, key string, old time.Time,
-		) (cachePointer, bool) {
-			c.notePressureUnpointed([]string{key})
-			c.evictMu.Lock()
-			c.pressureUnpointed[key] = old.Add(-time.Minute)
-			c.evictMu.Unlock()
+		"a later generation of its key was published and pressure removed it": func(
+			t *testing.T, f *cacheFake, c *Client, key string, old time.Time,
+		) (bool, int) {
+			t.Helper()
 
-			return cachePointer{Key: key, UsedAt: old, PublishedAt: old, RetentionHours: 7 * 24}, true
+			later := expiredGeneration(old.Add(time.Hour), 'b')
+			f.addVolume(later)
+			f.metadata[later] = map[string]string{cacheMetaPrefix + "used_at": old.Format(time.RFC3339Nano)}
+			record := cachePointer{Key: key, Generation: "gen-b", Handle: later, UsedAt: old,
+				PublishedAt: old.Add(time.Hour), RetentionHours: 7 * 24}
+			setIndexRecord(t, f, c, generationKey(key, "gen-b"), record)
+			setIndexRecord(t, f, c, pointerKey(key), record)
+
+			return true, 1
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -424,28 +433,32 @@ func TestPressureLeavesACandidateWhosePublicationMayComplete(t *testing.T) {
 			candidate := expiredGeneration(old, 'a')
 			f.addVolume(candidate)
 			f.metadata[candidate] = map[string]string{cacheMetaPrefix + "used_at": old.Format(time.RFC3339Nano)}
-			if record, ok := recorded(c, key, old); ok {
-				record.Generation, record.Handle = "gen-a", candidate
-				setIndexRecord(t, f, c, generationKey(key, "gen-a"), record)
+
+			recorded, evicted := staged(t, f, c, key, old)
+			if recorded {
+				setIndexRecord(t, f, c, generationKey(key, "gen-a"), cachePointer{Key: key, Generation: "gen-a",
+					Handle: candidate, UsedAt: old, PublishedAt: old, RetentionHours: 7 * 24})
 			}
 
 			report, err := c.EvictUnderPressure(t.Context())
 			if err != nil {
 				t.Fatalf("EvictUnderPressure: %v", err)
 			}
-			if !report.Pressed() || !f.images[candidate] || f.ranWith("rm", candidate) || report.Evicted != 0 {
+			if !report.Pressed() || report.Evicted != evicted {
+				t.Errorf("report = %+v, want the pool pressed and %d evicted", report, evicted)
+			}
+			if !f.images[candidate] || f.ranWith("rm", candidate) {
 				t.Errorf("pressure removed a candidate whose publication may complete: %+v", report)
 			}
 		})
 	}
 }
 
-// THE LINEAGE PRESSURE TAKES IS THE ONE IT UNPOINTED, and only while it remembers:
-// a generation whose every record names a key whose pointer this process's
-// pressure removed after the record was written is a candidate; once that is
-// pressureUnpointedKept behind, it is forgotten and the full pass is left the
-// generation.
-func TestPressureTakesOnlyTheLineageItRemembersUnpointing(t *testing.T) {
+// THE LINEAGE PRESSURE TAKES IS THE ONE IT PROVED PUBLISHED, and only while it
+// remembers: a generation whose every record is one a generation pressure removed
+// named as its Previous is a candidate; once that is pressureLineageKept behind,
+// it is forgotten and the full pass is left the generation.
+func TestPressureTakesOnlyTheLineageItProvedPublished(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now().UTC()
@@ -467,12 +480,15 @@ func TestPressureTakesOnlyTheLineageItRemembersUnpointing(t *testing.T) {
 
 		return handle
 	}
-	behind := add("acme/api/unpointed", 'a')
+	behind := add("acme/api/behind", 'a')
 	forgotten := add("acme/api/forgotten", 'b')
 
-	c.notePressureUnpointed([]string{"acme/api/unpointed", "acme/api/forgotten"})
+	c.notePressureLineage([]cachePointer{
+		{Key: "acme/api/behind", Previous: "gen-" + behind},
+		{Key: "acme/api/forgotten", Previous: "gen-" + forgotten},
+	})
 	c.evictMu.Lock()
-	c.pressureUnpointed["acme/api/forgotten"] = now.Add(-pressureUnpointedKept)
+	c.pressureLineage[lineageKey("acme/api/forgotten", "gen-"+forgotten)] = now.Add(-pressureLineageKept)
 	c.evictMu.Unlock()
 
 	report, err := c.EvictUnderPressure(t.Context())
@@ -480,18 +496,18 @@ func TestPressureTakesOnlyTheLineageItRemembersUnpointing(t *testing.T) {
 		t.Fatalf("EvictUnderPressure: %v", err)
 	}
 	if f.images[behind] || report.Evicted != 1 {
-		t.Errorf("pressure kept the generation behind a pointer it removed: %+v", report)
+		t.Errorf("pressure kept a generation of the lineage it proved published: %+v", report)
 	}
 	if !f.images[forgotten] || f.ranWith("rm", forgotten) {
-		t.Error("pressure took a generation behind a pointer it removed longer ago than it remembers")
+		t.Error("pressure took a generation it proved published longer ago than it remembers")
 	}
 
 	c.evictMu.Lock()
-	_, kept := c.pressureUnpointed["acme/api/forgotten"]
+	_, kept := c.pressureLineage[lineageKey("acme/api/forgotten", "gen-"+forgotten)]
 	c.evictMu.Unlock()
 
 	if kept {
-		t.Error("a removal pressureUnpointedKept behind outlived its sweep")
+		t.Error("a proof pressureLineageKept behind outlived its sweep")
 	}
 }
 
