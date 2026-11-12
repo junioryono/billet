@@ -148,6 +148,10 @@ type Client struct {
 	// removed, deferred when it ends. Both under evictMu.
 	pressureDeferred map[string]time.Time
 	pressureTried    map[string]bool
+	// pressureUnpointed is when pressure removed the pointer of each cache key, so
+	// the generations behind it in its lineage, which no pointer names, are
+	// pressure's to take, and nothing else no pointer names is; under evictMu.
+	pressureUnpointed map[string]time.Time
 
 	// lockImages holds the advisory-lock images a `lock add` has proved exist, so a
 	// retry skips the `rbd create` that could only fail.

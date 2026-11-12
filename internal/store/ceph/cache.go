@@ -1868,6 +1868,7 @@ func (c *Client) EvictUnderPressure(ctx context.Context) (PressureReport, error)
 	}
 
 	c.prunePressureDeferred()
+	c.prunePressureUnpointed()
 
 	report.Evicted, err = c.evictInRounds(ctx, pressureIdle, pressureSweepBudget, evictPressure)
 	c.deferPressureTried()
@@ -2146,12 +2147,71 @@ func (c *Client) deferPressureTried() {
 	c.pressureTried = nil
 }
 
+// pressureUnpointedKept is how long pressure remembers removing a key's pointer:
+// the longest retention any key has, after which the full pass takes whatever
+// generation behind it is still there.
+const pressureUnpointedKept = 8 * 24 * time.Hour
+
+// notePressureUnpointed records that pressure removed the pointer of each of keys
+// now, on this process's clock.
+func (c *Client) notePressureUnpointed(keys []string) {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	if len(keys) > 0 && c.pressureUnpointed == nil {
+		c.pressureUnpointed = map[string]time.Time{}
+	}
+
+	now := c.now()
+	for _, key := range keys {
+		if key != "" {
+			c.pressureUnpointed[key] = now
+		}
+	}
+}
+
+// behindRemovedPointer says every one of a generation's records, of which it has
+// at least one, names a key whose pointer this process's pressure removed after
+// the record was written. A record written after that is a publication begun
+// since, which may still complete; one written before it either was published and
+// then moved past, or can no longer be, since its key's pointer has changed from
+// what it expected. What a restart forgets waits for the full pass.
+func (c *Client) behindRemovedPointer(records []cachePointer) bool {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	for i := range records {
+		record := &records[i]
+		removedAt, ok := c.pressureUnpointed[record.Key]
+		if !ok || record.PublishedAt.IsZero() || !record.PublishedAt.Before(removedAt) {
+			return false
+		}
+	}
+
+	return len(records) > 0
+}
+
+// prunePressureUnpointed forgets each removal older than pressureUnpointedKept.
+func (c *Client) prunePressureUnpointed() {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	now := c.now()
+	for key, at := range c.pressureUnpointed {
+		if now.Sub(at) >= pressureUnpointedKept {
+			delete(c.pressureUnpointed, key)
+		}
+	}
+}
+
 // evictGenerations is one round of a pass, under the cache lock, holding it for at
 // most budget, what the pass has left of its own. evictSuperseded confines it to
 // the superseded generations, without the index bookkeeping; evictPressure takes
-// any generation nothing holds that went unused for olderThan, least recently used
-// first, whatever its retention, and removes the pointers naming each it removes.
-// Only the full pass keeps the rest of the index tidy.
+// the generations a pointer names, and the lineage behind a pointer it removed,
+// that nothing holds and went unused for olderThan, least recently used first,
+// whatever their retention, and removes the pointers naming each it removes. Every
+// mode removes a pointer whose generation is gone; only the full pass keeps the
+// rest of the index tidy.
 func (c *Client) evictGenerations(
 	ctx context.Context, olderThan time.Duration, now time.Time, budget time.Duration,
 	mode evictMode,
@@ -2215,6 +2275,7 @@ func (c *Client) evictGenerations(
 	// superseded all the same.
 	current := map[string]string{}
 	generationKeys := map[string][]string{}
+	generationRecords := map[string][]cachePointer{}
 	for key, value := range metadata {
 		switch {
 		case strings.HasPrefix(key, cacheMetaPrefix+"pointer."):
@@ -2226,6 +2287,7 @@ func (c *Client) evictGenerations(
 			var generation cachePointer
 			if json.Unmarshal([]byte(value), &generation) == nil && generation.Handle != "" {
 				generationKeys[generation.Handle] = append(generationKeys[generation.Handle], generation.Key)
+				generationRecords[generation.Handle] = append(generationRecords[generation.Handle], generation)
 			}
 		}
 	}
@@ -2233,9 +2295,11 @@ func (c *Client) evictGenerations(
 	// lastUsed is the latest use any record gives each generation, its pointer's
 	// or its generation record's (a restore of a named generation refreshes the
 	// latter alone), which pressure orders by; pointerKeys are the pointer records
-	// naming each, which pressure removes with it.
+	// naming each, which pressure removes with it, and pointedKeys the cache keys
+	// those pointers are for.
 	lastUsed := map[string]time.Time{}
 	pointerKeys := map[string][]string{}
+	pointedKeys := map[string][]string{}
 
 	for key, value := range metadata {
 		switch {
@@ -2248,6 +2312,7 @@ func (c *Client) evictGenerations(
 					lastUsed[pointer.Handle] = pointer.UsedAt
 				}
 				pointerKeys[pointer.Handle] = append(pointerKeys[pointer.Handle], key)
+				pointedKeys[pointer.Handle] = append(pointedKeys[pointer.Handle], pointer.Key)
 
 				switch {
 				case mode == evictPressure:
@@ -2316,25 +2381,24 @@ func (c *Client) evictGenerations(
 		}
 	}
 
-	// A POINTER WHOSE GENERATION IS GONE GOES, under pressure, on every sweep:
-	// pressure removes a generation and then its pointer, and a removal that failed
-	// between the two, or a process stopped there, would otherwise leave Current
-	// and Match handing out a missing generation and every save of the key refused,
-	// with no generation left for a later sweep to try again from. The pointer was
-	// written after its generation existed, and this round holds the lock every
-	// publication takes, so an absent image is a removed one.
-	if mode == evictPressure {
-		for handle, keys := range pointerKeys {
-			if present[handle] {
-				continue
+	// A POINTER WHOSE GENERATION IS GONE GOES, in every round of every pass and
+	// sweep, whatever the pool's fill: pressure removes a generation and then its
+	// pointer, and a removal that failed between the two, or a process stopped
+	// there, would otherwise leave Current and Match handing out a missing
+	// generation and every save of the key refused, with no generation left to try
+	// again from and pressure perhaps no longer running. The pointer was written
+	// after its generation existed, and this round holds the lock every publication
+	// takes, so an absent image is a removed one.
+	for handle, keys := range pointerKeys {
+		if present[handle] {
+			continue
+		}
+		for _, key := range keys {
+			if err := overBudget("pointers to removed generations and every generation"); err != nil {
+				return done(err)
 			}
-			for _, key := range keys {
-				if err := overBudget("pointers to removed generations and every generation"); err != nil {
-					return done(err)
-				}
-				if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-					failures = append(failures, fmt.Errorf("ceph: remove the pointer to removed %s: %w", handle, err))
-				}
+			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+				failures = append(failures, fmt.Errorf("ceph: remove the pointer to removed %s: %w", handle, err))
 			}
 		}
 	}
@@ -2354,15 +2418,16 @@ func (c *Client) evictGenerations(
 				continue
 			}
 		case evictPressure:
-			// ANY PUBLISHED GENERATION UNUSED FOR olderThan AND NOT DEFERRED, named by a
-			// pointer or not: one no pointer names is one no new job can be handed,
-			// which is how the lineage behind a generation pressure took becomes the
-			// next candidate once the purge has deleted the writer between them. NOT
-			// ONE NO RECORD NAMES: that is a candidate not yet published, which an
-			// Actions receipt may still publish after a restart; the full pass judges
+			// A KEY'S CURRENT GENERATION, OR ONE BEHIND A POINTER PRESSURE REMOVED,
+			// unused for olderThan and not deferred. The second is how the lineage
+			// behind a generation pressure took becomes the next candidate once the
+			// purge has deleted the writer between them. NOT ANYTHING ELSE NO POINTER
+			// NAMES: PublishCAS writes a generation record before its pointer, so a
+			// candidate whose publication was interrupted has a record and no pointer
+			// too, and an Actions receipt may still publish it; the full pass judges
 			// those by their age.
-			published := len(pointerKeys[handle]) > 0 || len(generationMetadata[handle]) > 0
-			if !published || now.Sub(lastUsed[handle]) < olderThan || c.pressureDeferredAt(handle) {
+			eligible := len(pointerKeys[handle]) > 0 || c.behindRemovedPointer(generationRecords[handle])
+			if !eligible || now.Sub(lastUsed[handle]) < olderThan || c.pressureDeferredAt(handle) {
 				continue
 			}
 		}
@@ -2463,8 +2528,9 @@ func (c *Client) evictGenerations(
 		// THE POINTER GOES WITH IT. A pointer naming a removed generation would make
 		// Current and Match hand it out, an Actions save of the key refuse as already
 		// there, and a build cache's publication try to clone it, for the rest of the
-		// key's retention. The lineage behind it needs no pointer: it is a candidate
-		// here on its own.
+		// key's retention. Its key is remembered as one pressure took the pointer of,
+		// which is what makes the lineage behind it pressure's to take as well.
+		c.notePressureUnpointed(pointedKeys[handle])
 		for _, key := range pointerKeys[handle] {
 			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
 				failures = append(failures, fmt.Errorf("ceph: remove the pointer to evicted %s: %w", handle, err))
