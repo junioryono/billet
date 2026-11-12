@@ -322,7 +322,8 @@ down)
 	# A POOL'S HOSTS' CONSOLES FIRST, into the workspace, where the node's warnings outlive
 	# a host the teardown ends (#861). WHATEVER IT KEEPS, the teardown runs and answers: a
 	# log not kept is said, and costs only the log.
-	if ! "$billet" acceptance matrix pool-consoles --workspace "$ws"; then
+	# BOUNDED ON ITS OWN, so a slow console read never spends the teardown's time.
+	if ! timeout --kill-after=30 600 "$billet" acceptance matrix pool-consoles --workspace "$ws"; then
 		echo "matrix: not every pool host's console was kept" >&2
 	fi
 	python3 -I "$supervise" keep-logs "$run_dir"

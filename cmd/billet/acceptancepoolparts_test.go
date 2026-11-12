@@ -747,10 +747,10 @@ func TestThePoolsConsolesAreKeptBesideTheRun(t *testing.T) {
 	}
 	kept, failed, err := acceptancePool{hosts: hosts}.writeConsoles(t.Context(), path, []acceptancePoolOrder{
 		order("p1", alloc.PoolReleased, "i-1"), order("p2", alloc.PoolGone, "i-2"), order("p3", alloc.PoolRefused, ""),
-		order("p4", alloc.PoolUncertain, ""),
+		order("p4", alloc.PoolUncertain, ""), order("p5", alloc.PoolOrdering, ""),
 	})
-	if err != nil || kept != 2 || failed != 1 {
-		t.Fatalf("kept %d, failed %d, %v; want two kept and one failed", kept, failed, err)
+	if err != nil || kept != 2 || failed != 2 {
+		t.Fatalf("kept %d, failed %d, %v; want two kept and two failed", kept, failed, err)
 	}
 	if body, err := os.ReadFile(outside); err != nil || string(body) != "UNTOUCHED\n" {
 		t.Errorf("the write followed the link already at its name: %q, %v", body, err)
@@ -764,7 +764,8 @@ func TestThePoolsConsolesAreKeptBesideTheRun(t *testing.T) {
 	}
 	for _, want := range []string{"=== pool host i-1 (order p1, released)\nnode: WARN could not attach a cache volume\n",
 		"=== pool host i-2 (order p2, gone)\ncould not read its console: throttled\n",
-		"=== pool host i-4 (order p4, uncertain)\ni-4 booted\n"} {
+		"=== pool host i-4 (order p4, uncertain)\ni-4 booted\n",
+		"=== pool order p5 (ordering)\nEC2 names no host for it\n"} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("the kept consoles do not hold %q:\n%s", want, body)
 		}

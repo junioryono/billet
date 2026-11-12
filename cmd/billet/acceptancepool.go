@@ -457,6 +457,13 @@ func (p acceptancePool) writeConsoles(ctx context.Context, path string, orders [
 				continue
 			case found:
 				id = h.ID
+			default:
+				// NOT FOUND IS NOT NONE: EC2 may not list a host it holds yet, as the
+				// teardown's own lookup knows.
+				fmt.Fprintf(&b, "=== pool order %s (%s)\nEC2 names no host for it\n\n", o.ID, o.State)
+				failed++
+
+				continue
 			}
 		}
 		if id == "" {
