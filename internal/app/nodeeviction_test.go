@@ -267,7 +267,10 @@ func TestTheSweepEvictsUnderPressureAfterTheSupersededGo(t *testing.T) {
 	}{
 		"room":    {report: ceph.PressureReport{Fill: 0.5, Threshold: 0.75}, quiet: true},
 		"pressed": {report: ceph.PressureReport{Fill: 0.88, Threshold: 0.75, Evicted: 31}, want: []string{"past its fill threshold", "fill=0.88", "evicted=31"}},
-		"unread":  {err: errors.New("ceph: read how full the cache pool is: no monitors"), want: []string{"short of room", "no monitors"}},
+		// PRESSED WITH NOTHING TO TAKE is said too: a pool past its threshold that
+		// pressure cannot relieve is the operator's to look at.
+		"pressed, nothing to take": {report: ceph.PressureReport{Fill: 0.9, Threshold: 0.75}, want: []string{"past its fill threshold", "evicted=0"}},
+		"unread":                   {err: errors.New("ceph: read how full the cache pool is: no monitors"), want: []string{"short of room", "no monitors"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -283,6 +286,11 @@ func TestTheSweepEvictsUnderPressureAfterTheSupersededGo(t *testing.T) {
 			}
 			if tc.quiet && logged.Len() != 0 {
 				t.Errorf("a pool with room logged %q", logged.String())
+			}
+			// A FILL NOBODY READ IS NOT PRESSURE: the failure is said, the
+			// threshold is not.
+			if tc.err != nil && strings.Contains(logged.String(), "past its fill threshold") {
+				t.Errorf("an unread fill was logged as pressure: %q", logged.String())
 			}
 			for _, want := range tc.want {
 				if !strings.Contains(logged.String(), want) {

@@ -1,8 +1,10 @@
 package ceph
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -10,10 +12,11 @@ import (
 
 // UNDER PRESSURE THE GENERATIONS UNUSED LONGEST GO, WHATEVER THEIR RETENTION, AND
 // ONLY THOSE. Every key here is inside its seven days, which is what the full pass
-// waits for; past pressureFill the sweep takes the oldest first and removes each
-// one's pointer with it. A generation an active record names stays, and so does
-// one used inside pressureIdle, which a job that read its pointer a moment ago may
-// be about to clone.
+// waits for; past pressureFill the sweep takes the oldest first, by the later of
+// its pointer's and its generation record's use, since a restore of a named
+// generation refreshes the record alone, and leaves each pointer. A generation an
+// active record names stays, and so does one used inside pressureIdle, which a
+// job that read its pointer a moment ago may be about to clone.
 func TestUnderPressureTheGenerationsUnusedLongestGoFirst(t *testing.T) {
 	t.Parallel()
 
@@ -25,23 +28,31 @@ func TestUnderPressureTheGenerationsUnusedLongestGoFirst(t *testing.T) {
 
 	type generation struct {
 		key, handle string
-		used        time.Time
+		// pointed is when the key's pointer was last read, used when anything,
+		// a pointer read or a restore of the generation by name, last read it.
+		pointed, used time.Time
 	}
 
-	threeDays, twoHours, tenMinutes := now.Add(-72*time.Hour), now.Add(-2*time.Hour), now.Add(-10*time.Minute)
+	fourDays, threeDays := now.Add(-96*time.Hour), now.Add(-72*time.Hour)
+	twoHours, ninetyMinutes, tenMinutes := now.Add(-2*time.Hour), now.Add(-90*time.Minute), now.Add(-10*time.Minute)
 	// THE ONE USED LONGEST AGO WAS CREATED LATER, so its name sorts after the
 	// other's, and only an order by use takes it first.
-	oldest := generation{"acme/api/oldest", expiredGeneration(now.Add(-96*time.Hour), 'a'), threeDays}
-	older := generation{"acme/api/older", expiredGeneration(now.Add(-120*time.Hour), 'b'), twoHours}
-	recent := generation{"acme/api/recent", expiredGeneration(tenMinutes, 'c'), tenMinutes}
-	held := generation{"acme/api/held", expiredGeneration(threeDays, 'd'), threeDays}
+	oldest := generation{"acme/api/oldest", expiredGeneration(fourDays, 'a'), threeDays, threeDays}
+	older := generation{"acme/api/older", expiredGeneration(now.Add(-120*time.Hour), 'b'), twoHours, twoHours}
+	// RESTORED BY NAME ninety minutes ago, through a pointer last read four days
+	// ago: the oldest pointer of all, and the most recent use of the three.
+	restored := generation{"acme/api/restored", expiredGeneration(now.Add(-144*time.Hour), 'e'), fourDays,
+		ninetyMinutes}
+	recent := generation{"acme/api/recent", expiredGeneration(tenMinutes, 'c'), tenMinutes, tenMinutes}
+	held := generation{"acme/api/held", expiredGeneration(threeDays, 'd'), threeDays, threeDays}
 
-	for _, g := range []generation{older, recent, held, oldest} {
+	for _, g := range []generation{older, recent, restored, held, oldest} {
 		f.addVolume(g.handle)
 		f.metadata[g.handle] = map[string]string{cacheMetaPrefix + "used_at": g.used.Format(time.RFC3339Nano)}
-		record := cachePointer{Key: g.key, Generation: "gen-" + g.handle, Handle: g.handle, UsedAt: g.used,
+		record := cachePointer{Key: g.key, Generation: "gen-" + g.handle, Handle: g.handle, UsedAt: g.pointed,
 			RetentionHours: 7 * 24}
 		setIndexRecord(t, f, c, pointerKey(g.key), record)
+		record.UsedAt = g.used
 		setIndexRecord(t, f, c, generationKey(g.key, "gen-"+g.handle), record)
 	}
 
@@ -57,19 +68,21 @@ func TestUnderPressureTheGenerationsUnusedLongestGoFirst(t *testing.T) {
 		t.Fatalf("EvictUnderPressure: %v", err)
 	}
 
-	if !report.Pressed() || report.Fill != 0.9 || report.Threshold != pressureFill || report.Evicted != 2 {
-		t.Errorf("report = %+v, want the pool pressed at 0.9 and two generations evicted", report)
+	if !report.Pressed() || report.Fill != 0.9 || report.Threshold != pressureFill || report.Evicted != 3 {
+		t.Errorf("report = %+v, want the pool pressed at 0.9 and three generations evicted", report)
 	}
 
-	for _, g := range []generation{oldest, older} {
+	for _, g := range []generation{oldest, older, restored} {
 		if f.images[g.handle] {
 			t.Errorf("pressure kept %s, unused since %s", g.key, g.used.Format(time.RFC3339))
 		}
-		if _, ok := f.metadata[c.cacheIndex()][pointerKey(g.key)]; ok {
-			t.Errorf("pressure left the pointer of %s, whose generation it removed", g.key)
-		}
 		if _, ok := f.metadata[c.cacheIndex()][generationKey(g.key, "gen-"+g.handle)]; ok {
 			t.Errorf("pressure left the generation record of %s", g.key)
+		}
+		// THE POINTER STAYS: it reads as a miss now, and it is what lets the
+		// superseded sweep take the lineage behind it.
+		if _, ok := f.metadata[c.cacheIndex()][pointerKey(g.key)]; !ok {
+			t.Errorf("pressure removed the pointer of %s", g.key)
 		}
 	}
 
@@ -85,11 +98,174 @@ func TestUnderPressureTheGenerationsUnusedLongestGoFirst(t *testing.T) {
 		}
 	}
 
-	if first, second := f.callIndex("rm", oldest.handle), f.callIndex("rm", older.handle); first < 0 ||
-		second < 0 || first > second {
-		t.Errorf("pressure removed the generation unused since %s at call %d and the one unused since %s "+
-			"at call %d: least recently used first", threeDays.Format(time.RFC3339), first,
-			twoHours.Format(time.RFC3339), second)
+	order := []int{f.callIndex("rm", oldest.handle), f.callIndex("rm", older.handle),
+		f.callIndex("rm", restored.handle)}
+	if order[0] < 0 || order[1] < 0 || order[2] < 0 || order[0] > order[1] || order[1] > order[2] {
+		t.Errorf("pressure removed the generations last used three days, two hours and ninety minutes ago "+
+			"at calls %v: least recently used first, by the latest of any record's use", order)
+	}
+}
+
+// A LINEAGE BEHIND A GENERATION PRESSURE TOOK FOLLOWS IT. Each publication is
+// cloned from the one before, through the retired writer between them, so the
+// older generation cannot go while the newer one stands; once pressure takes the
+// newer one, its pointer still names it, the older reads as superseded, and the
+// sweeps that follow take it and the writers, all inside their retention.
+func TestPressureUnwindsTheLineageBehindTheGenerationItTakes(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	f.poolFill = 0.9
+	c := cacheClient(t, f)
+	now := time.Now().UTC()
+	twoHours := now.Add(-2 * time.Hour)
+	key := "acme/api/go-chain"
+
+	volume, err := c.Create(t.Context(), key, 1<<30)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	lease, fence, err := c.acquireWriterAt(t.Context(), key, "lease-1", time.Minute, now)
+	if err != nil {
+		t.Fatalf("AcquireWriter first: %v", err)
+	}
+	first, err := c.snapshotAt(t.Context(), volume, now)
+	if err != nil {
+		t.Fatalf("Snapshot first: %v", err)
+	}
+	if err := c.publishCASAt(t.Context(), key, "", first, lease, fence, now); err != nil {
+		t.Fatalf("PublishCAS first: %v", err)
+	}
+
+	volume, err = c.Clone(t.Context(), key, "")
+	if err != nil {
+		t.Fatalf("Clone first: %v", err)
+	}
+	later := now.Add(time.Second)
+	lease, fence, err = c.acquireWriterAt(t.Context(), key, "lease-2", time.Minute, later)
+	if err != nil {
+		t.Fatalf("AcquireWriter second: %v", err)
+	}
+	second, err := c.snapshotAt(t.Context(), volume, later)
+	if err != nil {
+		t.Fatalf("Snapshot second: %v", err)
+	}
+	if err := c.publishCASAt(t.Context(), key, first.Generation, second, lease, fence, later); err != nil {
+		t.Fatalf("PublishCAS second: %v", err)
+	}
+
+	// EVERY USE TWO HOURS AGO: past pressureIdle and the superseded grace, inside
+	// the seven-day retention.
+	for _, candidate := range []string{first.Handle, second.Handle} {
+		f.metadata[candidate][cacheMetaPrefix+"used_at"] = twoHours.Format(time.RFC3339Nano)
+	}
+	for metadataKey, value := range f.metadata[c.cacheIndex()] {
+		if !strings.HasPrefix(metadataKey, cacheMetaPrefix+"pointer.") &&
+			!strings.HasPrefix(metadataKey, cacheMetaPrefix+"generation.") {
+			continue
+		}
+
+		var record cachePointer
+		if err := json.Unmarshal([]byte(value), &record); err != nil {
+			t.Fatalf("decode %s: %v", metadataKey, err)
+		}
+		record.UsedAt = twoHours
+		setIndexRecord(t, f, c, metadataKey, record)
+	}
+
+	// THE NODE'S SWEEPS, as sweepSuperseded runs them, until nothing changes.
+	for range 8 {
+		before := len(f.images) + len(f.trash)
+
+		if err := c.EvictSuperseded(t.Context()); err != nil {
+			t.Fatalf("EvictSuperseded: %v", err)
+		}
+		if _, err := c.EvictUnderPressure(t.Context()); err != nil {
+			t.Fatalf("EvictUnderPressure: %v", err)
+		}
+
+		if len(f.images)+len(f.trash) == before {
+			break
+		}
+	}
+
+	for _, candidate := range []string{first.Handle, second.Handle} {
+		if f.images[candidate] {
+			t.Errorf("the sweeps kept %s of a lineage pressure had taken the head of", candidate)
+		}
+	}
+	if len(f.trash) != 0 {
+		t.Errorf("the sweeps left %d retired writers of that lineage: %v", len(f.trash), f.trash)
+	}
+}
+
+// A GENERATION PRESSURE FAILED TO REMOVE IS LEFT FOR AN HOUR. Pressure starts from
+// the least recently used every sweep, so a failure there, slow or not, would
+// otherwise be asked again first, and failures enough would spend every sweep's
+// budget before anything behind them.
+func TestAGenerationPressureFailedToRemoveWaitsItsTurn(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	f := newCacheFake()
+	f.poolFill = 0.9
+
+	threeDays := now.Add(-72 * time.Hour)
+	failing := expiredGeneration(threeDays, 'a')
+	attempts := 0
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "purge") && slices.Contains(args, failing) {
+			attempts++
+
+			return nil, errors.New("exit status 5: rbd: snapshot purge failed: (5) Input/output error")
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	f.freshVolume(now)
+
+	clock := now
+	c.clock = func() time.Time { return clock }
+
+	add := func(handle, key string, used time.Time) {
+		f.addVolume(handle)
+		f.metadata[handle] = map[string]string{cacheMetaPrefix + "used_at": used.Format(time.RFC3339Nano)}
+		record := cachePointer{Key: key, Generation: "gen-" + handle, Handle: handle, UsedAt: used,
+			RetentionHours: 7 * 24}
+		setIndexRecord(t, f, c, pointerKey(key), record)
+		setIndexRecord(t, f, c, generationKey(key, "gen-"+handle), record)
+	}
+	add(failing, "acme/api/failing", threeDays)
+
+	if _, err := c.EvictUnderPressure(t.Context()); err == nil || !strings.Contains(err.Error(), "Input/output") {
+		t.Fatalf("EvictUnderPressure = %v, want the failure reported", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("the failing generation was tried %d times in one sweep, want once", attempts)
+	}
+
+	behind := expiredGeneration(now.Add(-48*time.Hour), 'b')
+	add(behind, "acme/api/behind", now.Add(-48*time.Hour))
+
+	clock = now.Add(pressureRetryAfter / 2)
+
+	report, err := c.EvictUnderPressure(t.Context())
+	if err != nil {
+		t.Fatalf("EvictUnderPressure inside the deferral: %v", err)
+	}
+	if attempts != 1 || report.Evicted != 1 || f.images[behind] {
+		t.Errorf("inside its deferral the failing generation was tried again (%d tries) or the one behind it "+
+			"was not reached: %+v", attempts, report)
+	}
+
+	clock = now.Add(pressureRetryAfter + time.Minute)
+
+	if _, err := c.EvictUnderPressure(t.Context()); err == nil {
+		t.Error("past its deferral the failing generation was not tried again")
+	}
+	if attempts != 2 {
+		t.Errorf("past its deferral the failing generation was tried %d times in all, want twice", attempts)
 	}
 }
 

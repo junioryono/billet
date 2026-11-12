@@ -120,7 +120,8 @@ type Client struct {
 	// paces nothing.
 	ioPressure func() (float64, bool)
 	pause      func(ctx context.Context, d time.Duration) bool
-	// clock replaces time.Now for finishHalfRemoved; only a test sets it.
+	// clock replaces time.Now for finishHalfRemoved, an eviction round's lock
+	// budget and pressure's deferrals; only a test sets it.
 	clock func() time.Time
 
 	// sessions reads which images the node's cache sessions name, for Evict.
@@ -141,6 +142,10 @@ type Client struct {
 	evictMu     sync.Mutex
 	evictResume string
 	sweepResume string
+	// pressureDeferred is when each generation pressure could not remove may be
+	// tried again, so failures at the front of its order cannot spend every
+	// sweep's budget; under evictMu.
+	pressureDeferred map[string]time.Time
 
 	// lockImages holds the advisory-lock images a `lock add` has proved exist, so a
 	// retry skips the `rbd create` that could only fail.
