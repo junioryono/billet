@@ -526,16 +526,40 @@ func runEviction(ctx context.Context, evict, sweep func()) {
 	}
 }
 
-// sweepSuperseded runs the store's superseded sweep, when it has one, and logs a
-// failure for the next sweep to retry.
+// pressureEvictor is a store that can take generations ahead of their retention
+// while its pool is short of room: the Ceph store.
+type pressureEvictor interface {
+	EvictUnderPressure(ctx context.Context) (ceph.PressureReport, error)
+}
+
+// sweepSuperseded runs the store's superseded sweep, when it has one, then its
+// pressure sweep, when it has one, and logs a failure for the next sweep to retry.
+//
+// PRESSURE ON EVERY SWEEP, AFTER THE SUPERSEDED ONES GO, because retention alone
+// let one CI build cache keyed per commit fill the reference deployment's pool past
+// Ceph's nearfull (2026-11-12): what the pool can hold is the bound, read every
+// ten minutes, and what nothing reads any more is taken first.
 func sweepSuperseded(ctx context.Context, storage cacheEvictor, log *slog.Logger) {
-	sweeper, ok := storage.(supersededEvictor)
-	if !ok {
+	if sweeper, ok := storage.(supersededEvictor); ok {
+		if err := sweeper.EvictSuperseded(ctx); err != nil && ctx.Err() == nil {
+			log.Warn("could not sweep superseded cache generations; will retry", "error", err)
+		}
+	}
+
+	pressed, ok := storage.(pressureEvictor)
+	if !ok || ctx.Err() != nil {
 		return
 	}
 
-	if err := sweeper.EvictSuperseded(ctx); err != nil && ctx.Err() == nil {
-		log.Warn("could not sweep superseded cache generations; will retry", "error", err)
+	report, err := pressed.EvictUnderPressure(ctx)
+	if report.Pressed() {
+		log.Warn("the site's cache pool is past its fill threshold, so the least recently used cache "+
+			"generations are evicted ahead of their retention", "fill", report.Fill,
+			"threshold", report.Threshold, "evicted", report.Evicted)
+	}
+	if err != nil && ctx.Err() == nil {
+		log.Warn("could not evict cache generations while the site's cache pool is short of room; "+
+			"will retry", "error", err)
 	}
 }
 

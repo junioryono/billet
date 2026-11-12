@@ -1809,9 +1809,9 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 	// A GENERATION MAPPING A CRASH LEFT BEHIND GOES FIRST, because eviction
 	// keeps every image this host maps.
 	sweep := c.sweepGenerationMaps(ctx, c.cfg.CachePool)
+	_, evicted := c.evictInRounds(ctx, olderThan, evictionLockBudget, evictExpired)
 
-	return errors.Join(sweep, c.evictInRounds(ctx, olderThan, evictionLockBudget, false),
-		c.evictVolumes(ctx, olderThan))
+	return errors.Join(sweep, evicted, c.evictVolumes(ctx, olderThan))
 }
 
 // EvictSuperseded removes the superseded generations alone, under the same rounds
@@ -1829,7 +1829,88 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 // keeps a resume point of its own, so slow failures at the front of its order
 // cannot spend every sweep's budget.
 func (c *Client) EvictSuperseded(ctx context.Context) error {
-	return c.evictInRounds(ctx, supersededGrace, supersededSweepBudget, true)
+	_, err := c.evictInRounds(ctx, supersededGrace, supersededSweepBudget, evictSuperseded)
+
+	return err
+}
+
+// PressureReport is what one pressure sweep read and did.
+type PressureReport struct {
+	// Fill is the cache pool's `percent_used`, 0 to 1, as Ceph answered it.
+	Fill float64
+	// Threshold is pressureFill, the fill past which the sweep evicts.
+	Threshold float64
+	// Evicted is how many generations the sweep removed ahead of their retention.
+	Evicted int
+}
+
+// Pressed says the pool was past its threshold, so the sweep evicted what it could.
+// A report without a threshold, which no reading produced, is never pressed.
+func (r PressureReport) Pressed() bool { return r.Threshold > 0 && r.Fill >= r.Threshold }
+
+// EvictUnderPressure removes, while the cache pool is past pressureFill, the
+// generations nothing holds that have gone unused longest, ahead of their
+// retention, under pressureSweepBudget of the cache lock, with the pointers naming
+// them; the trashed writers they leave are purged between its rounds, as in every
+// pass. Below the threshold it removes nothing. A fill it cannot read is an error
+// and removes nothing: pressure is never assumed.
+func (c *Client) EvictUnderPressure(ctx context.Context) (PressureReport, error) {
+	report := PressureReport{Threshold: pressureFill}
+
+	fill, err := c.cachePoolFill(ctx)
+	if err != nil {
+		return report, err
+	}
+
+	report.Fill = fill
+	if !report.Pressed() {
+		return report, nil
+	}
+
+	c.prunePressureDeferred()
+	c.prunePressureLineage()
+
+	report.Evicted, err = c.evictInRounds(ctx, pressureIdle, pressureSweepBudget, evictPressure)
+	c.deferPressureTried()
+
+	return report, err
+}
+
+// cachePoolFill is the cache pool's `percent_used` from `ceph df`: its share of
+// the room the fullest OSD it maps to can still take, which is what nearfull and
+// full are measured against.
+func (c *Client) cachePoolFill(ctx context.Context) (float64, error) {
+	out, err := c.cephCmd(ctx, true, "df")
+	if err != nil {
+		return 0, fmt.Errorf("ceph: read how full the cache pool is: %w", err)
+	}
+
+	var df struct {
+		Pools []struct {
+			Name  string `json:"name"`
+			Stats struct {
+				PercentUsed *float64 `json:"percent_used"`
+			} `json:"stats"`
+		} `json:"pools"`
+	}
+	if err := json.Unmarshal(out, &df); err != nil {
+		return 0, fmt.Errorf("ceph: %s did not describe the pools as json; is it the ceph command?", c.ceph)
+	}
+
+	for _, pool := range df.Pools {
+		if pool.Name != c.cfg.CachePool {
+			continue
+		}
+
+		fill := pool.Stats.PercentUsed
+		if fill == nil || *fill < 0 || *fill > 1 {
+			return 0, fmt.Errorf("ceph: `ceph df` gave pool %s no fill between 0 and 1", c.cfg.CachePool)
+		}
+
+		return *fill, nil
+	}
+
+	return 0, fmt.Errorf("ceph: `ceph df` does not list pool %s", c.cfg.CachePool)
 }
 
 // supersededSweepBudget is how long one superseded sweep starts new work under the
@@ -1840,11 +1921,11 @@ const supersededSweepBudget = 30 * time.Second
 
 // evictInRounds alternates the trash purge, outside the cache lock, with rounds of
 // evictGenerations under it, while a round removes a generation, the rounds holding
-// the lock for at most budget together; supersededOnly confines it to generations
-// whose key's pointer names another.
+// the lock for at most budget together; mode says which generations a round may
+// take. It reports how many its rounds removed.
 func (c *Client) evictInRounds(
-	ctx context.Context, olderThan, budget time.Duration, supersededOnly bool,
-) error {
+	ctx context.Context, olderThan, budget time.Duration, mode evictMode,
+) (int, error) {
 	// EVERY ROUND'S FAILURES ARE KEPT, once each: a later round that succeeds has not
 	// retried what an earlier one could not finish.
 	var failures evictionFailures
@@ -1858,6 +1939,7 @@ func (c *Client) evictInRounds(
 
 	var stopped error
 	remaining := budget
+	removed := 0
 
 	for round := range evictionRounds {
 		// A WRITER WAITING ON THE LOCK USUALLY TAKES IT BETWEEN ROUNDS: a purge that
@@ -1878,10 +1960,11 @@ func (c *Client) evictInRounds(
 
 		taken, release := c.withCacheLockReleased(ctx, time.Now(), func(now time.Time) error {
 			held = c.now()
-			r = c.evictGenerations(ctx, olderThan, now, remaining, supersededOnly)
+			r = c.evictGenerations(ctx, olderThan, now, remaining, mode)
 
 			return nil
 		})
+		removed += r.removed
 		for _, err := range r.failures {
 			keep(err)
 		}
@@ -1911,7 +1994,7 @@ func (c *Client) evictInRounds(
 		}
 	}
 
-	return errors.Join(stopped, failures.err())
+	return removed, errors.Join(stopped, failures.err())
 }
 
 // evictionRound is what one round of eviction did under the cache lock.
@@ -1949,12 +2032,198 @@ const evictionRounds = maxCacheCloneDepth
 // (#799).
 const supersededGrace = time.Hour
 
+// evictMode is which generations a round of eviction may take.
+type evictMode int
+
+const (
+	// evictExpired is the full pass: every generation unused for its key's
+	// retention, with the index bookkeeping.
+	evictExpired evictMode = iota
+	// evictSuperseded is the frequent sweep: the generations a key has moved past.
+	evictSuperseded
+	// evictPressure is eviction while the pool is short of room: any generation
+	// nothing holds, least recently used first, whatever its retention.
+	evictPressure
+)
+
+// pressureFill is the cache pool's fill, as Ceph's `percent_used` gives it,
+// past which eviction stops waiting for retention.
+//
+// RETENTION ALONE DID NOT BOUND THE POOL. An Actions cache key named for each
+// commit adds a generation per run that nothing reads again, and seven days of
+// them filled the reference deployment's pool: on 2026-11-12 one CI build cache of
+// about 1.56 GB a run held about 3.9 TB of a 4.9 TiB pool, `percent_used` read
+// 0.885, and the fuller of its two OSDs passed Ceph's 85% nearfull, 10 points
+// short of the full ratio at which every guest's root disk stops writing.
+// GitHub's own cache bounds a repository by size and evicts the least recently
+// used; this bounds the pool by the room Ceph says it has. `percent_used` is the
+// pool's share of what the fullest OSD can still take, so 0.75 starts well before
+// nearfull.
+const pressureFill = 0.75
+
+// pressureIdle is how long a generation must have gone unused before pressure
+// may take it: as supersededGrace, a job that read its key's pointer, lock-free, a
+// moment ago may be about to clone it.
+const pressureIdle = supersededGrace
+
+// pressureSweepBudget is how long one pressure sweep holds the cache lock, its
+// rounds together: about the full pass's reach per minute, every ten minutes
+// while the pool stays past pressureFill.
+const pressureSweepBudget = 2 * time.Minute
+
+// pressureRetryAfter is how long pressure leaves a generation it could not
+// remove before trying it again. Pressure always starts from the least recently
+// used, so without it a few slow failures at the front would spend every sweep's
+// budget and reach nothing behind them.
+const pressureRetryAfter = time.Hour
+
+// pressureDeferredAt says pressure tried handle and could not remove it within
+// the last pressureRetryAfter, forgetting a deferral that has run out. Both ends
+// read this process's own clock, never a cluster's.
+func (c *Client) pressureDeferredAt(handle string) bool {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	until, ok := c.pressureDeferred[handle]
+	if ok && !c.now().Before(until) {
+		delete(c.pressureDeferred, handle)
+
+		return false
+	}
+
+	return ok
+}
+
+// prunePressureDeferred forgets every deferral that has run out, so one for a
+// generation no sweep asks about again, removed by another pass or no longer a
+// candidate, does not stay in the map for the life of the process.
+func (c *Client) prunePressureDeferred() {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	now := c.now()
+	for handle, until := range c.pressureDeferred {
+		if !now.Before(until) {
+			delete(c.pressureDeferred, handle)
+		}
+	}
+}
+
+// notePressureTried records that the sweep in hand tried handle, and whether it
+// removed it.
+func (c *Client) notePressureTried(handle string, gone bool) {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	if gone {
+		delete(c.pressureTried, handle)
+
+		return
+	}
+
+	if c.pressureTried == nil {
+		c.pressureTried = map[string]bool{}
+	}
+
+	c.pressureTried[handle] = true
+}
+
+// deferPressureTried leaves what the sweep that just ended tried and did not
+// remove out of pressure's sweeps for pressureRetryAfter, and starts the next
+// sweep's record empty.
+func (c *Client) deferPressureTried() {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	if len(c.pressureTried) > 0 && c.pressureDeferred == nil {
+		c.pressureDeferred = map[string]time.Time{}
+	}
+
+	until := c.now().Add(pressureRetryAfter)
+	for handle := range c.pressureTried {
+		c.pressureDeferred[handle] = until
+	}
+
+	c.pressureTried = nil
+}
+
+// pressureLineageKept is how long pressure remembers a generation it proved
+// published: the longest retention any key has, after which the full pass takes
+// it if it is still there.
+const pressureLineageKept = 8 * 24 * time.Hour
+
+// lineageKey names one generation of one cache key in pressureLineage.
+func lineageKey(key, generation string) string { return key + "\x00" + generation }
+
+// notePressureLineage records, as each record of a generation pressure removed
+// says, the generation its key's pointer named when that one was published:
+// PublishCAS writes a record only while the pointer names what the record calls
+// Previous, so that generation's publication completed. It is the next of the
+// lineage behind the removed one, which pressure may take with no pointer naming
+// it.
+func (c *Client) notePressureLineage(records []cachePointer) {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	now := c.now()
+	for i := range records {
+		record := &records[i]
+		if record.Key == "" || record.Previous == "" {
+			continue
+		}
+
+		if c.pressureLineage == nil {
+			c.pressureLineage = map[string]time.Time{}
+		}
+
+		c.pressureLineage[lineageKey(record.Key, record.Previous)] = now
+	}
+}
+
+// inPressureLineage says every one of a generation's records, of which it has at
+// least one, names a generation of its key that notePressureLineage proved
+// published. Nothing else no pointer names is: PublishCAS writes a generation
+// record before its pointer, so a candidate whose publication stopped between the
+// two has a record too, and its Actions receipt may still publish it, even after
+// a later generation of its key was published and removed. What a restart forgets
+// waits for the full pass.
+func (c *Client) inPressureLineage(records []cachePointer) bool {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	for i := range records {
+		if _, ok := c.pressureLineage[lineageKey(records[i].Key, records[i].Generation)]; !ok {
+			return false
+		}
+	}
+
+	return len(records) > 0
+}
+
+// prunePressureLineage forgets each generation learnt pressureLineageKept ago.
+func (c *Client) prunePressureLineage() {
+	c.evictMu.Lock()
+	defer c.evictMu.Unlock()
+
+	now := c.now()
+	for key, at := range c.pressureLineage {
+		if now.Sub(at) >= pressureLineageKept {
+			delete(c.pressureLineage, key)
+		}
+	}
+}
+
 // evictGenerations is one round of a pass, under the cache lock, holding it for at
-// most budget, what the pass has left of its own. supersededOnly confines it to the
-// superseded generations, without the index bookkeeping or the resume point.
+// most budget, what the pass has left of its own. evictSuperseded confines it to
+// the superseded generations, without the index bookkeeping; evictPressure takes
+// the generations a pointer names, and the lineage behind a pointer it removed,
+// that nothing holds and went unused for olderThan, least recently used first,
+// whatever their retention, and removes the pointers naming each it removes. Every
+// mode removes a pointer whose generation is gone; only the full pass keeps the
+// rest of the index tidy.
 func (c *Client) evictGenerations(
 	ctx context.Context, olderThan time.Duration, now time.Time, budget time.Duration,
-	supersededOnly bool,
+	mode evictMode,
 ) evictionRound {
 	// EVERY WRITER WAITS ON THIS LOCK, for at most cacheLockWaitLimit, and a
 	// removal that fails no longer ends the pass, so the pass bounds how long it
@@ -1994,7 +2263,7 @@ func (c *Client) evictGenerations(
 		if json.Unmarshal([]byte(value), &active) != nil || !now.Before(active.Expires) {
 			// THE BOOKKEEPING IS THE FULL PASS'S: an expired record protects nothing
 			// either way, and removing it would spend the sweep's budget.
-			if supersededOnly {
+			if mode != evictExpired {
 				continue
 			}
 			if err := overBudget("expired index records and every generation"); err != nil {
@@ -2015,6 +2284,7 @@ func (c *Client) evictGenerations(
 	// superseded all the same.
 	current := map[string]string{}
 	generationKeys := map[string][]string{}
+	generationRecords := map[string][]cachePointer{}
 	for key, value := range metadata {
 		switch {
 		case strings.HasPrefix(key, cacheMetaPrefix+"pointer."):
@@ -2026,9 +2296,18 @@ func (c *Client) evictGenerations(
 			var generation cachePointer
 			if json.Unmarshal([]byte(value), &generation) == nil && generation.Handle != "" {
 				generationKeys[generation.Handle] = append(generationKeys[generation.Handle], generation.Key)
+				generationRecords[generation.Handle] = append(generationRecords[generation.Handle], generation)
 			}
 		}
 	}
+
+	// lastUsed is the latest use any record gives each generation, its pointer's
+	// or its generation record's (a restore of a named generation refreshes the
+	// latter alone), which pressure orders by; pointerKeys are the pointer records
+	// naming each, which pressure removes with it, and pointers what they say.
+	lastUsed := map[string]time.Time{}
+	pointerKeys := map[string][]string{}
+	pointers := map[string][]cachePointer{}
 
 	for key, value := range metadata {
 		switch {
@@ -2037,14 +2316,27 @@ func (c *Client) evictGenerations(
 			if json.Unmarshal([]byte(value), &pointer) == nil && pointer.Handle != "" {
 				age := retentionDuration(pointer, olderThan)
 				retention[pointer.Handle] = age
-				if protected[pointer.Handle] || now.Sub(pointer.UsedAt) < age {
+				if pointer.UsedAt.After(lastUsed[pointer.Handle]) {
+					lastUsed[pointer.Handle] = pointer.UsedAt
+				}
+				pointerKeys[pointer.Handle] = append(pointerKeys[pointer.Handle], key)
+				pointers[pointer.Handle] = append(pointers[pointer.Handle], pointer)
+
+				switch {
+				case mode == evictPressure:
+					// ONLY AN ACTIVE RECORD HOLDS A GENERATION UNDER PRESSURE: its
+					// retention is what pressure overrides.
+				case protected[pointer.Handle] || now.Sub(pointer.UsedAt) < age:
 					protected[pointer.Handle] = true
-				} else if supersededOnly {
+				case mode == evictSuperseded:
 					continue
-				} else if err := overBudget("expired index records and every generation"); err != nil {
-					return done(err)
-				} else if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-					return done(err)
+				default:
+					if err := overBudget("expired index records and every generation"); err != nil {
+						return done(err)
+					}
+					if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+						return done(err)
+					}
 				}
 			}
 		case strings.HasPrefix(key, cacheMetaPrefix+"generation."):
@@ -2052,6 +2344,9 @@ func (c *Client) evictGenerations(
 			if json.Unmarshal([]byte(value), &generation) == nil && generation.Handle != "" {
 				retention[generation.Handle] = retentionDuration(generation, olderThan)
 				generationMetadata[generation.Handle] = append(generationMetadata[generation.Handle], key)
+				if generation.UsedAt.After(lastUsed[generation.Handle]) {
+					lastUsed[generation.Handle] = generation.UsedAt
+				}
 			}
 		}
 	}
@@ -2081,7 +2376,7 @@ func (c *Client) evictGenerations(
 		present[c.cfg.CachePool+"/"+name] = true
 	}
 	for handle, keys := range generationMetadata {
-		if present[handle] || supersededOnly {
+		if present[handle] || mode != evictExpired {
 			continue
 		}
 		for _, key := range keys {
@@ -2094,35 +2389,95 @@ func (c *Client) evictGenerations(
 		}
 	}
 
+	// A POINTER WHOSE GENERATION IS GONE GOES, in every round of every pass and
+	// sweep, whatever the pool's fill: pressure removes a generation and then its
+	// pointer, and a removal that failed between the two, or a process stopped
+	// there, would otherwise leave Current and Match handing out a missing
+	// generation and every save of the key refused, with no generation left to try
+	// again from and pressure perhaps no longer running. The pointer was written
+	// after its generation existed, and this round holds the lock every publication
+	// takes, so an absent image is a removed one.
+	for handle, keys := range pointerKeys {
+		if present[handle] {
+			continue
+		}
+		for _, key := range keys {
+			if err := overBudget("pointers to removed generations and every generation"); err != nil {
+				return done(err)
+			}
+			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+				failures = append(failures, fmt.Errorf("ceph: remove the pointer to removed %s: %w", handle, err))
+			}
+		}
+	}
+
 	generations := make([]string, 0, len(images))
 	for _, name := range images {
-		if kind, _, ok := cacheImageName(name); ok && kind == "g" &&
-			(!supersededOnly || superseded(c.cfg.CachePool+"/"+name)) {
-			generations = append(generations, name)
+		kind, _, ok := cacheImageName(name)
+		if !ok || kind != "g" {
+			continue
 		}
-	}
 
-	// A PASS CUT SHORT IS RESUMED WHERE IT STOPPED, so generations that fail
-	// slowly at the front of the order cannot spend every pass's budget ahead of
-	// the ones behind them. The sweep keeps a resume point of its own, so neither
-	// moves the other's.
-	cursor := &c.evictResume
-	if supersededOnly {
-		cursor = &c.sweepResume
-	}
-
-	c.evictMu.Lock()
-	resume := *cursor
-	c.evictMu.Unlock()
-
-	first := 0
-	if resume != "" {
-		if i := slices.IndexFunc(generations, func(name string) bool { return name > resume }); i > 0 {
-			first = i
+		handle := c.cfg.CachePool + "/" + name
+		switch mode {
+		case evictExpired:
+		case evictSuperseded:
+			if !superseded(handle) {
+				continue
+			}
+		case evictPressure:
+			// A KEY'S CURRENT GENERATION, OR ONE IN THE LINEAGE BEHIND A GENERATION
+			// PRESSURE REMOVED, unused for olderThan and not deferred. The second is
+			// how that lineage becomes the next candidate once the purge has deleted
+			// the writer between them. NOT ANYTHING ELSE NO POINTER NAMES: PublishCAS
+			// writes a generation record before its pointer, so a candidate whose
+			// publication was interrupted has a record and no pointer too, and an
+			// Actions receipt may still publish it; the full pass judges those by
+			// their age.
+			eligible := len(pointerKeys[handle]) > 0 || c.inPressureLineage(generationRecords[handle])
+			if !eligible || now.Sub(lastUsed[handle]) < olderThan || c.pressureDeferredAt(handle) {
+				continue
+			}
 		}
+
+		generations = append(generations, name)
 	}
 
-	order := slices.Concat(generations[first:], generations[:first])
+	var (
+		order  []string
+		cursor *string
+	)
+
+	if mode == evictPressure {
+		// LEAST RECENTLY USED FIRST, so what a sweep's budget leaves is what jobs
+		// read last, and the next sweep starts again from the oldest.
+		order = slices.Clone(generations)
+		slices.SortStableFunc(order, func(a, b string) int {
+			return lastUsed[c.cfg.CachePool+"/"+a].Compare(lastUsed[c.cfg.CachePool+"/"+b])
+		})
+	} else {
+		// A PASS CUT SHORT IS RESUMED WHERE IT STOPPED, so generations that fail
+		// slowly at the front of the order cannot spend every pass's budget ahead of
+		// the ones behind them. The sweep keeps a resume point of its own, so neither
+		// moves the other's.
+		cursor = &c.evictResume
+		if mode == evictSuperseded {
+			cursor = &c.sweepResume
+		}
+
+		c.evictMu.Lock()
+		resume := *cursor
+		c.evictMu.Unlock()
+
+		first := 0
+		if resume != "" {
+			if i := slices.IndexFunc(generations, func(name string) bool { return name > resume }); i > 0 {
+				first = i
+			}
+		}
+
+		order = slices.Concat(generations[first:], generations[:first])
+	}
 
 	for i, name := range order {
 		// WHY THE PASS STOPPED is never one of the failures the cap counts away.
@@ -2131,7 +2486,7 @@ func (c *Client) evictGenerations(
 		}
 
 		if err := overBudget(fmt.Sprintf("%d generation(s) from %s on", len(order)-i, name)); err != nil {
-			if i > 0 {
+			if i > 0 && cursor != nil {
 				c.evictMu.Lock()
 				*cursor = order[i-1]
 				c.evictMu.Unlock()
@@ -2146,7 +2501,10 @@ func (c *Client) evictGenerations(
 		}
 
 		age := max(olderThan, retention[handle])
-		if superseded(handle) {
+		switch {
+		case mode == evictPressure:
+			age = olderThan
+		case superseded(handle):
 			age = supersededGrace
 		}
 
@@ -2154,14 +2512,46 @@ func (c *Client) evictGenerations(
 		if err != nil {
 			failures = append(failures, fmt.Errorf("ceph: evict expired generation %s: %w", handle, err))
 		}
-		if gone {
-			removed++
+
+		if mode != evictPressure {
+			if gone {
+				removed++
+			}
+
+			continue
+		}
+
+		// ANYTHING PRESSURE TRIED AND DID NOT REMOVE WAITS ITS TURN once the sweep
+		// ends: a failure, and also a generation a child still reads or one used
+		// since, which answer no error, so none of them is first in every sweep's
+		// order. Not before: a later round of the same sweep may take a generation
+		// whose child the purge between rounds has just deleted.
+		c.notePressureTried(handle, gone)
+		if !gone {
+			continue
+		}
+
+		removed++
+
+		// THE POINTER GOES WITH IT. A pointer naming a removed generation would make
+		// Current and Match hand it out, an Actions save of the key refuse as already
+		// there, and a build cache's publication try to clone it, for the rest of the
+		// key's retention. What its records name as the generation before it is
+		// remembered as published, which makes the lineage behind it pressure's to
+		// take as well, one generation at a time.
+		c.notePressureLineage(slices.Concat(pointers[handle], generationRecords[handle]))
+		for _, key := range pointerKeys[handle] {
+			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+				failures = append(failures, fmt.Errorf("ceph: remove the pointer to evicted %s: %w", handle, err))
+			}
 		}
 	}
 
-	c.evictMu.Lock()
-	*cursor = ""
-	c.evictMu.Unlock()
+	if cursor != nil {
+		c.evictMu.Lock()
+		*cursor = ""
+		c.evictMu.Unlock()
+	}
 
 	// A ROUND WHOSE LAST GENERATION SPENT THE BUDGET charges it to the pass, which
 	// then runs no further round (Evict).

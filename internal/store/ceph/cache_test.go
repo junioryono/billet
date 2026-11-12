@@ -95,6 +95,11 @@ type cacheFake struct {
 	// sessionsErr what reading them answers instead.
 	inSession   map[string]bool
 	sessionsErr error
+	// dfOut is what `ceph df --format json` answers, "" for a cache pool at
+	// poolFill; dfErr is its failure instead.
+	poolFill float64
+	dfOut    string
+	dfErr    error
 }
 
 type cacheExitError struct {
@@ -132,6 +137,19 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 	}
 
 	f.calls = append(f.calls, slices.Clone(args))
+
+	// `ceph df`, the one ceph command a cache pass asks: the cache pool at poolFill.
+	if slices.Contains(args, "df") {
+		if f.dfErr != nil {
+			return nil, f.dfErr
+		}
+		if f.dfOut != "" {
+			return []byte(f.dfOut), nil
+		}
+
+		return fmt.Appendf(nil, `{"pools":[{"name":"billet-images","stats":{"percent_used":0.1}},`+
+			`{"name":"billet-cache","stats":{"percent_used":%v}}]}`, f.poolFill), nil
+	}
 
 	f.lastBudget = 0
 	if deadline, ok := ctx.Deadline(); ok {

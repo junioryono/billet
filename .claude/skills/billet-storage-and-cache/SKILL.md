@@ -28,6 +28,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A discard is storage, not compute, and never runs on the node's command path (#223).**
 - **On Ceph, a discard moves to the trash and the node's sweep deletes (#280, #292).**
 - **A superseded generation outlives its last use by an hour, not its key's retention (#799).**
+- **Past a fill of the pool, the generations unused longest go ahead of their retention.**
 - **A compaction is a clone and a flatten, never `rbd cp`.**
 - **Every cache image carries object-map, and every command that changes one keeps the kernel client (#394).**
 - **Storage background work yields to jobs (#394).**
