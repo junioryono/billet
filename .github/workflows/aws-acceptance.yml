@@ -70,8 +70,8 @@ jobs:
     timeout-minutes: 360
     env:
       LANE: ${{ matrix.lane }}
-      # THE POOL ORDERS x64 ALONE (its base config's one architecture).
-      ARCHS: ${{ matrix.lane == 'pool' && 'x64' || inputs.archs || 'x64' }}
+      # THE POOL ORDERS EACH ARCHITECTURE ITS BASE CONFIG NAMES, one host of each.
+      ARCHS: ${{ matrix.lane == 'pool' && 'x64,arm64' || inputs.archs || 'x64' }}
       BACKEND: ${{ matrix.lane == 'pool' && 'firecracker/aws-metal' || 'ec2' }}
       RUN: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.lane }}
       AWS_REGION: ${{ vars.ACCEPTANCE_REGION }}

@@ -37,7 +37,7 @@ Retries:
 
 The S3 credentials reach curl on its standard input, never its arguments. They are written into its configuration only when every character is one a credential is made of, so no answer can add a configuration line of its own.
 
-An image name with `@` (a tier's `ubuntu-2404-x64@verified`) is refused at the start. A pull assigns the generation itself and refuses a name that names one.
+An image name with `@` (a tier's `ubuntu-2404-x64@verified`) is refused at the start. A pull assigns the generation itself and refuses a name that names one. With `PRELUDE_IMAGE` unset, the image is the host's own architecture's, `ubuntu-2404-x64` or, on an aarch64 host, `ubuntu-2404-arm64`, because a pool orders every architecture's hosts with the one prelude.
 
 It may be run again on the same host:
 - the disks come from the record, and a mounted scratch disk is reused;

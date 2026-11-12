@@ -15,7 +15,8 @@
 #   COLLECTION_URL, COLLECTION_SHA256  and BILLET_KEY / COLLECTION_KEY, read with the
 #                                      instance profile's own credentials)
 #   PRELUDE_JOIN_SERVER                server.pool.join_server
-#   PRELUDE_IMAGE                      the tier's image name (default ubuntu-2404-x64)
+#   PRELUDE_IMAGE                      the tier's image name (default ubuntu-2404-x64,
+#                                      or ubuntu-2404-arm64 on an aarch64 host)
 #   PRELUDE_IMAGE_SOURCE               optional: a guest image release to pull from
 #   PRELUDE_OSD_DEVICE                 optional: the OSD's disk, else the first free one
 #   PRELUDE_BUDGET_SECONDS             optional: how long after it starts the prelude
@@ -71,8 +72,12 @@ if [ -n "${PRELUDE_MAX_LIFETIME_MINUTES:-}" ]; then
 fi
 
 # The image by its name alone: a pull assigns the generation and refuses a name that
-# names one, and it would refuse it on every attempt until the budget was spent.
-image=${PRELUDE_IMAGE:-ubuntu-2404-x64}
+# names one, and it would refuse it on every attempt until the budget was spent. By
+# default the one of this host's architecture, as a pool orders each architecture's
+# hosts from one prelude.
+a=x64
+[ "$(uname -m)" != aarch64 ] || a=arm64
+image=${PRELUDE_IMAGE:-ubuntu-2404-$a}
 case $image in
 *@*)
 	echo "prelude: PRELUDE_IMAGE is an image's name alone, without @ and what follows" >&2
