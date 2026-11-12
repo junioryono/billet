@@ -65,6 +65,9 @@ func TestTheNodeSweepsSupersededGenerationsBetweenFullPasses(t *testing.T) {
 // really runs; a store that lost the method would otherwise be swept never.
 var _ supersededEvictor = (*ceph.Client)(nil)
 
+// AND IT EVICTS UNDER PRESSURE, for the same reason.
+var _ pressureEvictor = (*ceph.Client)(nil)
+
 // A PASS AND A SWEEP NEVER OVERLAP, AND A STOP ENDS THE LOOP AT AN IN-FLIGHT SWEEP:
 // a sweep due while the first pass runs waits for it, and once the context ends
 // the loop returns as soon as the sweep in hand does, starting nothing more.
@@ -226,5 +229,66 @@ func TestTheSweepAsksOnlyAStoreThatHasOne(t *testing.T) {
 
 	if logged.Len() != 0 {
 		t.Errorf("a store without the sweep logged %q", logged.String())
+	}
+}
+
+// pressureStore is a store with both sweeps, recording their order.
+type pressureStore struct {
+	order  []string
+	report ceph.PressureReport
+	err    error
+}
+
+func (s *pressureStore) Evict(context.Context, time.Duration) error { return nil }
+
+func (s *pressureStore) EvictSuperseded(context.Context) error {
+	s.order = append(s.order, "superseded")
+
+	return nil
+}
+
+func (s *pressureStore) EvictUnderPressure(context.Context) (ceph.PressureReport, error) {
+	s.order = append(s.order, "pressure")
+
+	return s.report, s.err
+}
+
+// EVERY SWEEP ASKS ABOUT PRESSURE, AFTER THE SUPERSEDED GENERATIONS GO, and says
+// what it found: a pool past its threshold with the fill and what was evicted, a
+// failure with its cause, and nothing for a pool with room.
+func TestTheSweepEvictsUnderPressureAfterTheSupersededGo(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		report ceph.PressureReport
+		err    error
+		want   []string
+		quiet  bool
+	}{
+		"room":    {report: ceph.PressureReport{Fill: 0.5, Threshold: 0.75}, quiet: true},
+		"pressed": {report: ceph.PressureReport{Fill: 0.88, Threshold: 0.75, Evicted: 31}, want: []string{"past its fill threshold", "fill=0.88", "evicted=31"}},
+		"unread":  {err: errors.New("ceph: read how full the cache pool is: no monitors"), want: []string{"short of room", "no monitors"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var logged bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&logged, nil))
+			store := &pressureStore{report: tc.report, err: tc.err}
+
+			sweepSuperseded(t.Context(), store, log)
+
+			if strings.Join(store.order, ",") != "superseded,pressure" {
+				t.Errorf("the sweep ran %v, want the superseded sweep and then pressure", store.order)
+			}
+			if tc.quiet && logged.Len() != 0 {
+				t.Errorf("a pool with room logged %q", logged.String())
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(logged.String(), want) {
+					t.Errorf("the sweep logged %q, want it to say %q", logged.String(), want)
+				}
+			}
+		})
 	}
 }
