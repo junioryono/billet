@@ -496,7 +496,7 @@ func TestTheMatrixHostRunsAndJudgesAPool(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-host.sh", []string{"MATRIX_POLL=0.1"}, "run", dir, "27", "50m"); code != 0 {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
-	if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 140m "+
+	if log := billetLog(t, f); !strings.Contains(log, "acceptance run --workspace "+dir+"/ws --jobs 27 --wait 125m "+
 		"--pool-released 50m --no-teardown\n") {
 		t.Errorf("billet was run as:\n%s", log)
 	}
