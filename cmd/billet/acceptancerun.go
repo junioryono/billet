@@ -178,7 +178,7 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 	// its control plane runs and its tiers' demand is read, and a seal is not the pool's
 	// way of letting a host go. What it did is the evidence's to judge, so a pool that
 	// held on is said here and fails nothing; the teardown takes its hosts back anyway.
-	if waitErr == nil && opts.poolReleased > 0 {
+	if poolReleaseOwed(ctx, opts) {
 		if err := waitForPoolReleased(ctx, env, ws, opts.poolReleased); err != nil {
 			fmt.Fprintf(env.Stderr, "acceptance: the pool did not release its hosts: %v\n", err)
 		}
@@ -500,6 +500,15 @@ func waitForPoolReleased(ctx context.Context, env cli.Env, ws acceptanceWorkspac
 	return awaitPoolReleased(ctx, env, func(ctx context.Context) ([]acceptancePoolOrder, error) {
 		return readAcceptancePool(ctx, ws)
 	}, bound, acceptancePoolPoll)
+}
+
+// poolReleaseOwed says whether a pool's run waits for its pool to release its hosts:
+// unless the run was stopped, WHETHER OR NOT EVERY JOB CAME. A job GitHub skipped,
+// because the job it needs failed, never reaches billet, so the jobs' wait gives up on
+// it; a run that then skipped this wait sealed a pool whose hosts had not yet been idle
+// for idle_after, and judged it as one that never shrank (run 43214914994, 2026-11-12).
+func poolReleaseOwed(ctx context.Context, opts acceptanceRunOptions) bool {
+	return opts.poolReleased > 0 && ctx.Err() == nil
 }
 
 // awaitPoolReleased is waitForPoolReleased over the orders read reads, asked every poll.
