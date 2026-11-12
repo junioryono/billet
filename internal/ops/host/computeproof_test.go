@@ -238,9 +238,11 @@ func TestDrainDoesNotFinishWhileAHostSaysItIsRunningWork(t *testing.T) {
 // The control plane drops a barrier whose admission generation has moved, but
 // that is asynchronous cleanup rather than a fence — and in this test there is
 // no control plane running at all, which is precisely the window. Every host's
-// run is still stored and still fenced, so without this check the drain reports
-// the fleet proved idle and exits 0 against a deployment that was reopened, took
-// work, and was closed again.
+// run is still stored and still fenced, so a drain that did not read admission
+// while proving could report the fleet proved idle against a deployment that was
+// reopened, took work, and was closed again. Clearance also refuses a stale
+// generation, so without the per-pass check the drain waits out its context
+// rather than exiting 0; either way the diagnostic must name the moved admission.
 func TestDrainStopsIfAdmissionMovesWhileProvingTheFleet(t *testing.T) {
 	db, cfgPath := drainFixture(t)
 	cfg := loadFixtureConfig(t, cfgPath)
