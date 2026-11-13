@@ -155,8 +155,9 @@ func TestADetachWaitsForAnAttachStillWaitingForItsDevice(t *testing.T) {
 					return
 				}
 
-				// NO LONGER THAN detachYield, while the attach still waits.
-				time.Sleep(detachYield)
+				// NO LONGER THAN detachYield (and the poll that notices it), while the attach
+				// still waits: 5 s have passed, so the rest of it.
+				time.Sleep(detachYield - 5*time.Second + 2*detachYieldPoll)
 				synctest.Wait()
 				select {
 				case err := <-detached:
@@ -164,7 +165,7 @@ func TestADetachWaitsForAnAttachStillWaitingForItsDevice(t *testing.T) {
 						t.Fatalf("the detach: %v", err)
 					}
 				default:
-					t.Fatalf("no detach %s after it began waiting, with the attach still out", detachYield+5*time.Second)
+					t.Fatalf("no detach %s after it began waiting, with the attach still out", detachYield)
 				}
 				select {
 				case err := <-attached:
@@ -179,36 +180,103 @@ func TestADetachWaitsForAnAttachStillWaitingForItsDevice(t *testing.T) {
 	}
 }
 
-// A DETACH NOT SEEN TO FINISH IS WAITED FOR BY THE NEXT ONE, which asks for its own only
-// after: the store never has two in EC2's queue. A volume whose own detach was not seen to
-// finish is waited for again, never asked to detach twice.
-func TestADetachNotSeenToFinishIsWaitedForByTheNext(t *testing.T) {
+// A DETACH IS ASKED OF EC2 ONLY ONCE EC2 IS CARRYING OUT NO OTHER OF THIS STORE'S, as EC2
+// itself answers: one whose wait gave up still counts, though nothing here holds a turn
+// for it any more.
+func TestADetachWaitsForEC2ToFinishTheStoresOtherDetaches(t *testing.T) {
 	t.Parallel()
 
-	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
-	s, _, attach, _ := localTestStore(&now)
-	attachedHere(t, s, "vol-a")
-	attachedHere(t, s, "vol-b")
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+		s, _, attach, _ := localTestStore(&now)
+		attachedHere(t, s, "vol-a")
+		attachedHere(t, s, "vol-b")
+		attach.holdDetaching = true
 
-	attach.awaitBlocks = true
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
-	defer cancel()
-	if err := s.detachLocal(ctx, "vol-a"); err == nil {
-		t.Fatal("a detach whose end was not seen answered success")
+		gaveUp, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		if err := s.detachLocal(gaveUp, "vol-a"); err == nil {
+			t.Fatal("a detach whose end was not seen answered success")
+		}
+
+		next := make(chan error, 1)
+		go func() { next <- s.detachLocal(t.Context(), "vol-b") }()
+		time.Sleep(30 * time.Second)
+		synctest.Wait()
+		attach.mu.Lock()
+		asked := slices.Clone(attach.detached)
+		attach.mu.Unlock()
+		if !slices.Equal(asked, []string{"vol-a"}) {
+			t.Fatalf("detaches asked of EC2 while vol-a's was still being carried out: %v; want vol-a's alone", asked)
+		}
+
+		attach.finishDetaching("vol-a")
+		time.Sleep(2 * detachSettlePoll)
+		synctest.Wait()
+		attach.finishDetaching("vol-b")
+		if err := <-next; err != nil {
+			t.Fatalf("vol-b's detach: %v", err)
+		}
+		if !slices.Equal(attach.detached, []string{"vol-a", "vol-b"}) {
+			t.Fatalf("detaches asked of EC2: %v; want vol-a, then vol-b", attach.detached)
+		}
+	})
+}
+
+// A VOLUME WHOSE OWN DETACH IS STILL BEING CARRIED OUT IS WAITED FOR ON A RETRY, never
+// asked to detach a second time.
+func TestARetriedDetachWaitsForTheOneAlreadyAsked(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+		s, _, attach, _ := localTestStore(&now)
+		attachedHere(t, s, "vol-a")
+		attach.holdDetaching = true
+
+		gaveUp, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		if err := s.detachLocal(gaveUp, "vol-a"); err == nil {
+			t.Fatal("a detach whose end was not seen answered success")
+		}
+
+		retried := make(chan error, 1)
+		go func() { retried <- s.detachLocal(t.Context(), "vol-a") }()
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		attach.finishDetaching("vol-a")
+		if err := <-retried; err != nil {
+			t.Fatalf("the retry: %v", err)
+		}
+		if !slices.Equal(attach.detached, []string{"vol-a"}) {
+			t.Fatalf("detaches asked of EC2: %v; want vol-a's once", attach.detached)
+		}
+	})
+}
+
+// A RECONCILE FORGETS NOTHING IF THE NAMES CHANGED WHILE EC2'S LISTING WAS READ: an attach
+// that took its name and finished meanwhile is not in a listing read before it, and its
+// name is live.
+func TestAReconcileKeepsNamesThatChangedDuringTheListing(t *testing.T) {
+	t.Parallel()
+
+	q := newAttachQueue()
+	if !q.reserve("/dev/sdf", "vol-stale") {
+		t.Fatal("could not stage /dev/sdf")
 	}
-	attach.awaitBlocks = false
-	if got := s.queue.settling(); got != "vol-a" {
-		t.Fatalf("the unsettled detach is %q, want vol-a", got)
+	stale, at := q.staleNames()
+	if !q.reserve("/dev/sdg", "vol-new") {
+		t.Fatal("could not reserve /dev/sdg")
+	}
+	q.reconcile(stale, at, map[string]time.Time{})
+	if q.reserve("/dev/sdg", "vol-other") || q.reserve("/dev/sdf", "vol-other") {
+		t.Fatal("a reconcile forgot names though they changed while the listing was read")
 	}
 
-	if err := s.detachLocal(t.Context(), "vol-b"); err != nil {
-		t.Fatalf("the next detach: %v", err)
-	}
-	if !slices.Equal(attach.awaited, []string{"vol-a", "vol-b"}) || !slices.Equal(attach.detached, []string{"vol-a", "vol-b"}) {
-		t.Fatalf("awaited %v and detached %v; want vol-a's end seen before vol-b was asked", attach.awaited, attach.detached)
-	}
-	if got := s.queue.settling(); got != "" {
-		t.Fatalf("%q is still unsettled", got)
+	stale, at = q.staleNames()
+	q.reconcile(stale, at, map[string]time.Time{"vol-new": {}})
+	if !q.reserve("/dev/sdf", "vol-other") || q.reserve("/dev/sdg", "vol-other") {
+		t.Fatal("a reconcile with nothing changed did not free the stale name and keep the attached one")
 	}
 }
 

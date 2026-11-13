@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,6 +29,8 @@ type attachAPI interface {
 	DetachVolume(ctx context.Context, id, instance string) error
 	Attachment(ctx context.Context, id string) (volumeAttachment, bool, error)
 	AttachedTo(ctx context.Context, instance string) (map[string]time.Time, error)
+	// Detaching lists this store's volumes EC2 is still detaching from instance.
+	Detaching(ctx context.Context, instance string) ([]string, error)
 	// AwaitDetached waits until EC2 describes a volume it was asked to detach as
 	// available.
 	AwaitDetached(ctx context.Context, id string) error
@@ -156,11 +159,12 @@ func (s Store) attachLocal(ctx context.Context, volume string) (string, error) {
 	// THE NAMES THIS STORE REMEMBERS ARE CHECKED AGAINST EC2 ONCE ALL ARE TAKEN: one whose
 	// detach was never seen to finish is free in fact.
 	if !attached && s.queue != nil {
+		stale, at := s.queue.staleNames()
 		on, listErr := s.attach.AttachedTo(ctx, s.host.InstanceID)
 		if listErr != nil {
 			return "", fmt.Errorf("ebs-s3: list the cache volumes attached to this instance: %w", listErr)
 		}
-		s.queue.reconcile(on)
+		s.queue.reconcile(stale, at, on)
 		if attached, err = s.attachUnderAFreeName(ctx, volume); err != nil {
 			return "", err
 		}
@@ -245,13 +249,11 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 	}
 	if !found || attachment.Instance == "" {
 		s.queue.forget(volume)
-		s.queue.settle(volume, false)
 
 		return nil
 	}
 	if attachment.Instance != s.host.InstanceID {
 		s.queue.forget(volume)
-		s.queue.settle(volume, false)
 
 		return fmt.Errorf("ebs-s3: cache volume %s is attached to %s, not this instance, and is left there",
 			volume, attachment.Instance)
@@ -267,23 +269,22 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 		}
 	}
 
-	// ONE AT A TIME, AFTER THIS STORE'S WAITING ATTACHES, AND HELD UNTIL EC2 HAS CARRIED
-	// IT OUT (attachQueue).
+	// ONE AT A TIME, AFTER THIS STORE'S WAITING ATTACHES (attachQueue), AND ONLY ONCE EC2
+	// IS CARRYING OUT NO OTHER DETACH OF THIS STORE'S: asked of EC2, so one whose answer
+	// was lost or whose wait gave up still counts. This volume's own detach, already
+	// asked for, is waited for, never asked again.
 	end, err := s.queue.detachTurn(ctx)
 	if err != nil {
 		return fmt.Errorf("ebs-s3: wait to detach cache volume %s: %w", volume, err)
 	}
 	defer end()
 
-	// A DETACH EC2 ACCEPTED AND NOBODY SAW FINISH IS WAITED FOR FIRST, so this store never
-	// has two in EC2's queue at once; this volume's own is not asked for twice.
-	if earlier := s.queue.settling(); earlier != "" {
-		if err := s.awaitDetached(ctx, earlier); err != nil {
-			return fmt.Errorf("ebs-s3: wait for cache volume %s's detach before detaching %s: %w",
-				earlier, volume, err)
+	if s.queue != nil {
+		if err := s.awaitOthersDetached(ctx, volume); err != nil {
+			return err
 		}
 	}
-	if s.queue.settling() != volume {
+	if attachment.State != "detaching" {
 		if err := s.attach.DetachVolume(ctx, volume, s.host.InstanceID); err != nil {
 			return fmt.Errorf("ebs-s3: detach cache volume %s: %w", volume, err)
 		}
@@ -292,18 +293,39 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 	return s.awaitDetached(ctx, volume)
 }
 
+// awaitOthersDetached waits, within detachSettleLimit, until EC2 is detaching none of
+// this store's volumes from this instance but volume.
+func (s Store) awaitOthersDetached(ctx context.Context, volume string) error {
+	settleCtx, cancel := context.WithTimeout(ctx, detachSettleLimit)
+	defer cancel()
+	poll := time.NewTicker(detachSettlePoll)
+	defer poll.Stop()
+	for {
+		detaching, err := s.attach.Detaching(settleCtx, s.host.InstanceID)
+		if err != nil {
+			return fmt.Errorf("ebs-s3: ask which cache volumes are detaching before detaching %s: %w", volume, err)
+		}
+		others := slices.DeleteFunc(detaching, func(id string) bool { return id == volume })
+		if len(others) == 0 {
+			return nil
+		}
+		select {
+		case <-settleCtx.Done():
+			return fmt.Errorf("ebs-s3: cache volume %s waits for %s to finish detaching: %w",
+				volume, strings.Join(others, ", "), settleCtx.Err())
+		case <-poll.C:
+		}
+	}
+}
+
 // awaitDetached waits, within detachSettleLimit, until EC2 calls volume available, and
-// says whether it has finished: a detach not seen to finish stays the store's unsettled
-// one, which the next detach waits for first.
+// gives back the name it held.
 func (s Store) awaitDetached(ctx context.Context, volume string) error {
 	settleCtx, cancel := context.WithTimeout(ctx, detachSettleLimit)
 	defer cancel()
 	if err := s.attach.AwaitDetached(settleCtx, volume); err != nil {
-		s.queue.settle(volume, true)
-
 		return err
 	}
-	s.queue.settle(volume, false)
 	s.queue.forget(volume)
 
 	return nil

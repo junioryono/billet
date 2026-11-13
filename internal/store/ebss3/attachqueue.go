@@ -13,10 +13,12 @@ const (
 	detachYield = 30 * time.Second
 	// detachYieldPoll is how often a waiting detach looks again.
 	detachYieldPoll = 100 * time.Millisecond
-	// detachSettleLimit bounds one wait for EC2 to call a detached volume available,
-	// so no stalled detach holds every other one: one alone took 10.5 s on a z1d.metal
-	// (2026-11-13).
+	// detachSettleLimit bounds one wait on EC2: for this store's other detaches to
+	// finish before asking for another, and for a detached volume to be available. One
+	// detach alone took 10.5 s on a z1d.metal (2026-11-13).
 	detachSettleLimit = 2 * time.Minute
+	// detachSettlePoll is how often EC2 is asked meanwhile.
+	detachSettlePoll = time.Second
 )
 
 // attachQueue orders this store's own changes to its instance's attachments.
@@ -29,7 +31,9 @@ const (
 // attach waited behind every detach before it and missed the breaker's deadline (#861).
 // Attaches still go at once (fifteen took 5.5 s); a detach goes one at a time, and only
 // once no attach of this store is waiting for its device, or detachYield has passed, so
-// an attach waits behind at most the one detach EC2 is already carrying out.
+// an attach waits behind at most the one detach EC2 is already carrying out. Which
+// detaches EC2 is carrying out is asked of EC2 (detachLocal), never remembered, so one
+// whose answer was lost or whose wait gave up still counts.
 //
 // IT ALSO KNOWS THE NAMES ITS OWN ATTACHMENTS HOLD, so an attach asks EC2 only for a name
 // none of them holds, rather than walking from /dev/sdf through every one in use: one
@@ -43,10 +47,9 @@ type attachQueue struct {
 	attaching map[string]int
 	// names are the device names this store's attachments hold, each to its volume.
 	names map[string]string
-	// unsettled is a volume EC2 accepted a detach of and has not been seen to finish:
-	// the next detach waits for it first, so EC2 is never carrying out two of this
-	// store's at once.
-	unsettled string
+	// changes counts every change to names, so a reconcile keeps what changed while
+	// EC2's listing was being read.
+	changes uint64
 	// detach holds the one detach in flight.
 	detach chan struct{}
 	yield  time.Duration
@@ -82,45 +85,41 @@ func (q *attachQueue) attachStarted(volume string) func() {
 	}
 }
 
-// reconcile forgets every name held by a volume that is neither attached here, by
-// EC2's listing, nor being attached by this store: a detach whose end was never seen
-// would otherwise keep its name for the life of the process.
-func (q *attachQueue) reconcile(attached map[string]time.Time) {
+// staleNames is what reconcile may forget once EC2's listing is read: every name held
+// by a volume not being attached now, and the count of changes it was taken at.
+func (q *attachQueue) staleNames() (map[string]string, uint64) {
 	if q == nil {
-		return
+		return nil, 0
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	stale := map[string]string{}
 	for name, volume := range q.names {
-		if _, on := attached[volume]; !on && q.attaching[volume] == 0 {
-			delete(q.names, name)
+		if q.attaching[volume] == 0 {
+			stale[name] = volume
 		}
 	}
+
+	return stale, q.changes
 }
 
-// settling is the volume whose detach was accepted and not seen to finish, if any.
-func (q *attachQueue) settling() string {
-	if q == nil {
-		return ""
-	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	return q.unsettled
-}
-
-// settle records whether volume's detach is unsettled.
-func (q *attachQueue) settle(volume string, unsettled bool) {
+// reconcile forgets each of stale's names whose volume EC2's listing, read after stale
+// was taken, does not show attached here: a detach whose end was never seen would
+// otherwise keep its name for the life of the process. Nothing is forgotten if the names
+// changed while the listing was read.
+func (q *attachQueue) reconcile(stale map[string]string, at uint64, attached map[string]time.Time) {
 	if q == nil {
 		return
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	switch {
-	case unsettled:
-		q.unsettled = volume
-	case q.unsettled == volume:
-		q.unsettled = ""
+	if q.changes != at {
+		return
+	}
+	for name, volume := range stale {
+		if _, on := attached[volume]; !on && q.names[name] == volume {
+			delete(q.names, name)
+		}
 	}
 }
 
@@ -135,6 +134,7 @@ func (q *attachQueue) reserve(name, volume string) bool {
 		return false
 	}
 	q.names[name] = volume
+	q.changes++
 
 	return true
 }
@@ -148,6 +148,7 @@ func (q *attachQueue) release(name, volume string) {
 	defer q.mu.Unlock()
 	if q.names[name] == volume {
 		delete(q.names, name)
+		q.changes++
 	}
 }
 
@@ -161,13 +162,14 @@ func (q *attachQueue) forget(volume string) {
 	for name, holder := range q.names {
 		if holder == volume {
 			delete(q.names, name)
+			q.changes++
 		}
 	}
 }
 
 // detachTurn waits for this store's turn to detach a volume: the one detach slot, then
 // no attach waiting for its device, for at most yield. The returned function ends the
-// turn, once EC2 has carried the detach out.
+// turn.
 func (q *attachQueue) detachTurn(ctx context.Context) (func(), error) {
 	if q == nil {
 		return func() {}, nil

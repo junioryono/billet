@@ -40,7 +40,33 @@ type fakeAttach struct {
 	awaitBlocks bool
 	// awaitGate, when set, holds every AwaitDetached until it is closed.
 	awaitGate chan struct{}
-	now       *time.Time
+	// holdDetaching leaves a detached volume detaching, as EC2 does while it carries the
+	// detach out, until finishDetaching; AwaitDetached waits for it meanwhile.
+	holdDetaching bool
+	now           *time.Time
+}
+
+// finishDetaching ends a held detach: the volume is attached to nothing.
+func (f *fakeAttach) finishDetaching(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.on, id)
+}
+
+func (f *fakeAttach) Detaching(ctx context.Context, instance string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for id, a := range f.on {
+		if a.Instance == instance && a.State == "detaching" {
+			out = append(out, id)
+		}
+	}
+
+	return out, nil
 }
 
 func newFakeAttach(now *time.Time) *fakeAttach {
@@ -71,6 +97,12 @@ func (f *fakeAttach) DetachVolume(ctx context.Context, id, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.detached = append(f.detached, id)
+	if a, ok := f.on[id]; ok && f.holdDetaching {
+		a.State = "detaching"
+		f.on[id] = a
+
+		return nil
+	}
 	delete(f.on, id)
 
 	return nil
@@ -102,6 +134,19 @@ func (f *fakeAttach) AwaitDetached(ctx context.Context, id string) error {
 		case <-f.awaitGate:
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+	}
+	for {
+		f.mu.Lock()
+		held := f.on[id].State == "detaching"
+		f.mu.Unlock()
+		if !held {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
 	if err := ctx.Err(); err != nil {
