@@ -1,9 +1,16 @@
 package firecracker
 
 import (
+	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -142,6 +149,385 @@ func TestAReservedDriveCanBeReplacedAndDetachedAfterBoot(t *testing.T) {
 	if patches[0].body["path_on_host"] != "/cache2" ||
 		patches[1].body["path_on_host"] != "/cache2" {
 		t.Errorf("runtime patches named unexpected paths: %+v", patches)
+	}
+}
+
+// cache0Patches counts the runtime PATCHes a VMM received for drive cache0.
+func cache0Patches(vmm *fakeVMM) int {
+	vmm.mu.Lock()
+	defer vmm.mu.Unlock()
+
+	n := 0
+	for _, call := range vmm.puts {
+		if call.method == http.MethodPatch && call.path == "/drives/cache0" {
+			n++
+		}
+	}
+
+	return n
+}
+
+// syncedDisk is an open disk whose write-back runs sync, or nothing, counting its
+// write-backs and closes when given counters.
+type syncedDisk struct {
+	sync   func() error
+	synced *atomic.Int32
+	closes *atomic.Int32
+}
+
+func (d syncedDisk) Sync() error {
+	if d.synced != nil {
+		d.synced.Add(1)
+	}
+	if d.sync != nil {
+		return d.sync()
+	}
+
+	return nil
+}
+
+func (d syncedDisk) Close() error {
+	if d.closes != nil {
+		d.closes.Add(1)
+	}
+
+	return nil
+}
+
+// forgotten waits, bounded, until the provider holds no write-back in flight. Its
+// worker marks one done and forgets it under one lock, so an empty map is a joined one.
+func forgotten(t *testing.T, p *Provider) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		p.flushMu.Lock()
+		left := len(p.flushing)
+		p.flushMu.Unlock()
+		if left == 0 {
+			return
+		}
+	}
+	t.Error("a write-back was still in flight ten seconds after it was released")
+}
+
+// A DETACH WRITES THE DEVICE BACK BEFORE IT REPLACES THE DRIVE, because the VMM's
+// close of the device writes back every dirty page before it answers (#871). A flush
+// that fails leaves the write-back to the close and still detaches; a caller whose
+// time runs out while the flush runs gets its error and no detach.
+func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
+	t.Parallel()
+
+	launched := func(t *testing.T) (*harness, *fakeVMM, string) {
+		t.Helper()
+		h := newHarness(t)
+		var vmm *fakeVMM
+		h.onJailer = func(id string) { vmm = h.serveVMM(t, id) }
+		spec := aSpec()
+		spec.CacheEndpoint = "http://172.20.0.1:7718"
+		spec.CacheToken = strings.Repeat("b", 64)
+		spec.BuildKitCacheMountLimit = 4 << 30
+		inst, err := h.p.Launch(t.Context(), spec)
+		if err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+		if err := h.p.AttachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); err != nil {
+			t.Fatalf("AttachVolume: %v", err)
+		}
+
+		return h, vmm, inst.ID
+	}
+
+	t.Run("flushed first", func(t *testing.T) {
+		t.Parallel()
+		h, vmm, id := launched(t)
+		var opened []string
+		var closes atomic.Int32
+		patchesAtFlush, closedAtPatch := -1, int32(-1)
+		h.p.openDisk = func(device string) (diskHandle, error) {
+			opened = append(opened, device)
+
+			return syncedDisk{closes: &closes, sync: func() error {
+				patchesAtFlush = cache0Patches(vmm)
+
+				return nil
+			}}, nil
+		}
+		vmm.mu.Lock()
+		vmm.onPatch = func() { closedAtPatch = closes.Load() }
+		vmm.mu.Unlock()
+		if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
+			t.Fatalf("DetachVolume: %v", err)
+		}
+		if len(opened) != 1 || opened[0] != "/dev/nvme9n1" {
+			t.Fatalf("opened %q, want the volume's device once", opened)
+		}
+		if patchesAtFlush != 1 || cache0Patches(vmm) != 2 {
+			t.Errorf("cache0 had %d PATCH(es) when it was written back and %d after; want the attach's, then the detach's",
+				patchesAtFlush, cache0Patches(vmm))
+		}
+		if closedAtPatch != 1 || closes.Load() != 1 {
+			t.Errorf("the device was closed %d time(s) by the detach's PATCH and %d after; want once, before it",
+				closedAtPatch, closes.Load())
+		}
+	})
+
+	for name, failure := range map[string]struct{ open, sync error }{
+		"an open that fails":      {open: errors.New("no such device")},
+		"a write-back that fails": {sync: errors.New("input/output error")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			h, vmm, id := launched(t)
+			var closes atomic.Int32
+			h.p.openDisk = func(string) (diskHandle, error) {
+				if failure.open != nil {
+					return nil, failure.open
+				}
+
+				return syncedDisk{closes: &closes, sync: func() error { return failure.sync }}, nil
+			}
+			if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
+				t.Fatalf("a detach whose write-back failed: %v", err)
+			}
+			if cache0Patches(vmm) != 2 {
+				t.Errorf("cache0 had %d PATCH(es); a failed write-back must still detach", cache0Patches(vmm))
+			}
+			wantCloses := int32(1)
+			if failure.open != nil {
+				wantCloses = 0
+			}
+			if closes.Load() != wantCloses {
+				t.Errorf("the device was closed %d time(s); want %d", closes.Load(), wantCloses)
+			}
+		})
+	}
+
+	t.Run("a slot that no longer holds the device", func(t *testing.T) {
+		t.Parallel()
+		h, vmm, id := launched(t)
+		h.p.slotHolds = func(string, string) bool { return false }
+		h.p.openDisk = func(device string) (diskHandle, error) {
+			t.Errorf("opened %s, which the slot does not hold", device)
+
+			return syncedDisk{}, nil
+		}
+		if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
+			t.Fatalf("DetachVolume: %v", err)
+		}
+		if cache0Patches(vmm) != 2 {
+			t.Errorf("cache0 had %d PATCH(es); the detach must still be made", cache0Patches(vmm))
+		}
+	})
+
+	t.Run("the caller's time runs out", func(t *testing.T) {
+		t.Parallel()
+		h, vmm, id := launched(t)
+		entered, release := make(chan struct{}), make(chan struct{})
+		var closes atomic.Int32
+		h.p.openDisk = func(string) (diskHandle, error) {
+			return syncedDisk{closes: &closes, sync: func() error {
+				close(entered)
+				<-release
+
+				return nil
+			}}, nil
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		var helper sync.WaitGroup
+		helper.Go(func() {
+			select {
+			case <-entered:
+				cancel()
+			case <-ctx.Done():
+			}
+		})
+		// RELEASED AND JOINED HOWEVER THE TEST ENDS.
+		t.Cleanup(func() {
+			cancel()
+			helper.Wait()
+			close(release)
+			forgotten(t, h.p)
+			if closes.Load() != 1 {
+				t.Errorf("the write-back left running closed its device %d time(s); want once", closes.Load())
+			}
+		})
+		err := h.p.DetachVolume(ctx, id, 0, "/dev/nvme9n1")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("a detach whose write-back outlasted its caller answered %v", err)
+		}
+		if cache0Patches(vmm) != 1 {
+			t.Errorf("cache0 had %d PATCH(es); a detach that gave up must not replace the drive",
+				cache0Patches(vmm))
+		}
+	})
+}
+
+// A WRITE-BACK IN FLIGHT IS WAITED ON, NEVER STARTED AGAIN BESIDE IT: a caller that gave
+// up leaves its fsync running, and the next caller for that device joins it, so retries
+// against a slow device add no descriptors and no blocked threads. Once it ends, the
+// next caller opens the device again and starts its own.
+func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p := &Provider{log: slog.New(slog.DiscardHandler)}
+		release := make(chan struct{})
+		// RELEASED HOWEVER THE TEST ENDS, or a failed assertion would leave the bubble
+		// waiting on a write-back nothing ends.
+		var once sync.Once
+		releaseAll := func() { once.Do(func() { close(release) }) }
+		defer releaseAll()
+		opens := 0
+		p.openDisk = func(string) (diskHandle, error) {
+			opens++
+
+			return syncedDisk{sync: func() error {
+				<-release
+
+				return nil
+			}}, nil
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := p.flushBefore(ctx, "/dev/nvme9n1"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a caller whose time ran out answered %v", err)
+		}
+
+		retried := make(chan error, 1)
+		go func() { retried <- p.flushBefore(t.Context(), "/dev/nvme9n1") }()
+		synctest.Wait()
+		select {
+		case err := <-retried:
+			t.Fatalf("the retry returned while the first write-back still ran: %v", err)
+		default:
+		}
+		if opens != 1 {
+			t.Fatalf("the device was opened %d times while one write-back was in flight", opens)
+		}
+
+		releaseAll()
+		if err := <-retried; err != nil {
+			t.Fatalf("the retry: %v", err)
+		}
+		synctest.Wait()
+		if err := p.flushBefore(t.Context(), "/dev/nvme9n1"); err != nil {
+			t.Fatalf("a caller after it ended: %v", err)
+		}
+		if opens != 2 {
+			t.Errorf("the device was opened %d times; want once for the first, waited on, then once after", opens)
+		}
+	})
+}
+
+// A SLOW OPEN HOLDS NO OTHER DEVICE'S DETACH, AND ONE THAT ENDS AFTER EVERY CALLER GAVE UP
+// WRITES NOTHING BACK: a block device's open can wait in the kernel, and once its callers
+// have gone the volume may be unmapped and its number another's, so the descriptor is
+// closed unused.
+func TestASlowOpenHoldsNoOtherDetachAndWritesNothingBackLate(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p := &Provider{log: slog.New(slog.DiscardHandler)}
+		slow := make(chan struct{})
+		var once sync.Once
+		releaseSlow := func() { once.Do(func() { close(slow) }) }
+		defer releaseSlow()
+		var slowSynced, slowClosed, otherSynced atomic.Int32
+		p.openDisk = func(device string) (diskHandle, error) {
+			if device == "/dev/slow" {
+				<-slow
+
+				return syncedDisk{synced: &slowSynced, closes: &slowClosed}, nil
+			}
+
+			return syncedDisk{synced: &otherSynced}, nil
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := p.flushBefore(ctx, "/dev/slow"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a caller whose device's open outlasted it answered %v", err)
+		}
+		if err := p.flushBefore(t.Context(), "/dev/other"); err != nil || otherSynced.Load() != 1 {
+			t.Fatalf("another device, while one open hung: %v, written back %d time(s)", err, otherSynced.Load())
+		}
+
+		releaseSlow()
+		synctest.Wait()
+		if slowSynced.Load() != 0 || slowClosed.Load() != 1 {
+			t.Errorf("an open that ended after its caller gave up was written back %d time(s) and closed %d; "+
+				"want closed once, unused", slowSynced.Load(), slowClosed.Load())
+		}
+	})
+}
+
+// deadlineRecorder records the deadline of every PATCH it carries.
+type deadlineRecorder struct {
+	inner http.RoundTripper
+	mu    sync.Mutex
+	seen  []time.Duration
+}
+
+func (d *deadlineRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
+	if deadline, ok := r.Context().Deadline(); ok && r.Method == http.MethodPatch {
+		d.mu.Lock()
+		d.seen = append(d.seen, time.Until(deadline))
+		d.mu.Unlock()
+	}
+
+	return d.inner.RoundTrip(r)
+}
+
+// A DETACH'S PATCH HAS WHAT IS LEFT OF ITS CALLER'S TIME, never less than apiTimeout: the
+// close it causes writes the device back, and a caller with five minutes gives it five.
+func TestADetachsPatchHasTheCallersTime(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.onJailer = func(id string) { h.serveVMM(t, id) }
+	spec := aSpec()
+	spec.CacheEndpoint = "http://172.20.0.1:7718"
+	spec.CacheToken = strings.Repeat("b", 64)
+	spec.BuildKitCacheMountLimit = 4 << 30
+	inst, err := h.p.Launch(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := h.p.AttachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); err != nil {
+		t.Fatalf("AttachVolume: %v", err)
+	}
+	recorder := &deadlineRecorder{}
+	h.p.apiAs = func(socket string, uid int) *vmmAPI {
+		api := answeringAsAnyone(socket, uid)
+		recorder.inner = api.http.Transport
+		api.http.Transport = recorder
+
+		return api
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	if err := h.p.DetachVolume(ctx, inst.ID, 0, "/dev/nvme9n1"); err != nil {
+		t.Fatalf("DetachVolume: %v", err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.seen) != 1 || recorder.seen[0] < 4*time.Minute {
+		t.Errorf("the detach's PATCH had %v to answer; want what was left of the caller's five minutes",
+			recorder.seen)
+	}
+
+	if got := callerTime(t.Context()); got != apiTimeout {
+		t.Errorf("no deadline: %s, want apiTimeout", got)
+	}
+	long, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	if got := callerTime(long); got < 4*time.Minute || got > 5*time.Minute {
+		t.Errorf("five minutes left: %s", got)
+	}
+	short, cancel2 := context.WithTimeout(t.Context(), time.Second)
+	defer cancel2()
+	if got := callerTime(short); got != apiTimeout {
+		t.Errorf("a second left: %s, want apiTimeout", got)
 	}
 }
 

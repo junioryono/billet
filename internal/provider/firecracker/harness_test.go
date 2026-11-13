@@ -66,6 +66,8 @@ type fakeVMM struct {
 	// a VMM that has been taken over could do to its own files.
 	root     string
 	onCreate func(root string)
+	// onPatch runs as each PATCH is answered, holding mu.
+	onPatch func()
 	// vcpus and memMiB are the guest shape it reports, as a loaded snapshot set it.
 	vcpus  int
 	memMiB int64
@@ -165,6 +167,9 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	v.puts = append(v.puts, recordedPut{method: r.Method, path: r.URL.Path, body: body})
+	if r.Method == http.MethodPatch && v.onPatch != nil {
+		v.onPatch()
+	}
 
 	// THE RUN STATE A REAL VMM KEEPS, measured on v1.16.1: a paused load reports
 	// Paused, PATCH /vm moves between Paused and Running, and GET / says which.
@@ -718,8 +723,11 @@ func tryHarness(t *testing.T, opts ...Option) (*harness, error) {
 	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
 	h.p.runningVMM = func(context.Context, jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
 
-	// AND ITS ROOT DISK IS NO DEVICE, so a flush is recorded rather than made.
-	h.p.flushRoot = func(device string) error {
+	// AND ITS DISKS ARE NO DEVICES, so a slot is taken to hold the device it was given
+	// and a flush is recorded rather than made.
+	h.p.slotHolds = func(string, string) bool { return true }
+	h.p.openDisk = func(string) (diskHandle, error) { return syncedDisk{}, nil }
+	h.p.flushDisk = func(device string) error {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 

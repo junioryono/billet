@@ -33,6 +33,12 @@ const (
 	cacheHandlerLimit  = 12*time.Minute + 45*time.Second
 	cacheCleanupMargin = 30 * time.Second
 	cacheWorkLimit     = cacheHandlerLimit - cacheCleanupMargin
+	// cacheDiscardLimit bounds a guest's discard, whose callers (the sticky-disk
+	// action and docker-cache.sh) each wait 120 s for its answer, and
+	// cacheDiscardDetachLimit its detach within that, which writes the volume back
+	// first: 40 s is 5 GB at a gp3's baseline 125 MB/s.
+	cacheDiscardLimit       = 100 * time.Second
+	cacheDiscardDetachLimit = 40 * time.Second
 	// cacheRenewWithin is how much life an active cache lease may have left before
 	// the node renews it. The node renews leases seven hours ahead every five
 	// minutes, so this renews each about once an hour and leaves six hours of
@@ -1792,7 +1798,7 @@ func (s *CacheService) publishDocker(
 	session *cacheSession,
 	attachment *cacheAttachment,
 ) error {
-	if err := s.attacher.DetachVolume(ctx, session.instance, 0, attachment.Volume.Device); err != nil {
+	if err := s.attacher.DetachVolume(ctx, session.instance, 0, s.detachDevice(ctx, attachment.Volume)); err != nil {
 		return fmt.Errorf("detach Docker image store: %w", err)
 	}
 
@@ -1970,7 +1976,7 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	// if the process dies in that window, this record is the only fact that lets
 	// restart cleanup find the mapped device and its storage handle.
 	if err := s.attacher.AttachVolume(ctx, session.instance, slot, volume.Device); err != nil {
-		detachErr := s.attacher.DetachVolume(ctx, session.instance, slot, volume.Device)
+		detachErr := s.attacher.DetachVolume(ctx, session.instance, slot, s.detachDevice(ctx, volume))
 		var discardErr, clearErr error
 		if detachErr == nil {
 			discardErr = s.store.Discard(ctx, volume)
@@ -2054,7 +2060,7 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	if err := s.attacher.DetachVolume(ctx, session.instance, slot,
-		attachment.Volume.Device); err != nil {
+		s.detachDevice(ctx, attachment.Volume)); err != nil {
 		s.nonFatalCommit(w, session, "detach", err)
 
 		return
@@ -2403,7 +2409,16 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 		return
 	}
 
-	session.mu.Lock()
+	// BOUNDED INSIDE THE GUEST'S OWN WAIT: the detach writes the volume back first, on
+	// this request's time, with the session locked, and a guest that gave up first
+	// would never hear what came of it.
+	ctx, cancel := context.WithTimeout(r.Context(), cacheDiscardLimit)
+	defer cancel()
+	if err := lockCacheSession(ctx, session); err != nil {
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
 	defer session.mu.Unlock()
 	if session.closed {
 		http.Error(w, "cache session has ended", http.StatusGone)
@@ -2437,13 +2452,17 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 		return
 	}
 
-	if err := s.attacher.DetachVolume(r.Context(), session.instance, slot,
-		attachment.Volume.Device); err != nil {
+	// THE DETACH ON PART OF THE TIME, so its write-back cannot spend what the store's
+	// discard needs (Ceph's unmap takes up to a minute of its own, whatever its caller).
+	detachCtx, cancelDetach := context.WithTimeout(ctx, cacheDiscardDetachLimit)
+	err := s.attacher.DetachVolume(detachCtx, session.instance, slot, s.detachDevice(detachCtx, attachment.Volume))
+	cancelDetach()
+	if err != nil {
 		s.nonFatalCommit(w, session, "detach discarded volume", err)
 
 		return
 	}
-	if err := s.store.Discard(r.Context(), attachment.Volume); err != nil {
+	if err := s.store.Discard(ctx, attachment.Volume); err != nil {
 		s.nonFatalCommit(w, session, "discard rejected volume", err)
 
 		return

@@ -180,7 +180,7 @@ func (p *Provider) Capture(ctx context.Context, id, snapshot string) (Evidence, 
 
 	// THE DISK, WHILE THE GUEST IS PAUSED: flushed, so the cluster holds every write
 	// the memory remembers, then published in place.
-	if err := p.flushRoot(shape.Device); err != nil {
+	if err := p.flushDisk(shape.Device); err != nil {
 		return Evidence{}, err
 	}
 

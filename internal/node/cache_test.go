@@ -367,6 +367,8 @@ type fakeVolumeAttacher struct {
 	// what its context said once that work was done.
 	detachDelay       time.Duration
 	detachContextErrs []error
+	// detachDevices is the device each DetachVolume was handed.
+	detachDevices []string
 }
 
 func (f *fakeVolumeAttacher) AttachVolume(ctx context.Context, _ string, slot int, _ string) error {
@@ -387,8 +389,9 @@ func (f *fakeVolumeAttacher) AttachVolume(ctx context.Context, _ string, slot in
 	return f.attachErr
 }
 
-func (f *fakeVolumeAttacher) DetachVolume(ctx context.Context, _ string, slot int, _ string) error {
+func (f *fakeVolumeAttacher) DetachVolume(ctx context.Context, _ string, slot int, device string) error {
 	f.detached = append(f.detached, slot)
+	f.detachDevices = append(f.detachDevices, device)
 	time.Sleep(f.detachDelay)
 	f.detachContextErrs = append(f.detachContextErrs, ctx.Err())
 

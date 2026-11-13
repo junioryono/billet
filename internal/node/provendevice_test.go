@@ -265,6 +265,41 @@ func TestAMergedCloneThatCannotBeSnapshottedIsNotAskedAgain(t *testing.T) {
 	}
 }
 
+// A DETACH IS HANDED ONLY THE DEVICE THE STORE PROVES NOW: a Firecracker detach writes
+// it back before replacing the drive, and a recorded name the kernel may since have
+// given another volume must not be the one written back (#871). One it cannot prove
+// hands none, and the detach is still made.
+func TestADetachIsHandedOnlyTheDeviceTheStoreProves(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		device string
+		err    error
+		want   string
+	}{
+		"proved":         {device: "/dev/rbd-proved", want: "/dev/rbd-proved"},
+		"could not tell": {err: storecontract.ErrDeviceUnknown, want: ""},
+		"gone":           {err: storecontract.ErrVolumeGone, want: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			storage := &fakeCacheStore{}
+			service, token, _ := scopedServiceIn(t, t.TempDir(), provider.TrustTrusted, defaultBranchCache(), storage)
+			service.store = &provingStore{fakeCacheStore: storage, device: tc.device, err: tc.err}
+			attachAndCommit(t, service, token)
+
+			attacher, ok := service.attacher.(*fakeVolumeAttacher)
+			if !ok {
+				t.Fatalf("the attacher is %T", service.attacher)
+			}
+			if !slices.Equal(attacher.detachDevices, []string{tc.want}) {
+				t.Fatalf("the commit's detach was handed %q, want [%q]", attacher.detachDevices, tc.want)
+			}
+		})
+	}
+}
+
 // A CLONE WHOSE DISCARD FAILED IS USED ONLY FROM A DEVICE PROVED AGAIN. A discard
 // unmaps first and can fail after that, and the recorded number may then already
 // be another job's disk, which this would have given to a guest.
