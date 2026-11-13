@@ -13,6 +13,10 @@ const (
 	detachYield = 30 * time.Second
 	// detachYieldPoll is how often a waiting detach looks again.
 	detachYieldPoll = 100 * time.Millisecond
+	// detachSettleLimit bounds one wait for EC2 to call a detached volume available,
+	// so no stalled detach holds every other one: one alone took 10.5 s on a z1d.metal
+	// (2026-11-13).
+	detachSettleLimit = 2 * time.Minute
 )
 
 // attachQueue orders this store's own changes to its instance's attachments.
@@ -35,10 +39,14 @@ const (
 // A nil queue orders nothing, as a store that attaches nothing to its own instance needs.
 type attachQueue struct {
 	mu sync.Mutex
-	// attaching counts this store's attaches between their request and their device.
-	attaching int
+	// attaching are this store's volumes between their attach's request and their device.
+	attaching map[string]int
 	// names are the device names this store's attachments hold, each to its volume.
 	names map[string]string
+	// unsettled is a volume EC2 accepted a detach of and has not been seen to finish:
+	// the next detach waits for it first, so EC2 is never carrying out two of this
+	// store's at once.
+	unsettled string
 	// detach holds the one detach in flight.
 	detach chan struct{}
 	yield  time.Duration
@@ -46,18 +54,18 @@ type attachQueue struct {
 }
 
 func newAttachQueue() *attachQueue {
-	return &attachQueue{names: map[string]string{}, detach: make(chan struct{}, 1), yield: detachYield,
-		poll: detachYieldPoll}
+	return &attachQueue{attaching: map[string]int{}, names: map[string]string{},
+		detach: make(chan struct{}, 1), yield: detachYield, poll: detachYieldPoll}
 }
 
-// attachStarted counts one attach as waiting for its device until the returned
+// attachStarted counts volume's attach as waiting for its device until the returned
 // function is called.
-func (q *attachQueue) attachStarted() func() {
+func (q *attachQueue) attachStarted(volume string) func() {
 	if q == nil {
 		return func() {}
 	}
 	q.mu.Lock()
-	q.attaching++
+	q.attaching[volume]++
 	q.mu.Unlock()
 
 	var once sync.Once
@@ -65,9 +73,54 @@ func (q *attachQueue) attachStarted() func() {
 	return func() {
 		once.Do(func() {
 			q.mu.Lock()
-			q.attaching--
+			q.attaching[volume]--
+			if q.attaching[volume] <= 0 {
+				delete(q.attaching, volume)
+			}
 			q.mu.Unlock()
 		})
+	}
+}
+
+// reconcile forgets every name held by a volume that is neither attached here, by
+// EC2's listing, nor being attached by this store: a detach whose end was never seen
+// would otherwise keep its name for the life of the process.
+func (q *attachQueue) reconcile(attached map[string]time.Time) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for name, volume := range q.names {
+		if _, on := attached[volume]; !on && q.attaching[volume] == 0 {
+			delete(q.names, name)
+		}
+	}
+}
+
+// settling is the volume whose detach was accepted and not seen to finish, if any.
+func (q *attachQueue) settling() string {
+	if q == nil {
+		return ""
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return q.unsettled
+}
+
+// settle records whether volume's detach is unsettled.
+func (q *attachQueue) settle(volume string, unsettled bool) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	switch {
+	case unsettled:
+		q.unsettled = volume
+	case q.unsettled == volume:
+		q.unsettled = ""
 	}
 }
 
@@ -132,7 +185,7 @@ func (q *attachQueue) detachTurn(ctx context.Context) (func(), error) {
 	defer poll.Stop()
 	for {
 		q.mu.Lock()
-		waiting := q.attaching
+		waiting := len(q.attaching)
 		q.mu.Unlock()
 		if waiting == 0 {
 			return end, nil

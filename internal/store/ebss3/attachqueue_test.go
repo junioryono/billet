@@ -148,19 +148,87 @@ func TestADetachWaitsForAnAttachStillWaitingForItsDevice(t *testing.T) {
 					if err := <-attached; err != nil {
 						t.Fatalf("the attach: %v", err)
 					}
-				} else {
-					time.Sleep(detachYield)
-				}
-				if err := <-detached; err != nil {
-					t.Fatalf("the detach: %v", err)
-				}
-				if !appears {
-					if err := <-attached; err == nil {
-						t.Fatal("an attach whose device never appeared succeeded")
+					if err := <-detached; err != nil {
+						t.Fatalf("the detach: %v", err)
 					}
+
+					return
+				}
+
+				// NO LONGER THAN detachYield, while the attach still waits.
+				time.Sleep(detachYield)
+				synctest.Wait()
+				select {
+				case err := <-detached:
+					if err != nil {
+						t.Fatalf("the detach: %v", err)
+					}
+				default:
+					t.Fatalf("no detach %s after it began waiting, with the attach still out", detachYield+5*time.Second)
+				}
+				select {
+				case err := <-attached:
+					t.Fatalf("the attach ended (%v) before the detach was let go; the yield was not what bounded it", err)
+				default:
+				}
+				if err := <-attached; err == nil {
+					t.Fatal("an attach whose device never appeared succeeded")
 				}
 			})
 		})
+	}
+}
+
+// A DETACH NOT SEEN TO FINISH IS WAITED FOR BY THE NEXT ONE, which asks for its own only
+// after: the store never has two in EC2's queue. A volume whose own detach was not seen to
+// finish is waited for again, never asked to detach twice.
+func TestADetachNotSeenToFinishIsWaitedForByTheNext(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	s, _, attach, _ := localTestStore(&now)
+	attachedHere(t, s, "vol-a")
+	attachedHere(t, s, "vol-b")
+
+	attach.awaitBlocks = true
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	if err := s.detachLocal(ctx, "vol-a"); err == nil {
+		t.Fatal("a detach whose end was not seen answered success")
+	}
+	attach.awaitBlocks = false
+	if got := s.queue.settling(); got != "vol-a" {
+		t.Fatalf("the unsettled detach is %q, want vol-a", got)
+	}
+
+	if err := s.detachLocal(t.Context(), "vol-b"); err != nil {
+		t.Fatalf("the next detach: %v", err)
+	}
+	if !slices.Equal(attach.awaited, []string{"vol-a", "vol-b"}) || !slices.Equal(attach.detached, []string{"vol-a", "vol-b"}) {
+		t.Fatalf("awaited %v and detached %v; want vol-a's end seen before vol-b was asked", attach.awaited, attach.detached)
+	}
+	if got := s.queue.settling(); got != "" {
+		t.Fatalf("%q is still unsettled", got)
+	}
+}
+
+// THE NAMES THIS STORE REMEMBERS ARE CHECKED AGAINST EC2 ONCE ALL ARE TAKEN: a name kept
+// by a volume whose detach was never seen to finish is free in fact, and an attach takes it
+// rather than refusing every name.
+func TestRememberedNamesAreCheckedAgainstEC2WhenAllAreTaken(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	s, _, attach, _ := localTestStore(&now)
+	for _, name := range attachmentPoints {
+		if !s.queue.reserve(name, "vol-long-gone") {
+			t.Fatalf("could not stage %s as held", name)
+		}
+	}
+
+	attachedHere(t, s, "vol-new")
+	if !slices.Equal(attach.asked, []string{"/dev/sdf"}) {
+		t.Fatalf("names asked for: %v, want /dev/sdf once the stale names were checked against EC2", attach.asked)
 	}
 }
 
@@ -171,7 +239,7 @@ func TestADetachThatGaveUpWaitingItsTurnLeavesItFree(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		q := newAttachQueue()
-		done := q.attachStarted()
+		done := q.attachStarted("vol-new")
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
 		if _, err := q.detachTurn(ctx); err == nil {
