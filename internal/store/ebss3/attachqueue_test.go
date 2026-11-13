@@ -2,6 +2,7 @@ package ebss3
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 	"testing/synctest"
@@ -225,47 +226,94 @@ func TestADetachWaitsForEC2ToFinishTheStoresOtherDetaches(t *testing.T) {
 
 // A DETACH WHOSE ANSWER WAS LOST KEEPS ITS TURN UNTIL ITS VOLUME IS SEEN DETACHED: EC2 may
 // have taken it, and a listing read just after may not show it yet, so the next detach
-// would otherwise go behind it in EC2.
+// would otherwise go behind it in EC2. A server's failure is no refusal, and the caller
+// giving up does not end the wait; a request never sent is let go once its volume has
+// read attached for longer than any listing lags, not after the whole bound.
 func TestADetachWhoseAnswerWasLostKeepsItsTurn(t *testing.T) {
 	t.Parallel()
 
-	synctest.Test(t, func(t *testing.T) {
-		now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
-		s, _, attach, _ := localTestStore(&now)
-		attachedHere(t, s, "vol-a")
-		attachedHere(t, s, "vol-b")
-		attach.holdDetaching = true
-		attach.loseDetachAnswer = true
-		attach.listingLags = true
+	reset := errors.New("read tcp 10.0.0.1:443: connection reset by peer")
+	for name, tc := range map[string]struct {
+		answer error
+		unsent bool
+		cancel bool
+	}{
+		"a lost answer":          {answer: reset},
+		"a server's failure":     {answer: &awsAPIError{Code: "InternalError", Status: 500}},
+		"a caller that gives up": {answer: reset, cancel: true},
+		"a request never sent":   {answer: reset, unsent: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-		lost := make(chan error, 1)
-		go func() { lost <- s.detachLocal(t.Context(), "vol-a") }()
-		synctest.Wait()
-		attach.mu.Lock()
-		attach.loseDetachAnswer = false
-		attach.mu.Unlock()
-		next := make(chan error, 1)
-		go func() { next <- s.detachLocal(t.Context(), "vol-b") }()
-		time.Sleep(30 * time.Second)
-		synctest.Wait()
-		attach.mu.Lock()
-		asked := slices.Clone(attach.detached)
-		attach.mu.Unlock()
-		if !slices.Equal(asked, []string{"vol-a"}) {
-			t.Fatalf("detaches asked of EC2 while vol-a's lost one went on: %v; want vol-a's alone", asked)
-		}
+			synctest.Test(t, func(t *testing.T) {
+				now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+				s, _, attach, _ := localTestStore(&now)
+				attachedHere(t, s, "vol-a")
+				attachedHere(t, s, "vol-b")
+				attach.holdDetaching = true
+				attach.detachAnswer = tc.answer
+				attach.detachUnsent = tc.unsent
+				attach.listingLags = true
 
-		attach.finishDetaching("vol-a")
-		if err := <-lost; err == nil {
-			t.Fatal("a detach whose answer was lost answered success")
-		}
-		time.Sleep(time.Second)
-		synctest.Wait()
-		attach.finishDetaching("vol-b")
-		if err := <-next; err != nil {
-			t.Fatalf("vol-b's detach: %v", err)
-		}
-	})
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				lost := make(chan error, 1)
+				go func() { lost <- s.detachLocal(ctx, "vol-a") }()
+				synctest.Wait()
+				attach.mu.Lock()
+				attach.detachAnswer, attach.detachUnsent = nil, false
+				attach.mu.Unlock()
+				if tc.cancel {
+					cancel()
+				}
+				next := make(chan error, 1)
+				go func() { next <- s.detachLocal(t.Context(), "vol-b") }()
+
+				if tc.unsent {
+					// Let go once vol-a has read attached past the grace, well inside the bound.
+					time.Sleep(detachUnseenGrace + 3*detachSettlePoll)
+					synctest.Wait()
+					attach.mu.Lock()
+					asked := slices.Clone(attach.detached)
+					attach.mu.Unlock()
+					if !slices.Equal(asked, []string{"vol-b"}) {
+						t.Fatalf("detaches asked of EC2 %s after an unsent one: %v; want vol-b's",
+							detachUnseenGrace+3*detachSettlePoll, asked)
+					}
+					attach.finishDetaching("vol-b")
+					if err := <-lost; !errors.Is(err, tc.answer) {
+						t.Fatalf("the unsent detach answered %v, want its own error", err)
+					}
+					if err := <-next; err != nil {
+						t.Fatalf("vol-b's detach: %v", err)
+					}
+
+					return
+				}
+
+				time.Sleep(30 * time.Second)
+				synctest.Wait()
+				attach.mu.Lock()
+				asked := slices.Clone(attach.detached)
+				attach.mu.Unlock()
+				if !slices.Equal(asked, []string{"vol-a"}) {
+					t.Fatalf("detaches asked of EC2 while vol-a's went on: %v; want vol-a's alone", asked)
+				}
+
+				attach.finishDetaching("vol-a")
+				if err := <-lost; !errors.Is(err, tc.answer) {
+					t.Fatalf("the detach answered %v, want its own error", err)
+				}
+				time.Sleep(time.Second)
+				synctest.Wait()
+				attach.finishDetaching("vol-b")
+				if err := <-next; err != nil {
+					t.Fatalf("vol-b's detach: %v", err)
+				}
+			})
+		})
+	}
 }
 
 // A VOLUME WHOSE OWN DETACH IS STILL BEING CARRIED OUT IS WAITED FOR ON A RETRY, never

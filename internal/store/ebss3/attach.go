@@ -287,10 +287,12 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 	if attachment.State != "detaching" {
 		if err := s.attach.DetachVolume(ctx, volume, s.host.InstanceID); err != nil {
 			// A REQUEST EC2 MAY HAVE TAKEN IS WAITED OUT ON THIS TURN: an answer that was
-			// lost, not refused, may be a detach EC2 is carrying out, which a listing read
-			// just after may not show yet. Only EC2's own refusal is proof it was not.
-			if refusal, refused := errors.AsType[*awsAPIError](err); !refused || refusal == nil {
-				err = errors.Join(err, s.awaitDetached(ctx, volume))
+			// lost, or a server's failure, may be a detach EC2 is carrying out, which a
+			// listing read just after may not show yet. Only EC2's own 4xx refusal is
+			// proof it was not.
+			if refusal, refused := errors.AsType[*awsAPIError](err); !refused || refusal == nil ||
+				refusal.Status >= 500 {
+				s.settleUncertainDetach(ctx, volume)
 			}
 
 			return fmt.Errorf("ebs-s3: detach cache volume %s: %w", volume, err)
@@ -298,6 +300,36 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 	}
 
 	return s.awaitDetached(ctx, volume)
+}
+
+// settleUncertainDetach holds the caller's turn, within detachSettleLimit and whatever
+// becomes of the caller, until volume's detach is seen to finish, or to have never been
+// taken: still plainly attached after detachUnseenGrace, longer than a listing lags, or a
+// read that does not answer. Nothing it sees is an error; the detach's own is.
+func (s Store) settleUncertainDetach(ctx context.Context, volume string) {
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachSettleLimit)
+	defer cancel()
+	unseen := time.Now().Add(detachUnseenGrace)
+	poll := time.NewTicker(detachSettlePoll)
+	defer poll.Stop()
+	for {
+		attachment, found, err := s.attach.Attachment(settleCtx, volume)
+		switch {
+		case err != nil:
+			return
+		case !found || attachment.Instance == "":
+			s.queue.forget(volume)
+
+			return
+		case attachment.State != "detaching" && time.Now().After(unseen):
+			return
+		}
+		select {
+		case <-settleCtx.Done():
+			return
+		case <-poll.C:
+		}
+	}
 }
 
 // awaitOthersDetached waits, within detachSettleLimit, until EC2 is detaching none of

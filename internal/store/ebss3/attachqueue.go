@@ -19,6 +19,10 @@ const (
 	detachSettleLimit = 2 * time.Minute
 	// detachSettlePoll is how often EC2 is asked meanwhile.
 	detachSettlePoll = time.Second
+	// detachUnseenGrace is how long a detach whose answer was lost may still read
+	// attached before it is taken never to have been asked: a detach's device went
+	// within 6.1 s of its request (2026-11-13), so EC2 had long since shown it detaching.
+	detachUnseenGrace = 15 * time.Second
 )
 
 // attachQueue orders this store's own changes to its instance's attachments.
