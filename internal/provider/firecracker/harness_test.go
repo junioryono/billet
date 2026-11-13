@@ -718,7 +718,9 @@ func tryHarness(t *testing.T, opts ...Option) (*harness, error) {
 	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
 	h.p.runningVMM = func(context.Context, jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
 
-	// AND ITS DISKS ARE NO DEVICES, so a flush is recorded rather than made.
+	// AND ITS DISKS ARE NO DEVICES, so a slot is taken to hold the device it was given
+	// and a flush is recorded rather than made.
+	h.p.slotHolds = func(string, string) bool { return true }
 	h.p.flushDisk = func(device string) error {
 		h.mu.Lock()
 		defer h.mu.Unlock()

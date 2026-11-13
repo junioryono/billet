@@ -3,10 +3,12 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/provider"
@@ -226,50 +228,99 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 		}
 	})
 
-	t.Run("the caller's time runs out, and the retry waits on the same flush", func(t *testing.T) {
+	t.Run("a slot that no longer holds the device", func(t *testing.T) {
 		t.Parallel()
 		h, vmm, id := launched(t)
-		release, finished := make(chan struct{}), make(chan struct{})
-		var mu sync.Mutex
-		flushes := 0
+		h.p.slotHolds = func(string, string) bool { return false }
+		h.p.flushDisk = func(device string) error {
+			t.Errorf("flushed %s, which the slot does not hold", device)
+
+			return nil
+		}
+		if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
+			t.Fatalf("DetachVolume: %v", err)
+		}
+		if cache0Patches(vmm) != 2 {
+			t.Errorf("cache0 had %d PATCH(es); the detach must still be made", cache0Patches(vmm))
+		}
+	})
+
+	t.Run("the caller's time runs out", func(t *testing.T) {
+		t.Parallel()
+		h, vmm, id := launched(t)
+		entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		h.p.flushDisk = func(string) error {
-			mu.Lock()
-			flushes++
-			mu.Unlock()
+			close(entered)
 			<-release
 			close(finished)
 
 			return nil
 		}
-		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-		defer cancel()
+		t.Cleanup(func() {
+			close(release)
+			<-finished
+		})
+		ctx, cancel := context.WithCancel(t.Context())
+		go func() {
+			<-entered
+			cancel()
+		}()
 		err := h.p.DetachVolume(ctx, id, 0, "/dev/nvme9n1")
-		if !errors.Is(err, context.DeadlineExceeded) {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("a detach whose flush outlasted its caller answered %v", err)
 		}
 		if cache0Patches(vmm) != 1 {
 			t.Errorf("cache0 had %d PATCH(es); a detach that gave up must not replace the drive",
 				cache0Patches(vmm))
 		}
+	})
+}
+
+// A WRITE-BACK IN FLIGHT IS WAITED ON, NEVER STARTED AGAIN BESIDE IT: a caller that gave
+// up leaves its fsync running, and the next caller for that device joins it, so retries
+// against a slow device add no descriptors and no blocked threads. Once it ends, the
+// next caller starts its own.
+func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p := &Provider{log: slog.New(slog.DiscardHandler)}
+		release := make(chan struct{})
+		flushes := 0
+		p.flushDisk = func(string) error {
+			flushes++
+			<-release
+
+			return nil
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := p.flushBefore(ctx, "/dev/nvme9n1"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a caller whose time ran out answered %v", err)
+		}
 
 		retried := make(chan error, 1)
-		go func() { retried <- h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1") }()
-		time.Sleep(50 * time.Millisecond)
+		go func() { retried <- p.flushBefore(t.Context(), "/dev/nvme9n1") }()
+		synctest.Wait()
 		select {
 		case err := <-retried:
-			t.Fatalf("the retry finished while the first flush still ran: %v", err)
+			t.Fatalf("the retry returned while the first write-back still ran: %v", err)
 		default:
 		}
+		if flushes != 1 {
+			t.Fatalf("%d write-backs in flight for one device", flushes)
+		}
+
 		close(release)
-		<-finished
 		if err := <-retried; err != nil {
 			t.Fatalf("the retry: %v", err)
 		}
-		mu.Lock()
-		defer mu.Unlock()
-		if flushes != 1 || cache0Patches(vmm) != 2 {
-			t.Errorf("%d flush(es) and %d PATCH(es); want the one flush, waited on, then the detach",
-				flushes, cache0Patches(vmm))
+		if err := p.flushBefore(t.Context(), "/dev/nvme9n1"); err != nil {
+			t.Fatalf("a caller after it ended: %v", err)
+		}
+		if flushes != 2 {
+			t.Errorf("%d write-backs; want the first, waited on, then one for the caller after it", flushes)
 		}
 	})
 }

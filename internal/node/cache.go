@@ -33,6 +33,9 @@ const (
 	cacheHandlerLimit  = 12*time.Minute + 45*time.Second
 	cacheCleanupMargin = 30 * time.Second
 	cacheWorkLimit     = cacheHandlerLimit - cacheCleanupMargin
+	// cacheDiscardLimit bounds a guest's discard, whose callers (the sticky-disk
+	// action and docker-cache.sh) each wait 120 s for its answer.
+	cacheDiscardLimit = 100 * time.Second
 	// cacheRenewWithin is how much life an active cache lease may have left before
 	// the node renews it. The node renews leases seven hours ahead every five
 	// minutes, so this renews each about once an hour and leaves six hours of
@@ -2403,12 +2406,13 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 		return
 	}
 
-	// BOUNDED AS A COMMIT IS: the detach writes the volume back first, on this
-	// request's time, and the session stays locked while it does.
-	ctx, cancel := context.WithTimeout(r.Context(), cacheWorkLimit)
+	// BOUNDED INSIDE THE GUEST'S OWN WAIT: the detach writes the volume back first, on
+	// this request's time, with the session locked, and a guest that gave up first
+	// would never hear what came of it.
+	ctx, cancel := context.WithTimeout(r.Context(), cacheDiscardLimit)
 	defer cancel()
 	if err := lockCacheSession(ctx, session); err != nil {
-		s.nonFatalCommit(w, session, "wait for session", err)
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
 	}

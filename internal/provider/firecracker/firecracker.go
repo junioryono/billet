@@ -191,6 +191,9 @@ type Provider struct {
 	// disk's before a capture publishes it, and a cache volume's before its drive is
 	// replaced. A seam because a test's disks are no devices.
 	flushDisk func(device string) error
+	// slotHolds says whether a jail's cache slot node is the named host device
+	// (sameBlockDevice). A seam because a test's slot holds no device.
+	slotHolds func(slot, device string) bool
 	// flushing is each device's write-back in flight before a detach, closed when it
 	// ends (flushBefore).
 	flushMu  sync.Mutex
@@ -381,6 +384,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		return apiPeerExecutable(ctx, j.socket(), res.UID)
 	}
 	p.flushDisk = flushDevice
+	p.slotHolds = sameBlockDevice
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt

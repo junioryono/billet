@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -58,6 +60,11 @@ func (p *Provider) AttachVolume(
 // (c7g.metal, 2026-11-13, #871). Flushed first, the PATCH took 0.2 s. A flush that
 // cannot be made is not the detach's failure, since the close writes back anyway, and
 // the PATCH has what is left of the caller's time for whatever the guest wrote since.
+//
+// ONLY THE DEVICE THE SLOT HOLDS: the recorded name is flushed only while the slot's
+// node is that same block device, since a name the kernel gave this volume may by now
+// be another's (a discard that unmapped it and failed after). Any other answer leaves
+// the write-back to the close.
 func (p *Provider) DetachVolume(
 	ctx context.Context,
 	instanceID string,
@@ -69,6 +76,9 @@ func (p *Provider) DetachVolume(
 		return err
 	}
 
+	if device != "" && !p.slotHolds(j.volumePath(slot), device) {
+		device = ""
+	}
 	if err := p.flushBefore(ctx, device); err != nil {
 		return fmt.Errorf("firecracker: write cache slot %d of %s back before detaching it: %w",
 			slot, instanceID, err)
@@ -133,6 +143,18 @@ func (p *Provider) flushBefore(ctx context.Context, device string) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// sameBlockDevice says whether the node at slot, never followed, and device are one
+// block device. Anything it cannot read is no.
+func sameBlockDevice(slot, device string) bool {
+	var held, named unix.Stat_t
+	if unix.Lstat(slot, &held) != nil || unix.Lstat(device, &named) != nil {
+		return false
+	}
+
+	return held.Mode&unix.S_IFMT == unix.S_IFBLK && named.Mode&unix.S_IFMT == unix.S_IFBLK &&
+		held.Rdev == named.Rdev
 }
 
 // callerTime is how long a call may take within ctx: what is left of its deadline,
