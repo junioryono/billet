@@ -115,6 +115,20 @@ func (s *CacheService) ensureMounted(
 // provenDevice is the device volume is mapped to now. A recorded number outlives
 // its mapping across a reboot, and the kernel may have given it to another job's
 // disk, which mounted here would be served or merged from as this job's.
+// detachDevice is what a detach is handed for volume: the device as the store proves it
+// now, or none. A Firecracker detach writes that device back before it replaces the
+// drive, and a recorded name the kernel may since have given another volume must not be
+// the one written back; with none it leaves the write-back to the VMM's close. An EC2
+// detach is handed the volume's id, which its store returns unproved and unchanged.
+func (s *CacheService) detachDevice(ctx context.Context, volume storecontract.Volume) string {
+	device, err := s.provenDevice(ctx, volume)
+	if err != nil {
+		return ""
+	}
+
+	return device
+}
+
 func (s *CacheService) provenDevice(ctx context.Context, volume storecontract.Volume) (string, error) {
 	prover, ok := s.store.(storecontract.DeviceProver)
 	if !ok {

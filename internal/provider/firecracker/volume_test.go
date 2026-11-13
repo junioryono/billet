@@ -248,22 +248,35 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 	t.Run("the caller's time runs out", func(t *testing.T) {
 		t.Parallel()
 		h, vmm, id := launched(t)
-		entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		entered, release := make(chan struct{}), make(chan struct{})
 		h.p.flushDisk = func(string) error {
 			close(entered)
 			<-release
-			close(finished)
 
 			return nil
 		}
+		// RELEASED AND JOINED HOWEVER THE TEST ENDS: the write-back, if it began, is
+		// waited for until the provider has forgotten it.
 		t.Cleanup(func() {
 			close(release)
-			<-finished
+			for {
+				h.p.flushMu.Lock()
+				left := len(h.p.flushing)
+				h.p.flushMu.Unlock()
+				if left == 0 {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
 		})
 		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 		go func() {
-			<-entered
-			cancel()
+			select {
+			case <-entered:
+				cancel()
+			case <-ctx.Done():
+			}
 		}()
 		err := h.p.DetachVolume(ctx, id, 0, "/dev/nvme9n1")
 		if !errors.Is(err, context.Canceled) {
@@ -286,6 +299,11 @@ func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := &Provider{log: slog.New(slog.DiscardHandler)}
 		release := make(chan struct{})
+		// RELEASED HOWEVER THE TEST ENDS, or a failed assertion would leave the bubble
+		// waiting on a write-back nothing ends.
+		var once sync.Once
+		releaseAll := func() { once.Do(func() { close(release) }) }
+		defer releaseAll()
 		flushes := 0
 		p.flushDisk = func(string) error {
 			flushes++
@@ -312,7 +330,7 @@ func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
 			t.Fatalf("%d write-backs in flight for one device", flushes)
 		}
 
-		close(release)
+		releaseAll()
 		if err := <-retried; err != nil {
 			t.Fatalf("the retry: %v", err)
 		}
