@@ -74,9 +74,15 @@ type NodeCacheControl interface {
 // storeDeadline is how long a job waits for the site's store to hand over a volume,
 // per store, past which it goes on without it. See docs/reference/records/cache-breaker.md
 // for what each was chosen from.
+//
+// A METAL NODE'S EBS-S3 STORE HAS ONE OF ITS OWN: it attaches every guest's volumes to
+// its one instance, where EC2 carries attachments out one at a time, so an attach can
+// wait behind the one detach in flight (9.6 s to the device, against 1.7 s alone, on a
+// z1d.metal, 2026-11-13) on top of the create per-job EC2 measured.
 const (
-	cephStoreDeadline  = 60 * time.Second
-	ebsS3StoreDeadline = 30 * time.Second
+	cephStoreDeadline          = 60 * time.Second
+	ebsS3StoreDeadline         = 30 * time.Second
+	ebsS3AttachedStoreDeadline = 45 * time.Second
 )
 
 // guardNodeStore puts the store a node's provider uses behind a breaker. Only a store
@@ -92,7 +98,7 @@ func guardNodeStore(cfg *config.Config, service *node.CacheService) {
 func nodeStoreGuard(cfg *config.Config) (string, time.Duration) {
 	switch {
 	case cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.EBSS3 != nil:
-		return string(config.SiteStoreEBSS3), ebsS3StoreDeadline
+		return string(config.SiteStoreEBSS3), ebsS3AttachedStoreDeadline
 	case cfg.Node.Provider == config.ProviderFirecracker:
 		return string(config.SiteStoreCeph), cephStoreDeadline
 	case cfg.Node.Provider == config.ProviderEC2:

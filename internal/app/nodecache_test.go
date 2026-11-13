@@ -140,8 +140,12 @@ func TestAMetalFirecrackerNodesCacheStoreAttachesToItsOwnInstance(t *testing.T) 
 	if _, ok := storage.(kernelMappingSweeper); ok {
 		t.Fatalf("the metal node's cache store, a %T, is the Ceph one", storage)
 	}
-	if name, deadline := nodeStoreGuard(cfg); name != "ebs-s3" || deadline != ebsS3StoreDeadline {
-		t.Errorf("the metal node's breaker guards %q for %s, want ebs-s3's", name, deadline)
+	if name, deadline := nodeStoreGuard(cfg); name != "ebs-s3" || deadline != ebsS3AttachedStoreDeadline {
+		t.Errorf("the metal node's breaker guards %q for %s, want a self-attaching ebs-s3 store's", name, deadline)
+	}
+	if ebsS3AttachedStoreDeadline <= ebsS3StoreDeadline {
+		t.Errorf("a self-attaching store's deadline (%s) is no longer than per-job EC2's (%s), though its "+
+			"attaches wait behind its detaches", ebsS3AttachedStoreDeadline, ebsS3StoreDeadline)
 	}
 
 	lost := func(context.Context) (ebss3.Host, error) { return ebss3.Host{}, errors.New("no metadata service") }

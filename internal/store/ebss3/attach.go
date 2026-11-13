@@ -107,6 +107,7 @@ func NewAttached(
 	}
 
 	store.host = &host
+	store.queue = newAttachQueue()
 	store.attach = blocks
 	store.disks = sysDisks{root: "/sys/block"}
 	store.sessions = sessions
@@ -143,14 +144,23 @@ func (s Store) local() bool { return s.host != nil }
 // id without the dash, never by the name asked for: on Nitro the name is a label, and
 // the kernel numbers NVMe devices in the order it finds them.
 func (s Store) attachLocal(ctx context.Context, volume string) (string, error) {
+	// WAITING FOR ITS DEVICE UNTIL THIS RETURNS, so no detach of this store's is asked of
+	// EC2 meanwhile (attachQueue).
+	done := s.queue.attachStarted()
+	defer done()
+
 	attached := false
 	for _, point := range attachmentPoints {
+		if !s.queue.reserve(point, volume) {
+			continue
+		}
 		err := s.attach.AttachVolume(ctx, volume, s.host.InstanceID, point)
 		if err == nil {
 			attached = true
 
 			break
 		}
+		s.queue.release(point, volume)
 		if attachmentPointInUse(err) {
 			continue
 		}
@@ -230,11 +240,23 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 		}
 	}
 
+	// ONE AT A TIME, AFTER THIS STORE'S WAITING ATTACHES, AND HELD UNTIL EC2 HAS CARRIED
+	// IT OUT (attachQueue).
+	end, err := s.queue.detachTurn(ctx)
+	if err != nil {
+		return fmt.Errorf("ebs-s3: wait to detach cache volume %s: %w", volume, err)
+	}
+	defer end()
+
 	if err := s.attach.DetachVolume(ctx, volume, s.host.InstanceID); err != nil {
 		return fmt.Errorf("ebs-s3: detach cache volume %s: %w", volume, err)
 	}
+	if err := s.attach.AwaitDetached(ctx, volume); err != nil {
+		return err
+	}
+	s.queue.forget(volume)
 
-	return s.attach.AwaitDetached(ctx, volume)
+	return nil
 }
 
 // releaseLocal is a failed attach's cleanup: the volume off this instance, if it got

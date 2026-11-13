@@ -24,6 +24,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The ebs-s3 store's first real publication was refused twice by things every fake accepted.**
 - **A candidate is verified as it is published, not only as it was written.**
 - **A Firecracker node on AWS metal attaches its site's volumes to its own instance, and detaches one only on proof nothing holds it (ADR-030, #827).**
+- **EC2 carries one instance's attachments out in order, so a self-attaching store detaches one at a time, after its waiting attaches (#861).**
 - **A recorded device number is never acted on until the kernel's table proves it is still the volume's.**
 - **A discard is storage, not compute, and never runs on the node's command path (#223).**
 - **On Ceph, a discard moves to the trash and the node's sweep deletes (#280, #292).**

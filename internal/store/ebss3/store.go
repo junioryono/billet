@@ -90,6 +90,8 @@ type Store struct {
 	attach   attachAPI
 	disks    hostDisks
 	sessions func() (func(name string) bool, error)
+	// queue orders this store's attaches and detaches on its own instance.
+	queue *attachQueue
 }
 
 var _ storecontract.Store = (*Store)(nil)
