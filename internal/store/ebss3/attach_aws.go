@@ -122,7 +122,37 @@ func (e ebsAPI) AwaitDetached(ctx context.Context, id string) error {
 // AttachedTo lists this store's volumes attached or attaching to instance, with when
 // each attachment began.
 func (e ebsAPI) AttachedTo(ctx context.Context, instance string) (map[string]time.Time, error) {
-	out := map[string]time.Time{}
+	all, err := e.attachmentsTo(ctx, instance)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]time.Time, len(all))
+	for id, a := range all {
+		out[id] = a.Attached
+	}
+
+	return out, nil
+}
+
+// Detaching lists this store's volumes EC2 is detaching from instance.
+func (e ebsAPI) Detaching(ctx context.Context, instance string) ([]string, error) {
+	all, err := e.attachmentsTo(ctx, instance)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for id, a := range all {
+		if a.State == "detaching" {
+			out = append(out, id)
+		}
+	}
+
+	return out, nil
+}
+
+// attachmentsTo lists this store's volumes with an attachment to instance, each with it.
+func (e ebsAPI) attachmentsTo(ctx context.Context, instance string) (map[string]volumeAttachment, error) {
+	out := map[string]volumeAttachment{}
 	seen := map[string]bool{}
 	for next := ""; ; {
 		values := url.Values{
@@ -148,7 +178,7 @@ func (e ebsAPI) AttachedTo(ctx context.Context, instance string) (map[string]tim
 			}
 			for _, a := range volume.Attachments {
 				if a.Instance == instance {
-					out[volume.ID] = a.Attached
+					out[volume.ID] = volumeAttachment{Instance: a.Instance, State: a.State, Attached: a.Attached}
 				}
 			}
 		}

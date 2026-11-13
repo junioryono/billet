@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -21,6 +22,7 @@ const testInstance = "i-0123456789abcdef0"
 
 // fakeAttach is EC2's attachment half, keeping which volume is on which instance.
 type fakeAttach struct {
+	mu sync.Mutex
 	// on is where each volume is attached; a missing entry is attached to none.
 	on map[string]volumeAttachment
 	// gone volumes EC2 says do not exist.
@@ -36,7 +38,41 @@ type fakeAttach struct {
 	awaited []string
 	// awaitBlocks makes AwaitDetached wait out its context, as EC2 not settling would.
 	awaitBlocks bool
-	now         *time.Time
+	// awaitGate, when set, holds every AwaitDetached until it is closed.
+	awaitGate chan struct{}
+	// holdDetaching leaves a detached volume detaching, as EC2 does while it carries the
+	// detach out, until finishDetaching; AwaitDetached waits for it meanwhile.
+	holdDetaching bool
+	// detachAnswer, when set, answers every DetachVolume after carrying it out, as a lost
+	// response or a server's failure would, or before, when detachUnsent; and listingLags
+	// hides every detaching volume from Detaching, as a listing read too soon.
+	detachAnswer error
+	detachUnsent bool
+	listingLags  bool
+	now          *time.Time
+}
+
+// finishDetaching ends a held detach: the volume is attached to nothing.
+func (f *fakeAttach) finishDetaching(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.on, id)
+}
+
+func (f *fakeAttach) Detaching(ctx context.Context, instance string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for id, a := range f.on {
+		if !f.listingLags && a.Instance == instance && a.State == "detaching" {
+			out = append(out, id)
+		}
+	}
+
+	return out, nil
 }
 
 func newFakeAttach(now *time.Time) *fakeAttach {
@@ -44,6 +80,8 @@ func newFakeAttach(now *time.Time) *fakeAttach {
 }
 
 func (f *fakeAttach) AttachVolume(_ context.Context, id, instance, point string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.asked = append(f.asked, point)
 	if f.used[point] {
 		return &awsAPIError{Code: "InvalidParameterValue", Status: 400,
@@ -62,16 +100,30 @@ func (f *fakeAttach) DetachVolume(ctx context.Context, id, _ string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	answer := f.detachAnswer
+	if answer != nil && f.detachUnsent {
+		return answer
+	}
 	f.detached = append(f.detached, id)
+	if a, ok := f.on[id]; ok && f.holdDetaching {
+		a.State = "detaching"
+		f.on[id] = a
+
+		return answer
+	}
 	delete(f.on, id)
 
-	return nil
+	return answer
 }
 
 func (f *fakeAttach) Attachment(ctx context.Context, id string) (volumeAttachment, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return volumeAttachment{}, false, err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.gone[id] {
 		return volumeAttachment{}, false, nil
 	}
@@ -87,9 +139,31 @@ func (f *fakeAttach) AwaitDetached(ctx context.Context, id string) error {
 
 		return ctx.Err()
 	}
+	if f.awaitGate != nil {
+		select {
+		case <-f.awaitGate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	for {
+		f.mu.Lock()
+		held := f.on[id].State == "detaching"
+		f.mu.Unlock()
+		if !held {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.awaited = append(f.awaited, id)
 	if a, ok := f.on[id]; ok && a.Instance != "" {
 		return fmt.Errorf("volume %s is still attached to %s", id, a.Instance)
@@ -99,6 +173,8 @@ func (f *fakeAttach) AwaitDetached(ctx context.Context, id string) error {
 }
 
 func (f *fakeAttach) AttachedTo(_ context.Context, instance string) (map[string]time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := map[string]time.Time{}
 	for id, a := range f.on {
 		if a.Instance == instance {
@@ -127,6 +203,8 @@ func (d *fakeDisks) Find(volume string) (string, bool, error) {
 	if d.findErr != nil {
 		return "", false, d.findErr
 	}
+	d.attach.mu.Lock()
+	defer d.attach.mu.Unlock()
 	if a, ok := d.attach.on[volume]; !ok || a.Instance != testInstance || d.hidden[volume] {
 		return "", false, nil
 	}
@@ -154,6 +232,7 @@ func localTestStore(now *time.Time, named ...string) (*Store, *fakeBlocks, *fake
 	disks := &fakeDisks{attach: attach, hidden: map[string]bool{}, held: map[string]bool{},
 		verify: storecontract.Filesystem{Type: "ext4", UUID: "host-uuid", Clean: true}}
 	s.host = &Host{InstanceID: testInstance, AvailabilityZone: "us-west-2a"}
+	s.queue = newAttachQueue()
 	s.attach = attach
 	s.disks = disks
 	s.sessions = func() (func(string) bool, error) {
