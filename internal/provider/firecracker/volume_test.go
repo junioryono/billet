@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -225,13 +226,18 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 		}
 	})
 
-	t.Run("the caller's time runs out", func(t *testing.T) {
+	t.Run("the caller's time runs out, and the retry waits on the same flush", func(t *testing.T) {
 		t.Parallel()
 		h, vmm, id := launched(t)
-		release := make(chan struct{})
-		t.Cleanup(func() { close(release) })
+		release, finished := make(chan struct{}), make(chan struct{})
+		var mu sync.Mutex
+		flushes := 0
 		h.p.flushDisk = func(string) error {
+			mu.Lock()
+			flushes++
+			mu.Unlock()
 			<-release
+			close(finished)
 
 			return nil
 		}
@@ -245,12 +251,83 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 			t.Errorf("cache0 had %d PATCH(es); a detach that gave up must not replace the drive",
 				cache0Patches(vmm))
 		}
+
+		retried := make(chan error, 1)
+		go func() { retried <- h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1") }()
+		time.Sleep(50 * time.Millisecond)
+		select {
+		case err := <-retried:
+			t.Fatalf("the retry finished while the first flush still ran: %v", err)
+		default:
+		}
+		close(release)
+		<-finished
+		if err := <-retried; err != nil {
+			t.Fatalf("the retry: %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if flushes != 1 || cache0Patches(vmm) != 2 {
+			t.Errorf("%d flush(es) and %d PATCH(es); want the one flush, waited on, then the detach",
+				flushes, cache0Patches(vmm))
+		}
 	})
 }
 
-// A DETACH'S PATCH HAS WHAT IS LEFT OF ITS CALLER'S TIME, never less than apiTimeout.
+// deadlineRecorder records the deadline of every PATCH it carries.
+type deadlineRecorder struct {
+	inner http.RoundTripper
+	mu    sync.Mutex
+	seen  []time.Duration
+}
+
+func (d *deadlineRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
+	if deadline, ok := r.Context().Deadline(); ok && r.Method == http.MethodPatch {
+		d.mu.Lock()
+		d.seen = append(d.seen, time.Until(deadline))
+		d.mu.Unlock()
+	}
+
+	return d.inner.RoundTrip(r)
+}
+
+// A DETACH'S PATCH HAS WHAT IS LEFT OF ITS CALLER'S TIME, never less than apiTimeout: the
+// close it causes writes the device back, and a caller with five minutes gives it five.
 func TestADetachsPatchHasTheCallersTime(t *testing.T) {
 	t.Parallel()
+
+	h := newHarness(t)
+	h.onJailer = func(id string) { h.serveVMM(t, id) }
+	spec := aSpec()
+	spec.CacheEndpoint = "http://172.20.0.1:7718"
+	spec.CacheToken = strings.Repeat("b", 64)
+	spec.BuildKitCacheMountLimit = 4 << 30
+	inst, err := h.p.Launch(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := h.p.AttachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); err != nil {
+		t.Fatalf("AttachVolume: %v", err)
+	}
+	recorder := &deadlineRecorder{}
+	h.p.apiAs = func(socket string, uid int) *vmmAPI {
+		api := answeringAsAnyone(socket, uid)
+		recorder.inner = api.http.Transport
+		api.http.Transport = recorder
+
+		return api
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	if err := h.p.DetachVolume(ctx, inst.ID, 0, "/dev/nvme9n1"); err != nil {
+		t.Fatalf("DetachVolume: %v", err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.seen) != 1 || recorder.seen[0] < 4*time.Minute {
+		t.Errorf("the detach's PATCH had %v to answer; want what was left of the caller's five minutes",
+			recorder.seen)
+	}
 
 	if got := callerTime(t.Context()); got != apiTimeout {
 		t.Errorf("no deadline: %s, want apiTimeout", got)

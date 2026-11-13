@@ -2403,7 +2403,15 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 		return
 	}
 
-	session.mu.Lock()
+	// BOUNDED AS A COMMIT IS: the detach writes the volume back first, on this
+	// request's time, and the session stays locked while it does.
+	ctx, cancel := context.WithTimeout(r.Context(), cacheWorkLimit)
+	defer cancel()
+	if err := lockCacheSession(ctx, session); err != nil {
+		s.nonFatalCommit(w, session, "wait for session", err)
+
+		return
+	}
 	defer session.mu.Unlock()
 	if session.closed {
 		http.Error(w, "cache session has ended", http.StatusGone)
@@ -2437,13 +2445,13 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 		return
 	}
 
-	if err := s.attacher.DetachVolume(r.Context(), session.instance, slot,
+	if err := s.attacher.DetachVolume(ctx, session.instance, slot,
 		attachment.Volume.Device); err != nil {
 		s.nonFatalCommit(w, session, "detach discarded volume", err)
 
 		return
 	}
-	if err := s.store.Discard(r.Context(), attachment.Volume); err != nil {
+	if err := s.store.Discard(ctx, attachment.Volume); err != nil {
 		s.nonFatalCommit(w, session, "discard rejected volume", err)
 
 		return

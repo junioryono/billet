@@ -89,20 +89,44 @@ func (p *Provider) DetachVolume(
 
 // flushBefore writes device back within ctx. Only ctx ending is an error: a device it
 // cannot open or flush is left to the VMM's close.
+//
+// ONE WRITE-BACK A DEVICE AT A TIME. An fsync cannot be cancelled, so a caller whose
+// time ends leaves it running; a detach of the same device after that waits on it
+// rather than starting another beside it, so retries against a slow device add no
+// descriptors and no blocked threads.
 func (p *Provider) flushBefore(ctx context.Context, device string) error {
 	if device == "" {
 		return nil
 	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// A FAILED FLUSH ONLY MOVES THE WRITE-BACK INTO THE PATCH, which has the
-		// caller's time for it.
-		if err := p.flushDisk(device); err != nil {
-			p.log.Info("could not write a cache volume back before its detach; the detach will",
-				"device", device, "error", err)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	p.flushMu.Lock()
+	done, running := p.flushing[device]
+	if !running {
+		if p.flushing == nil {
+			p.flushing = map[string]chan struct{}{}
 		}
-	}()
+		done = make(chan struct{})
+		p.flushing[device] = done
+		go func() {
+			defer func() {
+				p.flushMu.Lock()
+				delete(p.flushing, device)
+				p.flushMu.Unlock()
+				close(done)
+			}()
+			// A FAILED FLUSH ONLY MOVES THE WRITE-BACK INTO THE PATCH, which has the
+			// caller's time for it.
+			if err := p.flushDisk(device); err != nil {
+				p.log.Info("could not write a cache volume back before its detach; the detach will",
+					"device", device, "error", err)
+			}
+		}()
+	}
+	p.flushMu.Unlock()
+
 	select {
 	case <-done:
 		return nil
