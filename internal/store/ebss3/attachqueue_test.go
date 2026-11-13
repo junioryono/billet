@@ -223,6 +223,51 @@ func TestADetachWaitsForEC2ToFinishTheStoresOtherDetaches(t *testing.T) {
 	})
 }
 
+// A DETACH WHOSE ANSWER WAS LOST KEEPS ITS TURN UNTIL ITS VOLUME IS SEEN DETACHED: EC2 may
+// have taken it, and a listing read just after may not show it yet, so the next detach
+// would otherwise go behind it in EC2.
+func TestADetachWhoseAnswerWasLostKeepsItsTurn(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+		s, _, attach, _ := localTestStore(&now)
+		attachedHere(t, s, "vol-a")
+		attachedHere(t, s, "vol-b")
+		attach.holdDetaching = true
+		attach.loseDetachAnswer = true
+		attach.listingLags = true
+
+		lost := make(chan error, 1)
+		go func() { lost <- s.detachLocal(t.Context(), "vol-a") }()
+		synctest.Wait()
+		attach.mu.Lock()
+		attach.loseDetachAnswer = false
+		attach.mu.Unlock()
+		next := make(chan error, 1)
+		go func() { next <- s.detachLocal(t.Context(), "vol-b") }()
+		time.Sleep(30 * time.Second)
+		synctest.Wait()
+		attach.mu.Lock()
+		asked := slices.Clone(attach.detached)
+		attach.mu.Unlock()
+		if !slices.Equal(asked, []string{"vol-a"}) {
+			t.Fatalf("detaches asked of EC2 while vol-a's lost one went on: %v; want vol-a's alone", asked)
+		}
+
+		attach.finishDetaching("vol-a")
+		if err := <-lost; err == nil {
+			t.Fatal("a detach whose answer was lost answered success")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		attach.finishDetaching("vol-b")
+		if err := <-next; err != nil {
+			t.Fatalf("vol-b's detach: %v", err)
+		}
+	})
+}
+
 // A VOLUME WHOSE OWN DETACH IS STILL BEING CARRIED OUT IS WAITED FOR ON A RETRY, never
 // asked to detach a second time.
 func TestARetriedDetachWaitsForTheOneAlreadyAsked(t *testing.T) {
@@ -244,6 +289,11 @@ func TestARetriedDetachWaitsForTheOneAlreadyAsked(t *testing.T) {
 		go func() { retried <- s.detachLocal(t.Context(), "vol-a") }()
 		time.Sleep(10 * time.Second)
 		synctest.Wait()
+		select {
+		case err := <-retried:
+			t.Fatalf("the retry answered (%v) while vol-a was still detaching", err)
+		default:
+		}
 		attach.finishDetaching("vol-a")
 		if err := <-retried; err != nil {
 			t.Fatalf("the retry: %v", err)

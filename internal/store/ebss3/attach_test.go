@@ -43,7 +43,11 @@ type fakeAttach struct {
 	// holdDetaching leaves a detached volume detaching, as EC2 does while it carries the
 	// detach out, until finishDetaching; AwaitDetached waits for it meanwhile.
 	holdDetaching bool
-	now           *time.Time
+	// loseDetachAnswer carries out a detach and answers it as a lost response would; and
+	// listingLags hides every detaching volume from Detaching, as a listing read too soon.
+	loseDetachAnswer bool
+	listingLags      bool
+	now              *time.Time
 }
 
 // finishDetaching ends a held detach: the volume is attached to nothing.
@@ -61,7 +65,7 @@ func (f *fakeAttach) Detaching(ctx context.Context, instance string) ([]string, 
 	defer f.mu.Unlock()
 	var out []string
 	for id, a := range f.on {
-		if a.Instance == instance && a.State == "detaching" {
+		if !f.listingLags && a.Instance == instance && a.State == "detaching" {
 			out = append(out, id)
 		}
 	}
@@ -97,15 +101,19 @@ func (f *fakeAttach) DetachVolume(ctx context.Context, id, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.detached = append(f.detached, id)
+	var answer error
+	if f.loseDetachAnswer {
+		answer = errors.New("read tcp 10.0.0.1:443: connection reset by peer")
+	}
 	if a, ok := f.on[id]; ok && f.holdDetaching {
 		a.State = "detaching"
 		f.on[id] = a
 
-		return nil
+		return answer
 	}
 	delete(f.on, id)
 
-	return nil
+	return answer
 }
 
 func (f *fakeAttach) Attachment(ctx context.Context, id string) (volumeAttachment, bool, error) {

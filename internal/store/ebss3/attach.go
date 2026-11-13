@@ -286,6 +286,13 @@ func (s Store) detachLocal(ctx context.Context, volume string) error {
 	}
 	if attachment.State != "detaching" {
 		if err := s.attach.DetachVolume(ctx, volume, s.host.InstanceID); err != nil {
+			// A REQUEST EC2 MAY HAVE TAKEN IS WAITED OUT ON THIS TURN: an answer that was
+			// lost, not refused, may be a detach EC2 is carrying out, which a listing read
+			// just after may not show yet. Only EC2's own refusal is proof it was not.
+			if refusal, refused := errors.AsType[*awsAPIError](err); !refused || refusal == nil {
+				err = errors.Join(err, s.awaitDetached(ctx, volume))
+			}
+
 			return fmt.Errorf("ebs-s3: detach cache volume %s: %w", volume, err)
 		}
 	}
