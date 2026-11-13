@@ -49,7 +49,7 @@ type fakeAttach struct {
 	detachAnswer error
 	detachUnsent bool
 	listingLags  bool
-	now              *time.Time
+	now          *time.Time
 }
 
 // finishDetaching ends a held detach: the volume is attached to nothing.

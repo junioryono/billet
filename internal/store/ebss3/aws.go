@@ -29,7 +29,10 @@ const (
 	awsPollDelay  = 2 * time.Second
 	// unansweredVolumeLimit bounds removing a volume whose caller gave up. A guest
 	// is still waiting behind that caller: a Docker store's three-minute acquisition
-	// sits inside a metadata token that older images fetch for five.
+	// sits inside a metadata token that older images fetch for five. One exception
+	// outlasts it: a self-attaching store's detach whose answer was lost settles on time
+	// of its own, up to detachSettleLimit (attach.go), so EC2 is never carrying out two
+	// of its detaches at once, and the guest's caller may hear of it only after that.
 	unansweredVolumeLimit = 45 * time.Second
 	ownerTag              = "sh.billet.owner"
 	cacheOwnerTag         = "sh.billet.cache-owner"
