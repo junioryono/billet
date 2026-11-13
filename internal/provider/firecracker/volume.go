@@ -100,15 +100,19 @@ func (p *Provider) DetachVolume(
 // flushBefore writes device back within ctx. Only ctx ending is an error: a device it
 // cannot open or flush is left to the VMM's close.
 //
-// ONE WRITE-BACK A DEVICE AT A TIME. An fsync cannot be cancelled, so a caller whose
-// time ends leaves it running; a detach of the same device after that waits on it
-// rather than starting another beside it, so retries against a slow device add no
-// descriptors and no blocked threads.
+// ONE WRITE-BACK A DEVICE AT A TIME. Neither the open nor the fsync can be cancelled,
+// so a caller whose time ends leaves them running; a detach of the same device after
+// that waits on them rather than starting another beside them, so retries against a
+// slow device add no descriptors and no blocked threads. Nothing is opened or written
+// back under flushMu, so one slow device never holds another's detach.
 //
-// OPENED NOW, WRITTEN BACK AFTER: the device is opened before this returns, while its
-// caller's proof of it is fresh, and the write-back left running holds that descriptor,
-// never a name it opens later, when the number may be another volume's. While it holds
-// it, nothing on this host can prove the volume unheld, so no store detaches it.
+// WRITTEN BACK ONLY FOR A CALLER STILL WAITING WHEN THE OPEN ENDS. The caller's proof
+// of the device is fresh while it waits; once every caller has given up, the volume may
+// be unmapped and its number given to another, so an open that ends then is closed
+// again without a write-back. The write-back that runs holds the descriptor it opened,
+// never a name it opens later, and while it holds it nothing on this host can prove the
+// volume unheld, so no store detaches it.
+//
 // A FAILED OPEN OR FLUSH ONLY MOVES THE WRITE-BACK INTO THE PATCH, which has the
 // caller's time for it.
 func (p *Provider) flushBefore(ctx context.Context, device string) error {
@@ -120,46 +124,85 @@ func (p *Provider) flushBefore(ctx context.Context, device string) error {
 	}
 
 	p.flushMu.Lock()
-	done, running := p.flushing[device]
+	wb, running := p.flushing[device]
 	if !running {
-		disk, err := p.openDisk(device)
-		if err != nil {
-			p.flushMu.Unlock()
-			p.log.Info("could not open a cache volume to write it back before its detach; the detach will",
-				"device", device, "error", err)
-
-			return nil
-		}
 		if p.flushing == nil {
-			p.flushing = map[string]chan struct{}{}
+			p.flushing = map[string]*writeBack{}
 		}
-		done = make(chan struct{})
-		p.flushing[device] = done
-		go func() {
-			err := disk.Sync()
-			if closeErr := disk.Close(); err == nil {
-				err = closeErr
-			}
-			if err != nil {
-				p.log.Info("could not write a cache volume back before its detach; the detach will",
-					"device", device, "error", err)
-			}
-			// DONE BEFORE FORGOTTEN, under the lock, so nothing can see the entry gone
-			// while its write-back still runs.
-			p.flushMu.Lock()
-			close(done)
-			delete(p.flushing, device)
-			p.flushMu.Unlock()
-		}()
+		wb = &writeBack{opened: make(chan struct{}), done: make(chan struct{})}
+		p.flushing[device] = wb
+		go p.writeBack(device, wb)
+	}
+	select {
+	case <-wb.opened:
+	default:
+		wb.waiting++
 	}
 	p.flushMu.Unlock()
 
 	select {
-	case <-done:
+	case <-wb.opened:
+	case <-ctx.Done():
+		p.flushMu.Lock()
+		select {
+		case <-wb.opened:
+		default:
+			wb.waiting--
+		}
+		p.flushMu.Unlock()
+
+		return ctx.Err()
+	}
+
+	select {
+	case <-wb.done:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// writeBack is one device's write-back in flight (flushBefore): opened when its open
+// has ended, done when it has, and waiting the callers still waiting for its open.
+type writeBack struct {
+	opened  chan struct{}
+	done    chan struct{}
+	waiting int
+}
+
+// writeBack opens device, writes it back if a caller is still waiting for it, and
+// closes it.
+func (p *Provider) writeBack(device string, wb *writeBack) {
+	disk, err := p.openDisk(device)
+
+	p.flushMu.Lock()
+	wanted := wb.waiting > 0
+	close(wb.opened)
+	p.flushMu.Unlock()
+
+	switch {
+	case err != nil:
+		p.log.Info("could not open a cache volume to write it back before its detach; the detach will",
+			"device", device, "error", err)
+	case !wanted:
+		_ = disk.Close()
+	default:
+		err = disk.Sync()
+		if closeErr := disk.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			p.log.Info("could not write a cache volume back before its detach; the detach will",
+				"device", device, "error", err)
+		}
+	}
+
+	// DONE BEFORE FORGOTTEN, under the lock, so nothing can see the entry gone while
+	// its write-back still runs.
+	p.flushMu.Lock()
+	close(wb.done)
+	delete(p.flushing, device)
+	p.flushMu.Unlock()
 }
 
 // sameBlockDevice says whether the node at slot, never followed, and device are one

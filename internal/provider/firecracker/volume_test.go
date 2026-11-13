@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -166,10 +167,18 @@ func cache0Patches(vmm *fakeVMM) int {
 	return n
 }
 
-// syncedDisk is an open disk whose write-back runs sync, or nothing.
-type syncedDisk struct{ sync func() error }
+// syncedDisk is an open disk whose write-back runs sync, or nothing, counting its
+// write-backs and closes when given counters.
+type syncedDisk struct {
+	sync   func() error
+	synced *atomic.Int32
+	closes *atomic.Int32
+}
 
 func (d syncedDisk) Sync() error {
+	if d.synced != nil {
+		d.synced.Add(1)
+	}
 	if d.sync != nil {
 		return d.sync()
 	}
@@ -177,7 +186,13 @@ func (d syncedDisk) Sync() error {
 	return nil
 }
 
-func (syncedDisk) Close() error { return nil }
+func (d syncedDisk) Close() error {
+	if d.closes != nil {
+		d.closes.Add(1)
+	}
+
+	return nil
+}
 
 // forgotten waits, bounded, until the provider holds no write-back in flight. Its
 // worker marks one done and forgets it under one lock, so an empty map is a joined one.
@@ -225,16 +240,20 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 		t.Parallel()
 		h, vmm, id := launched(t)
 		var opened []string
-		patchesAtFlush := -1
+		var closes atomic.Int32
+		patchesAtFlush, closedAtPatch := -1, int32(-1)
 		h.p.openDisk = func(device string) (diskHandle, error) {
 			opened = append(opened, device)
 
-			return syncedDisk{sync: func() error {
+			return syncedDisk{closes: &closes, sync: func() error {
 				patchesAtFlush = cache0Patches(vmm)
 
 				return nil
 			}}, nil
 		}
+		vmm.mu.Lock()
+		vmm.onPatch = func() { closedAtPatch = closes.Load() }
+		vmm.mu.Unlock()
 		if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
 			t.Fatalf("DetachVolume: %v", err)
 		}
@@ -245,23 +264,39 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 			t.Errorf("cache0 had %d PATCH(es) when it was written back and %d after; want the attach's, then the detach's",
 				patchesAtFlush, cache0Patches(vmm))
 		}
+		if closedAtPatch != 1 || closes.Load() != 1 {
+			t.Errorf("the device was closed %d time(s) by the detach's PATCH and %d after; want once, before it",
+				closedAtPatch, closes.Load())
+		}
 	})
 
-	for name, open := range map[string]func(string) (diskHandle, error){
-		"an open that fails": func(string) (diskHandle, error) { return nil, errors.New("no such device") },
-		"a write-back that fails": func(string) (diskHandle, error) {
-			return syncedDisk{sync: func() error { return errors.New("input/output error") }}, nil
-		},
+	for name, failure := range map[string]struct{ open, sync error }{
+		"an open that fails":      {open: errors.New("no such device")},
+		"a write-back that fails": {sync: errors.New("input/output error")},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			h, vmm, id := launched(t)
-			h.p.openDisk = open
+			var closes atomic.Int32
+			h.p.openDisk = func(string) (diskHandle, error) {
+				if failure.open != nil {
+					return nil, failure.open
+				}
+
+				return syncedDisk{closes: &closes, sync: func() error { return failure.sync }}, nil
+			}
 			if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
 				t.Fatalf("a detach whose write-back failed: %v", err)
 			}
 			if cache0Patches(vmm) != 2 {
 				t.Errorf("cache0 had %d PATCH(es); a failed write-back must still detach", cache0Patches(vmm))
+			}
+			wantCloses := int32(1)
+			if failure.open != nil {
+				wantCloses = 0
+			}
+			if closes.Load() != wantCloses {
+				t.Errorf("the device was closed %d time(s); want %d", closes.Load(), wantCloses)
 			}
 		})
 	}
@@ -287,8 +322,9 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 		t.Parallel()
 		h, vmm, id := launched(t)
 		entered, release := make(chan struct{}), make(chan struct{})
+		var closes atomic.Int32
 		h.p.openDisk = func(string) (diskHandle, error) {
-			return syncedDisk{sync: func() error {
+			return syncedDisk{closes: &closes, sync: func() error {
 				close(entered)
 				<-release
 
@@ -310,6 +346,9 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 			helper.Wait()
 			close(release)
 			forgotten(t, h.p)
+			if closes.Load() != 1 {
+				t.Errorf("the write-back left running closed its device %d time(s); want once", closes.Load())
+			}
 		})
 		err := h.p.DetachVolume(ctx, id, 0, "/dev/nvme9n1")
 		if !errors.Is(err, context.Canceled) {
@@ -376,6 +415,48 @@ func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
 		}
 		if opens != 2 {
 			t.Errorf("the device was opened %d times; want once for the first, waited on, then once after", opens)
+		}
+	})
+}
+
+// A SLOW OPEN HOLDS NO OTHER DEVICE'S DETACH, AND ONE THAT ENDS AFTER EVERY CALLER GAVE UP
+// WRITES NOTHING BACK: a block device's open can wait in the kernel, and once its callers
+// have gone the volume may be unmapped and its number another's, so the descriptor is
+// closed unused.
+func TestASlowOpenHoldsNoOtherDetachAndWritesNothingBackLate(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p := &Provider{log: slog.New(slog.DiscardHandler)}
+		slow := make(chan struct{})
+		var once sync.Once
+		releaseSlow := func() { once.Do(func() { close(slow) }) }
+		defer releaseSlow()
+		var slowSynced, slowClosed, otherSynced atomic.Int32
+		p.openDisk = func(device string) (diskHandle, error) {
+			if device == "/dev/slow" {
+				<-slow
+
+				return syncedDisk{synced: &slowSynced, closes: &slowClosed}, nil
+			}
+
+			return syncedDisk{synced: &otherSynced}, nil
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := p.flushBefore(ctx, "/dev/slow"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a caller whose device's open outlasted it answered %v", err)
+		}
+		if err := p.flushBefore(t.Context(), "/dev/other"); err != nil || otherSynced.Load() != 1 {
+			t.Fatalf("another device, while one open hung: %v, written back %d time(s)", err, otherSynced.Load())
+		}
+
+		releaseSlow()
+		synctest.Wait()
+		if slowSynced.Load() != 0 || slowClosed.Load() != 1 {
+			t.Errorf("an open that ended after its caller gave up was written back %d time(s) and closed %d; "+
+				"want closed once, unused", slowSynced.Load(), slowClosed.Load())
 		}
 	})
 }

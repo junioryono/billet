@@ -199,7 +199,7 @@ type Provider struct {
 	// flushing is each device's write-back in flight before a detach, closed when it
 	// ends (flushBefore).
 	flushMu  sync.Mutex
-	flushing map[string]chan struct{}
+	flushing map[string]*writeBack
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
