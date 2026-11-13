@@ -3,6 +3,7 @@ package firecracker
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
@@ -93,28 +94,49 @@ func isLeaseID(s string) bool {
 // path inside the jail root is the jailed account's to replace, and root opening it
 // would follow whatever it became.
 func flushDevice(device string) error {
-	if !filepath.IsAbs(device) || filepath.Dir(device) != "/dev" {
-		return fmt.Errorf("firecracker: %s is not a device billet mapped", bounded(device))
-	}
-
-	fd, err := unix.Open(device, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	disk, err := openDiskDevice(device)
 	if err != nil {
-		return fmt.Errorf("firecracker: open the disk %s to flush it: %w", device, err)
+		return err
 	}
-	defer unix.Close(fd)
+	defer disk.Close()
 
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return fmt.Errorf("firecracker: stat the disk %s: %w", device, err)
-	}
-
-	if st.Mode&unix.S_IFMT != unix.S_IFBLK {
-		return fmt.Errorf("firecracker: %s is not a block device", device)
-	}
-
-	if err := unix.Fsync(fd); err != nil {
+	if err := disk.Sync(); err != nil {
 		return fmt.Errorf("firecracker: flush the disk %s: %w", device, err)
 	}
 
 	return nil
+}
+
+// diskHandle is an open disk a write-back is made through.
+type diskHandle interface {
+	Sync() error
+	Close() error
+}
+
+// openDiskDevice opens device to write it back: a block device under /dev, never
+// followed, and never waited on.
+func openDiskDevice(device string) (diskHandle, error) {
+	if !filepath.IsAbs(device) || filepath.Dir(device) != "/dev" {
+		return nil, fmt.Errorf("firecracker: %s is not a device billet mapped", bounded(device))
+	}
+
+	fd, err := unix.Open(device, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("firecracker: open the disk %s to flush it: %w", device, err)
+	}
+
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+
+		return nil, fmt.Errorf("firecracker: stat the disk %s: %w", device, err)
+	}
+
+	if st.Mode&unix.S_IFMT != unix.S_IFBLK {
+		unix.Close(fd)
+
+		return nil, fmt.Errorf("firecracker: %s is not a block device", device)
+	}
+
+	return os.NewFile(uintptr(fd), device), nil
 }

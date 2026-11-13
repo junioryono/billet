@@ -192,8 +192,10 @@ type Provider struct {
 	// replaced. A seam because a test's disks are no devices.
 	flushDisk func(device string) error
 	// slotHolds says whether a jail's cache slot node is the named host device
-	// (sameBlockDevice). A seam because a test's slot holds no device.
+	// (sameBlockDevice), and openDisk opens one to write it back (openDiskDevice).
+	// Seams because a test's slots hold no devices.
 	slotHolds func(slot, device string) bool
+	openDisk  func(device string) (diskHandle, error)
 	// flushing is each device's write-back in flight before a detach, closed when it
 	// ends (flushBefore).
 	flushMu  sync.Mutex
@@ -385,6 +387,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	}
 	p.flushDisk = flushDevice
 	p.slotHolds = sameBlockDevice
+	p.openDisk = openDiskDevice
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt

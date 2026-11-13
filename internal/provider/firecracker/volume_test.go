@@ -166,6 +166,34 @@ func cache0Patches(vmm *fakeVMM) int {
 	return n
 }
 
+// syncedDisk is an open disk whose write-back runs sync, or nothing.
+type syncedDisk struct{ sync func() error }
+
+func (d syncedDisk) Sync() error {
+	if d.sync != nil {
+		return d.sync()
+	}
+
+	return nil
+}
+
+func (syncedDisk) Close() error { return nil }
+
+// forgotten waits, bounded, until the provider holds no write-back in flight. Its
+// worker marks one done and forgets it under one lock, so an empty map is a joined one.
+func forgotten(t *testing.T, p *Provider) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		p.flushMu.Lock()
+		left := len(p.flushing)
+		p.flushMu.Unlock()
+		if left == 0 {
+			return
+		}
+	}
+	t.Error("a write-back was still in flight ten seconds after it was released")
+}
+
 // A DETACH WRITES THE DEVICE BACK BEFORE IT REPLACES THE DRIVE, because the VMM's
 // close of the device writes back every dirty page before it answers (#871). A flush
 // that fails leaves the write-back to the close and still detaches; a caller whose
@@ -196,46 +224,56 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 	t.Run("flushed first", func(t *testing.T) {
 		t.Parallel()
 		h, vmm, id := launched(t)
-		var flushed []string
-		var patchesAtFlush int
-		h.p.flushDisk = func(device string) error {
-			flushed = append(flushed, device)
-			patchesAtFlush = cache0Patches(vmm)
+		var opened []string
+		patchesAtFlush := -1
+		h.p.openDisk = func(device string) (diskHandle, error) {
+			opened = append(opened, device)
 
-			return nil
+			return syncedDisk{sync: func() error {
+				patchesAtFlush = cache0Patches(vmm)
+
+				return nil
+			}}, nil
 		}
 		if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
 			t.Fatalf("DetachVolume: %v", err)
 		}
-		if len(flushed) != 1 || flushed[0] != "/dev/nvme9n1" {
-			t.Fatalf("flushed %q, want the volume's device once", flushed)
+		if len(opened) != 1 || opened[0] != "/dev/nvme9n1" {
+			t.Fatalf("opened %q, want the volume's device once", opened)
 		}
 		if patchesAtFlush != 1 || cache0Patches(vmm) != 2 {
-			t.Errorf("cache0 had %d PATCH(es) when it was flushed and %d after; want the attach's, then the detach's",
+			t.Errorf("cache0 had %d PATCH(es) when it was written back and %d after; want the attach's, then the detach's",
 				patchesAtFlush, cache0Patches(vmm))
 		}
 	})
 
-	t.Run("a flush that fails", func(t *testing.T) {
-		t.Parallel()
-		h, vmm, id := launched(t)
-		h.p.flushDisk = func(string) error { return errors.New("no such device") }
-		if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
-			t.Fatalf("a detach whose flush failed: %v", err)
-		}
-		if cache0Patches(vmm) != 2 {
-			t.Errorf("cache0 had %d PATCH(es); a failed flush must still detach", cache0Patches(vmm))
-		}
-	})
+	for name, open := range map[string]func(string) (diskHandle, error){
+		"an open that fails": func(string) (diskHandle, error) { return nil, errors.New("no such device") },
+		"a write-back that fails": func(string) (diskHandle, error) {
+			return syncedDisk{sync: func() error { return errors.New("input/output error") }}, nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			h, vmm, id := launched(t)
+			h.p.openDisk = open
+			if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
+				t.Fatalf("a detach whose write-back failed: %v", err)
+			}
+			if cache0Patches(vmm) != 2 {
+				t.Errorf("cache0 had %d PATCH(es); a failed write-back must still detach", cache0Patches(vmm))
+			}
+		})
+	}
 
 	t.Run("a slot that no longer holds the device", func(t *testing.T) {
 		t.Parallel()
 		h, vmm, id := launched(t)
 		h.p.slotHolds = func(string, string) bool { return false }
-		h.p.flushDisk = func(device string) error {
-			t.Errorf("flushed %s, which the slot does not hold", device)
+		h.p.openDisk = func(device string) (diskHandle, error) {
+			t.Errorf("opened %s, which the slot does not hold", device)
 
-			return nil
+			return syncedDisk{}, nil
 		}
 		if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
 			t.Fatalf("DetachVolume: %v", err)
@@ -249,38 +287,33 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 		t.Parallel()
 		h, vmm, id := launched(t)
 		entered, release := make(chan struct{}), make(chan struct{})
-		h.p.flushDisk = func(string) error {
-			close(entered)
-			<-release
+		h.p.openDisk = func(string) (diskHandle, error) {
+			return syncedDisk{sync: func() error {
+				close(entered)
+				<-release
 
-			return nil
+				return nil
+			}}, nil
 		}
-		// RELEASED AND JOINED HOWEVER THE TEST ENDS: the write-back, if it began, is
-		// waited for until the provider has forgotten it.
-		t.Cleanup(func() {
-			close(release)
-			for {
-				h.p.flushMu.Lock()
-				left := len(h.p.flushing)
-				h.p.flushMu.Unlock()
-				if left == 0 {
-					return
-				}
-				time.Sleep(time.Millisecond)
-			}
-		})
 		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-		go func() {
+		var helper sync.WaitGroup
+		helper.Go(func() {
 			select {
 			case <-entered:
 				cancel()
 			case <-ctx.Done():
 			}
-		}()
+		})
+		// RELEASED AND JOINED HOWEVER THE TEST ENDS.
+		t.Cleanup(func() {
+			cancel()
+			helper.Wait()
+			close(release)
+			forgotten(t, h.p)
+		})
 		err := h.p.DetachVolume(ctx, id, 0, "/dev/nvme9n1")
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("a detach whose flush outlasted its caller answered %v", err)
+			t.Fatalf("a detach whose write-back outlasted its caller answered %v", err)
 		}
 		if cache0Patches(vmm) != 1 {
 			t.Errorf("cache0 had %d PATCH(es); a detach that gave up must not replace the drive",
@@ -292,7 +325,7 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 // A WRITE-BACK IN FLIGHT IS WAITED ON, NEVER STARTED AGAIN BESIDE IT: a caller that gave
 // up leaves its fsync running, and the next caller for that device joins it, so retries
 // against a slow device add no descriptors and no blocked threads. Once it ends, the
-// next caller starts its own.
+// next caller opens the device again and starts its own.
 func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
 	t.Parallel()
 
@@ -304,12 +337,15 @@ func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
 		var once sync.Once
 		releaseAll := func() { once.Do(func() { close(release) }) }
 		defer releaseAll()
-		flushes := 0
-		p.flushDisk = func(string) error {
-			flushes++
-			<-release
+		opens := 0
+		p.openDisk = func(string) (diskHandle, error) {
+			opens++
 
-			return nil
+			return syncedDisk{sync: func() error {
+				<-release
+
+				return nil
+			}}, nil
 		}
 
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -326,19 +362,20 @@ func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
 			t.Fatalf("the retry returned while the first write-back still ran: %v", err)
 		default:
 		}
-		if flushes != 1 {
-			t.Fatalf("%d write-backs in flight for one device", flushes)
+		if opens != 1 {
+			t.Fatalf("the device was opened %d times while one write-back was in flight", opens)
 		}
 
 		releaseAll()
 		if err := <-retried; err != nil {
 			t.Fatalf("the retry: %v", err)
 		}
+		synctest.Wait()
 		if err := p.flushBefore(t.Context(), "/dev/nvme9n1"); err != nil {
 			t.Fatalf("a caller after it ended: %v", err)
 		}
-		if flushes != 2 {
-			t.Errorf("%d write-backs; want the first, waited on, then one for the caller after it", flushes)
+		if opens != 2 {
+			t.Errorf("the device was opened %d times; want once for the first, waited on, then once after", opens)
 		}
 	})
 }

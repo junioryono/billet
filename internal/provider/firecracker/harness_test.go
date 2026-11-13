@@ -721,6 +721,7 @@ func tryHarness(t *testing.T, opts ...Option) (*harness, error) {
 	// AND ITS DISKS ARE NO DEVICES, so a slot is taken to hold the device it was given
 	// and a flush is recorded rather than made.
 	h.p.slotHolds = func(string, string) bool { return true }
+	h.p.openDisk = func(string) (diskHandle, error) { return syncedDisk{}, nil }
 	h.p.flushDisk = func(device string) error {
 		h.mu.Lock()
 		defer h.mu.Unlock()

@@ -104,6 +104,13 @@ func (p *Provider) DetachVolume(
 // time ends leaves it running; a detach of the same device after that waits on it
 // rather than starting another beside it, so retries against a slow device add no
 // descriptors and no blocked threads.
+//
+// OPENED NOW, WRITTEN BACK AFTER: the device is opened before this returns, while its
+// caller's proof of it is fresh, and the write-back left running holds that descriptor,
+// never a name it opens later, when the number may be another volume's. While it holds
+// it, nothing on this host can prove the volume unheld, so no store detaches it.
+// A FAILED OPEN OR FLUSH ONLY MOVES THE WRITE-BACK INTO THE PATCH, which has the
+// caller's time for it.
 func (p *Provider) flushBefore(ctx context.Context, device string) error {
 	if device == "" {
 		return nil
@@ -115,24 +122,34 @@ func (p *Provider) flushBefore(ctx context.Context, device string) error {
 	p.flushMu.Lock()
 	done, running := p.flushing[device]
 	if !running {
+		disk, err := p.openDisk(device)
+		if err != nil {
+			p.flushMu.Unlock()
+			p.log.Info("could not open a cache volume to write it back before its detach; the detach will",
+				"device", device, "error", err)
+
+			return nil
+		}
 		if p.flushing == nil {
 			p.flushing = map[string]chan struct{}{}
 		}
 		done = make(chan struct{})
 		p.flushing[device] = done
 		go func() {
-			defer func() {
-				p.flushMu.Lock()
-				delete(p.flushing, device)
-				p.flushMu.Unlock()
-				close(done)
-			}()
-			// A FAILED FLUSH ONLY MOVES THE WRITE-BACK INTO THE PATCH, which has the
-			// caller's time for it.
-			if err := p.flushDisk(device); err != nil {
+			err := disk.Sync()
+			if closeErr := disk.Close(); err == nil {
+				err = closeErr
+			}
+			if err != nil {
 				p.log.Info("could not write a cache volume back before its detach; the detach will",
 					"device", device, "error", err)
 			}
+			// DONE BEFORE FORGOTTEN, under the lock, so nothing can see the entry gone
+			// while its write-back still runs.
+			p.flushMu.Lock()
+			close(done)
+			delete(p.flushing, device)
+			p.flushMu.Unlock()
 		}()
 	}
 	p.flushMu.Unlock()
