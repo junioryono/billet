@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -46,18 +47,31 @@ func (p *Provider) AttachVolume(
 
 // DetachVolume replaces a drive with an empty placeholder before storage unmaps it.
 //
-// A successful PATCH is the boundary: only then has the VMM closed the RBD device
-// and may the store snapshot or unmap it. A failed patch leaves the device mapped
-// and returns an error so the caller cannot cross that boundary by accident.
+// A successful PATCH is the boundary: only then has the VMM closed the device and
+// may the store snapshot or unmap it. A failed patch leaves the device mapped and
+// returns an error so the caller cannot cross that boundary by accident.
+//
+// THE DEVICE IS WRITTEN BACK FIRST, ON THE CALLER'S TIME. The guest's writes are in
+// the host's page cache (flushDevice), and the VMM's close of the device writes them
+// all back before it answers the PATCH: 1.5 GB took 11.2 s on a 100 GB gp3, past
+// apiTimeout, so the drive was never replaced and the store never published
+// (c7g.metal, 2026-11-13, #871). Flushed first, the PATCH took 0.2 s. A flush that
+// cannot be made is not the detach's failure, since the close writes back anyway, and
+// the PATCH has what is left of the caller's time for whatever the guest wrote since.
 func (p *Provider) DetachVolume(
 	ctx context.Context,
 	instanceID string,
 	slot int,
-	_ string,
+	device string,
 ) error {
 	j, res, err := p.volumeJail(instanceID, slot)
 	if err != nil {
 		return err
+	}
+
+	if err := p.flushBefore(ctx, device); err != nil {
+		return fmt.Errorf("firecracker: write cache slot %d of %s back before detaching it: %w",
+			slot, instanceID, err)
 	}
 
 	if err := p.replaceVolumePath(j, res, slot, ""); err != nil {
@@ -65,13 +79,47 @@ func (p *Provider) DetachVolume(
 	}
 
 	id := provider.VolumeSlotID(slot)
-	if err := p.apiAs(j.socket(), res.UID).patch(ctx, "/drives/"+id, map[string]string{
-		"drive_id": id, "path_on_host": "/" + id,
-	}); err != nil {
+	if err := p.apiAs(j.socket(), res.UID).withTimeout(callerTime(ctx)).patch(ctx, "/drives/"+id,
+		map[string]string{"drive_id": id, "path_on_host": "/" + id}); err != nil {
 		return fmt.Errorf("firecracker: detach cache slot %d from %s: %w", slot, instanceID, err)
 	}
 
 	return nil
+}
+
+// flushBefore writes device back within ctx. Only ctx ending is an error: a device it
+// cannot open or flush is left to the VMM's close.
+func (p *Provider) flushBefore(ctx context.Context, device string) error {
+	if device == "" {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// A FAILED FLUSH ONLY MOVES THE WRITE-BACK INTO THE PATCH, which has the
+		// caller's time for it.
+		if err := p.flushDisk(device); err != nil {
+			p.log.Info("could not write a cache volume back before its detach; the detach will",
+				"device", device, "error", err)
+		}
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// callerTime is how long a call may take within ctx: what is left of its deadline,
+// never less than apiTimeout, and apiTimeout when it has none.
+func callerTime(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return apiTimeout
+	}
+
+	return max(time.Until(deadline), apiTimeout)
 }
 
 func (p *Provider) volumeJail(instanceID string, slot int) (jail, resources, error) {

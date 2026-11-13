@@ -187,9 +187,10 @@ type Provider struct {
 	// which may no longer be the file at the configured path. A seam because it
 	// needs the kernel's socket credentials and /proc/<pid>/exe.
 	runningVMM func(ctx context.Context, j jail, res resources) (*os.File, error)
-	// flushRoot writes a mapped root disk's dirty host pages back before a capture
-	// publishes it (flushDevice). A seam because a test's root disk is no device.
-	flushRoot func(device string) error
+	// flushDisk writes a mapped device's dirty host pages back (flushDevice): a root
+	// disk's before a capture publishes it, and a cache volume's before its drive is
+	// replaced. A seam because a test's disks are no devices.
+	flushDisk func(device string) error
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -375,7 +376,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	p.runningVMM = func(ctx context.Context, j jail, res resources) (*os.File, error) {
 		return apiPeerExecutable(ctx, j.socket(), res.UID)
 	}
-	p.flushRoot = flushDevice
+	p.flushDisk = flushDevice
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt

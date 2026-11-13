@@ -718,8 +718,8 @@ func tryHarness(t *testing.T, opts ...Option) (*harness, error) {
 	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
 	h.p.runningVMM = func(context.Context, jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
 
-	// AND ITS ROOT DISK IS NO DEVICE, so a flush is recorded rather than made.
-	h.p.flushRoot = func(device string) error {
+	// AND ITS DISKS ARE NO DEVICES, so a flush is recorded rather than made.
+	h.p.flushDisk = func(device string) error {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 

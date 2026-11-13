@@ -78,17 +78,20 @@ func isLeaseID(s string) bool {
 	return true
 }
 
-// flushDevice writes a mapped root disk's dirty host pages back to the device.
+// flushDevice writes a mapped disk's dirty host pages back to the device.
 //
 // A GUEST'S WRITES SIT IN THE HOST'S PAGE CACHE: Firecracker's default block cache
 // type (Unsafe, which billet configures) advertises no flush to the guest and never
 // fsyncs the backing file, so until the host writes them back a snapshot of the
-// device taken from the cluster does not hold them. This is that write-back, asked
-// for while the guest is paused.
+// device taken from the cluster does not hold them, and the VMM's last close of the
+// device, when its drive is replaced, writes every one of them back before the VMM
+// answers. This is that write-back, asked for while the guest is paused or done with
+// the device.
 //
-// THE DEVICE COMES FROM billet's OWN RECORD, the shape beside the jail root, and is
-// opened only if it is a block device under /dev: a path inside the jail root is the
-// jailed account's to replace, and root opening it would follow whatever it became.
+// THE DEVICE COMES FROM billet's OWN RECORD, the shape beside the jail root or the
+// cache session's volume, and is opened only if it is a block device under /dev: a
+// path inside the jail root is the jailed account's to replace, and root opening it
+// would follow whatever it became.
 func flushDevice(device string) error {
 	if !filepath.IsAbs(device) || filepath.Dir(device) != "/dev" {
 		return fmt.Errorf("firecracker: %s is not a device billet mapped", bounded(device))
@@ -96,13 +99,13 @@ func flushDevice(device string) error {
 
 	fd, err := unix.Open(device, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("firecracker: open the root disk %s to flush it: %w", device, err)
+		return fmt.Errorf("firecracker: open the disk %s to flush it: %w", device, err)
 	}
 	defer unix.Close(fd)
 
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
-		return fmt.Errorf("firecracker: stat the root disk %s: %w", device, err)
+		return fmt.Errorf("firecracker: stat the disk %s: %w", device, err)
 	}
 
 	if st.Mode&unix.S_IFMT != unix.S_IFBLK {
@@ -110,7 +113,7 @@ func flushDevice(device string) error {
 	}
 
 	if err := unix.Fsync(fd); err != nil {
-		return fmt.Errorf("firecracker: flush the root disk %s: %w", device, err)
+		return fmt.Errorf("firecracker: flush the disk %s: %w", device, err)
 	}
 
 	return nil
