@@ -1,6 +1,7 @@
 package fleetops
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -25,14 +26,17 @@ func energyEstimate(instanceType string, u *alloc.JobUsage, vcpu int64, d time.D
 	return cloudenergy.Of(vcpu, d)
 }
 
-// recordEnergyEstimate is energyEstimate for one job's record, over the runtime
-// `billet jobs show` prints for it.
+// recordEnergyEstimate is energyEstimate for one job's record.
+//
+// OVER THE DURATION `billet jobs stats` TAKES, from the start to GitHub's result,
+// not the runtime this report prints beside it, which runs to the lease's
+// archive: one job is estimated, or not, alike in both.
 func recordEnergyEstimate(rec alloc.JobRecord, u *alloc.RecordedUsage) (cloudenergy.Estimate, bool) {
 	var measured *alloc.JobUsage
 	if u != nil {
 		measured = &u.JobUsage
 	}
-	d, ran := rec.Runtime()
+	d, ran := rec.Duration()
 
 	return energyEstimate(rec.InstanceType, measured, rec.VCPU, d, ran)
 }
@@ -40,7 +44,18 @@ func recordEnergyEstimate(rec alloc.JobRecord, u *alloc.RecordedUsage) (cloudene
 // estimateText is how a report words an estimate: the figure, then how it was
 // made, so it is never read without the word estimated.
 func estimateText(e cloudenergy.Estimate) string {
-	return joules(e.Microjoules) + ", " + e.Method()
+	return estimateJoules(e.Microjoules) + ", " + e.Method()
+}
+
+// estimateJoules words an estimate's energy as joules does, with the
+// significant figures it would otherwise round to 0.0 J: an estimate is only
+// ever made of something, so it never reads as nothing.
+func estimateJoules(microjoules int64) string {
+	if microjoules < 50_000 {
+		return fmt.Sprintf("%.3g J", float64(microjoules)/1e6)
+	}
+
+	return joules(microjoules)
 }
 
 // energyEstimateJSON is a job's estimate in `billet jobs show --json`: the

@@ -3,6 +3,8 @@ package fleetops
 import (
 	"bytes"
 	"encoding/json"
+	"html"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -13,8 +15,10 @@ import (
 
 // ONLY A BOUGHT SHAPE THAT NO HOST MEASURED IS ESTIMATED, through the ledger: a
 // job with energy measured keeps its source, a host-backed job with none and a
-// bought job still running are not measured, and the estimate is a source of
-// its own that is never added to a measured one.
+// bought job still running are not estimated, every job without measured energy
+// is counted as not measured whether or not it was estimated, and the estimate is
+// a source of its own that is never added to a measured one. Every form of the
+// report says so.
 func TestJobStatsEstimatesOnlyABoughtShapeNoHostMeasured(t *testing.T) {
 	t.Parallel()
 
@@ -40,34 +44,86 @@ func TestJobStatsEstimatesOnlyABoughtShapeNoHostMeasured(t *testing.T) {
 	if len(f.Energy) != 2 || f.Energy[0] != want[0] || f.Energy[1] != want[1] {
 		t.Errorf("energy = %+v, want %+v", f.Energy, want)
 	}
-	if f.EnergyUnmeasured != 2 {
-		t.Errorf("%d jobs have no energy, want the bought one still running and the host-backed one",
-			f.EnergyUnmeasured)
+	if f.EnergyUnmeasured != 4 {
+		t.Errorf("%d jobs have no energy measured, want the two estimated, the one still running and the "+
+			"host-backed one", f.EnergyUnmeasured)
 	}
 
+	const wantText = "estimate: 5.1 kJ (not measured: each bought shape's vCPUs over its duration at an assumed " +
+		"50% CPU, 0.74 to 3.50 W per vCPU, Cloud Carbon Footprint's AWS averages) over 2 jobs; rapl: 1.0 J active, " +
+		"0.5 J idle (package RAPL, a model rather than a meter) over 1 jobs; not measured for 4 jobs, " +
+		"2 of them estimated"
 	var out bytes.Buffer
 	renderJobStats(&out, report)
-	if want := "estimate: 5.1 kJ (not measured: each bought shape's vCPUs over its duration at an assumed 50% " +
-		"CPU, 0.74 to 3.50 W per vCPU, Cloud Carbon Footprint's AWS averages) over 2 jobs; rapl: 1.0 J active, " +
-		"0.5 J idle (package RAPL, a model rather than a meter) over 1 jobs; not measured for 2 jobs"; !strings.Contains(out.String(), want) {
-		t.Errorf("the report does not say %q:\n%s", want, out.String())
+	if !strings.Contains(out.String(), wantText) {
+		t.Errorf("the report does not say %q:\n%s", wantText, out.String())
 	}
 
-	figures := statsFiguresJSONOf(&f)
-	estimate := figures.Energy[0]
-	if estimate.Source != cloudenergy.Source || estimate.ActiveJoules != 5088 || estimate.IdleJoules != nil ||
-		estimate.IdleIncluded == nil || !*estimate.IdleIncluded || estimate.Jobs != 2 {
-		t.Errorf("the estimate in JSON = %+v, want 5,088 J over 2 jobs with idle inside it and no idle figure",
-			estimate)
+	out.Reset()
+	if err := renderJobStatsPage(&out, report); err != nil {
+		t.Fatalf("renderJobStatsPage: %v", err)
+	}
+	if !strings.Contains(out.String(), html.EscapeString(wantText)) {
+		t.Errorf("the page does not say %q:\n%s", wantText, out.String())
+	}
+
+	out.Reset()
+	if err := renderJobStatsJSON(&out, report); err != nil {
+		t.Fatalf("renderJobStatsJSON: %v", err)
+	}
+	var decoded struct {
+		Groups []struct {
+			Current struct {
+				Energy           []statsEnergyJSON `json:"energy"`
+				EnergyUnmeasured int               `json:"energy_not_measured"`
+			} `json:"current"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out.String())
+	}
+	cur := decoded.Groups[0].Current
+	if cur.EnergyUnmeasured != 4 || len(cur.Energy) != 2 {
+		t.Fatalf("the JSON = %+v, want two sources and 4 jobs not measured", cur)
+	}
+	if e := cur.Energy[0]; e.Source != cloudenergy.Source || e.ActiveJoules != 5088 || e.IdleJoules != nil ||
+		e.IdleIncluded == nil || !*e.IdleIncluded || e.Jobs != 2 || e.Saturated {
+		t.Errorf("the estimate in JSON = %+v, want 5,088 J over 2 jobs with idle inside it and no idle figure", e)
 	}
 }
 
-// boughtRecord is a job that ran ninety seconds on four vCPUs of a bought shape.
+// A TOTAL HELD AT ITS LARGEST IS A LOWER BOUND, never a wrapped negative: each
+// job's estimate is bounded, and many at the bound still add up past an int64.
+func TestAnEnergyTotalPastAnInt64IsALowerBound(t *testing.T) {
+	t.Parallel()
+
+	e := &statsEnergy{Source: cloudenergy.Source}
+	e.add(math.MaxInt64-10, 0)
+	if e.Saturated {
+		t.Fatal("a total below the largest int64 was marked saturated")
+	}
+	e.add(11, 0)
+	if !e.Saturated || e.ActiveMicrojoules != math.MaxInt64 || e.Jobs != 2 {
+		t.Fatalf("after passing the largest int64: %+v, want it held there, saturated, over 2 jobs", e)
+	}
+
+	f := &statsFigures{Energy: []statsEnergy{*e}, EnergyUnmeasured: 2}
+	if text := energyText(f); !strings.HasPrefix(text, "at least estimate: ") {
+		t.Errorf("energyText = %q, want it worded as a lower bound", text)
+	}
+	if j := statsFiguresJSONOf(f); !j.Energy[0].Saturated {
+		t.Errorf("the JSON = %+v, want saturated", j.Energy[0])
+	}
+}
+
+// boughtRecord is a job that ran ninety seconds to GitHub's result on four vCPUs
+// of a bought shape, its lease archived a minute later.
 func boughtRecord(shape string) alloc.JobRecord {
 	start := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
 
 	return alloc.JobRecord{LeaseID: "l1", Tier: "t", InstanceType: shape, VCPU: 4,
-		StartedAt: start.Format(time.RFC3339Nano), FinishedAt: start.Add(90 * time.Second).Format(time.RFC3339Nano)}
+		StartedAt: start.Format(time.RFC3339Nano), ResultAt: start.Add(90 * time.Second).Format(time.RFC3339Nano),
+		FinishedAt: start.Add(150 * time.Second).Format(time.RFC3339Nano)}
 }
 
 // raplUsage is a host's report that measured the job's energy.
@@ -76,35 +132,50 @@ var raplUsage = &alloc.RecordedUsage{Node: "n1", JobUsage: alloc.JobUsage{
 	EnergySource: alloc.EnergyRAPL, EnergyActiveMicrojoules: 7_000_000,
 }}
 
-// `billet jobs show`, ITS JSON AND ITS PAGE ESTIMATE THE SAME JOBS, word the
-// estimate as one, and estimate nothing a host measured or that bought nothing.
-// Four vCPUs for ninety seconds at 2.12 W each is 763.2 J.
+// noEnergyUsage is a host's report that named energy unmeasured.
+var noEnergyUsage = &alloc.RecordedUsage{Node: "n1", JobUsage: alloc.JobUsage{
+	Source: alloc.UsageSourceHost, Samples: 1, IntervalMillis: 1000, Unmeasured: []string{alloc.UsageEnergy},
+}}
+
+// `billet jobs show`, ITS JSON AND ITS PAGE ESTIMATE THE SAME JOBS AS THE STATS
+// DO, over the job's own duration to GitHub's result, word the estimate as one,
+// and estimate nothing a host measured or that bought nothing. Four vCPUs for
+// ninety seconds at 2.12 W each is 763.2 J.
 func TestJobsShowEstimatesOnlyABoughtShapeNoHostMeasured(t *testing.T) {
 	t.Parallel()
 
 	const estimated = "763.2 J, estimated, not measured: 4 vCPU for 1m30s at an assumed 50% CPU"
+	with := func(change func(*alloc.JobRecord)) alloc.JobRecord {
+		r := boughtRecord("c7i.xlarge")
+		change(&r)
+		return r
+	}
 	for _, tc := range []struct {
 		name     string
 		rec      alloc.JobRecord
 		measured *alloc.RecordedUsage
 		want     bool
+		// line is the label the estimate is on in the text report.
+		line string
 	}{
-		{"bought, no report", boughtRecord("c7i.xlarge"), nil, true},
-		{"host-backed, no report", boughtRecord(""), nil, false},
-		{"bought, energy measured", boughtRecord("c7i.xlarge"), raplUsage, false},
-		{"bought, still running", func() alloc.JobRecord {
-			r := boughtRecord("c7i.xlarge")
-			r.FinishedAt = ""
-			return r
-		}(), nil, false},
+		{"bought, no report", boughtRecord("c7i.xlarge"), nil, true, "energy     "},
+		{"bought, a report that measured no energy", boughtRecord("c7i.xlarge"), noEnergyUsage, true, "estimated  "},
+		{"bought, a result and the lease not yet archived", with(func(r *alloc.JobRecord) { r.FinishedAt = "" }),
+			nil, true, "energy     "},
+		{"host-backed, no report", boughtRecord(""), nil, false, ""},
+		{"bought, energy measured", boughtRecord("c7i.xlarge"), raplUsage, false, ""},
+		{"bought, no result yet", with(func(r *alloc.JobRecord) { r.ResultAt = "" }), nil, false, ""},
 	} {
 		var text bytes.Buffer
 		renderJob(&text, tc.rec, tc.measured, nil)
 		if got := strings.Contains(text.String(), estimated); got != tc.want {
 			t.Errorf("%s: jobs show estimates %v, want %v:\n%s", tc.name, got, tc.want, text.String())
 		}
-		if tc.want && !strings.Contains(text.String(), "energy     "+estimated) {
-			t.Errorf("%s: the estimate is not on the energy line:\n%s", tc.name, text.String())
+		if tc.want && !strings.Contains(text.String(), tc.line+estimated) {
+			t.Errorf("%s: the estimate is not on its line %q:\n%s", tc.name, tc.line, text.String())
+		}
+		if tc.measured == noEnergyUsage && !strings.Contains(text.String(), "energy     not measured") {
+			t.Errorf("%s: the report's own energy no longer says not measured:\n%s", tc.name, text.String())
 		}
 
 		var js bytes.Buffer
@@ -113,6 +184,9 @@ func TestJobsShowEstimatesOnlyABoughtShapeNoHostMeasured(t *testing.T) {
 		}
 		var decoded struct {
 			Estimate *energyEstimateJSON `json:"energy_estimate"`
+			Usage    *struct {
+				Measured map[string]bool `json:"measured"`
+			} `json:"usage"`
 		}
 		if err := json.Unmarshal(js.Bytes(), &decoded); err != nil {
 			t.Fatalf("%s: not JSON: %v", tc.name, err)
@@ -125,32 +199,31 @@ func TestJobsShowEstimatesOnlyABoughtShapeNoHostMeasured(t *testing.T) {
 			!strings.HasPrefix(e.Method, "estimated, not measured")):
 			t.Errorf("%s: energy_estimate = %+v, want 763.2 J for 4 vCPU over 90 s at 50%%", tc.name, e)
 		}
-
-		page := jobPageOf(tc.rec, tc.measured, jobSteps{none: "x"}, nil, "no series")
-		var onPage bool
-		for _, g := range page.Usage.Groups {
-			onPage = onPage || strings.Contains(g.Value, estimated)
+		if tc.measured == noEnergyUsage && (decoded.Usage == nil || decoded.Usage.Measured[alloc.UsageEnergy]) {
+			t.Errorf("%s: the usage in JSON says energy was measured: %+v", tc.name, decoded.Usage)
 		}
-		if onPage != tc.want {
-			t.Errorf("%s: the page estimates %v, want %v: %+v", tc.name, onPage, tc.want, page.Usage.Groups)
+
+		var page bytes.Buffer
+		if err := renderJobPage(&page, jobPageOf(tc.rec, tc.measured, jobSteps{none: "x"}, nil, "no series")); err != nil {
+			t.Fatalf("%s: renderJobPage: %v", tc.name, err)
+		}
+		if got := strings.Contains(page.String(), html.EscapeString(estimated)); got != tc.want {
+			t.Errorf("%s: the page estimates %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
 
-// A REPORT THAT NAMED ENERGY UNMEASURED ON A BOUGHT SHAPE is estimated too, on a
-// line of its own beside the report's own "not measured", so neither hides the
-// other.
-func TestJobsShowEstimatesBesideAReportThatMeasuredNoEnergy(t *testing.T) {
+// AN ESTIMATE TOO SMALL FOR joules' ONE DECIMAL keeps its figures, so it never
+// reads as nothing.
+func TestASmallEstimateNeverReadsAsZero(t *testing.T) {
 	t.Parallel()
 
-	noEnergy := &alloc.RecordedUsage{Node: "n1", JobUsage: alloc.JobUsage{
-		Source: alloc.UsageSourceHost, Samples: 1, IntervalMillis: 1000, Unmeasured: []string{alloc.UsageEnergy},
-	}}
-	var out bytes.Buffer
-	renderJob(&out, boughtRecord("c7i.xlarge"), noEnergy, nil)
-	for _, want := range []string{"energy     not measured", "estimated  763.2 J, estimated, not measured"} {
-		if !strings.Contains(out.String(), want) {
-			t.Errorf("jobs show does not say %q:\n%s", want, out.String())
+	for _, tc := range []struct {
+		microjoules int64
+		want        string
+	}{{2120, "0.00212 J"}, {49_999, "0.05 J"}, {50_000, "0.1 J"}, {763_200_000, "763.2 J"}} {
+		if got := estimateJoules(tc.microjoules); got != tc.want {
+			t.Errorf("estimateJoules(%d) = %q, want %q", tc.microjoules, got, tc.want)
 		}
 	}
 }

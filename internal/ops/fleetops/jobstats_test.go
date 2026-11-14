@@ -415,8 +415,9 @@ func TestJobStatsNeverPrintsAFigureItDidNotMeasureAsZero(t *testing.T) {
 	}; len(m.Energy) != 3 || m.Energy[0] != want[0] || m.Energy[1] != want[1] || m.Energy[2] != want[2] {
 		t.Errorf("energy = %+v, want %+v", m.Energy, want)
 	}
-	if m.EnergyUnmeasured != 1 {
-		t.Errorf("%d jobs have no energy measured, want the host-backed one naming it", m.EnergyUnmeasured)
+	if m.EnergyUnmeasured != 2 {
+		t.Errorf("%d jobs have no energy measured, want the one naming it and the bought one, estimated or not",
+			m.EnergyUnmeasured)
 	}
 	if m.CostJobs != 1 || m.CostUSD != 2 {
 		t.Errorf("cost = $%v over %d jobs, want $2 over the one bought at $2 an hour for an hour", m.CostUSD, m.CostJobs)
@@ -435,7 +436,7 @@ func TestJobStatsNeverPrintsAFigureItDidNotMeasureAsZero(t *testing.T) {
 			"50% CPU, 0.74 to 3.50 W per vCPU, Cloud Carbon Footprint's AWS averages) over 1 jobs; " +
 			"meter: 5.0 J active, 2.0 J idle (the whole host at the wall) over 1 jobs; rapl: 3.0 J active, " +
 			"1.0 J idle (package RAPL, a model rather than a meter) over 2 jobs; " +
-			"not measured for 1 jobs",
+			"not measured for 2 jobs, 1 of them estimated",
 		"cloud cost $2.00 over 1 of 5 jobs", "vCPU-hours 20.0 over 5 of 5 jobs", "queue wait p99 30s (5 jobs)",
 		"energy     not measured", "cloud cost no bought shape", "duration   not recorded for any of 1 jobs",
 		"queue wait not recorded for any of 1 jobs", "vCPU-hours not recorded for any of 1 jobs",

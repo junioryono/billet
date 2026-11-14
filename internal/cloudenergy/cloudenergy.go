@@ -55,7 +55,8 @@ type Estimate struct {
 
 // Of estimates a job of vcpu vCPUs that ran for d at DefaultUtilization. It
 // answers false for a shape or a duration that is not recorded or not
-// plausible, which is a job with no estimate, never one of zero.
+// plausible, and for one too short to come to a microjoule, which is a job with
+// no estimate, never one of zero.
 func Of(vcpu int64, d time.Duration) (Estimate, bool) {
 	if vcpu <= 0 || vcpu > maxVCPU || d <= 0 || d > maxDuration {
 		return Estimate{}, false
@@ -63,6 +64,9 @@ func Of(vcpu int64, d time.Duration) (Estimate, bool) {
 
 	watts := float64(vcpu) * WattsPerVCPU(DefaultUtilization)
 	microjoules := math.Round(watts * d.Seconds() * 1e6)
+	if microjoules < 1 {
+		return Estimate{}, false
+	}
 
 	return Estimate{Microjoules: int64(microjoules), VCPU: vcpu, Duration: d,
 		Utilization: DefaultUtilization}, true
@@ -76,7 +80,13 @@ func WattsPerVCPU(u float64) float64 {
 
 // Method says how an estimate was made, in the words every report uses for it.
 func (e Estimate) Method() string {
+	// A duration under a second keeps its milliseconds, so it never reads as 0s.
+	d := e.Duration.Round(time.Second)
+	if e.Duration < time.Second {
+		d = e.Duration.Round(time.Millisecond)
+	}
+
 	return fmt.Sprintf("estimated, not measured: %d vCPU for %s at an assumed %.0f%% CPU, %.2f to %.2f W "+
 		"per vCPU (Cloud Carbon Footprint's AWS averages; memory, storage and the data centre left out)",
-		e.VCPU, e.Duration.Round(time.Second), e.Utilization*100, MinWattsPerVCPU, MaxWattsPerVCPU)
+		e.VCPU, d, e.Utilization*100, MinWattsPerVCPU, MaxWattsPerVCPU)
 }

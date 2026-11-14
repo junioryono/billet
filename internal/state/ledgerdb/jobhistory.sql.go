@@ -1022,7 +1022,8 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        detail_retired_at, github_run_id, image_cache, cache_generation, actions_cache,
        sticky_cache, git_cache, bazel_cache, go_cache, npm_cache, launched_at, registered_at,
        runner_id, custody_at, teardown_at, quarantined_at, launch_incarnation,
-       holder_incarnation, head_sha, head_branch, run_attempt, rerun_decision, rerun_decided_at, rerun_attempt
+       holder_incarnation, head_sha, head_branch, run_attempt, rerun_decision, rerun_decided_at, rerun_attempt,
+       result_at
   FROM job_history WHERE lease_id = $1
 `
 
@@ -1080,6 +1081,7 @@ type ReadJobRow struct {
 	RerunDecision            string
 	RerunDecidedAt           string
 	RerunAttempt             int64
+	ResultAt                 string
 }
 
 // One job's whole history row, for `billet jobs show`.
@@ -1144,6 +1146,7 @@ func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, erro
 		&i.RerunDecision,
 		&i.RerunDecidedAt,
 		&i.RerunAttempt,
+		&i.ResultAt,
 	)
 	return i, err
 }

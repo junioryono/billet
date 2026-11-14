@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -204,11 +205,29 @@ type statsFigures struct {
 }
 
 // statsEnergy is what one source measured for a group's jobs.
+//
+// Saturated says a total reached the largest int64 and was held there rather
+// than wrapping, so each figure is a lower bound and is worded as one.
 type statsEnergy struct {
 	Source            string
 	ActiveMicrojoules int64
 	IdleMicrojoules   int64
 	Jobs              int
+	Saturated         bool
+}
+
+// add counts one more job's energy, holding a total at the largest int64.
+func (e *statsEnergy) add(active, idle int64) {
+	sum := func(total, v int64) int64 {
+		if v > 0 && total > math.MaxInt64-v {
+			e.Saturated = true
+			return math.MaxInt64
+		}
+		return total + v
+	}
+	e.ActiveMicrojoules = sum(e.ActiveMicrojoules, active)
+	e.IdleMicrojoules = sum(e.IdleMicrojoules, idle)
+	e.Jobs++
 }
 
 // outcomes is the jobs with an outcome, which the rates are over.
@@ -367,13 +386,13 @@ func figuresOf(facts []alloc.JobFact) statsFigures {
 		if f.Usage != nil && f.Usage.Measured(alloc.UsageEnergy) {
 			source, active, idle = f.Usage.EnergySource, f.Usage.EnergyActiveMicrojoules, f.Usage.EnergyIdleMicrojoules
 		} else {
-			// AN ESTIMATE IS ITS OWN SOURCE, so it is totalled beside what hosts
-			// measured and never into it.
+			// AN ESTIMATE IS NOT A MEASUREMENT: the job is counted as not
+			// measured whether or not it is estimated, and an estimate is its
+			// own source, totalled beside what hosts measured and never into it.
+			out.EnergyUnmeasured++
 			d, ran := f.Duration()
 			est, ok := energyEstimate(f.InstanceType, f.Usage, f.VCPU, d, ran)
 			if !ok {
-				out.EnergyUnmeasured++
-
 				continue
 			}
 			source, active = cloudenergy.Source, est.Microjoules
@@ -383,9 +402,7 @@ func figuresOf(facts []alloc.JobFact) statsFigures {
 			e = &statsEnergy{Source: source}
 			energy[source] = e
 		}
-		e.ActiveMicrojoules += active
-		e.IdleMicrojoules += idle
-		e.Jobs++
+		e.add(active, idle)
 	}
 
 	out.Duration = alloc.SummarizeDurations(durations)
@@ -654,12 +671,24 @@ func energyText(f *statsFigures) string {
 	}
 
 	parts := make([]string, 0, len(f.Energy))
+	estimated := 0
 	for i := range f.Energy {
 		e := &f.Energy[i]
-		parts = append(parts, fmt.Sprintf("%s over %d jobs", energyOfSource(e), e.Jobs))
+		part := fmt.Sprintf("%s over %d jobs", energyOfSource(e), e.Jobs)
+		// A TOTAL HELD AT ITS LARGEST IS A LOWER BOUND, and says so.
+		if e.Saturated {
+			part = "at least " + part
+		}
+		parts = append(parts, part)
+		if e.Source == cloudenergy.Source {
+			estimated = e.Jobs
+		}
 	}
 	text := strings.Join(parts, "; ")
-	if f.EnergyUnmeasured > 0 {
+	switch {
+	case f.EnergyUnmeasured > 0 && estimated > 0:
+		text += fmt.Sprintf("; not measured for %d jobs, %d of them estimated", f.EnergyUnmeasured, estimated)
+	case f.EnergyUnmeasured > 0:
 		text += fmt.Sprintf("; not measured for %d jobs", f.EnergyUnmeasured)
 	}
 
@@ -906,6 +935,9 @@ type statsEnergyJSON struct {
 	IdleJoules   *float64 `json:"idle_joules"`
 	IdleIncluded *bool    `json:"idle_included"`
 	Jobs         int      `json:"jobs"`
+	// Saturated says a total reached the largest int64 and was held there, so
+	// each figure is a lower bound.
+	Saturated bool `json:"saturated,omitempty"`
 }
 
 // idleIncluded says whether a source's one figure has the machine's idle draw in it,
@@ -980,7 +1012,7 @@ func statsFiguresJSONOf(f *statsFigures) statsFiguresJSON {
 		out.Energy = append(out.Energy, statsEnergyJSON{Source: e.Source,
 			ActiveJoules: float64(e.ActiveMicrojoules) / 1e6, IdleJoules: idleJoules(e),
 			IdleIncluded: idleIncluded(e.Source),
-			Jobs:         e.Jobs})
+			Jobs:         e.Jobs, Saturated: e.Saturated})
 	}
 
 	return out

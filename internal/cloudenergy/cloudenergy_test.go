@@ -55,6 +55,26 @@ func TestNoEstimateFromWhatWasNotRecorded(t *testing.T) {
 	if !ok || e.Microjoules <= 0 {
 		t.Errorf("Of at the bounds = %+v, %v; want a positive estimate", e, ok)
 	}
+
+	// A duration too short to come to a microjoule has no estimate, and the
+	// shortest that does has one, never zero.
+	if e, ok := Of(1, time.Nanosecond); ok {
+		t.Errorf("Of(1, 1ns) = %+v, want no estimate of what rounds to nothing", e)
+	}
+	if e, ok := Of(1, time.Millisecond); !ok || e.Microjoules != 2120 {
+		t.Errorf("Of(1, 1ms) = %+v, %v; want 2,120 µJ", e, ok)
+	}
+}
+
+// A DURATION UNDER A SECOND KEEPS ITS MILLISECONDS in the method, so it never
+// reads as 0s.
+func TestTheMethodNeverRoundsADurationToNothing(t *testing.T) {
+	t.Parallel()
+
+	e, _ := Of(1, 1500*time.Microsecond)
+	if got := e.Method(); !strings.Contains(got, "1 vCPU for 2ms") {
+		t.Errorf("Method() = %q, want the duration in milliseconds", got)
+	}
 }
 
 // THE METHOD NEVER READS AS A MEASUREMENT: it says so first, then what the model
