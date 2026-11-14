@@ -158,9 +158,11 @@ func TestADestinationThatHangsIsBoundedAndHoldsUpNothingElse(t *testing.T) {
 		}
 	})
 	t.Cleanup(func() { close(release) })
-	// LONG ENOUGH TO REACH THE HANDLER on a loaded runner: at 100 ms a CI run's try ran out
-	// before its request arrived, and the wait for it to arrive never ended (2026-11-14).
-	hung.timeout = time.Second
+	// LONG ENOUGH TO REACH THE HANDLER, AND TO DELIVER THE OTHER ONE INSIDE IT, on a loaded
+	// runner: at 100 ms a CI run's try ran out before its request arrived, and the wait for
+	// it to arrive never ended (2026-11-14). Short of the transport's own bounds (8 s for a
+	// response's headers, 10 s for the whole request), which the ceiling below tells apart.
+	hung.timeout = 2 * time.Second
 
 	fine, _ := destination(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
@@ -171,14 +173,34 @@ func TestADestinationThatHangsIsBoundedAndHoldsUpNothingElse(t *testing.T) {
 	select {
 	case <-entered:
 	case err := <-result:
-		t.Fatalf("the hung try ended (%v) before its request reached the destination", err)
+		// BOTH MAY BE READY, when this goroutine was slow to get here.
+		select {
+		case <-entered:
+			t.Fatalf("the hung try ended (%v) before the other destination could be sent beside it", err)
+		default:
+			t.Fatalf("the hung try ended (%v) before its request reached the destination", err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the hung try's request never reached the destination")
 	}
 
-	// THE OTHER ONE, WHILE THIS ONE IS DEMONSTRABLY INSIDE ITS REQUEST.
-	if err := fine.Send(t.Context(), []byte(`{}`)); err != nil {
-		t.Errorf("another destination, while one hung: %v", err)
+	// THE OTHER ONE, WHILE THIS ONE IS DEMONSTRABLY INSIDE ITS REQUEST: delivered within a
+	// bound of its own, and before the hung try has ended, so one that waited for the hung
+	// try fails here rather than passing once it ran out.
+	delivered := make(chan error, 1)
+	go func() { delivered <- fine.Send(t.Context(), []byte(`{}`)) }()
+	select {
+	case err := <-delivered:
+		if err != nil {
+			t.Errorf("another destination, while one hung: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("another destination was held up by the one that hung")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("the hung try had ended (%v) by the time the other destination was delivered", err)
+	default:
 	}
 
 	select {
@@ -190,12 +212,12 @@ func TestADestinationThatHangsIsBoundedAndHoldsUpNothingElse(t *testing.T) {
 			t.Errorf("a hung try = %v, want it to say so", err)
 		}
 		assertNoSecret(t, "the error", err.Error(), address)
-	case <-time.After(5 * time.Second):
+	case <-time.After(7 * time.Second):
 		t.Fatal("a destination that hangs held its request past its bound")
 	}
 
 	// ITS OWN BOUND ENDED IT, not the transport's longer ones behind it.
-	if took := time.Since(begun); took < hung.timeout || took > 3*time.Second {
+	if took := time.Since(begun); took < hung.timeout || took > 6*time.Second {
 		t.Errorf("the try ended after %s, want its bound of %s", took, hung.timeout)
 	}
 }
