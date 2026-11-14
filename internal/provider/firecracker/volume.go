@@ -84,6 +84,7 @@ func (p *Provider) DetachVolume(
 		return err
 	}
 
+	named := device
 	if device != "" && !p.slotHolds(j.volumePath(slot), device) {
 		device = ""
 	}
@@ -92,12 +93,20 @@ func (p *Provider) DetachVolume(
 		return fmt.Errorf("firecracker: write cache slot %d of %s back before detaching it: %w",
 			slot, instanceID, lost)
 	}
+	// A SLOT THAT NO LONGER HOLDS THE DEVICE CAN BE ONE AN EARLIER DETACH EMPTIED: it
+	// puts the placeholder in before its PATCH, and a PATCH that failed kept the loss it
+	// had heard, which nothing writes back to tell again. Kept for this device and this
+	// disk, it is told here.
+	if lost == nil && device == "" && named != "" {
+		seq, known := p.diskSeqOf(named)
+		lost = p.takeLoss(named, seq, known)
+	}
 
 	// A DETACH THAT FAILED SAYS ONLY THAT IT FAILED: ErrWritesLost is the promise that
 	// the volume is detached, so lost writes heard before a failure are kept for the
 	// next detach of the device to be told (flushBefore).
 	if err := p.replaceVolumePath(j, res, slot, ""); err != nil {
-		p.keepLoss(device, lost)
+		p.keepLoss(named, "", lost)
 
 		return err
 	}
@@ -105,7 +114,7 @@ func (p *Provider) DetachVolume(
 	id := provider.VolumeSlotID(slot)
 	if err := p.apiAs(j.socket(), res.UID).withTimeout(callerTime(ctx)).patch(ctx, "/drives/"+id,
 		map[string]string{"drive_id": id, "path_on_host": "/" + id}); err != nil {
-		p.keepLoss(device, lost)
+		p.keepLoss(named, "", lost)
 
 		return fmt.Errorf("firecracker: detach cache slot %d from %s: %w", slot, instanceID, err)
 	}
@@ -154,12 +163,11 @@ func (p *Provider) flushBefore(ctx context.Context, device string) error {
 
 	p.flushMu.Lock()
 	wb, running := p.flushing[device]
-	if loss, kept := p.unreported[device]; kept && !running {
-		delete(p.unreported, device)
-		if !known || loss.seq == "" || loss.seq == seq {
+	if !running {
+		if lost := p.takeLossLocked(device, seq, known); lost != nil {
 			p.flushMu.Unlock()
 
-			return loss.err
+			return lost
 		}
 	}
 	if !running {
@@ -193,6 +201,12 @@ func (p *Provider) flushBefore(ctx context.Context, device string) error {
 
 	select {
 	case <-wb.done:
+		// A WRITE-BACK OF ANOTHER DISK IS NO ANSWER: one this caller joined may have
+		// been of the disk that had the name before, whose loss is not this one's and
+		// whose success says nothing of this one's writes.
+		if wb.seq != "" && known && wb.seq != seq {
+			return fmt.Errorf("firecracker: the write-back in flight for %s was of another disk", device)
+		}
 		if wb.lost != nil {
 			p.flushMu.Lock()
 			if loss, kept := p.unreported[device]; kept && errors.Is(loss.err, wb.lost) {
@@ -214,12 +228,15 @@ type writesLoss struct {
 	err error
 }
 
-// keepLoss keeps lost, if anything was lost, for the next detach of device to be told.
-func (p *Provider) keepLoss(device string, lost error) {
+// keepLoss keeps lost, if anything was lost, for the next detach of device to be told,
+// as lost by the disk seq names, or by the disk the name is now when seq is empty.
+func (p *Provider) keepLoss(device, seq string, lost error) {
 	if lost == nil || device == "" {
 		return
 	}
-	seq, _ := p.diskSeqOf(device)
+	if seq == "" {
+		seq, _ = p.diskSeqOf(device)
+	}
 
 	p.flushMu.Lock()
 	defer p.flushMu.Unlock()
@@ -228,6 +245,30 @@ func (p *Provider) keepLoss(device string, lost error) {
 		p.unreported = map[string]writesLoss{}
 	}
 	p.unreported[device] = writesLoss{seq: seq, err: lost}
+}
+
+// takeLoss is the loss kept for device, if it is the disk seq names (or either's
+// number is unknown), taken out so it is told once.
+func (p *Provider) takeLoss(device, seq string, known bool) error {
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+
+	return p.takeLossLocked(device, seq, known)
+}
+
+// takeLossLocked is takeLoss under flushMu. A loss kept for another disk that took
+// the name is forgotten.
+func (p *Provider) takeLossLocked(device, seq string, known bool) error {
+	loss, kept := p.unreported[device]
+	if !kept {
+		return nil
+	}
+	delete(p.unreported, device)
+	if known && loss.seq != "" && loss.seq != seq {
+		return nil
+	}
+
+	return loss.err
 }
 
 func (p *Provider) diskSeqOf(device string) (string, bool) {
@@ -253,11 +294,13 @@ func readDiskSeq(device string) (string, bool) {
 
 // writeBack is one device's write-back in flight (flushBefore): opened when its open
 // has ended, done when it has, waiting the callers still waiting for its open, and
-// lost, written before done closes, what its failed fsync reported.
+// seq and lost, written before done closes, the disk sequence number of the disk it
+// held open and what its failed fsync reported.
 type writeBack struct {
 	opened  chan struct{}
 	done    chan struct{}
 	waiting int
+	seq     string
 	lost    error
 }
 
@@ -278,13 +321,16 @@ func (p *Provider) writeBack(device string, wb *writeBack) {
 	case !wanted:
 		_ = disk.Close()
 	default:
+		// THE DISK IS NAMED WHILE ITS DESCRIPTOR IS HELD, so nothing can unmap it and give
+		// the name to another first.
+		wb.seq, _ = p.diskSeqOf(device)
 		syncErr := disk.Sync()
 		closeErr := disk.Close()
 		if syncErr != nil {
 			wb.lost = fmt.Errorf("%w: %s: %w", provider.ErrWritesLost, device, syncErr)
 			// KEPT BEFORE DONE CLOSES, so no caller can miss it: one waiting is told and
 			// takes it back out, and if none is, the next detach is told (flushBefore).
-			p.keepLoss(device, wb.lost)
+			p.keepLoss(device, wb.seq, wb.lost)
 			p.log.Warn("a cache volume's write-back failed before its detach; what it lost is discarded, "+
 				"never published", "device", device, "error", syncErr)
 		} else if closeErr != nil {

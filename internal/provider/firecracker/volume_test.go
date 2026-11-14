@@ -531,6 +531,60 @@ func TestLostWritesNobodyWaitedForAreToldToTheNextCaller(t *testing.T) {
 	}
 }
 
+// A WRITE-BACK OF THE DISK THAT HAD THE NAME BEFORE IS NO ANSWER FOR THE ONE THAT HAS
+// IT NOW: a caller that joins one in flight after the name passed to another disk is
+// told neither its loss nor its success, and the loss stays the old disk's, never
+// told to the new one.
+func TestAWriteBackOfAnotherDiskIsNoAnswer(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p := &Provider{log: slog.New(slog.DiscardHandler)}
+		seq := "41"
+		p.diskSeq = func(string) (string, bool) { return seq, true }
+		release := make(chan struct{})
+		var once sync.Once
+		releaseAll := func() { once.Do(func() { close(release) }) }
+		defer releaseAll()
+		opens := 0
+		p.openDisk = func(string) (diskHandle, error) {
+			opens++
+			first := opens == 1
+
+			return syncedDisk{sync: func() error {
+				if !first {
+					return nil
+				}
+				<-release
+
+				return errors.New("input/output error")
+			}}, nil
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := p.flushBefore(ctx, "/dev/rbd4"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a caller whose time ran out answered %v", err)
+		}
+
+		seq = "57"
+		joined := make(chan error, 1)
+		go func() { joined <- p.flushBefore(t.Context(), "/dev/rbd4") }()
+		synctest.Wait()
+		releaseAll()
+		if err := <-joined; err == nil || errors.Is(err, provider.ErrWritesLost) {
+			t.Fatalf("a caller for the disk that took the name was told %v, want neither success nor the "+
+				"other disk's loss", err)
+		}
+		synctest.Wait()
+		// THE LOSS IS THE OLD DISK'S, named while its descriptor was held, so the new
+		// disk's next caller writes back its own.
+		if err := p.flushBefore(t.Context(), "/dev/rbd4"); err != nil {
+			t.Errorf("the new disk's next caller was told %v, want its own write-back", err)
+		}
+	})
+}
+
 // A DETACH THAT FAILED IS NOT ONE THAT LOST WRITES, AND KEEPS THEM FOR THE NEXT.
 // ErrWritesLost promises the volume is detached, so a PATCH that failed answers only
 // its failure, and the next detach, whose PATCH goes through, is told what was lost.
@@ -560,11 +614,17 @@ func TestADetachThatFailedKeepsItsLostWritesForTheNext(t *testing.T) {
 
 		return syncedDisk{sync: func() error { return errors.New("input/output error") }}, nil
 	}
+	h.p.diskSeq = func(string) (string, bool) { return "7", true }
+	// THE PLACEHOLDER GOES IN BEFORE THE PATCH, so once the first detach has run the
+	// slot no longer holds the device, as a real one does not.
+	placed := false
+	h.p.slotHolds = func(string, string) bool { return !placed }
 	vmm.mu.Lock()
 	vmm.failDrivePatches = 1
 	vmm.mu.Unlock()
 
 	err = h.p.DetachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1")
+	placed = true
 	if err == nil || errors.Is(err, provider.ErrWritesLost) {
 		t.Fatalf("a detach whose PATCH failed answered %v, want its failure and not lost writes", err)
 	}

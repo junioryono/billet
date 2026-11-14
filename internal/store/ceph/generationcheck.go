@@ -1,7 +1,6 @@
 package ceph
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -355,11 +355,12 @@ func checkDamage(ctx context.Context, device string) (bool, error) {
 // reading block 545 (Input/output error)", then "The journal superblock is
 // corrupt", and exited 12, as a really corrupt journal superblock does
 // (e2fsckUncorrected). Read so, a healthy newest generation would be replaced by an
-// older one. "Error reading" begins every message e2fsprogs gives for a read that
-// failed, and a check that printed it at the start of a line is could-not-tell; in
-// the middle of one it can be a file's name in a report of real damage. The check
-// runs in the C locale, since e2fsck translates its messages and the phrase is the
-// English one.
+// older one. A check that printed one of e2fsprogs' messages for a read that failed
+// is could-not-tell, wherever in a line it appears (pass 1B prints a block number and
+// then, with no newline between, the read error it met); the messages name a block or
+// the extent tree, which a file's name in a report of real damage does not. The check
+// runs in the C locale, since e2fsck translates its messages and these are the
+// English ones.
 func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
 	watch := readFailureWatcher()
 	cmd := exec.CommandContext(ctx, e2fsck, "-f", "-n", device)
@@ -381,36 +382,43 @@ func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
 	return false, fmt.Errorf("check the filesystem on %s: %w", device, err)
 }
 
-// readFailureWatcher watches e2fsck's output for a line that begins with a read
-// that failed.
-func readFailureWatcher() *phraseWatcher {
-	return &phraseWatcher{phrase: []byte("\nError reading"), tail: []byte("\n")}
+// readFailure is e2fsprogs 1.47.2's words for a read that failed: "Error reading
+// block 545 (Input/output error)" measured 2026-11-13, and from its source the
+// extended attribute block's (problem.c PR_1_READ_EA_BLOCK), the extent tree's
+// (PR_1_READ_EXTENT) and a short read's (unix_io).
+var readFailure = regexp.MustCompile(`Error reading (block|extended attribute block) [0-9]+|` +
+	`Error while reading over extent tree|resulted in short read`)
+
+// readFailureWatcher watches e2fsck's output for a read that failed.
+func readFailureWatcher() *patternWatcher {
+	return &patternWatcher{pattern: readFailure, keep: 128}
 }
 
-// phraseWatcher is a writer that remembers whether phrase passed through it,
-// keeping no more of what it was written than the phrase's length, so a phrase
-// split across two writes is still seen; tail starts as what is taken to come
-// before the first write ("\n", for a phrase that must begin a line). One goroutine writes to it at a time:
-// os/exec copies stdout and stderr through one writer when they are the same.
-type phraseWatcher struct {
-	phrase []byte
-	tail   []byte
-	seen   bool
+// patternWatcher is a writer that remembers whether pattern matched what passed
+// through it, keeping no more of what it was written than keep bytes, so a match
+// split across writes is still seen as long as it is shorter than keep. One
+// goroutine writes to it at a time: os/exec copies stdout and stderr through one
+// writer when they are the same.
+type patternWatcher struct {
+	pattern *regexp.Regexp
+	keep    int
+	tail    []byte
+	seen    bool
 }
 
-func (w *phraseWatcher) Write(p []byte) (int, error) {
+func (w *patternWatcher) Write(p []byte) (int, error) {
 	if w.seen {
 		return len(p), nil
 	}
 	joined := make([]byte, 0, len(w.tail)+len(p))
 	joined = append(append(joined, w.tail...), p...)
-	if bytes.Contains(joined, w.phrase) {
+	if w.pattern.Match(joined) {
 		w.seen = true
 		w.tail = nil
 
 		return len(p), nil
 	}
-	keep := min(len(joined), len(w.phrase)-1)
+	keep := min(len(joined), w.keep)
 	w.tail = append(w.tail[:0:0], joined[len(joined)-keep:]...)
 
 	return len(p), nil

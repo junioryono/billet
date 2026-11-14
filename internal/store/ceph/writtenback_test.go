@@ -72,36 +72,39 @@ func TestAFailedWriteBackIsLostWrites(t *testing.T) {
 }
 
 // THE DAMAGE CHECK'S WATCHER SEES A FAILED READ HOWEVER e2fsck'S OUTPUT ARRIVES,
-// split anywhere across writes, and keeps no more of it than the phrase's length.
-func TestThePhraseWatcherSeesAPhraseSplitAcrossWrites(t *testing.T) {
+// split anywhere across writes, at the start of a line or after pass 1B's block
+// numbers with no newline between, and keeps no more of it than it says; a file
+// named like a failed read, in a report of real damage, is not one.
+func TestTheWatcherSeesAFailedReadSplitAcrossWrites(t *testing.T) {
 	t.Parallel()
 
-	const output = "Pass 1: Checking inodes\nError reading block 2081 (Input/output error) while getting next inode\n"
-	for split := range len(output) {
-		w := readFailureWatcher()
-		for _, part := range []string{output[:split], output[split:]} {
-			if n, err := w.Write([]byte(part)); n != len(part) || err != nil {
-				t.Fatalf("Write(%q) = %d, %v", part, n, err)
+	for _, output := range []string{
+		"Pass 1: Checking inodes\nError reading block 2081 (Input/output error) while getting next inode\n",
+		"Running additional passes to resolve blocks claimed by more than one inode...\n" +
+			"Multiply-claimed block(s) in inode 12: 1033Error reading block 1034 (Input/output error).  " +
+			"Ignore error? no\n",
+		"Error reading extended attribute block 33280 for inode 12.  Clear? no\n",
+	} {
+		for split := range len(output) {
+			w := readFailureWatcher()
+			for _, part := range []string{output[:split], output[split:]} {
+				if n, err := w.Write([]byte(part)); n != len(part) || err != nil {
+					t.Fatalf("Write(%q) = %d, %v", part, n, err)
+				}
+				if len(w.tail) > w.keep {
+					t.Fatalf("the watcher kept %d bytes, more than its %d", len(w.tail), w.keep)
+				}
 			}
-			if len(w.tail) >= len(w.phrase) {
-				t.Fatalf("the watcher kept %d bytes, more than the phrase", len(w.tail))
+			if !w.seen {
+				t.Fatalf("split at %d, the watcher did not see the failed read in %q", split, output)
 			}
-		}
-		if !w.seen {
-			t.Fatalf("split at %d, the watcher did not see the failed read", split)
 		}
 	}
 
-	// THE FIRST LINE COUNTS AS BEGINNING ONE; A NAME IN THE MIDDLE OF A LINE DOES NOT.
-	first := readFailureWatcher()
-	if _, err := first.Write([]byte("Error reading block 545 (Input/output error).  Ignore error? no\n")); err != nil ||
-		!first.seen {
-		t.Errorf("the watcher missed a failed read on the first line: %v", err)
-	}
 	for _, parts := range [][]string{
 		{"Error rea", "ched the end", " of reading\n"},
 		{"Entry 'Error reading' in / (2) has deleted/unused inode 20.  Clear? no\n"},
-		{"Entry 'x\n", "' in /Error reading (12) has an incorrect filetype\n"},
+		{"Inode 12, i_blocks is 8, should be 0.  Fix? no\n", "Block bitmap differences:  -(33904--33919)\n"},
 	} {
 		w := readFailureWatcher()
 		for _, part := range parts {

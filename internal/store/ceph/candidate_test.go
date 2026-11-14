@@ -466,14 +466,6 @@ func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
 			"echo \"Entry 'Error reading' in / (2) has deleted/unused inode 20.  Clear? no\"\nexit 4",
 			true, false,
 		},
-		// ITS OWN LANGUAGE, NOT THE NODE'S: e2fsck translates the message the check
-		// watches for, so it is run in the C locale.
-		{
-			"a failed read in a locale that would translate it",
-			"if [ \"$LC_ALL\" = C ]; then echo 'Error reading block 545 (Input/output error).' >&2; " +
-				"else echo 'Erreur de lecture du bloc 545' >&2; fi\nexit 12",
-			false, true,
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -499,12 +491,32 @@ func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
 		})
 	}
 
-	if damaged, err := checkDamageWith(t.Context(), filepath.Join(t.TempDir(), "absent"), "/dev/rbd9"); damaged || err == nil {
+	if damaged, err := checkDamageWith(t.Context(), filepath.Join(t.TempDir(), "absent"),
+		"/dev/rbd9"); damaged || err == nil {
 		t.Errorf("a missing e2fsck answered %v, %v; want could-not-tell", damaged, err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	if damaged, err := checkDamageWith(ctx, "/bin/sh", "/dev/rbd9"); damaged || err == nil {
 		t.Errorf("a cancelled check answered %v, %v; want could-not-tell", damaged, err)
+	}
+}
+
+// THE CHECK READS e2fsck IN ITS OWN LANGUAGE, NOT THE NODE'S: e2fsck translates the
+// messages the check watches for, so it is run in the C locale whatever the node's
+// is. Not parallel, because it sets the process's locale to one that translates.
+func TestTheDamageCheckRunsInTheCLocale(t *testing.T) {
+	t.Setenv("LC_ALL", "fr_FR.UTF-8")
+	t.Setenv("LANG", "fr_FR.UTF-8")
+
+	dir := t.TempDir()
+	e2fsck := filepath.Join(dir, "e2fsck")
+	script := "#!/bin/sh\nif [ \"$LC_ALL\" = C ]; then echo 'Error reading block 545 (Input/output error).' >&2; " +
+		"else echo 'Erreur de lecture du bloc 545' >&2; fi\nexit 12\n"
+	if err := forkSafeWriteFile(e2fsck, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if damaged, err := checkDamageWith(t.Context(), e2fsck, "/dev/rbd9"); damaged || err == nil {
+		t.Errorf("a failed read under a translating locale answered %v, %v; want could-not-tell", damaged, err)
 	}
 }
