@@ -185,6 +185,11 @@ func TestARestoreLoadsTheLinkedSnapshotAndConfiguresNoMachine(t *testing.T) {
 		t.Errorf("mem_backend = %v, want /snapshot.mem inside the chroot", mem)
 	}
 
+	if load["clock_realtime"] != true {
+		t.Errorf("clock_realtime = %v, want true: a fork's clock would start where its golden's stopped",
+			load["clock_realtime"])
+	}
+
 	// THE LINK IS THE PUBLISHED FILE, never a copy and never a chowned one.
 	j := h.p.jailFor(theInstance)
 	for _, file := range []string{snapshotStateFile, snapshotMemoryFile} {
