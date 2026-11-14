@@ -726,6 +726,72 @@ func gaveUpThenRetried(t *testing.T, holds, inFlight, giveUp bool) {
 	}
 }
 
+// A WAIT ON A WRITE-BACK IN FLIGHT WAITS UNTIL IT ENDS, OR UNTIL ITS CALLER GIVES UP,
+// and opens nothing; with none in flight it returns at once. In a bubble, so being
+// blocked is proved, not guessed from timing.
+func TestAWaitOnAWriteBackInFlightWaitsForItsEnd(t *testing.T) {
+	t.Parallel()
+
+	for name, giveUp := range map[string]bool{"until it ends": false, "until its caller gives up": true} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				p := &Provider{log: slog.New(slog.DiscardHandler)}
+				if err := p.awaitWriteBack(t.Context(), "/dev/rbd4"); err != nil {
+					t.Fatalf("a wait with nothing in flight answered %v", err)
+				}
+
+				release := make(chan struct{})
+				var once sync.Once
+				releaseAll := func() { once.Do(func() { close(release) }) }
+				defer releaseAll()
+				var opens atomic.Int32
+				p.openDisk = func(string) (diskHandle, error) {
+					opens.Add(1)
+
+					return syncedDisk{sync: func() error {
+						<-release
+
+						return nil
+					}}, nil
+				}
+				first, cancelFirst := context.WithTimeout(t.Context(), time.Second)
+				defer cancelFirst()
+				if err := p.flushBefore(first, "/dev/rbd4"); !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("the caller that started the write-back answered %v", err)
+				}
+
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				waited := make(chan error, 1)
+				go func() { waited <- p.awaitWriteBack(ctx, "/dev/rbd4") }()
+				synctest.Wait()
+				select {
+				case err := <-waited:
+					t.Fatalf("the wait returned %v while the write-back still ran", err)
+				default:
+				}
+
+				if giveUp {
+					cancel()
+					if err := <-waited; !errors.Is(err, context.Canceled) {
+						t.Errorf("a wait whose caller gave up answered %v", err)
+					}
+				} else {
+					releaseAll()
+					if err := <-waited; err != nil {
+						t.Errorf("a wait on a write-back that ended answered %v", err)
+					}
+				}
+				if opens.Load() != 1 {
+					t.Errorf("the device was opened %d time(s); a wait opens nothing", opens.Load())
+				}
+			})
+		})
+	}
+}
+
 // A WRITE-BACK OF THE DISK THAT HAD THE NAME BEFORE IS TOLD TO NO SLOT OF ANOTHER: a
 // name can pass to another VM's volume while an old write-back finishes, and that
 // slot, which remembers the disk it holds, is not told the old disk's loss.
