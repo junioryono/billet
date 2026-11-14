@@ -63,7 +63,7 @@ Medians over the three runs of each run's mean per instance. Each run's three va
 
 **The microVM's launch.** From `Launch` being called to its VMM running took a median 2.4 s (gostd) and 2.3 s (memory) per guest, outside its run time.
 
-**Energy windows.** Each run's energy is over its own window, from its start to its last instance's exit.
+**Energy windows.** Each run's energy is over its own window, from its start to its last instance's exit. The wall log has every second of every window but one: the third memory microVM run is missing one meter reading. Its wall figures therefore cover 86.3 of its 87.4 seconds, and are low by an estimated 0.13 kJ.
 
 **The first microVM run.** The first gostd microVM run took 51.5 s, against 37.4 and 37.7 s for the other two. It was the session's first boot of the generation; why it was slower was not measured.
 
@@ -94,19 +94,19 @@ Medians over the three runs of each run's mean per instance. Each run's three va
   - It used 29 CPU-seconds more per instance.
   - At the wall it drew 1.3 kJ more above idle for 4 guests, or 0.9 kJ above each run's own baseline.
 
-  How that splits between the guest's boot and shutdown and its slower work is not measured. Most of it is the interval the host modes do not have.
+  How that splits between the guest's boot and shutdown and the workload is not measured.
 - **On memory, a memory-stalled copy, the microVM used 2.4% more CPU** than the process (612.8 s against 598.5 s per instance), and its run time was 6.6 s longer.
-  - Its energy against the other two is not resolved. Above the quiet idle the microVM drew the most (10.13 kJ against 9.97 and 9.02).
-  - Above each run's own baseline it drew the least (9.65 kJ against 11.29 and 9.90).
-  - The idle wall readings alone ranged over 50 W.
+  - Its wall energy against the other two is not resolved. Above the quiet idle the microVM drew the most at the wall (10.13 kJ against 9.97 and 9.02).
+  - Above each run's own baseline it drew the least at the wall (9.65 kJ against 11.29 and 9.90). At the package, above the same baselines, it sat between the process and the container (6.02 kJ against 5.89 and 6.95).
+  - The idle wall readings alone ranged over about 50 W.
 
-  This says nothing about a compute-bound job, which neither workload is.
-- **The container and the process took the same time and CPU within 1%.** Their energy differed by less than its spread across baselines.
+  This result cannot establish the overhead on a compute-bound job.
+- **The container and the process took about the same time and CPU, within about 1%.** Their energy differed by less than its spread across baselines.
 - **The microVM holds more host memory**, 3.2 GiB per guest against 0.86 GiB on gostd, because a guest's own page cache and the RAM its kernel touched stay in its VMM. billet charges a tier for its guest RAM, not for what the VMM's resident set grows to, so this is headroom the node needs, not a cost a job is billed.
 
 ## What it does not establish
 
-- **One host, one shape.** It covers one host, 4 instances of 8 vCPUs, and two workloads, neither compute-bound.
+- **One host, one shape.** It covers one host, 4 instances of 8 vCPUs, and two workloads. The memory workload is not compute-bound, and gostd's bottleneck was not classified.
 - **No separation of the overhead.** It does not separate the hypervisor's own overhead from the guest's boot, its kernel, or its storage, and it measured no storage traffic.
 - **Too few runs for small differences.** Each figure is three runs, and the energy baseline varied by tens of watts, so a difference smaller than a mode's own spread is not a finding.
-- **No restore.** The microVM's start is billet's cold boot. Starting from a snapshot instead was measured on a different, sleeping job, and its saving on these workloads is untested.
+- **No restore.** The microVM's start is billet's cold boot. Starting from a snapshot instead was not tested on these workloads.
