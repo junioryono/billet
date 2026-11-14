@@ -161,25 +161,32 @@ func TestADestinationThatHangsIsBounded(t *testing.T) {
 	// request), which the ceiling below tells apart.
 	hung.timeout = 2 * time.Second
 
-	result := make(chan error, 1)
-	begun := time.Now()
-	go func() { result <- hung.Send(t.Context(), []byte(`{}`)) }()
+	// TIMED BY THE CALL ITSELF, so how late this goroutine reads the answer is not counted.
+	type tried struct {
+		err  error
+		took time.Duration
+	}
+	result := make(chan tried, 1)
+	go func() {
+		begun := time.Now()
+		err := hung.Send(t.Context(), []byte(`{}`))
+		result <- tried{err: err, took: time.Since(begun)}
+	}()
 
 	select {
-	case err := <-result:
-		if err == nil || errors.Is(err, ErrPermanent) {
-			t.Errorf("a hung try = %v, want one worth trying again", err)
+	case got := <-result:
+		if got.err == nil || errors.Is(got.err, ErrPermanent) {
+			t.Fatalf("a hung try = %v, want one worth trying again", got.err)
 		}
-		if !strings.Contains(err.Error(), "timed out") {
-			t.Errorf("a hung try = %v, want it to say so", err)
+		if !strings.Contains(got.err.Error(), "timed out") {
+			t.Errorf("a hung try = %v, want it to say so", got.err)
 		}
-		assertNoSecret(t, "the error", err.Error(), address)
-	case <-time.After(7 * time.Second):
+		assertNoSecret(t, "the error", got.err.Error(), address)
+		if got.took < hung.timeout || got.took > 6*time.Second {
+			t.Errorf("the try ended after %s, want its bound of %s", got.took, hung.timeout)
+		}
+	case <-time.After(20 * time.Second):
 		t.Fatal("a destination that hangs held its request past its bound")
-	}
-
-	if took := time.Since(begun); took < hung.timeout || took > 6*time.Second {
-		t.Errorf("the try ended after %s, want its bound of %s", took, hung.timeout)
 	}
 }
 
@@ -207,7 +214,15 @@ func TestADestinationThatHangsHoldsUpNothingElse(t *testing.T) {
 		}
 	})
 	t.Cleanup(func() { close(release) })
-	hung.timeout = 20 * time.Second
+	// EVERY BOUND OF THE HUNG TRY PAST THE TEST'S WATCHDOGS, the transport's own included,
+	// so only a held-up delivery ends the test, never the hung try's own deadline.
+	hung.timeout = time.Minute
+	hung.client.Timeout = time.Minute
+	transport, ok := hung.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("the sender's transport is a %T", hung.client.Transport)
+	}
+	transport.ResponseHeaderTimeout = time.Minute
 
 	var once sync.Once
 	fine, _ := destination(t, func(w http.ResponseWriter, _ *http.Request) {
