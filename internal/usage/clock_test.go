@@ -198,6 +198,31 @@ func TestAHostileClockedSeriesIsRefused(t *testing.T) {
 // THE SAMPLER MARKS WHAT IT DID NOT SEE: a read of a group it had read before
 // that failed keeps no point and marks the next one, as does a tick it missed;
 // an ordinary tick marks nothing, and the summary says when the series began.
+//
+// AND A BASELINE THAT COULD NOT READ THE CPU IS NO BASELINE: a job whose cpu.stat
+// was unreadable at Start is not Baselined, though it is no longer pending, so a
+// caller waiting to let its workload go keeps waiting.
+func TestABaselineWithoutTheCPUIsNotBaselined(t *testing.T) {
+	tr, target := referenceVM(t)
+	m := runMonitor(t, tr.root, Options{Interval: time.Second})
+
+	m.Start("read", target, 8)
+	if !m.Baselined("read") {
+		t.Error("a job whose baseline read its CPU is not Baselined")
+	}
+
+	tr.remove(refCgroup + "/cpu.stat")
+	m.Start("unread", target, 8)
+	if m.Baselined("unread") {
+		t.Error("a job whose baseline could not read its CPU says it is Baselined")
+	}
+
+	m.Forget("read")
+	if m.Baselined("read") {
+		t.Error("a forgotten job says it is Baselined")
+	}
+}
+
 func TestTheSamplerMarksWhatItDidNotSee(t *testing.T) {
 	tr, target := referenceVM(t)
 	start := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)

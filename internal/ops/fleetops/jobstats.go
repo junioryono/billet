@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/cloudenergy"
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -203,11 +205,29 @@ type statsFigures struct {
 }
 
 // statsEnergy is what one source measured for a group's jobs.
+//
+// Saturated says a total reached the largest int64 and was held there rather
+// than wrapping, so each figure is a lower bound and is worded as one.
 type statsEnergy struct {
 	Source            string
 	ActiveMicrojoules int64
 	IdleMicrojoules   int64
 	Jobs              int
+	Saturated         bool
+}
+
+// add counts one more job's energy, holding a total at the largest int64.
+func (e *statsEnergy) add(active, idle int64) {
+	sum := func(total, v int64) int64 {
+		if v > 0 && total > math.MaxInt64-v {
+			e.Saturated = true
+			return math.MaxInt64
+		}
+		return total + v
+	}
+	e.ActiveMicrojoules = sum(e.ActiveMicrojoules, active)
+	e.IdleMicrojoules = sum(e.IdleMicrojoules, idle)
+	e.Jobs++
 }
 
 // outcomes is the jobs with an outcome, which the rates are over.
@@ -361,19 +381,28 @@ func figuresOf(facts []alloc.JobFact) statsFigures {
 			out.Bought++
 		}
 
-		if f.Usage == nil || !f.Usage.Measured(alloc.UsageEnergy) {
+		var source string
+		var active, idle int64
+		if f.Usage != nil && f.Usage.Measured(alloc.UsageEnergy) {
+			source, active, idle = f.Usage.EnergySource, f.Usage.EnergyActiveMicrojoules, f.Usage.EnergyIdleMicrojoules
+		} else {
+			// AN ESTIMATE IS NOT A MEASUREMENT: the job is counted as not
+			// measured whether or not it is estimated, and an estimate is its
+			// own source, totalled beside what hosts measured and never into it.
 			out.EnergyUnmeasured++
-
-			continue
+			d, ran := f.Duration()
+			est, ok := energyEstimate(f.InstanceType, f.Usage, f.VCPU, d, ran)
+			if !ok {
+				continue
+			}
+			source, active = cloudenergy.Source, est.Microjoules
 		}
-		e := energy[f.Usage.EnergySource]
+		e := energy[source]
 		if e == nil {
-			e = &statsEnergy{Source: f.Usage.EnergySource}
-			energy[f.Usage.EnergySource] = e
+			e = &statsEnergy{Source: source}
+			energy[source] = e
 		}
-		e.ActiveMicrojoules += f.Usage.EnergyActiveMicrojoules
-		e.IdleMicrojoules += f.Usage.EnergyIdleMicrojoules
-		e.Jobs++
+		e.add(active, idle)
 	}
 
 	out.Duration = alloc.SummarizeDurations(durations)
@@ -501,7 +530,9 @@ const statsCovers = "Covers jobs GitHub started on a runner of this deployment: 
 	"their lease failed: two facts, not a verdict. Flaky is a job that failed and then passed on a re-run " +
 	"of the same run, which is the same commit, counted over the job runs whose attempts are all " +
 	"recorded; both attempts must have run on this deployment. vCPU-hours is the charged vCPUs over the " +
-	"duration. Energy is what the host measured, per source, never summed across sources. Cloud cost is " +
+	"duration. Energy is what the host measured, per source, never summed across sources; a job on a " +
+	"bought shape that no host measured is estimated from its shape and duration, under the source " +
+	"estimate. Cloud cost is " +
 	"the price the lease recorded when it bought a shape, over the duration."
 
 // statsRow is one figure as every form of the report words it, in this window
@@ -640,12 +671,24 @@ func energyText(f *statsFigures) string {
 	}
 
 	parts := make([]string, 0, len(f.Energy))
+	estimated := 0
 	for i := range f.Energy {
 		e := &f.Energy[i]
-		parts = append(parts, fmt.Sprintf("%s over %d jobs", energyOfSource(e), e.Jobs))
+		part := fmt.Sprintf("%s over %d jobs", energyOfSource(e), e.Jobs)
+		// A TOTAL HELD AT ITS LARGEST IS A LOWER BOUND, and says so.
+		if e.Saturated {
+			part = "at least " + part
+		}
+		parts = append(parts, part)
+		if e.Source == cloudenergy.Source {
+			estimated = e.Jobs
+		}
 	}
 	text := strings.Join(parts, "; ")
-	if f.EnergyUnmeasured > 0 {
+	switch {
+	case f.EnergyUnmeasured > 0 && estimated > 0:
+		text += fmt.Sprintf("; not measured for %d jobs, %d of them estimated", f.EnergyUnmeasured, estimated)
+	case f.EnergyUnmeasured > 0:
 		text += fmt.Sprintf("; not measured for %d jobs", f.EnergyUnmeasured)
 	}
 
@@ -654,26 +697,54 @@ func energyText(f *statsFigures) string {
 
 // energyOfSource words one source's energy as `billet jobs show` words a job's: only
 // a source that splits it says what was idle.
+//
+// A SATURATED TOTAL IS WORDED ROUNDED DOWN, since the caller calls it a lower
+// bound, and an estimate keeps the figures joules would round to nothing.
 func energyOfSource(e *statsEnergy) string {
+	j := joules
+	switch {
+	case e.Saturated:
+		j = joulesAtMost
+	case e.Source == cloudenergy.Source:
+		j = estimateJoules
+	}
 	switch e.Source {
 	case alloc.EnergyRAPL:
 		return fmt.Sprintf("rapl: %s active, %s idle (package RAPL, a model rather than a meter)",
-			joules(e.ActiveMicrojoules), joules(e.IdleMicrojoules))
+			j(e.ActiveMicrojoules), j(e.IdleMicrojoules))
 	case alloc.EnergyMeter:
-		return fmt.Sprintf("meter: %s active, %s idle (the whole host at the wall)", joules(e.ActiveMicrojoules),
-			joules(e.IdleMicrojoules))
+		return fmt.Sprintf("meter: %s active, %s idle (the whole host at the wall)", j(e.ActiveMicrojoules),
+			j(e.IdleMicrojoules))
 	case alloc.EnergyProcess:
 		return fmt.Sprintf("process: %s (macOS's own estimate for the VM's process; the machine's idle draw is not in it)",
-			joules(e.ActiveMicrojoules))
+			j(e.ActiveMicrojoules))
 	case alloc.EnergyRAPLUnsplit:
 		return fmt.Sprintf("rapl-unsplit: %s (package RAPL with no idle baseline, so idle is inside it)",
-			joules(e.ActiveMicrojoules))
+			j(e.ActiveMicrojoules))
+	case cloudenergy.Source:
+		return fmt.Sprintf("estimate: %s (not measured: each bought shape's vCPUs over its duration at an "+
+			"assumed %.0f%% CPU, %.2f to %.2f W per vCPU, Cloud Carbon Footprint's AWS averages)",
+			j(e.ActiveMicrojoules), cloudenergy.DefaultUtilization*100, cloudenergy.MinWattsPerVCPU,
+			cloudenergy.MaxWattsPerVCPU)
 	case "":
-		return fmt.Sprintf("source not recorded: %s", joules(e.ActiveMicrojoules))
+		return fmt.Sprintf("source not recorded: %s", j(e.ActiveMicrojoules))
 	}
 
 	return fmt.Sprintf("%s: %s, split by a source this binary does not know", strconv.Quote(e.Source),
-		joules(e.ActiveMicrojoules))
+		j(e.ActiveMicrojoules))
+}
+
+// joulesAtMost words microjoules as joules does, rounded down rather than to the
+// nearest, in integers so nothing rounds up on the way: the figure a lower bound
+// may claim.
+func joulesAtMost(microjoules int64) string {
+	if microjoules >= 1_000_000_000 {
+		tenths := microjoules / 100_000_000
+		return fmt.Sprintf("%d.%d kJ", tenths/10, tenths%10)
+	}
+	tenths := microjoules / 100_000
+
+	return fmt.Sprintf("%d.%d J", tenths/10, tenths%10)
 }
 
 // energySplit says whether a source's idle figure is one: the others report a total
@@ -881,12 +952,19 @@ type statsDurations struct {
 // statsEnergyJSON is one source's energy. IdleJoules is null for a source that does
 // not split idle out, and IdleIncluded says whether the active figure has the idle in
 // it, null for a source this binary does not know.
+//
+// THE JOULES ARE EXACT DECIMALS of the microjoules counted, never a float's nearest:
+// a total held at the largest int64 is a lower bound, and a float could round it up
+// past what was counted.
 type statsEnergyJSON struct {
-	Source       string   `json:"source"`
-	ActiveJoules float64  `json:"active_joules"`
-	IdleJoules   *float64 `json:"idle_joules"`
-	IdleIncluded *bool    `json:"idle_included"`
-	Jobs         int      `json:"jobs"`
+	Source       string       `json:"source"`
+	ActiveJoules json.Number  `json:"active_joules"`
+	IdleJoules   *json.Number `json:"idle_joules"`
+	IdleIncluded *bool        `json:"idle_included"`
+	Jobs         int          `json:"jobs"`
+	// Saturated says a total reached the largest int64 and was held there, so
+	// each figure is a lower bound.
+	Saturated bool `json:"saturated,omitempty"`
 }
 
 // idleIncluded says whether a source's one figure has the machine's idle draw in it,
@@ -894,7 +972,8 @@ type statsEnergyJSON struct {
 func idleIncluded(source string) *bool {
 	var included bool
 	switch source {
-	case alloc.EnergyRAPLUnsplit:
+	// The model's minimum is each vCPU's idle draw, so an estimate has idle in it.
+	case alloc.EnergyRAPLUnsplit, cloudenergy.Source:
 		included = true
 	case alloc.EnergyRAPL, alloc.EnergyMeter, alloc.EnergyProcess:
 	default:
@@ -905,13 +984,24 @@ func idleIncluded(source string) *bool {
 }
 
 // idleJoules is a source's idle energy, nil for one that reports none of its own.
-func idleJoules(e *statsEnergy) *float64 {
+func idleJoules(e *statsEnergy) *json.Number {
 	if !energySplit(e.Source) {
 		return nil
 	}
-	idle := float64(e.IdleMicrojoules) / 1e6
+	idle := joulesNumber(e.IdleMicrojoules)
 
 	return &idle
+}
+
+// joulesNumber is microjoules as an exact decimal count of joules, its trailing
+// zeros trimmed: 5088000000 is 5088, 8480 is 0.00848. A count is never negative.
+func joulesNumber(microjoules int64) json.Number {
+	whole, frac := microjoules/1_000_000, microjoules%1_000_000
+	if frac == 0 {
+		return json.Number(strconv.FormatInt(whole, 10))
+	}
+
+	return json.Number(strings.TrimRight(fmt.Sprintf("%d.%06d", whole, frac), "0"))
 }
 
 // rateOf is part over whole, null when whole is zero.
@@ -958,9 +1048,9 @@ func statsFiguresJSONOf(f *statsFigures) statsFiguresJSON {
 	for i := range f.Energy {
 		e := &f.Energy[i]
 		out.Energy = append(out.Energy, statsEnergyJSON{Source: e.Source,
-			ActiveJoules: float64(e.ActiveMicrojoules) / 1e6, IdleJoules: idleJoules(e),
+			ActiveJoules: joulesNumber(e.ActiveMicrojoules), IdleJoules: idleJoules(e),
 			IdleIncluded: idleIncluded(e.Source),
-			Jobs:         e.Jobs})
+			Jobs:         e.Jobs, Saturated: e.Saturated})
 	}
 
 	return out

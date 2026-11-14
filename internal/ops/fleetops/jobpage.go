@@ -213,6 +213,13 @@ func jobPageOf(rec alloc.JobRecord, measured *alloc.RecordedUsage, steps jobStep
 	page.Identity = identityFields(rec)
 
 	page.Usage = usageSection(measured)
+	if e, ok := recordEnergyEstimate(rec, measured); ok {
+		label := "energy"
+		if measured != nil {
+			label = "estimated"
+		}
+		page.Usage.Groups = append(page.Usage.Groups, pageField{Label: label, Value: estimateText(e)})
+	}
 	if v, ok := seriesViewOf(tl, unaligned, measured); ok {
 		page.Usage.Series, page.Usage.SeriesGaps, page.Usage.SeriesMore = v.head, v.gaps, v.more
 	}

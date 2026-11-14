@@ -156,12 +156,14 @@
 <dt>{{.Label}}</dt><dd{{if .Unmeasured}} class="unmeasured"{{end}}>{{.Value}}</dd>
 {{- end}}
 </dl>
+{{- if .Usage.Counters}}
 <h3>Hardware counters</h3>
 <dl class="fields">
 {{- range .Usage.Counters}}
 <dt>{{.Label}}</dt><dd{{if .Unmeasured}} class="unmeasured"{{end}}>{{.Value}}</dd>
 {{- end}}
 </dl>
+{{- end}}
 {{- end}}
 </section>
 
