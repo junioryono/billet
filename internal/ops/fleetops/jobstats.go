@@ -17,6 +17,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/cloudenergy"
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -361,18 +362,29 @@ func figuresOf(facts []alloc.JobFact) statsFigures {
 			out.Bought++
 		}
 
-		if f.Usage == nil || !f.Usage.Measured(alloc.UsageEnergy) {
-			out.EnergyUnmeasured++
+		var source string
+		var active, idle int64
+		if f.Usage != nil && f.Usage.Measured(alloc.UsageEnergy) {
+			source, active, idle = f.Usage.EnergySource, f.Usage.EnergyActiveMicrojoules, f.Usage.EnergyIdleMicrojoules
+		} else {
+			// AN ESTIMATE IS ITS OWN SOURCE, so it is totalled beside what hosts
+			// measured and never into it.
+			d, ran := f.Duration()
+			est, ok := energyEstimate(f.InstanceType, f.Usage, f.VCPU, d, ran)
+			if !ok {
+				out.EnergyUnmeasured++
 
-			continue
+				continue
+			}
+			source, active = cloudenergy.Source, est.Microjoules
 		}
-		e := energy[f.Usage.EnergySource]
+		e := energy[source]
 		if e == nil {
-			e = &statsEnergy{Source: f.Usage.EnergySource}
-			energy[f.Usage.EnergySource] = e
+			e = &statsEnergy{Source: source}
+			energy[source] = e
 		}
-		e.ActiveMicrojoules += f.Usage.EnergyActiveMicrojoules
-		e.IdleMicrojoules += f.Usage.EnergyIdleMicrojoules
+		e.ActiveMicrojoules += active
+		e.IdleMicrojoules += idle
 		e.Jobs++
 	}
 
@@ -501,7 +513,9 @@ const statsCovers = "Covers jobs GitHub started on a runner of this deployment: 
 	"their lease failed: two facts, not a verdict. Flaky is a job that failed and then passed on a re-run " +
 	"of the same run, which is the same commit, counted over the job runs whose attempts are all " +
 	"recorded; both attempts must have run on this deployment. vCPU-hours is the charged vCPUs over the " +
-	"duration. Energy is what the host measured, per source, never summed across sources. Cloud cost is " +
+	"duration. Energy is what the host measured, per source, never summed across sources; a job on a " +
+	"bought shape that no host measured is estimated from its shape and duration, under the source " +
+	"estimate. Cloud cost is " +
 	"the price the lease recorded when it bought a shape, over the duration."
 
 // statsRow is one figure as every form of the report words it, in this window
@@ -668,6 +682,11 @@ func energyOfSource(e *statsEnergy) string {
 	case alloc.EnergyRAPLUnsplit:
 		return fmt.Sprintf("rapl-unsplit: %s (package RAPL with no idle baseline, so idle is inside it)",
 			joules(e.ActiveMicrojoules))
+	case cloudenergy.Source:
+		return fmt.Sprintf("estimate: %s (not measured: each bought shape's vCPUs over its duration at an "+
+			"assumed %.0f%% CPU, %.2f to %.2f W per vCPU, Cloud Carbon Footprint's AWS averages)",
+			joules(e.ActiveMicrojoules), cloudenergy.DefaultUtilization*100, cloudenergy.MinWattsPerVCPU,
+			cloudenergy.MaxWattsPerVCPU)
 	case "":
 		return fmt.Sprintf("source not recorded: %s", joules(e.ActiveMicrojoules))
 	}
@@ -894,7 +913,8 @@ type statsEnergyJSON struct {
 func idleIncluded(source string) *bool {
 	var included bool
 	switch source {
-	case alloc.EnergyRAPLUnsplit:
+	// The model's minimum is each vCPU's idle draw, so an estimate has idle in it.
+	case alloc.EnergyRAPLUnsplit, cloudenergy.Source:
 		included = true
 	case alloc.EnergyRAPL, alloc.EnergyMeter, alloc.EnergyProcess:
 	default:
