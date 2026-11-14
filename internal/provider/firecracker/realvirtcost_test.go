@@ -102,7 +102,8 @@ func TestRealVirtualizationCost(t *testing.T) {
 	case mode == "container" && image == "":
 		t.Fatal("BILLET_VIRT_EXPERIMENT_IMAGE names no image for the container")
 	}
-	scratch, err := scratchHolds(os.Getenv("BILLET_VIRT_EXPERIMENT_SCRATCH"), instances, scratchProtected)
+	scratch, scratchDev, err := scratchHolds(os.Getenv("BILLET_VIRT_EXPERIMENT_SCRATCH"), instances,
+		scratchProtected)
 	if err != nil {
 		t.Fatalf("BILLET_VIRT_EXPERIMENT_SCRATCH: %v", err)
 	}
@@ -160,14 +161,14 @@ func TestRealVirtualizationCost(t *testing.T) {
 			stop.Add(1)
 			go func() {
 				defer stop.Done()
-				var removed int
-				removed, errs[i] = stopInstance(ctx, mode, in.name, runID)
-				// A CREATE THAT FAILED is settled only by removing what it made: a failure
-				// does not say whether the daemon made the container, and two empty reads
-				// do not prove it will not register one.
-				if errs[i] == nil && in.createUnsettled && removed == 0 {
-					errs[i] = fmt.Errorf("its docker create failed and no container of it was found; "+
-						"remove any container labelled billet-virtcost=%s if the daemon registers one", runID)
+				var found int
+				found, errs[i] = stopInstance(ctx, mode, in.name, runID)
+				// A LAUNCH THAT FAILED is settled only by stopping what it made: a failed
+				// docker create or systemd-run does not say whether the daemon or the
+				// manager made it, and two empty reads do not prove it never will.
+				if errs[i] == nil && in.launchUnsettled && found == 0 {
+					errs[i] = fmt.Errorf("its launch failed and nothing of it was found; if one appears, "+
+						"stop unit %s.service or remove containers labelled billet-virtcost=%s", in.name, runID)
 				}
 			}()
 		}
@@ -177,8 +178,15 @@ func TestRealVirtualizationCost(t *testing.T) {
 				t.Errorf("stop %s: %v; its directory %s is left", in.name, errs[i], in.dir)
 				continue
 			}
-			// BOUNDED, and on this filesystem only: rm is killed at the deadline, and
-			// does not follow a mount a namespace left behind out of the scratch.
+			// ONLY WHAT IS STILL ON THE ADMITTED SCRATCH, bounded, and on that
+			// filesystem only: a directory something else is now mounted on is left,
+			// rm is killed at the deadline, and it does not follow a mount out of the
+			// scratch. A replacement between this check and rm is not defended
+			// against; the node is drained and the operator's own.
+			if err := onDevice(in.dir, scratchDev); err != nil {
+				t.Errorf("remove %s: %v; it is left", in.dir, err)
+				continue
+			}
 			if out, err := exec.CommandContext(ctx, "rm", "-rf", "--one-file-system", "--", in.dir).
 				CombinedOutput(); err != nil {
 				t.Errorf("remove %s: %v: %s; what is left of it stays", in.dir, err, out)
@@ -187,6 +195,11 @@ func TestRealVirtualizationCost(t *testing.T) {
 	})
 	for _, in := range all {
 		if err := os.MkdirAll(filepath.Join(in.dir, "tmp"), 0o1777); err != nil {
+			t.Fatal(err)
+		}
+		// STILL ON THE ADMITTED SCRATCH once made, so a scratch unmounted since it
+		// was admitted is not filled through the directory it was mounted on.
+		if err := onDevice(filepath.Join(in.dir, "tmp"), scratchDev); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -261,29 +274,32 @@ const scratchPerInstance = 6 * config.GiB
 // One that does not exist protects nothing.
 var scratchProtected = []string{"/", "/var/lib/billet", "/var/lib/docker"}
 
-// scratchHolds admits a scratch directory and answers the path to use: dir with
-// every symlink resolved, so what is checked is what is written. It refuses one
-// that is not a filesystem of its own, mounted there (its device differs from its
-// parent's), one on the filesystem of any protected path, which a bind mount of
-// that filesystem is, and one with less than scratchPerInstance free for each
-// instance. What fills it then fills nothing the node or its ledger keeps.
-func scratchHolds(dir string, instances int, protected []string) (string, error) {
+// scratchHolds admits a scratch directory and answers the path to use, dir with
+// every symlink resolved so what is checked is what is written, and its device,
+// which every directory made in it is checked against. It refuses one that is not
+// a filesystem of its own, mounted there (its device differs from its parent's),
+// one on the filesystem of any protected path, which a bind mount of that
+// filesystem is, one whose backing could grow onto another filesystem or reach
+// the network (scratchBacking), and one with less than scratchPerInstance free for
+// each instance. What fills it then fills nothing the node or its ledger keeps.
+func scratchHolds(dir string, instances int, protected []string) (string, uint64, error) {
 	if dir == "" || !filepath.IsAbs(dir) {
-		return "", fmt.Errorf("%q is not an absolute path", dir)
+		return "", 0, fmt.Errorf("%q is not an absolute path", dir)
 	}
 	resolved, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	var here, parent unix.Stat_t
 	if err := unix.Stat(resolved, &here); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if err := unix.Stat(filepath.Dir(resolved), &parent); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if here.Dev == parent.Dev {
-		return "", fmt.Errorf("%s is on its parent's filesystem; mount a filesystem of its own there", resolved)
+		return "", 0, fmt.Errorf("%s is on its parent's filesystem; mount a filesystem of its own there",
+			resolved)
 	}
 	for _, path := range protected {
 		var kept unix.Stat_t
@@ -292,22 +308,116 @@ func scratchHolds(dir string, instances int, protected []string) (string, error)
 			continue
 		}
 		if err != nil {
-			return "", fmt.Errorf("could not tell which filesystem %s is on: %w", path, err)
+			return "", 0, fmt.Errorf("could not tell which filesystem %s is on: %w", path, err)
 		}
 		if here.Dev == kept.Dev {
-			return "", fmt.Errorf("%s is on the filesystem %s is on", resolved, path)
+			return "", 0, fmt.Errorf("%s is on the filesystem %s is on", resolved, path)
 		}
 	}
 	var fs unix.Statfs_t
 	if err := unix.Statfs(resolved, &fs); err != nil {
-		return "", err
+		return "", 0, err
+	}
+	dev := identityOf(resolved, &here).dev
+	if runtime.GOOS == "linux" {
+		if err := scratchBacking(dev, fs.Type == tmpfsMagic, sysBlock(dev)); err != nil {
+			return "", 0, fmt.Errorf("%s: %w", resolved, err)
+		}
 	}
 	free, need := fs.Bavail*uint64(fs.Bsize), uint64(instances)*uint64(scratchPerInstance)
 	if free < need {
-		return "", fmt.Errorf("%s has %d bytes free; %d instances need %d", resolved, free, instances, need)
+		return "", 0, fmt.Errorf("%s has %d bytes free; %d instances need %d", resolved, free, instances, need)
 	}
 
-	return resolved, nil
+	return resolved, dev, nil
+}
+
+// tmpfsMagic is tmpfs's filesystem type, as statfs reports it.
+const tmpfsMagic = 0x01021994
+
+// blockDevice is what /sys says of the block device behind a filesystem: its
+// name, and for a loop device whether its backing file is wholly allocated.
+type blockDevice struct {
+	name string
+	// loopAllocated reads a loop device's backing file; nil for any other device.
+	loopAllocated func() (bool, error)
+}
+
+// sysBlock describes the block device dev names, from /sys/dev/block.
+func sysBlock(dev uint64) blockDevice {
+	node := fmt.Sprintf("/sys/dev/block/%d:%d", unix.Major(dev), unix.Minor(dev))
+	target, err := os.Readlink(node)
+	if err != nil {
+		return blockDevice{}
+	}
+	d := blockDevice{name: filepath.Base(target)}
+	if strings.HasPrefix(d.name, "loop") {
+		d.loopAllocated = func() (bool, error) {
+			raw, err := os.ReadFile(filepath.Join(node, "loop", "backing_file"))
+			if err != nil {
+				return false, err
+			}
+			var st unix.Stat_t
+			if err := unix.Stat(strings.TrimSpace(string(raw)), &st); err != nil {
+				return false, err
+			}
+
+			return st.Blocks*512 >= st.Size, nil
+		}
+	}
+
+	return d
+}
+
+// scratchBacking refuses a scratch whose writes could land anywhere but its own
+// bounded storage: a filesystem with no block device behind it unless it is a
+// tmpfs, which its size and memory bound; a loop device whose backing file is
+// sparse, whose writes allocate it on the filesystem holding it; and a network
+// block device (rbd, nbd), which this experiment never touches. A device /sys does
+// not describe is refused too.
+func scratchBacking(dev uint64, tmpfs bool, block blockDevice) error {
+	if unix.Major(dev) == 0 {
+		if !tmpfs {
+			return errors.New("its filesystem has no block device of its own, and only a tmpfs is " +
+				"admitted without one")
+		}
+
+		return nil
+	}
+	switch {
+	case block.name == "":
+		return errors.New("its block device could not be read in /sys/dev/block")
+	case strings.HasPrefix(block.name, "rbd"), strings.HasPrefix(block.name, "nbd"):
+		return fmt.Errorf("it is on %s, a network block device", block.name)
+	case block.loopAllocated != nil:
+		whole, err := block.loopAllocated()
+		if err != nil {
+			return fmt.Errorf("could not tell whether %s's backing file is allocated: %w", block.name, err)
+		}
+		if !whole {
+			return fmt.Errorf("%s's backing file is sparse, so the scratch grows it on the filesystem "+
+				"holding it; allocate it whole (fallocate)", block.name)
+		}
+	}
+
+	return nil
+}
+
+// onDevice refuses a path that is not a directory on the admitted scratch, as
+// lstat sees it.
+func onDevice(path string, dev uint64) error {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	if identityOf(path, &st).dev != dev {
+		return fmt.Errorf("%s is no longer on the admitted scratch", path)
+	}
+
+	return nil
 }
 
 // openResults opens the results file to append to, refusing anything but a
@@ -338,9 +448,10 @@ type virtInstance struct {
 	summary         usage.Summary
 	final           bool
 	err             error
-	// createUnsettled is a docker create that failed, which does not say whether
-	// the daemon made the container; only its removal settles it.
-	createUnsettled bool
+	// launchUnsettled is a docker create or a systemd-run that failed, which does
+	// not say whether the daemon or the manager made it; only stopping it settles
+	// it.
+	launchUnsettled bool
 }
 
 // virtWrapper is what every instance runs: wait for the go file, run the body,
@@ -384,6 +495,7 @@ exec chroot "$R" /bin/bash -c "$3" wrapper "$4" /mnt/go /mnt/status`
 			"-p", "OOMPolicy=continue",
 			"--", "unshare", "--mount", "--propagation", "private", "--", "/bin/sh", "-c", inner, "sh",
 			root, in.dir, virtWrapper, body).CombinedOutput(); err != nil {
+			in.launchUnsettled = true
 			return fmt.Errorf("systemd-run: %w: %s", err, out)
 		}
 		cgroupRoot, err := cgroup2Mount(defaultProcMountsPath)
@@ -401,12 +513,12 @@ exec chroot "$R" /bin/bash -c "$3" wrapper "$4" /mnt/go /mnt/status`
 		// only the container's record.
 		mem := strconv.FormatInt(int64(memory), 10)
 		out, err := exec.CommandContext(ctx, "docker", "create", "--name", in.name,
-			"--label", "billet-virtcost="+runID, "--read-only", "--log-driver", "none",
+			"--label", "billet-virtcost="+runID, "--read-only", "--log-driver", "none", "--pull=never",
 			"--cpuset-cpus", in.cpus, "--memory", mem, "--memory-swap", mem,
 			"-v", in.dir+":/mnt", "-v", filepath.Join(in.dir, "tmp")+":/tmp",
 			image, "/bin/bash", "-c", virtWrapper, "wrapper", body, "/mnt/go", "/mnt/status").CombinedOutput()
 		if err != nil {
-			in.createUnsettled = true
+			in.launchUnsettled = true
 			return fmt.Errorf("docker create: %w: %s", err, out)
 		}
 		id := strings.TrimSpace(string(out))
@@ -503,32 +615,46 @@ func instanceAlive(ctx context.Context, mode, name string) (bool, error) {
 }
 
 // stopInstance stops whatever of an instance is still there and answers nil only
-// on proof nothing of it runs: a service's cgroup gone, or no container left
-// carrying the run's label, read twice a few seconds apart. It also says how many
-// containers it removed, which is what settles a create that never answered.
+// on proof nothing of it runs: a service stopped twice a few seconds apart and its
+// cgroup gone, or no container left carrying the run's label, read twice a few
+// seconds apart. It also says how many units or containers it found, which is what
+// settles a launch that failed.
 func stopInstance(ctx context.Context, mode, name, runID string) (int, error) {
 	if mode == "process" {
 		unit := name + ".service"
-		out, err := exec.CommandContext(ctx, "systemctl", "stop", unit).CombinedOutput()
-		if err != nil && !strings.Contains(string(out), "not loaded") {
-			return 0, fmt.Errorf("systemctl stop: %w: %s", err, out)
+		found := 0
+		for round := range 2 {
+			out, err := exec.CommandContext(ctx, "systemctl", "stop", unit).CombinedOutput()
+			switch {
+			case err == nil:
+				found++
+			case !strings.Contains(string(out), "not loaded"):
+				return found, fmt.Errorf("systemctl stop: %w: %s", err, out)
+			}
+			if round == 0 {
+				select {
+				case <-ctx.Done():
+					return found, ctx.Err()
+				case <-time.After(5 * time.Second):
+				}
+			}
 		}
 		cgroupRoot, err := cgroup2Mount(defaultProcMountsPath)
 		if err != nil {
-			return 0, err
+			return found, err
 		}
 		dir := filepath.Join(cgroupRoot, "system.slice", unit)
 		for {
 			_, err := os.Stat(dir)
 			if errors.Is(err, os.ErrNotExist) {
-				return 0, nil
+				return found, nil
 			}
 			if err != nil {
-				return 0, fmt.Errorf("could not tell whether %s is gone: %w", dir, err)
+				return found, fmt.Errorf("could not tell whether %s is gone: %w", dir, err)
 			}
 			select {
 			case <-ctx.Done():
-				return 0, fmt.Errorf("%s still exists: %w", dir, ctx.Err())
+				return found, fmt.Errorf("%s still exists: %w", dir, ctx.Err())
 			case <-time.After(250 * time.Millisecond):
 			}
 		}
@@ -731,8 +857,14 @@ func TestTheVirtWrapperPublishesItsStatusOrEnds(t *testing.T) {
 func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
 	t.Parallel()
 
-	if _, err := scratchHolds(t.TempDir(), 0, nil); err == nil {
+	if _, _, err := scratchHolds(t.TempDir(), 0, nil); err == nil {
 		t.Error("a directory on its parent's filesystem was accepted as the scratch")
+	}
+	// A FILESYSTEM OF ITS OWN THE BACKING CHECK ADMITS: a tmpfs on Linux, devfs on
+	// macOS, which has no /sys to judge a backing by.
+	own := "/dev"
+	if runtime.GOOS == "linux" {
+		own = "/dev/shm"
 	}
 	wd, err := os.Getwd()
 	if err != nil {
@@ -742,33 +874,92 @@ func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := scratchHolds(relative, 0, nil); err == nil {
+	if _, _, err := scratchHolds(relative, 0, nil); err == nil {
 		t.Errorf("the relative path %s was accepted as the scratch", relative)
 	}
-	// /dev is a filesystem of its own on Linux and macOS alike, with nowhere near
-	// a million instances' room.
-	if got, err := scratchHolds("/dev", 0, nil); err != nil || got != "/dev" {
-		t.Errorf("/dev, a mount of its own, was admitted as %q (%v); want it as itself", got, err)
+	// Neither has a million instances' room.
+	got, dev, err := scratchHolds(own, 0, nil)
+	if err != nil || got != own {
+		t.Errorf("%s, a mount of its own, was admitted as %q (%v); want it as itself", own, got, err)
 	}
-	if _, err := scratchHolds("/dev", 1<<20, nil); err == nil {
+	if err := onDevice(own, dev); err != nil {
+		t.Errorf("the device admitted for %s is not its own: %v", own, err)
+	}
+	if err := onDevice(t.TempDir(), dev); err == nil {
+		t.Errorf("a directory off %s was taken to be on it", own)
+	}
+	if _, _, err := scratchHolds(own, 1<<20, nil); err == nil {
 		t.Error("a scratch without room for its instances was accepted")
+	}
+	// A FILE IS NOT A DIRECTORY ON THE SCRATCH, though it is on its filesystem.
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(file, &st); err != nil {
+		t.Fatal(err)
+	}
+	if err := onDevice(file, identityOf(file, &st).dev); err == nil {
+		t.Error("a regular file was taken for a directory on the scratch")
+	}
+	// AND ITS BACKING IS JUDGED: /proc is a filesystem of its own with no block
+	// device and is not a tmpfs, which only Linux has /sys to tell.
+	if runtime.GOOS == "linux" {
+		if _, _, err := scratchHolds("/proc", 0, nil); err == nil {
+			t.Error("/proc, an anonymous filesystem that is not a tmpfs, was accepted as the scratch")
+		}
 	}
 
 	// A SYMLINK IS ADMITTED AS WHAT IT NAMES, and a protected path's filesystem is
 	// refused through one, as /dev/shm/scratch -> /var/lib/billet would be.
 	link := filepath.Join(t.TempDir(), "scratch")
-	if err := os.Symlink("/dev", link); err != nil {
+	if err := os.Symlink(own, link); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := scratchHolds(link, 0, nil); err != nil || got != "/dev" {
-		t.Errorf("a symlink to /dev was admitted as %q (%v); want /dev itself", got, err)
+	if got, _, err := scratchHolds(link, 0, nil); err != nil || got != own {
+		t.Errorf("a symlink to %s was admitted as %q (%v); want %s itself", own, got, err, own)
 	}
-	if _, err := scratchHolds(link, 0, []string{"/dev"}); err == nil {
+	if _, _, err := scratchHolds(link, 0, []string{own}); err == nil {
 		t.Error("a symlink to a protected path's filesystem was accepted as the scratch")
 	}
-	if got, err := scratchHolds("/dev", 0, []string{filepath.Join(t.TempDir(), "absent")}); err != nil ||
-		got != "/dev" {
-		t.Errorf("a protected path that does not exist refused /dev (%q, %v)", got, err)
+	if got, _, err := scratchHolds(own, 0, []string{filepath.Join(t.TempDir(), "absent")}); err != nil ||
+		got != own {
+		t.Errorf("a protected path that does not exist refused %s (%q, %v)", own, got, err)
+	}
+}
+
+// THE SCRATCH'S BACKING IS ITS OWN AND BOUNDED: a tmpfs, a disk, or a loop device
+// whose file is allocated whole; never another anonymous filesystem, a sparse loop
+// file that grows on the filesystem holding it, a network block device, or a device
+// /sys does not describe.
+func TestTheScratchsBackingIsItsOwn(t *testing.T) {
+	t.Parallel()
+
+	anonymous, disk := unix.Mkdev(0, 52), unix.Mkdev(259, 3)
+	loop := func(whole bool, err error) blockDevice {
+		return blockDevice{name: "loop7", loopAllocated: func() (bool, error) { return whole, err }}
+	}
+	for _, c := range []struct {
+		name  string
+		dev   uint64
+		tmpfs bool
+		block blockDevice
+		ok    bool
+	}{
+		{"a tmpfs", anonymous, true, blockDevice{}, true},
+		{"another anonymous filesystem", anonymous, false, blockDevice{}, false},
+		{"a disk", disk, false, blockDevice{name: "nvme0n1p3"}, true},
+		{"a whole loop file", disk, false, loop(true, nil), true},
+		{"a sparse loop file", disk, false, loop(false, nil), false},
+		{"an unreadable loop file", disk, false, loop(true, errors.New("gone")), false},
+		{"an rbd image", disk, false, blockDevice{name: "rbd0"}, false},
+		{"an nbd export", disk, false, blockDevice{name: "nbd2"}, false},
+		{"a device /sys does not describe", disk, false, blockDevice{}, false},
+	} {
+		if err := scratchBacking(c.dev, c.tmpfs, c.block); (err == nil) != c.ok {
+			t.Errorf("%s: admitted %v (%v), want %v", c.name, err == nil, err, c.ok)
+		}
 	}
 }
 
@@ -787,7 +978,9 @@ func TestTheResultsFileIsARegularFile(t *testing.T) {
 	go func() {
 		f, err := openResults(fifo)
 		if err == nil {
-			_ = f.Close()
+			if err := f.Close(); err != nil {
+				t.Errorf("close the FIFO: %v", err)
+			}
 		}
 		refused <- err
 	}()
@@ -797,7 +990,14 @@ func TestTheResultsFileIsARegularFile(t *testing.T) {
 			t.Error("a FIFO was opened as the results file")
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("opening a FIFO nobody reads as the results file blocked")
+		// A REGRESSION THAT BLOCKS IS UNBLOCKED AND JOINED: a reader lets the open
+		// return, so nothing of it outlives the test.
+		reader, err := os.OpenFile(fifo, os.O_RDONLY|unix.O_NONBLOCK, 0)
+		if err == nil {
+			<-refused
+			err = reader.Close()
+		}
+		t.Fatalf("opening a FIFO nobody reads as the results file blocked (unblocking it: %v)", err)
 	}
 
 	target := filepath.Join(dir, "target")

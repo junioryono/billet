@@ -224,6 +224,9 @@ type job struct {
 	// the limit on a read: the next tick takes the baseline instead, so the job
 	// is not left unsampled for the rest of its life.
 	untaken bool
+	// baselineCPU says the baseline read the job's CPU, which is what everything
+	// it uses from then is counted from.
+	baselineCPU bool
 }
 
 // see records that an interval since the last kept point went unseen, and why;
@@ -385,6 +388,7 @@ func (m *Monitor) start(key string, j *job) {
 	}
 	j.counters = counters
 	j.lastCPU, j.lastCPUOK, j.cpuFrom = s.CPUUsage, s.CPUOK, cpuAt
+	j.baselineCPU = s.CPUOK
 	j.seenCPU, j.seenCPUOK = s.CPUUsage, s.CPUOK
 	if now.Sub(began) >= m.opts.Interval {
 		j.see(GapSlowRead)
@@ -428,15 +432,16 @@ func (m *Monitor) Forget(key string) {
 	delete(m.jobs, key)
 }
 
-// Baselined reports whether the job under key has its first sample, so what it
-// does from now is measured from a baseline. A pending job, a forgotten one and
-// an unknown key all answer false.
+// Baselined reports whether the job under key has its first sample and that
+// sample read its CPU, so what it uses from now is counted from a baseline. A
+// pending job, one whose baseline could not read its CPU, a forgotten one and an
+// unknown key all answer false.
 func (m *Monitor) Baselined(key string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[key]
 
-	return ok && !j.pending
+	return ok && !j.pending && j.baselineCPU
 }
 
 // Tick asks Run for one tick and waits for it. Run ticks on its own clock;
