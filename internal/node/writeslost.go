@@ -12,6 +12,18 @@ import (
 // reached the volume's storage: the volume is discarded, never published.
 var errWritesLost = errors.New("writes to the volume were lost, so it is discarded rather than published")
 
+// errDiscarded is a publication refused because the guest discarded the volume.
+var errDiscarded = errors.New("the guest discarded the volume, so it is not published")
+
+// refusalOf is why a refused attachment is not published.
+func refusalOf(attachment *cacheAttachment) error {
+	if attachment.WritesLost {
+		return errWritesLost
+	}
+
+	return errDiscarded
+}
+
 // writesLost says err reports writes to a volume that never reached its storage:
 // a detach after a failed write-back (provider.ErrWritesLost), a snapshot's
 // write-back or a mounted filesystem's syncfs (store.ErrWritesLost).

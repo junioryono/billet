@@ -295,6 +295,52 @@ func attachedSticky(t *testing.T) (*CacheService, *fakeCacheStore, *cacheSession
 	return service, storage, session, attachment
 }
 
+// WHAT THE GUEST DISCARDED IS NEVER PUBLISHED, WHATEVER BECOMES OF ITS DETACH. A
+// detach that fails can have heard of lost writes it keeps for the slot's next
+// detach, and a deferred publication snapshots the volume once the compute is gone,
+// with no detach to be told them; so the discard is recorded before the detach, and
+// a node started on the record refuses it too.
+func TestAVolumeTheGuestDiscardedIsNeverPublished(t *testing.T) {
+	t.Parallel()
+
+	service, storage, session, attachment := attachedSticky(t)
+	attacher, ok := service.attacher.(*fakeVolumeAttacher)
+	if !ok {
+		t.Fatalf("the service's attacher is %T", service.attacher)
+	}
+	session.mu.Lock()
+	attachment.Deferred, attachment.Ready = true, true
+	attachment.Intent = &publishIntent{LeaseID: "lease", JobID: "1", RunID: 1, At: service.now()}
+	session.mu.Unlock()
+
+	attacher.detachErr = errors.New("firecracker: detach cache slot 0: the drive is busy")
+	cacheRequest(t, service, session.token, "/v1/volumes/0/discard", nil)
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if !attachment.Discarded {
+		t.Fatal("a discard whose detach failed left the attachment unmarked")
+	}
+	if done, err := service.publishDeferred(t.Context(), session, 0, attachment); err != nil || !done ||
+		attachment.Journal == nil || attachment.Journal.Phase != phaseAbandoned {
+		t.Errorf("the deferred publication of a discarded volume answered done %v, %v, journal %+v; want abandoned",
+			done, err, attachment.Journal)
+	}
+	if storage.snapshots != 0 || storage.published != 0 {
+		t.Errorf("a discarded volume was snapshotted %d time(s) and published %d", storage.snapshots, storage.published)
+	}
+
+	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", service.rootState,
+		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	recovered := restarted.sessionOf(session.instance)
+	if recovered == nil || recovered.slots[0] == nil || !recovered.slots[0].Discarded {
+		t.Error("a node started on the record does not know the volume was discarded")
+	}
+}
+
 // A DEFERRED PUBLICATION WHOSE SNAPSHOT LOST WRITES IS ABANDONED, NOT RETRIED: the
 // next pass's snapshot would be told nothing. One already marked is abandoned
 // without a snapshot.

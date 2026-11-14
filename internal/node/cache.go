@@ -360,7 +360,15 @@ type cacheAttachment struct {
 	// never reached its storage, which the kernel says once: nothing publishes it,
 	// and the session's cleanup discards it (writeslost.go).
 	WritesLost bool `json:"writes_lost,omitempty"`
+	// Discarded says the guest asked for it to be discarded, recorded before its
+	// detach: nothing publishes it after that, whatever becomes of the detach, which
+	// can fail having heard of lost writes it keeps for a detach that never comes.
+	Discarded bool `json:"discarded,omitempty"`
 }
+
+// refused says nothing may publish the attachment: its writes were lost, or the
+// guest discarded it.
+func (a *cacheAttachment) refused() bool { return a.WritesLost || a.Discarded }
 
 // NewCacheService constructs a node-local cache endpoint.
 func NewCacheService(
@@ -1802,8 +1810,8 @@ func (s *CacheService) publishDocker(
 	session *cacheSession,
 	attachment *cacheAttachment,
 ) error {
-	if attachment.WritesLost {
-		return errWritesLost
+	if attachment.refused() {
+		return refusalOf(attachment)
 	}
 	if err := s.attacher.DetachVolume(ctx, session.instance, 0, s.detachDevice(ctx, attachment.Volume)); err != nil {
 		if writesLost(err) {
@@ -2082,9 +2090,9 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	// WHAT LOST WRITES IS NEVER PUBLISHED OR DEFERRED, and a commit asked again is
 	// told so: the clone stays in the session's custody, and its cleanup discards it.
 	lostWrites := func() {
-		writeCacheJSON(w, http.StatusOK, map[string]any{"published": false, "reason": errWritesLost.Error()})
+		writeCacheJSON(w, http.StatusOK, map[string]any{"published": false, "reason": refusalOf(attachment).Error()})
 	}
-	if attachment.WritesLost {
+	if attachment.refused() {
 		lostWrites()
 
 		return
@@ -2262,8 +2270,8 @@ func (s *CacheService) publishAcquired(
 	lease storecontract.WriterLease,
 	fence storecontract.FencingToken,
 ) (storecontract.Candidate, publishStep, error) {
-	if attachment.WritesLost {
-		return storecontract.Candidate{}, stepSnapshot, errors.Join(errWritesLost, s.releaseWriter(ctx, lease, fence))
+	if attachment.refused() {
+		return storecontract.Candidate{}, stepSnapshot, errors.Join(refusalOf(attachment), s.releaseWriter(ctx, lease, fence))
 	}
 	candidate, err := s.store.Snapshot(ctx, attachment.Volume)
 	s.countedPublication(session.instance, "a cache snapshot", err)
@@ -2490,6 +2498,17 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 		writeCacheJSON(w, http.StatusOK, map[string]any{
 			"discarded": false, "reason": "the site's store is not answering",
 		})
+
+		return
+	}
+
+	// NOTHING PUBLISHES WHAT THE GUEST DISCARDED, recorded before the detach: a detach
+	// that fails can have heard of lost writes it keeps for the slot's next detach, and a
+	// deferred publication snapshots the volume after the compute is gone, with no detach
+	// to be told them.
+	attachment.Discarded = true
+	if err := s.persistSession(session); err != nil {
+		s.nonFatalCommit(w, session, "record the discard", err)
 
 		return
 	}

@@ -102,8 +102,8 @@ func (s *CacheService) publishDeferred(
 	if !attachment.Ready || attachment.Intent == nil {
 		return abandon("the attachment was never proved ready to publish")
 	}
-	if attachment.WritesLost {
-		return abandon(errWritesLost.Error())
+	if attachment.refused() {
+		return abandon(refusalOf(attachment).Error())
 	}
 	deadline := attachment.Intent.At.Add(publishWindow)
 	if !s.now().Before(deadline) {
