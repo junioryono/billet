@@ -33,6 +33,7 @@ replay-policies
 target-weights
 egress-allowlist
 bare-metal-hosts
+pool-release-energy
 job-statistics
 cache-breaker
 docker-builder
@@ -67,6 +68,7 @@ docker-builder
 | [Weights between targets](target-weights.md) | `targets[].weight` replayed through billet's real scheduler on 2026-11-04: two saturating targets at 2:1 holding 64% to 66% of the contested vCPU (1.83:1 on 16 slots, 1.94:1 on 64, the gap the size of a lease), about 1:1 with no weight, an idle target's rival holding the whole fleet, and the two starvations a replay of equal shapes could not show |
 | [Admission orders on replay](replay-policies.md) | `fair` against `fill` replayed through billet's real scheduler: on a whole-host shape beside smaller ones, `fill` starving the 32 vCPU jobs (p99 1h46m against 28m) and `fair` making every smaller shape wait behind them (8 vCPU p99 5h12m against 19m), and on the reference deployment's own week of 19,757 jobs, `fill` making the 16 vCPU jobs wait (p99 3h59m against 11m) and `fair` the 8 vCPU ones (p99 2h30m against 56m). |
 | [The egress allowlist](egress-allowlist.md) | a tier's allowlist in a real Firecracker guest: an allowed name connects, any other name, a hard-coded address, an outside resolver and IPv6 are refused and recorded by the host; and the kernel's behaviour behind each rule, including the frame a bridge's hooks never see, on kernels 7.0 and 6.8 |
+| [The pool's release, priced in idle energy](pool-release-energy.md) | a synthetic work week replayed through the pool's real scaler on 2026-11-14: releasing a host idle past `idle_after` removed 94 to 98% of the idle host-hours a kept pool pays for (about 42 to 68 kWh a week at the reference EPYC's 149.9 W idle draw), at a p99 queue wait two to three minutes longer with a 3-minute lead time and about one lead time longer with a 15-minute one; 20 minutes the value to start from |
 | [Bare-metal hosts](bare-metal-hosts.md) | what rented bare metal measured on 2026-11-05: four AWS metal types from the launch call to a running script in 21 to 47 s, which of them fit a 4 GiB per vCPU pool with local NVMe, their NVMe throughput and single-thread speed alone and under full load; and phoenixNAP's catalogue, stock per location, a new account's one-server quota and the order its API refused (#553) |
 | [Reading the ledger back](job-statistics.md) | `billet jobs stats`, `billet jobs rightsize` and `billet migrate workflows` against the reference deployment's week and GitHub's record of it: 78 of billet's own jobs agreeing with GitHub, what a re-run of failed jobs records under each attempt, why a recommendation reads the job's own window and its VM's memory rather than the usage summary, two jobs recomputed by hand, and GitHub's hosted labels on 2026-11-03 |
 | [A store that stops answering](cache-breaker.md) | the store breaker's deadlines, and a real Ceph site with its cache index's lock held, its cache pool's OSDs stopped and its monitors out of reach |
