@@ -586,6 +586,62 @@ func TestAWriteBackOfAnotherDiskIsNoAnswer(t *testing.T) {
 	})
 }
 
+// A DETACH THAT GAVE UP WHILE ITS WRITE-BACK RAN LEAVES ITS ANSWER FOR THE SLOT'S NEXT,
+// even one handed no device, as a detach whose proof of the device failed is: the
+// device the slot's write-back was of is asked again while the slot still holds it.
+func TestAWriteBackADetachGaveUpOnIsToldToTheSlotsNext(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	var vmm *fakeVMM
+	h.onJailer = func(id string) { vmm = h.serveVMM(t, id) }
+	spec := aSpec()
+	spec.CacheEndpoint = "http://172.20.0.1:7718"
+	spec.CacheToken = strings.Repeat("b", 64)
+	spec.BuildKitCacheMountLimit = 4 << 30
+	inst, err := h.p.Launch(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := h.p.AttachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); err != nil {
+		t.Fatalf("AttachVolume: %v", err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	opens := 0
+	h.p.openDisk = func(string) (diskHandle, error) {
+		opens++
+		if opens > 1 {
+			return syncedDisk{}, nil
+		}
+
+		return syncedDisk{sync: func() error {
+			close(entered)
+			<-release
+
+			return errors.New("input/output error")
+		}}, nil
+	}
+	h.p.diskSeq = func(string) (string, bool) { return "7", true }
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		<-entered
+		cancel()
+	}()
+	if err := h.p.DetachVolume(ctx, inst.ID, 0, "/dev/nvme9n1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a detach whose time ran out during its write-back answered %v", err)
+	}
+	close(release)
+	forgotten(t, h.p)
+
+	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, ""); !errors.Is(err, provider.ErrWritesLost) {
+		t.Fatalf("the slot's next detach, handed no device, answered %v, want the lost writes", err)
+	}
+	if cache0Patches(vmm) != 2 {
+		t.Errorf("cache0 had %d PATCH(es); the second detach must still detach", cache0Patches(vmm))
+	}
+}
+
 // A DETACH THAT FAILED IS NOT ONE THAT LOST WRITES, AND KEEPS THEM FOR THE NEXT.
 // ErrWritesLost promises the volume is detached, so a PATCH that failed answers only
 // its failure, and the next detach, whose PATCH goes through, is told what was lost.

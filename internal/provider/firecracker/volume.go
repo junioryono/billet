@@ -87,6 +87,16 @@ func (p *Provider) DetachVolume(
 	if device != "" && !p.slotHolds(j.volumePath(slot), device) {
 		device = ""
 	}
+	// A DETACH HANDED NO DEVICE IS NOT ONE WITH NOTHING TO HEAR: an earlier detach of
+	// the slot that gave up while its write-back ran left that write-back's answer for
+	// its device, and a detach whose proof of the device failed is handed none. The
+	// device the slot's unfinished detach wrote back is asked again, while the slot
+	// still holds that very block device.
+	if remembered := p.slotDevice(instanceID, slot); device == "" && remembered != "" &&
+		p.slotHolds(j.volumePath(slot), remembered) {
+		device = remembered
+	}
+	p.rememberSlotDevice(instanceID, slot, device)
 	lost := p.flushBefore(ctx, device)
 	if lost != nil && !errors.Is(lost, provider.ErrWritesLost) {
 		return fmt.Errorf("firecracker: write cache slot %d of %s back before detaching it: %w",
@@ -116,6 +126,7 @@ func (p *Provider) DetachVolume(
 
 		return fmt.Errorf("firecracker: detach cache slot %d from %s: %w", slot, instanceID, err)
 	}
+	p.forgetSlotDevice(instanceID, slot)
 	if lost != nil {
 		return fmt.Errorf("firecracker: cache slot %d of %s is detached: %w", slot, instanceID, lost)
 	}
@@ -257,6 +268,38 @@ func (p *Provider) keepSlotLoss(instanceID string, slot int, lost error) {
 		p.slotLosses = map[string]error{}
 	}
 	p.slotLosses[slotKey(instanceID, slot)] = lost
+}
+
+// rememberSlotDevice records device as the one the slot's detach writes back; a
+// detach handed no device keeps what an earlier one remembered.
+func (p *Provider) rememberSlotDevice(instanceID string, slot int, device string) {
+	if device == "" {
+		return
+	}
+
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+
+	if p.slotDevices == nil {
+		p.slotDevices = map[string]string{}
+	}
+	p.slotDevices[slotKey(instanceID, slot)] = device
+}
+
+// forgetSlotDevice forgets the slot's device once its detach has succeeded.
+func (p *Provider) forgetSlotDevice(instanceID string, slot int) {
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+
+	delete(p.slotDevices, slotKey(instanceID, slot))
+}
+
+// slotDevice is the device the slot's unfinished detach wrote back, if any.
+func (p *Provider) slotDevice(instanceID string, slot int) string {
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+
+	return p.slotDevices[slotKey(instanceID, slot)]
 }
 
 // takeSlotLoss is the loss kept for the slot, taken out so it is told once.

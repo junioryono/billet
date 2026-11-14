@@ -389,8 +389,11 @@ func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
 //
 // EACH IN ITS OWN CONTEXT: a block's read error carries its errno in parentheses, the
 // others name the inode, so a directory entry named "Error reading block 1" in a
-// report of real damage is not one (a content-addressed volume's names are digests
-// the node chose, but the check does not lean on that).
+// report of real damage is not one. A name can still be made to contain any of them,
+// and text alone cannot tell it from e2fsck's own words; the check is asked only of a
+// content-addressed volume (GenerationDamaged's one caller), whose every name is a
+// digest or a table the node chose, and a name taken for a read failure answers
+// could-not-tell, which publishes nothing.
 var readFailure = regexp.MustCompile(`Error reading block [0-9]+ \(|` +
 	`Error reading extended attribute block [0-9]+ for inode|` +
 	`Error while reading over extent tree in inode|resulted in short read`)

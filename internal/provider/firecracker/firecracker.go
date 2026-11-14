@@ -205,8 +205,10 @@ type Provider struct {
 	unreported map[string]writesLoss
 	diskSeq    func(device string) (string, bool)
 	// slotLosses is the lost writes a detach that then failed heard, by instance and
-	// slot (slotKey), told to the slot's next detach whatever device it is handed.
-	slotLosses map[string]error
+	// slot (slotKey), told to the slot's next detach whatever device it is handed;
+	// slotDevices the device each slot's unfinished detach wrote back.
+	slotLosses  map[string]error
+	slotDevices map[string]string
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
