@@ -1308,7 +1308,7 @@ func TestTheMatrixHostsLiftWaitsForABlockOnItsWay(t *testing.T) {
 	t.Parallel()
 	f, dir := s3BlockFakes(t)
 	f.fixture(t, "hold", "")
-	start := func(args ...string) (*exec.Cmd, *strings.Builder, chan error) {
+	start := func(args ...string) (*strings.Builder, chan error) {
 		t.Helper()
 		abs, err := filepath.Abs("acceptance/matrix-host.sh")
 		if err != nil {
@@ -1334,7 +1334,7 @@ func TestTheMatrixHostsLiftWaitsForABlockOnItsWay(t *testing.T) {
 			}
 		})
 
-		return cmd, &out, done
+		return &out, done
 	}
 	waitFor := func(name string) {
 		t.Helper()
@@ -1346,9 +1346,9 @@ func TestTheMatrixHostsLiftWaitsForABlockOnItsWay(t *testing.T) {
 		}
 	}
 
-	_, blockOut, blocked := start("block-s3", dir, "us-west-2", "3300")
+	blockOut, blocked := start("block-s3", dir, "us-west-2", "3300")
 	waitFor(filepath.Join(f.dir, "holding"))
-	_, liftOut, lifted := start("unblock-s3", dir, "us-west-2")
+	liftOut, lifted := start("unblock-s3", dir, "us-west-2")
 	waitFor(filepath.Join(dir, "s3-unblock-requested"))
 	// THE LIFT MUST STILL BE WAITING while the block holds the lock: one that returned here
 	// lifted nothing, and the block about to land would stay.
