@@ -77,9 +77,10 @@ The acceptance lane's store-unreachable phase ran in run `43590137207` ([aws-acc
 
 | UTC | What happened |
 |---|---|
-| 13:02:19 | Four x64 guests ask for their image store. |
-| 13:02:49 | Three of them wait the full deadline (30.001 s) and go cold. The breaker opens: `failures=3 reason=timeout last="a clone"`. |
-| 13:03:03 | The fourth, whose call was already out, goes cold at its own deadline. |
+| 13:02:19 | Three x64 guests ask for their image store. |
+| 13:02:33 | A fourth asks, 14 s later. |
+| 13:02:49 | The first three wait the full deadline (30.001 s) and go cold. The breaker opens: `failures=3 reason=timeout last="a clone"`. |
+| 13:03:03 | The fourth, whose call was already out, goes cold at its own deadline, 30.001 s after it asked. |
 | 13:03:25 onward | Every later call is answered at once, with the store unasked. The four jobs' sticky disks, builder state and Actions cache, and all eight later jobs' caches, record `bypassed`. |
 | 13:03:33 to 13:11:26 | As each job ends: "the site's store is not answering, so this job's Docker image store is not published". |
 
@@ -98,7 +99,7 @@ The acceptance lane's store-unreachable phase ran in run `43590137207` ([aws-acc
 ## What this does not establish
 
 - **An ebs-s3 store that comes back.** The breaker opened on a real ebs-s3 site (above); its probe, probation and close were measured on Ceph only.
-- **A bare host.** Every timing here is under nested virtualization.
-- **The metric.** `billet_cache_breaker_open` was not scraped, because the node had no metrics address. The breaker's report reached `billet status` through the ledger.
-- **Warm Docker image stores.** The tier was untrusted, so it published no image store, and every attach was a fresh volume. Sticky disks were warm, and those were clones.
+- **A bare host.** Every Ceph timing here is under nested virtualization. The ebs-s3 node was an ordinary EC2 instance launching per-job guests, with no nesting.
+- **The metric.** `billet_cache_breaker_open` was not scraped in either run, because neither node had a metrics address. On Ceph the breaker's report reached `billet status` through the ledger.
+- **Warm Docker image stores on Ceph.** The Ceph tier was untrusted, so it published no image store, and every attach was a fresh volume. Sticky disks were warm, and those were clones. The ebs-s3 tiers were trusted, and their image stores had been published before the store was cut off.
 - **One thing seen and not fixed here.** After the OSD leg and a restart, deferred sticky-disk publications verified device paths that by then held other images, a guest's root disk among them, and each failed closed until its window ended: #743.
