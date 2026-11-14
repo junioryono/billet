@@ -159,7 +159,7 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		return provider.Spec{
 			Name: name, Image: env.image, VCPU: vcpu, Memory: memory, Trust: provider.TrustTrusted,
 			Command: []string{"/bin/bash", "-c", snapshotStartWaiter, "waiter", snapshotStartPlaceholder,
-				"http://" + mmdsAddress, strconv.Itoa(snapshotStartPort)},
+				"http://" + mmdsAddress, strconv.Itoa(snapshotStartPort), snapshotStartRenew},
 			JITConfig: jit,
 		}
 	}
@@ -255,6 +255,15 @@ type startTrial struct {
 // waits for the metadata to stop saying.
 const snapshotStartPlaceholder = "billet-snapshot-start-placeholder"
 
+// snapshotStartRenew is what a guest's waiter runs once registered: a renewal of
+// its DHCP lease, as the runner account, which may sudo in the image.
+const snapshotStartRenew = "sudo -n networkctl renew eth0"
+
+// forkLifetime bounds how long a fork can live: five minutes to register, twenty
+// to finish its job, and the restore and teardown around them. A fork is restored
+// only while the golden's lease outlives it, renewed or not.
+const forkLifetime = 30 * time.Minute
+
 // snapshotStartPort is where a waiter serves its state, inside the guest.
 const snapshotStartPort = 47231
 
@@ -266,9 +275,10 @@ const snapshotStartPort = 47231
 // the host, having sampled the guest's memory, releases it with a POST; runs the
 // runner with it; and then holds on, listener and all, until the host destroys the
 // guest, since the agent's service ending would take the listener with it. Once
-// registered it renews its DHCP lease in the background: a fork resumes with its
-// golden's lease timers and lives minutes, so without this none would renew, and
-// the bridge's DHCP would let the golden's address go after an hour.
+// registered it runs $4 in the background, which in a guest renews its DHCP lease
+// (snapshotStartRenew): a fork resumes with its golden's lease timers and lives
+// minutes, so without this none would renew, and the bridge's DHCP would let the
+// golden's address go an hour after the golden booted.
 //
 // A fresh token for every read, since a restored VMM knows none the golden's did,
 // and every read bounded to a second, since one in flight at the capture is
@@ -311,7 +321,7 @@ while :; do
 	sleep 0.02
 done
 printf 'registered %s\n' "$(date +%s%3N)" >>"$state"
-( sudo -n networkctl renew eth0 >/dev/null 2>&1 & )
+( bash -c "$4" >/dev/null 2>&1 & )
 while [ ! -e "$state.release" ]; do sleep 0.01; done
 printf 'released %s\n' "$(date +%s%3N)" >>"$state"
 ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" ./run.sh
@@ -342,29 +352,32 @@ func lineOf(state, step string) (string, bool) {
 	return "", false
 }
 
-// releaseWaiter tells a waiter holding at its registration to run the runner.
-func releaseWaiter(ctx context.Context, addr string, port int) error {
+// releaseWaiter tells a waiter holding at its registration to run the runner,
+// and answers when the release was first sent, which is no later than the waiter
+// acted on it: a first POST whose reply was lost may already have released it.
+func releaseWaiter(ctx context.Context, addr string, port int) (time.Time, error) {
 	client := &http.Client{Timeout: time.Second}
 	url := fmt.Sprintf("http://%s:%d/release", addr, port)
-	deadline := time.Now().Add(10 * time.Second)
+	first := time.Now()
+	deadline := first.Add(10 * time.Second)
 	for {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, http.NoBody)
 		if err != nil {
-			return err
+			return first, err
 		}
 		resp, err := client.Do(req)
 		if err == nil {
 			err = resp.Body.Close()
 			if err == nil && resp.StatusCode == http.StatusOK {
-				return nil
+				return first, nil
 			}
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("release the waiter at %s: %w", url, err)
+			return first, fmt.Errorf("release the waiter at %s: %w", url, err)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return first, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
@@ -387,13 +400,17 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		return err
 	}
 
-	// A FORK ONLY WHILE THE GOLDEN'S ADDRESS IS STILL ITS OWN, for long enough to
-	// run a trial: a lease about to lapse, or the address given to another MAC,
-	// would put the fork on an address a production guest holds.
+	// A FORK ONLY WHILE THE GOLDEN'S ADDRESS IS STILL ITS OWN for longer than the
+	// fork can live, whether or not the fork's renewal works: a lease that could
+	// lapse under it, or the address given to another MAC, would put the fork on an
+	// address a production guest holds. A renewal that fails ends the restores
+	// early instead.
 	if arm == "restore" {
-		if err := goldenLeaseHolds(leases, goldenMAC, goldenAddr, 10*time.Minute, time.Now()); err != nil {
+		left, err := goldenLeaseHolds(leases, goldenMAC, goldenAddr, forkLifetime, time.Now())
+		if err != nil {
 			return fmt.Errorf("%w: %w", errLeaseLost, err)
 		}
+		fields["golden_lease_left_s"] = left.Seconds()
 	}
 
 	name := provider.InstanceName(freshLease(t))
@@ -492,10 +509,13 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		return err
 	}
 	fields["memory_at_registered"] = smapsRollup(pid)
-	if err := releaseWaiter(t.Context(), addr, snapshotStartPort); err != nil {
+	// THE SAMPLE THIRTY SECONDS ON COUNTS FROM THE FIRST POST, which is no later than
+	// the release; how long it took to be acknowledged is recorded beside it.
+	released, err := releaseWaiter(t.Context(), addr, snapshotStartPort)
+	fields["release_acknowledged_ms"] = time.Since(released).Milliseconds()
+	if err != nil {
 		return err
 	}
-	released := time.Now()
 
 	if arm == "restore" {
 		// THE FORK IS THE GOLDEN ON THE WIRE: its MAC, on its own tap.
@@ -620,13 +640,17 @@ func leasedAddress(ctx context.Context, leases, mac string, limit time.Duration)
 
 // goldenLeaseHolds refuses unless the lease file gives addr to mac, with at least
 // minRemaining left at now (an expiry of 0 never lapses), and gives addr to no
-// other MAC.
-func goldenLeaseHolds(leases, mac, addr string, minRemaining time.Duration, now time.Time) error {
+// other MAC, and answers how long it has left (a lease that never lapses, the
+// longest a Duration holds).
+func goldenLeaseHolds(leases, mac, addr string, minRemaining time.Duration, now time.Time) (time.Duration,
+	error,
+) {
 	raw, err := os.ReadFile(leases)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	held := false
+	var left time.Duration
 	for _, l := range strings.Split(string(raw), "\n") {
 		// expiry mac address hostname client-id
 		fields := strings.Fields(l)
@@ -634,22 +658,26 @@ func goldenLeaseHolds(leases, mac, addr string, minRemaining time.Duration, now 
 			continue
 		}
 		if !strings.EqualFold(fields[1], mac) {
-			return fmt.Errorf("%s is leased to %s, not the golden's %s", addr, fields[1], mac)
+			return 0, fmt.Errorf("%s is leased to %s, not the golden's %s", addr, fields[1], mac)
 		}
 		expiry, err := strconv.ParseInt(fields[0], 10, 64)
 		if err != nil {
-			return fmt.Errorf("the lease of %s has expiry %q", addr, fields[0])
+			return 0, fmt.Errorf("the lease of %s has expiry %q", addr, fields[0])
 		}
-		if left := time.Unix(expiry, 0).Sub(now); expiry != 0 && left < minRemaining {
-			return fmt.Errorf("the lease of %s to %s has %s left", addr, mac, left.Round(time.Second))
+		left = time.Duration(1<<63 - 1)
+		if expiry != 0 {
+			left = time.Unix(expiry, 0).Sub(now)
+		}
+		if left < minRemaining {
+			return 0, fmt.Errorf("the lease of %s to %s has %s left", addr, mac, left.Round(time.Second))
 		}
 		held = true
 	}
 	if !held {
-		return fmt.Errorf("%s is not leased to %s", addr, mac)
+		return 0, fmt.Errorf("%s is not leased to %s", addr, mac)
 	}
 
-	return nil
+	return left, nil
 }
 
 // takeJIT waits for a JIT configuration to arrive, reads it and removes it, so a
@@ -803,13 +831,27 @@ func TestAForkRunsOnlyOnALeaseStillItsOwn(t *testing.T) {
 		if err := os.WriteFile(path, []byte(c.leases), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := goldenLeaseHolds(path, mac, addr, 10*time.Minute, now); (err == nil) != c.ok {
+		if _, err := goldenLeaseHolds(path, mac, addr, 10*time.Minute, now); (err == nil) != c.ok {
 			t.Errorf("%s: admitted %v (%v), want %v", c.name, err == nil, err, c.ok)
 		}
 	}
-	if err := goldenLeaseHolds(filepath.Join(t.TempDir(), "absent"), mac, addr, 0, now); err == nil {
+	if left, err := goldenLeaseHolds(anHourLeaseFile(t), mac, addr, 0, now); err != nil || left != time.Hour {
+		t.Errorf("a lease with an hour left answered %s (%v)", left, err)
+	}
+	if _, err := goldenLeaseHolds(filepath.Join(t.TempDir(), "absent"), mac, addr, 0, now); err == nil {
 		t.Error("a lease file that could not be read was taken to hold the lease")
 	}
+}
+
+// anHourLeaseFile is a lease file giving the test's golden address an hour from its now.
+func anHourLeaseFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "dnsmasq.leases")
+	if err := os.WriteFile(path, []byte("1731603600 02:00:00:00:00:0a 172.31.0.42 * *\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	return path
 }
 
 // THE WAITER WAITS FOR A REAL REGISTRATION AND SAYS WHAT IT DID: against a stand-in
@@ -872,6 +914,9 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 
 	dir := t.TempDir()
 	seen := filepath.Join(dir, "seen")
+	// A RECORDER IN PLACE OF THE GUEST'S RENEWAL, so the host's own networking is
+	// never touched.
+	renewed := filepath.Join(dir, "renewed")
 	runner := "#!/bin/sh\nprintf '%s' \"$ACTIONS_RUNNER_INPUT_JITCONFIG\" >" + seen + "\nexit 3\n"
 	if err := os.WriteFile(filepath.Join(dir, "run.sh"), []byte(runner), 0o755); err != nil {
 		t.Fatal(err)
@@ -880,7 +925,7 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	// A PROCESS GROUP OF ITS OWN, so the listener and the sleep the waiter leaves
 	// behind are ended with it.
 	cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", snapshotStartWaiter, "waiter",
-		snapshotStartPlaceholder, mmds.URL, strconv.Itoa(port))
+		snapshotStartPlaceholder, mmds.URL, strconv.Itoa(port), "printf renewed >"+renewed)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "TMPDIR="+dir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -933,7 +978,7 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	if _, err := os.Stat(seen); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the runner ran before the waiter was released (%v)", err)
 	}
-	if err := releaseWaiter(t.Context(), "127.0.0.1", port); err != nil {
+	if _, err := releaseWaiter(t.Context(), "127.0.0.1", port); err != nil {
 		t.Fatal(err)
 	}
 
@@ -958,6 +1003,9 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	}
 	if got, err := os.ReadFile(seen); err != nil || string(got) != "a-real-registration" {
 		t.Errorf("the runner was given %q (%v); want the real registration", got, err)
+	}
+	if got, err := os.ReadFile(renewed); err != nil || string(got) != "renewed" {
+		t.Errorf("the waiter did not run its renewal (%q, %v)", got, err)
 	}
 	// AND IT HOLDS ON, listener and all, until the host destroys the guest.
 	select {
