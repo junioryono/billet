@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 	"strings"
 	"time"
@@ -19,6 +20,30 @@ const stepDestinationsShown = 3
 // stepDestinationsLabel heads a step's destinations wherever a report shows them.
 const stepDestinationsLabel = "destinations, by when each connection opened"
 
+// stepDestinationsClock is said once wherever a report shows a step's
+// destinations, with or without a series: the step is on GitHub's clock and the
+// connections on the host's, with no correction for skew between them, so a
+// connection opened near a step's edge can be counted in the step beside it.
+const stepDestinationsClock = "a step's destinations are by when each connection opened, on the host's " +
+	"clock against GitHub's for the step, with no correction for skew between them, so a connection " +
+	"opened near a step's edge can be counted in the step beside it"
+
+// splitByTime says a job's destinations were split by when each connection
+// opened, so its steps have destinations to show.
+func splitByTime(measured *alloc.RecordedUsage) bool {
+	return measured != nil && measured.Destinations != nil && measured.Destinations.OpeningSeconds > 0
+}
+
+// sentence is s with its first letter capitalised and a full stop after it, for
+// a page that sets a note as a sentence.
+func sentence(s string) string {
+	if s == "" {
+		return s
+	}
+
+	return strings.ToUpper(s[:1]) + s[1:] + "."
+}
+
 // stepDestinations words where a step's traffic went: the destinations its
 // connections opened to between its start and its end, largest first, from the
 // host's connection tracker. It is empty for a job whose destinations were not
@@ -27,24 +52,21 @@ const stepDestinationsLabel = "destinations, by when each connection opened"
 // a step talked to nothing.
 //
 // BY WHEN A CONNECTION OPENED: a connection's bytes are all in the bucket it
-// opened in, so one open across two steps is the first one's, and one opened in
-// the second before a step's end and still running is that step's. A bucket
-// wider than a second is placed by its start, which the words say.
-//
-// ON TWO CLOCKS, as a step's usage is: GitHub's for the step and the host's for
-// the connection, with no correction for skew between them.
+// opened in, so one open across two steps is the first one's. A bucket wider
+// than a second is placed by its start, which the words say. Every figure is
+// what was counted in the step's buckets, never a bound on the step's own: the
+// clocks differ, and a bucket can straddle the step's end.
 func stepDestinations(d *alloc.JobDestinations, from, to time.Time) string {
 	if d == nil || d.OpeningSeconds == 0 || !from.Before(to) {
 		return ""
 	}
 
-	// rank is the total's size for ordering, as a float so it holds the sum of
-	// every opening exactly enough to rank, where the shown counts are held at
-	// the largest int64.
+	// rank is the sum of every opening's bytes, exact in 128 bits, where the
+	// shown counts are held at the largest int64.
 	type total struct {
 		ordinal                     int
 		sent, received, connections int64
-		rank                        float64
+		rankHi, rankLo              uint64
 	}
 	byOrdinal := map[int]*total{}
 	for _, o := range d.Openings {
@@ -60,12 +82,13 @@ func stepDestinations(d *alloc.JobDestinations, from, to time.Time) string {
 		t.sent = addCapped(t.sent, o.SentBytes)
 		t.received = addCapped(t.received, o.ReceivedBytes)
 		t.connections = addCapped(t.connections, o.Connections)
-		t.rank += float64(o.SentBytes) + float64(o.ReceivedBytes)
+		for _, v := range []int64{o.SentBytes, o.ReceivedBytes} {
+			var carry uint64
+			t.rankLo, carry = bits.Add64(t.rankLo, uint64(v), 0)
+			t.rankHi += carry
+		}
 	}
 
-	// A BUCKET WIDER THAN A SECOND IS PLACED BY ITS START, so a step's figures
-	// are its buckets', which can hold a connection that opened just after the
-	// step: not a bound on the step's own, which the words never claim.
 	prefix := ""
 	if d.OpeningSeconds > 1 {
 		prefix = fmt.Sprintf("to within %ds (each connection counted in the step its %d-second bucket "+
@@ -73,54 +96,57 @@ func stepDestinations(d *alloc.JobDestinations, from, to time.Time) string {
 	}
 	// AN INCOMPLETE CAPTURE PROVES NOTHING ABSENT: the job's flows may have been
 	// missed anywhere in its life, so a step where none was seen is not a step
-	// that opened none. At one second a bucket is the step's, so what was seen is
-	// a lower bound; wider, it is only what was seen.
+	// that opened none, and what was seen in one is only that.
 	if d.Incomplete {
 		if len(byOrdinal) == 0 {
 			return prefix + "no connection seen opening in this step, though the job's flows are incomplete, " +
 				"so some may have been missed"
 		}
-		if d.OpeningSeconds == 1 {
-			prefix += "at least, since the job's flows are incomplete: "
-		} else {
-			prefix += "what was seen, since the job's flows are incomplete: "
-		}
+		prefix += "what was seen, since the job's flows are incomplete: "
 	}
 	if len(byOrdinal) == 0 {
 		return prefix + "no connection opened in this step"
 	}
 
-	all := make([]*total, 0, len(byOrdinal))
+	// THE TRAFFIC BEYOND THE NAMED DESTINATIONS IS NEVER RANKED AMONG THEM: it is
+	// any number of addresses, so it is said apart, last, as itself.
+	beyond := byOrdinal[alloc.MaxJobDestinations]
+	named := make([]*total, 0, len(byOrdinal))
 	for _, t := range byOrdinal {
-		all = append(all, t)
+		if t != beyond {
+			named = append(named, t)
+		}
 	}
 	// LARGEST FIRST, AND THE ORDER IS TOTAL: equal totals fall back to the
 	// ordinal, which is the job's own largest-first order.
-	// Ranked by every opening's bytes, so totals past an int64 still rank by
-	// their size rather than tying at the cap.
-	slices.SortFunc(all, func(x, y *total) int {
-		return cmp.Or(cmp.Compare(y.rank, x.rank), cmp.Compare(x.ordinal, y.ordinal))
+	slices.SortFunc(named, func(x, y *total) int {
+		return cmp.Or(cmp.Compare(y.rankHi, x.rankHi), cmp.Compare(y.rankLo, x.rankLo),
+			cmp.Compare(x.ordinal, y.ordinal))
 	})
 
-	name := func(ordinal int) string {
-		if ordinal == alloc.MaxJobDestinations || ordinal >= len(d.Destinations) {
-			return "traffic beyond the named destinations"
+	traffic := func(sent, received, connections int64) string {
+		return fmt.Sprintf("sent %s, received %s, %s", cli.HumanBytes(sent), cli.HumanBytes(received),
+			connectionsText(connections))
+	}
+	parts := make([]string, 0, stepDestinationsShown+2)
+	for _, t := range named[:min(len(named), stepDestinationsShown)] {
+		addr := "an address the report does not name"
+		if t.ordinal < len(d.Destinations) {
+			addr = d.Destinations[t.ordinal].Addr
 		}
-		return d.Destinations[ordinal].Addr
+		parts = append(parts, fmt.Sprintf("%s (%s)", addr, traffic(t.sent, t.received, t.connections)))
 	}
-	parts := make([]string, 0, stepDestinationsShown+1)
-	for _, t := range all[:min(len(all), stepDestinationsShown)] {
-		parts = append(parts, fmt.Sprintf("%s (sent %s, received %s, %s)", name(t.ordinal),
-			cli.HumanBytes(t.sent), cli.HumanBytes(t.received), connectionsText(t.connections)))
-	}
-	if rest := all[min(len(all), stepDestinationsShown):]; len(rest) > 0 {
+	if rest := named[min(len(named), stepDestinationsShown):]; len(rest) > 0 {
 		var sent, received, connections int64
 		for _, t := range rest {
 			sent, received, connections = addCapped(sent, t.sent), addCapped(received, t.received),
 				addCapped(connections, t.connections)
 		}
-		parts = append(parts, fmt.Sprintf("and %d more (sent %s, received %s, %s)", len(rest),
-			cli.HumanBytes(sent), cli.HumanBytes(received), connectionsText(connections)))
+		parts = append(parts, fmt.Sprintf("%d more named (%s)", len(rest), traffic(sent, received, connections)))
+	}
+	if beyond != nil {
+		parts = append(parts, fmt.Sprintf("traffic beyond the named destinations (%s)",
+			traffic(beyond.sent, beyond.received, beyond.connections)))
 	}
 
 	return prefix + strings.Join(parts, "; ")

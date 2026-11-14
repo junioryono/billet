@@ -97,6 +97,9 @@ type pageSteps struct {
 	Why       string
 	Head      string
 	Alignment string
+	// DestinationsClock says how a step's destinations are placed, when the job's
+	// destinations were split by time; empty otherwise.
+	DestinationsClock string
 	// Aligned says each step's usage was read from the series; without it,
 	// Alignment says why none could be.
 	Aligned bool
@@ -336,6 +339,9 @@ func stepsSection(s jobSteps, tl *usage.Timeline, unaligned string, measured *al
 			"samples, with no correction for skew between them; within one sample interval, usage is split by time."
 	} else {
 		out.Alignment = "Usage per step: could not tell, because " + unaligned + "."
+	}
+	if splitByTime(measured) {
+		out.DestinationsClock = sentence(stepDestinationsClock)
 	}
 
 	var lo, hi time.Time

@@ -41,8 +41,9 @@ func fiveDestinations() *alloc.JobDestinations {
 
 // A STEP'S DESTINATIONS ARE THE CONNECTIONS THAT OPENED BETWEEN ITS START AND ITS
 // END, largest first: one opened the second before the step or at the second it
-// ends is another step's, the three largest are named, and the rest, the traffic
-// beyond the named destinations among them, are counted and totalled.
+// ends is another step's, the three largest are named, the rest of the named ones
+// are counted and totalled, and the traffic beyond the named destinations, which is
+// any number of addresses, is said apart and last.
 func TestAStepsDestinationsAreTheConnectionsThatOpenedInIt(t *testing.T) {
 	t.Parallel()
 
@@ -50,7 +51,8 @@ func TestAStepsDestinationsAreTheConnectionsThatOpenedInIt(t *testing.T) {
 	want := "10.0.0.2 (sent 400 B, received 1000 B, 2 connections); " +
 		"10.0.0.1 (sent 400 B, received 900 B, 1 connection); " +
 		"10.0.0.3 (sent 300 B, received 1000 B, 2 connections); " +
-		"and 2 more (sent 101 B, received 1002 B, 3 connections)"
+		"1 more named (sent 100 B, received 1000 B, 2 connections); " +
+		"traffic beyond the named destinations (sent 1 B, received 2 B, 1 connection)"
 	if got != want {
 		t.Errorf("stepDestinations =\n%q\nwant\n%q", got, want)
 	}
@@ -113,9 +115,9 @@ func TestAStepsDestinationsSayWhatTheyCannotTell(t *testing.T) {
 }
 
 // AN INCOMPLETE CAPTURE PROVES NOTHING ABSENT: a step where no connection was
-// seen says the job's flows may have been missed, and one where some were gives
-// its totals as lower bounds.
-func TestAStepsDestinationsFromAnIncompleteCaptureAreLowerBounds(t *testing.T) {
+// seen says the job's flows may have been missed, and one where some were says its
+// figures are what was seen, never a bound, since the clocks differ.
+func TestAStepsDestinationsFromAnIncompleteCaptureAreWhatWasSeen(t *testing.T) {
 	t.Parallel()
 
 	d := fiveDestinations()
@@ -125,7 +127,8 @@ func TestAStepsDestinationsFromAnIncompleteCaptureAreLowerBounds(t *testing.T) {
 		t.Errorf("a quiet step of an incomplete capture = %q", got)
 	}
 	if got := stepDestinations(d, t0, t0.Add(time.Minute)); !strings.HasPrefix(got,
-		"at least, since the job's flows are incomplete: 10.0.0.2 (sent 400 B") {
+		"what was seen, since the job's flows are incomplete: 10.0.0.2 (sent 400 B") ||
+		strings.Contains(got, "at least") {
 		t.Errorf("a busy step of an incomplete capture = %q", got)
 	}
 }
@@ -155,6 +158,34 @@ func TestAStepsLargestDestinationIsNamedPastAnInt64(t *testing.T) {
 	if got := stepDestinations(d, t0, t0.Add(time.Minute)); !strings.HasPrefix(got, "10.0.0.4 (") {
 		t.Errorf("the step's destinations = %q, want 10.0.0.4, the largest, first", got)
 	}
+
+	// EXACT PAST A FLOAT'S 53 BITS: one byte more is still more.
+	exact := &alloc.JobDestinations{OpeningSeconds: 1}
+	for i, addr := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"} {
+		sent := int64(1) << 53
+		if i == 3 {
+			sent++
+		}
+		exact.Destinations = append(exact.Destinations, alloc.JobDestination{Addr: addr, SentBytes: sent,
+			Connections: 1})
+		exact.Openings = append(exact.Openings, alloc.DestinationOpening{Ordinal: i, Start: t0.Unix(),
+			SentBytes: sent, Connections: 1})
+	}
+	if got := stepDestinations(exact, t0, t0.Add(time.Minute)); !strings.HasPrefix(got, "10.0.0.4 (") {
+		t.Errorf("the step's destinations = %q, want 10.0.0.4, one byte larger, first", got)
+	}
+
+	// THE TRAFFIC BEYOND THE NAMED DESTINATIONS IS SAID APART even when it is the
+	// largest, so it never takes a named one's place or counts as one.
+	big := fiveDestinations()
+	big.Other = alloc.JobDestination{SentBytes: 1 << 30, ReceivedBytes: 1 << 30, Connections: 100}
+	big.Openings[len(big.Openings)-1] = alloc.DestinationOpening{Ordinal: alloc.MaxJobDestinations,
+		Start: t0.Unix() + 30, SentBytes: 1 << 30, ReceivedBytes: 1 << 30, Connections: 100}
+	got := stepDestinations(big, t0, t0.Add(time.Minute))
+	if !strings.HasPrefix(got, "10.0.0.2 (") ||
+		!strings.HasSuffix(got, "traffic beyond the named destinations (sent 1.0 GiB, received 1.0 GiB, 100 connections)") {
+		t.Errorf("a step whose largest traffic is beyond the named destinations = %q", got)
+	}
 }
 
 // `billet jobs show` AND ITS PAGE PUT A STEP'S DESTINATIONS UNDER IT, with or
@@ -176,6 +207,10 @@ func TestJobsShowPutsAStepsDestinationsUnderIt(t *testing.T) {
 	if !strings.Contains(out.String(), want) {
 		t.Errorf("jobs show does not put the step's destinations under it:\n%s", out.String())
 	}
+	// THE CLOCKS ARE SAID ONCE, WITH NO SERIES TOO, since the destinations need none.
+	if strings.Count(out.String(), "on the host's clock against GitHub's") != 1 {
+		t.Errorf("jobs show does not say once which clocks a step's destinations are on:\n%s", out.String())
+	}
 
 	row := stepRow(step, nil, measured)
 	if !strings.HasPrefix(row.Destinations, "10.0.0.2 (sent 400 B") {
@@ -189,5 +224,9 @@ func TestJobsShowPutsAStepsDestinationsUnderIt(t *testing.T) {
 	}
 	if !strings.Contains(page.String(), html.EscapeString("Destinations, by when each connection opened: 10.0.0.2")) {
 		t.Errorf("the page does not put the step's destinations under it")
+	}
+	if !strings.Contains(page.String(), html.EscapeString("A step's destinations are by when each connection "+
+		"opened, on the host's clock against GitHub's")) {
+		t.Errorf("the page does not say which clocks a step's destinations are on")
 	}
 }

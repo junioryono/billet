@@ -143,6 +143,9 @@ func renderSteps(w io.Writer, s jobSteps) {
 			"its samples, with no correction for skew between them; within one sample interval, "+
 			"usage is split by time")
 	}
+	if splitByTime(s.measured) {
+		line("", "%s", stepDestinationsClock)
+	}
 	for _, step := range s.job.Steps {
 		renderStep(line, step, s.timeline, s.measured)
 	}
