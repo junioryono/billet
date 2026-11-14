@@ -49,6 +49,8 @@ import (
 //   - BILLET_VIRT_EXPERIMENT_SCRATCH: a filesystem of its own, mounted for the run,
 //     with at least scratchPerInstance free for each instance: their /tmp, go
 //     files and statuses, so a compile that fills it fills nothing billet keeps.
+//     It may not be the filesystem of /, billet's state or Docker's
+//     (scratchProtected), however it is reached.
 //   - BILLET_VIRT_EXPERIMENT_RUN: a label written on every line.
 //   - BILLET_VIRT_EXPERIMENT_IDLE_WATTS: the package's idle power, so each
 //     instance's share of the energy above it is what the node would attribute.
@@ -100,10 +102,18 @@ func TestRealVirtualizationCost(t *testing.T) {
 	case mode == "container" && image == "":
 		t.Fatal("BILLET_VIRT_EXPERIMENT_IMAGE names no image for the container")
 	}
-	scratch := os.Getenv("BILLET_VIRT_EXPERIMENT_SCRATCH")
-	if err := scratchHolds(scratch, instances); err != nil {
+	scratch, err := scratchHolds(os.Getenv("BILLET_VIRT_EXPERIMENT_SCRATCH"), instances, scratchProtected)
+	if err != nil {
 		t.Fatalf("BILLET_VIRT_EXPERIMENT_SCRATCH: %v", err)
 	}
+	// THE RESULTS FILE IS OPENED BEFORE ANYTHING STARTS, so a path that cannot take
+	// them (a FIFO nobody reads, a device) is refused while there is nothing to clean
+	// up, rather than blocking between the run and its cleanup.
+	file, err := openResults(out)
+	if err != nil {
+		t.Fatalf("BILLET_VIRT_EXPERIMENT_OUT: %v", err)
+	}
+	defer file.Close()
 	idle, err := strconv.ParseFloat(os.Getenv("BILLET_VIRT_EXPERIMENT_IDLE_WATTS"), 64)
 	if err != nil {
 		t.Fatalf("BILLET_VIRT_EXPERIMENT_IDLE_WATTS: %v", err)
@@ -138,8 +148,9 @@ func TestRealVirtualizationCost(t *testing.T) {
 	}
 
 	// ONE CLEANUP FOR EVERY INSTANCE, registered before any is made: stop them all
-	// at once, then remove their directories, each phase bounded, all within the
-	// ten minutes the run leaves.
+	// at once, then remove their directories, both phases within one five-minute
+	// deadline of the ten minutes the run leaves. What the deadline cuts short is
+	// reported, never removed after it.
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Minute)
 		defer cancel()
@@ -151,11 +162,12 @@ func TestRealVirtualizationCost(t *testing.T) {
 				defer stop.Done()
 				var removed int
 				removed, errs[i] = stopInstance(ctx, mode, in.name, runID)
-				// A CREATE WHOSE OUTCOME WAS NEVER KNOWN is settled only by removing what
-				// it made: two empty reads do not prove the daemon will not register it.
+				// A CREATE THAT FAILED is settled only by removing what it made: a failure
+				// does not say whether the daemon made the container, and two empty reads
+				// do not prove it will not register one.
 				if errs[i] == nil && in.createUnsettled && removed == 0 {
-					errs[i] = fmt.Errorf("its docker create never answered and no container of it was "+
-						"found; remove any container labelled billet-virtcost=%s once the daemon settles", runID)
+					errs[i] = fmt.Errorf("its docker create failed and no container of it was found; "+
+						"remove any container labelled billet-virtcost=%s if the daemon registers one", runID)
 				}
 			}()
 		}
@@ -165,8 +177,11 @@ func TestRealVirtualizationCost(t *testing.T) {
 				t.Errorf("stop %s: %v; its directory %s is left", in.name, errs[i], in.dir)
 				continue
 			}
-			if err := os.RemoveAll(in.dir); err != nil {
-				t.Errorf("remove %s: %v", in.dir, err)
+			// BOUNDED, and on this filesystem only: rm is killed at the deadline, and
+			// does not follow a mount a namespace left behind out of the scratch.
+			if out, err := exec.CommandContext(ctx, "rm", "-rf", "--one-file-system", "--", in.dir).
+				CombinedOutput(); err != nil {
+				t.Errorf("remove %s: %v: %s; what is left of it stays", in.dir, err, out)
 			}
 		}
 	})
@@ -190,11 +205,6 @@ func TestRealVirtualizationCost(t *testing.T) {
 	finished := time.Now()
 	hostBusySeconds := float64(hostBusyJiffies(t)-hostBusyBefore) / userHZ
 
-	file, err := os.OpenFile(out, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		t.Fatalf("open the results file: %v", err)
-	}
-	defer file.Close()
 	encoder := json.NewEncoder(file)
 	for i, in := range all {
 		line := map[string]any{
@@ -246,34 +256,79 @@ func TestRealVirtualizationCost(t *testing.T) {
 // and its tests in /tmp, about 3 GiB together on the reference node.
 const scratchPerInstance = 6 * config.GiB
 
-// scratchHolds refuses a scratch directory that is not a filesystem of its own,
-// mounted there (its device differs from its parent's), or that has less than
-// scratchPerInstance free for each instance. What fills it then fills nothing the
-// node or its ledger keeps.
-func scratchHolds(dir string, instances int) error {
+// scratchProtected are the paths whose filesystems the scratch may not be: the
+// root, billet's state (the ledger and the node's records) and Docker's storage.
+// One that does not exist protects nothing.
+var scratchProtected = []string{"/", "/var/lib/billet", "/var/lib/docker"}
+
+// scratchHolds admits a scratch directory and answers the path to use: dir with
+// every symlink resolved, so what is checked is what is written. It refuses one
+// that is not a filesystem of its own, mounted there (its device differs from its
+// parent's), one on the filesystem of any protected path, which a bind mount of
+// that filesystem is, and one with less than scratchPerInstance free for each
+// instance. What fills it then fills nothing the node or its ledger keeps.
+func scratchHolds(dir string, instances int, protected []string) (string, error) {
 	if dir == "" || !filepath.IsAbs(dir) {
-		return fmt.Errorf("%q is not an absolute path", dir)
+		return "", fmt.Errorf("%q is not an absolute path", dir)
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", err
 	}
 	var here, parent unix.Stat_t
-	if err := unix.Stat(dir, &here); err != nil {
-		return err
+	if err := unix.Stat(resolved, &here); err != nil {
+		return "", err
 	}
-	if err := unix.Stat(filepath.Dir(dir), &parent); err != nil {
-		return err
+	if err := unix.Stat(filepath.Dir(resolved), &parent); err != nil {
+		return "", err
 	}
 	if here.Dev == parent.Dev {
-		return fmt.Errorf("%s is on its parent's filesystem; mount a filesystem of its own there", dir)
+		return "", fmt.Errorf("%s is on its parent's filesystem; mount a filesystem of its own there", resolved)
+	}
+	for _, path := range protected {
+		var kept unix.Stat_t
+		err := unix.Stat(path, &kept)
+		if errors.Is(err, unix.ENOENT) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("could not tell which filesystem %s is on: %w", path, err)
+		}
+		if here.Dev == kept.Dev {
+			return "", fmt.Errorf("%s is on the filesystem %s is on", resolved, path)
+		}
 	}
 	var fs unix.Statfs_t
-	if err := unix.Statfs(dir, &fs); err != nil {
-		return err
+	if err := unix.Statfs(resolved, &fs); err != nil {
+		return "", err
 	}
 	free, need := fs.Bavail*uint64(fs.Bsize), uint64(instances)*uint64(scratchPerInstance)
 	if free < need {
-		return fmt.Errorf("%s has %d bytes free; %d instances need %d", dir, free, instances, need)
+		return "", fmt.Errorf("%s has %d bytes free; %d instances need %d", resolved, free, instances, need)
 	}
 
-	return nil
+	return resolved, nil
+}
+
+// openResults opens the results file to append to, refusing anything but a
+// regular file without waiting on it: an existing path is looked at before it is
+// opened, and the open neither follows a symlink nor blocks on a FIFO.
+func openResults(path string) (*os.File, error) {
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is a %s, not a regular file", path, info.Mode().Type())
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, errors.Join(fmt.Errorf("%s is not a regular file", path), err, file.Close())
+	}
+
+	return file, nil
 }
 
 // virtInstance is one container or process of the cost experiment.
@@ -283,8 +338,8 @@ type virtInstance struct {
 	summary         usage.Summary
 	final           bool
 	err             error
-	// createUnsettled is a docker create that failed without saying whether the
-	// daemon made the container, which only its removal settles.
+	// createUnsettled is a docker create that failed, which does not say whether
+	// the daemon made the container; only its removal settles it.
 	createUnsettled bool
 }
 
@@ -340,16 +395,18 @@ exec chroot "$R" /bin/bash -c "$3" wrapper "$4" /mnt/go /mnt/status`
 		// CREATED, THEN STARTED: a create that settled has a name and a run label
 		// the cleanup removes by, and a start that failed leaves a container it
 		// finds the same way.
+		//
+		// NOTHING BUT THE SCRATCH IS WRITTEN: the container's root is read-only and
+		// it keeps no log, so Docker's storage, on the host's own filesystem, gets
+		// only the container's record.
 		mem := strconv.FormatInt(int64(memory), 10)
 		out, err := exec.CommandContext(ctx, "docker", "create", "--name", in.name,
-			"--label", "billet-virtcost="+runID, "--cpuset-cpus", in.cpus, "--memory", mem, "--memory-swap", mem,
+			"--label", "billet-virtcost="+runID, "--read-only", "--log-driver", "none",
+			"--cpuset-cpus", in.cpus, "--memory", mem, "--memory-swap", mem,
 			"-v", in.dir+":/mnt", "-v", filepath.Join(in.dir, "tmp")+":/tmp",
 			image, "/bin/bash", "-c", virtWrapper, "wrapper", body, "/mnt/go", "/mnt/status").CombinedOutput()
 		if err != nil {
-			// A CREATE THE DAEMON ANSWERED WITH AN ERROR made nothing; one whose client
-			// was killed, or that answered nothing, may yet register a container.
-			var exit *exec.ExitError
-			in.createUnsettled = !errors.As(err, &exit) || ctx.Err() != nil || len(out) == 0
+			in.createUnsettled = true
 			return fmt.Errorf("docker create: %w: %s", err, out)
 		}
 		id := strings.TrimSpace(string(out))
@@ -620,8 +677,19 @@ func TestTheVirtWrapperPublishesItsStatusOrEnds(t *testing.T) {
 	if err := held.Start(); err != nil {
 		t.Fatal(err)
 	}
-	exited := make(chan error, 1)
-	go func() { exited <- held.Wait() }()
+	exited := make(chan struct{})
+	var waitErr error
+	go func() {
+		defer close(exited)
+		waitErr = held.Wait()
+	}()
+	// KILLED AND JOINED HOWEVER THE TEST ENDS, the wrapper and its sleep.
+	t.Cleanup(func() {
+		if err := held.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Errorf("stop the wrapper: %v", err)
+		}
+		<-exited
+	})
 	deadline := time.After(10 * time.Second)
 	for {
 		raw, err := os.ReadFile(status)
@@ -632,22 +700,18 @@ func TestTheVirtWrapperPublishesItsStatusOrEnds(t *testing.T) {
 			break
 		}
 		select {
-		case err := <-exited:
-			t.Fatalf("the wrapper ended (%v) without publishing a status it could write", err)
+		case <-exited:
+			t.Fatalf("the wrapper ended (%v) without publishing a status it could write", waitErr)
 		case <-deadline:
 			t.Fatal("the wrapper published no status in 10s")
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
 	select {
-	case err := <-exited:
-		t.Errorf("the wrapper ended (%v) after publishing; want it holding its cgroup", err)
+	case <-exited:
+		t.Errorf("the wrapper ended (%v) after publishing; want it holding its cgroup", waitErr)
 	case <-time.After(200 * time.Millisecond):
 	}
-	if err := held.Process.Kill(); err != nil {
-		t.Errorf("stop the held wrapper: %v", err)
-	}
-	<-exited
 
 	// Bounded, since a wrapper that held on without its status would never end.
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -662,11 +726,12 @@ func TestTheVirtWrapperPublishesItsStatusOrEnds(t *testing.T) {
 
 // THE SCRATCH IS A FILESYSTEM OF ITS OWN: a directory on its parent's filesystem,
 // where a compile that fills it fills what the node keeps, is refused, and so is
-// one without room for its instances.
+// one on a protected path's filesystem however it is reached, and one without room
+// for its instances. What is admitted is the path with its symlinks resolved.
 func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
 	t.Parallel()
 
-	if err := scratchHolds(t.TempDir(), 0); err == nil {
+	if _, err := scratchHolds(t.TempDir(), 0, nil); err == nil {
 		t.Error("a directory on its parent's filesystem was accepted as the scratch")
 	}
 	wd, err := os.Getwd()
@@ -677,15 +742,91 @@ func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := scratchHolds(relative, 0); err == nil {
+	if _, err := scratchHolds(relative, 0, nil); err == nil {
 		t.Errorf("the relative path %s was accepted as the scratch", relative)
 	}
 	// /dev is a filesystem of its own on Linux and macOS alike, with nowhere near
 	// a million instances' room.
-	if err := scratchHolds("/dev", 0); err != nil {
-		t.Errorf("/dev, a mount of its own, was refused: %v", err)
+	if got, err := scratchHolds("/dev", 0, nil); err != nil || got != "/dev" {
+		t.Errorf("/dev, a mount of its own, was admitted as %q (%v); want it as itself", got, err)
 	}
-	if err := scratchHolds("/dev", 1<<20); err == nil {
+	if _, err := scratchHolds("/dev", 1<<20, nil); err == nil {
 		t.Error("a scratch without room for its instances was accepted")
+	}
+
+	// A SYMLINK IS ADMITTED AS WHAT IT NAMES, and a protected path's filesystem is
+	// refused through one, as /dev/shm/scratch -> /var/lib/billet would be.
+	link := filepath.Join(t.TempDir(), "scratch")
+	if err := os.Symlink("/dev", link); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := scratchHolds(link, 0, nil); err != nil || got != "/dev" {
+		t.Errorf("a symlink to /dev was admitted as %q (%v); want /dev itself", got, err)
+	}
+	if _, err := scratchHolds(link, 0, []string{"/dev"}); err == nil {
+		t.Error("a symlink to a protected path's filesystem was accepted as the scratch")
+	}
+	if got, err := scratchHolds("/dev", 0, []string{filepath.Join(t.TempDir(), "absent")}); err != nil ||
+		got != "/dev" {
+		t.Errorf("a protected path that does not exist refused /dev (%q, %v)", got, err)
+	}
+}
+
+// THE RESULTS FILE IS A REGULAR FILE, opened without waiting: a FIFO nobody reads
+// is refused at once rather than blocking the run before its cleanup, and so is a
+// symlink, while a new file and an existing one are appended to.
+func TestTheResultsFileIsARegularFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
+	if err := unix.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refused := make(chan error, 1)
+	go func() {
+		f, err := openResults(fifo)
+		if err == nil {
+			_ = f.Close()
+		}
+		refused <- err
+	}()
+	select {
+	case err := <-refused:
+		if err == nil {
+			t.Error("a FIFO was opened as the results file")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("opening a FIFO nobody reads as the results file blocked")
+	}
+
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := openResults(link); err == nil {
+		_ = f.Close()
+		t.Error("a symlink was opened as the results file")
+	}
+
+	results := filepath.Join(dir, "results.jsonl")
+	for _, line := range []string{"one\n", "two\n"} {
+		f, err := openResults(results)
+		if err != nil {
+			t.Fatalf("open a regular results file: %v", err)
+		}
+		if _, err := f.WriteString(line); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if raw, err := os.ReadFile(results); err != nil || string(raw) != "one\ntwo\n" {
+		t.Errorf("the results file holds %q (%v); want both lines appended", raw, err)
 	}
 }
