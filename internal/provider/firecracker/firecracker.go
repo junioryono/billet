@@ -178,6 +178,9 @@ type Provider struct {
 	// goarch is this host's machine, and so its guests'. A seam because the other
 	// machine's boot arguments would otherwise be unreachable from a test.
 	goarch string
+	// kvmClock boots an x86 guest on kvm-clock, which a golden needs so that a
+	// restore's clock_realtime brings each fork's clock to the host's (ADR-017).
+	kvmClock bool
 	// digests remembers the digests of the VMM binary and the guest kernels.
 	digests fileDigests
 	// jailWrote reports whether a file in a jail is one its VMM wrote. A seam
@@ -328,6 +331,15 @@ func withDurability(file func(*os.File) error, dir func(string) error) Option {
 			p.syncDir = dir
 		}
 	}
+}
+
+// withKVMClock boots every x86 guest with clocksource=kvm-clock, as a golden is
+// built: Firecracker's clock_realtime corrects only a guest keeping time on
+// kvm-clock, and a guest left on tsc resumes with its clock where the capture left
+// it (measured, docs/reference/records/workspace-snapshots.md). A cold boot keeps
+// the kernel's own choice.
+func withKVMClock() Option {
+	return func(p *Provider) { p.kvmClock = true }
 }
 
 // WithBootWait bounds how long Launch waits for a new VMM to answer.
@@ -1080,7 +1092,7 @@ func (p *Provider) configure(
 		}},
 		{"/boot-source", map[string]any{
 			"kernel_image_path": "/" + guestKernel,
-			"boot_args":         bootArgs(p.goarch),
+			"boot_args":         p.bootArgs(),
 		}},
 		{"/drives/rootfs", map[string]any{
 			"drive_id":       "rootfs",
@@ -1317,6 +1329,18 @@ func bootArgs(goarch string) string {
 
 	return "reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd " +
 		"root=/dev/vda rw"
+}
+
+// bootArgs is the command line this provider boots its guests with: the
+// machine's, and kvm-clock for a golden on x86. An arm64 guest keeps time on the
+// architected timer, which has no kvm-clock to choose.
+func (p *Provider) bootArgs() string {
+	args := bootArgs(p.goarch)
+	if p.kvmClock && p.goarch != "arm64" {
+		args += " clocksource=kvm-clock"
+	}
+
+	return args
 }
 
 // guestInterface is the one network device a guest gets.
