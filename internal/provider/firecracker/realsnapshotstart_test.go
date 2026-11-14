@@ -82,6 +82,17 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 	}
 
 	trials := experimentInt(t, "BILLET_SNAPSHOT_START_TRIALS", 10)
+	// A TEST DEADLINE THAT COULD END THE RUN IS REFUSED BEFORE ANYTHING STARTS: the
+	// test binary's timeout panics without running a trial's teardown or any
+	// cleanup, which would leave a fork and the builder running. Unset (-timeout 0)
+	// or long enough for every trial's budget, the golden and the cleanup.
+	if d, ok := t.Deadline(); ok {
+		need := time.Duration(trials)*(trialBudget+teardownBudget) + 45*time.Minute
+		if left := time.Until(d); left < need {
+			t.Fatalf("the test's deadline is %s away and %d trials need %s; run with -test.timeout 0 or longer",
+				left.Round(time.Second), trials, need)
+		}
+	}
 	vcpu := experimentInt(t, "BILLET_SNAPSHOT_START_VCPU", 2)
 	memory := config.ByteSize(experimentInt(t, "BILLET_SNAPSHOT_START_MEMORY_GIB", 4)) * config.GiB
 	leases := os.Getenv("BILLET_SNAPSHOT_START_LEASES")
@@ -129,7 +140,9 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 	// THE GOLDEN'S DISK GOES LAST, after the builder and every trial (cleanups run in
 	// reverse), because each holds a mapping or a clone of it.
 	t.Cleanup(func() {
-		if err := env.disk.removeGolden(context.WithoutCancel(t.Context()), goldenDiskPrefix+env.lease); err != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Minute)
+		defer cancel()
+		if err := env.disk.removeGolden(ctx, goldenDiskPrefix+env.lease); err != nil {
 			t.Errorf("remove the golden's system disk: %v", err)
 		}
 	})
@@ -226,6 +239,9 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		// which the fork must be killed, is reported before anything that could fail.
 		stop := errors.Is(err, errTrialSurvived) || errors.Is(err, errLeaseLost)
 		if stop {
+			// STRAIGHT TO STDERR AS WELL, which the test binary does not buffer: the
+			// test's own log is held until it ends, after every cleanup.
+			fmt.Fprintf(os.Stderr, "SNAPSHOT START EXPERIMENT STOPPED: trial %d (%s): %v\n", i, arm, err)
 			t.Errorf("trial %d (%s): %v", i, arm, err)
 		}
 		if err != nil {
