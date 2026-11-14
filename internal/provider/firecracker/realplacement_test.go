@@ -324,39 +324,60 @@ func TestRealPlacementExperiment(t *testing.T) {
 		finished.Sub(started).Round(time.Second), filepath.Clean(out))
 }
 
-// experimentWorkloads are commands the runner image can run with no network.
-// Each reboots the guest when it succeeds, which is what ends a Firecracker
-// VMM, and halts it when it fails, which leaves the VMM running for the host to
-// time out.
+// experimentBodies are the workloads themselves, which the runner image can run
+// with no network: the same bytes run in a microVM, in a container and as a
+// plain process (TestRealVirtualizationCost), so the three are compared on one
+// workload.
 //
 // EVERY FALLIBLE STEP IS ITS OWN ASSIGNMENT, under pipefail: `export X=$(...)`
 // answers with export's status and hides the substitution's, which set -e would
 // then never see.
-const workloadEnd = `trap 'if [ $? -eq 0 ]; then sudo -n reboot -f; else sudo -n halt -f; fi' EXIT
-set -eo pipefail
-`
-
-var experimentWorkloads = map[string][]string{
-	"gostd": {"/bin/bash", "-c", workloadEnd + `gobin=$(ls -d /opt/hostedtoolcache/go/1.26*/x64/bin | tail -1)
+//
+// THE CPUS ARE THE ONES THE WORKLOAD MAY RUN ON (nproc, sched_getaffinity), never
+// the machine's: in a guest they are its vCPUs, and on the host the cpus its
+// cgroup confines it to, where the machine has 128.
+var experimentBodies = map[string]string{
+	"gostd": `set -eo pipefail
+gobin=$(ls -d /opt/hostedtoolcache/go/1.26*/x64/bin | tail -1)
 test -x "$gobin/go"
 procs=$(nproc)
 export HOME=/tmp GOTOOLCHAIN=local GOFLAGS=-p=$procs PATH=$gobin:$PATH
 for build in 1 2; do
 	cache=$(mktemp -d)
 	GOCACHE=$cache "$gobin/go" build -a std
-done`},
-	"noop": {"/bin/bash", "-c", workloadEnd + `true`},
-	"memory": {"/bin/bash", "-c", workloadEnd + `python3 -c '
-import multiprocessing as m
+done`,
+	"noop": `true`,
+	"memory": `set -eo pipefail
+python3 -c '
+import multiprocessing as m, os
 def copy(_):
     a = bytearray(256 << 20)
     b = bytearray(256 << 20)
     for _ in range(600):
         b[:] = a
-n = m.cpu_count()
+n = len(os.sched_getaffinity(0))
 m.Pool(n).map(copy, range(n))
-'`},
+'`,
 }
+
+// workloadEnd is how a guest's workload ends its VMM: it reboots the guest when
+// the workload succeeds, which is what ends a Firecracker VMM, and halts it when
+// it fails, which leaves the VMM running for the host to time out.
+//
+// NEVER ON THE HOST: in a container or a chroot this would reboot the machine.
+const workloadEnd = `trap 'if [ $? -eq 0 ]; then sudo -n reboot -f; else sudo -n halt -f; fi' EXIT
+`
+
+// experimentWorkloads are experimentBodies as a guest runs them, each ended by
+// workloadEnd.
+var experimentWorkloads = func() map[string][]string {
+	out := make(map[string][]string, len(experimentBodies))
+	for name, body := range experimentBodies {
+		out[name] = []string{"/bin/bash", "-c", workloadEnd + body}
+	}
+
+	return out
+}()
 
 // cgroupConfines refuses a guest whose VMM, and every thread of it, is not in
 // cgroupDir, or whose cgroupDir does not confine it to exactly the cpus its
