@@ -158,7 +158,9 @@ func TestADestinationThatHangsIsBoundedAndHoldsUpNothingElse(t *testing.T) {
 		}
 	})
 	t.Cleanup(func() { close(release) })
-	hung.timeout = 100 * time.Millisecond
+	// LONG ENOUGH TO REACH THE HANDLER on a loaded runner: at 100 ms a CI run's try ran out
+	// before its request arrived, and the wait for it to arrive never ended (2026-11-14).
+	hung.timeout = time.Second
 
 	fine, _ := destination(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
@@ -166,7 +168,13 @@ func TestADestinationThatHangsIsBoundedAndHoldsUpNothingElse(t *testing.T) {
 	begun := time.Now()
 	go func() { result <- hung.Send(t.Context(), []byte(`{}`)) }()
 
-	<-entered
+	select {
+	case <-entered:
+	case err := <-result:
+		t.Fatalf("the hung try ended (%v) before its request reached the destination", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hung try's request never reached the destination")
+	}
 
 	// THE OTHER ONE, WHILE THIS ONE IS DEMONSTRABLY INSIDE ITS REQUEST.
 	if err := fine.Send(t.Context(), []byte(`{}`)); err != nil {
