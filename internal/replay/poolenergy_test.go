@@ -83,10 +83,12 @@ func TestAPoolHostIsPoweredFromItsJoinToItsRelease(t *testing.T) {
 			Ordered: []PoolOrderRecord{
 				// a: asked at 4h, no recorded release, so off at 4h05.
 				{Order: "a", Joined: h(1), ReleaseAsked: h(4)},
-				// b: its recorded release at 3h wins over its ask at 2h50 plus the clearance.
-				{Order: "b", Joined: h(2), ReleaseAsked: h(2).Add(50 * time.Minute), Released: h(3)},
-				// c: joins at 4h05, the instant a leaves, and is never asked: on to the window's end.
-				{Order: "c", Joined: h(4).Add(5 * time.Minute)},
+				// b: joins at 4h05, the instant a leaves; its recorded release at 5h
+				// wins over its ask at 4h50 plus the clearance.
+				{Order: "b", Joined: h(4).Add(5 * time.Minute), ReleaseAsked: h(4).Add(50 * time.Minute),
+					Released: h(5)},
+				// c: joins at 6h and is never asked: on to the window's end.
+				{Order: "c", Joined: h(6)},
 				// d: ordered, never joined.
 				{Order: "d"},
 			},
@@ -96,17 +98,19 @@ func TestAPoolHostIsPoweredFromItsJoinToItsRelease(t *testing.T) {
 			// Two overlapping leases on a: busy from 1h to 2h30 once, 1.5 h.
 			{ChargedFrom: h(1), FinishedAt: h(2), VCPU: 4, Memory: 16 * config.GiB, Node: alloc.PoolNodeName("a")},
 			{ChargedFrom: h(1.5), FinishedAt: h(2.5), VCPU: 4, Memory: 16 * config.GiB, Node: alloc.PoolNodeName("a")},
-			// b at the same time as a, 0.5 h.
-			{ChargedFrom: h(2), FinishedAt: h(2.5), VCPU: 4, Memory: 16 * config.GiB, Node: alloc.PoolNodeName("b")},
+			// b, from 4h10 to 4h40, 0.5 h.
+			{ChargedFrom: h(4).Add(10 * time.Minute), FinishedAt: h(4).Add(40 * time.Minute), VCPU: 4,
+				Memory: 16 * config.GiB, Node: alloc.PoolNodeName("b")},
 			// c, 1 h.
 			{ChargedFrom: h(6), FinishedAt: h(7), VCPU: 4, Memory: 16 * config.GiB, Node: alloc.PoolNodeName("c")},
 		},
 	}
 
+	// One host at a time throughout: b joins as a leaves, and c after b.
 	got := r.PoolPowered(t0, h(10))
-	want := PoolPower{Hosts: 3, ReleasesAsk: 2, MostAtOnce: 2,
-		// a 3h05m, b 1h, c 5h55m.
-		Powered: 3 + 5.0/60 + 1 + 5 + 55.0/60,
+	want := PoolPower{Hosts: 3, ReleasesAsk: 2, MostAtOnce: 1,
+		// a 3h05m, b 55m, c 4h.
+		Powered: 3 + 5.0/60 + 55.0/60 + 4,
 		Busy:    1.5 + 0.5 + 1,
 	}
 	want.Idle = want.Powered - want.Busy
@@ -116,9 +120,10 @@ func TestAPoolHostIsPoweredFromItsJoinToItsRelease(t *testing.T) {
 		t.Errorf("PoolPowered = %+v,\nwant %+v", got, want)
 	}
 
-	// A WINDOW CUTS A HOST'S POWERED TIME at both ends, and its busy time with it.
+	// A WINDOW CUTS A HOST'S POWERED TIME at both ends, and its busy time with it:
+	// a from 1h30, b whole, c to 6h30.
 	cut := r.PoolPowered(h(1.5), h(6.5))
-	if wantPowered := (4 + 5.0/60 - 1.5) + 1 + (6.5 - 4 - 5.0/60); !near(cut.Powered, wantPowered) ||
+	if wantPowered := (4 + 5.0/60 - 1.5) + 55.0/60 + 0.5; !near(cut.Powered, wantPowered) ||
 		!near(cut.Busy, 1+0.5+0.5) {
 		t.Errorf("PoolPowered over 1h30 to 6h30 = %+v, want %.4f powered and 2 busy", cut, wantPowered)
 	}
