@@ -104,6 +104,47 @@ func TestAStepsDestinationsSayWhatTheyCannotTell(t *testing.T) {
 	}
 }
 
+// AN INCOMPLETE CAPTURE PROVES NOTHING ABSENT: a step where no connection was
+// seen says the job's flows may have been missed, and one where some were gives
+// its totals as lower bounds.
+func TestAStepsDestinationsFromAnIncompleteCaptureAreLowerBounds(t *testing.T) {
+	t.Parallel()
+
+	d := fiveDestinations()
+	d.Incomplete = true
+	if got := stepDestinations(d, t0.Add(5*time.Minute), t0.Add(6*time.Minute)); got !=
+		"no connection seen opening in this step, though the job's flows are incomplete, so some may have been missed" {
+		t.Errorf("a quiet step of an incomplete capture = %q", got)
+	}
+	if got := stepDestinations(d, t0, t0.Add(time.Minute)); !strings.HasPrefix(got,
+		"at least, since the job's flows are incomplete: 10.0.0.2 (sent 400 B") {
+		t.Errorf("a busy step of an incomplete capture = %q", got)
+	}
+}
+
+// TOTALS PAST AN INT64 STILL RANK BY SIZE, never tying at the cap and falling
+// back to the job's order: the step's largest destination is named.
+func TestAStepsLargestDestinationIsNamedPastAnInt64(t *testing.T) {
+	t.Parallel()
+
+	most := int64(math.MaxInt64)
+	d := &alloc.JobDestinations{OpeningSeconds: 1}
+	for i, addr := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"} {
+		d.Destinations = append(d.Destinations, alloc.JobDestination{Addr: addr, SentBytes: most,
+			ReceivedBytes: most, Connections: 1})
+		// 10.0.0.4, last in the job's order, has the most in this step.
+		received := most / 2
+		if i == 3 {
+			received = most
+		}
+		d.Openings = append(d.Openings, alloc.DestinationOpening{Ordinal: i, Start: t0.Unix(),
+			SentBytes: most, ReceivedBytes: received, Connections: 1})
+	}
+	if got := stepDestinations(d, t0, t0.Add(time.Minute)); !strings.HasPrefix(got, "10.0.0.4 (") {
+		t.Errorf("the step's destinations = %q, want 10.0.0.4, the largest, first", got)
+	}
+}
+
 // `billet jobs show` AND ITS PAGE PUT A STEP'S DESTINATIONS UNDER IT, with or
 // without a series, since they need only the step's times and the split.
 func TestJobsShowPutsAStepsDestinationsUnderIt(t *testing.T) {

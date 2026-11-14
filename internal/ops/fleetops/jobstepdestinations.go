@@ -62,6 +62,16 @@ func stepDestinations(d *alloc.JobDestinations, from, to time.Time) string {
 	if d.OpeningSeconds > 1 {
 		prefix = fmt.Sprintf("to within %ds, ", d.OpeningSeconds)
 	}
+	// AN INCOMPLETE CAPTURE PROVES NOTHING ABSENT: the job's flows may have been
+	// missed anywhere in its life, so a step where none was seen is not a step
+	// that opened none, and the totals of one where some were are lower bounds.
+	if d.Incomplete {
+		if len(byOrdinal) == 0 {
+			return prefix + "no connection seen opening in this step, though the job's flows are incomplete, " +
+				"so some may have been missed"
+		}
+		prefix += "at least, since the job's flows are incomplete: "
+	}
 	if len(byOrdinal) == 0 {
 		return prefix + "no connection opened in this step"
 	}
@@ -72,8 +82,10 @@ func stepDestinations(d *alloc.JobDestinations, from, to time.Time) string {
 	}
 	// LARGEST FIRST, AND THE ORDER IS TOTAL: equal totals fall back to the
 	// ordinal, which is the job's own largest-first order.
+	// The sum of two counts that are not negative fits a uint64, so totals past
+	// an int64 still rank by their size rather than tying at the cap.
 	slices.SortFunc(all, func(x, y *total) int {
-		return cmp.Or(cmp.Compare(addCapped(y.sent, y.received), addCapped(x.sent, x.received)),
+		return cmp.Or(cmp.Compare(uint64(y.sent)+uint64(y.received), uint64(x.sent)+uint64(x.received)),
 			cmp.Compare(x.ordinal, y.ordinal))
 	})
 

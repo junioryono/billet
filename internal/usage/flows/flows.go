@@ -20,6 +20,7 @@ package flows
 import (
 	"cmp"
 	"maps"
+	"math"
 	"net/netip"
 	"slices"
 	"sync"
@@ -212,7 +213,12 @@ type Result struct {
 // more buckets than this has its buckets widened, by doubling, until they fit:
 // a coarser answer, never a partial one, so the openings always add up to the
 // destinations' totals.
-const MaxOpenings = 2048
+//
+// 1,024 BECAUSE THE WHOLE REPORT IS ONE REQUEST: at their widest, this many
+// openings beside the largest series and every destination at its widest come
+// to about 0.93 MB of the plane's 1 MiB body, and 2,048 to about 1.08 MB, which
+// would have the plane refuse the job's whole measurement.
+const MaxOpenings = 1024
 
 // Opening is the traffic of the connections a job opened to one destination in
 // one bucket of time, a bucket being OpeningWidth from Start.
@@ -256,9 +262,9 @@ func openingsOf(counted map[entry]Flow, index map[netip.Addr]int) ([]Opening, ti
 			o = &Opening{Dest: dest}
 			perSecond[k] = o
 		}
-		o.Sent += f.OrigBytes
-		o.Received += f.ReplyBytes
-		o.Connections++
+		o.Sent = satAdd(o.Sent, f.OrigBytes)
+		o.Received = satAdd(o.Received, f.ReplyBytes)
+		o.Connections = satAdd(o.Connections, 1)
 	}
 
 	width := int64(1)
@@ -273,9 +279,9 @@ func openingsOf(counted map[entry]Flow, index map[netip.Addr]int) ([]Opening, ti
 				w = &Opening{Dest: k.dest}
 				buckets[wide] = w
 			}
-			w.Sent += o.Sent
-			w.Received += o.Received
-			w.Connections += o.Connections
+			w.Sent = satAdd(w.Sent, o.Sent)
+			w.Received = satAdd(w.Received, o.Received)
+			w.Connections = satAdd(w.Connections, o.Connections)
 		}
 	}
 
@@ -301,6 +307,15 @@ func openingsOf(counted map[entry]Flow, index map[netip.Addr]int) ([]Opening, ti
 	})
 
 	return out, time.Duration(width) * time.Second
+}
+
+// satAdd is a+b held at the largest uint64 rather than wrapping.
+func satAdd(a, b uint64) uint64 {
+	if a > math.MaxUint64-b {
+		return math.MaxUint64
+	}
+
+	return a + b
 }
 
 // floorDiv is a divided by b rounded down, for a second before 1970 as for one
@@ -795,9 +810,12 @@ func summarize(w *watch) Result {
 			byDest[f.Dest] = d
 		}
 
-		d.Sent += f.OrigBytes
-		d.Received += f.ReplyBytes
-		d.Connections++
+		// SATURATING, AS THE OPENINGS ARE: a total that wrapped would be less
+		// than the openings it is split into, and a report holding both would be
+		// refused whole.
+		d.Sent = satAdd(d.Sent, f.OrigBytes)
+		d.Received = satAdd(d.Received, f.ReplyBytes)
+		d.Connections = satAdd(d.Connections, 1)
 		// UNANSWERED ONLY WHERE THE GUEST'S OWN PACKETS WERE COUNTED: a flow
 		// begins with the guest's packet, so one with none counted either way is
 		// a tracker that kept no counts, and the whole result cannot say what
@@ -847,12 +865,12 @@ func summarize(w *watch) Result {
 
 	if len(all) > MaxDestinations {
 		for _, d := range all[MaxDestinations:] {
-			r.Other.Sent += d.Sent
-			r.Other.Received += d.Received
-			r.Other.Connections += d.Connections
-			r.Other.Unanswered += d.Unanswered
-			r.Other.TimedReplies += d.TimedReplies
-			r.Other.SlowReplies += d.SlowReplies
+			r.Other.Sent = satAdd(r.Other.Sent, d.Sent)
+			r.Other.Received = satAdd(r.Other.Received, d.Received)
+			r.Other.Connections = satAdd(r.Other.Connections, d.Connections)
+			r.Other.Unanswered = satAdd(r.Other.Unanswered, d.Unanswered)
+			r.Other.TimedReplies = satAdd(r.Other.TimedReplies, d.TimedReplies)
+			r.Other.SlowReplies = satAdd(r.Other.SlowReplies, d.SlowReplies)
 			r.Other.SlowestReply = max(r.Other.SlowestReply, d.SlowestReply)
 		}
 

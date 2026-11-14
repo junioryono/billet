@@ -72,6 +72,31 @@ func TestTheOpeningsAreNumberedAsTheReportsDestinations(t *testing.T) {
 		t.Errorf("a report with a count held at its largest is refused: %v", err)
 	}
 
+	// THROUGH THE TRACKER ITSELF, connections whose bytes together pass a uint64
+	// give a destination total held at its largest, as its openings are, never
+	// one that wrapped below them: the report the node builds from them is kept,
+	// not refused whole with every other measurement of the job.
+	guest, dest := netip.MustParseAddr("192.168.100.23"), netip.MustParseAddr("140.82.112.4")
+	acct := flows.NewAccountant()
+	began := time.Unix(1_794_650_000, 0).UTC()
+	acct.Watch("l1", guest, began, nil)
+	for i, sent := range []uint64{math.MaxUint64, 1} {
+		acct.Observe(flows.Flow{ID: uint32(i + 1), Start: began.Add(time.Duration(i+1) * time.Second),
+			Protocol: 6, Source: guest, Dest: dest, DestPort: 443, OrigBytes: sent, ReplyBytes: 1,
+			OrigPackets: 1, ReplyPackets: 1})
+	}
+	tracked, ok := acct.Final("l1", nil, began.Add(time.Hour))
+	if !ok {
+		t.Fatal("the watched job had no result")
+	}
+	if tracked.Destinations[0].Sent != math.MaxUint64 {
+		t.Errorf("the tracker's total sent is %d, want it held at the largest uint64", tracked.Destinations[0].Sent)
+	}
+	got, _ = jobDestinationsOf(tracked, tapComparison{})
+	if err := got.Validate(); err != nil {
+		t.Errorf("a report from connections whose bytes pass a uint64 is refused: %v", err)
+	}
+
 	// NO SPLIT IS NO OPENINGS AND NO WIDTH, never an empty split.
 	res.Openings, res.OpeningWidth = nil, 0
 	if got, _ = jobDestinationsOf(res, tapComparison{}); got.Openings != nil || got.OpeningSeconds != 0 {

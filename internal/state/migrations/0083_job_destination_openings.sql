@@ -6,7 +6,7 @@
 -- connection tracker. A connection's bytes are all in the bucket it opened in,
 -- since the tracker keeps a connection's totals and not their times.
 --
--- ONE ROW A JOB, THE OPENINGS PACKED, because a job keeps up to 2,048 of them
+-- ONE ROW A JOB, THE OPENINGS PACKED, because a job keeps up to 1,024 of them
 -- (lease.MaxDestinationOpenings) and a statement a row would hold the ledger's
 -- only writer for as many round trips; migration 59's queries say what that
 -- cost was measured to be. The packing is internal/alloc packOpenings' and is

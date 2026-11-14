@@ -60,8 +60,10 @@ type JobDestinations struct {
 }
 
 // MaxDestinationOpenings is how many openings one report carries, the node's
-// flows.MaxOpenings, which widens its buckets until a job's fit.
-const MaxDestinationOpenings = 2048
+// flows.MaxOpenings, which widens its buckets until a job's fit. It is bounded
+// by the body the whole report is sent in (nodeplane's
+// TestTheLargestUsageReportFitsOneRequest).
+const MaxDestinationOpenings = 1024
 
 // maxOpeningSeconds bounds a bucket's width: a power of two past any job's
 // length, which the node never needs to reach.
@@ -244,7 +246,7 @@ func (d JobDestinations) validateOpenings() error {
 			s = &sum{}
 			sums[o.Ordinal] = s
 		}
-		// Each count is at most MaxInt64 and there are at most 2048 of them, so
+		// Each count is at most MaxInt64 and there are at most 1,024 of them, so
 		// a sum past MaxInt64 saturates rather than wrapping.
 		s.sent, s.received, s.connections = addCapped(s.sent, o.SentBytes), addCapped(s.received, o.ReceivedBytes),
 			addCapped(s.connections, o.Connections)
