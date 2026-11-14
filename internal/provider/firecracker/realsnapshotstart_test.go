@@ -3,6 +3,8 @@ package firecracker
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -159,7 +161,7 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		return provider.Spec{
 			Name: name, Image: env.image, VCPU: vcpu, Memory: memory, Trust: provider.TrustTrusted,
 			Command: []string{"/bin/bash", "-c", snapshotStartWaiter, "waiter", snapshotStartPlaceholder,
-				"http://" + mmdsAddress, strconv.Itoa(snapshotStartPort), snapshotStartRenew},
+				"http://" + mmdsAddress, strconv.Itoa(snapshotStartPort), snapshotStartRenew, "0.0.0.0"},
 			JITConfig: jit,
 		}
 	}
@@ -268,11 +270,15 @@ const forkLifetime = 30 * time.Minute
 const snapshotStartPort = 47231
 
 // snapshotStartWaiter is the command both arms run in place of the runner. It
-// serves its state on port $3, one line appended per step (waiting; registered and
+// serves its state on address $5, port $3, one line appended per step (waiting; registered and
 // the guest's time in milliseconds; released and the time; finished, the time and
 // the runner's status), so no step's time is lost to a later one; waits for the
 // metadata service at $2 to hold a registration that is not $1; holds there until
-// the host, having sampled the guest's memory, releases it with a POST; runs the
+// the host, having sampled the guest's memory, releases it with a POST carrying
+// the registration's sha256, which only the host that minted it and this guest
+// know, and which is written, after any release left from the golden is cleared,
+// only once the registration is (so a release before it, or from a peer on the
+// bridge, is refused); runs the
 // runner with it; and then holds on, listener and all, until the host destroys the
 // guest, since the agent's service ending would take the listener with it. Once
 // registered it runs $4 in the background, which in a guest renews its DHCP lease
@@ -285,7 +291,7 @@ const snapshotStartPort = 47231
 // answered by nobody.
 const snapshotStartWaiter = `set -u
 state=${TMPDIR:-/tmp}/billet-snapshot-start
-rm -f "$state.release"
+rm -f "$state.release" "$state.token"
 printf 'waiting\n' >"$state"
 python3 -c '
 import http.server, sys
@@ -303,12 +309,22 @@ class State(http.server.BaseHTTPRequestHandler):
             body = b"unreadable\n"
         self.reply(body)
     def do_POST(self):
+        body = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 128))
+        try:
+            token = open(path + ".token", "rb").read().strip()
+        except OSError:
+            token = b""
+        if not token or body.strip() != token:
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         open(path + ".release", "w").close()
         self.reply(b"released\n")
     def log_message(self, *args):
         pass
-http.server.ThreadingHTTPServer(("0.0.0.0", int(sys.argv[2])), State).serve_forever()
-' "$state" "$3" &
+http.server.ThreadingHTTPServer((sys.argv[3], int(sys.argv[2])), State).serve_forever()
+' "$state" "$3" "$5" &
 mmds=$2
 while :; do
 	if token=$(curl -sf --connect-timeout 1 --max-time 1 -X PUT "$mmds/latest/api/token" \
@@ -320,6 +336,8 @@ while :; do
 	fi
 	sleep 0.02
 done
+rm -f "$state.release"
+printf '%s' "$jit" | sha256sum | cut -d' ' -f1 >"$state.token.part" && mv "$state.token.part" "$state.token"
 printf 'registered %s\n' "$(date +%s%3N)" >>"$state"
 ( bash -c "$4" >/dev/null 2>&1 & )
 while [ ! -e "$state.release" ]; do sleep 0.01; done
@@ -352,16 +370,23 @@ func lineOf(state, step string) (string, bool) {
 	return "", false
 }
 
+// releaseToken is what releases a waiter holding jit: the registration's sha256.
+func releaseToken(jit string) string {
+	sum := sha256.Sum256([]byte(jit))
+
+	return hex.EncodeToString(sum[:])
+}
+
 // releaseWaiter tells a waiter holding at its registration to run the runner,
 // and answers when the release was first sent, which is no later than the waiter
 // acted on it: a first POST whose reply was lost may already have released it.
-func releaseWaiter(ctx context.Context, addr string, port int) (time.Time, error) {
+func releaseWaiter(ctx context.Context, addr string, port int, token string) (time.Time, error) {
 	client := &http.Client{Timeout: time.Second}
 	url := fmt.Sprintf("http://%s:%d/release", addr, port)
 	first := time.Now()
 	deadline := first.Add(10 * time.Second)
 	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, http.NoBody)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(token))
 		if err != nil {
 			return first, err
 		}
@@ -413,6 +438,11 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		fields["golden_lease_left_s"] = left.Seconds()
 	}
 
+	// THE TRIAL ENDS WITHIN THE LEASE IT WAS ADMITTED ON, its restore included:
+	// forkLifetime from the check, less five minutes for the teardown after it.
+	ctx, cancel := context.WithTimeout(t.Context(), forkLifetime-5*time.Minute)
+	defer cancel()
+
 	name := provider.InstanceName(freshLease(t))
 	fields["instance"] = name
 
@@ -437,22 +467,31 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 			t.Errorf("cleanup %s: %v", name, err)
 		}
 	})
+	// A FORK THAT CANNOT BE DESTROYED IS TAKEN OFF THE BRIDGE: its tap, which this
+	// trial's own jail recorded, is detached and downed, so whatever still runs
+	// behind it answers on no address a production guest may be given.
+	var tap string
 	defer func() {
-		if derr := destroy(); derr != nil {
-			err = errors.Join(err, fmt.Errorf("%w: %s: %w", errTrialSurvived, name, derr))
+		derr := destroy()
+		if derr == nil {
+			return
+		}
+		err = errors.Join(err, fmt.Errorf("%w: %s: %w", errTrialSurvived, name, derr))
+		if arm == "restore" {
+			err = errors.Join(err, isolateTap(context.WithoutCancel(t.Context()), tap))
 		}
 	}()
 
 	asked := time.Now()
 	fields["asked_epoch_ms"] = asked.UnixMilli()
 	if arm == "cold" {
-		_, err = p.Launch(t.Context(), spec(name, jit))
+		_, err = p.Launch(ctx, spec(name, jit))
 	} else {
 		// OUTSTANDING FROM BEFORE THE CALL, since a restore that failed may still
 		// have started a VMM with the golden's MAC.
 		tr.outstanding[name] = true
 		fields["snapshot_age_s"] = asked.Sub(tr.captured).Seconds()
-		_, err = p.Restore(t.Context(), spec(name, jit), tr.snapshot, tr.evidence)
+		_, err = p.Restore(ctx, spec(name, jit), tr.snapshot, tr.evidence)
 	}
 	if err != nil {
 		return fmt.Errorf("start: %w", err)
@@ -464,13 +503,14 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	if err != nil {
 		return err
 	}
+	tap = res.Tap
 	addr := goldenAddr
 	if arm == "cold" {
 		mac, err := guestMAC(res.Tap)
 		if err != nil {
 			return err
 		}
-		if addr, err = leasedAddress(t.Context(), leases, mac, 2*time.Minute); err != nil {
+		if addr, err = leasedAddress(ctx, leases, mac, 2*time.Minute); err != nil {
 			return fmt.Errorf("the guest's address: %w", err)
 		}
 	} else {
@@ -484,10 +524,14 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		}
 	}
 
-	registered, err := waiterState(t.Context(), addr, snapshotStartPort, 5*time.Minute,
+	registered, err := waiterState(ctx, addr, snapshotStartPort, 5*time.Minute,
 		func(s string) bool { return hasLine(s, "registered") })
 	if err != nil {
 		return fmt.Errorf("the waiter: %w", err)
+	}
+	// HELD AT ITS REGISTRATION, or the memory below is not of the same instruction.
+	if hasLine(registered.state, "released") || hasLine(registered.state, "finished") {
+		return fmt.Errorf("the waiter was already past its registration: %q", registered.state)
 	}
 	stamp, _ := lineOf(registered.state, "registered")
 	guestMS, err := strconv.ParseInt(stamp, 10, 64)
@@ -511,7 +555,7 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	fields["memory_at_registered"] = smapsRollup(pid)
 	// THE SAMPLE THIRTY SECONDS ON COUNTS FROM THE FIRST POST, which is no later than
 	// the release; how long it took to be acknowledged is recorded beside it.
-	released, err := releaseWaiter(t.Context(), addr, snapshotStartPort)
+	released, err := releaseWaiter(ctx, addr, snapshotStartPort, releaseToken(jit))
 	fields["release_acknowledged_ms"] = time.Since(released).Milliseconds()
 	if err != nil {
 		return err
@@ -527,7 +571,7 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	// the release, while the job runs, and the peak.
 	var peak int64
 	sampled := false
-	finished, err := waiterState(t.Context(), addr, snapshotStartPort, 20*time.Minute, func(s string) bool {
+	finished, err := waiterState(ctx, addr, snapshotStartPort, 20*time.Minute, func(s string) bool {
 		m := smapsRollup(pid)
 		if pss, ok := m["Pss"]; ok && pss > peak {
 			peak = pss
@@ -636,6 +680,27 @@ func leasedAddress(ctx context.Context, leases, mac string, limit time.Duration)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+// isolateTap takes a tap off its bridge and down. A tap this trial never learned
+// cannot be, which is said.
+func isolateTap(ctx context.Context, tap string) error {
+	if tap == "" {
+		return errors.New("its tap was never read, so it could not be taken off the bridge")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	var errs []error
+	for _, args := range [][]string{{"link", "set", "dev", tap, "nomaster"}, {"link", "set", "dev", tap, "down"}} {
+		if out, err := exec.CommandContext(ctx, "ip", args...).CombinedOutput(); err != nil {
+			errs = append(errs, fmt.Errorf("ip %s: %w: %s", strings.Join(args, " "), err, out))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("take %s off the bridge: %w", tap, errors.Join(errs...))
+	}
+
+	return fmt.Errorf("%s was taken off the bridge and down; destroy the fork by hand", tap)
 }
 
 // goldenLeaseHolds refuses unless the lease file gives addr to mac, with at least
@@ -843,6 +908,26 @@ func TestAForkRunsOnlyOnALeaseStillItsOwn(t *testing.T) {
 	}
 }
 
+// postRelease sends one release with token to a waiter on this host, and answers
+// its status.
+func postRelease(t *testing.T, port int, token string) int {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		fmt.Sprintf("http://127.0.0.1:%d/release", port), strings.NewReader(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post a release: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	return resp.StatusCode
+}
+
 // anHourLeaseFile is a lease file giving the test's golden address an hour from its now.
 func anHourLeaseFile(t *testing.T) string {
 	t.Helper()
@@ -925,7 +1010,7 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	// A PROCESS GROUP OF ITS OWN, so the listener and the sleep the waiter leaves
 	// behind are ended with it.
 	cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", snapshotStartWaiter, "waiter",
-		snapshotStartPlaceholder, mmds.URL, strconv.Itoa(port), "printf renewed >"+renewed)
+		snapshotStartPlaceholder, mmds.URL, strconv.Itoa(port), "printf renewed >"+renewed, "127.0.0.1")
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "TMPDIR="+dir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -964,6 +1049,23 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	// NOTHING REGISTERED WHILE THE PLACEHOLDER IS SERVED, and no release taken.
+	before, err := waiterState(t.Context(), "127.0.0.1", port, 5*time.Second, func(string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []string{"registered", "released", "finished"} {
+		if hasLine(before.state, step) {
+			t.Errorf("the waiter served %s before it had a real registration: %q", step, before.state)
+		}
+	}
+	for _, token := range []string{releaseToken(snapshotStartPlaceholder), ""} {
+		if code := postRelease(t, port, token); code != http.StatusForbidden {
+			t.Errorf("a release with token %q before the registration answered %d; want it refused", token, code)
+		}
+	}
+
+	switched := time.Now()
 	mu.Lock()
 	jit = "a-real-registration"
 	mu.Unlock()
@@ -973,12 +1075,23 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the waiter never served registered: %v", err)
 	}
-	// HELD THERE until released: the runner has not run a moment later.
+	// STAMPED BETWEEN THE SWITCH AND THE READ, on this host's one clock.
+	stamp, _ := lineOf(registered.state, "registered")
+	if ms, err := strconv.ParseInt(stamp, 10, 64); err != nil ||
+		ms < switched.UnixMilli() || ms > registered.seen.UnixMilli() {
+		t.Errorf("the registration was stamped %q, not between the switch (%d) and the read (%d)",
+			stamp, switched.UnixMilli(), registered.seen.UnixMilli())
+	}
+	// HELD THERE until released by the registration's own token: the runner has not
+	// run a moment later, nor after a release carrying another.
+	if code := postRelease(t, port, releaseToken("another-registration")); code != http.StatusForbidden {
+		t.Errorf("a release with another registration's token answered %d; want it refused", code)
+	}
 	time.Sleep(300 * time.Millisecond)
 	if _, err := os.Stat(seen); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the runner ran before the waiter was released (%v)", err)
 	}
-	if _, err := releaseWaiter(t.Context(), "127.0.0.1", port); err != nil {
+	if _, err := releaseWaiter(t.Context(), "127.0.0.1", port, releaseToken("a-real-registration")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -991,9 +1104,6 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 		if !hasLine(finished.state, step) {
 			t.Errorf("the finished state %q lost its %s line", finished.state, step)
 		}
-	}
-	if stamp, _ := lineOf(registered.state, "registered"); stamp == "" {
-		t.Errorf("the registered line %q carries no time", registered.state)
 	}
 	var at int64
 	var status int
