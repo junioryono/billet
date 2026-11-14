@@ -428,6 +428,17 @@ func (m *Monitor) Forget(key string) {
 	delete(m.jobs, key)
 }
 
+// Baselined reports whether the job under key has its first sample, so what it
+// does from now is measured from a baseline. A pending job, a forgotten one and
+// an unknown key all answer false.
+func (m *Monitor) Baselined(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[key]
+
+	return ok && !j.pending
+}
+
 // Tick asks Run for one tick and waits for it. Run ticks on its own clock;
 // this is for tests that drive time themselves.
 func (m *Monitor) Tick() {

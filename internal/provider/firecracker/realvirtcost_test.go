@@ -10,12 +10,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/usage"
@@ -43,6 +46,9 @@ import (
 //     own filesystem, which the instances chroot into.
 //   - BILLET_VIRT_EXPERIMENT_IMAGE: for container, a Docker image imported from
 //     that same filesystem.
+//   - BILLET_VIRT_EXPERIMENT_SCRATCH: a filesystem of its own, mounted for the run,
+//     with at least scratchPerInstance free for each instance: their /tmp, go
+//     files and statuses, so a compile that fills it fills nothing billet keeps.
 //   - BILLET_VIRT_EXPERIMENT_RUN: a label written on every line.
 //   - BILLET_VIRT_EXPERIMENT_IDLE_WATTS: the package's idle power, so each
 //     instance's share of the energy above it is what the node would attribute.
@@ -51,14 +57,15 @@ import (
 // export of the generation's snapshot loop-mounted on the host's own disk
 // (docs/reference/records/virtualization-cost.md), so nothing here maps, locks or
 // removes an RBD image beside the node's own. Each instance's /tmp, where the
-// compile keeps its caches, is a directory of its own on the host's disk; the
-// microVM keeps its root, /tmp included, on Ceph, as billet runs one.
+// compile keeps its caches, is a directory of its own on the scratch filesystem;
+// the microVM keeps its root, /tmp included, on Ceph, as billet runs one.
 //
 // HOW AN INSTANCE RUNS, so it is measured from its first instruction to its last
-// while its cgroup exists: it waits for a go file, which is written once the
-// sampler has its baseline; its body runs; its exit status is written to a file of
-// its own; and a sleep holds its cgroup until the final reading is taken. A setup
-// that failed writes a status too, and an instance whose unit or container died
+// while its cgroup exists: it waits for a go file, which is written only once the
+// sampler says it has the cgroup's baseline; its body runs; its exit status is
+// written to a file of its own; and a sleep holds its cgroup until the final
+// reading is taken. A setup that failed writes a status too, a status that could
+// not be written ends the instance, and an instance whose unit or container died
 // without one is a failure reported at once.
 func TestRealVirtualizationCost(t *testing.T) {
 	out := os.Getenv("BILLET_VIRT_EXPERIMENT_OUT")
@@ -93,6 +100,10 @@ func TestRealVirtualizationCost(t *testing.T) {
 	case mode == "container" && image == "":
 		t.Fatal("BILLET_VIRT_EXPERIMENT_IMAGE names no image for the container")
 	}
+	scratch := os.Getenv("BILLET_VIRT_EXPERIMENT_SCRATCH")
+	if err := scratchHolds(scratch, instances); err != nil {
+		t.Fatalf("BILLET_VIRT_EXPERIMENT_SCRATCH: %v", err)
+	}
 	idle, err := strconv.ParseFloat(os.Getenv("BILLET_VIRT_EXPERIMENT_IDLE_WATTS"), 64)
 	if err != nil {
 		t.Fatalf("BILLET_VIRT_EXPERIMENT_IDLE_WATTS: %v", err)
@@ -122,7 +133,7 @@ func TestRealVirtualizationCost(t *testing.T) {
 		// ONE THREAD OF EACH OF CCD i's FIRST CORES, as spread places a guest of
 		// this shape on an empty host: cpu N's SMT sibling is N+64.
 		name := "virtcost-" + runID + "-" + strconv.Itoa(i)
-		dir := filepath.Join(virtcostDir, name)
+		dir := filepath.Join(scratch, name)
 		all[i] = &virtInstance{name: name, cpus: fmt.Sprintf("%d-%d", 8*i, 8*i+vcpu-1), dir: dir}
 	}
 
@@ -138,7 +149,14 @@ func TestRealVirtualizationCost(t *testing.T) {
 			stop.Add(1)
 			go func() {
 				defer stop.Done()
-				errs[i] = stopInstance(ctx, mode, in.name, runID)
+				var removed int
+				removed, errs[i] = stopInstance(ctx, mode, in.name, runID)
+				// A CREATE WHOSE OUTCOME WAS NEVER KNOWN is settled only by removing what
+				// it made: two empty reads do not prove the daemon will not register it.
+				if errs[i] == nil && in.createUnsettled && removed == 0 {
+					errs[i] = fmt.Errorf("its docker create never answered and no container of it was "+
+						"found; remove any container labelled billet-virtcost=%s once the daemon settles", runID)
+				}
 			}()
 		}
 		stop.Wait()
@@ -182,7 +200,7 @@ func TestRealVirtualizationCost(t *testing.T) {
 		line := map[string]any{
 			"run": os.Getenv("BILLET_VIRT_EXPERIMENT_RUN"), "mode": mode, "placement": "spread",
 			"workload": workload, "vms": instances, "vcpu": vcpu, "guest": i, "cpus": in.cpus,
-			"memory_limit_bytes": int64(memory), "tmp": "a directory on the host's disk",
+			"memory_limit_bytes": int64(memory), "tmp": "a directory on the scratch filesystem",
 			"run_started_epoch": started.Unix(), "run_finished_epoch": finished.Unix(),
 			"host_busy_cpu_seconds": hostBusySeconds,
 		}
@@ -223,8 +241,40 @@ func TestRealVirtualizationCost(t *testing.T) {
 		finished.Sub(started).Round(time.Second), filepath.Clean(out))
 }
 
-// virtcostDir holds each instance's /tmp, go file and exit status.
-const virtcostDir = "/var/lib/billet-virtcost"
+// scratchPerInstance is the free space the scratch filesystem needs for each
+// instance: the gostd body keeps two fresh Go build caches of the standard library
+// and its tests in /tmp, about 3 GiB together on the reference node.
+const scratchPerInstance = 6 * config.GiB
+
+// scratchHolds refuses a scratch directory that is not a filesystem of its own,
+// mounted there (its device differs from its parent's), or that has less than
+// scratchPerInstance free for each instance. What fills it then fills nothing the
+// node or its ledger keeps.
+func scratchHolds(dir string, instances int) error {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return fmt.Errorf("%q is not an absolute path", dir)
+	}
+	var here, parent unix.Stat_t
+	if err := unix.Stat(dir, &here); err != nil {
+		return err
+	}
+	if err := unix.Stat(filepath.Dir(dir), &parent); err != nil {
+		return err
+	}
+	if here.Dev == parent.Dev {
+		return fmt.Errorf("%s is on its parent's filesystem; mount a filesystem of its own there", dir)
+	}
+	var fs unix.Statfs_t
+	if err := unix.Statfs(dir, &fs); err != nil {
+		return err
+	}
+	free, need := fs.Bavail*uint64(fs.Bsize), uint64(instances)*uint64(scratchPerInstance)
+	if free < need {
+		return fmt.Errorf("%s has %d bytes free; %d instances need %d", dir, free, instances, need)
+	}
+
+	return nil
+}
 
 // virtInstance is one container or process of the cost experiment.
 type virtInstance struct {
@@ -233,14 +283,20 @@ type virtInstance struct {
 	summary         usage.Summary
 	final           bool
 	err             error
+	// createUnsettled is a docker create that failed without saying whether the
+	// daemon made the container, which only its removal settles.
+	createUnsettled bool
 }
 
 // virtWrapper is what every instance runs: wait for the go file, run the body,
 // write its status, and hold the cgroup. $1 is the body, $2 the go file and $3
-// the status file, as the instance sees them.
+// the status file, as the instance sees them. A status it could not write ends
+// it, which its waiter sees at once, rather than holding a cgroup nobody will
+// read a status from.
 const virtWrapper = `while [ ! -e "$2" ]; do sleep 0.05; done
 bash -c "$1"
-echo $? >"$3.part" && mv "$3.part" "$3"
+rc=$?
+{ printf '%s\n' "$rc" >"$3.part" && mv "$3.part" "$3"; } || exit 1
 exec sleep infinity`
 
 // run starts the instance, opens its go file once the sampler has its baseline,
@@ -290,6 +346,10 @@ exec chroot "$R" /bin/bash -c "$3" wrapper "$4" /mnt/go /mnt/status`
 			"-v", in.dir+":/mnt", "-v", filepath.Join(in.dir, "tmp")+":/tmp",
 			image, "/bin/bash", "-c", virtWrapper, "wrapper", body, "/mnt/go", "/mnt/status").CombinedOutput()
 		if err != nil {
+			// A CREATE THE DAEMON ANSWERED WITH AN ERROR made nothing; one whose client
+			// was killed, or that answered nothing, may yet register a container.
+			var exit *exec.ExitError
+			in.createUnsettled = !errors.As(err, &exit) || ctx.Err() != nil || len(out) == 0
 			return fmt.Errorf("docker create: %w: %s", err, out)
 		}
 		id := strings.TrimSpace(string(out))
@@ -309,8 +369,12 @@ exec chroot "$R" /bin/bash -c "$3" wrapper "$4" /mnt/go /mnt/status`
 	}
 	monitor.Start(in.name, usage.Target{CgroupDir: cgroupDir}, vcpu)
 	defer monitor.Forget(in.name)
-	// THE BASELINE FIRST: the sampler reads the cgroup and the package at Start,
-	// so the workload begins after both and nothing of it falls before them.
+	// THE BASELINE FIRST, as the sampler acknowledges it: Start can return with
+	// it still pending, and a workload let go before it would be measured from
+	// part way through.
+	if err := baselined(ctx, monitor, in.name); err != nil {
+		return err
+	}
 	in.started = time.Now()
 	if err := os.WriteFile(goFile, nil, 0o644); err != nil {
 		return fmt.Errorf("open the go file: %w", err)
@@ -345,6 +409,24 @@ exec chroot "$R" /bin/bash -c "$3" wrapper "$4" /mnt/go /mnt/status`
 	}
 }
 
+// baselined waits for the sampler to say it has an instance's baseline, which a
+// Start it was too busy to take gets at its next tick.
+func baselined(ctx context.Context, monitor *usage.Monitor, name string) error {
+	deadline := time.Now().Add(10 * time.Second)
+	for !monitor.Baselined(name) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the sampler had no baseline for %s after 10s", name)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	return nil
+}
+
 // instanceAlive reports whether an instance's unit or container is still running.
 func instanceAlive(ctx context.Context, mode, name string) (bool, error) {
 	if mode == "process" {
@@ -365,56 +447,58 @@ func instanceAlive(ctx context.Context, mode, name string) (bool, error) {
 
 // stopInstance stops whatever of an instance is still there and answers nil only
 // on proof nothing of it runs: a service's cgroup gone, or no container left
-// carrying the run's label, read twice a few seconds apart so a create the daemon
-// was still finishing is found by the second read.
-func stopInstance(ctx context.Context, mode, name, runID string) error {
+// carrying the run's label, read twice a few seconds apart. It also says how many
+// containers it removed, which is what settles a create that never answered.
+func stopInstance(ctx context.Context, mode, name, runID string) (int, error) {
 	if mode == "process" {
 		unit := name + ".service"
 		out, err := exec.CommandContext(ctx, "systemctl", "stop", unit).CombinedOutput()
 		if err != nil && !strings.Contains(string(out), "not loaded") {
-			return fmt.Errorf("systemctl stop: %w: %s", err, out)
+			return 0, fmt.Errorf("systemctl stop: %w: %s", err, out)
 		}
 		cgroupRoot, err := cgroup2Mount(defaultProcMountsPath)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		dir := filepath.Join(cgroupRoot, "system.slice", unit)
 		for {
 			_, err := os.Stat(dir)
 			if errors.Is(err, os.ErrNotExist) {
-				return nil
+				return 0, nil
 			}
 			if err != nil {
-				return fmt.Errorf("could not tell whether %s is gone: %w", dir, err)
+				return 0, fmt.Errorf("could not tell whether %s is gone: %w", dir, err)
 			}
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("%s still exists: %w", dir, ctx.Err())
+				return 0, fmt.Errorf("%s still exists: %w", dir, ctx.Err())
 			case <-time.After(250 * time.Millisecond):
 			}
 		}
 	}
+	removed := 0
 	for round := range 2 {
 		out, err := exec.CommandContext(ctx, "docker", "ps", "-aq", "--filter", "label=billet-virtcost="+runID,
 			"--filter", "name=^"+name+"$").Output()
 		if err != nil {
-			return fmt.Errorf("docker ps: %w", err)
+			return removed, fmt.Errorf("docker ps: %w", err)
 		}
 		for _, id := range strings.Fields(string(out)) {
 			if out, err := exec.CommandContext(ctx, "docker", "rm", "-f", id).CombinedOutput(); err != nil {
-				return fmt.Errorf("docker rm %s: %w: %s", id, err, out)
+				return removed, fmt.Errorf("docker rm %s: %w: %s", id, err, out)
 			}
+			removed++
 		}
 		if round == 0 {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return removed, ctx.Err()
 			case <-time.After(5 * time.Second):
 			}
 		}
 	}
 
-	return nil
+	return removed, nil
 }
 
 // containerCgroup is the cgroup of the container docker just started, found by its
@@ -516,4 +600,92 @@ func readOnlyMount(dir string) bool {
 	}
 
 	return false
+}
+
+// THE WRAPPER PUBLISHES ITS BODY'S STATUS OR ENDS: it holds its cgroup only once
+// the status is written, and a status it cannot write ends it at once, which its
+// waiter sees as an instance that died without one.
+func TestTheVirtWrapperPublishesItsStatusOrEnds(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "linux" {
+		t.Skip("the wrapper holds its cgroup with GNU sleep infinity, which a BSD sleep refuses")
+	}
+
+	dir := t.TempDir()
+	goFile, status := filepath.Join(dir, "go"), filepath.Join(dir, "status")
+	if err := os.WriteFile(goFile, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held := exec.CommandContext(t.Context(), "bash", "-c", virtWrapper, "wrapper", "exit 3", goFile, status)
+	if err := held.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- held.Wait() }()
+	deadline := time.After(10 * time.Second)
+	for {
+		raw, err := os.ReadFile(status)
+		if err == nil {
+			if got := string(raw); got != "3\n" {
+				t.Errorf("the wrapper published %q; want the body's status 3", got)
+			}
+			break
+		}
+		select {
+		case err := <-exited:
+			t.Fatalf("the wrapper ended (%v) without publishing a status it could write", err)
+		case <-deadline:
+			t.Fatal("the wrapper published no status in 10s")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	select {
+	case err := <-exited:
+		t.Errorf("the wrapper ended (%v) after publishing; want it holding its cgroup", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := held.Process.Kill(); err != nil {
+		t.Errorf("stop the held wrapper: %v", err)
+	}
+	<-exited
+
+	// Bounded, since a wrapper that held on without its status would never end.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	unwritable := filepath.Join(dir, "missing", "status")
+	err := exec.CommandContext(ctx, "bash", "-c", virtWrapper, "wrapper", "true", goFile, unwritable).Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		t.Errorf("a wrapper that could not write its status answered %v; want it to end with status 1", err)
+	}
+}
+
+// THE SCRATCH IS A FILESYSTEM OF ITS OWN: a directory on its parent's filesystem,
+// where a compile that fills it fills what the node keeps, is refused, and so is
+// one without room for its instances.
+func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
+	t.Parallel()
+
+	if err := scratchHolds(t.TempDir(), 0); err == nil {
+		t.Error("a directory on its parent's filesystem was accepted as the scratch")
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(wd, "/dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scratchHolds(relative, 0); err == nil {
+		t.Errorf("the relative path %s was accepted as the scratch", relative)
+	}
+	// /dev is a filesystem of its own on Linux and macOS alike, with nowhere near
+	// a million instances' room.
+	if err := scratchHolds("/dev", 0); err != nil {
+		t.Errorf("/dev, a mount of its own, was refused: %v", err)
+	}
+	if err := scratchHolds("/dev", 1<<20); err == nil {
+		t.Error("a scratch without room for its instances was accepted")
+	}
 }
