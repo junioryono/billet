@@ -567,6 +567,9 @@ func TestAWriteBackOfAnotherDiskIsNoAnswer(t *testing.T) {
 			t.Fatalf("a caller whose time ran out answered %v", err)
 		}
 
+		// THE WRITE-BACK IS BLOCKED ON ITS RELEASE, so it read its disk's number before
+		// the name passes to another.
+		synctest.Wait()
 		seq = "57"
 		joined := make(chan error, 1)
 		go func() { joined <- p.flushBefore(t.Context(), "/dev/rbd4") }()
@@ -592,6 +595,23 @@ func TestAWriteBackOfAnotherDiskIsNoAnswer(t *testing.T) {
 func TestAWriteBackADetachGaveUpOnIsToldToTheSlotsNext(t *testing.T) {
 	t.Parallel()
 
+	// WHETHER OR NOT THE SLOT CAN BE PROVED TO HOLD THE DEVICE, and whether the
+	// write-back has ended or is still in flight when the next detach comes.
+	for name, tc := range map[string]struct{ holds, inFlight bool }{
+		"the slot proved to hold it":            {holds: true},
+		"a proof that cannot tell":              {},
+		"a proof that cannot tell, still going": {inFlight: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			gaveUpThenRetried(t, tc.holds, tc.inFlight)
+		})
+	}
+}
+
+func gaveUpThenRetried(t *testing.T, holds, inFlight bool) {
+	t.Helper()
+
 	h := newHarness(t)
 	var vmm *fakeVMM
 	h.onJailer = func(id string) { vmm = h.serveVMM(t, id) }
@@ -607,10 +627,9 @@ func TestAWriteBackADetachGaveUpOnIsToldToTheSlotsNext(t *testing.T) {
 		t.Fatalf("AttachVolume: %v", err)
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
-	opens := 0
+	var opens atomic.Int32
 	h.p.openDisk = func(string) (diskHandle, error) {
-		opens++
-		if opens > 1 {
+		if opens.Add(1) > 1 {
 			return syncedDisk{}, nil
 		}
 
@@ -631,11 +650,44 @@ func TestAWriteBackADetachGaveUpOnIsToldToTheSlotsNext(t *testing.T) {
 	if err := h.p.DetachVolume(ctx, inst.ID, 0, "/dev/nvme9n1"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("a detach whose time ran out during its write-back answered %v", err)
 	}
-	close(release)
-	forgotten(t, h.p)
+
+	var asked []string
+	var askedMu sync.Mutex
+	h.p.slotHolds = func(_, device string) bool {
+		askedMu.Lock()
+		asked = append(asked, device)
+		askedMu.Unlock()
+
+		return holds
+	}
+	if !inFlight {
+		close(release)
+		forgotten(t, h.p)
+	} else {
+		// RELEASED ONLY ONCE THE NEXT DETACH IS WAITING ON IT, which it must be: it
+		// cannot be told success while the write-back that may lose writes runs.
+		go func() {
+			for {
+				askedMu.Lock()
+				n := len(asked)
+				askedMu.Unlock()
+				if n > 0 {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			time.Sleep(50 * time.Millisecond)
+			close(release)
+		}()
+	}
 
 	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, ""); !errors.Is(err, provider.ErrWritesLost) {
 		t.Fatalf("the slot's next detach, handed no device, answered %v, want the lost writes", err)
+	}
+	askedMu.Lock()
+	defer askedMu.Unlock()
+	if len(asked) == 0 || asked[0] != "/dev/nvme9n1" {
+		t.Errorf("the next detach asked whether the slot holds %q, want the device its write-back was of", asked)
 	}
 	if cache0Patches(vmm) != 2 {
 		t.Errorf("cache0 had %d PATCH(es); the second detach must still detach", cache0Patches(vmm))
@@ -675,12 +727,11 @@ func detachThatFailedThenRetried(t *testing.T, retryDevice string) {
 	if err := h.p.AttachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); err != nil {
 		t.Fatalf("AttachVolume: %v", err)
 	}
-	failed := false
+	var failed atomic.Bool
 	h.p.openDisk = func(string) (diskHandle, error) {
-		if failed {
+		if failed.Swap(true) {
 			return syncedDisk{}, nil
 		}
-		failed = true
 
 		return syncedDisk{sync: func() error { return errors.New("input/output error") }}, nil
 	}

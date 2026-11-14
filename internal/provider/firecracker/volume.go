@@ -92,9 +92,17 @@ func (p *Provider) DetachVolume(
 	// its device, and a detach whose proof of the device failed is handed none. The
 	// device the slot's unfinished detach wrote back is asked again, while the slot
 	// still holds that very block device.
-	if remembered := p.slotDevice(instanceID, slot); device == "" && remembered != "" &&
-		p.slotHolds(j.volumePath(slot), remembered) {
-		device = remembered
+	//
+	// AND A SLOT WHOSE DEVICE CANNOT BE PROVED IS NOT TOLD SUCCESS: a write-back of its
+	// device still in flight is waited on, never joined with a fresh open, and what it
+	// lost reaches the slot itself (keepLoss), whatever the proof answers.
+	if remembered := p.slotDevice(instanceID, slot); device == "" && remembered != "" {
+		if p.slotHolds(j.volumePath(slot), remembered) {
+			device = remembered
+		} else if err := p.awaitWriteBack(ctx, remembered); err != nil {
+			return fmt.Errorf("firecracker: wait for the write-back of cache slot %d of %s: %w",
+				slot, instanceID, err)
+		}
 	}
 	p.rememberSlotDevice(instanceID, slot, device)
 	lost := p.flushBefore(ctx, device)
@@ -238,7 +246,9 @@ type writesLoss struct {
 }
 
 // keepLoss keeps lost, if anything was lost, for the next detach of device to be told,
-// as lost by the disk seq names (none known when it is empty).
+// as lost by the disk seq names (none known when it is empty), and for the next detach
+// of every slot whose unfinished detach wrote device back, which is told it whatever
+// device it is handed and whatever its proof of the device answers.
 func (p *Provider) keepLoss(device, seq string, lost error) {
 	if lost == nil || device == "" {
 		return
@@ -251,6 +261,34 @@ func (p *Provider) keepLoss(device, seq string, lost error) {
 		p.unreported = map[string]writesLoss{}
 	}
 	p.unreported[device] = writesLoss{seq: seq, err: lost}
+	for key, slotDevice := range p.slotDevices {
+		if slotDevice != device {
+			continue
+		}
+		if p.slotLosses == nil {
+			p.slotLosses = map[string]error{}
+		}
+		p.slotLosses[key] = lost
+	}
+}
+
+// awaitWriteBack waits, within ctx, for a write-back of device in flight to end,
+// opening nothing; with none in flight it returns at once. What the write-back lost
+// is kept for the slot that started it (keepLoss).
+func (p *Provider) awaitWriteBack(ctx context.Context, device string) error {
+	p.flushMu.Lock()
+	wb, running := p.flushing[device]
+	p.flushMu.Unlock()
+	if !running {
+		return nil
+	}
+
+	select {
+	case <-wb.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func slotKey(instanceID string, slot int) string { return fmt.Sprintf("%s/%d", instanceID, slot) }
