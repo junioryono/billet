@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -128,7 +129,17 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 			t.Errorf("remove the golden's system disk: %v", err)
 		}
 	})
+	// THE BUILDER HOLDS ITS TAP, AND SO THE GOLDEN'S MAC, while any fork may still
+	// run with it: a fork whose teardown failed leaves the builder too, so no guest
+	// the node launches next is given the MAC that fork answers on.
+	forkSurvived := false
 	t.Cleanup(func() {
+		if forkSurvived {
+			t.Errorf("the builder %s is left running, paused, so its tap stays reserved while a fork "+
+				"that could not be destroyed may hold the golden's MAC; destroy the fork, then the builder", builder)
+
+			return
+		}
 		if _, err := goldens.Destroy(context.WithoutCancel(t.Context()), builder); err != nil {
 			t.Errorf("cleanup the builder: %v", err)
 		}
@@ -168,7 +179,8 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 	// CAPTURED WHILE ITS WAITER ASKS, which is after the guest kernel finished
 	// booting (Firecracker's condition for a snapshot) and after the agent did
 	// everything a job's guest does before its runner starts.
-	waiting, err := waiterState(t.Context(), goldenAddr, snapshotStartPort, 5*time.Minute, func(s string) bool { return s == "waiting" })
+	waiting, err := waiterState(t.Context(), goldenAddr, snapshotStartPort, 5*time.Minute,
+		func(s string) bool { return hasLine(s, "waiting") })
 	if err != nil {
 		t.Fatalf("the builder's waiter: %v", err)
 	}
@@ -200,14 +212,25 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		if arm == "restore" {
 			fields["snapshot_age_s"] = time.Since(captured).Seconds()
 		}
-		if err := runStartTrial(t, p, spec, i, arm, jits, leases, snapshot, evidence, goldenMAC, goldenAddr,
-			fields); err != nil {
+		err := runStartTrial(t, p, spec, i, arm, jits, leases, snapshot, evidence, goldenMAC, goldenAddr, fields)
+		if err != nil {
 			fields["error"] = err.Error()
-			t.Errorf("trial %d (%s): %v", i, arm, err)
 		}
 		line(fields)
+		// A TRIAL WHOSE GUEST COULD NOT BE DESTROYED ENDS THE EXPERIMENT: the next
+		// fork would share its MAC and address.
+		if errors.Is(err, errTrialSurvived) {
+			forkSurvived = true
+			t.Fatalf("trial %d (%s): %v", i, arm, err)
+		}
+		if err != nil {
+			t.Errorf("trial %d (%s): %v", i, arm, err)
+		}
 	}
 }
+
+// errTrialSurvived is a trial whose guest could not be destroyed.
+var errTrialSurvived = errors.New("its guest could not be destroyed")
 
 // snapshotStartPlaceholder is the golden's JIT configuration: what its waiter
 // waits for the metadata to stop saying.
@@ -216,29 +239,40 @@ const snapshotStartPlaceholder = "billet-snapshot-start-placeholder"
 // snapshotStartPort is where a waiter serves its state, inside the guest.
 const snapshotStartPort = 47231
 
-// snapshotStartWaiter is the command both arms run in place of the runner: it
-// serves its state on port $3 (waiting; registered and the guest's time in
-// milliseconds; finished, the guest's time and the runner's status), waits for the
-// metadata service at $2 to hold a registration that is not $1, and runs the
-// runner with it. A fresh token for every read, since a restored VMM knows none
-// the golden's did, and every read bounded to a second, since one in flight at the
-// capture is answered by nobody.
+// snapshotStartWaiter is the command both arms run in place of the runner. It
+// serves its state on port $3, one line appended per step (waiting; registered and
+// the guest's time in milliseconds; released and the time; finished, the time and
+// the runner's status), so no step's time is lost to a later one; waits for the
+// metadata service at $2 to hold a registration that is not $1; holds there until
+// the host, having sampled the guest's memory, releases it with a POST; runs the
+// runner with it; and then holds on, listener and all, until the host destroys the
+// guest, since the agent's service ending would take the listener with it.
+//
+// A fresh token for every read, since a restored VMM knows none the golden's did,
+// and every read bounded to a second, since one in flight at the capture is
+// answered by nobody.
 const snapshotStartWaiter = `set -u
 state=${TMPDIR:-/tmp}/billet-snapshot-start
+rm -f "$state.release"
 printf 'waiting\n' >"$state"
 python3 -c '
 import http.server, sys
 path = sys.argv[1]
 class State(http.server.BaseHTTPRequestHandler):
+    def reply(self, body):
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
     def do_GET(self):
         try:
             body = open(path, "rb").read()
         except OSError:
             body = b"unreadable\n"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self.reply(body)
+    def do_POST(self):
+        open(path + ".release", "w").close()
+        self.reply(b"released\n")
     def log_message(self, *args):
         pass
 http.server.ThreadingHTTPServer(("0.0.0.0", int(sys.argv[2])), State).serve_forever()
@@ -254,19 +288,72 @@ while :; do
 	fi
 	sleep 0.02
 done
-printf 'registered %s\n' "$(date +%s%3N)" >"$state.part" && mv "$state.part" "$state"
+printf 'registered %s\n' "$(date +%s%3N)" >>"$state"
+while [ ! -e "$state.release" ]; do sleep 0.01; done
+printf 'released %s\n' "$(date +%s%3N)" >>"$state"
 ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" ./run.sh
 rc=$?
-printf 'finished %s %s\n' "$(date +%s%3N)" "$rc" >"$state.part" && mv "$state.part" "$state"
-exit "$rc"`
+printf 'finished %s %s\n' "$(date +%s%3N)" "$rc" >>"$state"
+exec sleep infinity`
+
+// hasLine reports whether a waiter's state holds a line starting with step.
+func hasLine(state, step string) bool {
+	_, ok := lineOf(state, step)
+
+	return ok
+}
+
+// lineOf is the rest of a waiter's line for step, without the step's own word.
+func lineOf(state, step string) (string, bool) {
+	for _, l := range strings.Split(state, "\n") {
+		if l == step {
+			return "", true
+		}
+		if rest, ok := strings.CutPrefix(l, step+" "); ok {
+			return rest, true
+		}
+	}
+
+	return "", false
+}
+
+// releaseWaiter tells a waiter holding at its registration to run the runner.
+func releaseWaiter(ctx context.Context, addr string, port int) error {
+	client := &http.Client{Timeout: time.Second}
+	url := fmt.Sprintf("http://%s:%d/release", addr, port)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, http.NoBody)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			err = resp.Body.Close()
+			if err == nil && resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("release the waiter at %s: %w", url, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
 
 // runStartTrial runs one trial and fills its fields: when billet was asked, when
 // it answered, when the waiter had its registration by the guest's clock and when
-// the host first read it, the VMM's memory then and later, and when the runner
-// finished its one job.
+// the host first read it, the VMM's memory while the runner is held there and
+// later, and when the runner finished its one job. The guest is destroyed however
+// the trial ends, before the next starts; one that could not be is
+// errTrialSurvived.
 func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provider.Spec, i int, arm, jits,
 	leases, snapshot string, evidence Evidence, goldenMAC, goldenAddr string, fields map[string]any,
-) error {
+) (err error) {
 	t.Helper()
 
 	jit, err := takeJIT(t.Context(), filepath.Join(jits, strconv.Itoa(i)+".jit"), 10*time.Minute)
@@ -277,23 +364,31 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	name := provider.InstanceName(freshLease(t))
 	fields["instance"] = name
 
-	// REGISTERED BEFORE THE START: a guest that started is destroyed however the
-	// trial ends, and a Destroy of one that never started is a no-op.
+	// DESTROYED HOWEVER THE TRIAL ENDS, and done only once it is: a Destroy that
+	// failed is tried again at cleanup, and a Destroy of one that never started is
+	// a no-op.
 	destroyed := false
 	destroy := func() error {
 		if destroyed {
 			return nil
 		}
+		if _, err := p.Destroy(context.WithoutCancel(t.Context()), name); err != nil {
+			return err
+		}
 		destroyed = true
-		_, err := p.Destroy(context.WithoutCancel(t.Context()), name)
 
-		return err
+		return nil
 	}
 	t.Cleanup(func() {
 		if err := destroy(); err != nil {
 			t.Errorf("cleanup %s: %v", name, err)
 		}
 	})
+	defer func() {
+		if derr := destroy(); derr != nil {
+			err = errors.Join(err, fmt.Errorf("%w: %s: %w", errTrialSurvived, name, derr))
+		}
+	}()
 
 	asked := time.Now()
 	fields["asked_epoch_ms"] = asked.UnixMilli()
@@ -333,21 +428,34 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	}
 
 	registered, err := waiterState(t.Context(), addr, snapshotStartPort, 5*time.Minute,
-		func(s string) bool { return strings.HasPrefix(s, "registered ") })
+		func(s string) bool { return hasLine(s, "registered") })
 	if err != nil {
 		return fmt.Errorf("the waiter: %w", err)
 	}
-	guestMS, err := strconv.ParseInt(strings.TrimPrefix(registered.state, "registered "), 10, 64)
+	stamp, _ := lineOf(registered.state, "registered")
+	guestMS, err := strconv.ParseInt(stamp, 10, 64)
 	if err != nil {
 		return fmt.Errorf("the waiter answered %q", registered.state)
 	}
 	fields["registered_guest_epoch_ms"] = guestMS
 	fields["registered_seen_ms"] = registered.seen.Sub(asked).Milliseconds()
 	fields["registered_guest_ms"] = guestMS - asked.UnixMilli()
-	// AN UPPER BOUND ON THE GUEST'S CLOCK ERROR, from below: the guest stamped
-	// before the host read it, so a guest clock behind the host's shows here as
-	// how far its stamp precedes the read, poll interval included.
+	// HOW FAR THE GUEST'S STAMP PRECEDES THE HOST'S FIRST READ OF IT: the poll's
+	// interval and latency, plus however far the guest's clock is behind the
+	// host's. A large value says the clock is behind; a negative one, ahead.
 	fields["guest_stamp_before_read_ms"] = registered.seen.UnixMilli() - guestMS
+
+	// THE MEMORY WHILE THE RUNNER IS HELD AT ITS REGISTRATION, the same instruction
+	// in both arms, then the release.
+	pid, err := vmmPID(j)
+	if err != nil {
+		return err
+	}
+	fields["memory_at_registered"] = smapsRollup(pid)
+	if err := releaseWaiter(t.Context(), addr, snapshotStartPort); err != nil {
+		return err
+	}
+	released := time.Now()
 
 	if arm == "restore" {
 		// THE FORK IS THE GOLDEN ON THE WIRE: its MAC, on its own tap.
@@ -355,14 +463,8 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		fields["fork_mac_is_golden"] = err == nil && strings.Contains(string(fdb), goldenMAC)
 	}
 
-	pid, err := vmmPID(j)
-	if err != nil {
-		return err
-	}
-	fields["memory_at_registered"] = smapsRollup(pid)
-
-	// SAMPLED UNTIL THE RUNNER FINISHES ITS JOB: the memory thirty seconds in,
-	// while the job runs, and the peak.
+	// SAMPLED UNTIL THE RUNNER FINISHES ITS JOB: the memory thirty seconds after
+	// the release, while the job runs, and the peak.
 	var peak int64
 	sampled := false
 	finished, err := waiterState(t.Context(), addr, snapshotStartPort, 20*time.Minute, func(s string) bool {
@@ -370,20 +472,26 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		if pss, ok := m["Pss"]; ok && pss > peak {
 			peak = pss
 		}
-		if !sampled && time.Since(registered.seen) >= 30*time.Second {
-			fields["memory_30s_after_registered"] = m
+		if !sampled && time.Since(released) >= 30*time.Second {
+			fields["memory_30s_after_release"] = m
 			sampled = true
 		}
 
-		return strings.HasPrefix(s, "finished ")
+		return hasLine(s, "finished")
 	})
 	fields["pss_peak_kib"] = peak
 	if err != nil {
 		return fmt.Errorf("the runner: %w", err)
 	}
+	if stamp, ok := lineOf(finished.state, "released"); ok {
+		if ms, err := strconv.ParseInt(stamp, 10, 64); err == nil {
+			fields["released_guest_ms"] = ms - asked.UnixMilli()
+		}
+	}
+	rest, _ := lineOf(finished.state, "finished")
 	var finishedMS int64
 	var status int
-	if _, err := fmt.Sscanf(finished.state, "finished %d %d", &finishedMS, &status); err != nil {
+	if _, err := fmt.Sscanf(rest, "%d %d", &finishedMS, &status); err != nil {
 		return fmt.Errorf("the waiter answered %q", finished.state)
 	}
 	fields["finished_guest_ms"] = finishedMS - asked.UnixMilli()
@@ -392,7 +500,7 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		return fmt.Errorf("the runner exited %d", status)
 	}
 
-	return destroy()
+	return nil
 }
 
 // waiterSeen is a waiter's state and when the host first read it.
@@ -415,7 +523,7 @@ func waiterState(ctx context.Context, addr string, port int, limit time.Duration
 			return waiterSeen{}, err
 		}
 		if resp, err := client.Do(req); err == nil {
-			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 256))
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1024))
 			seen := time.Now()
 			readErr = errors.Join(readErr, resp.Body.Close())
 			if readErr == nil && resp.StatusCode == http.StatusOK {
@@ -577,9 +685,10 @@ func loadAverage() string {
 // THE WAITER WAITS FOR A REAL REGISTRATION AND SAYS WHAT IT DID: against a stand-in
 // for the metadata service, it serves "waiting" while the service answers the
 // placeholder, asks for a fresh token before every read (a restored VMM honours
-// none the golden's did, which the stand-in enforces by forgetting every token it
-// issued), runs the runner with the registration the service then gives, and
-// serves its finish and the runner's status.
+// none the golden's did, which the stand-in enforces by honouring only the newest
+// token), holds at its registration without running the runner until it is
+// released, runs the runner with the registration the service then gives, serves
+// every step's line, and holds on after the runner finishes.
 func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS != "linux" {
@@ -606,7 +715,7 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 			reads++
 			// ONLY THE NEWEST TOKEN IS HONOURED, so a waiter that kept one would be
 			// refused from the second read on.
-			if r.Header.Get("X-metadata-token") != live {
+			if r.Header.Get("X-Metadata-Token") != live {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -617,11 +726,16 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	}))
 	t.Cleanup(mmds.Close)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	listener, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("a TCP listener answered %T for its address", listener.Addr())
+	}
+	port := addr.Port
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -633,10 +747,13 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A PROCESS GROUP OF ITS OWN, so the listener and the sleep the waiter leaves
+	// behind are ended with it.
 	cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", snapshotStartWaiter, "waiter",
 		snapshotStartPlaceholder, mmds.URL, strconv.Itoa(port))
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "TMPDIR="+dir)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -646,21 +763,15 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 		defer close(exited)
 		waitErr = cmd.Wait()
 	}()
-	// THE WAITER, AND THE LISTENER IT LEFT BEHIND, END WITH THE TEST.
 	t.Cleanup(func() {
-		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			t.Errorf("stop the waiter: %v", err)
+		if err := unix.Kill(-cmd.Process.Pid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+			t.Errorf("stop the waiter's process group: %v", err)
 		}
 		<-exited
-		// BY ITS STATE FILE, which is under this test's own directory.
-		if out, err := exec.Command("pkill", "-f", filepath.Join(dir, "billet-snapshot-start")).
-			CombinedOutput(); err != nil && len(out) > 0 {
-			t.Errorf("stop the waiter's listener: %v: %s", err, out)
-		}
 	})
 
 	if _, err := waiterState(t.Context(), "127.0.0.1", port, 30*time.Second,
-		func(s string) bool { return s == "waiting" }); err != nil {
+		func(s string) bool { return hasLine(s, "waiting") }); err != nil {
 		t.Fatalf("the waiter never served waiting: %v", err)
 	}
 	// SEVERAL READS OF THE PLACEHOLDER, so the token rule has had its chance to bite.
@@ -682,23 +793,47 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	jit = "a-real-registration"
 	mu.Unlock()
 
+	registered, err := waiterState(t.Context(), "127.0.0.1", port, 30*time.Second,
+		func(s string) bool { return hasLine(s, "registered") })
+	if err != nil {
+		t.Fatalf("the waiter never served registered: %v", err)
+	}
+	// HELD THERE until released: the runner has not run a moment later.
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(seen); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the runner ran before the waiter was released (%v)", err)
+	}
+	if err := releaseWaiter(t.Context(), "127.0.0.1", port); err != nil {
+		t.Fatal(err)
+	}
+
 	finished, err := waiterState(t.Context(), "127.0.0.1", port, 30*time.Second,
-		func(s string) bool { return strings.HasPrefix(s, "finished ") })
+		func(s string) bool { return hasLine(s, "finished") })
 	if err != nil {
 		t.Fatalf("the waiter never served finished: %v", err)
 	}
+	for _, step := range []string{"waiting", "registered", "released"} {
+		if !hasLine(finished.state, step) {
+			t.Errorf("the finished state %q lost its %s line", finished.state, step)
+		}
+	}
+	if stamp, _ := lineOf(registered.state, "registered"); stamp == "" {
+		t.Errorf("the registered line %q carries no time", registered.state)
+	}
 	var at int64
 	var status int
-	if _, err := fmt.Sscanf(finished.state, "finished %d %d", &at, &status); err != nil || status != 3 {
+	rest, _ := lineOf(finished.state, "finished")
+	if _, err := fmt.Sscanf(rest, "%d %d", &at, &status); err != nil || status != 3 {
 		t.Errorf("the waiter served %q; want the runner's status 3", finished.state)
 	}
 	if got, err := os.ReadFile(seen); err != nil || string(got) != "a-real-registration" {
 		t.Errorf("the runner was given %q (%v); want the real registration", got, err)
 	}
-	<-exited
-	var exit *exec.ExitError
-	if !errors.As(waitErr, &exit) || exit.ExitCode() != 3 {
-		t.Errorf("the waiter answered %v; want the runner's status 3", waitErr)
+	// AND IT HOLDS ON, listener and all, until the host destroys the guest.
+	select {
+	case <-exited:
+		t.Errorf("the waiter ended (%v) after its runner; want it holding on", waitErr)
+	case <-time.After(300 * time.Millisecond):
 	}
 	mu.Lock()
 	defer mu.Unlock()

@@ -303,11 +303,12 @@ func (p *Provider) restoreInto(
 		// Metadata is this lease's, never the golden's: the data store is empty after
 		// a load, so nothing of the golden's survives into it.
 		Metadata: md,
-		// EVERY LOAD ADVANCES THE GUEST'S CLOCK by the time since capture, which a
-		// golden on kvm-clock takes and one on tsc ignores (ADR-017): a fork's
+		// EVERY x86 LOAD ADVANCES THE GUEST'S CLOCK by the time since capture, which
+		// a golden on kvm-clock takes and one on tsc ignores (ADR-017): a fork's
 		// clock otherwise starts where its golden's stopped, and its runner's first
-		// TLS and token checks run in the past.
-		ClockRealtime: true,
+		// TLS and token checks run in the past. Firecracker refuses the option on
+		// aarch64 (v1.16.1, UnsupportedClockRealtime), so an arm64 load leaves it.
+		ClockRealtime: p.goarch != "arm64",
 		VCPUs:         spec.VCPU,
 		MemoryMiB:     int64(spec.Memory) >> 20,
 	}); err != nil {

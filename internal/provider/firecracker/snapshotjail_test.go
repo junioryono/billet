@@ -153,6 +153,28 @@ func (h *harness) restoreExpecting(
 	return inst, vmm, err
 }
 
+// AN x86 RESTORE ADVANCES THE GUEST'S CLOCK, so a fork does not start where its
+// golden's clock stopped; an arm64 one does not ask, since Firecracker refuses the
+// option there.
+func TestARestoreAdvancesTheClockWhereFirecrackerCan(t *testing.T) {
+	t.Parallel()
+
+	for goarch, want := range map[string]bool{"amd64": true, "arm64": false} {
+		h := newHarness(t)
+		h.p.goarch = goarch
+		publish(t, h, "gold-1", 0o444)
+
+		_, vmm, err := h.restoreWith(t, "gold-1")
+		if err != nil {
+			t.Fatalf("Restore on %s: %v", goarch, err)
+		}
+		load, _ := vmm.bodyPut("/snapshot/load")
+		if got := load["clock_realtime"] == true; got != want {
+			t.Errorf("on %s clock_realtime = %v, want %v", goarch, load["clock_realtime"], want)
+		}
+	}
+}
+
 // A RESTORE LOADS THE SNAPSHOT IT LINKED, AND BOOTS NOTHING. Every resource a cold
 // boot configures is in the snapshot already, and Firecracker refuses most of them
 // once one is loaded, so a restore that configured a machine first would be a boot
@@ -183,11 +205,6 @@ func TestARestoreLoadsTheLinkedSnapshotAndConfiguresNoMachine(t *testing.T) {
 
 	if mem := field[map[string]any](t, load, "mem_backend"); mem["backend_path"] != "/snapshot.mem" {
 		t.Errorf("mem_backend = %v, want /snapshot.mem inside the chroot", mem)
-	}
-
-	if load["clock_realtime"] != true {
-		t.Errorf("clock_realtime = %v, want true: a fork's clock would start where its golden's stopped",
-			load["clock_realtime"])
 	}
 
 	// THE LINK IS THE PUBLISHED FILE, never a copy and never a chowned one.
