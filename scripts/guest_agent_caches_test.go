@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // THE AGENT'S BUILD-CACHE BLOCK IS RUN HERE, not grepped for. What a job gets is
@@ -84,6 +85,14 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 
 			bazelrc := filepath.Join(t.TempDir(), "bazel.bazelrc")
 			gitconfig := filepath.Join(t.TempDir(), "gitconfig")
+			// THE READ IS RECORDED, not made: it runs in the background, so the reader
+			// writes what it was given to a file the test waits for.
+			preread := filepath.Join(t.TempDir(), "preread")
+			reader := filepath.Join(t.TempDir(), "reader")
+			if err := forkSafeWriteFile(reader, []byte("#!/bin/sh\nprintf '%s' \"$1\" >"+shellQuote(preread)+"\n"),
+				0o755); err != nil {
+				t.Fatal(err)
+			}
 			script := strings.Join([]string{
 				"set -euo pipefail",
 				`log() { printf 'billet-agent: %s\n' "$*" >&2; }`,
@@ -92,6 +101,7 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 				"guest_caches=" + shellQuote(tc.caches),
 				"GUEST_BILLET=" + shellQuote(tc.binary),
 				"BAZELRC_FILE=" + shellQuote(bazelrc),
+				"GUEST_PREREAD=" + shellQuote(reader),
 				"GITCONFIG_FILE=" + shellQuote(gitconfig),
 				"runner_env=()",
 				block,
@@ -133,6 +143,27 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 			}
 			if strings.Contains(string(rc), "token") {
 				t.Errorf("the bazelrc carries the bearer: %q", rc)
+			}
+
+			// BILLET IS READ IN WHENEVER A CACHE RUNS IT AS A HELPER (#878), and only then.
+			wantRead := len(tc.wantBazelrc) > 0 || len(tc.wantGit) > 0 ||
+				slices.ContainsFunc(tc.wantEnv, func(e string) bool { return strings.HasPrefix(e, "GOCACHEPROG=") })
+			var read []byte
+			for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				read, err = os.ReadFile(preread)
+				if err == nil || !wantRead || time.Now().After(deadline) {
+					break
+				}
+			}
+			if !wantRead {
+				time.Sleep(200 * time.Millisecond)
+				read, err = os.ReadFile(preread)
+			}
+			switch {
+			case wantRead && string(read) != tc.binary:
+				t.Errorf("billet was not read in before a job: read %q (%v), want %s", read, err, tc.binary)
+			case !wantRead && err == nil:
+				t.Errorf("billet was read in though no cache runs it: %q", read)
 			}
 
 			gc, err := os.ReadFile(gitconfig)

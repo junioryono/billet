@@ -2358,6 +2358,15 @@ if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ] && [ -x "$GUEST_BILLET" ]; 
 		esac
 	done
 fi
+# BILLET IS READ IN BEFORE A JOB FIRST RUNS IT, in the background, whenever a cache
+# runs it as a helper. A fresh EC2 guest's root volume loads its blocks from the AMI's
+# snapshot as they are first read, and billet's first exec there took 9.0 s, against
+# 0.017 s after (c7i.2xlarge from the lane's AMI, 2026-11-13): within a second of
+# Bazel's 10 s wait for its credential helper, which a job exceeded (#878). Read in
+# order, the rest of the binary took 4.1 s, and a job starts about a minute after boot.
+if [ -n "$guest_go$guest_bazel$guest_git" ]; then
+	("${GUEST_PREREAD:-cat}" "$GUEST_BILLET" >/dev/null 2>&1 &)
+fi
 if [ -n "$guest_go" ]; then
 	# THE ONLY WAY OUT IS GOCACHEPROG= (EMPTY) IN A WORKFLOW: the go command
 	# prefers GOCACHEPROG to GOCACHE, so setting GOCACHE alone changes nothing.
