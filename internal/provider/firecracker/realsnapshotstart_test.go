@@ -82,16 +82,13 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 	}
 
 	trials := experimentInt(t, "BILLET_SNAPSHOT_START_TRIALS", 10)
-	// A TEST DEADLINE THAT COULD END THE RUN IS REFUSED BEFORE ANYTHING STARTS: the
-	// test binary's timeout panics without running a trial's teardown or any
-	// cleanup, which would leave a fork and the builder running. Unset (-timeout 0)
-	// or long enough for every trial's budget, the golden and the cleanup.
-	if d, ok := t.Deadline(); ok {
-		need := time.Duration(trials)*(trialBudget+teardownBudget) + 45*time.Minute
-		if left := time.Until(d); left < need {
-			t.Fatalf("the test's deadline is %s away and %d trials need %s; run with -test.timeout 0 or longer",
-				left.Round(time.Second), trials, need)
-		}
+	// NO TEST DEADLINE, refused before anything starts: the test binary's timeout
+	// panics without running a trial's teardown or any cleanup, which would leave a
+	// fork and the builder running. Every step has a deadline of its own instead,
+	// and the operator watching the run sees a stop on stderr as it happens.
+	if _, ok := t.Deadline(); ok {
+		t.Fatal("run with -test.timeout 0: every step has its own deadline, and the binary's timeout would " +
+			"skip the teardown")
 	}
 	vcpu := experimentInt(t, "BILLET_SNAPSHOT_START_VCPU", 2)
 	memory := config.ByteSize(experimentInt(t, "BILLET_SNAPSHOT_START_MEMORY_GIB", 4)) * config.GiB
@@ -160,7 +157,9 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 
 			return
 		}
-		if _, err := goldens.Destroy(context.WithoutCancel(t.Context()), builder); err != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Minute)
+		defer cancel()
+		if _, err := goldens.Destroy(ctx, builder); err != nil {
 			t.Errorf("cleanup the builder: %v", err)
 		}
 	})
@@ -180,7 +179,9 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 	}
 
 	bootStarted := time.Now()
-	if _, err := goldens.Launch(t.Context(), spec(builder, snapshotStartPlaceholder)); err != nil {
+	launchCtx, cancelLaunch := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancelLaunch()
+	if _, err := goldens.Launch(launchCtx, spec(builder, snapshotStartPlaceholder)); err != nil {
 		t.Fatalf("Launch the builder: %v", err)
 	}
 	builderRes, err := resourcesOf(goldens.jailFor(builder))
@@ -207,7 +208,9 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 	bootToWaiting := waiting.seen.Sub(bootStarted)
 
 	captureStarted := time.Now()
-	evidence, err := goldens.Capture(t.Context(), builder, snapshot)
+	captureCtx, cancelCapture := context.WithTimeout(t.Context(), 15*time.Minute)
+	defer cancelCapture()
+	evidence, err := goldens.Capture(captureCtx, builder, snapshot)
 	if err != nil {
 		t.Fatalf("Capture the golden: %v", err)
 	}
