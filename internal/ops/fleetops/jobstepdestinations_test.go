@@ -187,7 +187,7 @@ func TestAStepsLargestDestinationIsNamedPastAnInt64(t *testing.T) {
 				SentBytes: most, ReceivedBytes: most, Connections: 1})
 			continue
 		}
-		// Three openings past 2^64: a carry, and a small low word.
+		// Three openings past 2^64: a carry, and a smaller low word.
 		for s := range 3 {
 			wide.Openings = append(wide.Openings, alloc.DestinationOpening{Ordinal: i, Start: t0.Unix() + int64(s),
 				SentBytes: most, ReceivedBytes: most / 3, Connections: 1})
