@@ -1,0 +1,30 @@
+name: Known-answer run (Mac)
+
+# THE MAC'S CALLER for the known-answer kit (docs/operating/measurement-validation.md),
+# beside known-answer-run.yml's for the Linux reference host. Dispatched by hand: it
+# runs six jobs one after another on billet-4vcpu-ubuntu-2404-arm, an arm64 Linux tier
+# on Tart that only macos-01 serves, so every loaded job's idle reference ran on the
+# same Mac. The kit's scripts are fetched from this run's own commit.
+#
+# THE LOADS FIT THE TIER, 4 vCPU and 12 GiB: two CPU workers, so the guest's own
+# setup has vCPUs beside them; a 6 GiB memory load, half the guest, since a Tart VM's
+# memory is its process's physical footprint and that holds what the guest touched,
+# setup's page cache included; 2 GiB written, as on Linux. The network load is the
+# same Linux tarball known-answer-run.yml downloads, for the reason it gives.
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  known-answer:
+    uses: ./.github/workflows/known-answer.yml
+    with:
+      runner_label: billet-4vcpu-ubuntu-2404-arm
+      billet_ref: ${{ github.sha }}
+      seconds: 60
+      cpu_workers: 2
+      memory_bytes: 6442450944
+      network_url: https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.155.tar.xz
+      network_bytes: 135390644
+      disk_bytes: 2147483648
