@@ -438,6 +438,29 @@ func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
 		{"uncorrected and cannot proceed", "exit 12", true, false},
 		{"operational error", "exit 8", false, true},
 		{"signal", "kill -9 $$", false, true},
+		// A READ THAT FAILED MAKES THE CHECK COULD-NOT-TELL, WHATEVER IT EXITS: e2fsprogs
+		// 1.47.2's own words, measured 2026-11-13 with the only OSD stopped partway.
+		{
+			"a read that failed, then a corrupt journal superblock",
+			"echo 'Error reading block 545 (Input/output error).  Ignore error? no' >&2\n" +
+				"echo 'e2fsck: The journal superblock is corrupt while checking journal for /dev/rbd9'\nexit 12",
+			false, true,
+		},
+		{
+			"a read that failed on stdout, then uncorrected errors",
+			"echo 'Error reading extended attribute block 33280 for inode 12.  Clear? no'\nexit 4",
+			false, true,
+		},
+		{
+			"a read that failed, split across two writes",
+			"printf 'Error rea' >&2\nsleep 0.1\nprintf 'ding block 9 (Input/output error)\\n' >&2\nexit 4",
+			false, true,
+		},
+		{
+			"damage reported without a failed read",
+			"echo \"Entry 'f8' in / (2) has deleted/unused inode 20.  Clear? no\"\nexit 4",
+			true, false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

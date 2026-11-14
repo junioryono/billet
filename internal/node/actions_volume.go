@@ -16,6 +16,12 @@ type actionsVolumeManager interface {
 	// content-addressed cache volume is.
 	MountWritable(ctx context.Context, device, target string) error
 	Trim(ctx context.Context, target string) error
+	// SyncWrites writes back the filesystem mounted at target and answers whether
+	// everything written to it since it was mounted reached its volume: an error
+	// wrapping store.ErrWritesLost when some never did, nil when nothing is mounted
+	// there. A publication asks it before the unmount that comes before its
+	// snapshot, because an unmount writes back without asking (writtenback.go).
+	SyncWrites(ctx context.Context, target string) error
 	Unmount(ctx context.Context, target string) error
 	// Mounted reports whether something is mounted at target in this process's
 	// mount namespace; an error is could-not-tell, never "no".
@@ -131,6 +137,18 @@ func (hostActionsVolumeManager) Mounted(ctx context.Context, target string) (boo
 	}
 
 	return true, nil
+}
+
+func (m hostActionsVolumeManager) SyncWrites(ctx context.Context, target string) error {
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	mounted, err := m.Mounted(ctx, target)
+	if err != nil || !mounted {
+		return err
+	}
+
+	return syncFilesystem(target)
 }
 
 func (m hostActionsVolumeManager) Unmount(ctx context.Context, target string) error {

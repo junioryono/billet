@@ -87,6 +87,10 @@ type actionsArchive struct {
 	Version   string               `json:"version"`
 	Volume    storecontract.Volume `json:"volume"`
 	Unmounted bool                 `json:"unmounted,omitempty"`
+	// WritesLost says its filesystem's syncfs or its snapshot reported that writes
+	// to it never reached its volume, which the kernel says once: no finalization
+	// publishes it, and the session's cleanup discards it (writeslost.go).
+	WritesLost bool `json:"writes_lost,omitempty"`
 	// Upload names this reservation's blocks, and Object the archive a download
 	// reads, on a store that keeps whole objects (actions_objects.go). Neither has a
 	// volume.
@@ -1045,6 +1049,9 @@ func (s *CacheService) finalizeActionsCache(
 	if archive.Upload != "" {
 		return s.finalizeObjectArchive(ctx, session, archive, size)
 	}
+	if archive.WritesLost {
+		return nil, errWritesLost
+	}
 
 	info, err := os.Stat(s.actionsArchivePath(session, archive))
 	if err != nil || !info.Mode().IsRegular() || info.Size() != size {
@@ -1055,6 +1062,17 @@ func (s *CacheService) finalizeActionsCache(
 	}
 	if err := s.actionIO.Trim(ctx, s.actionsMountPath(session, archive)); err != nil {
 		return nil, fmt.Errorf("trim freed Actions cache blocks: %w", err)
+	}
+	// ASKED BEFORE THE UNMOUNT, which writes back without asking: an archive whose
+	// blocks never reached the volume would otherwise unmount, check clean and be
+	// published short. Nothing is mounted to ask once an earlier finalize unmounted
+	// it, and that one asked.
+	if err := s.actionIO.SyncWrites(ctx, s.actionsMountPath(session, archive)); err != nil {
+		if writesLost(err) {
+			return nil, s.noteWritesLost(session, &archive.WritesLost, archive.Volume.Handle, err)
+		}
+
+		return nil, fmt.Errorf("write the Actions cache archive back: %w", err)
 	}
 	// ASKED BEFORE A WRITER IS TAKEN, so a finalize the switch does not allow
 	// leaves no writer for anyone to give back; publishActionsReceipt asks again
@@ -1086,6 +1104,9 @@ func (s *CacheService) finalizeActionsCache(
 	}
 	candidate, err := s.store.Snapshot(ctx, archive.Volume)
 	s.countedPublication(session.instance, "an Actions cache snapshot", err)
+	if writesLost(err) {
+		err = s.noteWritesLost(session, &archive.WritesLost, archive.Volume.Handle, err)
+	}
 	if err != nil {
 		return nil, abandon(err)
 	}

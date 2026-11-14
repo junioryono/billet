@@ -270,6 +270,8 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 		}
 	})
 
+	// AN OPEN THAT FAILS LEAVES THE WRITE-BACK TO THE VMM'S CLOSE; A WRITE-BACK THAT
+	// FAILS LOST WRITES. Both still detach, and only the second says so.
 	for name, failure := range map[string]struct{ open, sync error }{
 		"an open that fails":      {open: errors.New("no such device")},
 		"a write-back that fails": {sync: errors.New("input/output error")},
@@ -285,8 +287,14 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 
 				return syncedDisk{closes: &closes, sync: func() error { return failure.sync }}, nil
 			}
-			if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
-				t.Fatalf("a detach whose write-back failed: %v", err)
+			err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1")
+			switch {
+			case failure.sync != nil && !errors.Is(err, provider.ErrWritesLost):
+				t.Fatalf("a detach whose write-back failed answered %v, want provider.ErrWritesLost", err)
+			case failure.sync != nil && !strings.Contains(err.Error(), "input/output error"):
+				t.Errorf("the lost writes' answer %q does not carry the fsync's error", err)
+			case failure.sync == nil && err != nil:
+				t.Fatalf("a detach whose device could not be opened: %v", err)
 			}
 			if cache0Patches(vmm) != 2 {
 				t.Errorf("cache0 had %d PATCH(es); a failed write-back must still detach", cache0Patches(vmm))
@@ -415,6 +423,43 @@ func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
 		}
 		if opens != 2 {
 			t.Errorf("the device was opened %d times; want once for the first, waited on, then once after", opens)
+		}
+	})
+}
+
+// A WRITE-BACK'S LOST WRITES REACH EVERY CALLER WAITING ON IT. The kernel tells the
+// one fsync, so a caller that joined a write-back already in flight, after the first
+// caller's time ran out, is told what that fsync found, never success.
+func TestAWriteBackThatFailedTellsEveryCallerWaitingOnIt(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p := &Provider{log: slog.New(slog.DiscardHandler)}
+		release := make(chan struct{})
+		var once sync.Once
+		releaseAll := func() { once.Do(func() { close(release) }) }
+		defer releaseAll()
+		p.openDisk = func(string) (diskHandle, error) {
+			return syncedDisk{sync: func() error {
+				<-release
+
+				return errors.New("input/output error")
+			}}, nil
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := p.flushBefore(ctx, "/dev/nvme9n1"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a caller whose time ran out answered %v", err)
+		}
+
+		joined := make(chan error, 1)
+		go func() { joined <- p.flushBefore(t.Context(), "/dev/nvme9n1") }()
+		synctest.Wait()
+		releaseAll()
+
+		if err := <-joined; !errors.Is(err, provider.ErrWritesLost) {
+			t.Fatalf("a caller that joined a write-back that failed answered %v, want provider.ErrWritesLost", err)
 		}
 	})
 }

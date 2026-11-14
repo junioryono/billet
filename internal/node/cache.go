@@ -356,6 +356,10 @@ type cacheAttachment struct {
 	// publication the cache loop runs has got.
 	Intent  *publishIntent  `json:"intent,omitempty"`
 	Journal *publishJournal `json:"journal,omitempty"`
+	// WritesLost says a detach or a snapshot reported that writes to this volume
+	// never reached its storage, which the kernel says once: nothing publishes it,
+	// and the session's cleanup discards it (writeslost.go).
+	WritesLost bool `json:"writes_lost,omitempty"`
 }
 
 // NewCacheService constructs a node-local cache endpoint.
@@ -1798,7 +1802,14 @@ func (s *CacheService) publishDocker(
 	session *cacheSession,
 	attachment *cacheAttachment,
 ) error {
+	if attachment.WritesLost {
+		return errWritesLost
+	}
 	if err := s.attacher.DetachVolume(ctx, session.instance, 0, s.detachDevice(ctx, attachment.Volume)); err != nil {
+		if writesLost(err) {
+			return s.noteWritesLost(session, &attachment.WritesLost, attachment.Volume.Handle, err)
+		}
+
 		return fmt.Errorf("detach Docker image store: %w", err)
 	}
 
@@ -1977,6 +1988,10 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	// restart cleanup find the mapped device and its storage handle.
 	if err := s.attacher.AttachVolume(ctx, session.instance, slot, volume.Device); err != nil {
 		detachErr := s.attacher.DetachVolume(ctx, session.instance, slot, s.detachDevice(ctx, volume))
+		if writesLost(detachErr) {
+			// DETACHED, and what it lost is discarded here anyway.
+			detachErr = nil
+		}
 		var discardErr, clearErr error
 		if detachErr == nil {
 			discardErr = s.store.Discard(ctx, volume)
@@ -2059,8 +2074,26 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		attachment.Volume.Filesystem = request.Filesystem
 	}
 
+	// WHAT LOST WRITES IS NEVER PUBLISHED OR DEFERRED, and a commit asked again is
+	// told so: the clone stays in the session's custody, and its cleanup discards it.
+	lostWrites := func() {
+		writeCacheJSON(w, http.StatusOK, map[string]any{"published": false, "reason": errWritesLost.Error()})
+	}
+	if attachment.WritesLost {
+		lostWrites()
+
+		return
+	}
 	if err := s.attacher.DetachVolume(ctx, session.instance, slot,
 		s.detachDevice(ctx, attachment.Volume)); err != nil {
+		if writesLost(err) {
+			// NEVER NIL, and already logged: the guest is told only that its writes were lost.
+			if noted := s.noteWritesLost(session, &attachment.WritesLost, attachment.Volume.Handle, err); noted != nil {
+				lostWrites()
+			}
+
+			return
+		}
 		s.nonFatalCommit(w, session, "detach", err)
 
 		return
@@ -2226,8 +2259,14 @@ func (s *CacheService) publishAcquired(
 	lease storecontract.WriterLease,
 	fence storecontract.FencingToken,
 ) (storecontract.Candidate, publishStep, error) {
+	if attachment.WritesLost {
+		return storecontract.Candidate{}, stepSnapshot, errors.Join(errWritesLost, s.releaseWriter(ctx, lease, fence))
+	}
 	candidate, err := s.store.Snapshot(ctx, attachment.Volume)
 	s.countedPublication(session.instance, "a cache snapshot", err)
+	if writesLost(err) {
+		err = s.noteWritesLost(session, &attachment.WritesLost, attachment.Volume.Handle, err)
+	}
 	if err != nil {
 		return storecontract.Candidate{}, stepSnapshot, errors.Join(err, s.releaseWriter(ctx, lease, fence))
 	}
@@ -2457,7 +2496,8 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 	detachCtx, cancelDetach := context.WithTimeout(ctx, cacheDiscardDetachLimit)
 	err := s.attacher.DetachVolume(detachCtx, session.instance, slot, s.detachDevice(detachCtx, attachment.Volume))
 	cancelDetach()
-	if err != nil {
+	// A DETACH THAT LOST WRITES DETACHED, and what it lost is being discarded anyway.
+	if err != nil && !writesLost(err) {
 		s.nonFatalCommit(w, session, "detach discarded volume", err)
 
 		return

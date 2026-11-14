@@ -1,6 +1,7 @@
 package ceph
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -343,11 +344,28 @@ func checkDamage(ctx context.Context, device string) (bool, error) {
 	return checkDamageWith(ctx, e2fsck, device)
 }
 
-// checkDamageWith is checkDamage with the e2fsck to run. Its output is
-// discarded, never buffered: a badly damaged filesystem's report is as long as
-// its damage.
+// checkDamageWith is checkDamage with the e2fsck to run. Its output is watched
+// for a failed read and otherwise discarded, never buffered: a badly damaged
+// filesystem's report is as long as its damage.
+//
+// A CHECK WHOSE READS FAILED PROVES NOTHING, WHATEVER IT EXITS. Every device billet
+// maps fails an OSD request after osd_request_timeout, and e2fsck reads what it
+// could not read as damage: measured 2026-11-13 with e2fsprogs 1.47.2 on a healthy
+// filesystem whose only OSD stopped partway through the check, it answered "Error
+// reading block 545 (Input/output error)", then "The journal superblock is
+// corrupt", and exited 12, as a really corrupt journal superblock does
+// (e2fsckUncorrected). Read so, a healthy newest generation would be replaced by an
+// older one. "Error reading" begins every message e2fsprogs gives for a read that
+// failed, and a check that printed it is could-not-tell.
 func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
-	err := exec.CommandContext(ctx, e2fsck, "-f", "-n", device).Run()
+	watch := &phraseWatcher{phrase: []byte("Error reading")}
+	cmd := exec.CommandContext(ctx, e2fsck, "-f", "-n", device)
+	cmd.Stdout, cmd.Stderr = watch, watch
+	err := cmd.Run()
+	if watch.seen {
+		return false, fmt.Errorf("check the filesystem on %s: e2fsck could not read all of it, "+
+			"so what it found says nothing (exit %v)", device, err)
+	}
 	if err == nil {
 		return false, nil
 	}
@@ -357,4 +375,32 @@ func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
 	}
 
 	return false, fmt.Errorf("check the filesystem on %s: %w", device, err)
+}
+
+// phraseWatcher is a writer that remembers whether phrase passed through it,
+// keeping no more of what it was written than the phrase's length, so a phrase
+// split across two writes is still seen. One goroutine writes to it at a time:
+// os/exec copies stdout and stderr through one writer when they are the same.
+type phraseWatcher struct {
+	phrase []byte
+	tail   []byte
+	seen   bool
+}
+
+func (w *phraseWatcher) Write(p []byte) (int, error) {
+	if w.seen {
+		return len(p), nil
+	}
+	joined := make([]byte, 0, len(w.tail)+len(p))
+	joined = append(append(joined, w.tail...), p...)
+	if bytes.Contains(joined, w.phrase) {
+		w.seen = true
+		w.tail = nil
+
+		return len(p), nil
+	}
+	keep := min(len(joined), len(w.phrase)-1)
+	w.tail = append(w.tail[:0:0], joined[len(joined)-keep:]...)
+
+	return len(p), nil
 }

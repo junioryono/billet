@@ -102,6 +102,9 @@ func (s *CacheService) publishDeferred(
 	if !attachment.Ready || attachment.Intent == nil {
 		return abandon("the attachment was never proved ready to publish")
 	}
+	if attachment.WritesLost {
+		return abandon(errWritesLost.Error())
+	}
 	deadline := attachment.Intent.At.Add(publishWindow)
 	if !s.now().Before(deadline) {
 		return abandon("the publication did not complete within its window")
@@ -138,6 +141,12 @@ func (s *CacheService) publishDeferred(
 			// and that failure is what was logged. Asking again until the window
 			// ended held the session open for it, and for nothing else.
 			return abandon("the volume is gone after an earlier failed snapshot")
+		}
+		// NOT RETRIED: the next snapshot would be told the volume is fine.
+		if writesLost(err) {
+			attachment.WritesLost = true
+
+			return abandon(fmt.Sprintf("%s: %v", errWritesLost, err))
 		}
 		if err != nil {
 			// RETRIED ON THE NEXT PASS. A failed Snapshot leaves the pointer

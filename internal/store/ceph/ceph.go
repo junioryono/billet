@@ -309,7 +309,7 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("ceph: %w", errors.Join(errs...))
 	}
 
-	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: blockfs.VerifyExt4,
+	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyWrittenBack,
 		purgeWorkers: trashPurgeWorkers, ioPressure: readHostIOPressure, pause: sleepFor,
 		purgeSlot: make(chan struct{}, 1), checkSlot: generationMapSlot, damaged: checkDamage,
 		machine: config.HostMachine(runtime.GOARCH), readProbe: readProbeWithDebugfs}

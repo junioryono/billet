@@ -61,6 +61,13 @@ func (p *Provider) AttachVolume(
 // cannot be made is not the detach's failure, since the close writes back anyway, and
 // the PATCH has what is left of the caller's time for whatever the guest wrote since.
 //
+// A WRITE-BACK THAT FAILED IS LOST WRITES, NOT A SLOW ONE. The device is opened, so
+// the fsync's error is the kernel's report that pages it wrote back never reached the
+// volume (an OSD request past the map's osd_request_timeout, a blocklisted client);
+// those pages are clean again, and nothing writes them back a second time. The drive
+// is still replaced, since whatever happens to the volume next needs it detached, and
+// the answer is provider.ErrWritesLost, so it is discarded rather than published.
+//
 // ONLY THE DEVICE THE SLOT HOLDS: the recorded name is flushed only while the slot's
 // node is that same block device, since a name the kernel gave this volume may by now
 // be another's (a discard that unmapped it and failed after). Any other answer leaves
@@ -79,26 +86,31 @@ func (p *Provider) DetachVolume(
 	if device != "" && !p.slotHolds(j.volumePath(slot), device) {
 		device = ""
 	}
-	if err := p.flushBefore(ctx, device); err != nil {
+	lost := p.flushBefore(ctx, device)
+	if lost != nil && !errors.Is(lost, provider.ErrWritesLost) {
 		return fmt.Errorf("firecracker: write cache slot %d of %s back before detaching it: %w",
-			slot, instanceID, err)
+			slot, instanceID, lost)
 	}
 
 	if err := p.replaceVolumePath(j, res, slot, ""); err != nil {
-		return err
+		return errors.Join(err, lost)
 	}
 
 	id := provider.VolumeSlotID(slot)
 	if err := p.apiAs(j.socket(), res.UID).withTimeout(callerTime(ctx)).patch(ctx, "/drives/"+id,
 		map[string]string{"drive_id": id, "path_on_host": "/" + id}); err != nil {
-		return fmt.Errorf("firecracker: detach cache slot %d from %s: %w", slot, instanceID, err)
+		return errors.Join(fmt.Errorf("firecracker: detach cache slot %d from %s: %w", slot, instanceID, err), lost)
+	}
+	if lost != nil {
+		return fmt.Errorf("firecracker: cache slot %d of %s is detached: %w", slot, instanceID, lost)
 	}
 
 	return nil
 }
 
-// flushBefore writes device back within ctx. Only ctx ending is an error: a device it
-// cannot open or flush is left to the VMM's close.
+// flushBefore writes device back within ctx. ctx ending is an error, and so is a
+// write-back that failed, as provider.ErrWritesLost, to every caller waiting on it: a
+// device it cannot open is left to the VMM's close.
 //
 // ONE WRITE-BACK A DEVICE AT A TIME. Neither the open nor the fsync can be cancelled,
 // so a caller whose time ends leaves them running; a detach of the same device after
@@ -113,8 +125,8 @@ func (p *Provider) DetachVolume(
 // never a name it opens later, and while it holds it nothing on this host can prove the
 // volume unheld, so no store detaches it.
 //
-// A FAILED OPEN OR FLUSH ONLY MOVES THE WRITE-BACK INTO THE PATCH, which has the
-// caller's time for it.
+// A FAILED OPEN ONLY MOVES THE WRITE-BACK INTO THE PATCH, which has the caller's time
+// for it. A FAILED FLUSH IS LOST WRITES (DetachVolume).
 func (p *Provider) flushBefore(ctx context.Context, device string) error {
 	if device == "" {
 		return nil
@@ -156,18 +168,20 @@ func (p *Provider) flushBefore(ctx context.Context, device string) error {
 
 	select {
 	case <-wb.done:
-		return nil
+		return wb.lost
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
 // writeBack is one device's write-back in flight (flushBefore): opened when its open
-// has ended, done when it has, and waiting the callers still waiting for its open.
+// has ended, done when it has, waiting the callers still waiting for its open, and
+// lost, written before done closes, what its failed fsync reported.
 type writeBack struct {
 	opened  chan struct{}
 	done    chan struct{}
 	waiting int
+	lost    error
 }
 
 // writeBack opens device, writes it back if a caller is still waiting for it, and
@@ -187,13 +201,14 @@ func (p *Provider) writeBack(device string, wb *writeBack) {
 	case !wanted:
 		_ = disk.Close()
 	default:
-		err = disk.Sync()
-		if closeErr := disk.Close(); err == nil {
-			err = closeErr
-		}
-		if err != nil {
-			p.log.Info("could not write a cache volume back before its detach; the detach will",
-				"device", device, "error", err)
+		syncErr := disk.Sync()
+		closeErr := disk.Close()
+		if syncErr != nil {
+			wb.lost = fmt.Errorf("%w: %s: %w", provider.ErrWritesLost, device, syncErr)
+			p.log.Warn("a cache volume's write-back failed before its detach; what it lost is discarded, "+
+				"never published", "device", device, "error", syncErr)
+		} else if closeErr != nil {
+			p.log.Info("could not close a cache volume after writing it back", "device", device, "error", closeErr)
 		}
 	}
 
