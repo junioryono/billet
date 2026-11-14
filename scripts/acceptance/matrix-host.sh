@@ -434,6 +434,11 @@ block-s3)
 		exit 2
 		;;
 	esac
+	# LONG ENOUGH TO OUTLAST ITS OWN INSTALLATION, which the check after it proves.
+	if [ "$expiry" -lt 300 ]; then
+		echo "matrix: the block's expiry is ${expiry}s; it is at least 300s" >&2
+		exit 2
+	fi
 	s3_lock || exit 1
 	if [ -e "$run_dir/s3-unblock-requested" ]; then
 		echo "matrix: S3 was given back before the block could be installed; nothing is blocked" >&2
@@ -470,6 +475,14 @@ block-s3)
 	if [ "$reached" -ne 28 ]; then
 		echo "matrix: a request to S3 in $region did not go unanswered through the block (curl exit $reached);" \
 			"it is lifted" >&2
+		lift
+		exit 1
+	fi
+	# THE EXPIRY IS STILL TO COME, proved after the table is in: it fires once, and one that
+	# fired before the table was installed would leave a block nothing removes. An elapsed
+	# timer still reads active, so its sub-state is what says so.
+	if ! armed=$(systemctl show -p SubState --value "$s3_expiry.timer") || [ "$armed" != waiting ]; then
+		echo "matrix: the block's expiry is ${armed:-unreadable}, not waiting to remove it; it is lifted" >&2
 		lift
 		exit 1
 	fi

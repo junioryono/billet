@@ -1058,6 +1058,10 @@ out="" prev=""
 for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
 case "$*" in
 *ip-ranges*)
+	if [ -f "$FAKE/hold" ]; then
+		: >"$FAKE/holding"
+		while [ -f "$FAKE/hold" ]; do sleep 0.05; done
+	fi
 	[ -f "$FAKE/fetch.exit" ] && exit "$(cat "$FAKE/fetch.exit")"
 	cp "$FAKE/ip-ranges.json" "$out"
 	;;
@@ -1087,14 +1091,25 @@ esac
 	fakeSystemdRun = `echo "systemd-run $*" >>"$FAKE/calls"
 [ -f "$FAKE/systemd-run.exit" ] && exit "$(cat "$FAKE/systemd-run.exit")"
 [ -f "$FAKE/timer" ] && exit 1
-: >"$FAKE/timer"
+cat "$FAKE/timer-state" 2>/dev/null >"$FAKE/timer" || echo waiting >"$FAKE/timer"
 `
 	fakeS3Systemctl = `echo "systemctl $*" >>"$FAKE/calls"
-[ "$1 $2" = "stop billet-matrix-s3-expiry.timer" ] || exit 9
-[ -f "$FAKE/timer" ] || exit 5
-rm "$FAKE/timer"
+case "$*" in
+"stop billet-matrix-s3-expiry.timer")
+	[ -f "$FAKE/timer" ] || exit 5
+	rm "$FAKE/timer"
+	;;
+"show -p SubState --value billet-matrix-s3-expiry.timer")
+	cat "$FAKE/timer" 2>/dev/null || echo dead
+	;;
+*) exit 9 ;;
+esac
 `
+	// fakeFlock takes a real lock on the descriptor it names, as flock(1) does, through the
+	// interpreter's flock(2): the lock belongs to the open file it shares with its caller.
 	fakeFlock = `echo "flock $*" >>"$FAKE/calls"
+fd=${3:?}
+python3 -I -c 'import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)' "$fd"
 `
 	// Two of us-west-2's S3 ranges and one of its IPv6 ones, beside ranges of another
 	// service, another region, and the same range under the umbrella service.
@@ -1206,15 +1221,15 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "unblock-s3", dir, "us-west-2"); code != 0 {
 		t.Fatalf("a lift with nothing to lift: exit %d:\n%s", code, out)
 	}
+	if calls := s3BlockCalls(t, f); callIndex(calls, "flock -w 240 9") < 0 {
+		t.Errorf("the lift took no lock: %q", calls)
+	}
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "block-s3", dir, "us-west-2", "3300"); code != 1 ||
 		!strings.Contains(out, "given back before the block could be installed") {
 		t.Errorf("a block after its lift: exit %d:\n%s", code, out)
 	}
 	if exists(t, filepath.Join(f.dir, "table")) || callIndex(s3BlockCalls(t, f), "systemd-run ") >= 0 {
 		t.Errorf("a block after its lift installed something: %q", s3BlockCalls(t, f))
-	}
-	if calls := s3BlockCalls(t, f); callIndex(calls, "flock -w 240 9") < 0 {
-		t.Errorf("the lift took no lock: %q", calls)
 	}
 
 	for name, c := range map[string]struct {
@@ -1236,6 +1251,12 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 		"rules nftables refuses": {region: "us-west-2", expiry: "3300", fixtures: []string{"nft-f.exit=1"},
 			code: 1, says: "could not be installed", armed: true},
 		"an expiry that is not seconds": {region: "us-west-2", expiry: "55m", code: 2, says: "not a number of seconds"},
+		"an expiry too short to outlast its installation": {region: "us-west-2", expiry: "60", code: 2,
+			says: "it is at least 300s"},
+		"an expiry that fired before the table was in": {region: "us-west-2", expiry: "3300",
+			fixtures: []string{"timer-state=elapsed"}, code: 1, says: "expiry is elapsed, not waiting", armed: true},
+		"an expiry that cannot be read": {region: "us-west-2", expiry: "3300",
+			fixtures: []string{"timer-state="}, code: 1, says: "expiry is unreadable", armed: true},
 	} {
 		f, dir := s3BlockFakes(t)
 		for _, fx := range c.fixtures {
@@ -1257,7 +1278,7 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 	// A BLOCK THAT WILL NOT COME OFF keeps the expiry that will take it off, and is said;
 	// and so is S3 still silent once it has come off.
 	f, dir = s3BlockFakes(t)
-	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "block-s3", dir, "us-west-2", "60"); code != 0 {
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "block-s3", dir, "us-west-2", "300"); code != 0 {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
 	f.fixture(t, "stuck", "")
@@ -1275,6 +1296,88 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "unblock-s3", dir, "us-west-2"); code != 1 ||
 		!strings.Contains(out, "did not answer this host (curl exit 28)") {
 		t.Errorf("S3 still silent: exit %d:\n%s", code, out)
+	}
+}
+
+// A LIFT WAITS FOR A BLOCK ALREADY ON ITS WAY, as one a cancelled step left running on the
+// host is, and lifts what it installed: the block is held mid-fetch, holding the lock, while
+// the lift records itself and waits; a lift that did not wait would find nothing to lift and
+// leave the block that lands after it. The lock is a real one, taken by the fake through
+// flock(2).
+func TestTheMatrixHostsLiftWaitsForABlockOnItsWay(t *testing.T) {
+	t.Parallel()
+	f, dir := s3BlockFakes(t)
+	f.fixture(t, "hold", "")
+	start := func(args ...string) (*exec.Cmd, *strings.Builder, chan error) {
+		t.Helper()
+		abs, err := filepath.Abs("acceptance/matrix-host.sh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(t.Context(), abs, args...)
+		cmd.Env = []string{"PATH=" + f.path, "HOME=" + t.TempDir(), "FAKE=" + f.dir}
+		var out strings.Builder
+		cmd.Stdout, cmd.Stderr = &out, &out
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		t.Cleanup(func() {
+			if err := os.Remove(filepath.Join(f.dir, "hold")); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Error(err)
+			}
+			select {
+			case <-done:
+			case <-time.After(20 * time.Second):
+				t.Errorf("%v did not end", args)
+			}
+		})
+
+		return cmd, &out, done
+	}
+	waitFor := func(name string) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); !exists(t, name); {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s never appeared", name)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	_, blockOut, blocked := start("block-s3", dir, "us-west-2", "3300")
+	waitFor(filepath.Join(f.dir, "holding"))
+	_, liftOut, lifted := start("unblock-s3", dir, "us-west-2")
+	waitFor(filepath.Join(dir, "s3-unblock-requested"))
+	// THE LIFT MUST STILL BE WAITING while the block holds the lock: one that returned here
+	// lifted nothing, and the block about to land would stay.
+	select {
+	case err := <-lifted:
+		t.Fatalf("the lift returned while a block held the lock (%v):\n%s", err, liftOut.String())
+	case <-time.After(time.Second):
+	}
+	if err := os.Remove(filepath.Join(f.dir, "hold")); err != nil {
+		t.Fatal(err)
+	}
+	for name, done := range map[string]chan error{"the block": blocked, "the lift": lifted} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("%s: %v\nblock:\n%s\nlift:\n%s", name, err, blockOut.String(), liftOut.String())
+			}
+			done <- err
+		case <-time.After(20 * time.Second):
+			t.Fatalf("%s did not end", name)
+		}
+	}
+	calls := s3BlockCalls(t, f)
+	installed := callIndex(calls, "nft -f ")
+	if installed < 0 || callIndex(calls[installed:], "nft delete table inet billet_matrix_s3") < 0 {
+		t.Errorf("the lift did not come after the block it waited for: %q", calls)
+	}
+	if exists(t, filepath.Join(f.dir, "table")) || exists(t, filepath.Join(f.dir, "timer")) {
+		t.Errorf("the block outlived the lift: %q", calls)
 	}
 }
 
