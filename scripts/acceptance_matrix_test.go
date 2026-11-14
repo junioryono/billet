@@ -1050,7 +1050,8 @@ esac
 // to S3 with $FAKE/reach-blocked (default 28, no answer in time) while a table is installed
 // and $FAKE/reach-open (default 0) while none is; nft installs a table by copying the file
 // it is given to $FAKE/table ($FAKE/nft-f.exit refuses it), deletes it ($FAKE/stuck keeps
-// it) and lists it; systemd-run exits $FAKE/systemd-run.exit.
+// it) and lists it; systemd-run arms the expiry as $FAKE/timer unless $FAKE/systemd-run.exit
+// fails it, and `systemctl stop` of it removes that; flock takes nothing.
 const (
 	fakeS3Curl = `echo "curl $*" >>"$FAKE/calls"
 out="" prev=""
@@ -1084,10 +1085,16 @@ case "$1 $2" in
 esac
 `
 	fakeSystemdRun = `echo "systemd-run $*" >>"$FAKE/calls"
-exit "$(cat "$FAKE/systemd-run.exit" 2>/dev/null || echo 0)"
+[ -f "$FAKE/systemd-run.exit" ] && exit "$(cat "$FAKE/systemd-run.exit")"
+[ -f "$FAKE/timer" ] && exit 1
+: >"$FAKE/timer"
 `
 	fakeS3Systemctl = `echo "systemctl $*" >>"$FAKE/calls"
-exit 5
+[ "$1 $2" = "stop billet-matrix-s3-expiry.timer" ] || exit 9
+[ -f "$FAKE/timer" ] || exit 5
+rm "$FAKE/timer"
+`
+	fakeFlock = `echo "flock $*" >>"$FAKE/calls"
 `
 	// Two of us-west-2's S3 ranges and one of its IPv6 ones, beside ranges of another
 	// service, another region, and the same range under the umbrella service.
@@ -1109,6 +1116,7 @@ func s3BlockFakes(t *testing.T) (matrixFakes, string) {
 	f.command(t, "nft", fakeNft)
 	f.command(t, "systemd-run", fakeSystemdRun)
 	f.command(t, "systemctl", fakeS3Systemctl)
+	f.command(t, "flock", fakeFlock)
 	f.fixture(t, "ip-ranges.json", ipRangesFixture)
 
 	return f, t.TempDir()
@@ -1122,6 +1130,17 @@ func s3BlockCalls(t *testing.T, f matrixFakes) []string {
 	}
 
 	return strings.Split(strings.TrimSpace(string(raw)), "\n")
+}
+
+// exists says whether a name is there, failing the test on anything but its absence.
+func exists(t *testing.T, name string) bool {
+	t.Helper()
+	_, err := os.Lstat(name)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+
+	return err == nil
 }
 
 // callIndex is the first call that starts with prefix, or -1.
@@ -1164,6 +1183,11 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 		t.Errorf("the expiry does not remove the table at 3300 s: %q", calls[armed])
 	case callIndex(calls[installed:], "curl -s -o /dev/null --max-time 8 https://s3.us-west-2.amazonaws.com/") < 0:
 		t.Errorf("the block was not proved by a request to S3 through it: %q", calls)
+	case callIndex(calls, "flock -w 240 9") != 0:
+		t.Errorf("the block did not take the lock before anything else: %q", calls)
+	}
+	if !exists(t, filepath.Join(f.dir, "timer")) {
+		t.Error("the block's expiry is not armed")
 	}
 
 	for range 2 {
@@ -1171,9 +1195,26 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 		if code != 0 || !strings.Contains(out, "answers this host again") {
 			t.Fatalf("unblock: exit %d:\n%s", code, out)
 		}
-		if _, err := os.Stat(filepath.Join(f.dir, "table")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("the table is still installed: %v", err)
+		if exists(t, filepath.Join(f.dir, "table")) || exists(t, filepath.Join(f.dir, "timer")) {
+			t.Fatal("the table or its expiry is still there")
 		}
+	}
+
+	// A LIFT ASKED FOR FIRST IS NEVER UNDONE by a block that arrives after it, as one a
+	// cancelled step left running on the host would.
+	f, dir = s3BlockFakes(t)
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "unblock-s3", dir, "us-west-2"); code != 0 {
+		t.Fatalf("a lift with nothing to lift: exit %d:\n%s", code, out)
+	}
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "block-s3", dir, "us-west-2", "3300"); code != 1 ||
+		!strings.Contains(out, "given back before the block could be installed") {
+		t.Errorf("a block after its lift: exit %d:\n%s", code, out)
+	}
+	if exists(t, filepath.Join(f.dir, "table")) || callIndex(s3BlockCalls(t, f), "systemd-run ") >= 0 {
+		t.Errorf("a block after its lift installed something: %q", s3BlockCalls(t, f))
+	}
+	if calls := s3BlockCalls(t, f); callIndex(calls, "flock -w 240 9") < 0 {
+		t.Errorf("the lift took no lock: %q", calls)
 	}
 
 	for name, c := range map[string]struct {
@@ -1205,15 +1246,16 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 		if code != c.code || !strings.Contains(out, c.says) {
 			t.Errorf("%s: exit %d, want %d saying %q:\n%s", name, code, c.code, c.says, out)
 		}
-		if _, err := os.Stat(filepath.Join(f.dir, "table")); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("%s: a table is left installed: %v", name, err)
+		if exists(t, filepath.Join(f.dir, "table")) {
+			t.Errorf("%s: a table is left installed", name)
 		}
 		if armed := callIndex(s3BlockCalls(t, f), "systemd-run ") >= 0; armed != c.armed {
 			t.Errorf("%s: the expiry was asked for: %v, want %v", name, armed, c.armed)
 		}
 	}
 
-	// A BLOCK THAT WILL NOT COME OFF, and S3 still silent once it has, are both said.
+	// A BLOCK THAT WILL NOT COME OFF keeps the expiry that will take it off, and is said;
+	// and so is S3 still silent once it has come off.
 	f, dir = s3BlockFakes(t)
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "block-s3", dir, "us-west-2", "60"); code != 0 {
 		t.Fatalf("exit %d:\n%s", code, out)
@@ -1223,6 +1265,9 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 		!strings.Contains(out, "still installed") {
 		t.Errorf("a stuck block: exit %d:\n%s", code, out)
 	}
+	if !exists(t, filepath.Join(f.dir, "timer")) {
+		t.Error("a block that would not come off lost the expiry that takes it off")
+	}
 	if err := os.Remove(filepath.Join(f.dir, "stuck")); err != nil {
 		t.Fatal(err)
 	}
@@ -1230,65 +1275,6 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "unblock-s3", dir, "us-west-2"); code != 1 ||
 		!strings.Contains(out, "did not answer this host (curl exit 28)") {
 		t.Errorf("S3 still silent: exit %d:\n%s", code, out)
-	}
-}
-
-// fakeStatusBillet answers `billet status` with $FAKE/status.<n> on its nth call, or
-// $FAKE/status.last past those, and exits $FAKE/status.exit.
-const fakeStatusBillet = `[ "$1" = status ] || exit 9
-n=$(( $(cat "$FAKE/status.n" 2>/dev/null || echo 0) + 1 ))
-echo "$n" >"$FAKE/status.n"
-file="$FAKE/status.$n"
-[ -f "$file" ] || file="$FAKE/status.last"
-cat "$file"
-exit "$(cat "$FAKE/status.exit" 2>/dev/null || echo 0)"
-`
-
-// THE BREAKER IS WAITED FOR UNTIL NONE IS OPEN, each read kept, and a breaker still open
-// at the deadline, or a status that could not be read, is never read as one that closed.
-func TestTheMatrixHostWaitsForTheStoreBreakerToLetJobsIn(t *testing.T) {
-	t.Parallel()
-	const open = "cache     cache-us: ebs-s3 breaker OPEN for 20s (3 timeout failures); its new jobs start cold\n"
-	const probation = "cache     cache-us: ebs-s3 breaker on probation for 7s; it answered a probe\n"
-	for name, c := range map[string]struct {
-		seconds  string
-		fixtures map[string]string
-		code     int
-		says     string
-		reads    int
-	}{
-		"open, then on probation": {seconds: "60", fixtures: map[string]string{"status.1": "admission open\n" + open,
-			"status.last": "admission open\n" + probation}, says: "on probation for 7s", reads: 2},
-		"no breaker at all": {seconds: "60", fixtures: map[string]string{"status.last": "admission open\n"},
-			says: "no store breaker is open", reads: 1},
-		"open at the deadline": {seconds: "0", fixtures: map[string]string{"status.last": open}, code: 1,
-			says: "still open", reads: 1},
-		"a status that fails": {seconds: "60", fixtures: map[string]string{"status.last": probation, "status.exit": "1"},
-			code: 2, says: "could not be read", reads: 1},
-		"seconds that are not": {seconds: "5m", fixtures: map[string]string{"status.last": probation}, code: 2,
-			says: "not a number of seconds"},
-	} {
-		f := newMatrixFakes(t)
-		f.command(t, "billet", fakeStatusBillet)
-		for name, body := range c.fixtures {
-			f.fixture(t, name, body)
-		}
-		dir := hostRunDir(t, f)
-		out, code := f.run(t, "acceptance/matrix-host.sh", []string{"MATRIX_POLL=0"}, "breaker", dir, c.seconds)
-		if code != c.code || !strings.Contains(out, c.says) {
-			t.Errorf("%s: exit %d, want %d saying %q:\n%s", name, code, c.code, c.says, out)
-		}
-		if c.reads == 0 {
-			continue
-		}
-		kept, err := filepath.Glob(filepath.Join(dir, "logs", "status-*.txt"))
-		if err != nil || len(kept) == 0 {
-			t.Errorf("%s: no read was kept (%v)", name, err)
-		}
-		n, err := os.ReadFile(filepath.Join(f.dir, "status.n"))
-		if err != nil || strings.TrimSpace(string(n)) != strconv.Itoa(c.reads) {
-			t.Errorf("%s: status was read %q times (%v), want %d", name, n, err, c.reads)
-		}
 	}
 }
 

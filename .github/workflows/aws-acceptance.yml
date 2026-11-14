@@ -439,8 +439,8 @@ jobs:
       # every packet it sends to its region's S3, so the node's site store hangs as #531's
       # did, and the breaker that opens sends every job on the node cold. The block lifts
       # itself 55 minutes on whatever happens; the step after the runs lifts it at once,
-      # before anything else here needs S3, and the breaker must then let jobs use their
-      # caches again.
+      # before anything else here needs S3. How the breaker recovers is not judged here:
+      # the host's run stops the node once these jobs are its last.
       - id: block-s3
         name: Cut the host off from its region's S3
         if: ${{ env.LANE == 'ec2' }}
@@ -463,14 +463,13 @@ jobs:
           set -euo pipefail
           read -r -a labels <<<"$LABELS"
           scripts/acceptance/matrix-dispatch.sh store-unreachable "$REPO" "$RUN" out/runs "${labels[@]}"
+      # WHATEVER HAPPENED, the block step included: a cancelled step leaves its command
+      # running on the host, and the lift is recorded there before it waits for the lock
+      # that command holds, so a block still arriving installs nothing.
       - name: Give the host its region's S3 back
         if: ${{ always() && steps.block-s3.outcome != 'skipped' && steps.block-s3.outcome != '' }}
         run: |
-          scripts/acceptance/ssm-run.sh run "$HOST" 180 "bash '$RUN_DIR/matrix-host.sh' unblock-s3 '$RUN_DIR' '$AWS_REGION'"
-      - name: Wait for the node's store breaker to let jobs use their caches again
-        if: ${{ steps.block-s3.outcome == 'success' }}
-        run: |
-          scripts/acceptance/ssm-run.sh run "$HOST" 420 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' breaker '$RUN_DIR' 300"
+          scripts/acceptance/ssm-run.sh run "$HOST" 300 "bash '$RUN_DIR/matrix-host.sh' unblock-s3 '$RUN_DIR' '$AWS_REGION'"
       # A FAILED OR CANCELLED DISPATCH STOPS THE HOST'S RUN rather than leave it waiting
       # out --wait for jobs nobody sent; the wait below then joins it, and the judge
       # refuses a run with no recorded exit. Asked whether or not the run's command id
