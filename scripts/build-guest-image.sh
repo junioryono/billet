@@ -1650,6 +1650,21 @@ guest_caches=""
 if [ -n "$cache_endpoint" ]; then
 	guest_caches=$(fetch guest-caches 2>/dev/null) || guest_caches=""
 fi
+# BILLET_PREREAD_BEGIN
+# BILLET IS READ IN AS SOON AS THE GUEST KNOWS A CACHE WILL RUN IT, in the background,
+# before the job can. A fresh EC2 guest's root volume loads its blocks from the AMI's
+# snapshot as they are first read, and billet's first exec there took 9.0 s, against
+# 0.017 s after (c7i.2xlarge from the lane's AMI, 2026-11-13): within a second of
+# Bazel's 10 s wait for its credential helper, which a job exceeded (#878). The Go,
+# Bazel and Git caches each run billet as a helper.
+if [ -n "$cache_endpoint" ] && [ -x "$GUEST_BILLET" ]; then
+	case ",$guest_caches," in
+		*,go,* | *,bazel,* | *,git,*)
+			("${GUEST_PREREAD:-cat}" "$GUEST_BILLET" >/dev/null 2>&1 &)
+			;;
+	esac
+fi
+# BILLET_PREREAD_END
 
 # TRANSPARENT ACTIONS CACHE REQUESTS USE A NODE-LOCAL TLS TERMINATOR. The proxy
 # address carries this guest's cache-session identity and the CA is unique to the
