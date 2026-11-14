@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/netutil"
 	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/config"
@@ -139,11 +140,15 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 	// THE PORT'S LOCK, THEN THE PORT: a `billet images verify` started while this
 	// runs refuses on the lock rather than failing to listen.
 	if lockPath := os.Getenv("BILLET_SNAPSHOT_START_PORT_LOCK"); lockPath != "" {
-		release, err := holdLock(lockPath)
+		lock, err := holdLock(lockPath)
 		if err != nil {
 			t.Fatalf("BILLET_SNAPSHOT_START_PORT_LOCK: %v", err)
 		}
-		t.Cleanup(release)
+		t.Cleanup(func() {
+			if err := lock.release(); err != nil {
+				t.Errorf("release the port's lock: %v", err)
+			}
+		})
 	}
 	server, err := listenForGuests(t.Context(), listen)
 	if err != nil {
@@ -234,6 +239,10 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		t.Fatalf("the builder's address: %v", err)
 	}
 
+	if err := server.enroll(registrationID(snapshotStartPlaceholder)); err != nil {
+		t.Fatal(err)
+	}
+
 	// CAPTURED WHILE ITS WAITER ASKS, which is after the guest kernel finished
 	// booting (Firecracker's condition for a snapshot) and after the agent did
 	// everything a job's guest does before its runner starts.
@@ -251,6 +260,7 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		t.Fatalf("Capture the golden: %v", err)
 	}
 	captured := time.Now()
+	server.retire(registrationID(snapshotStartPlaceholder))
 	memoryFile, err := os.Stat(filepath.Join(published, snapshotMemoryFile))
 	if err != nil {
 		t.Fatal(err)
@@ -349,8 +359,9 @@ const (
 //     this none would renew, and the bridge's DHCP would let the golden's address
 //     go an hour after the golden booted), and holds until the host, having read
 //     the guest's memory, answers its key's release with `go`;
-//   - reports `released`, runs the runner, reports `finished` with the time and
-//     the runner's status, and holds on until the host destroys the guest.
+//   - reports `released` in the background, so no retried report stands between
+//     the release and the runner, runs the runner, reports `finished` with the time
+//     and the runner's status, and holds on until the host destroys the guest.
 //
 // A report is retried until the host takes it, a few seconds at most.
 const snapshotStartWaiter = `set -u
@@ -386,7 +397,8 @@ id=$(key "$jit")
 report "$id" "registered $(date +%s%3N)" || exit 1
 ( bash -c "$4" >/dev/null 2>&1 & )
 until [ "$(curl -sf --connect-timeout 1 --max-time 1 "$host/release/$id")" = go ]; do sleep 0.01; done
-report "$id" "released $(date +%s%3N)" || true
+released="released $(date +%s%3N)"
+( report "$id" "$released" & )
 ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" ./run.sh
 rc=$?
 report "$id" "finished $(date +%s%3N) $rc" || true
@@ -405,18 +417,30 @@ type startStep struct {
 	at   time.Time
 }
 
-// startServer is the host's end of the waiters' protocol: it keeps every step a
+// startServer is the host's end of the waiters' protocol: it keeps the steps a
 // waiter reports, by key, with the host's time of receipt, and answers a waiter's
-// release once the experiment has released its key. A key is a sha256, and a
-// step is one of the four the waiter sends, whole; anything else is refused.
+// release once the experiment has released its key.
+//
+// ANY GUEST ON THE BRIDGE CAN REACH IT, so it holds only what the experiment asked
+// it to: a key is taken only while enrolled (the golden's, then one trial's at a
+// time), each keeps at most maxStartSteps steps and one `waiting`, a step is one
+// of the four the waiter sends, whole, and a retired key is forgotten. Connections
+// are capped and every read and write bounded.
 type startServer struct {
 	mu       sync.Mutex
+	enrolled map[string]bool
+	ever     map[string]bool
 	steps    map[string][]startStep
 	released map[string]bool
+	polls    map[string]int
 	http     *http.Server
 	addr     string
 	done     chan struct{}
 }
+
+// maxStartSteps bounds the steps one key keeps: a waiter sends four, and a
+// retried report may send one twice.
+const maxStartSteps = 8
 
 var (
 	startKey  = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -424,7 +448,32 @@ var (
 )
 
 func newStartServer() *startServer {
-	return &startServer{steps: map[string][]startStep{}, released: map[string]bool{}, done: make(chan struct{})}
+	return &startServer{enrolled: map[string]bool{}, ever: map[string]bool{}, steps: map[string][]startStep{},
+		released: map[string]bool{}, polls: map[string]int{}, done: make(chan struct{})}
+}
+
+// enroll lets key report, once in the server's life: a key enrolled before is
+// refused, since its steps would be another trial's.
+func (s *startServer) enroll(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ever[key] {
+		return fmt.Errorf("the registration %s.. was enrolled before; a trial needs a registration of its own",
+			key[:12])
+	}
+	s.ever[key], s.enrolled[key] = true, true
+
+	return nil
+}
+
+// retire forgets key: what it reported, its release and its polls.
+func (s *startServer) retire(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.enrolled, key)
+	delete(s.steps, key)
+	delete(s.released, key)
+	delete(s.polls, key)
 }
 
 // listenForGuests starts a startServer on addr.
@@ -436,10 +485,11 @@ func listenForGuests(ctx context.Context, addr string) (*startServer, error) {
 	}
 	s := newStartServer()
 	s.addr = listener.Addr().String()
-	s.http = &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second}
+	s.http = &http.Server{Handler: s, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second,
+		WriteTimeout: 5 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 4 << 10}
 	go func() {
 		defer close(s.done)
-		_ = s.http.Serve(listener) //nolint:errcheck // ErrServerClosed at close, and close says the rest
+		_ = s.http.Serve(netutil.LimitListener(listener, 32)) //nolint:errcheck // ErrServerClosed at close
 	}()
 
 	return s, nil
@@ -469,13 +519,21 @@ func (s *startServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		at := time.Now()
 		s.mu.Lock()
-		s.steps[key] = append(s.steps[key], startStep{line: string(body), at: at})
+		taken := s.enrolled[key] && len(s.steps[key]) < maxStartSteps &&
+			!(string(body) == "waiting" && slices.ContainsFunc(s.steps[key],
+				func(st startStep) bool { return st.line == "waiting" }))
+		if taken {
+			s.steps[key] = append(s.steps[key], startStep{line: string(body), at: at})
+		}
 		s.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/release/"):
 		key := strings.TrimPrefix(r.URL.Path, "/release/")
 		s.mu.Lock()
 		go_ := s.released[key]
+		if s.enrolled[key] {
+			s.polls[key]++
+		}
 		s.mu.Unlock()
 		if !go_ {
 			w.WriteHeader(http.StatusNoContent)
@@ -492,6 +550,14 @@ func (s *startServer) release(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.released[key] = true
+}
+
+// pollsOf is how many times the waiter under key has asked for its release.
+func (s *startServer) pollsOf(key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.polls[key]
 }
 
 // reported is every step reported under key so far.
@@ -560,6 +626,10 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		return err
 	}
 	key := registrationID(jit)
+	if err := server.enroll(key); err != nil {
+		return err
+	}
+	defer server.retire(key)
 
 	// A FORK ONLY WHILE THE GOLDEN'S ADDRESS IS STILL ITS OWN for longer than the
 	// fork can live, whether or not the fork's renewal works: a lease that could
@@ -688,16 +758,27 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		fields["fork_mac_is_golden"] = err == nil && strings.Contains(string(fdb), goldenMAC)
 	}
 
-	// SAMPLED UNTIL THE RUNNER FINISHES ITS JOB: the memory thirty seconds after
-	// the release, while the job runs, and the peak.
+	// SAMPLED UNTIL THE RUNNER FINISHES ITS JOB: the memory thirty seconds after the
+	// waiter reported its release, which it does as the runner starts, so a release
+	// the waiter was slow to see does not move the sample before the runner; and
+	// the peak.
 	var peak int64
 	sampled := false
+	var runnerFrom time.Time
 	finished, err := server.await(ctx, key, "finished", 20*time.Minute, func() {
 		m := smapsRollup(pid)
 		if pss, ok := m["Pss"]; ok && pss > peak {
 			peak = pss
 		}
-		if !sampled && time.Since(released) >= 30*time.Second {
+		if runnerFrom.IsZero() {
+			for _, st := range server.reported(key) {
+				if strings.HasPrefix(st.line, "released ") {
+					runnerFrom = st.at
+					fields["release_seen_after_ms"] = st.at.Sub(released).Milliseconds()
+				}
+			}
+		}
+		if !sampled && !runnerFrom.IsZero() && time.Since(runnerFrom) >= 30*time.Second {
 			fields["memory_30s_after_release"] = m
 			sampled = true
 		}
@@ -726,9 +807,18 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	return nil
 }
 
-// holdLock takes an exclusive flock on path without waiting, and answers its
-// release.
-func holdLock(path string) (func(), error) {
+// heldLock is an exclusive flock holdLock took.
+type heldLock struct{ f *os.File }
+
+// release unlocks, then closes. UNLOCKED FIRST: a child forked while the
+// descriptor was open shares its open file description, and a close alone would
+// leave the lock held until that child execs.
+func (l *heldLock) release() error {
+	return errors.Join(unix.Flock(int(l.f.Fd()), unix.LOCK_UN), l.f.Close())
+}
+
+// holdLock takes an exclusive flock on path without waiting.
+func holdLock(path string) (*heldLock, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return nil, err
@@ -737,7 +827,7 @@ func holdLock(path string) (func(), error) {
 		return nil, errors.Join(fmt.Errorf("%s is held by another user of the port: %w", path, err), f.Close())
 	}
 
-	return func() { _ = f.Close() }, nil // closing releases the flock, whatever it says
+	return &heldLock{f: f}, nil
 }
 
 // leasedAddress is the address dnsmasq leased to mac, waiting for the lease.
@@ -930,6 +1020,11 @@ func TestTheStartServerTakesOnlyWholeSteps(t *testing.T) {
 	srv := httptest.NewServer(s)
 	t.Cleanup(srv.Close)
 	key, other := registrationID("one"), registrationID("two")
+	for _, k := range []string{key, other} {
+		if err := s.enroll(k); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	post := func(k, body string) int {
 		t.Helper()
@@ -1011,6 +1106,36 @@ func TestTheStartServerTakesOnlyWholeSteps(t *testing.T) {
 	if code := post(key, "registered 1"); code != http.StatusNoContent || len(s.reported(other)) != 0 {
 		t.Errorf("one key's steps reached another's")
 	}
+
+	// A KEY NOT ENROLLED KEEPS NOTHING, a key keeps one waiting and at most
+	// maxStartSteps, and a retired key is forgotten and cannot be enrolled again.
+	stranger := registrationID("never enrolled")
+	post(stranger, "waiting")
+	if n := len(s.reported(stranger)); n != 0 {
+		t.Errorf("a key never enrolled kept %d steps", n)
+	}
+	for range 3 {
+		post(other, "waiting")
+	}
+	for range 2 * maxStartSteps {
+		post(other, "registered 1")
+	}
+	waits := 0
+	for _, st := range s.reported(other) {
+		if st.line == "waiting" {
+			waits++
+		}
+	}
+	if n := len(s.reported(other)); n != maxStartSteps || waits != 1 {
+		t.Errorf("a flooded key kept %d steps, %d of them waiting; want %d and one", n, waits, maxStartSteps)
+	}
+	s.retire(key)
+	if len(s.reported(key)) != 0 || get(key) != "" {
+		t.Error("a retired key kept its steps or its release")
+	}
+	if err := s.enroll(key); err == nil {
+		t.Error("a key enrolled before was enrolled again")
+	}
 }
 
 // A FORK RUNS ONLY ON A GOLDEN ADDRESS STILL ITS OWN: the lease must name the
@@ -1059,20 +1184,34 @@ func TestThePortsLockExcludesAnotherHolder(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "port.lock")
-	release, err := holdLock(path)
+	lock, err := holdLock(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if again, err := holdLock(path); err == nil {
-		again()
-		t.Error("a lock already held was taken again")
+		t.Errorf("a lock already held was taken again (its release: %v)", again.release())
 	}
-	release()
+	// ITS OPEN FILE DESCRIPTION SHARED WITH ANOTHER DESCRIPTOR, as a child forked
+	// while it was held shares it, it is still released.
+	shared, err := unix.Dup(int(lock.f.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := unix.Close(shared); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := lock.release(); err != nil {
+		t.Fatal(err)
+	}
 	again, err := holdLock(path)
 	if err != nil {
-		t.Fatalf("a released lock could not be taken: %v", err)
+		t.Fatalf("a released lock whose description another descriptor shares could not be taken: %v", err)
 	}
-	again()
+	if err := again.release(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // THE WAITER WAITS FOR A REAL REGISTRATION AND REPORTS WHAT IT DID: against a
@@ -1128,7 +1267,7 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	// never touched.
 	renewed := filepath.Join(dir, "renewed")
 	runner := "#!/bin/sh\nprintf '%s' \"$ACTIONS_RUNNER_INPUT_JITCONFIG\" >" + seen + "\nexit 3\n"
-	if err := os.WriteFile(filepath.Join(dir, "run.sh"), []byte(runner), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(dir, "run.sh"), []byte(runner), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1154,6 +1293,11 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	})
 
 	goldenKey, realKey := registrationID(snapshotStartPlaceholder), registrationID("a-real-registration")
+	for _, k := range []string{goldenKey, realKey} {
+		if err := server.enroll(k); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := server.await(t.Context(), goldenKey, "waiting", 30*time.Second, nil); err != nil {
 		t.Fatalf("the waiter never reported waiting: %v", err)
 	}
@@ -1192,10 +1336,16 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 		t.Errorf("the registration was stamped %q, not between the switch (%d) and its arrival (%d)",
 			registered.line, switched.UnixMilli(), registered.at.UnixMilli())
 	}
-	// HELD THERE until its own key is released: another key's release does not,
-	// and the runner has not run a moment later.
+	// HELD THERE until its own key is released: with another key released, it asks
+	// for its own and is refused, more than once, and the runner has not run.
 	server.release(goldenKey)
-	time.Sleep(300 * time.Millisecond)
+	deadline = time.Now().Add(10 * time.Second)
+	for server.pollsOf(realKey) < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the waiter asked for its release %d times in 10s", server.pollsOf(realKey))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if _, err := os.Stat(seen); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the runner ran before the waiter was released (%v)", err)
 	}
@@ -1219,8 +1369,18 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	if got, err := os.ReadFile(seen); err != nil || string(got) != "a-real-registration" {
 		t.Errorf("the runner was given %q (%v); want the real registration", got, err)
 	}
-	if got, err := os.ReadFile(renewed); err != nil || string(got) != "renewed" {
-		t.Errorf("the waiter did not run its renewal (%q, %v)", got, err)
+	// THE RENEWAL RUNS IN THE BACKGROUND, so it is waited for on its own.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		got, err := os.ReadFile(renewed)
+		if err == nil && string(got) == "renewed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("the waiter did not run its renewal (%q, %v)", got, err)
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	// AND IT HOLDS ON until the host destroys the guest.
 	select {
