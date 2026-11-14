@@ -51,9 +51,16 @@ func TestTheAgentReadsBilletInWhenACacheWillRunIt(t *testing.T) {
 			dir := t.TempDir()
 			release := filepath.Join(dir, "release")
 			reader := filepath.Join(dir, "reader")
+			// IT SAYS WHAT IT WAS GIVEN, holds until released, and says it saw the release,
+			// so a read cut short before then is told from one that was held; it stops too
+			// once its directory is gone, so a test that failed leaves nothing looping.
 			if err := forkSafeWriteFile(reader, []byte("#!/bin/sh\n"+
 				"printf '%s\\n' \"$1\" >&3\n"+
-				"while [ ! -e "+shellQuote(release)+" ]; do sleep 0.05; done\n"), 0o755); err != nil {
+				"while [ ! -e "+shellQuote(release)+" ]; do\n"+
+				"\t[ -d "+shellQuote(dir)+" ] || exit 1\n"+
+				"\tsleep 0.05\n"+
+				"done\n"+
+				"printf 'released\\n' >&3\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			// A READ NOBODY WANTS IS RELEASED BEFORE IT COULD START, so one started wrongly
@@ -63,14 +70,6 @@ func TestTheAgentReadsBilletInWhenACacheWillRunIt(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// RELEASED WHATEVER HAPPENS, and registered after t.TempDir's removal so it runs
-			// before it: a reader never outlives the file it waits for.
-			t.Cleanup(func() {
-				if err := os.WriteFile(release, nil, 0o600); err != nil {
-					t.Errorf("release the reader: %v", err)
-				}
-			})
-
 			// EVERY PROCESS THE BLOCK STARTS INHERITS THE PIPE'S WRITE END as descriptor 3,
 			// and the read end comes to its end only once every one of them has exited,
 			// reaped or not, so no signal, process group or quiet interval is needed to know
@@ -79,6 +78,26 @@ func TestTheAgentReadsBilletInWhenACacheWillRunIt(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// RELEASED WHATEVER HAPPENS, and awaited: registered after the pipe's cleanup
+			// and t.TempDir's, so it runs before either.
+			t.Cleanup(func() {
+				if err := os.WriteFile(release, nil, 0o600); err != nil {
+					t.Errorf("release the reader: %v", err)
+				}
+				ended := time.After(10 * time.Second)
+				for {
+					select {
+					case _, ok := <-said.lines:
+						if !ok {
+							return
+						}
+					case <-ended:
+						t.Errorf("what the block started had not ended 10 s after its release")
+
+						return
+					}
+				}
+			})
 			output, err := os.Create(filepath.Join(dir, "output"))
 			if err != nil {
 				t.Fatal(err)
@@ -142,7 +161,7 @@ func TestTheAgentReadsBilletInWhenACacheWillRunIt(t *testing.T) {
 			}
 			var want []string
 			if tc.wantRead {
-				want = []string{tc.binary}
+				want = []string{tc.binary, "released"}
 			}
 			if !slices.Equal(read, want) {
 				t.Errorf("the block read %q, want %q", read, want)
