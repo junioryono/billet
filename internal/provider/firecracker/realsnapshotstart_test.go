@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -130,13 +132,16 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		}
 	})
 	// THE BUILDER HOLDS ITS TAP, AND SO THE GOLDEN'S MAC, while any fork may still
-	// run with it: a fork whose teardown failed leaves the builder too, so no guest
-	// the node launches next is given the MAC that fork answers on.
-	forkSurvived := false
+	// run with it. outstanding names every fork started and not yet proved
+	// destroyed; a trial's own cleanup, which runs before this one, removes it once
+	// a retry succeeds, so a fork still named here leaves the builder too, and no
+	// guest the node launches next is given the MAC that fork answers on.
+	outstanding := map[string]bool{}
 	t.Cleanup(func() {
-		if forkSurvived {
-			t.Errorf("the builder %s is left running, paused, so its tap stays reserved while a fork "+
-				"that could not be destroyed may hold the golden's MAC; destroy the fork, then the builder", builder)
+		if len(outstanding) > 0 {
+			t.Errorf("the builder %s is left running, paused, so its tap stays reserved while forks %v, "+
+				"which could not be destroyed, may hold the golden's MAC; destroy them, then the builder",
+				builder, slices.Sorted(maps.Keys(outstanding)))
 
 			return
 		}
@@ -209,18 +214,18 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		}
 
 		fields := map[string]any{"arm": arm, "trial": i, "loadavg": loadAverage()}
-		if arm == "restore" {
-			fields["snapshot_age_s"] = time.Since(captured).Seconds()
-		}
-		err := runStartTrial(t, p, spec, i, arm, jits, leases, snapshot, evidence, goldenMAC, goldenAddr, fields)
+		err := runStartTrial(t, p, spec, startTrial{
+			index: i, arm: arm, jits: jits, leases: leases, snapshot: snapshot, evidence: evidence,
+			goldenMAC: goldenMAC, goldenAddr: goldenAddr, captured: captured, outstanding: outstanding,
+		}, fields)
 		if err != nil {
 			fields["error"] = err.Error()
 		}
 		line(fields)
-		// A TRIAL WHOSE GUEST COULD NOT BE DESTROYED ENDS THE EXPERIMENT: the next
-		// fork would share its MAC and address.
-		if errors.Is(err, errTrialSurvived) {
-			forkSurvived = true
+		// A TRIAL WHOSE GUEST COULD NOT BE DESTROYED ENDS THE EXPERIMENT, since the
+		// next fork would share its MAC and address, and so does a golden's lease
+		// the bridge's DHCP no longer holds for it.
+		if errors.Is(err, errTrialSurvived) || errors.Is(err, errLeaseLost) {
 			t.Fatalf("trial %d (%s): %v", i, arm, err)
 		}
 		if err != nil {
@@ -231,6 +236,20 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 
 // errTrialSurvived is a trial whose guest could not be destroyed.
 var errTrialSurvived = errors.New("its guest could not be destroyed")
+
+// errLeaseLost is a golden address the bridge's DHCP no longer holds for the
+// golden's MAC, which a fork would then share with whoever it was given to.
+var errLeaseLost = errors.New("the golden's address is no longer leased to it")
+
+// startTrial is what a trial needs beyond the provider and its spec.
+type startTrial struct {
+	index                       int
+	arm, jits, leases, snapshot string
+	evidence                    Evidence
+	goldenMAC, goldenAddr       string
+	captured                    time.Time
+	outstanding                 map[string]bool
+}
 
 // snapshotStartPlaceholder is the golden's JIT configuration: what its waiter
 // waits for the metadata to stop saying.
@@ -246,7 +265,10 @@ const snapshotStartPort = 47231
 // metadata service at $2 to hold a registration that is not $1; holds there until
 // the host, having sampled the guest's memory, releases it with a POST; runs the
 // runner with it; and then holds on, listener and all, until the host destroys the
-// guest, since the agent's service ending would take the listener with it.
+// guest, since the agent's service ending would take the listener with it. Once
+// registered it renews its DHCP lease in the background: a fork resumes with its
+// golden's lease timers and lives minutes, so without this none would renew, and
+// the bridge's DHCP would let the golden's address go after an hour.
 //
 // A fresh token for every read, since a restored VMM knows none the golden's did,
 // and every read bounded to a second, since one in flight at the capture is
@@ -289,6 +311,7 @@ while :; do
 	sleep 0.02
 done
 printf 'registered %s\n' "$(date +%s%3N)" >>"$state"
+( sudo -n networkctl renew eth0 >/dev/null 2>&1 & )
 while [ ! -e "$state.release" ]; do sleep 0.01; done
 printf 'released %s\n' "$(date +%s%3N)" >>"$state"
 ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" ./run.sh
@@ -304,8 +327,10 @@ func hasLine(state, step string) bool {
 }
 
 // lineOf is the rest of a waiter's line for step, without the step's own word.
+// Only a line its newline ends counts: a read can land in the middle of an append.
 func lineOf(state, step string) (string, bool) {
-	for _, l := range strings.Split(state, "\n") {
+	lines := strings.Split(state, "\n")
+	for _, l := range lines[:len(lines)-1] {
 		if l == step {
 			return "", true
 		}
@@ -351,14 +376,24 @@ func releaseWaiter(ctx context.Context, addr string, port int) error {
 // later, and when the runner finished its one job. The guest is destroyed however
 // the trial ends, before the next starts; one that could not be is
 // errTrialSurvived.
-func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provider.Spec, i int, arm, jits,
-	leases, snapshot string, evidence Evidence, goldenMAC, goldenAddr string, fields map[string]any,
+func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provider.Spec, tr startTrial,
+	fields map[string]any,
 ) (err error) {
 	t.Helper()
+	arm, leases, goldenMAC, goldenAddr := tr.arm, tr.leases, tr.goldenMAC, tr.goldenAddr
 
-	jit, err := takeJIT(t.Context(), filepath.Join(jits, strconv.Itoa(i)+".jit"), 10*time.Minute)
+	jit, err := takeJIT(t.Context(), filepath.Join(tr.jits, strconv.Itoa(tr.index)+".jit"), 10*time.Minute)
 	if err != nil {
 		return err
+	}
+
+	// A FORK ONLY WHILE THE GOLDEN'S ADDRESS IS STILL ITS OWN, for long enough to
+	// run a trial: a lease about to lapse, or the address given to another MAC,
+	// would put the fork on an address a production guest holds.
+	if arm == "restore" {
+		if err := goldenLeaseHolds(leases, goldenMAC, goldenAddr, 10*time.Minute, time.Now()); err != nil {
+			return fmt.Errorf("%w: %w", errLeaseLost, err)
+		}
 	}
 
 	name := provider.InstanceName(freshLease(t))
@@ -376,6 +411,7 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 			return err
 		}
 		destroyed = true
+		delete(tr.outstanding, name)
 
 		return nil
 	}
@@ -395,7 +431,11 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	if arm == "cold" {
 		_, err = p.Launch(t.Context(), spec(name, jit))
 	} else {
-		_, err = p.Restore(t.Context(), spec(name, jit), snapshot, evidence)
+		// OUTSTANDING FROM BEFORE THE CALL, since a restore that failed may still
+		// have started a VMM with the golden's MAC.
+		tr.outstanding[name] = true
+		fields["snapshot_age_s"] = asked.Sub(tr.captured).Seconds()
+		_, err = p.Restore(t.Context(), spec(name, jit), tr.snapshot, tr.evidence)
 	}
 	if err != nil {
 		return fmt.Errorf("start: %w", err)
@@ -527,7 +567,7 @@ func waiterState(ctx context.Context, addr string, port int, limit time.Duration
 			seen := time.Now()
 			readErr = errors.Join(readErr, resp.Body.Close())
 			if readErr == nil && resp.StatusCode == http.StatusOK {
-				last = strings.TrimSpace(string(body))
+				last = string(body)
 				if done(last) {
 					return waiterSeen{state: last, seen: seen}, nil
 				}
@@ -576,6 +616,40 @@ func leasedAddress(ctx context.Context, leases, mac string, limit time.Duration)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+// goldenLeaseHolds refuses unless the lease file gives addr to mac, with at least
+// minRemaining left at now (an expiry of 0 never lapses), and gives addr to no
+// other MAC.
+func goldenLeaseHolds(leases, mac, addr string, minRemaining time.Duration, now time.Time) error {
+	raw, err := os.ReadFile(leases)
+	if err != nil {
+		return err
+	}
+	held := false
+	for _, l := range strings.Split(string(raw), "\n") {
+		// expiry mac address hostname client-id
+		fields := strings.Fields(l)
+		if len(fields) < 3 || fields[2] != addr {
+			continue
+		}
+		if !strings.EqualFold(fields[1], mac) {
+			return fmt.Errorf("%s is leased to %s, not the golden's %s", addr, fields[1], mac)
+		}
+		expiry, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			return fmt.Errorf("the lease of %s has expiry %q", addr, fields[0])
+		}
+		if left := time.Unix(expiry, 0).Sub(now); expiry != 0 && left < minRemaining {
+			return fmt.Errorf("the lease of %s to %s has %s left", addr, mac, left.Round(time.Second))
+		}
+		held = true
+	}
+	if !held {
+		return fmt.Errorf("%s is not leased to %s", addr, mac)
+	}
+
+	return nil
 }
 
 // takeJIT waits for a JIT configuration to arrive, reads it and removes it, so a
@@ -680,6 +754,62 @@ func loadAverage() string {
 	}
 
 	return fields[0]
+}
+
+// ONLY A WHOLE LINE IS A STEP: a read that lands in the middle of an append sees
+// a tail without its newline, which is neither found nor parsed.
+func TestAWaiterStepIsAWholeLine(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct {
+		state, step, rest string
+		found             bool
+	}{
+		{"waiting\nregistered 1731600000123\n", "registered", "1731600000123", true},
+		{"waiting\nregistered 179", "registered", "", false},
+		{"waiting\nregistered 1731600000123\nfinished 17316", "finished", "", false},
+		{"waiting\n", "waiting", "", true},
+		{"waiting", "waiting", "", false},
+		{"waiting\nregisteredx 1\n", "registered", "", false},
+	} {
+		rest, found := lineOf(c.state, c.step)
+		if found != c.found || rest != c.rest {
+			t.Errorf("lineOf(%q, %s) = %q, %v; want %q, %v", c.state, c.step, rest, found, c.rest, c.found)
+		}
+	}
+}
+
+// A FORK RUNS ONLY ON A GOLDEN ADDRESS STILL ITS OWN: the lease must name the
+// golden's MAC with ten minutes left, and no other MAC may hold the address.
+func TestAForkRunsOnlyOnALeaseStillItsOwn(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_731_600_000, 0)
+	const mac, addr = "02:00:00:00:00:0a", "172.31.0.42"
+	for _, c := range []struct {
+		name, leases string
+		ok           bool
+	}{
+		{"held for an hour", "1731603600 02:00:00:00:00:0a 172.31.0.42 * 01:02\n", true},
+		{"held for ever", "0 02:00:00:00:00:0a 172.31.0.42 * *\n", true},
+		{"held, the MAC in capitals", "1731603600 02:00:00:00:00:0A 172.31.0.42 * *\n" +
+			"1731603600 02:00:00:00:00:0b 172.31.0.43 * *\n", true},
+		{"lapsing in five minutes", "1731600300 02:00:00:00:00:0a 172.31.0.42 * *\n", false},
+		{"given to another MAC", "1731603600 02:00:00:00:00:09 172.31.0.42 * *\n", false},
+		{"not leased at all", "1731603600 02:00:00:00:00:0a 172.31.0.99 * *\n", false},
+		{"an unreadable expiry", "soon 02:00:00:00:00:0a 172.31.0.42 * *\n", false},
+	} {
+		path := filepath.Join(t.TempDir(), "dnsmasq.leases")
+		if err := os.WriteFile(path, []byte(c.leases), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := goldenLeaseHolds(path, mac, addr, 10*time.Minute, now); (err == nil) != c.ok {
+			t.Errorf("%s: admitted %v (%v), want %v", c.name, err == nil, err, c.ok)
+		}
+	}
+	if err := goldenLeaseHolds(filepath.Join(t.TempDir(), "absent"), mac, addr, 0, now); err == nil {
+		t.Error("a lease file that could not be read was taken to hold the lease")
+	}
 }
 
 // THE WAITER WAITS FOR A REAL REGISTRATION AND SAYS WHAT IT DID: against a stand-in
