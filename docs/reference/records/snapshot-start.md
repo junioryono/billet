@@ -37,7 +37,7 @@ The waiter reported `registered` with the guest's clock, then held the runner un
 **Measured at:**
 - `Launch` or `Restore` being called, and when it answered;
 - the host receiving the waiter's `registered`, on the host's clock;
-- the VMM's memory then, 30 seconds after the release, and at its peak while the job ran;
+- the VMM's memory then, 30 seconds after the host received `released`, and the largest PSS sampled from the release until the host received `finished`;
 - GitHub's `started_at` for the job, joined afterwards by the runner's name, which has one-second resolution.
 
 **The guest reports to the host.** The node's firewall drops everything a guest sends the host except DNS, DHCP, the node's cache port and the image verification port. The experiment's first attempt that day polled a listener inside the guest, and failed: the guest leased an address and answered nothing. So the host listened on the image verification port, holding `billet images verify`'s own lock. It kept steps only for the key of the trial in progress, the sha256 of its registration.
@@ -67,8 +67,13 @@ The waiter reported `registered` with the guest's clock, then held the runner un
 
 **Teardown.**
 - **Per trial.** Every trial's `Destroy` returned success before the next began.
-- **After the run**, the node was checked: no jail of the run's instances, no image of its golden in either pool, no mapping of them, and nothing listening on the image verification port.
-- **Runners.** The organization had no runner left under the run's labels.
+- **After the run**, at 17:47 UTC, the node was checked by hand, and every check came back empty:
+  - its jails directory held none of the run's instances;
+  - `rbd ls billet-images` named no image of the run's golden;
+  - `ss -ltn` showed nothing on port 7719.
+- **Runners.** The organization's runner list, read afterwards for the run's label prefix, named none: each just-in-time runner was gone once its job ended.
+
+These checks were run at the terminal; their output is not kept beside the record.
 
 ## What it means
 
@@ -78,7 +83,7 @@ The waiter reported `registered` with the guest's clock, then held the runner un
   - These forks ran one at a time, so each was charged all of its file-backed pages.
   - The ten concurrent forks in [Workspace snapshots](workspace-snapshots.md) held 227 MiB PSS together. Those were 2 GiB probe guests with no application stack, sampled a few seconds after resume, so they show that the pages are shared, not what concurrent runners of this shape would hold. That is unmeasured.
   - The medians differed by 290 MiB 30 s after the release and by 280 MiB at the largest sample.
-- **The clock agreed within tens of milliseconds.** The host received a guest's stamp 35 to 73 ms after the time the stamp carried, in both arms. That figure combines clock offset and delivery and cannot separate them. It is consistent with a restored guest keeping near the host's time, as a cold one does, where an unadjusted fork would be as far behind as the snapshot's age. `clock_realtime` on every x86 load and `kvm-clock` in the golden are what ADR-017 relies on, and both are now in the provider.
+- **The timestamps were consistent with near-host time.** The host received a guest's stamp 35 to 73 ms after the time the stamp carried, in both arms. That figure combines clock offset and delivery and cannot separate them. It is consistent with a restored guest keeping near the host's time, as a cold one does, where an unadjusted fork would be as far behind as the snapshot's age. `clock_realtime` on every x86 load and `kvm-clock` in the golden are what ADR-017 relies on, and both are now in the provider.
 
 ## What it does not establish
 
