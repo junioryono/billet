@@ -218,7 +218,8 @@ billet_backup_timer: true
 
 # Where needrestart is looked for. The role installs <dir>/conf.d/90-billet.conf
 # wherever either exists, so an unattended library upgrade never restarts a
-# billet service. Inputs only so tests/needrestart-check.yml can drive the tasks
+# billet service, and <dir>/conf.d/91-billet-ceph.conf where it gives Ceph, so
+# none restarts an OSD under the volumes this host maps. Inputs only so tests/needrestart-check.yml can drive the tasks
 # against a temporary tree; a host has no reason to change them.
 billet_needrestart_dir: /etc/needrestart
 billet_needrestart_binary: /usr/sbin/needrestart
