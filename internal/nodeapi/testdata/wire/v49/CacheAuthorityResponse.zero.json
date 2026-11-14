@@ -1,0 +1,13 @@
+{
+  "authority": {
+    "lease_id": "",
+    "job_id": "",
+    "run_id": 0,
+    "owner": "",
+    "repository": "",
+    "event": "",
+    "proven": false,
+    "write_own_ref": false,
+    "publish_default": false
+  }
+}

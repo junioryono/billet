@@ -78,6 +78,9 @@ func (a *Allocator) RecordLeaseUsage(
 		if err := recordDestinations(ctx, q, lease.ID, usage.Destinations); err != nil {
 			return err
 		}
+		if err := recordOpenings(ctx, q, lease.ID, usage.Destinations); err != nil {
+			return err
+		}
 		if series == nil {
 			return nil
 		}
@@ -138,6 +141,9 @@ func (a *Allocator) LeaseUsage(ctx context.Context, leaseID string) (RecordedUsa
 		}
 		dests, err := readDestinations(ctx, q, leaseID, row)
 		if err != nil {
+			return err
+		}
+		if err := readOpenings(ctx, q, leaseID, dests); err != nil {
 			return err
 		}
 		out.Destinations = dests

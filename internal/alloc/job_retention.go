@@ -102,6 +102,9 @@ func (a *Allocator) RetireJobDetail(ctx context.Context, leaseIDs []string) (Ret
 		if err != nil {
 			return fmt.Errorf("alloc: delete retired job destinations: %w", err)
 		}
+		if _, err := q.DeleteRetiredJobDestinationOpenings(ctx, stamp); err != nil {
+			return fmt.Errorf("alloc: delete retired job destination openings: %w", err)
+		}
 		if err := q.ForgetRetiredJobDestinationTotals(ctx, stamp); err != nil {
 			return fmt.Errorf("alloc: forget retired jobs' destination totals: %w", err)
 		}

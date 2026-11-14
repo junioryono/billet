@@ -179,18 +179,30 @@ func TestTheLargestUsageReportFitsOneRequest(t *testing.T) {
 	c := dial(t, base)
 
 	const most = int64(1<<63 - 1)
+	// EVERY COUNT AT ITS WIDEST: half the connections unanswered and the other
+	// half timed and slow, each a 19-digit number, and every opening a report
+	// carries, each count and start 19 digits too.
+	widest := alloc.JobDestination{SentBytes: most, ReceivedBytes: most, Connections: most,
+		Unanswered: most / 2, TimedReplies: most - most/2, SlowReplies: most - most/2, SlowestReplyMillis: most}
 	usage := aUsage()
 	usage.Destinations = &alloc.JobDestinations{
-		Other: alloc.JobDestination{SentBytes: most, ReceivedBytes: most, Connections: most,
-			Unanswered: most},
+		Other:      widest,
 		Incomplete: true, Tap: &alloc.TapTotals{SentBytes: most, ReceivedBytes: most},
-		UnansweredCounted: true,
+		UnansweredCounted: true, RepliesTimed: true, OpeningSeconds: 1,
 	}
 	for i := range alloc.MaxJobDestinations {
-		usage.Destinations.Destinations = append(usage.Destinations.Destinations, alloc.JobDestination{
-			Addr:      fmt.Sprintf("ffff:ffff:ffff:ffff:ffff:ffff:ffff:%x", 0xf000+i),
-			SentBytes: most, ReceivedBytes: most, Connections: most, Unanswered: most,
+		dest := widest
+		dest.Addr = fmt.Sprintf("ffff:ffff:ffff:ffff:ffff:ffff:ffff:%x", 0xf000+i)
+		usage.Destinations.Destinations = append(usage.Destinations.Destinations, dest)
+	}
+	for i := range alloc.MaxDestinationOpenings {
+		usage.Destinations.Openings = append(usage.Destinations.Openings, alloc.DestinationOpening{
+			Ordinal: alloc.MaxJobDestinations, Start: most - alloc.MaxDestinationOpenings + int64(i),
+			SentBytes: most, ReceivedBytes: most, Connections: most,
 		})
+	}
+	if err := usage.Destinations.Validate(); err != nil {
+		t.Fatalf("the largest report is not one a node can send: %v", err)
 	}
 	data := bytes.Repeat([]byte{0xff}, alloc.MaxUsageSeriesBytes)
 	if err := c.RecordLeaseUsage(t.Context(), "l1", 7, usage,
@@ -201,7 +213,11 @@ func TestTheLargestUsageReportFitsOneRequest(t *testing.T) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if len(store.usages) != 1 || store.usages[0].usage.Destinations == nil ||
-		len(store.usages[0].usage.Destinations.Destinations) != alloc.MaxJobDestinations {
+		len(store.usages[0].usage.Destinations.Destinations) != alloc.MaxJobDestinations ||
+		len(store.usages[0].usage.Destinations.Openings) != alloc.MaxDestinationOpenings {
 		t.Fatalf("the largest report did not reach the ledger whole: %d report(s)", len(store.usages))
+	}
+	if s := store.usages[0].series; s == nil || len(s.Data) != alloc.MaxUsageSeriesBytes {
+		t.Fatalf("the largest report's series did not reach the ledger whole")
 	}
 }

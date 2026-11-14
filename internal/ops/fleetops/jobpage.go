@@ -97,6 +97,9 @@ type pageSteps struct {
 	Why       string
 	Head      string
 	Alignment string
+	// DestinationsClock says how a step's destinations are placed, when the job's
+	// destinations were split by time; empty otherwise.
+	DestinationsClock string
 	// Aligned says each step's usage was read from the series; without it,
 	// Alignment says why none could be.
 	Aligned bool
@@ -116,6 +119,9 @@ type pageStep struct {
 	Note string
 	// Usage is the step's window, one cell a group; nil when it has none.
 	Usage []pageField
+	// Destinations is where the step's connections went, as stepDestinations
+	// words it; empty when the job's destinations were not split by time.
+	Destinations string
 	// Bar places the step among the steps (thousandths of their span); HasBar
 	// is false for a step with no length.
 	HasBar     bool
@@ -341,6 +347,9 @@ func stepsSection(s jobSteps, tl *usage.Timeline, unaligned string, measured *al
 	} else {
 		out.Alignment = "Usage per step: could not tell, because " + unaligned + "."
 	}
+	if splitByTime(measured) {
+		out.DestinationsClock = sentence(stepDestinationsClock)
+	}
 
 	var lo, hi time.Time
 	for _, step := range s.job.Steps {
@@ -413,6 +422,9 @@ func stepRow(step github.JobStep, tl *usage.Timeline, measured *alloc.RecordedUs
 		return row
 	}
 	row.Took = took.String()
+	if measured != nil {
+		row.Destinations = stepDestinations(measured.Destinations, step.StartedAt, step.CompletedAt)
+	}
 	if tl == nil || measured == nil {
 		row.Note = "could not tell"
 		return row

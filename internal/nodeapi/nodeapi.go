@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 48
+	Version = 49
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -643,6 +643,18 @@ const (
 	// sends it, so no node that registers today sends anything new, and an older plane's
 	// strict decoder refuses only the new pairing, which needs this plane first.
 	VersionSiteStore = 48
+
+	// VersionDestinationOpenings is the version from which a usage report's
+	// destinations are split by when each connection opened
+	// (lease.JobDestinations.Openings and OpeningSeconds), so a report can say
+	// which step of a job talked to which destination.
+	//
+	// A DIAGNOSTIC, reported rather than refused, for VersionReplyTimes' reason
+	// and CHECKED at both of its places: below it the node sends the
+	// destinations without the split, and a pairing that negotiated below it and
+	// sends one anyway has the report kept with the split dropped, which reads
+	// as not split by time rather than as no traffic in any step.
+	VersionDestinationOpenings = 49
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

@@ -28,6 +28,9 @@
 {{- else}}
 <p>{{.Steps.Head}}</p>
 <p class="note">{{.Steps.Alignment}}</p>
+{{- with .Steps.DestinationsClock}}
+<p class="note">{{.}}</p>
+{{- end}}
 <ol class="timeline">
 {{- range .Steps.Rows}}
 <li class="{{.Class}}">
@@ -119,6 +122,9 @@
 {{- else}}<td colspan="7" class="none">{{.Note}}</td>{{end}}</tr>
 {{- if and .Usage .Note}}
 <tr class="qualifier"><td></td><td colspan="9">{{.Note}}</td></tr>
+{{- end}}
+{{- with .Destinations}}
+<tr class="qualifier"><td></td><td colspan="9">Destinations, by when each connection opened: {{.}}</td></tr>
 {{- end}}
 {{- end}}
 </tbody>

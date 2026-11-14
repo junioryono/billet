@@ -143,6 +143,9 @@ func renderSteps(w io.Writer, s jobSteps) {
 			"its samples, with no correction for skew between them; within one sample interval, "+
 			"usage is split by time")
 	}
+	if splitByTime(s.measured) {
+		line("", "%s", stepDestinationsClock)
+	}
 	for _, step := range s.job.Steps {
 		renderStep(line, step, s.timeline, s.measured)
 	}
@@ -186,6 +189,13 @@ func renderStep(line func(label, format string, args ...any), step github.JobSte
 		return
 	}
 	line(label, "%s, started %s, took %s", head, stamp(step.StartedAt), took)
+	// THE DESTINATIONS NEED NO SERIES, only the step's times and the split the
+	// node made of its connections.
+	if measured != nil {
+		if where := stepDestinations(measured.Destinations, step.StartedAt, step.CompletedAt); where != "" {
+			line("", "%s: %s", stepDestinationsLabel, where)
+		}
+	}
 	if tl == nil || measured == nil {
 		return
 	}
