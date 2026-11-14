@@ -8,6 +8,9 @@
 #   matrix-host.sh judge <run-dir> <archs> <runs-file> <owner/repo> [<backends>]
 #   matrix-host.sh stopped <run-dir>
 #   matrix-host.sh down <run-dir>
+#   matrix-host.sh block-s3 <run-dir> <region> <expiry-seconds>
+#   matrix-host.sh unblock-s3 <run-dir> <region>
+#   matrix-host.sh breaker <run-dir> <seconds>
 #
 # The acceptance matrix's half that runs on the acceptance host, beside the node its
 # instances dial (#554). <run-dir> holds this run's billet binary at <run-dir>/billet, and
@@ -67,11 +70,83 @@
 # pool's run keeps its hosts' consoles with them (`billet acceptance matrix
 # pool-consoles`), where the prelude forwards the node's warnings and errors, since the
 # host the node ran on is ended (#861).
+#
+# block-s3, as root, drops every packet this host sends to <region>'s S3, the S3 entries
+# of AWS's published address ranges, so the node's site store hangs rather than refuses,
+# as #531's did; the EC2 API its launches and volumes use stays in reach. The rules are a
+# table of billet's own, removed by a timer <expiry-seconds> on whatever else happens,
+# armed before the table exists; and the block is installed only once a request to S3 is
+# proved to go unanswered through it, else it is lifted and the command fails.
+#
+# unblock-s3, as root, removes that table and its timer, and exits 0 only once S3 answers
+# this host again. It is idempotent, and a run that never blocked has nothing to remove.
+#
+# breaker reads the run's `billet status` until no store breaker is open, or <seconds>
+# pass, keeping each read in <run-dir>/logs and printing the store's breaker lines: 0 once
+# none is open, 1 if one still is, 2 if the status could not be read.
 set -uo pipefail
 
 usage() {
-	sed -n '2,10p' "$0" >&2
+	sed -n '2,13p' "$0" >&2
 	exit 2
+}
+
+# The block's table and its expiry's unit. One run holds the host at a time (the
+# workflow's concurrency group), so a fixed name is the run's, and one a killed run left is
+# replaced.
+s3_table=billet_matrix_s3
+s3_expiry=billet-matrix-s3-expiry
+
+# s3_rules prints the block's nftables table from AWS's published ranges ($1) for one
+# region ($2), and fails, printing nothing, when they name no IPv4 range for it or one that
+# is not an address range.
+s3_rules='import ipaddress, json, sys
+doc = json.load(open(sys.argv[1]))
+region, table = sys.argv[2], sys.argv[3]
+def ranges(key, field):
+    return sorted({str(ipaddress.ip_network(p[field])) for p in doc.get(key, [])
+                   if p.get("service") == "S3" and p.get("region") == region})
+v4, v6 = ranges("prefixes", "ip_prefix"), ranges("ipv6_prefixes", "ipv6_prefix")
+if not v4:
+    sys.exit("no S3 range for " + region)
+out = ["table inet %s {" % table,
+       "\tset v4 { type ipv4_addr; flags interval; auto-merge; elements = { %s } }" % ", ".join(v4)]
+if v6:
+    out.append("\tset v6 { type ipv6_addr; flags interval; auto-merge; elements = { %s } }" % ", ".join(v6))
+out += ["\tchain out {", "\t\ttype filter hook output priority 0; policy accept;", "\t\tip daddr @v4 drop"]
+if v6:
+    out.append("\t\tip6 daddr @v6 drop")
+out += ["\t}", "}"]
+print("\n".join(out))'
+
+# reach asks the region's S3 endpoint for anything at all within 8 s and answers with
+# curl's status: 0 is an answer, whatever it said; 28 is none in time; anything else is a
+# question that could not be put, which is neither.
+reach() {
+	curl -s -o /dev/null --max-time 8 "https://s3.$1.amazonaws.com/"
+}
+
+# lift removes the block's table and its expiry, and answers 0 only once no table of
+# that name is installed.
+lift() {
+	systemctl stop "$s3_expiry.timer" >/dev/null 2>&1
+	nft delete table inet "$s3_table" >/dev/null 2>&1
+	nft list tables >"$run_dir/nft-tables" 2>&1 || {
+		echo "matrix: nftables' tables could not be listed, so whether the block is lifted cannot be told" >&2
+		return 2
+	}
+	grep -qx "table inet $s3_table" "$run_dir/nft-tables"
+	case $? in
+	1) return 0 ;;
+	0)
+		echo "matrix: the block on S3 is still installed" >&2
+		return 1
+		;;
+	*)
+		echo "matrix: nftables' tables could not be read" >&2
+		return 2
+		;;
+	esac
 }
 
 # lstat_kind PATH prints what lstat says PATH is: dir, file, link or other, or absent
@@ -334,6 +409,111 @@ down)
 	fi
 	python3 -I "$supervise" keep-logs "$run_dir"
 	"$billet" acceptance down --workspace "$ws"
+	;;
+block-s3)
+	[ "$#" -eq 4 ] || usage
+	region=$3 expiry=$4
+	case "$expiry" in
+	'' | *[!0-9]*)
+		echo "matrix: the block's expiry is \"$expiry\", not a number of seconds" >&2
+		exit 2
+		;;
+	esac
+	if ! curl -fsS --max-time 60 -o "$run_dir/ip-ranges.json" \
+		"${MATRIX_IP_RANGES_URL:-https://ip-ranges.amazonaws.com/ip-ranges.json}"; then
+		echo "matrix: AWS's published address ranges could not be fetched; nothing is blocked" >&2
+		exit 1
+	fi
+	if ! python3 -I -c "$s3_rules" "$run_dir/ip-ranges.json" "$region" "$s3_table" >"$run_dir/s3-block.nft"; then
+		echo "matrix: AWS's published ranges name no S3 range for $region that could be read; nothing is blocked" >&2
+		exit 1
+	fi
+	if ! nft_path=$(command -v nft); then
+		echo "matrix: nft is not on this host; nothing is blocked" >&2
+		exit 1
+	fi
+	# ONE A KILLED RUN LEFT IS REPLACED, its timer first, so it cannot lift this run's block.
+	lift || exit 1
+	# THE EXPIRY BEFORE THE RULE: no moment holds a block nothing will remove.
+	if ! systemd-run --quiet --collect --unit "$s3_expiry" --on-active="${expiry}s" \
+		"$nft_path" delete table inet "$s3_table"; then
+		echo "matrix: the block's expiry could not be armed; nothing is blocked" >&2
+		exit 1
+	fi
+	if ! nft -f "$run_dir/s3-block.nft"; then
+		echo "matrix: the block could not be installed" >&2
+		lift
+		exit 1
+	fi
+	reach "$region"
+	reached=$?
+	if [ "$reached" -ne 28 ]; then
+		echo "matrix: a request to S3 in $region did not go unanswered through the block (curl exit $reached);" \
+			"it is lifted" >&2
+		lift
+		exit 1
+	fi
+	echo "matrix: S3 in $region is out of this host's reach, for at most ${expiry}s"
+	;;
+unblock-s3)
+	[ "$#" -eq 3 ] || usage
+	region=$3
+	lift || exit 1
+	reach "$region"
+	reached=$?
+	if [ "$reached" -ne 0 ]; then
+		echo "matrix: the block is lifted, and S3 in $region did not answer this host (curl exit $reached)" >&2
+		exit 1
+	fi
+	echo "matrix: S3 in $region answers this host again"
+	;;
+breaker)
+	[ "$#" -eq 3 ] || usage
+	case "$3" in
+	'' | *[!0-9]*)
+		echo "matrix: \"$3\" is not a number of seconds" >&2
+		exit 2
+		;;
+	esac
+	end=$((SECONDS + $3))
+	mkdir -p "$run_dir/logs" || exit 2
+	while :; do
+		at=$(date -u +%Y%m%dT%H%M%SZ)
+		status="$run_dir/logs/status-$at.txt"
+		if ! "$billet" status --config "$ws/billet.yaml" >"$status" 2>&1; then
+			echo "matrix: the run's status could not be read at $at" >&2
+			exit 2
+		fi
+		grep 'breaker' "$status" >"$status.breaker"
+		case $? in
+		0) ;;
+		1) : >"$status.breaker" ;;
+		*)
+			echo "matrix: the run's status at $at could not be read back" >&2
+			exit 2
+			;;
+		esac
+		grep -q 'breaker OPEN' "$status.breaker"
+		open=$?
+		case $open in
+		1)
+			echo "matrix: $at: no store breaker is open"
+			cat "$status.breaker"
+			exit 0
+			;;
+		0) ;;
+		*)
+			echo "matrix: the run's status at $at could not be read back" >&2
+			exit 2
+			;;
+		esac
+		if [ "$SECONDS" -ge "$end" ]; then
+			cat "$status.breaker"
+			echo "matrix: a store breaker is still open at $at" >&2
+			exit 1
+		fi
+		sleep "${MATRIX_POLL:-10}"
+	done
 	;;
 *)
 	usage

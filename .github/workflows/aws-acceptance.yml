@@ -64,8 +64,9 @@ jobs:
     # THE BUDGET, inside GitHub's six hours for a hosted job: the host's run waits 210
     # minutes for its jobs, 20 more for its compute barrier and 5 for each service's stop
     # (SSM gives it 250), then the judge (15) and the teardown (`stopped` and `down`, at
-    # most 30 and 40). Five dispatch phases of at most 45 minutes each (images, cold, warm,
-    # and each architecture's two-writer runs) can outlast the host's wait; a run that
+    # most 30 and 40). Six dispatch phases of at most 45 minutes each (images, cold, warm,
+    # each architecture's two-writer runs, and the store out of reach) can outlast the
+    # host's wait; a run that
     # does fails its phase or its jobs' count, and never passes. A POOL'S run waits 125
     # minutes for its jobs and 85 more for the pool to release its hosts, inside the same
     # 250; its first phase waits up to 55 minutes for a host to boot, its writers are one
@@ -109,7 +110,7 @@ jobs:
           */*) ;;
           *) echo "ACCEPTANCE_REPO is \"$REPO\", not owner/name" >&2; exit 1 ;;
           esac
-          jobs=$(dist/billet acceptance matrix jobs --archs "$ARCHS")
+          jobs=$(dist/billet acceptance matrix jobs --archs "$ARCHS" --backend "$BACKEND")
           {
             echo "owner=${REPO%%/*}"
             echo "name=${REPO#*/}"
@@ -434,6 +435,42 @@ jobs:
           GH_TOKEN: ${{ steps.writers-arm64-token.outputs.token }}
           LABEL: ${{ steps.labels.outputs.label_arm64 }}
         run: scripts/acceptance/matrix-dispatch.sh writers "$REPO" "$RUN" out/runs "$LABEL"
+      # THE STORE OUT OF REACH LAST, with nothing else on the deployment: the host drops
+      # every packet it sends to its region's S3, so the node's site store hangs as #531's
+      # did, and the breaker that opens sends every job on the node cold. The block lifts
+      # itself 55 minutes on whatever happens; the step after the runs lifts it at once,
+      # before anything else here needs S3, and the breaker must then let jobs use their
+      # caches again.
+      - id: block-s3
+        name: Cut the host off from its region's S3
+        if: ${{ env.LANE == 'ec2' }}
+        run: |
+          scripts/acceptance/ssm-run.sh run "$HOST" 180 "bash '$RUN_DIR/matrix-host.sh' block-s3 '$RUN_DIR' '$AWS_REGION' 3300"
+      - id: unreachable-token
+        if: ${{ steps.block-s3.outcome == 'success' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Dispatch the store-unreachable runs, and wait for them
+        if: ${{ steps.block-s3.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.unreachable-token.outputs.token }}
+          LABELS: ${{ steps.labels.outputs.labels }}
+        run: |
+          set -euo pipefail
+          read -r -a labels <<<"$LABELS"
+          scripts/acceptance/matrix-dispatch.sh store-unreachable "$REPO" "$RUN" out/runs "${labels[@]}"
+      - name: Give the host its region's S3 back
+        if: ${{ always() && steps.block-s3.outcome != 'skipped' && steps.block-s3.outcome != '' }}
+        run: |
+          scripts/acceptance/ssm-run.sh run "$HOST" 180 "bash '$RUN_DIR/matrix-host.sh' unblock-s3 '$RUN_DIR' '$AWS_REGION'"
+      - name: Wait for the node's store breaker to let jobs use their caches again
+        if: ${{ steps.block-s3.outcome == 'success' }}
+        run: |
+          scripts/acceptance/ssm-run.sh run "$HOST" 420 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' breaker '$RUN_DIR' 300"
       # A FAILED OR CANCELLED DISPATCH STOPS THE HOST'S RUN rather than leave it waiting
       # out --wait for jobs nobody sent; the wait below then joins it, and the judge
       # refuses a run with no recorded exit. Asked whether or not the run's command id

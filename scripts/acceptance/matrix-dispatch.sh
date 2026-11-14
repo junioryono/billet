@@ -8,6 +8,7 @@
 #   matrix-dispatch.sh warm <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh writers <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh writers-apart <owner/repo> <tag> <runs-file> <label>...
+#   matrix-dispatch.sh store-unreachable <owner/repo> <tag> <runs-file> <label>...
 #
 # Dispatches the acceptance matrix's workflows in <owner/repo> for each tier label and
 # appends the id of every run it starts to <runs-file>, which is what `billet acceptance
@@ -28,7 +29,10 @@
 # slot (the workflow calls it once per architecture, so each has its own deadline).
 # `writers-apart` sends every label's at once and waits for them all, for tiers that share
 # no host, as a pool's architectures do: one waiting for another would leave its host
-# idle long enough for the pool to release it. Every
+# idle long enough for the pool to release it. `store-unreachable` sends every label's
+# store-unreachable run at once and waits for them all; the caller has cut the node off
+# from its store first, and nothing else may run beside them, since the breaker they open
+# sends every job on the node cold. Every
 # phase is a step of its own with an installation token of its own, because a token lasts
 # an hour.
 #
@@ -44,7 +48,7 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,10p' "$0" >&2
+	sed -n '2,11p' "$0" >&2
 	exit 2
 }
 
@@ -198,6 +202,15 @@ writers-apart)
 	done
 	await "${writers[@]}" || exit 1
 	echo "the two-writer runs are done"
+	;;
+store-unreachable)
+	unreachable=()
+	for label in "$@"; do
+		id=$(dispatch matrix-store-unreachable.yml "$label") || exit 1
+		unreachable+=("$id")
+	done
+	await "${unreachable[@]}" || exit 1
+	echo "the store-unreachable runs are done"
 	;;
 *)
 	usage
