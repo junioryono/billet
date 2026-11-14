@@ -14,6 +14,7 @@ shared-uplink
 cache-parity
 ledger-write-budget
 workspace-snapshots
+snapshot-start
 shared-node-queue-wait
 ci-capacity
 job-logs
@@ -50,6 +51,7 @@ docker-builder
 | [The stale rollout that downgraded a control plane](stale-rollout-downgrade.md) | the day a real control plane was moved backwards by its own updater: the three defects that had to line up, what each guard should have said, and what an operator does to a host left that way |
 | [The ledger's write budget](ledger-write-budget.md) | what a renewal, a purchase and a placement cost against the ledger's one writer slot on both engines, on a laptop and then at the target fleet on server hardware with SQLite and a PostgreSQL on its own machine, each on network block storage and on NVMe; why a listener renews its leases in one commit a pass, and how placement stopped growing with the fleet squared |
 | [Workspace snapshots](workspace-snapshots.md) | what Firecracker did when one warm guest was snapshotted and restored many times: millisecond restores, per-fork memory, VMGenID driver binding, differing kernel random samples and duplicated userspace RNG state, MMDS and logging order, clone networking, vsock and the clock across a snapshot, and the memory file under the jailer |
+| [Starting a runner from a snapshot](snapshot-start.md) | real GitHub jobs run from guests booted cold and from forks of a golden captured with its runner waiting for a registration, on the reference node beside production on 2026-11-14: a restored runner holding its registration a median 0.76 s after billet was asked against 6.5 s cold, GitHub starting the job 5 s sooner, the restored VMM holding 310 MiB PSS at that point against 651 MiB, most of it pages of the shared snapshot, and its clock within the report's trip of the host's |
 | [Queue wait on a shared node](shared-node-queue-wait.md) | why an organization's jobs waited up to 55 minutes on 2026-10-16: a node full by memory at 120 of its 180 vCPU, a workload that tripled beside billet's own CI, the admission order and each tier's own backlog at GitHub, and what the cold lint runs and the uplink showed |
 | [CI capacity](ci-capacity.md) | what a pull request's CI reserves on the fleet it shares, what each host-lifecycle group uses measured from its own `/proc`, the move of every group to 2 vCPU and what it frees, and the options for a shorter Go verdict compared on those numbers (#237) |
 | [Job logs](job-logs.md) | what the runner writes for a job's log and when it goes, whether a line is masked before it is written, and what the index measured |
