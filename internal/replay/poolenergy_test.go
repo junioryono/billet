@@ -130,6 +130,29 @@ func TestAPoolHostIsPoweredFromItsJoinToItsRelease(t *testing.T) {
 		t.Errorf("PoolPowered over 1h30 to 6h30 = %+v, want %.4f powered and 2 busy", cut, wantPowered)
 	}
 
+	// A HOST'S LEASES ARE MERGED HOWEVER THEY COME: out of order, touching end to
+	// start, and one enclosing the host's whole powered time.
+	merged := &Report{
+		Pool: &PoolReport{Ordered: []PoolOrderRecord{
+			{Order: "e", Joined: h(1), ReleaseAsked: h(3)},
+			{Order: "f", Joined: h(1), ReleaseAsked: h(2)},
+		}},
+		Records: []Record{
+			// e, out of order and touching: 2h to 2h30, then 1h to 2h, then 1h30 to 1h45.
+			{ChargedFrom: h(2), FinishedAt: h(2.5), VCPU: 4, Node: alloc.PoolNodeName("e")},
+			{ChargedFrom: h(1), FinishedAt: h(2), VCPU: 4, Node: alloc.PoolNodeName("e")},
+			{ChargedFrom: h(1.5), FinishedAt: h(1.75), VCPU: 4, Node: alloc.PoolNodeName("e")},
+			// f, one lease from before its join to after its release.
+			{ChargedFrom: h(0.5), FinishedAt: h(5), VCPU: 4, Node: alloc.PoolNodeName("f")},
+		},
+	}
+	m := merged.PoolPowered(t0, h(10))
+	// e: powered 1h to 3h05, busy 1h to 2h30; f: powered 1h to 2h05, busy all of it.
+	if !near(m.Powered, (2+5.0/60)+(1+5.0/60)) || !near(m.Busy, 1.5+(1+5.0/60)) {
+		t.Errorf("merging a host's leases = %+v, want %.4f powered and %.4f busy", m,
+			(2+5.0/60)+(1+5.0/60), 1.5+(1+5.0/60))
+	}
+
 	if none := (&Report{}).PoolPowered(t0, h(10)); none != (PoolPower{}) {
 		t.Errorf("a report with no pool measured %+v", none)
 	}
@@ -231,7 +254,7 @@ func TestPoolReleaseEnergy(t *testing.T) {
 		"minute; a released host counted powered to its release ask plus %s; an idle host-hour priced at %.1f W.\n\n",
 		jobs, seed, window, maxHosts, lead, PoolClearance, idleWallWatts)
 	fmt.Fprintln(&b, "| Configuration | Hosts joined | Most at once | Powered host-hours | Busy | Idle | "+
-		"Idle energy (kWh) | Saved against always on | Queue wait p50 | p99 |")
+		"Idle energy (kWh) | Idle energy saved against always on | Queue wait p50 | p99 |")
 	fmt.Fprintln(&b, "|---|---|---|---|---|---|---|---|---|---|")
 	fmt.Fprintf(&b, "| %d hosts always on (counterfactual: the never-released pool's peak, its placements) "+
 		"| %d | %d | %.1f | %.1f | %.1f | %.1f | | | |\n",
