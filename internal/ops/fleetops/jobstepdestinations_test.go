@@ -64,7 +64,7 @@ func TestAStepsDestinationsAreTheConnectionsThatOpenedInIt(t *testing.T) {
 	}
 	// A step that opened nothing says so, never nothing at all.
 	if got := stepDestinations(fiveDestinations(), t0.Add(5*time.Minute), t0.Add(6*time.Minute)); got !=
-		"no connection opened in this step" {
+		"no connection opening counted in this step's buckets" {
 		t.Errorf("a quiet step's destinations = %q", got)
 	}
 }
@@ -123,7 +123,7 @@ func TestAStepsDestinationsFromAnIncompleteCaptureAreWhatWasSeen(t *testing.T) {
 	d := fiveDestinations()
 	d.Incomplete = true
 	if got := stepDestinations(d, t0.Add(5*time.Minute), t0.Add(6*time.Minute)); got !=
-		"no connection seen opening in this step, though the job's flows are incomplete, so some may have been missed" {
+		"no connection opening counted in this step's buckets, and the job's flows are incomplete, so some may have been missed" {
 		t.Errorf("a quiet step of an incomplete capture = %q", got)
 	}
 	if got := stepDestinations(d, t0, t0.Add(time.Minute)); !strings.HasPrefix(got,
@@ -173,6 +173,28 @@ func TestAStepsLargestDestinationIsNamedPastAnInt64(t *testing.T) {
 	}
 	if got := stepDestinations(exact, t0, t0.Add(time.Minute)); !strings.HasPrefix(got, "10.0.0.4 (") {
 		t.Errorf("the step's destinations = %q, want 10.0.0.4, one byte larger, first", got)
+	}
+
+	// EXACT PAST 64 BITS: a destination whose openings add up past 2^64 outranks
+	// one whose sum's low word is larger, which a sum kept in 64 bits would lose.
+	wide := &alloc.JobDestinations{OpeningSeconds: 1}
+	for i, addr := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"} {
+		wide.Destinations = append(wide.Destinations, alloc.JobDestination{Addr: addr, SentBytes: most,
+			ReceivedBytes: most, Connections: 3})
+		if i < 3 {
+			// Just under 2^64 in all: the largest low word, and no carry.
+			wide.Openings = append(wide.Openings, alloc.DestinationOpening{Ordinal: i, Start: t0.Unix(),
+				SentBytes: most, ReceivedBytes: most, Connections: 1})
+			continue
+		}
+		// Three openings past 2^64: a carry, and a small low word.
+		for s := range 3 {
+			wide.Openings = append(wide.Openings, alloc.DestinationOpening{Ordinal: i, Start: t0.Unix() + int64(s),
+				SentBytes: most, ReceivedBytes: most / 3, Connections: 1})
+		}
+	}
+	if got := stepDestinations(wide, t0, t0.Add(time.Minute)); !strings.HasPrefix(got, "10.0.0.4 (") {
+		t.Errorf("the step's destinations = %q, want 10.0.0.4, past 2^64, first", got)
 	}
 
 	// THE TRAFFIC BEYOND THE NAMED DESTINATIONS IS SAID APART even when it is the

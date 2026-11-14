@@ -99,13 +99,15 @@ func stepDestinations(d *alloc.JobDestinations, from, to time.Time) string {
 	// that opened none, and what was seen in one is only that.
 	if d.Incomplete {
 		if len(byOrdinal) == 0 {
-			return prefix + "no connection seen opening in this step, though the job's flows are incomplete, " +
-				"so some may have been missed"
+			return prefix + "no connection opening counted in this step's buckets, and the job's flows are " +
+				"incomplete, so some may have been missed"
 		}
 		prefix += "what was seen, since the job's flows are incomplete: "
 	}
+	// NONE COUNTED IS NOT NONE OPENED: a wide bucket that opened before the step
+	// holds a connection that opened inside it, and the clocks differ.
 	if len(byOrdinal) == 0 {
-		return prefix + "no connection opened in this step"
+		return prefix + "no connection opening counted in this step's buckets"
 	}
 
 	// THE TRAFFIC BEYOND THE NAMED DESTINATIONS IS NEVER RANKED AMONG THEM: it is
