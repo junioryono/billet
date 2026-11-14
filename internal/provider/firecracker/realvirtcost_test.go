@@ -30,40 +30,44 @@ import (
 // three write the same lines to one results file, which
 // docs/reference/records/virtualization-cost.md compares.
 //
-// It skips unless BILLET_VIRT_EXPERIMENT_OUT names a results file, on top of
-// everything requireRealHost needs, and it is meant for a drained node: its
-// instances run beside nothing billet placed, on cpus nothing else is pinned to.
+// It skips unless BILLET_VIRT_EXPERIMENT_OUT names a results file, and it is
+// meant for a drained node, as root: its instances run beside nothing billet
+// placed, on cpus nothing else is pinned to.
 //
 // Settings, all from the environment:
 //   - BILLET_VIRT_EXPERIMENT_MODE: container or process.
 //   - BILLET_VIRT_EXPERIMENT_INSTANCES and _VCPU: how many, of how many cpus,
 //     at most 8 of at most 8, so each has a CCD of its own as spread gives.
 //   - BILLET_VIRT_EXPERIMENT_WORKLOAD: gostd or memory.
-//   - BILLET_VIRT_EXPERIMENT_IMAGE: for container, the Docker image to run, one
-//     imported from the golden's own filesystem so the workload's binaries are
-//     the guest's.
+//   - BILLET_VIRT_EXPERIMENT_ROOT: for process, a read-only mount of the golden's
+//     own filesystem, which the instances chroot into.
+//   - BILLET_VIRT_EXPERIMENT_IMAGE: for container, a Docker image imported from
+//     that same filesystem.
 //   - BILLET_VIRT_EXPERIMENT_RUN: a label written on every line.
 //   - BILLET_VIRT_EXPERIMENT_IDLE_WATTS: the package's idle power, so each
 //     instance's share of the energy above it is what the node would attribute.
 //
-// WHAT EACH MODE SHARES WITH THE GUEST: its cpus, the guest's RAM as its memory
-// limit, and its /tmp, where the compile keeps its caches, on a clone of the golden
-// on Ceph as the guest's root is. A process runs the guest's very binaries,
-// chrooted into that clone in a mount namespace of its own; a container runs them
-// from an image of the golden's filesystem. What differs is what is measured: the
-// virtualization.
+// IT TOUCHES NO CEPH. The golden reaches it once, out of band, as a read-only
+// export of the generation's snapshot loop-mounted on the host's own disk
+// (docs/reference/records/virtualization-cost.md), so nothing here maps, locks or
+// removes an RBD image beside the node's own. Each instance's /tmp, where the
+// compile keeps its caches, is a directory of its own on the host's disk; the
+// microVM keeps its root, /tmp included, on Ceph, as billet runs one.
 //
-// HOW AN INSTANCE ENDS, so its counters are read while its cgroup still exists:
-// its body runs, its exit status is written to a file of its own, and a sleep holds
-// the cgroup until the final reading is taken and the instance is stopped. Every
-// clone, mount, unit and container is torn down by a cleanup registered before the
-// step that makes it, which runs whichever way the test ends.
+// HOW AN INSTANCE RUNS, so it is measured from its first instruction to its last
+// while its cgroup exists: it waits for a go file, which is written once the
+// sampler has its baseline; its body runs; its exit status is written to a file of
+// its own; and a sleep holds its cgroup until the final reading is taken. A setup
+// that failed writes a status too, and an instance whose unit or container died
+// without one is a failure reported at once.
 func TestRealVirtualizationCost(t *testing.T) {
 	out := os.Getenv("BILLET_VIRT_EXPERIMENT_OUT")
 	if out == "" {
 		t.Skip("set BILLET_VIRT_EXPERIMENT_OUT to a results file to run the virtualization cost experiment")
 	}
-	env := requireRealHost(t)
+	if os.Geteuid() != 0 {
+		t.Skip("not root: an instance runs as a transient service or a container with set cpus")
+	}
 
 	mode := os.Getenv("BILLET_VIRT_EXPERIMENT_MODE")
 	if mode != "container" && mode != "process" {
@@ -82,8 +86,11 @@ func TestRealVirtualizationCost(t *testing.T) {
 	if strings.Contains(body, "reboot") || strings.Contains(body, "halt") || strings.Contains(body, "poweroff") {
 		t.Fatalf("the %s body would power off the host it runs on", workload)
 	}
-	image := os.Getenv("BILLET_VIRT_EXPERIMENT_IMAGE")
-	if mode == "container" && image == "" {
+	root, image := os.Getenv("BILLET_VIRT_EXPERIMENT_ROOT"), os.Getenv("BILLET_VIRT_EXPERIMENT_IMAGE")
+	switch {
+	case mode == "process" && !readOnlyMount(root):
+		t.Fatalf("BILLET_VIRT_EXPERIMENT_ROOT %q is not a read-only mount", root)
+	case mode == "container" && image == "":
 		t.Fatal("BILLET_VIRT_EXPERIMENT_IMAGE names no image for the container")
 	}
 	idle, err := strconv.ParseFloat(os.Getenv("BILLET_VIRT_EXPERIMENT_IDLE_WATTS"), 64)
@@ -91,9 +98,10 @@ func TestRealVirtualizationCost(t *testing.T) {
 		t.Fatalf("BILLET_VIRT_EXPERIMENT_IDLE_WATTS: %v", err)
 	}
 	memory := config.ByteSize(vcpu) * config.GiB
+	runID := freshLease(t)[:12]
 
-	// THE WHOLE RUN ENDS WELL BEFORE THE TEST DOES, so every cleanup has time to
-	// run before the test binary's own timeout kills it.
+	// THE WHOLE RUN ENDS WELL BEFORE THE TEST DOES: the one cleanup phase below is
+	// bounded at five minutes, and this leaves it ten.
 	deadline := time.Now().Add(45 * time.Minute)
 	if d, ok := t.Deadline(); ok && d.Add(-10*time.Minute).Before(deadline) {
 		deadline = d.Add(-10 * time.Minute)
@@ -109,74 +117,55 @@ func TestRealVirtualizationCost(t *testing.T) {
 	}()
 	t.Cleanup(func() { <-done })
 
-	type instance struct {
-		name, cpus, root, rc string
-		started, exited      time.Time
-		summary              usage.Summary
-		final                bool
-		err                  error
-	}
-	all := make([]*instance, instances)
+	all := make([]*virtInstance, instances)
 	for i := range all {
 		// ONE THREAD OF EACH OF CCD i's FIRST CORES, as spread places a guest of
 		// this shape on an empty host: cpu N's SMT sibling is N+64.
-		name := "virtcost-" + freshLease(t)[:12]
-		all[i] = &instance{name: name, cpus: fmt.Sprintf("%d-%d", 8*i, 8*i+vcpu-1),
-			root: filepath.Join(virtcostRoots, name), rc: filepath.Join(virtcostRoots, name+".rc")}
+		name := "virtcost-" + runID + "-" + strconv.Itoa(i)
+		dir := filepath.Join(virtcostDir, name)
+		all[i] = &virtInstance{name: name, cpus: fmt.Sprintf("%d-%d", 8*i, 8*i+vcpu-1), dir: dir}
 	}
 
-	// EVERY INSTANCE'S ROOT IS A CLONE OF THE GOLDEN, mounted before any starts so
-	// a clone's time is never a run's. The discard and the unmount are registered
-	// before the clone and the mount, so a step that half succeeded is undone too;
-	// cleanups run last first, so the unmount comes before the discard.
+	// ONE CLEANUP FOR EVERY INSTANCE, registered before any is made: stop them all
+	// at once, then remove their directories, each phase bounded, all within the
+	// ten minutes the run leaves.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Minute)
+		defer cancel()
+		var stop sync.WaitGroup
+		errs := make([]error, len(all))
+		for i, in := range all {
+			stop.Add(1)
+			go func() {
+				defer stop.Done()
+				errs[i] = stopInstance(ctx, mode, in.name, runID)
+			}()
+		}
+		stop.Wait()
+		for i, in := range all {
+			if errs[i] != nil {
+				t.Errorf("stop %s: %v; its directory %s is left", in.name, errs[i], in.dir)
+				continue
+			}
+			if err := os.RemoveAll(in.dir); err != nil {
+				t.Errorf("remove %s: %v", in.dir, err)
+			}
+		}
+	})
 	for _, in := range all {
-		t.Cleanup(func() {
-			if err := env.disk.DiscardRoot(cleanupContext(t), in.name); err != nil {
-				t.Errorf("discard %s's clone: %v", in.name, err)
-			}
-		})
-		dev, err := env.disk.CloneRoot(runCtx, env.image, in.name, 0)
-		if err != nil {
-			t.Fatalf("clone the golden for %s: %v", in.name, err)
-		}
-		if err := os.MkdirAll(in.root, 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Join(in.dir, "tmp"), 0o1777); err != nil {
 			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			ctx := cleanupContext(t)
-			if mounted(in.root) {
-				if out, err := exec.CommandContext(ctx, "umount", in.root).CombinedOutput(); err != nil {
-					t.Errorf("unmount %s's clone: %v: %s", in.name, err, out)
-				}
-			}
-			for _, leftover := range []string{in.root, in.rc, in.rc + ".d/rc", in.rc + ".d"} {
-				if err := os.Remove(leftover); err != nil && !errors.Is(err, os.ErrNotExist) {
-					t.Logf("remove %s: %v", leftover, err)
-				}
-			}
-		})
-		if out, err := exec.CommandContext(runCtx, "mount", dev, in.root).CombinedOutput(); err != nil {
-			t.Fatalf("mount %s's clone: %v: %s", in.name, err, out)
 		}
 	}
 
 	hostBusyBefore := hostBusyJiffies(t)
 	started := time.Now()
-
 	var wg sync.WaitGroup
 	for _, in := range all {
-		// THE INSTANCE IS STOPPED BEFORE ITS ROOT IS UNMOUNTED: this cleanup is
-		// registered after the mount's, so it runs first.
-		t.Cleanup(func() {
-			if err := stopInstance(cleanupContext(t), mode, in.name); err != nil {
-				t.Errorf("stop %s: %v", in.name, err)
-			}
-		})
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			in.err = runInstance(runCtx, monitor, mode, image, in.name, in.root, in.rc, in.cpus, memory, vcpu,
-				body, &in.started, &in.exited, &in.summary, &in.final)
+			in.err = in.run(runCtx, monitor, mode, root, image, runID, memory, vcpu, body)
 		}()
 	}
 	wg.Wait()
@@ -193,7 +182,7 @@ func TestRealVirtualizationCost(t *testing.T) {
 		line := map[string]any{
 			"run": os.Getenv("BILLET_VIRT_EXPERIMENT_RUN"), "mode": mode, "placement": "spread",
 			"workload": workload, "vms": instances, "vcpu": vcpu, "guest": i, "cpus": in.cpus,
-			"memory_limit_bytes": int64(memory), "tmp": "golden clone (ext4 on rbd)",
+			"memory_limit_bytes": int64(memory), "tmp": "a directory on the host's disk",
 			"run_started_epoch": started.Unix(), "run_finished_epoch": finished.Unix(),
 			"host_busy_cpu_seconds": hostBusySeconds,
 		}
@@ -234,120 +223,195 @@ func TestRealVirtualizationCost(t *testing.T) {
 		finished.Sub(started).Round(time.Second), filepath.Clean(out))
 }
 
-// virtcostRoots is where an instance's clone of the golden is mounted and its exit
-// status written.
-const virtcostRoots = "/run/billet-virtcost"
+// virtcostDir holds each instance's /tmp, go file and exit status.
+const virtcostDir = "/var/lib/billet-virtcost"
 
-// cleanupContext bounds one cleanup step, apart from the test's own context, which
-// has ended by the time cleanups run.
-func cleanupContext(t *testing.T) context.Context {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Minute)
-	t.Cleanup(cancel)
-
-	return ctx
+// virtInstance is one container or process of the cost experiment.
+type virtInstance struct {
+	name, cpus, dir string
+	started, exited time.Time
+	summary         usage.Summary
+	final           bool
+	err             error
 }
 
-// runInstance starts one instance, measures it from the moment it is running
-// until its body has written its exit status, and takes the final reading while
-// its cgroup still holds it. Started is when the unit or container was running;
-// the guest's equivalent is when Launch returned.
-func runInstance(ctx context.Context, monitor *usage.Monitor, mode, image, name, root, rc, cpus string,
-	memory config.ByteSize, vcpu int, body string, started, exited *time.Time, summary *usage.Summary,
-	final *bool,
+// virtWrapper is what every instance runs: wait for the go file, run the body,
+// write its status, and hold the cgroup. $1 is the body, $2 the go file and $3
+// the status file, as the instance sees them.
+const virtWrapper = `while [ ! -e "$2" ]; do sleep 0.05; done
+bash -c "$1"
+echo $? >"$3.part" && mv "$3.part" "$3"
+exec sleep infinity`
+
+// run starts the instance, opens its go file once the sampler has its baseline,
+// and measures it until its status is written, taking the final reading while
+// its cgroup still holds it.
+func (in *virtInstance) run(ctx context.Context, monitor *usage.Monitor, mode, root, image, runID string,
+	memory config.ByteSize, vcpu int, body string,
 ) error {
-	var dir string
+	goFile, status := filepath.Join(in.dir, "go"), filepath.Join(in.dir, "status")
+	var cgroupDir string
 	switch mode {
 	case "process":
-		// A TRANSIENT SERVICE, so stopping it kills everything in its cgroup, and
-		// a mount namespace of its own, so proc, the devices and /dev/shm go with
-		// it and nothing is mounted on the host's own tree. /tmp is the clone's.
+		// A TRANSIENT SERVICE, so stopping it kills everything in its cgroup, its
+		// wrapper kept through a workload process the OOM killer takes, and a mount
+		// namespace of its own, so proc, the devices, /dev/shm and its /tmp go with
+		// it and nothing is mounted on the host's own tree. A setup that fails
+		// writes its status before it exits.
 		inner := `set -u
-R=$1
-mount -t proc proc "$R/proc" && mount --rbind /dev "$R/dev" && mount -t tmpfs tmpfs "$R/dev/shm" || exit 1
-chroot "$R" /bin/bash -c "$2"
-echo $? >"$3"
-exec sleep infinity`
-		unit := name + ".service"
+R=$1 D=$2
+fail() { echo 125 >"$D/status.part"; mv "$D/status.part" "$D/status"; exit 1; }
+mount -t proc proc "$R/proc" || fail
+mount --rbind /dev "$R/dev" || fail
+mount -t tmpfs tmpfs "$R/dev/shm" || fail
+mount --bind "$D" "$R/mnt" || fail
+mount --bind "$D/tmp" "$R/tmp" || fail
+exec chroot "$R" /bin/bash -c "$3" wrapper "$4" /mnt/go /mnt/status`
+		unit := in.name + ".service"
 		if out, err := exec.CommandContext(ctx, "systemd-run", "--quiet", "--unit="+unit, "--collect",
-			"-p", "AllowedCPUs="+cpus, "-p", fmt.Sprintf("MemoryMax=%d", int64(memory)), "-p", "MemorySwapMax=0",
+			"-p", "AllowedCPUs="+in.cpus, "-p", fmt.Sprintf("MemoryMax=%d", int64(memory)), "-p", "MemorySwapMax=0",
+			"-p", "OOMPolicy=continue",
 			"--", "unshare", "--mount", "--propagation", "private", "--", "/bin/sh", "-c", inner, "sh",
-			root, body, rc).CombinedOutput(); err != nil {
+			root, in.dir, virtWrapper, body).CombinedOutput(); err != nil {
 			return fmt.Errorf("systemd-run: %w: %s", err, out)
 		}
-		*started = time.Now()
 		cgroupRoot, err := cgroup2Mount(defaultProcMountsPath)
 		if err != nil {
 			return err
 		}
-		dir = filepath.Join(cgroupRoot, "system.slice", unit)
+		cgroupDir = filepath.Join(cgroupRoot, "system.slice", unit)
 	default:
+		// CREATED, THEN STARTED: a create that settled has a name and a run label
+		// the cleanup removes by, and a start that failed leaves a container it
+		// finds the same way.
 		mem := strconv.FormatInt(int64(memory), 10)
-		wrapper := `bash -c "$0"; echo $? >/billet-rc/rc; exec sleep infinity`
-		rcDir := rc + ".d"
-		if err := os.MkdirAll(rcDir, 0o700); err != nil {
-			return err
-		}
-		out, err := exec.CommandContext(ctx, "docker", "run", "-d", "--name", name, "--label", "billet-virtcost=1",
-			"--cpuset-cpus", cpus, "--memory", mem, "--memory-swap", mem,
-			"-v", filepath.Join(root, "tmp")+":/tmp", "-v", rcDir+":/billet-rc",
-			image, "/bin/bash", "-c", wrapper, body).CombinedOutput()
+		out, err := exec.CommandContext(ctx, "docker", "create", "--name", in.name,
+			"--label", "billet-virtcost="+runID, "--cpuset-cpus", in.cpus, "--memory", mem, "--memory-swap", mem,
+			"-v", in.dir+":/mnt", "-v", filepath.Join(in.dir, "tmp")+":/tmp",
+			image, "/bin/bash", "-c", virtWrapper, "wrapper", body, "/mnt/go", "/mnt/status").CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("docker run: %w: %s", err, out)
+			return fmt.Errorf("docker create: %w: %s", err, out)
 		}
-		*started = time.Now()
 		id := strings.TrimSpace(string(out))
-		if dir, err = containerCgroup(ctx, name, id); err != nil {
+		if out, err := exec.CommandContext(ctx, "docker", "start", in.name).CombinedOutput(); err != nil {
+			return fmt.Errorf("docker start: %w: %s", err, out)
+		}
+		if cgroupDir, err = containerCgroup(ctx, in.name, id); err != nil {
 			return err
 		}
-		rc = filepath.Join(rcDir, "rc")
 	}
 
-	// THE CGROUP IS THE INSTANCE'S OWN, read back with the limits it was given,
-	// so a lookup that found another cgroup is never measured as this one.
-	if err := cgroupHolds(ctx, dir, cpus, memory); err != nil {
+	// THE CGROUP IS THE INSTANCE'S OWN, read back with the cpus the kernel
+	// applies and the memory it was given, so a lookup that found another cgroup
+	// is never measured as this one.
+	if err := cgroupHolds(ctx, cgroupDir, in.cpus, memory); err != nil {
 		return err
 	}
-	monitor.Start(name, usage.Target{CgroupDir: dir}, vcpu)
-	defer monitor.Forget(name)
+	monitor.Start(in.name, usage.Target{CgroupDir: cgroupDir}, vcpu)
+	defer monitor.Forget(in.name)
+	// THE BASELINE FIRST: the sampler reads the cgroup and the package at Start,
+	// so the workload begins after both and nothing of it falls before them.
+	in.started = time.Now()
+	if err := os.WriteFile(goFile, nil, 0o644); err != nil {
+		return fmt.Errorf("open the go file: %w", err)
+	}
 
 	for {
-		raw, err := os.ReadFile(rc)
-		if err == nil && strings.HasSuffix(string(raw), "\n") {
-			*exited = time.Now()
-			*summary, *final = monitor.Final(name)
+		raw, err := os.ReadFile(status)
+		switch {
+		case err == nil:
+			in.exited = time.Now()
+			in.summary, in.final = monitor.Final(in.name)
 			if code := strings.TrimSpace(string(raw)); code != "0" {
 				return fmt.Errorf("the workload exited %s", code)
 			}
 			return nil
+		case !errors.Is(err, os.ErrNotExist):
+			return fmt.Errorf("read the workload's status: %w", err)
+		}
+		// AN INSTANCE THAT DIED WITHOUT A STATUS is a failure now, not at the
+		// deadline.
+		if alive, err := instanceAlive(ctx, mode, in.name); err != nil || !alive {
+			if _, statErr := os.Stat(status); statErr == nil {
+				continue
+			}
+			return errors.Join(fmt.Errorf("the instance ended without writing a status"), err)
 		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("the workload had not finished by the run's deadline: %w", ctx.Err())
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
 }
 
-// stopInstance stops whatever of an instance is still there, and reports it gone
-// only once nothing of it runs. Stopping one that never started is not an error.
-func stopInstance(ctx context.Context, mode, name string) error {
+// instanceAlive reports whether an instance's unit or container is still running.
+func instanceAlive(ctx context.Context, mode, name string) (bool, error) {
+	if mode == "process" {
+		out, err := exec.CommandContext(ctx, "systemctl", "show", "-p", "ActiveState", "--value",
+			name+".service").Output()
+		if err != nil {
+			return false, fmt.Errorf("systemctl show: %w", err)
+		}
+		return strings.TrimSpace(string(out)) == "active", nil
+	}
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Running}}", name).Output()
+	if err != nil {
+		return false, fmt.Errorf("docker inspect: %w", err)
+	}
+
+	return strings.TrimSpace(string(out)) == "true", nil
+}
+
+// stopInstance stops whatever of an instance is still there and answers nil only
+// on proof nothing of it runs: a service's cgroup gone, or no container left
+// carrying the run's label, read twice a few seconds apart so a create the daemon
+// was still finishing is found by the second read.
+func stopInstance(ctx context.Context, mode, name, runID string) error {
 	if mode == "process" {
 		unit := name + ".service"
 		out, err := exec.CommandContext(ctx, "systemctl", "stop", unit).CombinedOutput()
 		if err != nil && !strings.Contains(string(out), "not loaded") {
 			return fmt.Errorf("systemctl stop: %w: %s", err, out)
 		}
-		state, err := exec.CommandContext(ctx, "systemctl", "show", "-p", "ActiveState", "--value", unit).Output()
-		if err == nil && strings.TrimSpace(string(state)) == "active" {
-			return fmt.Errorf("%s is still active after its stop", unit)
+		cgroupRoot, err := cgroup2Mount(defaultProcMountsPath)
+		if err != nil {
+			return err
 		}
-
-		return nil
+		dir := filepath.Join(cgroupRoot, "system.slice", unit)
+		for {
+			_, err := os.Stat(dir)
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("could not tell whether %s is gone: %w", dir, err)
+			}
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("%s still exists: %w", dir, ctx.Err())
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
 	}
-	out, err := exec.CommandContext(ctx, "docker", "rm", "-f", name).CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "No such container") {
-		return fmt.Errorf("docker rm: %w: %s", err, out)
+	for round := range 2 {
+		out, err := exec.CommandContext(ctx, "docker", "ps", "-aq", "--filter", "label=billet-virtcost="+runID,
+			"--filter", "name=^"+name+"$").Output()
+		if err != nil {
+			return fmt.Errorf("docker ps: %w", err)
+		}
+		for _, id := range strings.Fields(string(out)) {
+			if out, err := exec.CommandContext(ctx, "docker", "rm", "-f", id).CombinedOutput(); err != nil {
+				return fmt.Errorf("docker rm %s: %w: %s", id, err, out)
+			}
+		}
+		if round == 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
 	}
 
 	return nil
@@ -398,15 +462,25 @@ func containerCgroup(ctx context.Context, name, id string) (string, error) {
 }
 
 // cgroupHolds refuses a cgroup that does not confine its instance to exactly the
-// cpus and memory it was given, waiting briefly while it is still being set up.
+// cpus and memory it was given: the cpus the kernel applies (cpuset.cpus.effective),
+// compared as sets, waiting briefly while the cgroup is still being set up.
 func cgroupHolds(ctx context.Context, dir, cpus string, memory config.ByteSize) error {
+	want, err := parseCPUList(cpus)
+	if err != nil {
+		return fmt.Errorf("the instance's cpus %q: %w", cpus, err)
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		gotCPUs, errCPUs := os.ReadFile(filepath.Join(dir, "cpuset.cpus"))
+		gotCPUs, errCPUs := os.ReadFile(filepath.Join(dir, "cpuset.cpus.effective"))
 		gotMem, errMem := os.ReadFile(filepath.Join(dir, "memory.max"))
 		if errCPUs == nil && errMem == nil {
-			if strings.TrimSpace(string(gotCPUs)) != cpus {
-				return fmt.Errorf("%s confines its instance to cpus %q, not %s", dir, gotCPUs, cpus)
+			got, err := parseCPUList(strings.TrimSpace(string(gotCPUs)))
+			if err != nil {
+				return fmt.Errorf("%s's cpus read %q: %w", dir, gotCPUs, err)
+			}
+			if formatCPUList(got) != formatCPUList(want) {
+				return fmt.Errorf("%s confines its instance to cpus %s, not %s", dir, formatCPUList(got),
+					formatCPUList(want))
 			}
 			if strings.TrimSpace(string(gotMem)) != strconv.FormatInt(int64(memory), 10) {
 				return fmt.Errorf("%s limits its instance's memory to %q, not %d", dir, gotMem, int64(memory))
@@ -424,15 +498,20 @@ func cgroupHolds(ctx context.Context, dir, cpus string, memory config.ByteSize) 
 	}
 }
 
-// mounted reports whether dir is a mount point, by its own line in /proc/mounts.
-func mounted(dir string) bool {
+// readOnlyMount reports whether dir is a mount point mounted read-only, by its own
+// line in /proc/mounts.
+func readOnlyMount(dir string) bool {
+	if dir == "" {
+		return false
+	}
 	raw, err := os.ReadFile(defaultProcMountsPath)
 	if err != nil {
-		return true // could not tell: try the unmount, which says if there was none
+		return false
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
-		if fields := strings.Fields(line); len(fields) > 1 && fields[1] == dir {
-			return true
+		fields := strings.Fields(line)
+		if len(fields) > 3 && fields[1] == filepath.Clean(dir) {
+			return slices.Contains(strings.Split(fields[3], ","), "ro")
 		}
 	}
 
