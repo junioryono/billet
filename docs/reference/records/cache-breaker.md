@@ -99,7 +99,7 @@ The acceptance lane's store-unreachable phase ran in run `43590137207` ([aws-acc
 ## What this does not establish
 
 - **An ebs-s3 store that comes back.** The breaker opened on a real ebs-s3 site (above); its probe, probation and close were measured on Ceph only.
-- **A bare host.** Every Ceph timing here is under nested virtualization. The ebs-s3 node was an ordinary EC2 instance launching per-job guests, with no nesting.
+- **A bare host.** Every timing from the 2026-11-05 Ceph rehearsal is under nested virtualization. The ebs-s3 node was an ordinary EC2 instance launching per-job guests, with no nesting.
 - **The metric.** `billet_cache_breaker_open` was not scraped in either run, because neither node had a metrics address. On Ceph the breaker's report reached `billet status` through the ledger.
 - **Warm Docker image stores on Ceph.** The Ceph tier was untrusted, so it published no image store, and every attach was a fresh volume. Sticky disks were warm, and those were clones. The ebs-s3 tiers were trusted, and their image stores had been published before the store was cut off.
 - **One thing seen and not fixed here.** After the OSD leg and a restart, deferred sticky-disk publications verified device paths that by then held other images, a guest's root disk among them, and each failed closed until its window ended: #743.
