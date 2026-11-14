@@ -220,15 +220,20 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 			index: i, arm: arm, jits: jits, leases: leases, snapshot: snapshot, evidence: evidence,
 			goldenMAC: goldenMAC, goldenAddr: goldenAddr, captured: captured, outstanding: outstanding,
 		}, fields)
+		// A TRIAL WHOSE GUEST COULD NOT BE DESTROYED ENDS THE EXPERIMENT, since the
+		// next fork would share its MAC and address, and so does a golden's lease
+		// the bridge's DHCP no longer holds for it. Its warning, with the time by
+		// which the fork must be killed, is reported before anything that could fail.
+		stop := errors.Is(err, errTrialSurvived) || errors.Is(err, errLeaseLost)
+		if stop {
+			t.Errorf("trial %d (%s): %v", i, arm, err)
+		}
 		if err != nil {
 			fields["error"] = err.Error()
 		}
 		line(fields)
-		// A TRIAL WHOSE GUEST COULD NOT BE DESTROYED ENDS THE EXPERIMENT, since the
-		// next fork would share its MAC and address, and so does a golden's lease
-		// the bridge's DHCP no longer holds for it.
-		if errors.Is(err, errTrialSurvived) || errors.Is(err, errLeaseLost) {
-			t.Fatalf("trial %d (%s): %v", i, arm, err)
+		if stop {
+			t.FailNow()
 		}
 		if err != nil {
 			t.Errorf("trial %d (%s): %v", i, arm, err)
@@ -261,10 +266,19 @@ const snapshotStartPlaceholder = "billet-snapshot-start-placeholder"
 // its DHCP lease, as the runner account, which may sudo in the image.
 const snapshotStartRenew = "sudo -n networkctl renew eth0"
 
-// forkLifetime bounds how long a fork can live: five minutes to register, twenty
-// to finish its job, and the restore and teardown around them. A fork is restored
-// only while the golden's lease outlives it, renewed or not.
-const forkLifetime = 30 * time.Minute
+// The budget a fork runs on, from the lease check, all of it before the golden's
+// lease can lapse whether or not the fork's renewal works. trialBudget is the
+// restore, five minutes to register and twenty to finish its job; teardownBudget
+// is its Destroy after that; and a fork that survives both leaves killMargin
+// before the expiry, by which it is to be killed by hand, and operatorBudget for
+// someone to do it. A restore is admitted only while the lease has all four left.
+const (
+	trialBudget    = 26 * time.Minute
+	teardownBudget = 5 * time.Minute
+	operatorBudget = 10 * time.Minute
+	killMargin     = 5 * time.Minute
+	forkLeaseNeed  = trialBudget + teardownBudget + operatorBudget + killMargin
+)
 
 // snapshotStartPort is where a waiter serves its state, inside the guest.
 const snapshotStartPort = 47231
@@ -430,19 +444,26 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	// lapse under it, or the address given to another MAC, would put the fork on an
 	// address a production guest holds. A renewal that fails ends the restores
 	// early instead.
+	checked := time.Now()
+	killBy := checked.Add(forkLeaseNeed - killMargin)
 	if arm == "restore" {
-		left, err := goldenLeaseHolds(leases, goldenMAC, goldenAddr, forkLifetime, time.Now())
+		left, err := goldenLeaseHolds(leases, goldenMAC, goldenAddr, forkLeaseNeed, checked)
 		if err != nil {
 			return fmt.Errorf("%w: %w", errLeaseLost, err)
 		}
 		fields["golden_lease_left_s"] = left.Seconds()
+		// BY THE PROVEN EXPIRY, which is no earlier than the budget assumes.
+		if left < time.Duration(1<<63-1) {
+			killBy = checked.Add(left - killMargin)
+		}
 	}
 
-	// THE TRIAL ENDS WITHIN THE LEASE IT WAS ADMITTED ON, its restore included:
-	// forkLifetime from the check, less five minutes for the teardown, which is
-	// bounded by the check plus forkLifetime itself.
-	leaseDeadline := time.Now().Add(forkLifetime)
-	ctx, cancel := context.WithDeadline(t.Context(), leaseDeadline.Add(-5*time.Minute))
+	// THE TRIAL AND ITS TEARDOWN END WITHIN THEIR BUDGETS FROM THE CHECK, its
+	// restore included, leaving the operator's time and the margin before the
+	// lease can lapse.
+	trialEnds := checked.Add(trialBudget)
+	teardownEnds := trialEnds.Add(teardownBudget)
+	ctx, cancel := context.WithDeadline(t.Context(), trialEnds)
 	defer cancel()
 
 	name := provider.InstanceName(freshLease(t))
@@ -456,7 +477,7 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		if destroyed {
 			return nil
 		}
-		dctx, cancel := context.WithDeadline(context.WithoutCancel(t.Context()), leaseDeadline)
+		dctx, cancel := context.WithDeadline(context.WithoutCancel(t.Context()), teardownEnds)
 		defer cancel()
 		if _, err := p.Destroy(dctx, name); err != nil {
 			return err
@@ -484,8 +505,8 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		err = errors.Join(err, fmt.Errorf("%w: %s (jail %s): %w", errTrialSurvived, name, p.jailFor(name).dir(),
 			derr))
 		if arm == "restore" {
-			err = fmt.Errorf("%w; it may run on the golden's address %s, leased until at least %s: kill its "+
-				"VMM before then", err, goldenAddr, leaseDeadline.Format(time.RFC3339))
+			err = fmt.Errorf("%w; it may run on the golden's address %s: kill its VMM by %s, %s before the "+
+				"golden's lease can lapse", err, goldenAddr, killBy.Format(time.RFC3339), killMargin)
 		}
 	}()
 
