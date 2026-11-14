@@ -845,11 +845,15 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	if err != nil {
 		return fmt.Errorf("the runner: %w", err)
 	}
-	for _, st := range server.reported(key) {
-		if strings.HasPrefix(st.line, "released ") {
-			if n := stepFields(st); len(n) == 1 {
-				fields["released_guest_ms"] = n[0] - asked.UnixMilli()
-			}
+	// THE RELEASED REPORT IS SENT IN THE BACKGROUND and may arrive after finished,
+	// so it is waited for before the guest is destroyed; one that never comes is
+	// recorded as missing, not as nothing.
+	releasedStep, rerr := server.await(ctx, key, "released", 30*time.Second, nil)
+	fields["released_reported"] = rerr == nil
+	if n := stepFields(releasedStep); rerr == nil && len(n) == 1 {
+		fields["released_guest_ms"] = n[0] - asked.UnixMilli()
+		if _, ok := fields["release_seen_after_ms"]; !ok {
+			fields["release_seen_after_ms"] = releasedStep.at.Sub(released).Milliseconds()
 		}
 	}
 	end := stepFields(finished)
@@ -1145,6 +1149,16 @@ func TestTheStartServerTakesOnlyWholeSteps(t *testing.T) {
 	steps := s.reported(key)
 	if len(steps) != 3 || steps[1].line != "registered 1731600000123" || steps[1].at.Before(before) {
 		t.Errorf("the steps kept are %v; want the three, timed on arrival", steps)
+	}
+	// THE FIRST OF A KIND IS KEPT, its time with it: another of the same kind,
+	// with another value, is acknowledged and changes nothing.
+	first := steps[1]
+	time.Sleep(5 * time.Millisecond)
+	if code := post(key, "registered 1731600009999"); code != http.StatusNoContent {
+		t.Errorf("a second registered answered %d; want it acknowledged", code)
+	}
+	if again := s.reported(key); len(again) != 3 || again[1] != first {
+		t.Errorf("a second registered changed the first to %v; want %v kept", again, first)
 	}
 	if n := stepFields(steps[2]); len(n) != 2 || n[0] != 1731600000999 || n[1] != 3 {
 		t.Errorf("the finished step's fields are %v", n)
@@ -1468,10 +1482,12 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 			registered.line, switched.UnixMilli(), registered.at.UnixMilli())
 	}
 	// HELD THERE until its own key is released: with another key released, it asks
-	// for its own and is refused, more than once, and the runner has not run.
+	// for its own and is refused, more than once after that release, and the runner
+	// has not run.
+	polled := server.pollsOf(realKey)
 	server.release(goldenKey)
 	deadline = time.Now().Add(10 * time.Second)
-	for server.pollsOf(realKey) < 3 {
+	for server.pollsOf(realKey) < polled+3 {
 		if time.Now().After(deadline) {
 			t.Fatalf("the waiter asked for its release %d times in 10s", server.pollsOf(realKey))
 		}
