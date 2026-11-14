@@ -103,6 +103,12 @@ func TestRealVirtualizationCost(t *testing.T) {
 	case mode == "container" && image == "":
 		t.Fatal("BILLET_VIRT_EXPERIMENT_IMAGE names no image for the container")
 	}
+	// THE HOST'S OWN MOUNTS: systemd and the Docker daemon resolve the scratch in
+	// PID 1's mount namespace, so a scratch admitted in another namespace would not
+	// be the one they write to.
+	if err := sameMountNamespace("/proc/self/ns/mnt", "/proc/1/ns/mnt"); err != nil {
+		t.Fatal(err)
+	}
 	scratch, scratchDev, err := scratchHolds(os.Getenv("BILLET_VIRT_EXPERIMENT_SCRATCH"), instances,
 		scratchProtected, scratchIsTmpfs)
 	if err != nil {
@@ -331,6 +337,24 @@ func scratchHolds(dir string, instances int, protected []string,
 	return resolved, dev, nil
 }
 
+// sameMountNamespace refuses unless the two namespace links name one namespace.
+func sameMountNamespace(mine, host string) error {
+	a, err := os.Readlink(mine)
+	if err != nil {
+		return fmt.Errorf("could not tell which mount namespace this process is in: %w", err)
+	}
+	b, err := os.Readlink(host)
+	if err != nil {
+		return fmt.Errorf("could not tell which mount namespace PID 1 is in: %w", err)
+	}
+	if a != b {
+		return fmt.Errorf("this process is in mount namespace %s and PID 1 in %s; run it in the host's, "+
+			"where systemd and the Docker daemon see the scratch", a, b)
+	}
+
+	return nil
+}
+
 // tmpfsMagic is tmpfs's filesystem type, as statfs reports it.
 const tmpfsMagic = 0x01021994
 
@@ -459,7 +483,10 @@ exec chroot "$R" /bin/bash -c "$3" wrapper "$4" /mnt/go /mnt/status`
 		out, err := exec.CommandContext(ctx, "docker", "create", "--name", in.name,
 			"--label", "billet-virtcost="+runID, "--read-only", "--log-driver", "none", "--pull=never",
 			"--cpuset-cpus", in.cpus, "--memory", mem, "--memory-swap", mem,
-			"-v", in.dir+":/mnt", "-v", filepath.Join(in.dir, "tmp")+":/tmp",
+			// --mount, not -v: a source the daemon cannot find is refused, never made
+			// on whatever filesystem the daemon sees at that path.
+			"--mount", "type=bind,source="+in.dir+",target=/mnt",
+			"--mount", "type=bind,source="+filepath.Join(in.dir, "tmp")+",target=/tmp",
 			image, "/bin/bash", "-c", virtWrapper, "wrapper", body, "/mnt/go", "/mnt/status").CombinedOutput()
 		if err != nil {
 			in.launchUnsettled = true
@@ -866,6 +893,33 @@ func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
 	if got, _, err := scratchHolds(own, 0, []string{filepath.Join(t.TempDir(), "absent")}, anyBacking); err != nil ||
 		got != own {
 		t.Errorf("a protected path that does not exist refused %s (%q, %v)", own, got, err)
+	}
+}
+
+// THE HARNESS RUNS IN THE HOST'S MOUNT NAMESPACE: two links naming one namespace
+// pass, two naming different ones, or one that cannot be read, are refused.
+func TestTheHarnessRunsInTheHostsMountNamespace(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	link := func(name, target string) string {
+		path := filepath.Join(dir, name)
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+
+		return path
+	}
+	mine, same, other := link("mine", "mnt:[4026531841]"), link("same", "mnt:[4026531841]"),
+		link("other", "mnt:[4026532999]")
+	if err := sameMountNamespace(mine, same); err != nil {
+		t.Errorf("one namespace was refused: %v", err)
+	}
+	if err := sameMountNamespace(mine, other); err == nil {
+		t.Error("two namespaces were taken for one")
+	}
+	if err := sameMountNamespace(mine, filepath.Join(dir, "absent")); err == nil {
+		t.Error("a namespace that could not be read was taken for the host's")
 	}
 }
 
