@@ -88,8 +88,16 @@ func TestAStepsDestinationsSayWhatTheyCannotTell(t *testing.T) {
 		Other:    alloc.JobDestination{SentBytes: 9, ReceivedBytes: 9, Connections: 1},
 		Openings: []alloc.DestinationOpening{{Ordinal: alloc.MaxJobDestinations, Start: t0.Unix(), SentBytes: 9, ReceivedBytes: 9, Connections: 1}}}
 	if got := stepDestinations(wide, t0, t0.Add(time.Minute)); got !=
-		"to within 4s, traffic beyond the named destinations (sent 9 B, received 9 B, 1 connection)" {
+		"to within 4s (each connection counted in the step its 4-second bucket starts in), "+
+			"traffic beyond the named destinations (sent 9 B, received 9 B, 1 connection)" {
 		t.Errorf("a wide split's destinations = %q", got)
+	}
+	// A WIDE SPLIT OF AN INCOMPLETE CAPTURE CLAIMS NO BOUND: its bucket can hold a
+	// connection that opened after the step.
+	wide.Incomplete = true
+	if got := stepDestinations(wide, t0, t0.Add(time.Second)); !strings.Contains(got,
+		"what was seen, since the job's flows are incomplete: traffic beyond") || strings.Contains(got, "at least") {
+		t.Errorf("a wide split of an incomplete capture = %q", got)
 	}
 
 	// Totals at the largest int64 are held there, never wrapped.
@@ -132,12 +140,16 @@ func TestAStepsLargestDestinationIsNamedPastAnInt64(t *testing.T) {
 	for i, addr := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"} {
 		d.Destinations = append(d.Destinations, alloc.JobDestination{Addr: addr, SentBytes: most,
 			ReceivedBytes: most, Connections: 1})
-		// 10.0.0.4, last in the job's order, has the most in this step.
+		// 10.0.0.4, last in the job's order, has the most in this step, over two
+		// openings each as large as the others' one, so its shown totals are
+		// held at the largest int64 as theirs nearly are.
 		received := most / 2
 		if i == 3 {
-			received = most
+			received = 0
+			d.Openings = append(d.Openings, alloc.DestinationOpening{Ordinal: i, Start: t0.Unix(),
+				SentBytes: most, Connections: 1})
 		}
-		d.Openings = append(d.Openings, alloc.DestinationOpening{Ordinal: i, Start: t0.Unix(),
+		d.Openings = append(d.Openings, alloc.DestinationOpening{Ordinal: i, Start: t0.Unix() + 1,
 			SentBytes: most, ReceivedBytes: received, Connections: 1})
 	}
 	if got := stepDestinations(d, t0, t0.Add(time.Minute)); !strings.HasPrefix(got, "10.0.0.4 (") {

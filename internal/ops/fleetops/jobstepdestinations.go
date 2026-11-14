@@ -38,9 +38,13 @@ func stepDestinations(d *alloc.JobDestinations, from, to time.Time) string {
 		return ""
 	}
 
+	// rank is the total's size for ordering, as a float so it holds the sum of
+	// every opening exactly enough to rank, where the shown counts are held at
+	// the largest int64.
 	type total struct {
 		ordinal                     int
 		sent, received, connections int64
+		rank                        float64
 	}
 	byOrdinal := map[int]*total{}
 	for _, o := range d.Openings {
@@ -56,21 +60,31 @@ func stepDestinations(d *alloc.JobDestinations, from, to time.Time) string {
 		t.sent = addCapped(t.sent, o.SentBytes)
 		t.received = addCapped(t.received, o.ReceivedBytes)
 		t.connections = addCapped(t.connections, o.Connections)
+		t.rank += float64(o.SentBytes) + float64(o.ReceivedBytes)
 	}
 
+	// A BUCKET WIDER THAN A SECOND IS PLACED BY ITS START, so a step's figures
+	// are its buckets', which can hold a connection that opened just after the
+	// step: not a bound on the step's own, which the words never claim.
 	prefix := ""
 	if d.OpeningSeconds > 1 {
-		prefix = fmt.Sprintf("to within %ds, ", d.OpeningSeconds)
+		prefix = fmt.Sprintf("to within %ds (each connection counted in the step its %d-second bucket "+
+			"starts in), ", d.OpeningSeconds, d.OpeningSeconds)
 	}
 	// AN INCOMPLETE CAPTURE PROVES NOTHING ABSENT: the job's flows may have been
 	// missed anywhere in its life, so a step where none was seen is not a step
-	// that opened none, and the totals of one where some were are lower bounds.
+	// that opened none. At one second a bucket is the step's, so what was seen is
+	// a lower bound; wider, it is only what was seen.
 	if d.Incomplete {
 		if len(byOrdinal) == 0 {
 			return prefix + "no connection seen opening in this step, though the job's flows are incomplete, " +
 				"so some may have been missed"
 		}
-		prefix += "at least, since the job's flows are incomplete: "
+		if d.OpeningSeconds == 1 {
+			prefix += "at least, since the job's flows are incomplete: "
+		} else {
+			prefix += "what was seen, since the job's flows are incomplete: "
+		}
 	}
 	if len(byOrdinal) == 0 {
 		return prefix + "no connection opened in this step"
@@ -82,11 +96,10 @@ func stepDestinations(d *alloc.JobDestinations, from, to time.Time) string {
 	}
 	// LARGEST FIRST, AND THE ORDER IS TOTAL: equal totals fall back to the
 	// ordinal, which is the job's own largest-first order.
-	// The sum of two counts that are not negative fits a uint64, so totals past
-	// an int64 still rank by their size rather than tying at the cap.
+	// Ranked by every opening's bytes, so totals past an int64 still rank by
+	// their size rather than tying at the cap.
 	slices.SortFunc(all, func(x, y *total) int {
-		return cmp.Or(cmp.Compare(uint64(y.sent)+uint64(y.received), uint64(x.sent)+uint64(x.received)),
-			cmp.Compare(x.ordinal, y.ordinal))
+		return cmp.Or(cmp.Compare(y.rank, x.rank), cmp.Compare(x.ordinal, y.ordinal))
 	})
 
 	name := func(ordinal int) string {

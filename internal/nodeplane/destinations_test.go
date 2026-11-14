@@ -213,7 +213,11 @@ func TestTheLargestUsageReportFitsOneRequest(t *testing.T) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if len(store.usages) != 1 || store.usages[0].usage.Destinations == nil ||
-		len(store.usages[0].usage.Destinations.Destinations) != alloc.MaxJobDestinations {
+		len(store.usages[0].usage.Destinations.Destinations) != alloc.MaxJobDestinations ||
+		len(store.usages[0].usage.Destinations.Openings) != alloc.MaxDestinationOpenings {
 		t.Fatalf("the largest report did not reach the ledger whole: %d report(s)", len(store.usages))
+	}
+	if s := store.usages[0].series; s == nil || len(s.Data) != alloc.MaxUsageSeriesBytes {
+		t.Fatalf("the largest report's series did not reach the ledger whole")
 	}
 }
