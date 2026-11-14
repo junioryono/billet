@@ -1107,9 +1107,16 @@ esac
 `
 	// fakeFlock takes a real lock on the descriptor it names, as flock(1) does, through the
 	// interpreter's flock(2): the lock belongs to the open file it shares with its caller.
+	// Finding it held, it says so in $FAKE/contended before it waits.
 	fakeFlock = `echo "flock $*" >>"$FAKE/calls"
 fd=${3:?}
-python3 -I -c 'import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)' "$fd"
+python3 -I -c 'import fcntl, sys
+fd = int(sys.argv[1])
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    open(sys.argv[2], "w").close()
+    fcntl.flock(fd, fcntl.LOCK_EX)' "$fd" "$FAKE/contended"
 `
 	// Two of us-west-2's S3 ranges and one of its IPv6 ones, beside ranges of another
 	// service, another region, and the same range under the umbrella service.
@@ -1299,42 +1306,60 @@ func TestTheMatrixHostCutsTheNodeOffFromS3AndGivesItBack(t *testing.T) {
 	}
 }
 
+// hostProc is one matrix-host.sh run in the background: done is closed once it has ended,
+// and err and out are read only after that.
+type hostProc struct {
+	done chan struct{}
+	err  error
+	out  strings.Builder
+}
+
+// ended reports whether the run has ended within the time given.
+func (p *hostProc) ended(within time.Duration) bool {
+	select {
+	case <-p.done:
+		return true
+	case <-time.After(within):
+		return false
+	}
+}
+
 // A LIFT WAITS FOR A BLOCK ALREADY ON ITS WAY, as one a cancelled step left running on the
-// host is, and lifts what it installed: the block is held mid-fetch, holding the lock, while
-// the lift records itself and waits; a lift that did not wait would find nothing to lift and
-// leave the block that lands after it. The lock is a real one, taken by the fake through
-// flock(2).
+// host is, and lifts what it installed: the block is held mid-fetch, holding the lock, and
+// the lift records itself and is seen to find the lock held before the block is let go; a
+// lift that did not wait would find nothing to lift and leave the block that lands after
+// it. The lock is a real one, taken by the fake through flock(2).
 func TestTheMatrixHostsLiftWaitsForABlockOnItsWay(t *testing.T) {
 	t.Parallel()
 	f, dir := s3BlockFakes(t)
 	f.fixture(t, "hold", "")
-	start := func(args ...string) (*strings.Builder, chan error) {
+	abs, err := filepath.Abs("acceptance/matrix-host.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := func(args ...string) *hostProc {
 		t.Helper()
-		abs, err := filepath.Abs("acceptance/matrix-host.sh")
-		if err != nil {
-			t.Fatal(err)
-		}
+		p := &hostProc{done: make(chan struct{})}
 		cmd := exec.CommandContext(t.Context(), abs, args...)
 		cmd.Env = []string{"PATH=" + f.path, "HOME=" + t.TempDir(), "FAKE=" + f.dir}
-		var out strings.Builder
-		cmd.Stdout, cmd.Stderr = &out, &out
+		cmd.Stdout, cmd.Stderr = &p.out, &p.out
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
+		go func() {
+			p.err = cmd.Wait()
+			close(p.done)
+		}()
 		t.Cleanup(func() {
 			if err := os.Remove(filepath.Join(f.dir, "hold")); err != nil && !errors.Is(err, os.ErrNotExist) {
 				t.Error(err)
 			}
-			select {
-			case <-done:
-			case <-time.After(20 * time.Second):
+			if !p.ended(20 * time.Second) {
 				t.Errorf("%v did not end", args)
 			}
 		})
 
-		return &out, done
+		return p
 	}
 	waitFor := func(name string) {
 		t.Helper()
@@ -1346,30 +1371,20 @@ func TestTheMatrixHostsLiftWaitsForABlockOnItsWay(t *testing.T) {
 		}
 	}
 
-	blockOut, blocked := start("block-s3", dir, "us-west-2", "3300")
+	block := start("block-s3", dir, "us-west-2", "3300")
 	waitFor(filepath.Join(f.dir, "holding"))
-	liftOut, lifted := start("unblock-s3", dir, "us-west-2")
+	lift := start("unblock-s3", dir, "us-west-2")
 	waitFor(filepath.Join(dir, "s3-unblock-requested"))
-	// THE LIFT MUST STILL BE WAITING while the block holds the lock: one that returned here
-	// lifted nothing, and the block about to land would stay.
-	select {
-	case err := <-lifted:
-		t.Fatalf("the lift returned while a block held the lock (%v):\n%s", err, liftOut.String())
-	case <-time.After(time.Second):
-	}
+	// THE LIFT FOUND THE LOCK HELD, which only a lift that asks for it can.
+	waitFor(filepath.Join(f.dir, "contended"))
 	if err := os.Remove(filepath.Join(f.dir, "hold")); err != nil {
 		t.Fatal(err)
 	}
-	for name, done := range map[string]chan error{"the block": blocked, "the lift": lifted} {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("%s: %v\nblock:\n%s\nlift:\n%s", name, err, blockOut.String(), liftOut.String())
-			}
-			done <- err
-		case <-time.After(20 * time.Second):
-			t.Fatalf("%s did not end", name)
-		}
+	if !block.ended(20*time.Second) || !lift.ended(20*time.Second) {
+		t.Fatal("the block or the lift did not end")
+	}
+	if block.err != nil || lift.err != nil {
+		t.Errorf("block: %v\n%s\nlift: %v\n%s", block.err, block.out.String(), lift.err, lift.out.String())
 	}
 	calls := s3BlockCalls(t, f)
 	installed := callIndex(calls, "nft -f ")
