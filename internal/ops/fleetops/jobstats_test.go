@@ -473,7 +473,7 @@ func TestJobStatsNeverPrintsAFigureItDidNotMeasureAsZero(t *testing.T) {
 	}
 	first := decoded.Groups[0].Current
 	if first.CostUSD == nil || *first.CostUSD != 2 || first.VCPUHours == nil || *first.VCPUHours != 20 ||
-		len(first.Energy) != 3 || first.Energy[1].ActiveJoules != 5 {
+		len(first.Energy) != 3 || first.Energy[1].ActiveJoules != "5" {
 		t.Errorf("the measured group = %+v", decoded.Groups[0])
 	}
 }

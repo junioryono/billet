@@ -86,7 +86,7 @@ func TestJobStatsEstimatesOnlyABoughtShapeNoHostMeasured(t *testing.T) {
 	if cur.EnergyUnmeasured != 4 || len(cur.Energy) != 2 {
 		t.Fatalf("the JSON = %+v, want two sources and 4 jobs not measured", cur)
 	}
-	if e := cur.Energy[0]; e.Source != cloudenergy.Source || e.ActiveJoules != 5088 || e.IdleJoules != nil ||
+	if e := cur.Energy[0]; e.Source != cloudenergy.Source || e.ActiveJoules != "5088" || e.IdleJoules != nil ||
 		e.IdleIncluded == nil || !*e.IdleIncluded || e.Jobs != 2 || e.Saturated {
 		t.Errorf("the estimate in JSON = %+v, want 5,088 J over 2 jobs with idle inside it and no idle figure", e)
 	}
@@ -121,8 +121,27 @@ func TestAnEnergyTotalPastAnInt64IsALowerBound(t *testing.T) {
 			t.Errorf("joulesAtMost(%d) = %q, want %q", tc.microjoules, got, tc.want)
 		}
 	}
-	if j := statsFiguresJSONOf(f); !j.Energy[0].Saturated {
-		t.Errorf("the JSON = %+v, want saturated", j.Energy[0])
+	if j := statsFiguresJSONOf(f); !j.Energy[0].Saturated || j.Energy[0].ActiveJoules != "9223372036854.775807" {
+		t.Errorf("the JSON = %+v, want saturated at exactly the largest int64 of microjoules", j.Energy[0])
+	}
+
+	// BOTH FIGURES ARE EXACT, so neither is claimed past what was counted,
+	// whichever of them saturated: here the active one did, and the idle one sits
+	// a thousand microjoules below the largest int64.
+	r := &statsEnergy{Source: alloc.EnergyRAPL}
+	r.add(math.MaxInt64, math.MaxInt64-1000)
+	r.add(1, 0)
+	rj := statsFiguresJSONOf(&statsFigures{Energy: []statsEnergy{*r}}).Energy[0]
+	if rj.ActiveJoules != "9223372036854.775807" || rj.IdleJoules == nil || *rj.IdleJoules != "9223372036854.774807" {
+		t.Errorf("the JSON = active %s, idle %v; want each exactly what was counted", rj.ActiveJoules, rj.IdleJoules)
+	}
+	for _, tc := range []struct {
+		microjoules int64
+		want        json.Number
+	}{{0, "0"}, {1, "0.000001"}, {8480, "0.00848"}, {5_088_000_000, "5088"}, {1_500_000, "1.5"}} {
+		if got := joulesNumber(tc.microjoules); got != tc.want {
+			t.Errorf("joulesNumber(%d) = %s, want %s", tc.microjoules, got, tc.want)
+		}
 	}
 }
 
@@ -259,7 +278,7 @@ func TestASmallEstimateIsNeverZeroInAnyReport(t *testing.T) {
 	if !strings.Contains(out.String(), "estimate: "+small+" (") {
 		t.Errorf("the stats page does not say %s", small)
 	}
-	if e := statsFiguresJSONOf(&report.Groups[0].Current).Energy; len(e) != 1 || e[0].ActiveJoules != 0.00848 {
+	if e := statsFiguresJSONOf(&report.Groups[0].Current).Energy; len(e) != 1 || e[0].ActiveJoules != "0.00848" {
 		t.Errorf("the stats JSON = %+v, want 0.00848 J", e)
 	}
 

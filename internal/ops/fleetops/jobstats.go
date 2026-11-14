@@ -952,12 +952,16 @@ type statsDurations struct {
 // statsEnergyJSON is one source's energy. IdleJoules is null for a source that does
 // not split idle out, and IdleIncluded says whether the active figure has the idle in
 // it, null for a source this binary does not know.
+//
+// THE JOULES ARE EXACT DECIMALS of the microjoules counted, never a float's nearest:
+// a total held at the largest int64 is a lower bound, and a float could round it up
+// past what was counted.
 type statsEnergyJSON struct {
-	Source       string   `json:"source"`
-	ActiveJoules float64  `json:"active_joules"`
-	IdleJoules   *float64 `json:"idle_joules"`
-	IdleIncluded *bool    `json:"idle_included"`
-	Jobs         int      `json:"jobs"`
+	Source       string       `json:"source"`
+	ActiveJoules json.Number  `json:"active_joules"`
+	IdleJoules   *json.Number `json:"idle_joules"`
+	IdleIncluded *bool        `json:"idle_included"`
+	Jobs         int          `json:"jobs"`
 	// Saturated says a total reached the largest int64 and was held there, so
 	// each figure is a lower bound.
 	Saturated bool `json:"saturated,omitempty"`
@@ -980,13 +984,24 @@ func idleIncluded(source string) *bool {
 }
 
 // idleJoules is a source's idle energy, nil for one that reports none of its own.
-func idleJoules(e *statsEnergy) *float64 {
+func idleJoules(e *statsEnergy) *json.Number {
 	if !energySplit(e.Source) {
 		return nil
 	}
-	idle := float64(e.IdleMicrojoules) / 1e6
+	idle := joulesNumber(e.IdleMicrojoules)
 
 	return &idle
+}
+
+// joulesNumber is microjoules as an exact decimal count of joules, its trailing
+// zeros trimmed: 5088000000 is 5088, 8480 is 0.00848. A count is never negative.
+func joulesNumber(microjoules int64) json.Number {
+	whole, frac := microjoules/1_000_000, microjoules%1_000_000
+	if frac == 0 {
+		return json.Number(strconv.FormatInt(whole, 10))
+	}
+
+	return json.Number(strings.TrimRight(fmt.Sprintf("%d.%06d", whole, frac), "0"))
 }
 
 // rateOf is part over whole, null when whole is zero.
@@ -1033,7 +1048,7 @@ func statsFiguresJSONOf(f *statsFigures) statsFiguresJSON {
 	for i := range f.Energy {
 		e := &f.Energy[i]
 		out.Energy = append(out.Energy, statsEnergyJSON{Source: e.Source,
-			ActiveJoules: float64(e.ActiveMicrojoules) / 1e6, IdleJoules: idleJoules(e),
+			ActiveJoules: joulesNumber(e.ActiveMicrojoules), IdleJoules: idleJoules(e),
 			IdleIncluded: idleIncluded(e.Source),
 			Jobs:         e.Jobs, Saturated: e.Saturated})
 	}
