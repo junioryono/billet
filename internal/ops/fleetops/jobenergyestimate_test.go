@@ -239,6 +239,10 @@ func TestJobsShowEstimatesOnlyABoughtShapeNoHostMeasured(t *testing.T) {
 		if got := strings.Contains(page.String(), html.EscapeString(estimated)); got != tc.want {
 			t.Errorf("%s: the page estimates %v, want %v", tc.name, got, tc.want)
 		}
+		// A PAGE WITH NO REPORT HAS NO COUNTERS TO HEAD, estimate or not.
+		if tc.measured == nil && strings.Contains(page.String(), "Hardware counters") {
+			t.Errorf("%s: the page heads hardware counters it has none of", tc.name)
+		}
 	}
 }
 
