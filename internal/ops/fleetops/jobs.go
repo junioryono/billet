@@ -351,6 +351,10 @@ type jobJSON struct {
 	// were deleted past the deployment's retention, empty while they are kept.
 	DetailRetiredAt string     `json:"detail_retired_at"`
 	Usage           *usageJSON `json:"usage"`
+	// EnergyEstimate is the energy cloudenergy's model gives a job on a bought
+	// shape that no host measured, null for every other job. It is never a
+	// measurement and never part of Usage.
+	EnergyEstimate *energyEstimateJSON `json:"energy_estimate"`
 	// Prediction is what a controller refreshing hourly would have predicted
 	// the job's runtime to be when it started, beside the runtime and the
 	// error once it finished; null for a job that never started.
@@ -445,6 +449,7 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 			Npm: string(rec.Caches.Npm),
 		},
 	}
+	out.EnergyEstimate = energyEstimateJSONOf(recordEnergyEstimate(rec, u))
 	out.EgressUnreadable = network.unreadable
 	if r := network.row; r != nil {
 		out.Egress = &egressJSON{Node: r.Node, RecordedAt: r.RecordedAt, JobEgress: r.JobEgress}
@@ -523,10 +528,16 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, names m
 		// NOT A REASON: a job still running has no report either, since the node
 		// sends one as its compute is destroyed.
 		line("usage", "%s", noUsageReport)
+		if e, ok := recordEnergyEstimate(rec, nil); ok {
+			line("energy", "%s", estimateText(e))
+		}
 		return
 	}
 	line("usage", "%s", measuredBy(u))
 	renderUsageGroups(line, u)
+	if e, ok := recordEnergyEstimate(rec, u); ok {
+		line("estimated", "%s", estimateText(e))
+	}
 	renderCounters(line, u.Counters)
 	if u.Destinations == nil && rec.DetailRetiredAt != "" {
 		fmt.Fprintln(w)
