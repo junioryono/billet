@@ -423,9 +423,11 @@ type startStep struct {
 //
 // ANY GUEST ON THE BRIDGE CAN REACH IT, so it holds only what the experiment asked
 // it to: a key is taken only while enrolled (the golden's, then one trial's at a
-// time), each keeps at most maxStartSteps steps and one `waiting`, a step is one
-// of the four the waiter sends, whole, and a retired key is forgotten. Connections
-// are capped and every read and write bounded.
+// time), a step is one of the four the waiter sends, whole, and a key keeps one of
+// each, the first to arrive, so a retried report is acknowledged and changes
+// nothing; a retired key is forgotten. Each peer may hold peerConnections
+// connections and all of them together totalConnections, so one guest cannot
+// starve another, and every read and write is bounded.
 type startServer struct {
 	mu       sync.Mutex
 	enrolled map[string]bool
@@ -438,9 +440,62 @@ type startServer struct {
 	done     chan struct{}
 }
 
-// maxStartSteps bounds the steps one key keeps: a waiter sends four, and a
-// retried report may send one twice.
-const maxStartSteps = 8
+// How many connections the listener holds, from one peer and in all.
+const (
+	peerConnections  = 4
+	totalConnections = 64
+)
+
+// peerLimited is a listener that closes, as it accepts it, a connection from a
+// peer already holding peerConnections, and holds at most totalConnections.
+type peerLimited struct {
+	net.Listener
+	mu    sync.Mutex
+	peers map[string]int
+}
+
+func (l *peerLimited) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		host, _, err := net.SplitHostPort(c.RemoteAddr().String())
+		if err != nil {
+			host = c.RemoteAddr().String()
+		}
+		l.mu.Lock()
+		if l.peers[host] >= peerConnections {
+			l.mu.Unlock()
+			_ = c.Close() // a peer over its share is refused; nothing to tell it
+			continue
+		}
+		l.peers[host]++
+		l.mu.Unlock()
+
+		return &peerConn{Conn: c, release: func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			l.peers[host]--
+			if l.peers[host] == 0 {
+				delete(l.peers, host)
+			}
+		}}, nil
+	}
+}
+
+// peerConn gives its peer's share back once, when it is closed.
+type peerConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *peerConn) Close() error {
+	c.once.Do(c.release)
+
+	return c.Conn.Close()
+}
 
 var (
 	startKey  = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -489,7 +544,8 @@ func listenForGuests(ctx context.Context, addr string) (*startServer, error) {
 		WriteTimeout: 5 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 4 << 10}
 	go func() {
 		defer close(s.done)
-		_ = s.http.Serve(netutil.LimitListener(listener, 32)) //nolint:errcheck // ErrServerClosed at close
+		_ = s.http.Serve(&peerLimited{Listener: netutil.LimitListener(listener, totalConnections), //nolint:errcheck // ErrServerClosed at close
+			peers: map[string]int{}})
 	}()
 
 	return s, nil
@@ -519,9 +575,11 @@ func (s *startServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		at := time.Now()
 		s.mu.Lock()
-		taken := s.enrolled[key] && len(s.steps[key]) < maxStartSteps &&
-			!(string(body) == "waiting" && slices.ContainsFunc(s.steps[key],
-				func(st startStep) bool { return st.line == "waiting" }))
+		word, _, _ := strings.Cut(string(body), " ")
+		taken := s.enrolled[key] && !slices.ContainsFunc(s.steps[key], func(st startStep) bool {
+			first, _, _ := strings.Cut(st.line, " ")
+			return first == word
+		})
 		if taken {
 			s.steps[key] = append(s.steps[key], startStep{line: string(body), at: at})
 		}
@@ -1107,27 +1165,29 @@ func TestTheStartServerTakesOnlyWholeSteps(t *testing.T) {
 		t.Errorf("one key's steps reached another's")
 	}
 
-	// A KEY NOT ENROLLED KEEPS NOTHING, a key keeps one waiting and at most
-	// maxStartSteps, and a retired key is forgotten and cannot be enrolled again.
+	// A KEY NOT ENROLLED KEEPS NOTHING, a key keeps one step of each kind, the
+	// first, however often it is retried, so the later kinds still have their
+	// place, and a retired key is forgotten and cannot be enrolled again.
 	stranger := registrationID("never enrolled")
 	post(stranger, "waiting")
 	if n := len(s.reported(stranger)); n != 0 {
 		t.Errorf("a key never enrolled kept %d steps", n)
 	}
-	for range 3 {
+	for range 20 {
 		post(other, "waiting")
+		post(other, "registered 2")
 	}
-	for range 2 * maxStartSteps {
-		post(other, "registered 1")
-	}
-	waits := 0
-	for _, st := range s.reported(other) {
-		if st.line == "waiting" {
-			waits++
+	for _, body := range []string{"released 3", "finished 4 0"} {
+		if code := post(other, body); code != http.StatusNoContent {
+			t.Errorf("the step %q after a flood answered %d", body, code)
 		}
 	}
-	if n := len(s.reported(other)); n != maxStartSteps || waits != 1 {
-		t.Errorf("a flooded key kept %d steps, %d of them waiting; want %d and one", n, waits, maxStartSteps)
+	var lines []string
+	for _, st := range s.reported(other) {
+		lines = append(lines, st.line)
+	}
+	if !slices.Equal(lines, []string{"waiting", "registered 2", "released 3", "finished 4 0"}) {
+		t.Errorf("a flooded key kept %v; want the first of each kind", lines)
 	}
 	s.retire(key)
 	if len(s.reported(key)) != 0 || get(key) != "" {
@@ -1135,6 +1195,77 @@ func TestTheStartServerTakesOnlyWholeSteps(t *testing.T) {
 	}
 	if err := s.enroll(key); err == nil {
 		t.Error("a key enrolled before was enrolled again")
+	}
+}
+
+// ONE PEER CANNOT HOLD THE LISTENER: a peer past its share has its next connection
+// closed as it is accepted, and gets its share back as it closes one.
+func TestOnePeerCannotHoldTheListener(t *testing.T) {
+	t.Parallel()
+
+	var lc net.ListenConfig
+	inner, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &peerLimited{Listener: inner, peers: map[string]int{}}
+	t.Cleanup(func() { _ = l.Close() }) // the test's own listener
+
+	accepted := make(chan net.Conn, 2*peerConnections)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+	var d net.Dialer
+	dial := func() net.Conn {
+		t.Helper()
+		c, err := d.DialContext(t.Context(), "tcp", inner.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() }) // the test's own connection
+
+		return c
+	}
+	var held []net.Conn
+	for range peerConnections {
+		dial()
+		select {
+		case c := <-accepted:
+			held = append(held, c)
+		case <-time.After(5 * time.Second):
+			t.Fatal("a connection within the peer's share was not accepted")
+		}
+	}
+	over := dial()
+	if err := over.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := over.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("a connection past the peer's share read %v; want it closed", err)
+	}
+	select {
+	case <-accepted:
+		t.Error("a connection past the peer's share was handed on")
+	default:
+	}
+	if err := held[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	dial()
+	select {
+	case c := <-accepted:
+		t.Cleanup(func() { _ = c.Close() }) // the accepted end
+	case <-time.After(5 * time.Second):
+		t.Error("a peer that closed a connection did not get its share back")
+	}
+	for _, c := range held[1:] {
+		_ = c.Close() // the accepted ends
 	}
 }
 
@@ -1358,13 +1489,12 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	if n := stepFields(finished); len(n) != 2 || n[1] != 3 {
 		t.Errorf("the waiter reported %q; want the runner's status 3", finished.line)
 	}
-	var words []string
-	for _, st := range server.reported(realKey) {
-		first, _, _ := strings.Cut(st.line, " ")
-		words = append(words, first)
+	// RELEASED IS REPORTED IN THE BACKGROUND, so it may arrive after finished.
+	if _, err := server.await(t.Context(), realKey, "released", 30*time.Second, nil); err != nil {
+		t.Errorf("the waiter never reported released: %v", err)
 	}
-	if !slices.Equal(words, []string{"registered", "released", "finished"}) {
-		t.Errorf("the waiter reported %v under its registration; want registered, released, finished", words)
+	if n := len(server.reported(realKey)); n != 3 {
+		t.Errorf("the waiter reported %d steps under its registration; want registered, released, finished", n)
 	}
 	if got, err := os.ReadFile(seen); err != nil || string(got) != "a-real-registration" {
 		t.Errorf("the runner was given %q (%v); want the real registration", got, err)
