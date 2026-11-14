@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	gotoken "go/token"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -58,6 +62,37 @@ func TestAStickyDiskWhoseDetachLostWritesIsNeverPublished(t *testing.T) {
 	if storage.snapshots != 0 || storage.published != 0 {
 		t.Errorf("a volume whose writes were lost was snapshotted %d time(s) and published %d",
 			storage.snapshots, storage.published)
+	}
+}
+
+// A DISCARD THAT HEARD OF LOST WRITES AND THEN FAILED LEAVES A DISK NOTHING PUBLISHES.
+// The detach is told once; the discard after it can fail and leave the disk in its
+// slot, and a commit then would detach it again, be told nothing, and publish it.
+func TestADiscardThatFailedAfterLostWritesLeavesNothingToPublish(t *testing.T) {
+	t.Parallel()
+
+	service, storage, token := testCacheService(t, provider.TrustTrusted)
+	attacher, ok := service.attacher.(*fakeVolumeAttacher)
+	if !ok {
+		t.Fatalf("the service's attacher is %T", service.attacher)
+	}
+	attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
+	})
+	if attached.Code != http.StatusCreated {
+		t.Fatalf("attach status = %d", attached.Code)
+	}
+
+	attacher.detachErr = fmt.Errorf("detached: %w", provider.ErrWritesLost)
+	storage.discardFailures = 1
+	cacheRequest(t, service, token, "/v1/volumes/0/discard", nil)
+
+	attacher.detachErr = nil
+	committed := cacheRequest(t, service, token, "/v1/volumes/0/commit", nil)
+	if !bytes.Contains(committed.Body.Bytes(), []byte(`"published":false`)) || storage.snapshots != 0 ||
+		storage.published != 0 {
+		t.Errorf("after a failed discard of a disk that lost writes, a commit answered %s, snapshotted %d "+
+			"and published %d", committed.Body.String(), storage.snapshots, storage.published)
 	}
 }
 
@@ -345,6 +380,91 @@ func TestTheFunnelRefusesAVolumeWhoseWritesWereLost(t *testing.T) {
 	if storage.snapshots != 0 || storage.published != 0 || len(storage.released) != 1 {
 		t.Errorf("a marked volume was snapshotted %d time(s) and published %d, and %d writer(s) went back; "+
 			"want none, none and its one", storage.snapshots, storage.published, len(storage.released))
+	}
+}
+
+// THE MARK OUTLIVES THE PROCESS THAT HEARD IT: a commit's lost writes are in the
+// session's record, and a node started on it refuses the disk too.
+func TestLostWritesAreRecordedForTheNextProcess(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	storage := &fakeCacheStore{}
+	service, token, instance := scopedServiceIn(t, dir, provider.TrustTrusted, defaultBranchCache(), storage)
+	attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "npm", "size_bytes": int64(10 << 30), "architecture": "amd64",
+	})
+	if attached.Code != http.StatusCreated {
+		t.Fatalf("attach status = %d", attached.Code)
+	}
+	attacher, ok := service.attacher.(*fakeVolumeAttacher)
+	if !ok {
+		t.Fatalf("the service's attacher is %T", service.attacher)
+	}
+	attacher.detachErr = fmt.Errorf("detached: %w", provider.ErrWritesLost)
+	cacheRequest(t, service, token, "/v1/volumes/0/commit", nil)
+
+	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", dir,
+		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	session := restarted.sessionOf(instance)
+	if session == nil {
+		t.Fatal("the restarted node did not recover the session")
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if attachment := session.slots[0]; attachment == nil || !attachment.WritesLost {
+		t.Fatalf("the recovered attachment %+v does not carry its lost writes", attachment)
+	}
+}
+
+// EVERY WRITABLE MOUNT ABORTS ITS JOURNAL ON LOST DATA, so nothing committed names
+// data that never landed, and a restart, whose new mount has heard of no failure,
+// finds such a file absent rather than wrong. A read-only mount writes nothing.
+func TestEveryWritableMountAbortsOnLostData(t *testing.T) {
+	t.Parallel()
+
+	if !slices.Contains(strings.Split(writableMountOptions, ","), "data_err=abort") {
+		t.Fatalf("writableMountOptions %q does not abort the journal on lost data", writableMountOptions)
+	}
+
+	file, err := parser.ParseFile(gotoken.NewFileSet(), "actions_volume.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse actions_volume.go: %v", err)
+	}
+	used := map[string]string{}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || !slices.Contains([]string{"MountNew", "MountWritable", "MountReadOnly"}, fn.Name.Name) {
+			continue
+		}
+		ast.Inspect(fn, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) != 4 {
+				return true
+			}
+			if name, named := call.Fun.(*ast.Ident); !named || name.Name != "mountActionsVolume" {
+				return true
+			}
+			switch options := call.Args[3].(type) {
+			case *ast.Ident:
+				used[fn.Name.Name] = options.Name
+			case *ast.BasicLit:
+				used[fn.Name.Name] = options.Value
+			}
+
+			return true
+		})
+	}
+	for _, mount := range []string{"MountNew", "MountWritable"} {
+		if used[mount] != "writableMountOptions" {
+			t.Errorf("%s mounts with %q, want writableMountOptions", mount, used[mount])
+		}
+	}
+	if strings.Contains(used["MountReadOnly"], "data_err") {
+		t.Errorf("MountReadOnly mounts with %s, which only a filesystem written to needs", used["MountReadOnly"])
 	}
 }
 

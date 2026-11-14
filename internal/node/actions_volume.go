@@ -50,12 +50,27 @@ func (hostActionsVolumeManager) MountNew(ctx context.Context, device, target str
 		return fmt.Errorf("node: format Actions cache volume: %w: %s", err, boundedOutput(output))
 	}
 
-	return mountActionsVolume(ctx, device, target, "noatime,nodev,nosuid,noexec")
+	return mountActionsVolume(ctx, device, target, writableMountOptions)
 }
 
 func (hostActionsVolumeManager) MountWritable(ctx context.Context, device, target string) error {
-	return mountActionsVolume(ctx, device, target, "noatime,nodev,nosuid,noexec")
+	return mountActionsVolume(ctx, device, target, writableMountOptions)
 }
+
+// writableMountOptions mount a volume the node writes.
+//
+// DATA THAT NEVER LANDED IS NEVER NAMED. Every device billet maps fails an OSD
+// request after osd_request_timeout, and ext4's default (data_err=ignore) only logs
+// a failed write of a file's data in ordered mode, so the journal can still commit
+// a name for data that is not there; a restart, whose new mount has heard of no
+// failure, would then publish it. data_err=abort aborts the journal instead, so the
+// filesystem goes read-only (later writes fail, and SyncWrites reports it) and
+// nothing committed names lost data. Measured 2026-11-13 on kernel 7.0 with the only
+// OSD stopped: a file written during the outage was absent after the OSD returned
+// and the volume was mounted again, the one written before it intact, e2fsck
+// clean. A total outage aborts the journal either way, since its commit fails too;
+// the option is for a partial one, where data and journal sit on different OSDs.
+const writableMountOptions = "noatime,nodev,nosuid,noexec,data_err=abort"
 
 func (hostActionsVolumeManager) MountReadOnly(ctx context.Context, device, target string) error {
 	return mountActionsVolume(ctx, device, target, "ro,noload,nodev,nosuid,noexec")

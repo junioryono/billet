@@ -25,19 +25,23 @@ func writesLost(err error) bool {
 	return errors.Is(err, storecontract.ErrWritesLost) || errors.Is(err, provider.ErrWritesLost)
 }
 
-// noteWritesLost marks a volume whose writes were lost, through mark, and records
-// the session: the answer is errWritesLost with what reported it, and with the
-// record's failure if it could not be made, which is also logged. The mark is set
-// first, so a failed record still refuses every publication this process tries.
-func (s *CacheService) noteWritesLost(session *cacheSession, mark *bool, what string, err error) error {
+// markWritesLost marks a volume whose writes were lost, through mark, and records
+// the session. The mark is set first, so a record that could not be made, which is
+// logged, still leaves every publication this process tries refused; it is made
+// even where the volume is being discarded, since a discard can fail and leave it.
+func (s *CacheService) markWritesLost(session *cacheSession, mark *bool, what string, err error) {
 	*mark = true
 	s.log.Warn("writes to a cache volume never reached its storage; it is discarded, never published",
 		"instance", session.instance, "volume", what, "error", err)
-	persistErr := s.persistSession(session)
-	if persistErr != nil {
+	if persistErr := s.persistSession(session); persistErr != nil {
 		s.log.Warn("could not record a cache volume's lost writes; this process still refuses to publish it",
 			"instance", session.instance, "volume", what, "error", persistErr)
 	}
+}
 
-	return errors.Join(fmt.Errorf("%w: %w", errWritesLost, err), persistErr)
+// noteWritesLost is markWritesLost answering errWritesLost with what reported it.
+func (s *CacheService) noteWritesLost(session *cacheSession, mark *bool, what string, err error) error {
+	s.markWritesLost(session, mark, what, err)
+
+	return fmt.Errorf("%w: %w", errWritesLost, err)
 }

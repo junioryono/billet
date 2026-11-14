@@ -66,8 +66,10 @@ type fakeVMM struct {
 	// a VMM that has been taken over could do to its own files.
 	root     string
 	onCreate func(root string)
-	// onPatch runs as each PATCH is answered, holding mu.
-	onPatch func()
+	// onPatch runs as each PATCH is answered, holding mu, and failDrivePatches is how
+	// many PATCHes of a drive still to come fail.
+	onPatch          func()
+	failDrivePatches int
 	// vcpus and memMiB are the guest shape it reports, as a loaded snapshot set it.
 	vcpus  int
 	memMiB int64
@@ -169,6 +171,12 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	v.puts = append(v.puts, recordedPut{method: r.Method, path: r.URL.Path, body: body})
 	if r.Method == http.MethodPatch && v.onPatch != nil {
 		v.onPatch()
+	}
+	if r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/drives/") && v.failDrivePatches > 0 {
+		v.failDrivePatches--
+		http.Error(w, `{"fault_message":"the drive is busy"}`, http.StatusBadRequest)
+
+		return
 	}
 
 	// THE RUN STATE A REAL VMM KEEPS, measured on v1.16.1: a paused load reports

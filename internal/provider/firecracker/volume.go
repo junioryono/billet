@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -92,14 +93,21 @@ func (p *Provider) DetachVolume(
 			slot, instanceID, lost)
 	}
 
+	// A DETACH THAT FAILED SAYS ONLY THAT IT FAILED: ErrWritesLost is the promise that
+	// the volume is detached, so lost writes heard before a failure are kept for the
+	// next detach of the device to be told (flushBefore).
 	if err := p.replaceVolumePath(j, res, slot, ""); err != nil {
-		return errors.Join(err, lost)
+		p.keepLoss(device, lost)
+
+		return err
 	}
 
 	id := provider.VolumeSlotID(slot)
 	if err := p.apiAs(j.socket(), res.UID).withTimeout(callerTime(ctx)).patch(ctx, "/drives/"+id,
 		map[string]string{"drive_id": id, "path_on_host": "/" + id}); err != nil {
-		return errors.Join(fmt.Errorf("firecracker: detach cache slot %d from %s: %w", slot, instanceID, err), lost)
+		p.keepLoss(device, lost)
+
+		return fmt.Errorf("firecracker: detach cache slot %d from %s: %w", slot, instanceID, err)
 	}
 	if lost != nil {
 		return fmt.Errorf("firecracker: cache slot %d of %s is detached: %w", slot, instanceID, lost)
@@ -127,6 +135,14 @@ func (p *Provider) DetachVolume(
 //
 // A FAILED OPEN ONLY MOVES THE WRITE-BACK INTO THE PATCH, which has the caller's time
 // for it. A FAILED FLUSH IS LOST WRITES (DetachVolume).
+//
+// LOST WRITES ARE KEPT UNTIL A CALLER IS TOLD. The kernel tells the one fsync, and a
+// write-back whose every caller gave up before it failed would otherwise tell nobody,
+// and the next detach's own fsync would be told the volume is fine. So a failure is
+// kept for the device until a caller receives it, and a later call is told it before
+// anything else; only while it is the same disk, by the kernel's disk sequence
+// number, since the name may by now be another volume's. A disk whose number cannot
+// be read is told it, which discards a volume rather than publish one.
 func (p *Provider) flushBefore(ctx context.Context, device string) error {
 	if device == "" {
 		return nil
@@ -134,9 +150,18 @@ func (p *Provider) flushBefore(ctx context.Context, device string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	seq, known := p.diskSeqOf(device)
 
 	p.flushMu.Lock()
 	wb, running := p.flushing[device]
+	if loss, kept := p.unreported[device]; kept && !running {
+		delete(p.unreported, device)
+		if !known || loss.seq == "" || loss.seq == seq {
+			p.flushMu.Unlock()
+
+			return loss.err
+		}
+	}
 	if !running {
 		if p.flushing == nil {
 			p.flushing = map[string]*writeBack{}
@@ -168,10 +193,62 @@ func (p *Provider) flushBefore(ctx context.Context, device string) error {
 
 	select {
 	case <-wb.done:
+		if wb.lost != nil {
+			p.flushMu.Lock()
+			if loss, kept := p.unreported[device]; kept && errors.Is(loss.err, wb.lost) {
+				delete(p.unreported, device)
+			}
+			p.flushMu.Unlock()
+		}
+
 		return wb.lost
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// writesLoss is a device's lost writes no detach has been told yet, with the disk
+// sequence number of the disk that lost them.
+type writesLoss struct {
+	seq string
+	err error
+}
+
+// keepLoss keeps lost, if anything was lost, for the next detach of device to be told.
+func (p *Provider) keepLoss(device string, lost error) {
+	if lost == nil || device == "" {
+		return
+	}
+	seq, _ := p.diskSeqOf(device)
+
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+
+	if p.unreported == nil {
+		p.unreported = map[string]writesLoss{}
+	}
+	p.unreported[device] = writesLoss{seq: seq, err: lost}
+}
+
+func (p *Provider) diskSeqOf(device string) (string, bool) {
+	if p.diskSeq == nil {
+		return "", false
+	}
+
+	return p.diskSeq(device)
+}
+
+// readDiskSeq is a block device's disk sequence number, which the kernel gives each
+// disk it creates and never gives another (Linux 5.15), so a number that matches is
+// the same disk, never one that took its name.
+func readDiskSeq(device string) (string, bool) {
+	raw, err := os.ReadFile("/sys/class/block/" + filepath.Base(device) + "/diskseq")
+	if err != nil {
+		return "", false
+	}
+	seq := strings.TrimSpace(string(raw))
+
+	return seq, seq != ""
 }
 
 // writeBack is one device's write-back in flight (flushBefore): opened when its open
@@ -205,6 +282,9 @@ func (p *Provider) writeBack(device string, wb *writeBack) {
 		closeErr := disk.Close()
 		if syncErr != nil {
 			wb.lost = fmt.Errorf("%w: %s: %w", provider.ErrWritesLost, device, syncErr)
+			// KEPT BEFORE DONE CLOSES, so no caller can miss it: one waiting is told and
+			// takes it back out, and if none is, the next detach is told (flushBefore).
+			p.keepLoss(device, wb.lost)
 			p.log.Warn("a cache volume's write-back failed before its detach; what it lost is discarded, "+
 				"never published", "device", device, "error", syncErr)
 		} else if closeErr != nil {

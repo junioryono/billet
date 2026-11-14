@@ -2,6 +2,7 @@ package ceph
 
 import (
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -77,12 +78,12 @@ func TestThePhraseWatcherSeesAPhraseSplitAcrossWrites(t *testing.T) {
 
 	const output = "Pass 1: Checking inodes\nError reading block 2081 (Input/output error) while getting next inode\n"
 	for split := range len(output) {
-		w := &phraseWatcher{phrase: []byte("Error reading")}
+		w := readFailureWatcher()
 		for _, part := range []string{output[:split], output[split:]} {
 			if n, err := w.Write([]byte(part)); n != len(part) || err != nil {
 				t.Fatalf("Write(%q) = %d, %v", part, n, err)
 			}
-			if len(w.tail) >= len("Error reading") {
+			if len(w.tail) >= len(w.phrase) {
 				t.Fatalf("the watcher kept %d bytes, more than the phrase", len(w.tail))
 			}
 		}
@@ -91,14 +92,26 @@ func TestThePhraseWatcherSeesAPhraseSplitAcrossWrites(t *testing.T) {
 		}
 	}
 
-	w := &phraseWatcher{phrase: []byte("Error reading")}
-	for _, part := range []string{"Error rea", "ched the end", " of reading\n", "Entry 'f8' has deleted inode 20\n"} {
-		if n, err := w.Write([]byte(part)); n != len(part) || err != nil {
-			t.Fatalf("Write(%q) = %d, %v", part, n, err)
-		}
+	// THE FIRST LINE COUNTS AS BEGINNING ONE; A NAME IN THE MIDDLE OF A LINE DOES NOT.
+	first := readFailureWatcher()
+	if _, err := first.Write([]byte("Error reading block 545 (Input/output error).  Ignore error? no\n")); err != nil ||
+		!first.seen {
+		t.Errorf("the watcher missed a failed read on the first line: %v", err)
 	}
-	if w.seen {
-		t.Error("the watcher saw a phrase that was never written")
+	for _, parts := range [][]string{
+		{"Error rea", "ched the end", " of reading\n"},
+		{"Entry 'Error reading' in / (2) has deleted/unused inode 20.  Clear? no\n"},
+		{"Entry 'x\n", "' in /Error reading (12) has an incorrect filetype\n"},
+	} {
+		w := readFailureWatcher()
+		for _, part := range parts {
+			if n, err := w.Write([]byte(part)); n != len(part) || err != nil {
+				t.Fatalf("Write(%q) = %d, %v", part, n, err)
+			}
+		}
+		if w.seen {
+			t.Errorf("the watcher saw a failed read in %q, which reports none", parts)
+		}
 	}
 }
 
@@ -116,5 +129,12 @@ func TestTheClientVerifiesAWrittenBackDevice(t *testing.T) {
 	if reflect.ValueOf(c.verify).Pointer() != reflect.ValueOf(filesystemVerifier(verifyWrittenBack)).Pointer() {
 		t.Error("the client's filesystem verifier is not verifyWrittenBack, so a Snapshot would check a " +
 			"filesystem without asking whether its writes reached the volume")
+	}
+
+	// AND IT ASKS BEFORE IT CHECKS: a device it cannot open for the write-back is
+	// refused for that, not by the filesystem check after it.
+	_, err = verifyWrittenBack(t.Context(), filepath.Join(t.TempDir(), "rbd9"))
+	if err == nil || !strings.Contains(err.Error(), "to ask for its write-back") {
+		t.Errorf("verifyWrittenBack of a device it could not open answered %v, want the write-back's open refused", err)
 	}
 }

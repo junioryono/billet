@@ -464,6 +464,115 @@ func TestAWriteBackThatFailedTellsEveryCallerWaitingOnIt(t *testing.T) {
 	})
 }
 
+// LOST WRITES NOBODY WAITED TO HEAR ARE TOLD TO THE NEXT CALLER, ONCE. Every caller gave
+// up while the fsync ran, and the fsync then failed; the kernel tells that fsync and no
+// other, so the next caller is told before anything is opened again, and the one after
+// opens and writes back as usual. A different disk that took the name is told nothing.
+func TestLostWritesNobodyWaitedForAreToldToTheNextCaller(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		seqThen, seqNow string
+		told            bool
+	}{
+		"the same disk":                 {seqThen: "41", seqNow: "41", told: true},
+		"a disk that took its name":     {seqThen: "41", seqNow: "57"},
+		"a disk whose number is unread": {seqThen: "41", told: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				p := &Provider{log: slog.New(slog.DiscardHandler)}
+				seq := tc.seqThen
+				p.diskSeq = func(string) (string, bool) { return seq, seq != "" }
+				release := make(chan struct{})
+				var once sync.Once
+				releaseAll := func() { once.Do(func() { close(release) }) }
+				defer releaseAll()
+				opens := 0
+				p.openDisk = func(string) (diskHandle, error) {
+					opens++
+					first := opens == 1
+
+					return syncedDisk{sync: func() error {
+						if !first {
+							return nil
+						}
+						<-release
+
+						return errors.New("input/output error")
+					}}, nil
+				}
+
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				synctest.Wait()
+				if err := p.flushBefore(ctx, "/dev/rbd4"); !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("a caller whose time ran out answered %v", err)
+				}
+				releaseAll()
+				synctest.Wait()
+
+				seq = tc.seqNow
+				err := p.flushBefore(t.Context(), "/dev/rbd4")
+				if told := errors.Is(err, provider.ErrWritesLost); told != tc.told {
+					t.Fatalf("the next caller was told %v, want lost writes told %v", err, tc.told)
+				}
+				wantOpens := map[bool]int{true: 1, false: 2}[tc.told]
+				if opens != wantOpens {
+					t.Errorf("the device was opened %d time(s), want %d", opens, wantOpens)
+				}
+				if err := p.flushBefore(t.Context(), "/dev/rbd4"); err != nil {
+					t.Errorf("the caller after that was told %v, want the write-back it made", err)
+				}
+			})
+		})
+	}
+}
+
+// A DETACH THAT FAILED IS NOT ONE THAT LOST WRITES, AND KEEPS THEM FOR THE NEXT.
+// ErrWritesLost promises the volume is detached, so a PATCH that failed answers only
+// its failure, and the next detach, whose PATCH goes through, is told what was lost.
+func TestADetachThatFailedKeepsItsLostWritesForTheNext(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	var vmm *fakeVMM
+	h.onJailer = func(id string) { vmm = h.serveVMM(t, id) }
+	spec := aSpec()
+	spec.CacheEndpoint = "http://172.20.0.1:7718"
+	spec.CacheToken = strings.Repeat("b", 64)
+	spec.BuildKitCacheMountLimit = 4 << 30
+	inst, err := h.p.Launch(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := h.p.AttachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); err != nil {
+		t.Fatalf("AttachVolume: %v", err)
+	}
+	failed := false
+	h.p.openDisk = func(string) (diskHandle, error) {
+		if failed {
+			return syncedDisk{}, nil
+		}
+		failed = true
+
+		return syncedDisk{sync: func() error { return errors.New("input/output error") }}, nil
+	}
+	vmm.mu.Lock()
+	vmm.failDrivePatches = 1
+	vmm.mu.Unlock()
+
+	err = h.p.DetachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1")
+	if err == nil || errors.Is(err, provider.ErrWritesLost) {
+		t.Fatalf("a detach whose PATCH failed answered %v, want its failure and not lost writes", err)
+	}
+	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); !errors.Is(err, provider.ErrWritesLost) {
+		t.Fatalf("the next detach answered %v, want the lost writes the failed one heard", err)
+	}
+}
+
 // A SLOW OPEN HOLDS NO OTHER DEVICE'S DETACH, AND ONE THAT ENDS AFTER EVERY CALLER GAVE UP
 // WRITES NOTHING BACK: a block device's open can wait in the kernel, and once its callers
 // have gone the volume may be unmapped and its number another's, so the descriptor is

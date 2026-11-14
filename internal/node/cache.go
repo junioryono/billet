@@ -1988,8 +1988,13 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	// restart cleanup find the mapped device and its storage handle.
 	if err := s.attacher.AttachVolume(ctx, session.instance, slot, volume.Device); err != nil {
 		detachErr := s.attacher.DetachVolume(ctx, session.instance, slot, s.detachDevice(ctx, volume))
-		if writesLost(detachErr) {
-			// DETACHED, and what it lost is discarded here anyway.
+		lost := writesLost(detachErr)
+		if lost {
+			// DETACHED, and what it lost is discarded here; marked first all the same,
+			// since the discard can fail and leave the volume in the slot.
+			if recorded := session.slots[slot]; recorded != nil {
+				s.markWritesLost(session, &recorded.WritesLost, volume.Handle, detachErr)
+			}
 			detachErr = nil
 		}
 		var discardErr, clearErr error
@@ -2000,7 +2005,7 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 				clearErr = s.persistSession(session)
 				if clearErr != nil {
 					session.slots[slot] = &cacheAttachment{
-						Volume: volume, Publication: request.Publication,
+						Volume: volume, Publication: request.Publication, WritesLost: lost,
 					}
 				}
 			}
@@ -2087,10 +2092,8 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	if err := s.attacher.DetachVolume(ctx, session.instance, slot,
 		s.detachDevice(ctx, attachment.Volume)); err != nil {
 		if writesLost(err) {
-			// NEVER NIL, and already logged: the guest is told only that its writes were lost.
-			if noted := s.noteWritesLost(session, &attachment.WritesLost, attachment.Volume.Handle, err); noted != nil {
-				lostWrites()
-			}
+			s.markWritesLost(session, &attachment.WritesLost, attachment.Volume.Handle, err)
+			lostWrites()
 
 			return
 		}
@@ -2496,8 +2499,13 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 	detachCtx, cancelDetach := context.WithTimeout(ctx, cacheDiscardDetachLimit)
 	err := s.attacher.DetachVolume(detachCtx, session.instance, slot, s.detachDevice(detachCtx, attachment.Volume))
 	cancelDetach()
-	// A DETACH THAT LOST WRITES DETACHED, and what it lost is being discarded anyway.
-	if err != nil && !writesLost(err) {
+	// A DETACH THAT LOST WRITES DETACHED, and what it lost is being discarded; marked
+	// first all the same, since the discard can fail and leave the volume for a commit.
+	if writesLost(err) {
+		s.markWritesLost(session, &attachment.WritesLost, attachment.Volume.Handle, err)
+		err = nil
+	}
+	if err != nil {
 		s.nonFatalCommit(w, session, "detach discarded volume", err)
 
 		return

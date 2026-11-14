@@ -356,10 +356,14 @@ func checkDamage(ctx context.Context, device string) (bool, error) {
 // corrupt", and exited 12, as a really corrupt journal superblock does
 // (e2fsckUncorrected). Read so, a healthy newest generation would be replaced by an
 // older one. "Error reading" begins every message e2fsprogs gives for a read that
-// failed, and a check that printed it is could-not-tell.
+// failed, and a check that printed it at the start of a line is could-not-tell; in
+// the middle of one it can be a file's name in a report of real damage. The check
+// runs in the C locale, since e2fsck translates its messages and the phrase is the
+// English one.
 func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
-	watch := &phraseWatcher{phrase: []byte("Error reading")}
+	watch := readFailureWatcher()
 	cmd := exec.CommandContext(ctx, e2fsck, "-f", "-n", device)
+	cmd.Env = append(cmd.Environ(), "LC_ALL=C")
 	cmd.Stdout, cmd.Stderr = watch, watch
 	err := cmd.Run()
 	if watch.seen {
@@ -377,9 +381,16 @@ func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
 	return false, fmt.Errorf("check the filesystem on %s: %w", device, err)
 }
 
+// readFailureWatcher watches e2fsck's output for a line that begins with a read
+// that failed.
+func readFailureWatcher() *phraseWatcher {
+	return &phraseWatcher{phrase: []byte("\nError reading"), tail: []byte("\n")}
+}
+
 // phraseWatcher is a writer that remembers whether phrase passed through it,
 // keeping no more of what it was written than the phrase's length, so a phrase
-// split across two writes is still seen. One goroutine writes to it at a time:
+// split across two writes is still seen; tail starts as what is taken to come
+// before the first write ("\n", for a phrase that must begin a line). One goroutine writes to it at a time:
 // os/exec copies stdout and stderr through one writer when they are the same.
 type phraseWatcher struct {
 	phrase []byte

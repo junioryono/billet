@@ -830,9 +830,9 @@ func (s *CacheService) releaseCASVolume(
 			if hv.Journal == nil {
 				hv.Journal = &publishJournal{}
 			}
-			hv.Journal.Phase, hv.Journal.Reason = phaseAbandoned, fmt.Sprintf("%s: %v", errWritesLost, err)
-			s.log.Warn("writes to a content-addressed cache never reached its volume; it is discarded, "+
-				"never published", "instance", session.instance, "kind", hv.Kind, "error", err)
+			hv.Journal.Phase, hv.Journal.Reason = phaseAbandoned, err.Error()
+			s.log.Warn("writes to a content-addressed cache are not proved to have reached its volume; "+
+				"it is discarded, never published", "instance", session.instance, "kind", hv.Kind, "error", err)
 			if err := s.persistSession(session); err != nil {
 				return false, err
 			}

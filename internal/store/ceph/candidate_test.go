@@ -461,6 +461,19 @@ func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
 			"echo \"Entry 'f8' in / (2) has deleted/unused inode 20.  Clear? no\"\nexit 4",
 			true, false,
 		},
+		{
+			"damage to a file named like a failed read",
+			"echo \"Entry 'Error reading' in / (2) has deleted/unused inode 20.  Clear? no\"\nexit 4",
+			true, false,
+		},
+		// ITS OWN LANGUAGE, NOT THE NODE'S: e2fsck translates the message the check
+		// watches for, so it is run in the C locale.
+		{
+			"a failed read in a locale that would translate it",
+			"if [ \"$LC_ALL\" = C ]; then echo 'Error reading block 545 (Input/output error).' >&2; " +
+				"else echo 'Erreur de lecture du bloc 545' >&2; fi\nexit 12",
+			false, true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
