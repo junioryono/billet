@@ -56,10 +56,10 @@ import (
 //   - BILLET_VIRT_EXPERIMENT_IDLE_WATTS: the package's idle power, so each
 //     instance's share of the energy above it is what the node would attribute.
 //
-// IT TOUCHES NO CEPH. The golden reaches it once, out of band, as a read-only
-// export of the generation's snapshot loop-mounted on the host's own disk
-// (docs/reference/records/virtualization-cost.md), so nothing here maps, locks or
-// removes an RBD image beside the node's own. Each instance's /tmp, where the
+// IT TOUCHES NO CEPH. The golden reaches it out of band, prepared before the run:
+// the generation's snapshot mapped read-only and mounted read-only, and an image
+// imported from that mount (docs/reference/records/virtualization-cost.md), so
+// nothing here maps, locks or removes an RBD image beside the node's own. Each instance's /tmp, where the
 // compile keeps its caches, is a directory of its own on the scratch filesystem;
 // the microVM keeps its root, /tmp included, on Ceph, as billet runs one.
 //
