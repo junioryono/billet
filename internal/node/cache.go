@@ -2492,23 +2492,24 @@ func (s *CacheService) discard(w http.ResponseWriter, r *http.Request, session *
 		return
 	}
 
+	// NOTHING PUBLISHES WHAT THE GUEST DISCARDED, recorded before anything else: a
+	// detach that fails can have heard of lost writes it keeps for the slot's next
+	// detach, a deferred publication snapshots the volume after the compute is gone,
+	// with no detach to be told them, and a discard the breaker turns away below is
+	// still the guest's word.
+	attachment.Discarded = true
+	if err := s.persistSession(session); err != nil {
+		s.nonFatalCommit(w, session, "record the discard", err)
+
+		return
+	}
+
 	// THE SESSION'S CLEANUP TAKES IT LATER, off the job's path, rather than this request
 	// waiting on a store that has stopped answering.
 	if !s.breaker.allow() {
 		writeCacheJSON(w, http.StatusOK, map[string]any{
 			"discarded": false, "reason": "the site's store is not answering",
 		})
-
-		return
-	}
-
-	// NOTHING PUBLISHES WHAT THE GUEST DISCARDED, recorded before the detach: a detach
-	// that fails can have heard of lost writes it keeps for the slot's next detach, and a
-	// deferred publication snapshots the volume after the compute is gone, with no detach
-	// to be told them.
-	attachment.Discarded = true
-	if err := s.persistSession(session); err != nil {
-		s.nonFatalCommit(w, session, "record the discard", err)
 
 		return
 	}

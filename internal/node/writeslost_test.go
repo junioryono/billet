@@ -12,8 +12,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/lease"
 	"github.com/junioryono/billet/internal/provider"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
@@ -341,6 +343,31 @@ func TestAVolumeTheGuestDiscardedIsNeverPublished(t *testing.T) {
 	}
 }
 
+// A DISCARD THE BREAKER TURNS AWAY IS STILL THE GUEST'S WORD: the volume is left for the
+// session's cleanup, and nothing publishes it once the store answers again.
+func TestADiscardTurnedAwayByTheBreakerIsStillRecorded(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, attachment := attachedSticky(t)
+	service.GuardStore("ceph", time.Minute)
+	for i := range breakerFailures {
+		service.breaker.failed(storeCall{op: "clone", who: fmt.Sprintf("session-%d", i)}, lease.CacheStoreTimeout)
+	}
+	if !service.breaker.isOpen() {
+		t.Fatal("the breaker did not open")
+	}
+
+	turned := cacheRequest(t, service, session.token, "/v1/volumes/0/discard", nil)
+	if !bytes.Contains(turned.Body.Bytes(), []byte(`"discarded":false`)) {
+		t.Fatalf("a discard with the store not answering answered %s, want it turned away", turned.Body.String())
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if !attachment.refused() {
+		t.Error("a discard the breaker turned away left the volume publishable")
+	}
+}
+
 // A DEFERRED PUBLICATION WHOSE SNAPSHOT LOST WRITES IS ABANDONED, NOT RETRIED: the
 // next pass's snapshot would be told nothing. One already marked is abandoned
 // without a snapshot.
@@ -416,11 +443,11 @@ func TestTheFunnelRefusesAVolumeWhoseWritesWereLost(t *testing.T) {
 	defer session.mu.Unlock()
 	attachment.WritesLost = true
 
-	lease, fence, err := storage.AcquireWriter(t.Context(), attachment.Volume.Key, "holder", cacheWriterTTL)
+	writer, fence, err := storage.AcquireWriter(t.Context(), attachment.Volume.Key, "holder", cacheWriterTTL)
 	if err != nil {
 		t.Fatalf("AcquireWriter: %v", err)
 	}
-	if _, _, err := service.publishAcquired(t.Context(), session, 0, attachment, lease, fence); !errors.Is(err, errWritesLost) {
+	if _, _, err := service.publishAcquired(t.Context(), session, 0, attachment, writer, fence); !errors.Is(err, errWritesLost) {
 		t.Fatalf("publishAcquired of a marked volume answered %v, want errWritesLost", err)
 	}
 	if storage.snapshots != 0 || storage.published != 0 || len(storage.released) != 1 {
