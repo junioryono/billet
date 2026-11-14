@@ -48,6 +48,25 @@ const DefaultTimeout = 15 * time.Second
 // finished it anyway, leaving a mapping nothing tracked.
 const MapTimeout = 60 * time.Second
 
+// mapRequestTimeout is the kernel client's osd_request_timeout on every device
+// billet maps: an OSD request still unanswered after it fails with ETIMEDOUT
+// rather than waiting for ever.
+//
+// A MAPPED DEVICE OTHERWISE HOLDS ITS HOST UNTIL THE OSDS RETURN, AND ON A HOST
+// THAT RUNS ITS OWN OSDS THEY CANNOT. An OSD's start runs ceph-volume, whose
+// `lvs` reads every block device, the ones billet mapped too, and a read waits
+// for its device's writeback, which waits for the OSDs. On 2026-11-13 a libc6
+// upgrade restarted the reference deployment's two OSDs that way and neither came
+// back for nine hours. Measured the same day on kernel 7.0 against Ceph 19.2.3 and
+// 20.2.0, with the only OSD stopped: with the timeout at 30s the direct read
+// failed ETIMEDOUT after 31s and the device worked again once the OSD returned;
+// without it a buffered write alone sat in D state until the OSD came back; and a
+// 10s restart under 30s lost nothing. Five minutes is many times an ordinary OSD
+// restart (a stop of 7.5s and a start of about 12s on the reference deployment),
+// so only an outage longer than that fails a job's IO, and a host whose OSDs wait
+// on a device billet mapped frees itself within it.
+const mapRequestTimeout = 5 * time.Minute
+
 // Client runs the ceph client commands against one site's pools.
 //
 // TWO BINARIES, ONE PACKAGE. `rbd` addresses images and `ceph` answers for the
@@ -290,7 +309,7 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("ceph: %w", errors.Join(errs...))
 	}
 
-	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: blockfs.VerifyExt4,
+	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyWrittenBack,
 		purgeWorkers: trashPurgeWorkers, ioPressure: readHostIOPressure, pause: sleepFor,
 		purgeSlot: make(chan struct{}, 1), checkSlot: generationMapSlot, damaged: checkDamage,
 		machine: config.HostMachine(runtime.GOARCH), readProbe: readProbeWithDebugfs}
@@ -901,15 +920,24 @@ func (c *Client) rbdCmd(ctx context.Context, asJSON bool, command ...string) ([]
 	return c.run(ctx, c.bin, append(args, command...))
 }
 
-// rbdMap maps one image under MapTimeout rather than DefaultTimeout, and is the
-// only way billet runs `rbd device map`. options come before the spec.
+// rbdMap maps one image under MapTimeout rather than DefaultTimeout, with the
+// kernel client's mapRequestTimeout, and is the only way billet runs `rbd device
+// map`. options come before the spec.
 func (c *Client) rbdMap(ctx context.Context, spec string, options ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, MapTimeout)
 	defer cancel()
 
-	args := append(append(c.identity(), "device", "map"), options...)
+	args := append(c.identity(), "device", "map", "-o", requestTimeoutOption())
+	args = append(args, options...)
 
 	return c.run(ctx, c.bin, append(args, spec))
+}
+
+// requestTimeoutOption is mapRequestTimeout as `rbd device map -o` takes it, in
+// whole seconds: rbd 20.2.0 refuses any other spelling ("couldn't parse map
+// options", measured 2026-11-13).
+func requestTimeoutOption() string {
+	return fmt.Sprintf("osd_request_timeout=%d", int64(mapRequestTimeout/time.Second))
 }
 
 // noBlocklist prefixes a command that may break a lock so that Ceph does not

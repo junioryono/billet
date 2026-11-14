@@ -197,9 +197,20 @@ type Provider struct {
 	slotHolds func(slot, device string) bool
 	openDisk  func(device string) (diskHandle, error)
 	// flushing is each device's write-back in flight before a detach, closed when it
-	// ends (flushBefore).
-	flushMu  sync.Mutex
-	flushing map[string]*writeBack
+	// ends (flushBefore), and unreported each device's lost writes no detach has been
+	// told yet; diskSeq reads a device's kernel disk sequence number (readDiskSeq),
+	// which a test's devices have none of.
+	flushMu    sync.Mutex
+	flushing   map[string]*writeBack
+	unreported map[string]writesLoss
+	diskSeq    func(device string) (string, bool)
+	// slotLosses is the lost writes a detach that then failed heard, by instance and
+	// slot (slotKey), told to the slot's next detach whatever device it is handed;
+	// slotDevices the device, and its disk, each slot's unfinished detach wrote back;
+	// awaiting, a test's, is told when a detach waits on a write-back in flight.
+	slotLosses  map[string]error
+	slotDevices map[string]slotDisk
+	awaiting    func(device string)
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -388,6 +399,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	p.flushDisk = flushDevice
 	p.slotHolds = sameBlockDevice
 	p.openDisk = openDiskDevice
+	p.diskSeq = readDiskSeq
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt

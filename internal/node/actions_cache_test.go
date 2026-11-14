@@ -35,6 +35,10 @@ type fakeActionsVolumeManager struct {
 	// readOnlyMountedButFailed mounts a download and then reports the mount failed,
 	// as a mount command killed after the kernel mounted does.
 	readOnlyMountedButFailed bool
+	// writesLost is what SyncWrites answers, and synced the mount points it was
+	// asked about.
+	writesLost error
+	synced     []string
 }
 
 type syncCloseRecorder struct {
@@ -129,6 +133,12 @@ func (f *fakeActionsVolumeManager) Mounted(_ context.Context, target string) (bo
 	}
 
 	return true, nil
+}
+
+func (f *fakeActionsVolumeManager) SyncWrites(_ context.Context, target string) error {
+	f.synced = append(f.synced, target)
+
+	return f.writesLost
 }
 
 func (f *fakeActionsVolumeManager) Trim(_ context.Context, target string) error {

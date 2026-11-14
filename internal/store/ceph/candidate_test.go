@@ -438,6 +438,34 @@ func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
 		{"uncorrected and cannot proceed", "exit 12", true, false},
 		{"operational error", "exit 8", false, true},
 		{"signal", "kill -9 $$", false, true},
+		// A READ THAT FAILED MAKES THE CHECK COULD-NOT-TELL, WHATEVER IT EXITS: e2fsprogs
+		// 1.47.2's own words, measured 2026-11-13 with the only OSD stopped partway.
+		{
+			"a read that failed, then a corrupt journal superblock",
+			"echo 'Error reading block 545 (Input/output error).  Ignore error? no' >&2\n" +
+				"echo 'e2fsck: The journal superblock is corrupt while checking journal for /dev/rbd9'\nexit 12",
+			false, true,
+		},
+		{
+			"a read that failed on stdout, then uncorrected errors",
+			"echo 'Error reading extended attribute block 33280 for inode 12.  Clear? no'\nexit 4",
+			false, true,
+		},
+		{
+			"a read that failed, split across two writes",
+			"printf 'Error rea' >&2\nsleep 0.1\nprintf 'ding block 9 (Input/output error)\\n' >&2\nexit 4",
+			false, true,
+		},
+		{
+			"damage reported without a failed read",
+			"echo \"Entry 'f8' in / (2) has deleted/unused inode 20.  Clear? no\"\nexit 4",
+			true, false,
+		},
+		{
+			"damage to a file named like a failed read",
+			"echo \"Entry 'Error reading' in / (2) has deleted/unused inode 20.  Clear? no\"\nexit 4",
+			true, false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -463,12 +491,34 @@ func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
 		})
 	}
 
-	if damaged, err := checkDamageWith(t.Context(), filepath.Join(t.TempDir(), "absent"), "/dev/rbd9"); damaged || err == nil {
+	if damaged, err := checkDamageWith(t.Context(), filepath.Join(t.TempDir(), "absent"),
+		"/dev/rbd9"); damaged || err == nil {
 		t.Errorf("a missing e2fsck answered %v, %v; want could-not-tell", damaged, err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	if damaged, err := checkDamageWith(ctx, "/bin/sh", "/dev/rbd9"); damaged || err == nil {
 		t.Errorf("a cancelled check answered %v, %v; want could-not-tell", damaged, err)
+	}
+}
+
+// THE CHECK READS e2fsck IN ITS OWN LANGUAGE, NOT THE NODE'S: e2fsck translates the
+// messages the check watches for, so it is run in the C locale whatever the node's
+// is. Not parallel, because it sets the process's locale to one that translates.
+func TestTheDamageCheckRunsInTheCLocale(t *testing.T) {
+	t.Setenv("LC_ALL", "fr_FR.UTF-8")
+	t.Setenv("LANG", "fr_FR.UTF-8")
+
+	dir := t.TempDir()
+	e2fsck := filepath.Join(dir, "e2fsck")
+	script := "#!/bin/sh\nif [ \"$LC_ALL\" = C ]; then echo 'Error reading block 545 (Input/output error).' >&2; " +
+		"else echo 'Erreur de lecture du bloc 545' >&2; fi\nexit 12\n"
+	if err := forkSafeWriteFile(e2fsck, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if damaged, err := checkDamageWith(t.Context(), e2fsck, "/dev/rbd9"); damaged || err == nil ||
+		!strings.Contains(err.Error(), "could not read all of it") {
+		t.Errorf("a failed read under a translating locale answered %v, %v; want could-not-tell for the "+
+			"failed read", damaged, err)
 	}
 }

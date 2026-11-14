@@ -69,7 +69,15 @@ type VolumeMount struct {
 	Path string
 }
 
+// ErrWritesLost is a DetachVolume that detached the volume after its write-back
+// failed: some of what the guest wrote never reached the volume's storage, so it
+// must be discarded and never published. The kernel reports a failed write-back
+// to the first fsync that asks and to no later one, so this answer is the only
+// time it is told; a caller records it before anything else.
+var ErrWritesLost = errors.New("provider: writes to the volume were lost before its detach")
+
 // VolumeAttacher replaces pre-reserved block-device slots on a running instance.
+// A DetachVolume answering ErrWritesLost has detached the volume.
 type VolumeAttacher interface {
 	AttachVolume(ctx context.Context, instanceID string, slot int, device string) error
 	DetachVolume(ctx context.Context, instanceID string, slot int, device string) error
