@@ -206,9 +206,11 @@ type Provider struct {
 	diskSeq    func(device string) (string, bool)
 	// slotLosses is the lost writes a detach that then failed heard, by instance and
 	// slot (slotKey), told to the slot's next detach whatever device it is handed;
-	// slotDevices the device each slot's unfinished detach wrote back.
+	// slotDevices the device, and its disk, each slot's unfinished detach wrote back;
+	// awaiting, a test's, is told when a detach waits on a write-back in flight.
 	slotLosses  map[string]error
-	slotDevices map[string]string
+	slotDevices map[string]slotDisk
+	awaiting    func(device string)
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error

@@ -261,8 +261,12 @@ func (p *Provider) keepLoss(device, seq string, lost error) {
 		p.unreported = map[string]writesLoss{}
 	}
 	p.unreported[device] = writesLoss{seq: seq, err: lost}
+	// ONLY TO A SLOT OF THE SAME DISK: a name can pass to another VM's volume between
+	// a write-back's close and this, and that slot's disk is told nothing it did not
+	// lose. A disk whose number is unknown on either side is told, which discards a
+	// volume rather than publish one.
 	for key, slotDevice := range p.slotDevices {
-		if slotDevice != device {
+		if slotDevice.device != device || (seq != "" && slotDevice.seq != "" && slotDevice.seq != seq) {
 			continue
 		}
 		if p.slotLosses == nil {
@@ -270,6 +274,13 @@ func (p *Provider) keepLoss(device, seq string, lost error) {
 		}
 		p.slotLosses[key] = lost
 	}
+}
+
+// slotDisk is the device a slot's unfinished detach wrote back, and its disk's
+// sequence number as the slot held it (empty when unknown).
+type slotDisk struct {
+	device string
+	seq    string
 }
 
 // awaitWriteBack waits, within ctx, for a write-back of device in flight to end,
@@ -281,6 +292,9 @@ func (p *Provider) awaitWriteBack(ctx context.Context, device string) error {
 	p.flushMu.Unlock()
 	if !running {
 		return nil
+	}
+	if p.awaiting != nil {
+		p.awaiting(device)
 	}
 
 	select {
@@ -308,20 +322,22 @@ func (p *Provider) keepSlotLoss(instanceID string, slot int, lost error) {
 	p.slotLosses[slotKey(instanceID, slot)] = lost
 }
 
-// rememberSlotDevice records device as the one the slot's detach writes back; a
-// detach handed no device keeps what an earlier one remembered.
+// rememberSlotDevice records device, which the slot is proved to hold, as the one the
+// slot's detach writes back, with its disk's number read now; a detach handed no
+// device keeps what an earlier one remembered.
 func (p *Provider) rememberSlotDevice(instanceID string, slot int, device string) {
 	if device == "" {
 		return
 	}
+	seq, _ := p.diskSeqOf(device)
 
 	p.flushMu.Lock()
 	defer p.flushMu.Unlock()
 
 	if p.slotDevices == nil {
-		p.slotDevices = map[string]string{}
+		p.slotDevices = map[string]slotDisk{}
 	}
-	p.slotDevices[slotKey(instanceID, slot)] = device
+	p.slotDevices[slotKey(instanceID, slot)] = slotDisk{device: device, seq: seq}
 }
 
 // forgetSlotDevice forgets the slot's device once its detach has succeeded.
@@ -337,16 +353,24 @@ func (p *Provider) slotDevice(instanceID string, slot int) string {
 	p.flushMu.Lock()
 	defer p.flushMu.Unlock()
 
-	return p.slotDevices[slotKey(instanceID, slot)]
+	return p.slotDevices[slotKey(instanceID, slot)].device
 }
 
-// takeSlotLoss is the loss kept for the slot, taken out so it is told once.
+// takeSlotLoss is the loss kept for the slot, taken out so it is told once, with the
+// same loss kept for its device, which this telling answers too.
 func (p *Provider) takeSlotLoss(instanceID string, slot int) error {
 	p.flushMu.Lock()
 	defer p.flushMu.Unlock()
 
 	lost := p.slotLosses[slotKey(instanceID, slot)]
 	delete(p.slotLosses, slotKey(instanceID, slot))
+	if lost != nil {
+		for device, loss := range p.unreported {
+			if errors.Is(loss.err, lost) {
+				delete(p.unreported, device)
+			}
+		}
+	}
 
 	return lost
 }

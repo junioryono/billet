@@ -3,6 +3,7 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -595,21 +596,23 @@ func TestAWriteBackOfAnotherDiskIsNoAnswer(t *testing.T) {
 func TestAWriteBackADetachGaveUpOnIsToldToTheSlotsNext(t *testing.T) {
 	t.Parallel()
 
-	// WHETHER OR NOT THE SLOT CAN BE PROVED TO HOLD THE DEVICE, and whether the
-	// write-back has ended or is still in flight when the next detach comes.
-	for name, tc := range map[string]struct{ holds, inFlight bool }{
-		"the slot proved to hold it":            {holds: true},
-		"a proof that cannot tell":              {},
-		"a proof that cannot tell, still going": {inFlight: true},
+	// WHETHER OR NOT THE SLOT CAN BE PROVED TO HOLD THE DEVICE, whether the write-back
+	// has ended or is still in flight when the next detach comes, and whether that one
+	// gives up while it waits.
+	for name, tc := range map[string]struct{ holds, inFlight, giveUp bool }{
+		"the slot proved to hold it":                   {holds: true},
+		"a proof that cannot tell":                     {},
+		"a proof that cannot tell, still going":        {inFlight: true},
+		"a proof that cannot tell, given up meanwhile": {inFlight: true, giveUp: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			gaveUpThenRetried(t, tc.holds, tc.inFlight)
+			gaveUpThenRetried(t, tc.holds, tc.inFlight, tc.giveUp)
 		})
 	}
 }
 
-func gaveUpThenRetried(t *testing.T, holds, inFlight bool) {
+func gaveUpThenRetried(t *testing.T, holds, inFlight, giveUp bool) {
 	t.Helper()
 
 	h := newHarness(t)
@@ -664,33 +667,84 @@ func gaveUpThenRetried(t *testing.T, holds, inFlight bool) {
 		close(release)
 		forgotten(t, h.p)
 	} else {
-		// RELEASED ONLY ONCE THE NEXT DETACH IS WAITING ON IT, which it must be: it
+		// THE NEXT DETACH WAITS ON THE WRITE-BACK, and stays waiting until it ends: it
 		// cannot be told success while the write-back that may lose writes runs.
-		go func() {
-			for {
-				askedMu.Lock()
-				n := len(asked)
-				askedMu.Unlock()
-				if n > 0 {
-					break
-				}
-				time.Sleep(time.Millisecond)
+		waiting := make(chan struct{})
+		var once sync.Once
+		h.p.awaiting = func(string) { once.Do(func() { close(waiting) }) }
+		retryCtx, giveUpRetry := context.WithCancel(t.Context())
+		defer giveUpRetry()
+		retried := make(chan error, 1)
+		go func() { retried <- h.p.DetachVolume(retryCtx, inst.ID, 0, "") }()
+		select {
+		case <-waiting:
+		case err := <-retried:
+			t.Fatalf("the next detach answered %v without waiting on the write-back in flight", err)
+		}
+		select {
+		case err := <-retried:
+			t.Fatalf("the next detach answered %v while the write-back it waits on still ran", err)
+		default:
+		}
+		if giveUp {
+			giveUpRetry()
+			if err := <-retried; !errors.Is(err, context.Canceled) {
+				t.Fatalf("a detach that gave up waiting answered %v, want its cancellation", err)
 			}
-			time.Sleep(50 * time.Millisecond)
-			close(release)
-		}()
+		}
+		close(release)
+		if !giveUp {
+			if err := <-retried; !errors.Is(err, provider.ErrWritesLost) {
+				t.Fatalf("the waiting detach answered %v, want the lost writes", err)
+			}
+		}
+		forgotten(t, h.p)
 	}
 
-	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, ""); !errors.Is(err, provider.ErrWritesLost) {
-		t.Fatalf("the slot's next detach, handed no device, answered %v, want the lost writes", err)
+	if !inFlight || giveUp {
+		if err := h.p.DetachVolume(t.Context(), inst.ID, 0, ""); !errors.Is(err, provider.ErrWritesLost) {
+			t.Fatalf("the slot's next detach, handed no device, answered %v, want the lost writes", err)
+		}
+	}
+	// TOLD ONCE: the slot's next detach, and its device's, hear nothing more.
+	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, ""); errors.Is(err, provider.ErrWritesLost) {
+		t.Errorf("a detach after the lost writes were told was told them again: %v", err)
+	}
+	h.p.flushMu.Lock()
+	kept := len(h.p.unreported)
+	h.p.flushMu.Unlock()
+	if kept != 0 {
+		t.Errorf("%d loss(es) still kept for a device after the slot was told", kept)
 	}
 	askedMu.Lock()
 	defer askedMu.Unlock()
 	if len(asked) == 0 || asked[0] != "/dev/nvme9n1" {
 		t.Errorf("the next detach asked whether the slot holds %q, want the device its write-back was of", asked)
 	}
-	if cache0Patches(vmm) != 2 {
-		t.Errorf("cache0 had %d PATCH(es); the second detach must still detach", cache0Patches(vmm))
+	if cache0Patches(vmm) < 2 {
+		t.Errorf("cache0 had %d PATCH(es); the detach told the lost writes must still detach", cache0Patches(vmm))
+	}
+}
+
+// A WRITE-BACK OF THE DISK THAT HAD THE NAME BEFORE IS TOLD TO NO SLOT OF ANOTHER: a
+// name can pass to another VM's volume while an old write-back finishes, and that
+// slot, which remembers the disk it holds, is not told the old disk's loss.
+func TestAnOldDisksLossReachesNoSlotOfANewOne(t *testing.T) {
+	t.Parallel()
+
+	p := &Provider{log: slog.New(slog.DiscardHandler)}
+	seq := "57"
+	p.diskSeq = func(string) (string, bool) { return seq, true }
+	p.rememberSlotDevice("billet-new", 0, "/dev/rbd4")
+	p.keepLoss("/dev/rbd4", "41", fmt.Errorf("%w: old disk", provider.ErrWritesLost))
+	if lost := p.takeSlotLoss("billet-new", 0); lost != nil {
+		t.Errorf("the new disk's slot was told the old disk's loss: %v", lost)
+	}
+
+	p.rememberSlotDevice("billet-same", 0, "/dev/rbd5")
+	p.keepLoss("/dev/rbd5", "57", fmt.Errorf("%w: same disk", provider.ErrWritesLost))
+	if lost := p.takeSlotLoss("billet-same", 0); !errors.Is(lost, provider.ErrWritesLost) {
+		t.Errorf("the slot of the disk that lost writes was told %v", lost)
 	}
 }
 
