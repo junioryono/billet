@@ -2,10 +2,12 @@ package scripts_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -55,11 +57,14 @@ func TestTheAgentReadsBilletInWhenACacheWillRunIt(t *testing.T) {
 				"while [ ! -e "+shellQuote(release)+" ]; do sleep 0.05; done\n"), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() {
-				if err := os.WriteFile(release, nil, 0o600); err != nil {
-					t.Errorf("release the reader: %v", err)
+			// A READ NOBODY WANTS IS RELEASED BEFORE IT STARTS, so one started wrongly
+			// publishes its marker and ends, and the group's end is what the absence is
+			// judged after.
+			if !tc.wantRead {
+				if err := forkSafeWriteFile(release, nil, 0o600); err != nil {
+					t.Fatal(err)
 				}
-			})
+			}
 
 			script := strings.Join([]string{
 				"set -euo pipefail",
@@ -72,28 +77,74 @@ func TestTheAgentReadsBilletInWhenACacheWillRunIt(t *testing.T) {
 			}, "\n")
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
-			output, err := exec.CommandContext(ctx, "bash", "-c", script).CombinedOutput()
-			if err != nil || strings.TrimSpace(string(output)) != "done" {
-				t.Fatalf("the block did not return while its read was held: %v\n%s", err, output)
+			// ITS OWN PROCESS GROUP, which a background read stays in (bash runs no job
+			// control), so the test knows when everything the block started has ended.
+			cmd := exec.CommandContext(ctx, "bash", "-c", script)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+			var output strings.Builder
+			cmd.Stdout, cmd.Stderr = &output, &output
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			group := cmd.Process.Pid
+			// Registered after t.TempDir's, so it runs first: nothing the block started
+			// outlives the test or the directory it writes in.
+			t.Cleanup(func() {
+				if groupGone(group, 0) {
+					return
+				}
+				if err := syscall.Kill(-group, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+					t.Errorf("end the block's processes: %v", err)
+				}
+				if !groupGone(group, 10*time.Second) {
+					t.Errorf("the block's process group %d outlived its kill", group)
+				}
+			})
+			err := cmd.Wait()
+			if err != nil || strings.TrimSpace(output.String()) != "done" {
+				t.Fatalf("the block did not return while its read was held: %v\n%s", err, output.String())
 			}
 
-			var read []byte
-			deadline := time.Now().Add(5 * time.Second)
-			if !tc.wantRead {
-				deadline = time.Now().Add(time.Second)
-			}
-			for time.Now().Before(deadline) {
-				if read, err = os.ReadFile(marker); err == nil {
-					break
+			if tc.wantRead {
+				deadline := time.Now().Add(5 * time.Second)
+				var read []byte
+				for time.Now().Before(deadline) {
+					if read, err = os.ReadFile(marker); err == nil {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
 				}
-				time.Sleep(10 * time.Millisecond)
+				if string(read) != tc.binary {
+					t.Errorf("billet was not read in: read %q (%v), want %s", read, err, tc.binary)
+				}
+				if groupGone(group, 0) {
+					t.Errorf("the read ended before it was released")
+				}
+				if err := os.WriteFile(release, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
 			}
-			switch {
-			case tc.wantRead && string(read) != tc.binary:
-				t.Errorf("billet was not read in: read %q (%v), want %s", read, err, tc.binary)
-			case !tc.wantRead && err == nil:
+			if !groupGone(group, 10*time.Second) {
+				t.Fatalf("what the block started has not ended")
+			}
+			if read, err := os.ReadFile(marker); !tc.wantRead && err == nil {
 				t.Errorf("billet was read in though no cache runs it: %q", read)
 			}
 		})
+	}
+}
+
+// groupGone reports whether no process is left in the group within the time given.
+func groupGone(group int, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for {
+		if errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
