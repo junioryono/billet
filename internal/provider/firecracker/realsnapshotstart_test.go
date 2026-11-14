@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -40,20 +41,29 @@ import (
 // THE GOLDEN WAITS FOR A REGISTRATION. It boots like any guest, with a placeholder
 // for its JIT configuration and kvm-clock (withKVMClock), and its command is
 // snapshotStartWaiter: once the agent has done everything a job's guest does before
-// its runner starts, the waiter serves its state on snapshotStartPort and asks the
-// metadata service, with a fresh token each time, for a registration that is not
-// the placeholder. It is captured while it asks. A restore installs the fork's own
-// metadata before resuming it, so the restored waiter finds a real registration and
-// starts the runner; a cold guest is given the same command and finds its
-// registration at once. Both arms are therefore measured to the same instruction.
-// The runner takes its one job and exits, and the waiter says so; the guest is
-// then destroyed, as the node destroys a guest whose job is done.
+// its runner starts, the waiter reports that it is waiting and asks the metadata
+// service, with a fresh token each time, for a registration that is not the
+// placeholder. It is captured while it asks. A restore installs the fork's own
+// metadata before resuming it, so the restored waiter finds a real registration;
+// a cold guest is given the same command and finds its registration at once. Both
+// arms are therefore measured to the same instruction. The runner takes its one
+// job and exits, and the waiter says so; the guest is then destroyed, as the node
+// destroys a guest whose job is done.
+//
+// THE GUEST REPORTS TO THE HOST, never the other way: the node's firewall drops
+// everything a guest sends the host but DNS, DHCP, the node's cache port and the
+// port `billet images verify` listens on for the same purpose, a guest reporting
+// to its host (measured on ubuntu-01 2026-11-14: a guest leased an address and
+// answered nothing the host sent it). So the host listens there (startServer) and
+// each waiter posts its steps to it, keyed by the sha256 of its registration, and
+// asks it whether it may run its runner. Only the host, which minted the
+// registration, and the guest know that key.
 //
 // THE JOBS ARE QUEUED FIRST. Trial i reads its JIT configuration from
 // BILLET_SNAPSHOT_START_JITS/<i>.jit, written by whoever minted it for a runner
 // whose label only trial i's job asks for and removed once read; the job is already
 // queued, so the job's start on GitHub, joined afterwards by the runner's name, is
-// the end-to-end measure, and the waiter's state the host-side one.
+// the end-to-end measure, and the waiter's steps the host-side one.
 //
 // FORKS RUN ONE AT A TIME. A restored guest keeps the golden's MAC and address, so
 // two at once would share one; and the paused builder keeps its tap until the last
@@ -61,12 +71,19 @@ import (
 // the forks run with.
 //
 // It skips unless BILLET_SNAPSHOT_START_OUT names a results file, on top of
-// everything requireRealHost needs. Settings, all from the environment:
+// everything requireRealHost needs, and it runs only with -test.timeout 0.
+// Settings, all from the environment:
 //   - BILLET_SNAPSHOT_START_JITS: the directory the JIT configurations arrive in.
+//   - BILLET_SNAPSHOT_START_LISTEN: where the host listens for its guests, an
+//     address on the bridge and a port the node's firewall lets guests reach
+//     (172.31.0.1:7719 on ubuntu-01, the image verification port).
+//   - BILLET_SNAPSHOT_START_PORT_LOCK: a lock held while listening, so another
+//     user of that port refuses rather than collides (`billet images verify`'s,
+//     <node.lock_dir>/billet-imageverify-<deployment>.lock).
 //   - BILLET_SNAPSHOT_START_TRIALS: how many, alternating cold and restored, cold first.
 //   - BILLET_SNAPSHOT_START_VCPU and _MEMORY_GIB: the guest's shape, both arms.
-//   - BILLET_SNAPSHOT_START_LEASES: the bridge's dnsmasq lease file, where a guest's
-//     address is found by its MAC.
+//   - BILLET_SNAPSHOT_START_LEASES: the bridge's dnsmasq lease file, where the
+//     golden's address is found by its MAC.
 //   - BILLET_SNAPSHOT_START_RUN: a label written on every line.
 func TestRealSnapshotStartExperiment(t *testing.T) {
 	out := os.Getenv("BILLET_SNAPSHOT_START_OUT")
@@ -79,6 +96,10 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 	jits := os.Getenv("BILLET_SNAPSHOT_START_JITS")
 	if jits == "" {
 		t.Fatal("BILLET_SNAPSHOT_START_JITS names no directory for the JIT configurations")
+	}
+	listen := os.Getenv("BILLET_SNAPSHOT_START_LISTEN")
+	if listen == "" {
+		t.Fatal("BILLET_SNAPSHOT_START_LISTEN names no address on the bridge for the guests to report to")
 	}
 
 	trials := experimentInt(t, "BILLET_SNAPSHOT_START_TRIALS", 10)
@@ -114,6 +135,22 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 			t.Fatalf("write the results: %v", err)
 		}
 	}
+
+	// THE PORT'S LOCK, THEN THE PORT: a `billet images verify` started while this
+	// runs refuses on the lock rather than failing to listen.
+	if lockPath := os.Getenv("BILLET_SNAPSHOT_START_PORT_LOCK"); lockPath != "" {
+		release, err := holdLock(lockPath)
+		if err != nil {
+			t.Fatalf("BILLET_SNAPSHOT_START_PORT_LOCK: %v", err)
+		}
+		t.Cleanup(release)
+	}
+	server, err := listenForGuests(t.Context(), listen)
+	if err != nil {
+		t.Fatalf("listen for the guests on %s: %v", listen, err)
+	}
+	t.Cleanup(server.close)
+	host := "http://" + listen
 
 	p, err := New(selftestDeployment, env.cfg, env.disk, WithBootWait(20*time.Second))
 	if err != nil {
@@ -173,7 +210,7 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		return provider.Spec{
 			Name: name, Image: env.image, VCPU: vcpu, Memory: memory, Trust: provider.TrustTrusted,
 			Command: []string{"/bin/bash", "-c", snapshotStartWaiter, "waiter", snapshotStartPlaceholder,
-				"http://" + mmdsAddress, strconv.Itoa(snapshotStartPort), snapshotStartRenew, "0.0.0.0"},
+				"http://" + mmdsAddress, host, snapshotStartRenew},
 			JITConfig: jit,
 		}
 	}
@@ -200,12 +237,11 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 	// CAPTURED WHILE ITS WAITER ASKS, which is after the guest kernel finished
 	// booting (Firecracker's condition for a snapshot) and after the agent did
 	// everything a job's guest does before its runner starts.
-	waiting, err := waiterState(t.Context(), goldenAddr, snapshotStartPort, 5*time.Minute,
-		func(s string) bool { return hasLine(s, "waiting") })
+	waiting, err := server.await(t.Context(), registrationID(snapshotStartPlaceholder), "waiting", 5*time.Minute, nil)
 	if err != nil {
 		t.Fatalf("the builder's waiter: %v", err)
 	}
-	bootToWaiting := waiting.seen.Sub(bootStarted)
+	bootToWaiting := waiting.at.Sub(bootStarted)
 
 	captureStarted := time.Now()
 	captureCtx, cancelCapture := context.WithTimeout(t.Context(), 15*time.Minute)
@@ -232,7 +268,7 @@ func TestRealSnapshotStartExperiment(t *testing.T) {
 		}
 
 		fields := map[string]any{"arm": arm, "trial": i, "loadavg": loadAverage()}
-		err := runStartTrial(t, p, spec, startTrial{
+		err := runStartTrial(t, p, spec, server, startTrial{
 			index: i, arm: arm, jits: jits, leases: leases, snapshot: snapshot, evidence: evidence,
 			goldenMAC: goldenMAC, goldenAddr: goldenAddr, captured: captured, outstanding: outstanding,
 		}, fields)
@@ -267,7 +303,7 @@ var errTrialSurvived = errors.New("its guest could not be destroyed")
 // golden's MAC, which a fork would then share with whoever it was given to.
 var errLeaseLost = errors.New("the golden's address is no longer leased to it")
 
-// startTrial is what a trial needs beyond the provider and its spec.
+// startTrial is what a trial needs beyond the provider, its spec and the server.
 type startTrial struct {
 	index                       int
 	arm, jits, leases, snapshot string
@@ -299,66 +335,39 @@ const (
 	forkLeaseNeed  = trialBudget + teardownBudget + operatorBudget + killMargin
 )
 
-// snapshotStartPort is where a waiter serves its state, inside the guest.
-const snapshotStartPort = 47231
-
-// snapshotStartWaiter is the command both arms run in place of the runner. It
-// serves its state on address $5, port $3, one line appended per step (waiting; registered and
-// the guest's time in milliseconds; released and the time; finished, the time and
-// the runner's status), so no step's time is lost to a later one; waits for the
-// metadata service at $2 to hold a registration that is not $1; holds there until
-// the host, having sampled the guest's memory, releases it with a POST carrying
-// the registration's sha256, which only the host that minted it and this guest
-// know, and which is written, after any release left from the golden is cleared,
-// only once the registration is (so a release before it, or from a peer on the
-// bridge, is refused); runs the
-// runner with it; and then holds on, listener and all, until the host destroys the
-// guest, since the agent's service ending would take the listener with it. Once
-// registered it runs $4 in the background, which in a guest renews its DHCP lease
-// (snapshotStartRenew): a fork resumes with its golden's lease timers and lives
-// minutes, so without this none would renew, and the bridge's DHCP would let the
-// golden's address go an hour after the golden booted.
+// snapshotStartWaiter is the command both arms run in place of the runner. With
+// $1 the golden's placeholder, $2 the metadata service, $3 the host's listener
+// and $4 the lease renewal, it:
+//   - reports `waiting` under the placeholder's key about once a second while
+//     the metadata service holds no registration but the placeholder, asking with
+//     a fresh token every time, since a restored VMM honours none the golden's
+//     did, and every read bounded to a second, since one in flight at the capture
+//     is answered by nobody;
+//   - once it has one, reports `registered` and the guest's time in milliseconds
+//     under that registration's key, renews its DHCP lease in the background (a
+//     fork resumes with its golden's lease timers and lives minutes, so without
+//     this none would renew, and the bridge's DHCP would let the golden's address
+//     go an hour after the golden booted), and holds until the host, having read
+//     the guest's memory, answers its key's release with `go`;
+//   - reports `released`, runs the runner, reports `finished` with the time and
+//     the runner's status, and holds on until the host destroys the guest.
 //
-// A fresh token for every read, since a restored VMM knows none the golden's did,
-// and every read bounded to a second, since one in flight at the capture is
-// answered by nobody.
+// A report is retried until the host takes it, a few seconds at most.
 const snapshotStartWaiter = `set -u
-state=${TMPDIR:-/tmp}/billet-snapshot-start
-rm -f "$state.release" "$state.token"
-printf 'waiting\n' >"$state"
-python3 -c '
-import http.server, sys
-path = sys.argv[1]
-class State(http.server.BaseHTTPRequestHandler):
-    def reply(self, body):
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-    def do_GET(self):
-        try:
-            body = open(path, "rb").read()
-        except OSError:
-            body = b"unreadable\n"
-        self.reply(body)
-    def do_POST(self):
-        body = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 128))
-        try:
-            token = open(path + ".token", "rb").read().strip()
-        except OSError:
-            token = b""
-        if not token or body.strip() != token:
-            self.send_response(403)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        open(path + ".release", "w").close()
-        self.reply(b"released\n")
-    def log_message(self, *args):
-        pass
-http.server.ThreadingHTTPServer((sys.argv[3], int(sys.argv[2])), State).serve_forever()
-' "$state" "$3" "$5" &
-mmds=$2
+mmds=$2 host=$3
+key() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+report() {
+	local i
+	for i in $(seq 1 30); do
+		if curl -sf --connect-timeout 1 --max-time 2 -X POST --data-binary "$2" "$host/state/$1" >/dev/null; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	return 1
+}
+golden=$(key "$1")
+n=0
 while :; do
 	if token=$(curl -sf --connect-timeout 1 --max-time 1 -X PUT "$mmds/latest/api/token" \
 		-H "X-metadata-token-ttl-seconds: 60") &&
@@ -367,96 +376,190 @@ while :; do
 		[ -n "$jit" ] && [ "$jit" != "$1" ]; then
 		break
 	fi
+	if [ $((n % 50)) -eq 0 ]; then
+		report "$golden" waiting || true
+	fi
+	n=$((n + 1))
 	sleep 0.02
 done
-rm -f "$state.release"
-printf '%s' "$jit" | sha256sum | cut -d' ' -f1 >"$state.token.part" && mv "$state.token.part" "$state.token"
-printf 'registered %s\n' "$(date +%s%3N)" >>"$state"
+id=$(key "$jit")
+report "$id" "registered $(date +%s%3N)" || exit 1
 ( bash -c "$4" >/dev/null 2>&1 & )
-while [ ! -e "$state.release" ]; do sleep 0.01; done
-printf 'released %s\n' "$(date +%s%3N)" >>"$state"
+until [ "$(curl -sf --connect-timeout 1 --max-time 1 "$host/release/$id")" = go ]; do sleep 0.01; done
+report "$id" "released $(date +%s%3N)" || true
 ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" ./run.sh
 rc=$?
-printf 'finished %s %s\n' "$(date +%s%3N)" "$rc" >>"$state"
+report "$id" "finished $(date +%s%3N) $rc" || true
 exec sleep infinity`
 
-// hasLine reports whether a waiter's state holds a line starting with step.
-func hasLine(state, step string) bool {
-	_, ok := lineOf(state, step)
-
-	return ok
-}
-
-// lineOf is the rest of a waiter's line for step, without the step's own word.
-// Only a line its newline ends counts: a read can land in the middle of an append.
-func lineOf(state, step string) (string, bool) {
-	lines := strings.Split(state, "\n")
-	for _, l := range lines[:len(lines)-1] {
-		if l == step {
-			return "", true
-		}
-		if rest, ok := strings.CutPrefix(l, step+" "); ok {
-			return rest, true
-		}
-	}
-
-	return "", false
-}
-
-// releaseToken is what releases a waiter holding jit: the registration's sha256.
-func releaseToken(jit string) string {
+// registrationID is the key a waiter reports under: its registration's sha256.
+func registrationID(jit string) string {
 	sum := sha256.Sum256([]byte(jit))
 
 	return hex.EncodeToString(sum[:])
 }
 
-// releaseWaiter tells a waiter holding at its registration to run the runner,
-// and answers when the release was first sent, which is no later than the waiter
-// acted on it: a first POST whose reply was lost may already have released it.
-func releaseWaiter(ctx context.Context, addr string, port int, token string) (time.Time, error) {
-	client := &http.Client{Timeout: time.Second}
-	url := fmt.Sprintf("http://%s:%d/release", addr, port)
-	first := time.Now()
-	deadline := first.Add(10 * time.Second)
-	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(token))
-		if err != nil {
-			return first, err
+// startStep is one step a waiter reported and when the host received it.
+type startStep struct {
+	line string
+	at   time.Time
+}
+
+// startServer is the host's end of the waiters' protocol: it keeps every step a
+// waiter reports, by key, with the host's time of receipt, and answers a waiter's
+// release once the experiment has released its key. A key is a sha256, and a
+// step is one of the four the waiter sends, whole; anything else is refused.
+type startServer struct {
+	mu       sync.Mutex
+	steps    map[string][]startStep
+	released map[string]bool
+	http     *http.Server
+	addr     string
+	done     chan struct{}
+}
+
+var (
+	startKey  = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	startLine = regexp.MustCompile(`^(waiting|registered [0-9]{1,15}|released [0-9]{1,15}|finished [0-9]{1,15} [0-9]{1,3})$`)
+)
+
+func newStartServer() *startServer {
+	return &startServer{steps: map[string][]startStep{}, released: map[string]bool{}, done: make(chan struct{})}
+}
+
+// listenForGuests starts a startServer on addr.
+func listenForGuests(ctx context.Context, addr string) (*startServer, error) {
+	var lc net.ListenConfig
+	listener, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	s := newStartServer()
+	s.addr = listener.Addr().String()
+	s.http = &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second}
+	go func() {
+		defer close(s.done)
+		_ = s.http.Serve(listener) //nolint:errcheck // ErrServerClosed at close, and close says the rest
+	}()
+
+	return s, nil
+}
+
+// url is where a guest reaches the server.
+func (s *startServer) url() string { return "http://" + s.addr }
+
+// close stops the listener and waits for it.
+func (s *startServer) close() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.http.Shutdown(ctx); err != nil {
+		_ = s.http.Close() // the shutdown's own error is the one that matters
+	}
+	<-s.done
+}
+
+func (s *startServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/state/"):
+		key := strings.TrimPrefix(r.URL.Path, "/state/")
+		body, err := io.ReadAll(io.LimitReader(r.Body, 64))
+		if err != nil || !startKey.MatchString(key) || !startLine.Match(body) {
+			http.Error(w, "not a step", http.StatusBadRequest)
+			return
 		}
-		resp, err := client.Do(req)
-		if err == nil {
-			err = resp.Body.Close()
-			if err == nil && resp.StatusCode == http.StatusOK {
-				return first, nil
+		at := time.Now()
+		s.mu.Lock()
+		s.steps[key] = append(s.steps[key], startStep{line: string(body), at: at})
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/release/"):
+		key := strings.TrimPrefix(r.URL.Path, "/release/")
+		s.mu.Lock()
+		go_ := s.released[key]
+		s.mu.Unlock()
+		if !go_ {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		fmt.Fprint(w, "go")
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// release lets the waiter reporting under key run its runner.
+func (s *startServer) release(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.released[key] = true
+}
+
+// reported is every step reported under key so far.
+func (s *startServer) reported(key string) []startStep {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.steps[key])
+}
+
+// await waits up to limit for the first step under key whose first word is step,
+// calling each, when given, on every poll.
+func (s *startServer) await(ctx context.Context, key, step string, limit time.Duration,
+	each func(),
+) (startStep, error) {
+	deadline := time.Now().Add(limit)
+	for {
+		if each != nil {
+			each()
+		}
+		for _, st := range s.reported(key) {
+			if first, _, _ := strings.Cut(st.line, " "); first == step {
+				return st, nil
 			}
 		}
 		if time.Now().After(deadline) {
-			return first, fmt.Errorf("release the waiter at %s: %w", url, err)
+			return startStep{}, fmt.Errorf("no %s step under %s.. after %s (had %d)", step, key[:12], limit,
+				len(s.reported(key)))
 		}
 		select {
 		case <-ctx.Done():
-			return first, ctx.Err()
-		case <-time.After(50 * time.Millisecond):
+			return startStep{}, ctx.Err()
+		case <-time.After(5 * time.Millisecond):
 		}
 	}
 }
 
+// stepFields are a step's numbers after its word.
+func stepFields(st startStep) []int64 {
+	var out []int64
+	for _, f := range strings.Fields(st.line)[1:] {
+		n, err := strconv.ParseInt(f, 10, 64)
+		if err != nil {
+			return nil
+		}
+		out = append(out, n)
+	}
+
+	return out
+}
+
 // runStartTrial runs one trial and fills its fields: when billet was asked, when
 // it answered, when the waiter had its registration by the guest's clock and when
-// the host first read it, the VMM's memory while the runner is held there and
+// the host received it, the VMM's memory while the runner is held there and
 // later, and when the runner finished its one job. The guest is destroyed however
 // the trial ends, before the next starts; one that could not be is
 // errTrialSurvived.
-func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provider.Spec, tr startTrial,
-	fields map[string]any,
+func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provider.Spec, server *startServer,
+	tr startTrial, fields map[string]any,
 ) (err error) {
 	t.Helper()
-	arm, leases, goldenMAC, goldenAddr := tr.arm, tr.leases, tr.goldenMAC, tr.goldenAddr
+	arm, goldenMAC, goldenAddr := tr.arm, tr.goldenMAC, tr.goldenAddr
 
 	jit, err := takeJIT(t.Context(), filepath.Join(tr.jits, strconv.Itoa(tr.index)+".jit"), 10*time.Minute)
 	if err != nil {
 		return err
 	}
+	key := registrationID(jit)
 
 	// A FORK ONLY WHILE THE GOLDEN'S ADDRESS IS STILL ITS OWN for longer than the
 	// fork can live, whether or not the fork's renewal works: a lease that could
@@ -466,7 +569,7 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	checked := time.Now()
 	killBy := checked.Add(forkLeaseNeed - killMargin)
 	if arm == "restore" {
-		left, err := goldenLeaseHolds(leases, goldenMAC, goldenAddr, forkLeaseNeed, checked)
+		left, err := goldenLeaseHolds(tr.leases, goldenMAC, goldenAddr, forkLeaseNeed, checked)
 		if err != nil {
 			return fmt.Errorf("%w: %w", errLeaseLost, err)
 		}
@@ -550,47 +653,23 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	if err != nil {
 		return err
 	}
-	addr := goldenAddr
-	if arm == "cold" {
-		mac, err := guestMAC(res.Tap)
-		if err != nil {
-			return err
-		}
-		if addr, err = leasedAddress(ctx, leases, mac, 2*time.Minute); err != nil {
-			return fmt.Errorf("the guest's address: %w", err)
-		}
-	} else {
-		// THE HOST'S NEIGHBOUR ENTRY FOR THE GOLDEN'S ADDRESS IS ASKED AGAIN, so the
-		// host finds the fork on its own tap rather than the paused builder on its.
-		// An entry that is not there is what this wants.
-		if out, err := exec.CommandContext(ctx, "ip", "neigh", "del", goldenAddr, "dev",
-			p.bridgeFor(provider.TrustTrusted)).CombinedOutput(); err != nil &&
-			!strings.Contains(string(out), "No such file") {
-			return fmt.Errorf("forget the host's neighbour entry for %s: %w: %s", goldenAddr, err, out)
-		}
-	}
 
-	registered, err := waiterState(ctx, addr, snapshotStartPort, 5*time.Minute,
-		func(s string) bool { return hasLine(s, "registered") })
+	registered, err := server.await(ctx, key, "registered", 5*time.Minute, nil)
 	if err != nil {
 		return fmt.Errorf("the waiter: %w", err)
 	}
-	// HELD AT ITS REGISTRATION, or the memory below is not of the same instruction.
-	if hasLine(registered.state, "released") || hasLine(registered.state, "finished") {
-		return fmt.Errorf("the waiter was already past its registration: %q", registered.state)
+	stamp := stepFields(registered)
+	if len(stamp) != 1 {
+		return fmt.Errorf("the waiter reported %q", registered.line)
 	}
-	stamp, _ := lineOf(registered.state, "registered")
-	guestMS, err := strconv.ParseInt(stamp, 10, 64)
-	if err != nil {
-		return fmt.Errorf("the waiter answered %q", registered.state)
-	}
+	guestMS := stamp[0]
 	fields["registered_guest_epoch_ms"] = guestMS
-	fields["registered_seen_ms"] = registered.seen.Sub(asked).Milliseconds()
+	fields["registered_seen_ms"] = registered.at.Sub(asked).Milliseconds()
 	fields["registered_guest_ms"] = guestMS - asked.UnixMilli()
-	// HOW FAR THE GUEST'S STAMP PRECEDES THE HOST'S FIRST READ OF IT: the poll's
-	// interval and latency, plus however far the guest's clock is behind the
-	// host's. A large value says the clock is behind; a negative one, ahead.
-	fields["guest_stamp_before_read_ms"] = registered.seen.UnixMilli() - guestMS
+	// HOW FAR THE GUEST'S STAMP PRECEDES THE HOST'S RECEIPT OF IT: the report's
+	// trip, plus however far the guest's clock is behind the host's. A large value
+	// says the clock is behind; a negative one, ahead.
+	fields["guest_stamp_before_receipt_ms"] = registered.at.UnixMilli() - guestMS
 
 	// THE MEMORY WHILE THE RUNNER IS HELD AT ITS REGISTRATION, the same instruction
 	// in both arms, then the release.
@@ -599,16 +678,12 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		return err
 	}
 	fields["memory_at_registered"] = smapsRollup(pid)
-	// THE SAMPLE THIRTY SECONDS ON COUNTS FROM THE FIRST POST, which is no later than
-	// the release; how long it took to be acknowledged is recorded beside it.
-	released, err := releaseWaiter(ctx, addr, snapshotStartPort, releaseToken(jit))
-	fields["release_acknowledged_ms"] = time.Since(released).Milliseconds()
-	if err != nil {
-		return err
-	}
+	released := time.Now()
+	server.release(key)
 
 	if arm == "restore" {
-		// THE FORK IS THE GOLDEN ON THE WIRE: its MAC, on its own tap.
+		// THE FORK IS THE GOLDEN ON THE WIRE: its MAC, on its own tap, which its
+		// report to the host has taught the bridge.
 		fdb, err := exec.CommandContext(ctx, "bridge", "fdb", "show", "dev", res.Tap).Output()
 		fields["fork_mac_is_golden"] = err == nil && strings.Contains(string(fdb), goldenMAC)
 	}
@@ -617,7 +692,7 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	// the release, while the job runs, and the peak.
 	var peak int64
 	sampled := false
-	finished, err := waiterState(ctx, addr, snapshotStartPort, 20*time.Minute, func(s string) bool {
+	finished, err := server.await(ctx, key, "finished", 20*time.Minute, func() {
 		m := smapsRollup(pid)
 		if pss, ok := m["Pss"]; ok && pss > peak {
 			peak = pss
@@ -626,72 +701,43 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 			fields["memory_30s_after_release"] = m
 			sampled = true
 		}
-
-		return hasLine(s, "finished")
 	})
 	fields["pss_peak_kib"] = peak
 	if err != nil {
 		return fmt.Errorf("the runner: %w", err)
 	}
-	if stamp, ok := lineOf(finished.state, "released"); ok {
-		if ms, err := strconv.ParseInt(stamp, 10, 64); err == nil {
-			fields["released_guest_ms"] = ms - asked.UnixMilli()
+	for _, st := range server.reported(key) {
+		if strings.HasPrefix(st.line, "released ") {
+			if n := stepFields(st); len(n) == 1 {
+				fields["released_guest_ms"] = n[0] - asked.UnixMilli()
+			}
 		}
 	}
-	rest, _ := lineOf(finished.state, "finished")
-	var finishedMS int64
-	var status int
-	if _, err := fmt.Sscanf(rest, "%d %d", &finishedMS, &status); err != nil {
-		return fmt.Errorf("the waiter answered %q", finished.state)
+	end := stepFields(finished)
+	if len(end) != 2 {
+		return fmt.Errorf("the waiter reported %q", finished.line)
 	}
-	fields["finished_guest_ms"] = finishedMS - asked.UnixMilli()
-	fields["runner_status"] = status
-	if status != 0 {
-		return fmt.Errorf("the runner exited %d", status)
+	fields["finished_guest_ms"] = end[0] - asked.UnixMilli()
+	fields["runner_status"] = end[1]
+	if end[1] != 0 {
+		return fmt.Errorf("the runner exited %d", end[1])
 	}
 
 	return nil
 }
 
-// waiterSeen is a waiter's state and when the host first read it.
-type waiterSeen struct {
-	state string
-	seen  time.Time
-}
-
-// waiterState polls a waiter's state every 20 ms until done accepts it.
-func waiterState(ctx context.Context, addr string, port int, limit time.Duration,
-	done func(string) bool,
-) (waiterSeen, error) {
-	client := &http.Client{Timeout: 200 * time.Millisecond}
-	url := fmt.Sprintf("http://%s:%d/", addr, port)
-	deadline := time.Now().Add(limit)
-	last := "nothing"
-	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
-		if err != nil {
-			return waiterSeen{}, err
-		}
-		if resp, err := client.Do(req); err == nil {
-			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			seen := time.Now()
-			readErr = errors.Join(readErr, resp.Body.Close())
-			if readErr == nil && resp.StatusCode == http.StatusOK {
-				last = string(body)
-				if done(last) {
-					return waiterSeen{state: last, seen: seen}, nil
-				}
-			}
-		}
-		if time.Now().After(deadline) {
-			return waiterSeen{}, fmt.Errorf("%s answered %q after %s", url, last, limit)
-		}
-		select {
-		case <-ctx.Done():
-			return waiterSeen{}, ctx.Err()
-		case <-time.After(20 * time.Millisecond):
-		}
+// holdLock takes an exclusive flock on path without waiting, and answers its
+// release.
+func holdLock(path string) (func(), error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return nil, err
 	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return nil, errors.Join(fmt.Errorf("%s is held by another user of the port: %w", path, err), f.Close())
+	}
+
+	return func() { _ = f.Close() }, nil // closing releases the flock, whatever it says
 }
 
 // leasedAddress is the address dnsmasq leased to mac, waiting for the lease.
@@ -874,26 +920,96 @@ func loadAverage() string {
 	return fields[0]
 }
 
-// ONLY A WHOLE LINE IS A STEP: a read that lands in the middle of an append sees
-// a tail without its newline, which is neither found nor parsed.
-func TestAWaiterStepIsAWholeLine(t *testing.T) {
+// THE HOST TAKES ONLY WHOLE STEPS UNDER A KEY, and releases only the key it was
+// told to: a malformed key or step is refused, a step is kept with the time it
+// arrived, and one key's release is not another's.
+func TestTheStartServerTakesOnlyWholeSteps(t *testing.T) {
 	t.Parallel()
 
-	for _, c := range []struct {
-		state, step, rest string
-		found             bool
-	}{
-		{"waiting\nregistered 1731600000123\n", "registered", "1731600000123", true},
-		{"waiting\nregistered 179", "registered", "", false},
-		{"waiting\nregistered 1731600000123\nfinished 17316", "finished", "", false},
-		{"waiting\n", "waiting", "", true},
-		{"waiting", "waiting", "", false},
-		{"waiting\nregisteredx 1\n", "registered", "", false},
-	} {
-		rest, found := lineOf(c.state, c.step)
-		if found != c.found || rest != c.rest {
-			t.Errorf("lineOf(%q, %s) = %q, %v; want %q, %v", c.state, c.step, rest, found, c.rest, c.found)
+	s := newStartServer()
+	srv := httptest.NewServer(s)
+	t.Cleanup(srv.Close)
+	key, other := registrationID("one"), registrationID("two")
+
+	post := func(k, body string) int {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+"/state/"+k,
+			strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
 		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		return resp.StatusCode
+	}
+	get := func(k string) string {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/release/"+k, http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err := errors.Join(err, resp.Body.Close()); err != nil {
+			t.Fatal(err)
+		}
+
+		return string(body)
+	}
+
+	for _, c := range []struct{ key, body string }{
+		{"not-a-key", "waiting"},
+		{key, "registered 179\nfinished 1 0"},
+		{key, "registered"},
+		{key, "registered 1731600000123 extra"},
+		{key, "finished 1731600000123"},
+		{key, "running 1"},
+		{strings.ToUpper(key), "waiting"},
+	} {
+		if code := post(c.key, c.body); code != http.StatusBadRequest {
+			t.Errorf("a step %q under %q answered %d; want it refused", c.body, c.key, code)
+		}
+	}
+	if steps := s.reported(key); len(steps) != 0 {
+		t.Fatalf("refused steps were kept: %v", steps)
+	}
+
+	before := time.Now()
+	for _, body := range []string{"waiting", "registered 1731600000123", "finished 1731600000999 3"} {
+		if code := post(key, body); code != http.StatusNoContent {
+			t.Errorf("the step %q answered %d; want it taken", body, code)
+		}
+	}
+	steps := s.reported(key)
+	if len(steps) != 3 || steps[1].line != "registered 1731600000123" || steps[1].at.Before(before) {
+		t.Errorf("the steps kept are %v; want the three, timed on arrival", steps)
+	}
+	if n := stepFields(steps[2]); len(n) != 2 || n[0] != 1731600000999 || n[1] != 3 {
+		t.Errorf("the finished step's fields are %v", n)
+	}
+
+	if got := get(key); got != "" {
+		t.Errorf("a key not released answered %q", got)
+	}
+	s.release(other)
+	if got := get(key); got != "" {
+		t.Errorf("another key's release released this one (%q)", got)
+	}
+	s.release(key)
+	if got := get(key); got != "go" {
+		t.Errorf("a released key answered %q; want go", got)
+	}
+	if code := post(key, "registered 1"); code != http.StatusNoContent || len(s.reported(other)) != 0 {
+		t.Errorf("one key's steps reached another's")
 	}
 }
 
@@ -925,7 +1041,11 @@ func TestAForkRunsOnlyOnALeaseStillItsOwn(t *testing.T) {
 			t.Errorf("%s: admitted %v (%v), want %v", c.name, err == nil, err, c.ok)
 		}
 	}
-	if left, err := goldenLeaseHolds(anHourLeaseFile(t), mac, addr, 0, now); err != nil || left != time.Hour {
+	path := filepath.Join(t.TempDir(), "dnsmasq.leases")
+	if err := os.WriteFile(path, []byte("1731603600 02:00:00:00:00:0a 172.31.0.42 * *\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if left, err := goldenLeaseHolds(path, mac, addr, 0, now); err != nil || left != time.Hour {
 		t.Errorf("a lease with an hour left answered %s (%v)", left, err)
 	}
 	if _, err := goldenLeaseHolds(filepath.Join(t.TempDir(), "absent"), mac, addr, 0, now); err == nil {
@@ -933,51 +1053,40 @@ func TestAForkRunsOnlyOnALeaseStillItsOwn(t *testing.T) {
 	}
 }
 
-// postRelease sends one release with token to a waiter on this host, and answers
-// its status.
-func postRelease(t *testing.T, port int, token string) int {
-	t.Helper()
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		fmt.Sprintf("http://127.0.0.1:%d/release", port), strings.NewReader(token))
+// THE PORT'S LOCK EXCLUDES ANOTHER HOLDER: a second take refuses while the first
+// holds it, and succeeds once it is released.
+func TestThePortsLockExcludesAnotherHolder(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "port.lock")
+	release, err := holdLock(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	if again, err := holdLock(path); err == nil {
+		again()
+		t.Error("a lock already held was taken again")
+	}
+	release()
+	again, err := holdLock(path)
 	if err != nil {
-		t.Fatalf("post a release: %v", err)
+		t.Fatalf("a released lock could not be taken: %v", err)
 	}
-	if err := resp.Body.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	return resp.StatusCode
+	again()
 }
 
-// anHourLeaseFile is a lease file giving the test's golden address an hour from its now.
-func anHourLeaseFile(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "dnsmasq.leases")
-	if err := os.WriteFile(path, []byte("1731603600 02:00:00:00:00:0a 172.31.0.42 * *\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	return path
-}
-
-// THE WAITER WAITS FOR A REAL REGISTRATION AND SAYS WHAT IT DID: against a stand-in
-// for the metadata service, it serves "waiting" while the service answers the
-// placeholder, asks for a fresh token before every read (a restored VMM honours
-// none the golden's did, which the stand-in enforces by honouring only the newest
-// token), holds at its registration without running the runner until it is
-// released, runs the runner with the registration the service then gives, serves
-// every step's line, and holds on after the runner finishes.
+// THE WAITER WAITS FOR A REAL REGISTRATION AND REPORTS WHAT IT DID: against a
+// stand-in for the metadata service and the host's own server, it reports waiting
+// under the placeholder's key while the service answers the placeholder, asks for
+// a fresh token before every read (a restored VMM honours none the golden's did,
+// which the stand-in enforces by honouring only the newest token), reports its
+// registration under that registration's key, holds there without running the
+// runner until that key is released, runs the runner with the registration the
+// service gives, reports every step, and holds on after the runner finishes.
 func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS != "linux" {
-		t.Skip("the waiter stamps its state with GNU date's %3N")
-	}
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("no python3 to serve the waiter's state")
+		t.Skip("the waiter stamps its steps with GNU date's %3N")
 	}
 
 	var mu sync.Mutex
@@ -1008,20 +1117,11 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	}))
 	t.Cleanup(mmds.Close)
 
-	var lc net.ListenConfig
-	listener, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	server, err := listenForGuests(t.Context(), "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr, ok := listener.Addr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("a TCP listener answered %T for its address", listener.Addr())
-	}
-	port := addr.Port
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-
+	t.Cleanup(server.close)
 	dir := t.TempDir()
 	seen := filepath.Join(dir, "seen")
 	// A RECORDER IN PLACE OF THE GUEST'S RENEWAL, so the host's own networking is
@@ -1032,12 +1132,10 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A PROCESS GROUP OF ITS OWN, so the listener and the sleep the waiter leaves
-	// behind are ended with it.
+	// A PROCESS GROUP OF ITS OWN, so the sleep the waiter leaves behind ends with it.
 	cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", snapshotStartWaiter, "waiter",
-		snapshotStartPlaceholder, mmds.URL, strconv.Itoa(port), "printf renewed >"+renewed, "127.0.0.1")
+		snapshotStartPlaceholder, mmds.URL, server.url(), "printf renewed >"+renewed)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "TMPDIR="+dir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -1055,9 +1153,9 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 		<-exited
 	})
 
-	if _, err := waiterState(t.Context(), "127.0.0.1", port, 30*time.Second,
-		func(s string) bool { return hasLine(s, "waiting") }); err != nil {
-		t.Fatalf("the waiter never served waiting: %v", err)
+	goldenKey, realKey := registrationID(snapshotStartPlaceholder), registrationID("a-real-registration")
+	if _, err := server.await(t.Context(), goldenKey, "waiting", 30*time.Second, nil); err != nil {
+		t.Fatalf("the waiter never reported waiting: %v", err)
 	}
 	// SEVERAL READS OF THE PLACEHOLDER, so the token rule has had its chance to bite.
 	deadline := time.Now().Add(10 * time.Second)
@@ -1073,20 +1171,10 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-
-	// NOTHING REGISTERED WHILE THE PLACEHOLDER IS SERVED, and no release taken.
-	before, err := waiterState(t.Context(), "127.0.0.1", port, 5*time.Second, func(string) bool { return true })
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, step := range []string{"registered", "released", "finished"} {
-		if hasLine(before.state, step) {
-			t.Errorf("the waiter served %s before it had a real registration: %q", step, before.state)
-		}
-	}
-	for _, token := range []string{releaseToken(snapshotStartPlaceholder), ""} {
-		if code := postRelease(t, port, token); code != http.StatusForbidden {
-			t.Errorf("a release with token %q before the registration answered %d; want it refused", token, code)
+	// NOTHING BUT WAITING WHILE THE PLACEHOLDER IS SERVED.
+	for _, st := range server.reported(goldenKey) {
+		if st.line != "waiting" {
+			t.Errorf("the waiter reported %q before it had a real registration", st.line)
 		}
 	}
 
@@ -1095,46 +1183,38 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	jit = "a-real-registration"
 	mu.Unlock()
 
-	registered, err := waiterState(t.Context(), "127.0.0.1", port, 30*time.Second,
-		func(s string) bool { return hasLine(s, "registered") })
+	registered, err := server.await(t.Context(), realKey, "registered", 30*time.Second, nil)
 	if err != nil {
-		t.Fatalf("the waiter never served registered: %v", err)
+		t.Fatalf("the waiter never reported registered: %v", err)
 	}
-	// STAMPED BETWEEN THE SWITCH AND THE READ, on this host's one clock.
-	stamp, _ := lineOf(registered.state, "registered")
-	if ms, err := strconv.ParseInt(stamp, 10, 64); err != nil ||
-		ms < switched.UnixMilli() || ms > registered.seen.UnixMilli() {
-		t.Errorf("the registration was stamped %q, not between the switch (%d) and the read (%d)",
-			stamp, switched.UnixMilli(), registered.seen.UnixMilli())
+	// STAMPED BETWEEN THE SWITCH AND ITS ARRIVAL, on this host's one clock.
+	if n := stepFields(registered); len(n) != 1 || n[0] < switched.UnixMilli() || n[0] > registered.at.UnixMilli() {
+		t.Errorf("the registration was stamped %q, not between the switch (%d) and its arrival (%d)",
+			registered.line, switched.UnixMilli(), registered.at.UnixMilli())
 	}
-	// HELD THERE until released by the registration's own token: the runner has not
-	// run a moment later, nor after a release carrying another.
-	if code := postRelease(t, port, releaseToken("another-registration")); code != http.StatusForbidden {
-		t.Errorf("a release with another registration's token answered %d; want it refused", code)
-	}
+	// HELD THERE until its own key is released: another key's release does not,
+	// and the runner has not run a moment later.
+	server.release(goldenKey)
 	time.Sleep(300 * time.Millisecond)
 	if _, err := os.Stat(seen); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the runner ran before the waiter was released (%v)", err)
 	}
-	if _, err := releaseWaiter(t.Context(), "127.0.0.1", port, releaseToken("a-real-registration")); err != nil {
-		t.Fatal(err)
-	}
+	server.release(realKey)
 
-	finished, err := waiterState(t.Context(), "127.0.0.1", port, 30*time.Second,
-		func(s string) bool { return hasLine(s, "finished") })
+	finished, err := server.await(t.Context(), realKey, "finished", 30*time.Second, nil)
 	if err != nil {
-		t.Fatalf("the waiter never served finished: %v", err)
+		t.Fatalf("the waiter never reported finished: %v", err)
 	}
-	for _, step := range []string{"waiting", "registered", "released"} {
-		if !hasLine(finished.state, step) {
-			t.Errorf("the finished state %q lost its %s line", finished.state, step)
-		}
+	if n := stepFields(finished); len(n) != 2 || n[1] != 3 {
+		t.Errorf("the waiter reported %q; want the runner's status 3", finished.line)
 	}
-	var at int64
-	var status int
-	rest, _ := lineOf(finished.state, "finished")
-	if _, err := fmt.Sscanf(rest, "%d %d", &at, &status); err != nil || status != 3 {
-		t.Errorf("the waiter served %q; want the runner's status 3", finished.state)
+	var words []string
+	for _, st := range server.reported(realKey) {
+		first, _, _ := strings.Cut(st.line, " ")
+		words = append(words, first)
+	}
+	if !slices.Equal(words, []string{"registered", "released", "finished"}) {
+		t.Errorf("the waiter reported %v under its registration; want registered, released, finished", words)
 	}
 	if got, err := os.ReadFile(seen); err != nil || string(got) != "a-real-registration" {
 		t.Errorf("the runner was given %q (%v); want the real registration", got, err)
@@ -1142,7 +1222,7 @@ func TestTheSnapshotStartWaiterWaitsForARealRegistration(t *testing.T) {
 	if got, err := os.ReadFile(renewed); err != nil || string(got) != "renewed" {
 		t.Errorf("the waiter did not run its renewal (%q, %v)", got, err)
 	}
-	// AND IT HOLDS ON, listener and all, until the host destroys the guest.
+	// AND IT HOLDS ON until the host destroys the guest.
 	select {
 	case <-exited:
 		t.Errorf("the waiter ended (%v) after its runner; want it holding on", waitErr)
