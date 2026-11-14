@@ -386,8 +386,14 @@ func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
 // block 545 (Input/output error)" measured 2026-11-13, and from its source the
 // extended attribute block's (problem.c PR_1_READ_EA_BLOCK), the extent tree's
 // (PR_1_READ_EXTENT) and a short read's (unix_io).
-var readFailure = regexp.MustCompile(`Error reading (block|extended attribute block) [0-9]+|` +
-	`Error while reading over extent tree|resulted in short read`)
+//
+// EACH IN ITS OWN CONTEXT: a block's read error carries its errno in parentheses, the
+// others name the inode, so a directory entry named "Error reading block 1" in a
+// report of real damage is not one (a content-addressed volume's names are digests
+// the node chose, but the check does not lean on that).
+var readFailure = regexp.MustCompile(`Error reading block [0-9]+ \(|` +
+	`Error reading extended attribute block [0-9]+ for inode|` +
+	`Error while reading over extent tree in inode|resulted in short read`)
 
 // readFailureWatcher watches e2fsck's output for a read that failed.
 func readFailureWatcher() *patternWatcher {

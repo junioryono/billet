@@ -84,7 +84,6 @@ func (p *Provider) DetachVolume(
 		return err
 	}
 
-	named := device
 	if device != "" && !p.slotHolds(j.volumePath(slot), device) {
 		device = ""
 	}
@@ -93,20 +92,19 @@ func (p *Provider) DetachVolume(
 		return fmt.Errorf("firecracker: write cache slot %d of %s back before detaching it: %w",
 			slot, instanceID, lost)
 	}
-	// A SLOT THAT NO LONGER HOLDS THE DEVICE CAN BE ONE AN EARLIER DETACH EMPTIED: it
-	// puts the placeholder in before its PATCH, and a PATCH that failed kept the loss it
-	// had heard, which nothing writes back to tell again. Kept for this device and this
-	// disk, it is told here.
-	if lost == nil && device == "" && named != "" {
-		seq, known := p.diskSeqOf(named)
-		lost = p.takeLoss(named, seq, known)
+	// A DETACH THAT FAILED KEPT WHAT IT HEARD FOR THE SLOT, and the next is told it
+	// whatever device it is handed: the failed one put the placeholder in before its
+	// PATCH, so the slot no longer holds the device, and a detach whose proof of the
+	// device failed is handed none. The slot is this VM's until its detach succeeds.
+	if slotLost := p.takeSlotLoss(instanceID, slot); lost == nil {
+		lost = slotLost
 	}
 
 	// A DETACH THAT FAILED SAYS ONLY THAT IT FAILED: ErrWritesLost is the promise that
 	// the volume is detached, so lost writes heard before a failure are kept for the
-	// next detach of the device to be told (flushBefore).
+	// slot's next detach to be told.
 	if err := p.replaceVolumePath(j, res, slot, ""); err != nil {
-		p.keepLoss(named, "", lost)
+		p.keepSlotLoss(instanceID, slot, lost)
 
 		return err
 	}
@@ -114,7 +112,7 @@ func (p *Provider) DetachVolume(
 	id := provider.VolumeSlotID(slot)
 	if err := p.apiAs(j.socket(), res.UID).withTimeout(callerTime(ctx)).patch(ctx, "/drives/"+id,
 		map[string]string{"drive_id": id, "path_on_host": "/" + id}); err != nil {
-		p.keepLoss(named, "", lost)
+		p.keepSlotLoss(instanceID, slot, lost)
 
 		return fmt.Errorf("firecracker: detach cache slot %d from %s: %w", slot, instanceID, err)
 	}
@@ -229,13 +227,10 @@ type writesLoss struct {
 }
 
 // keepLoss keeps lost, if anything was lost, for the next detach of device to be told,
-// as lost by the disk seq names, or by the disk the name is now when seq is empty.
+// as lost by the disk seq names (none known when it is empty).
 func (p *Provider) keepLoss(device, seq string, lost error) {
 	if lost == nil || device == "" {
 		return
-	}
-	if seq == "" {
-		seq, _ = p.diskSeqOf(device)
 	}
 
 	p.flushMu.Lock()
@@ -247,17 +242,37 @@ func (p *Provider) keepLoss(device, seq string, lost error) {
 	p.unreported[device] = writesLoss{seq: seq, err: lost}
 }
 
-// takeLoss is the loss kept for device, if it is the disk seq names (or either's
-// number is unknown), taken out so it is told once.
-func (p *Provider) takeLoss(device, seq string, known bool) error {
+func slotKey(instanceID string, slot int) string { return fmt.Sprintf("%s/%d", instanceID, slot) }
+
+// keepSlotLoss keeps lost, if anything was lost, for the slot's next detach.
+func (p *Provider) keepSlotLoss(instanceID string, slot int, lost error) {
+	if lost == nil {
+		return
+	}
+
 	p.flushMu.Lock()
 	defer p.flushMu.Unlock()
 
-	return p.takeLossLocked(device, seq, known)
+	if p.slotLosses == nil {
+		p.slotLosses = map[string]error{}
+	}
+	p.slotLosses[slotKey(instanceID, slot)] = lost
 }
 
-// takeLossLocked is takeLoss under flushMu. A loss kept for another disk that took
-// the name is forgotten.
+// takeSlotLoss is the loss kept for the slot, taken out so it is told once.
+func (p *Provider) takeSlotLoss(instanceID string, slot int) error {
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+
+	lost := p.slotLosses[slotKey(instanceID, slot)]
+	delete(p.slotLosses, slotKey(instanceID, slot))
+
+	return lost
+}
+
+// takeLossLocked is the loss kept for device, if it is the disk seq names (or either's
+// number is unknown), taken out under flushMu so it is told once. A loss kept for
+// another disk that took the name is forgotten.
 func (p *Provider) takeLossLocked(device, seq string, known bool) error {
 	loss, kept := p.unreported[device]
 	if !kept {

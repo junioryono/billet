@@ -516,7 +516,9 @@ func TestTheDamageCheckRunsInTheCLocale(t *testing.T) {
 	if err := forkSafeWriteFile(e2fsck, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if damaged, err := checkDamageWith(t.Context(), e2fsck, "/dev/rbd9"); damaged || err == nil {
-		t.Errorf("a failed read under a translating locale answered %v, %v; want could-not-tell", damaged, err)
+	if damaged, err := checkDamageWith(t.Context(), e2fsck, "/dev/rbd9"); damaged || err == nil ||
+		!strings.Contains(err.Error(), "could not read all of it") {
+		t.Errorf("a failed read under a translating locale answered %v, %v; want could-not-tell for the "+
+			"failed read", damaged, err)
 	}
 }

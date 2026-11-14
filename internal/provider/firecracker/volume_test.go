@@ -579,8 +579,9 @@ func TestAWriteBackOfAnotherDiskIsNoAnswer(t *testing.T) {
 		synctest.Wait()
 		// THE LOSS IS THE OLD DISK'S, named while its descriptor was held, so the new
 		// disk's next caller writes back its own.
-		if err := p.flushBefore(t.Context(), "/dev/rbd4"); err != nil {
-			t.Errorf("the new disk's next caller was told %v, want its own write-back", err)
+		if err := p.flushBefore(t.Context(), "/dev/rbd4"); err != nil || opens != 2 {
+			t.Errorf("the new disk's next caller was told %v after %d open(s), want its own write-back, "+
+				"a second open", err, opens)
 		}
 	})
 }
@@ -590,6 +591,19 @@ func TestAWriteBackOfAnotherDiskIsNoAnswer(t *testing.T) {
 // its failure, and the next detach, whose PATCH goes through, is told what was lost.
 func TestADetachThatFailedKeepsItsLostWritesForTheNext(t *testing.T) {
 	t.Parallel()
+
+	// THE NEXT DETACH IS HANDED THE DEVICE, OR NONE, as one whose proof of the device
+	// failed is; either is told.
+	for name, retryDevice := range map[string]string{"handed the device": "/dev/nvme9n1", "handed none": ""} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			detachThatFailedThenRetried(t, retryDevice)
+		})
+	}
+}
+
+func detachThatFailedThenRetried(t *testing.T, retryDevice string) {
+	t.Helper()
 
 	h := newHarness(t)
 	var vmm *fakeVMM
@@ -628,8 +642,11 @@ func TestADetachThatFailedKeepsItsLostWritesForTheNext(t *testing.T) {
 	if err == nil || errors.Is(err, provider.ErrWritesLost) {
 		t.Fatalf("a detach whose PATCH failed answered %v, want its failure and not lost writes", err)
 	}
-	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); !errors.Is(err, provider.ErrWritesLost) {
+	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, retryDevice); !errors.Is(err, provider.ErrWritesLost) {
 		t.Fatalf("the next detach answered %v, want the lost writes the failed one heard", err)
+	}
+	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, retryDevice); errors.Is(err, provider.ErrWritesLost) {
+		t.Errorf("a third detach was told the lost writes again: %v", err)
 	}
 }
 

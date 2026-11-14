@@ -84,6 +84,8 @@ func TestTheWatcherSeesAFailedReadSplitAcrossWrites(t *testing.T) {
 			"Multiply-claimed block(s) in inode 12: 1033Error reading block 1034 (Input/output error).  " +
 			"Ignore error? no\n",
 		"Error reading extended attribute block 33280 for inode 12.  Clear? no\n",
+		"Error while reading over extent tree in inode 12: Input/output error\nClear inode? no\n",
+		"Attempt to read block from filesystem resulted in short read while reading block 1034\n",
 	} {
 		for split := range len(output) {
 			w := readFailureWatcher()
@@ -104,6 +106,8 @@ func TestTheWatcherSeesAFailedReadSplitAcrossWrites(t *testing.T) {
 	for _, parts := range [][]string{
 		{"Error rea", "ched the end", " of reading\n"},
 		{"Entry 'Error reading' in / (2) has deleted/unused inode 20.  Clear? no\n"},
+		{"Entry 'Error reading block 1' in / (2) has deleted/unused inode 20.  Clear? no\n"},
+		{"Entry 'Error reading extended attribute block 7' in / (2) has an incorrect filetype\n"},
 		{"Inode 12, i_blocks is 8, should be 0.  Fix? no\n", "Block bitmap differences:  -(33904--33919)\n"},
 	} {
 		w := readFailureWatcher()
