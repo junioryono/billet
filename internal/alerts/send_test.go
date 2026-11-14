@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -141,67 +142,28 @@ func TestARedirectIsNotFollowed(t *testing.T) {
 	}
 }
 
-// A DESTINATION THAT HANGS COSTS ONE BOUNDED TRY, ends with no address in its error,
-// and holds up nothing else: another destination is delivered while it hangs.
-func TestADestinationThatHangsIsBoundedAndHoldsUpNothingElse(t *testing.T) {
+// A DESTINATION THAT HANGS COSTS ONE BOUNDED TRY, and ends with no address in its error:
+// its own bound ends it, not the transport's longer ones behind it.
+func TestADestinationThatHangsIsBounded(t *testing.T) {
 	t.Parallel()
 
 	// RELEASED BEFORE THE SERVER CLOSES, which waits for its handlers: cleanups run
 	// last first, so this one is registered after the server's.
 	release := make(chan struct{})
-	entered := make(chan struct{}, 1)
 	hung, address := destination(t, func(_ http.ResponseWriter, r *http.Request) {
-		entered <- struct{}{}
 		select {
 		case <-release:
 		case <-r.Context().Done():
 		}
 	})
 	t.Cleanup(func() { close(release) })
-	// LONG ENOUGH TO REACH THE HANDLER, AND TO DELIVER THE OTHER ONE INSIDE IT, on a loaded
-	// runner: at 100 ms a CI run's try ran out before its request arrived, and the wait for
-	// it to arrive never ended (2026-11-14). Short of the transport's own bounds (8 s for a
-	// response's headers, 10 s for the whole request), which the ceiling below tells apart.
+	// SHORT OF THE TRANSPORT'S OWN BOUNDS (8 s for a response's headers, 10 s for the whole
+	// request), which the ceiling below tells apart.
 	hung.timeout = 2 * time.Second
-
-	fine, _ := destination(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	result := make(chan error, 1)
 	begun := time.Now()
 	go func() { result <- hung.Send(t.Context(), []byte(`{}`)) }()
-
-	select {
-	case <-entered:
-	case err := <-result:
-		// BOTH MAY BE READY, when this goroutine was slow to get here.
-		select {
-		case <-entered:
-			t.Fatalf("the hung try ended (%v) before the other destination could be sent beside it", err)
-		default:
-			t.Fatalf("the hung try ended (%v) before its request reached the destination", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the hung try's request never reached the destination")
-	}
-
-	// THE OTHER ONE, WHILE THIS ONE IS DEMONSTRABLY INSIDE ITS REQUEST: delivered within a
-	// bound of its own, and before the hung try has ended, so one that waited for the hung
-	// try fails here rather than passing once it ran out.
-	delivered := make(chan error, 1)
-	go func() { delivered <- fine.Send(t.Context(), []byte(`{}`)) }()
-	select {
-	case err := <-delivered:
-		if err != nil {
-			t.Errorf("another destination, while one hung: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("another destination was held up by the one that hung")
-	}
-	select {
-	case err := <-result:
-		t.Fatalf("the hung try had ended (%v) by the time the other destination was delivered", err)
-	default:
-	}
 
 	select {
 	case err := <-result:
@@ -216,9 +178,77 @@ func TestADestinationThatHangsIsBoundedAndHoldsUpNothingElse(t *testing.T) {
 		t.Fatal("a destination that hangs held its request past its bound")
 	}
 
-	// ITS OWN BOUND ENDED IT, not the transport's longer ones behind it.
 	if took := time.Since(begun); took < hung.timeout || took > 6*time.Second {
 		t.Errorf("the try ended after %s, want its bound of %s", took, hung.timeout)
+	}
+}
+
+// A DESTINATION THAT HANGS HOLDS UP NOTHING ELSE: another destination is delivered while
+// it is still inside its request. The proof is the servers', never the test's timing: the
+// hung destination's handler holds its request until the other destination's request has
+// reached its own server, so a sender that made one destination wait for another would
+// leave the hung request to its bound, and the other one's bound, shorter, ends the test
+// first. (A CI run hung 35 minutes on an earlier form of this test, whose 100 ms try ran
+// out before its request arrived, while the test waited for it with no bound; 2026-11-14.)
+func TestADestinationThatHangsHoldsUpNothingElse(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	arrived := make(chan struct{})
+	var overlapped atomic.Bool
+	hung, _ := destination(t, func(_ http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		select {
+		case <-arrived:
+			overlapped.Store(true)
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	t.Cleanup(func() { close(release) })
+	hung.timeout = 20 * time.Second
+
+	var once sync.Once
+	fine, _ := destination(t, func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() { close(arrived) })
+		w.WriteHeader(http.StatusOK)
+	})
+
+	result := make(chan error, 1)
+	go func() { result <- hung.Send(t.Context(), []byte(`{}`)) }()
+
+	// THE HUNG REQUEST IS INSIDE ITS HANDLER before the other is sent, so the other cannot
+	// go first and find nothing to overlap.
+	select {
+	case <-entered:
+	case err := <-result:
+		t.Fatalf("the hung try ended (%v) before its request reached the destination", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hung try's request never reached the destination")
+	}
+
+	delivered := make(chan error, 1)
+	go func() { delivered <- fine.Send(t.Context(), []byte(`{}`)) }()
+	select {
+	case err := <-delivered:
+		if err != nil {
+			t.Errorf("another destination, beside one that hangs: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("another destination was held up by the one that hangs")
+	}
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Errorf("the hung destination, released by the other's delivery: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hung destination was not released by the other's delivery")
+	}
+	if !overlapped.Load() {
+		t.Error("the other destination was delivered only once the hung request had ended")
 	}
 }
 
