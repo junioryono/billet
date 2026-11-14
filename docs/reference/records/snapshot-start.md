@@ -4,14 +4,21 @@ How much sooner a GitHub Actions job starts, and how much less memory its guest 
 
 ## The question and what would answer it
 
-[Workspace snapshots](workspace-snapshots.md) measured the primitive by hand: a paused load in 4 to 5 ms, and a probe agent answering 31 to 38 ms after its VMM started. Neither of those is a job. The question here is what restoring buys a CI job end to end, through billet's own provider: from billet being asked for a guest to that guest's runner holding its registration, and from there to GitHub starting the job; and what the guest's VMM holds in host memory at the same point.
+[Workspace snapshots](workspace-snapshots.md) measured the primitive by hand: a paused load in 4 to 5 ms, and a probe agent answering 31 to 38 ms after its VMM started. Neither of those is a job. The question here is what restoring buys a CI job end to end, through billet's own provider. That means three things:
+- the time from billet being asked for a guest to that guest's waiter having its runner's registration;
+- the time from there to GitHub starting the job;
+- what the guest's VMM holds in host memory at that point.
 
 What would count as success:
-- a restored runner holding its registration well under a second after billet is asked, at the median, against the several seconds a cold boot spends booting and setting up its guest;
+- a restored guest having its registration well under a second after billet is asked, at the median, against the several seconds a cold boot spends booting and setting up its guest;
 - GitHub starting the job measurably sooner;
 - the restored VMM holding less host memory at the same instruction.
 
-The comparison is billet's existing method, a cold boot of the same golden generation with the same command, run in the same session and interleaved with the restores.
+The comparison is billet's existing method, a cold boot of the same golden generation with the same command, run in the same session and interleaved with the restores. Each arm ran as it would be configured:
+- cold guests with the provider's ordinary boot arguments;
+- restored guests inheriting the golden's `clocksource=kvm-clock`.
+
+So the run compares the two methods as each would run, not snapshotting alone.
 
 ## How it was measured
 
@@ -35,38 +42,47 @@ The waiter reported `registered` with the guest's clock, then held the runner un
 
 **The guest reports to the host.** The node's firewall drops everything a guest sends the host except DNS, DHCP, the node's cache port and the image verification port. The experiment's first attempt that day polled a listener inside the guest, and failed: the guest leased an address and answered nothing. So the host listened on the image verification port, holding `billet images verify`'s own lock. It kept steps only for the key of the trial in progress, the sha256 of its registration.
 
-**Conditions.** The node ran its production guests throughout. Its one-minute load average was 38 to 63, and is recorded on every trial. Each fork came up on the golden's MAC on a tap of its own, which the bridge's forwarding table confirmed on every restore. The forks were restored 56 to 852 seconds after the capture.
+**Conditions.**
+- **Load.** The node ran its production guests throughout. Its one-minute load average was 38 to 63, and is recorded on every trial.
+- **MAC.** Each fork came up on the golden's MAC on a tap of its own, which the bridge's forwarding table confirmed on every restore.
+- **Snapshot age.** The forks were restored 56 to 852 seconds after the capture, the oldest about 14 minutes.
 
 ## Results
 
 | Measure (median, min to max, 10 trials each) | Cold boot | Restore |
 |---|---|---|
 | `Launch` / `Restore` answered | 792 ms (394 to 3,653) | 498 ms (432 to 2,222) |
-| Runner had its registration, host's clock | 6,545 ms (5,085 to 13,375) | 756 ms (647 to 2,443) |
-| Runner had its registration, after `Launch` / `Restore` answered | 5,335 ms | 219 ms |
+| Waiter had the runner's registration, on the host's clock | 6,545 ms (5,085 to 13,375) | 756 ms (647 to 2,443) |
+| Waiter had the runner's registration, after `Launch` / `Restore` answered | 5,335 ms | 219 ms |
 | GitHub started the job, after billet was asked | 10 s (8 to 16) | 5 s (4 to 6) |
-| Guest's stamp before the host received it (clock offset and trip) | 36 ms (35 to 40) | 53 ms (40 to 73) |
+| Host's receipt of the registration less the guest's stamp (clock offset and delivery together) | 36 ms (35 to 40) | 53 ms (40 to 73) |
 | VMM's PSS while the runner was held at its registration | 651 MiB (646 to 655) | 310 MiB (219 to 345) |
 | of which private dirty | 651 MiB | 58 MiB (37 to 82) |
-| of which file-backed (the snapshot's memory file) | 2 MiB | 250 MiB (184 to 277) |
-| VMM's PSS 30 s into the job | 798 MiB (788 to 821) | 508 MiB (395 to 608) |
-| VMM's peak PSS during the job | 799 MiB (797 to 821) | 519 MiB (407 to 608) |
+| of which file-backed, all mappings together | 2 MiB | 250 MiB (184 to 277) |
+| VMM's PSS 30 s after the host received `released` | 798 MiB (788 to 821) | 508 MiB (395 to 608) |
+| Largest PSS sampled from the release to the runner's end | 799 MiB (797 to 821) | 519 MiB (407 to 608) |
 | Jobs GitHub reported as succeeded | 10 of 10 | 10 of 10 |
 
 **The golden.** It booted to its waiter in 8.3 s, and its capture took 18.4 s, writing a 4 GiB memory file.
 
-**Clean teardown.** Every trial's guest was destroyed before the next began. After the run, no jail, clone, golden disk, snapshot, mapping, listener or runner registration was left.
+**Teardown.**
+- **Per trial.** Every trial's `Destroy` returned success before the next began.
+- **After the run**, the node was checked: no jail of the run's instances, no image of its golden in either pool, no mapping of them, and nothing listening on the image verification port.
+- **Runners.** The organization had no runner left under the run's labels.
 
 ## What it means
 
-- **A restored runner is ready in under a second.** The median was 0.76 s from billet being asked to the runner holding its registration, against 6.5 s for a cold boot. A fork spent a median 219 ms between its `Restore` answering and its registration: the time to resume, read its metadata and report. A cold guest spent 5.3 s booting its kernel and running its agent's setup.
-- **GitHub started the job about 5 seconds sooner.** The median was 5 s against 10 s, measured at GitHub's one-second resolution. The roughly 4 s between a runner's registration and the job's start is GitHub's own, and is the same in both arms.
-- **The restored guest holds about half the host memory, most of it shareable.** A fork's VMM held 310 MiB at its registration, against 651 MiB cold, and only 58 MiB of that was private dirty. The other 250 MiB was pages of the snapshot's memory file, which every fork restored from one capture maps from the same read-only file. These forks ran one at a time, so each was charged all of those pages. Concurrent forks would share them, as the ten concurrent forks in [Workspace snapshots](workspace-snapshots.md) did: 227 MiB PSS together. During the job the gap stayed at about 290 MiB.
-- **The clock was right.** The guest's stamp preceded the host's receipt by 35 to 73 ms in both arms, which is the report's trip, so restored guests kept time with the host as cold ones did. `clock_realtime` on every x86 load and `kvm-clock` in the golden are what ADR-017 relies on, and both are now in the provider.
+- **A restored guest has its registration in under a second.** The median was 0.76 s from billet being asked to the waiter having the runner's registration, against 6.5 s for a cold boot. A fork spent a median 219 ms between its `Restore` answering and that point: the time to resume, read its metadata and report. A cold guest spent 5.3 s booting its kernel and running its agent's setup.
+- **GitHub started the job about 5 seconds sooner.** The median was 5 s against 10 s, measured at GitHub's one-second resolution. The rest of the interval is the same in both arms: a median 3.7 s from the registration to GitHub's start. It covers the waiter's hold for the memory sample, the runner's own start, and its handover with GitHub, which this does not separate.
+- **The restored guest holds about half the host memory.** A fork's VMM held 310 MiB at its registration, against 651 MiB cold, and only 58 MiB of that was private dirty. 250 MiB was file-backed. That is all the VMM's file mappings together, which for a restored guest are presumably mostly the snapshot's memory file, but `smaps_rollup` does not say which file.
+  - These forks ran one at a time, so each was charged all of its file-backed pages.
+  - The ten concurrent forks in [Workspace snapshots](workspace-snapshots.md) held 227 MiB PSS together. Those were 2 GiB probe guests with no application stack, sampled a few seconds after resume, so they show that the pages are shared, not what concurrent runners of this shape would hold. That is unmeasured.
+  - The medians differed by 290 MiB 30 s after the release and by 280 MiB at the largest sample.
+- **The clock agreed within tens of milliseconds.** The host received a guest's stamp 35 to 73 ms after the time the stamp carried, in both arms. That figure combines clock offset and delivery and cannot separate them. It is consistent with a restored guest keeping near the host's time, as a cold one does, where an unadjusted fork would be as far behind as the snapshot's age. `clock_realtime` on every x86 load and `kvm-clock` in the golden are what ADR-017 relies on, and both are now in the provider.
 
 ## What it does not establish
 
 - **The guests were not unique.** The restore barrier [ADR-017](../decisions/adr-017-workspaces.md) requires is not implemented: forks of one golden shared its machine-id, `boot_id`, Docker daemon identity and anything else its userspace held. That is acceptable for a measurement, and is not how billet may run untrusted work.
-- **The comparison covers one host, one shape and one kind of job.** A 2 vCPU, 4 GiB guest ran a job that only sleeps, beside a production load average of 38 to 63. A job that builds would spend the same few seconds less at its start, and its own time after that.
-- **Snapshot age was bounded.** Forks were restored at most 14 minutes after the capture, within one golden's life, and a golden's age beyond that was not tried.
+- **The comparison covers one host, one shape and one kind of job.** A 2 vCPU, 4 GiB guest ran a job that only sleeps, beside a production load average of 38 to 63. How a job that builds would compare, touching more of the snapshot's pages, is untested.
+- **Snapshot age was bounded.** Forks were restored up to about 14 minutes after the capture, within one golden's life, and a golden's age beyond that was not tried.
 - **Restore is not wired into scheduling.** Restoring runners for real jobs still needs a golden per tier and image, rebuilt when the image changes, and the restore barrier before untrusted work. This measures what that would buy.
