@@ -439,8 +439,10 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	}
 
 	// THE TRIAL ENDS WITHIN THE LEASE IT WAS ADMITTED ON, its restore included:
-	// forkLifetime from the check, less five minutes for the teardown after it.
-	ctx, cancel := context.WithTimeout(t.Context(), forkLifetime-5*time.Minute)
+	// forkLifetime from the check, less five minutes for the teardown, which is
+	// bounded by the check plus forkLifetime itself.
+	leaseDeadline := time.Now().Add(forkLifetime)
+	ctx, cancel := context.WithDeadline(t.Context(), leaseDeadline.Add(-5*time.Minute))
 	defer cancel()
 
 	name := provider.InstanceName(freshLease(t))
@@ -454,7 +456,9 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		if destroyed {
 			return nil
 		}
-		if _, err := p.Destroy(context.WithoutCancel(t.Context()), name); err != nil {
+		dctx, cancel := context.WithDeadline(context.WithoutCancel(t.Context()), leaseDeadline)
+		defer cancel()
+		if _, err := p.Destroy(dctx, name); err != nil {
 			return err
 		}
 		destroyed = true
@@ -467,18 +471,21 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 			t.Errorf("cleanup %s: %v", name, err)
 		}
 	})
-	// A FORK THAT CANNOT BE DESTROYED IS TAKEN OFF THE BRIDGE: its tap, which this
-	// trial's own jail recorded, is detached and downed, so whatever still runs
-	// behind it answers on no address a production guest may be given.
-	var tap string
+	// A FORK THAT CANNOT BE DESTROYED IS REPORTED AT ONCE, with its lease still
+	// running: the experiment ends, the builder keeps the golden's MAC, and the
+	// message says by when the fork's VMM must be killed by hand, before the bridge's
+	// DHCP may give its address to another guest. The harness touches no tap: a
+	// Destroy that failed may already have released the fork's to a production guest.
 	defer func() {
 		derr := destroy()
 		if derr == nil {
 			return
 		}
-		err = errors.Join(err, fmt.Errorf("%w: %s: %w", errTrialSurvived, name, derr))
+		err = errors.Join(err, fmt.Errorf("%w: %s (jail %s): %w", errTrialSurvived, name, p.jailFor(name).dir(),
+			derr))
 		if arm == "restore" {
-			err = errors.Join(err, isolateTap(context.WithoutCancel(t.Context()), tap))
+			err = fmt.Errorf("%w; it may run on the golden's address %s, leased until at least %s: kill its "+
+				"VMM before then", err, goldenAddr, leaseDeadline.Format(time.RFC3339))
 		}
 	}()
 
@@ -503,7 +510,6 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 	if err != nil {
 		return err
 	}
-	tap = res.Tap
 	addr := goldenAddr
 	if arm == "cold" {
 		mac, err := guestMAC(res.Tap)
@@ -517,7 +523,7 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 		// THE HOST'S NEIGHBOUR ENTRY FOR THE GOLDEN'S ADDRESS IS ASKED AGAIN, so the
 		// host finds the fork on its own tap rather than the paused builder on its.
 		// An entry that is not there is what this wants.
-		if out, err := exec.CommandContext(t.Context(), "ip", "neigh", "del", goldenAddr, "dev",
+		if out, err := exec.CommandContext(ctx, "ip", "neigh", "del", goldenAddr, "dev",
 			p.bridgeFor(provider.TrustTrusted)).CombinedOutput(); err != nil &&
 			!strings.Contains(string(out), "No such file") {
 			return fmt.Errorf("forget the host's neighbour entry for %s: %w: %s", goldenAddr, err, out)
@@ -563,7 +569,7 @@ func runStartTrial(t *testing.T, p *Provider, spec func(name, jit string) provid
 
 	if arm == "restore" {
 		// THE FORK IS THE GOLDEN ON THE WIRE: its MAC, on its own tap.
-		fdb, err := exec.CommandContext(t.Context(), "bridge", "fdb", "show", "dev", res.Tap).Output()
+		fdb, err := exec.CommandContext(ctx, "bridge", "fdb", "show", "dev", res.Tap).Output()
 		fields["fork_mac_is_golden"] = err == nil && strings.Contains(string(fdb), goldenMAC)
 	}
 
@@ -680,27 +686,6 @@ func leasedAddress(ctx context.Context, leases, mac string, limit time.Duration)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-}
-
-// isolateTap takes a tap off its bridge and down. A tap this trial never learned
-// cannot be, which is said.
-func isolateTap(ctx context.Context, tap string) error {
-	if tap == "" {
-		return errors.New("its tap was never read, so it could not be taken off the bridge")
-	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	var errs []error
-	for _, args := range [][]string{{"link", "set", "dev", tap, "nomaster"}, {"link", "set", "dev", tap, "down"}} {
-		if out, err := exec.CommandContext(ctx, "ip", args...).CombinedOutput(); err != nil {
-			errs = append(errs, fmt.Errorf("ip %s: %w: %s", strings.Join(args, " "), err, out))
-		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("take %s off the bridge: %w", tap, errors.Join(errs...))
-	}
-
-	return fmt.Errorf("%s was taken off the bridge and down; destroy the fork by hand", tap)
 }
 
 // goldenLeaseHolds refuses unless the lease file gives addr to mac, with at least
