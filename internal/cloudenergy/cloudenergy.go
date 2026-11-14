@@ -80,10 +80,17 @@ func WattsPerVCPU(u float64) float64 {
 
 // Method says how an estimate was made, in the words every report uses for it.
 func (e Estimate) Method() string {
-	// A duration under a second keeps its milliseconds, so it never reads as 0s.
-	d := e.Duration.Round(time.Second)
-	if e.Duration < time.Second {
-		d = e.Duration.Round(time.Millisecond)
+	// ROUNDED TO THE UNIT OF ITS OWN SIZE, so a duration under a second keeps
+	// its milliseconds, one under a millisecond its microseconds, and none reads
+	// as 0s.
+	d := e.Duration
+	switch {
+	case d >= time.Second:
+		d = d.Round(time.Second)
+	case d >= time.Millisecond:
+		d = d.Round(time.Millisecond)
+	case d >= time.Microsecond:
+		d = d.Round(time.Microsecond)
 	}
 
 	return fmt.Sprintf("estimated, not measured: %d vCPU for %s at an assumed %.0f%% CPU, %.2f to %.2f W "+

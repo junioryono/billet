@@ -196,7 +196,12 @@ UPDATE job_history SET failure_reason = @failure_reason
 --
 -- WITH WHEN THE LEASE WAS BOUGHT AND ITS CHARGED SHAPE, which a queue-wait
 -- report splits a wait by and groups jobs under while the lease still runs;
--- the archive overwrites the shape with the same terminal facts. The purchase
+-- the archive overwrites the shape with the same terminal facts. The cloud
+-- shape it bought and that shape's price are read from the lease row too, so a
+-- job on a bought shape is one from its assignment, not only from its archive:
+-- a report that estimates such a job's energy, or counts its cost, would
+-- otherwise skip it for as long as its teardown takes. Neither is ever blanked
+-- by a later assignment that finds the lease row gone. The purchase
 -- time is the lease row's own, read here because that row is reaped and this
 -- one is what an operator reads, and kept at its first value.
 --
@@ -206,16 +211,22 @@ UPDATE job_history SET failure_reason = @failure_reason
 -- process dies -- recorded no host at all, and the jobs most worth investigating
 -- are exactly the ones that end that way.
 INSERT INTO job_history (lease_id, tier, node, run_id, request_id, queued_at, assigned_at,
-                         vcpu, memory, bought_at)
+                         vcpu, memory, bought_at, instance_type, price_micros_per_hour)
 VALUES (@lease_id, @tier, @node, @run_id, @request_id, @queued_at, @assigned_at,
         @vcpu, @memory,
-        COALESCE((SELECT created_at FROM leases WHERE id = @lease_id), ''))
+        COALESCE((SELECT created_at FROM leases WHERE id = @lease_id), ''),
+        COALESCE((SELECT instance_type FROM leases WHERE id = @lease_id), ''),
+        COALESCE((SELECT price_micros_per_hour FROM leases WHERE id = @lease_id), 0))
 ON CONFLICT (lease_id) DO UPDATE SET
   run_id = excluded.run_id, request_id = excluded.request_id,
   assigned_at = excluded.assigned_at,
   vcpu = excluded.vcpu, memory = excluded.memory,
   bought_at = CASE WHEN job_history.bought_at = '' THEN excluded.bought_at
-                   ELSE job_history.bought_at END;
+                   ELSE job_history.bought_at END,
+  instance_type = CASE WHEN excluded.instance_type = '' THEN job_history.instance_type
+                       ELSE excluded.instance_type END,
+  price_micros_per_hour = CASE WHEN excluded.price_micros_per_hour = 0 THEN job_history.price_micros_per_hour
+                               ELSE excluded.price_micros_per_hour END;
 
 -- name: ArchiveJobHistory :exec
 -- Close the history row when the lease terminalizes.

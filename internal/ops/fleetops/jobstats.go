@@ -697,31 +697,54 @@ func energyText(f *statsFigures) string {
 
 // energyOfSource words one source's energy as `billet jobs show` words a job's: only
 // a source that splits it says what was idle.
+//
+// A SATURATED TOTAL IS WORDED ROUNDED DOWN, since the caller calls it a lower
+// bound, and an estimate keeps the figures joules would round to nothing.
 func energyOfSource(e *statsEnergy) string {
+	j := joules
+	switch {
+	case e.Saturated:
+		j = joulesAtMost
+	case e.Source == cloudenergy.Source:
+		j = estimateJoules
+	}
 	switch e.Source {
 	case alloc.EnergyRAPL:
 		return fmt.Sprintf("rapl: %s active, %s idle (package RAPL, a model rather than a meter)",
-			joules(e.ActiveMicrojoules), joules(e.IdleMicrojoules))
+			j(e.ActiveMicrojoules), j(e.IdleMicrojoules))
 	case alloc.EnergyMeter:
-		return fmt.Sprintf("meter: %s active, %s idle (the whole host at the wall)", joules(e.ActiveMicrojoules),
-			joules(e.IdleMicrojoules))
+		return fmt.Sprintf("meter: %s active, %s idle (the whole host at the wall)", j(e.ActiveMicrojoules),
+			j(e.IdleMicrojoules))
 	case alloc.EnergyProcess:
 		return fmt.Sprintf("process: %s (macOS's own estimate for the VM's process; the machine's idle draw is not in it)",
-			joules(e.ActiveMicrojoules))
+			j(e.ActiveMicrojoules))
 	case alloc.EnergyRAPLUnsplit:
 		return fmt.Sprintf("rapl-unsplit: %s (package RAPL with no idle baseline, so idle is inside it)",
-			joules(e.ActiveMicrojoules))
+			j(e.ActiveMicrojoules))
 	case cloudenergy.Source:
 		return fmt.Sprintf("estimate: %s (not measured: each bought shape's vCPUs over its duration at an "+
 			"assumed %.0f%% CPU, %.2f to %.2f W per vCPU, Cloud Carbon Footprint's AWS averages)",
-			joules(e.ActiveMicrojoules), cloudenergy.DefaultUtilization*100, cloudenergy.MinWattsPerVCPU,
+			j(e.ActiveMicrojoules), cloudenergy.DefaultUtilization*100, cloudenergy.MinWattsPerVCPU,
 			cloudenergy.MaxWattsPerVCPU)
 	case "":
-		return fmt.Sprintf("source not recorded: %s", joules(e.ActiveMicrojoules))
+		return fmt.Sprintf("source not recorded: %s", j(e.ActiveMicrojoules))
 	}
 
 	return fmt.Sprintf("%s: %s, split by a source this binary does not know", strconv.Quote(e.Source),
-		joules(e.ActiveMicrojoules))
+		j(e.ActiveMicrojoules))
+}
+
+// joulesAtMost words microjoules as joules does, rounded down rather than to the
+// nearest, in integers so nothing rounds up on the way: the figure a lower bound
+// may claim.
+func joulesAtMost(microjoules int64) string {
+	if microjoules >= 1_000_000_000 {
+		tenths := microjoules / 100_000_000
+		return fmt.Sprintf("%d.%d kJ", tenths/10, tenths%10)
+	}
+	tenths := microjoules / 100_000
+
+	return fmt.Sprintf("%d.%d J", tenths/10, tenths%10)
 }
 
 // energySplit says whether a source's idle figure is one: the others report a total

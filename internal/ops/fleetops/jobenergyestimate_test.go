@@ -107,9 +107,19 @@ func TestAnEnergyTotalPastAnInt64IsALowerBound(t *testing.T) {
 		t.Fatalf("after passing the largest int64: %+v, want it held there, saturated, over 2 jobs", e)
 	}
 
+	// The true total is MaxInt64+1 µJ, 9,223,372,036.854775808 kJ: the bound
+	// claimed is rounded down from it, never up past it.
 	f := &statsFigures{Energy: []statsEnergy{*e}, EnergyUnmeasured: 2}
-	if text := energyText(f); !strings.HasPrefix(text, "at least estimate: ") {
-		t.Errorf("energyText = %q, want it worded as a lower bound", text)
+	if text := energyText(f); !strings.HasPrefix(text, "at least estimate: 9223372036.8 kJ (") {
+		t.Errorf("energyText = %q, want it worded as a lower bound rounded down", text)
+	}
+	for _, tc := range []struct {
+		microjoules int64
+		want        string
+	}{{999_999_999, "999.9 J"}, {1_000_000_000, "1.0 kJ"}, {1_999_999_999, "1.9 kJ"}, {99_999, "0.0 J"}} {
+		if got := joulesAtMost(tc.microjoules); got != tc.want {
+			t.Errorf("joulesAtMost(%d) = %q, want %q", tc.microjoules, got, tc.want)
+		}
 	}
 	if j := statsFiguresJSONOf(f); !j.Energy[0].Saturated {
 		t.Errorf("the JSON = %+v, want saturated", j.Energy[0])
@@ -225,5 +235,62 @@ func TestASmallEstimateNeverReadsAsZero(t *testing.T) {
 		if got := estimateJoules(tc.microjoules); got != tc.want {
 			t.Errorf("estimateJoules(%d) = %q, want %q", tc.microjoules, got, tc.want)
 		}
+	}
+}
+
+// A SMALL ESTIMATE IS NEVER ZERO IN ANY REPORT: four vCPUs for a millisecond is
+// 8,480 µJ, which every rendering of the stats and of jobs show keeps.
+func TestASmallEstimateIsNeverZeroInAnyReport(t *testing.T) {
+	t.Parallel()
+
+	const small = "0.00848 J"
+	report := statsOver(t, statsByRepository, "", []fixedJob{{lease: "tiny", tier: "t", repo: "acme/api",
+		workflow: fixedWorkflow, job: "test", run: 1, result: "succeeded", startedAgo: time.Hour,
+		ran: time.Millisecond, vcpu: 4, instanceType: "c7i.xlarge"}})
+	var out bytes.Buffer
+	renderJobStats(&out, report)
+	if !strings.Contains(out.String(), "estimate: "+small+" (") {
+		t.Errorf("the stats do not say %s:\n%s", small, out.String())
+	}
+	out.Reset()
+	if err := renderJobStatsPage(&out, report); err != nil {
+		t.Fatalf("renderJobStatsPage: %v", err)
+	}
+	if !strings.Contains(out.String(), "estimate: "+small+" (") {
+		t.Errorf("the stats page does not say %s", small)
+	}
+	if e := statsFiguresJSONOf(&report.Groups[0].Current).Energy; len(e) != 1 || e[0].ActiveJoules != 0.00848 {
+		t.Errorf("the stats JSON = %+v, want 0.00848 J", e)
+	}
+
+	rec := boughtRecord("c7i.xlarge")
+	start, err := time.Parse(time.RFC3339Nano, rec.StartedAt)
+	if err != nil {
+		t.Fatalf("the record's start: %v", err)
+	}
+	rec.ResultAt = start.Add(time.Millisecond).Format(time.RFC3339Nano)
+	const shown = small + ", estimated, not measured: 4 vCPU for 1ms"
+	var text bytes.Buffer
+	renderJob(&text, rec, nil, nil)
+	if !strings.Contains(text.String(), shown) {
+		t.Errorf("jobs show does not say %q:\n%s", shown, text.String())
+	}
+	var page bytes.Buffer
+	if err := renderJobPage(&page, jobPageOf(rec, nil, jobSteps{none: "x"}, nil, "no series")); err != nil {
+		t.Fatalf("renderJobPage: %v", err)
+	}
+	if !strings.Contains(page.String(), html.EscapeString(shown)) {
+		t.Errorf("the job page does not say %q", shown)
+	}
+	var js bytes.Buffer
+	if err := renderJobJSON(&js, rec, nil, nil, "", nil, jobEgress{}, jobTests{}, nil); err != nil {
+		t.Fatalf("renderJobJSON: %v", err)
+	}
+	var decoded struct {
+		Estimate *energyEstimateJSON `json:"energy_estimate"`
+	}
+	if err := json.Unmarshal(js.Bytes(), &decoded); err != nil || decoded.Estimate == nil ||
+		decoded.Estimate.Joules != 0.00848 {
+		t.Errorf("the JSON estimate = %+v, %v; want 0.00848 J", decoded.Estimate, err)
 	}
 }

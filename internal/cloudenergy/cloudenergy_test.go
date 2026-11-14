@@ -71,9 +71,24 @@ func TestNoEstimateFromWhatWasNotRecorded(t *testing.T) {
 func TestTheMethodNeverRoundsADurationToNothing(t *testing.T) {
 	t.Parallel()
 
-	e, _ := Of(1, 1500*time.Microsecond)
-	if got := e.Method(); !strings.Contains(got, "1 vCPU for 2ms") {
-		t.Errorf("Method() = %q, want the duration in milliseconds", got)
+	for _, tc := range []struct {
+		vcpu int64
+		d    time.Duration
+		want string
+	}{
+		{1, 1500 * time.Microsecond, "1 vCPU for 2ms"},
+		{1, 600 * time.Millisecond, "1 vCPU for 600ms"},
+		{4, 100 * time.Microsecond, "4 vCPU for 100µs"},
+		{1024, 300 * time.Nanosecond, "1024 vCPU for 300ns"},
+		{2, 90 * time.Second, "2 vCPU for 1m30s"},
+	} {
+		e, ok := Of(tc.vcpu, tc.d)
+		if !ok {
+			t.Fatalf("Of(%d, %s) gave no estimate", tc.vcpu, tc.d)
+		}
+		if got := e.Method(); !strings.Contains(got, tc.want) {
+			t.Errorf("Of(%d, %s).Method() = %q, want %q", tc.vcpu, tc.d, got, tc.want)
+		}
 	}
 }
 
