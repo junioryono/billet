@@ -318,6 +318,46 @@ func TestTheBootArgumentsAreTheMachines(t *testing.T) {
 	}
 }
 
+// A GOLDEN KEEPS TIME ON KVM-CLOCK, so a restore's clock_realtime corrects its
+// forks; a cold boot keeps the kernel's own choice, and an arm64 guest, which has
+// no kvm-clock, is never given one.
+func TestAGoldenBootsOnKVMClock(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct {
+		goarch   string
+		kvmClock bool
+		want     bool
+	}{
+		{"amd64", false, false},
+		{"amd64", true, true},
+		{"arm64", true, false},
+	} {
+		h := newHarness(t)
+		h.p.goarch = c.goarch
+		if c.kvmClock {
+			withKVMClock()(h.p)
+		}
+		_, vmm := h.launch(t)
+
+		body, called := vmm.bodyPut("/boot-source")
+		if !called {
+			t.Fatal("no boot source was configured")
+		}
+		args, ok := body["boot_args"].(string)
+		if !ok {
+			t.Fatalf("on %s the boot arguments were %v, not a string", c.goarch, body["boot_args"])
+		}
+		if got := strings.Contains(args, "clocksource=kvm-clock"); got != c.want {
+			t.Errorf("on %s with kvm-clock asked %v, the guest booted with %q", c.goarch, c.kvmClock, args)
+		}
+		if !strings.HasPrefix(args, bootArgs(c.goarch)) {
+			t.Errorf("on %s the guest booted with %q, which is not the machine's %q", c.goarch, args,
+				bootArgs(c.goarch))
+		}
+	}
+}
+
 // THE GUEST GETS WHAT THE LEASE PAID FOR, in the units the VMM counts in.
 func TestTheGuestIsSizedFromTheSpec(t *testing.T) {
 	t.Parallel()
