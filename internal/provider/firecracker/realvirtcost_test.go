@@ -46,11 +46,12 @@ import (
 //     own filesystem, which the instances chroot into.
 //   - BILLET_VIRT_EXPERIMENT_IMAGE: for container, a Docker image imported from
 //     that same filesystem.
-//   - BILLET_VIRT_EXPERIMENT_SCRATCH: a filesystem of its own, mounted for the run,
-//     with at least scratchPerInstance free for each instance: their /tmp, go
-//     files and statuses, so a compile that fills it fills nothing billet keeps.
-//     It may not be the filesystem of /, billet's state or Docker's
-//     (scratchProtected), however it is reached.
+//   - BILLET_VIRT_EXPERIMENT_SCRATCH: a tmpfs of its own, mounted for the run
+//     (mount -t tmpfs -o size=64G), with at least scratchPerInstance free for each
+//     instance: their /tmp, go files and statuses. A tmpfs and nothing else, so a
+//     compile that fills it reaches no disk, whatever is stacked beneath one; and
+//     what an instance writes there is charged to its own cgroup's memory, as a
+//     microVM's writes sit in its guest's page cache, inside its RAM.
 //   - BILLET_VIRT_EXPERIMENT_RUN: a label written on every line.
 //   - BILLET_VIRT_EXPERIMENT_IDLE_WATTS: the package's idle power, so each
 //     instance's share of the energy above it is what the node would attribute.
@@ -103,7 +104,7 @@ func TestRealVirtualizationCost(t *testing.T) {
 		t.Fatal("BILLET_VIRT_EXPERIMENT_IMAGE names no image for the container")
 	}
 	scratch, scratchDev, err := scratchHolds(os.Getenv("BILLET_VIRT_EXPERIMENT_SCRATCH"), instances,
-		scratchProtected)
+		scratchProtected, scratchIsTmpfs)
 	if err != nil {
 		t.Fatalf("BILLET_VIRT_EXPERIMENT_SCRATCH: %v", err)
 	}
@@ -264,9 +265,8 @@ func TestRealVirtualizationCost(t *testing.T) {
 		finished.Sub(started).Round(time.Second), filepath.Clean(out))
 }
 
-// scratchPerInstance is the free space the scratch filesystem needs for each
-// instance: the gostd body keeps two fresh Go build caches of the standard library
-// and its tests in /tmp, about 3 GiB together on the reference node.
+// scratchPerInstance is the free space the scratch needs for each instance: the
+// gostd body keeps two fresh Go build caches of the standard library in /tmp.
 const scratchPerInstance = 6 * config.GiB
 
 // scratchProtected are the paths whose filesystems the scratch may not be: the
@@ -279,10 +279,11 @@ var scratchProtected = []string{"/", "/var/lib/billet", "/var/lib/docker"}
 // which every directory made in it is checked against. It refuses one that is not
 // a filesystem of its own, mounted there (its device differs from its parent's),
 // one on the filesystem of any protected path, which a bind mount of that
-// filesystem is, one whose backing could grow onto another filesystem or reach
-// the network (scratchBacking), and one with less than scratchPerInstance free for
-// each instance. What fills it then fills nothing the node or its ledger keeps.
-func scratchHolds(dir string, instances int, protected []string) (string, uint64, error) {
+// filesystem is, one backing refuses, and one with less than scratchPerInstance
+// free for each instance.
+func scratchHolds(dir string, instances int, protected []string,
+	backing func(dev uint64, fs *unix.Statfs_t) error,
+) (string, uint64, error) {
 	if dir == "" || !filepath.IsAbs(dir) {
 		return "", 0, fmt.Errorf("%q is not an absolute path", dir)
 	}
@@ -319,10 +320,8 @@ func scratchHolds(dir string, instances int, protected []string) (string, uint64
 		return "", 0, err
 	}
 	dev := identityOf(resolved, &here).dev
-	if runtime.GOOS == "linux" {
-		if err := scratchBacking(dev, fs.Type == tmpfsMagic, sysBlock(dev)); err != nil {
-			return "", 0, fmt.Errorf("%s: %w", resolved, err)
-		}
+	if err := backing(dev, &fs); err != nil {
+		return "", 0, fmt.Errorf("%s: %w", resolved, err)
 	}
 	free, need := fs.Bavail*uint64(fs.Bsize), uint64(instances)*uint64(scratchPerInstance)
 	if free < need {
@@ -335,69 +334,14 @@ func scratchHolds(dir string, instances int, protected []string) (string, uint64
 // tmpfsMagic is tmpfs's filesystem type, as statfs reports it.
 const tmpfsMagic = 0x01021994
 
-// blockDevice is what /sys says of the block device behind a filesystem: its
-// name, and for a loop device whether its backing file is wholly allocated.
-type blockDevice struct {
-	name string
-	// loopAllocated reads a loop device's backing file; nil for any other device.
-	loopAllocated func() (bool, error)
-}
-
-// sysBlock describes the block device dev names, from /sys/dev/block.
-func sysBlock(dev uint64) blockDevice {
-	node := fmt.Sprintf("/sys/dev/block/%d:%d", unix.Major(dev), unix.Minor(dev))
-	target, err := os.Readlink(node)
-	if err != nil {
-		return blockDevice{}
-	}
-	d := blockDevice{name: filepath.Base(target)}
-	if strings.HasPrefix(d.name, "loop") {
-		d.loopAllocated = func() (bool, error) {
-			raw, err := os.ReadFile(filepath.Join(node, "loop", "backing_file"))
-			if err != nil {
-				return false, err
-			}
-			var st unix.Stat_t
-			if err := unix.Stat(strings.TrimSpace(string(raw)), &st); err != nil {
-				return false, err
-			}
-
-			return st.Blocks*512 >= st.Size, nil
-		}
-	}
-
-	return d
-}
-
-// scratchBacking refuses a scratch whose writes could land anywhere but its own
-// bounded storage: a filesystem with no block device behind it unless it is a
-// tmpfs, which its size and memory bound; a loop device whose backing file is
-// sparse, whose writes allocate it on the filesystem holding it; and a network
-// block device (rbd, nbd), which this experiment never touches. A device /sys does
-// not describe is refused too.
-func scratchBacking(dev uint64, tmpfs bool, block blockDevice) error {
-	if unix.Major(dev) == 0 {
-		if !tmpfs {
-			return errors.New("its filesystem has no block device of its own, and only a tmpfs is " +
-				"admitted without one")
-		}
-
-		return nil
-	}
-	switch {
-	case block.name == "":
-		return errors.New("its block device could not be read in /sys/dev/block")
-	case strings.HasPrefix(block.name, "rbd"), strings.HasPrefix(block.name, "nbd"):
-		return fmt.Errorf("it is on %s, a network block device", block.name)
-	case block.loopAllocated != nil:
-		whole, err := block.loopAllocated()
-		if err != nil {
-			return fmt.Errorf("could not tell whether %s's backing file is allocated: %w", block.name, err)
-		}
-		if !whole {
-			return fmt.Errorf("%s's backing file is sparse, so the scratch grows it on the filesystem "+
-				"holding it; allocate it whole (fallocate)", block.name)
-		}
+// scratchIsTmpfs admits only a tmpfs: no block device behind it, so nothing
+// written there reaches a disk however the disks are stacked, and its size and
+// the host's memory bound it. A filesystem on any block device is refused, since a
+// mapper, a loop file or a reflinked image can each put its writes on a filesystem
+// it does not name.
+func scratchIsTmpfs(dev uint64, fs *unix.Statfs_t) error {
+	if unix.Major(dev) != 0 || fs.Type != tmpfsMagic {
+		return errors.New("it is not a tmpfs; mount one there (mount -t tmpfs -o size=64G tmpfs <dir>)")
 	}
 
 	return nil
@@ -852,33 +796,31 @@ func TestTheVirtWrapperPublishesItsStatusOrEnds(t *testing.T) {
 
 // THE SCRATCH IS A FILESYSTEM OF ITS OWN: a directory on its parent's filesystem,
 // where a compile that fills it fills what the node keeps, is refused, and so is
-// one on a protected path's filesystem however it is reached, and one without room
-// for its instances. What is admitted is the path with its symlinks resolved.
+// one on a protected path's filesystem however it is reached, one its backing
+// judge refuses, and one without room for its instances. What is admitted is the
+// path with its symlinks resolved. /dev stands in for a mount of its own, which it
+// is on Linux and macOS alike, its backing judged elsewhere.
 func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
 	t.Parallel()
 
-	if _, _, err := scratchHolds(t.TempDir(), 0, nil); err == nil {
+	anyBacking := func(uint64, *unix.Statfs_t) error { return nil }
+	const own = "/dev"
+
+	if _, _, err := scratchHolds(t.TempDir(), 0, nil, anyBacking); err == nil {
 		t.Error("a directory on its parent's filesystem was accepted as the scratch")
-	}
-	// A FILESYSTEM OF ITS OWN THE BACKING CHECK ADMITS: a tmpfs on Linux, devfs on
-	// macOS, which has no /sys to judge a backing by.
-	own := "/dev"
-	if runtime.GOOS == "linux" {
-		own = "/dev/shm"
 	}
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	relative, err := filepath.Rel(wd, "/dev")
+	relative, err := filepath.Rel(wd, own)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := scratchHolds(relative, 0, nil); err == nil {
+	if _, _, err := scratchHolds(relative, 0, nil, anyBacking); err == nil {
 		t.Errorf("the relative path %s was accepted as the scratch", relative)
 	}
-	// Neither has a million instances' room.
-	got, dev, err := scratchHolds(own, 0, nil)
+	got, dev, err := scratchHolds(own, 0, nil, anyBacking)
 	if err != nil || got != own {
 		t.Errorf("%s, a mount of its own, was admitted as %q (%v); want it as itself", own, got, err)
 	}
@@ -888,9 +830,14 @@ func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
 	if err := onDevice(t.TempDir(), dev); err == nil {
 		t.Errorf("a directory off %s was taken to be on it", own)
 	}
-	if _, _, err := scratchHolds(own, 1<<20, nil); err == nil {
-		t.Error("a scratch without room for its instances was accepted")
+	if _, _, err := scratchHolds(own, 1<<20, nil, anyBacking); err == nil {
+		t.Error("a scratch without room for a million instances was accepted")
 	}
+	refused := func(uint64, *unix.Statfs_t) error { return errors.New("not this backing") }
+	if _, _, err := scratchHolds(own, 0, nil, refused); err == nil {
+		t.Error("a scratch its backing judge refused was accepted")
+	}
+
 	// A FILE IS NOT A DIRECTORY ON THE SCRATCH, though it is on its filesystem.
 	file := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(file, nil, 0o644); err != nil {
@@ -903,13 +850,6 @@ func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
 	if err := onDevice(file, identityOf(file, &st).dev); err == nil {
 		t.Error("a regular file was taken for a directory on the scratch")
 	}
-	// AND ITS BACKING IS JUDGED: /proc is a filesystem of its own with no block
-	// device and is not a tmpfs, which only Linux has /sys to tell.
-	if runtime.GOOS == "linux" {
-		if _, _, err := scratchHolds("/proc", 0, nil); err == nil {
-			t.Error("/proc, an anonymous filesystem that is not a tmpfs, was accepted as the scratch")
-		}
-	}
 
 	// A SYMLINK IS ADMITTED AS WHAT IT NAMES, and a protected path's filesystem is
 	// refused through one, as /dev/shm/scratch -> /var/lib/billet would be.
@@ -917,50 +857,72 @@ func TestTheScratchMustBeAFilesystemOfItsOwn(t *testing.T) {
 	if err := os.Symlink(own, link); err != nil {
 		t.Fatal(err)
 	}
-	if got, _, err := scratchHolds(link, 0, nil); err != nil || got != own {
+	if got, _, err := scratchHolds(link, 0, nil, anyBacking); err != nil || got != own {
 		t.Errorf("a symlink to %s was admitted as %q (%v); want %s itself", own, got, err, own)
 	}
-	if _, _, err := scratchHolds(link, 0, []string{own}); err == nil {
+	if _, _, err := scratchHolds(link, 0, []string{own}, anyBacking); err == nil {
 		t.Error("a symlink to a protected path's filesystem was accepted as the scratch")
 	}
-	if got, _, err := scratchHolds(own, 0, []string{filepath.Join(t.TempDir(), "absent")}); err != nil ||
+	if got, _, err := scratchHolds(own, 0, []string{filepath.Join(t.TempDir(), "absent")}, anyBacking); err != nil ||
 		got != own {
 		t.Errorf("a protected path that does not exist refused %s (%q, %v)", own, got, err)
 	}
 }
 
-// THE SCRATCH'S BACKING IS ITS OWN AND BOUNDED: a tmpfs, a disk, or a loop device
-// whose file is allocated whole; never another anonymous filesystem, a sparse loop
-// file that grows on the filesystem holding it, a network block device, or a device
-// /sys does not describe.
-func TestTheScratchsBackingIsItsOwn(t *testing.T) {
+// ONLY A TMPFS IS A SCRATCH: an anonymous filesystem of another type, and any
+// filesystem on a block device (a disk, a mapper, a loop file), are refused. A
+// tmpfs this host really has is admitted when /proc/mounts shows one.
+func TestOnlyATmpfsIsAScratch(t *testing.T) {
 	t.Parallel()
 
-	anonymous, disk := unix.Mkdev(0, 52), unix.Mkdev(259, 3)
-	loop := func(whole bool, err error) blockDevice {
-		return blockDevice{name: "loop7", loopAllocated: func() (bool, error) { return whole, err }}
-	}
+	tmpfs, other := unix.Statfs_t{Type: tmpfsMagic}, unix.Statfs_t{Type: 0xef53}
 	for _, c := range []struct {
-		name  string
-		dev   uint64
-		tmpfs bool
-		block blockDevice
-		ok    bool
+		name string
+		dev  uint64
+		fs   *unix.Statfs_t
+		ok   bool
 	}{
-		{"a tmpfs", anonymous, true, blockDevice{}, true},
-		{"another anonymous filesystem", anonymous, false, blockDevice{}, false},
-		{"a disk", disk, false, blockDevice{name: "nvme0n1p3"}, true},
-		{"a whole loop file", disk, false, loop(true, nil), true},
-		{"a sparse loop file", disk, false, loop(false, nil), false},
-		{"an unreadable loop file", disk, false, loop(true, errors.New("gone")), false},
-		{"an rbd image", disk, false, blockDevice{name: "rbd0"}, false},
-		{"an nbd export", disk, false, blockDevice{name: "nbd2"}, false},
-		{"a device /sys does not describe", disk, false, blockDevice{}, false},
+		{"a tmpfs", unix.Mkdev(0, 52), &tmpfs, true},
+		{"another anonymous filesystem", unix.Mkdev(0, 52), &other, false},
+		{"a filesystem on a block device", unix.Mkdev(259, 3), &other, false},
+		{"a block device claiming tmpfs's type", unix.Mkdev(253, 1), &tmpfs, false},
 	} {
-		if err := scratchBacking(c.dev, c.tmpfs, c.block); (err == nil) != c.ok {
+		if err := scratchIsTmpfs(c.dev, c.fs); (err == nil) != c.ok {
 			t.Errorf("%s: admitted %v (%v), want %v", c.name, err == nil, err, c.ok)
 		}
 	}
+
+	raw, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		t.Logf("no /proc/mounts (%v), so no live tmpfs is tried", err)
+		return
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[1] != "/dev/shm" || fields[2] != "tmpfs" {
+			continue
+		}
+		if _, _, err := scratchHolds("/dev/shm", 0, nil, scratchIsTmpfs); err != nil {
+			t.Errorf("/dev/shm, a tmpfs of its own, was refused: %v", err)
+		}
+		if _, _, err := scratchHolds("/proc", 0, nil, scratchIsTmpfs); err == nil && hasMount(raw, "/proc") {
+			t.Error("/proc, mounted and not a tmpfs, was accepted as the scratch")
+		}
+
+		return
+	}
+	t.Log("/dev/shm is not a tmpfs mount here, so no live tmpfs is tried")
+}
+
+// hasMount reports whether /proc/mounts names a mount at dir.
+func hasMount(mounts []byte, dir string) bool {
+	for _, line := range strings.Split(string(mounts), "\n") {
+		if fields := strings.Fields(line); len(fields) > 1 && fields[1] == dir {
+			return true
+		}
+	}
+
+	return false
 }
 
 // THE RESULTS FILE IS A REGULAR FILE, opened without waiting: a FIFO nobody reads
