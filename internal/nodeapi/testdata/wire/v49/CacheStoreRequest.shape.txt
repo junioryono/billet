@@ -1,0 +1,7 @@
+CacheStoreRequest.store string
+CacheStoreRequest.state string
+CacheStoreRequest.since string
+CacheStoreRequest.failures tag omitempty
+CacheStoreRequest.failures int
+CacheStoreRequest.reason tag omitempty
+CacheStoreRequest.reason string

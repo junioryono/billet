@@ -120,6 +120,9 @@
 {{- if and .Usage .Note}}
 <tr class="qualifier"><td></td><td colspan="9">{{.Note}}</td></tr>
 {{- end}}
+{{- with .Destinations}}
+<tr class="qualifier"><td></td><td colspan="9">Destinations, by when each connection opened: {{.}}</td></tr>
+{{- end}}
 {{- end}}
 </tbody>
 </table>

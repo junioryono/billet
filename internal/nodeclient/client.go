@@ -1229,6 +1229,10 @@ func (c *Client) RecordLeaseUsage(
 		without := measured.Destinations.WithoutReplyTimes()
 		measured.Destinations = &without
 	}
+	if wire < nodeapi.VersionDestinationOpenings && measured.Destinations != nil {
+		without := measured.Destinations.WithoutOpenings()
+		measured.Destinations = &without
+	}
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/usage"),
 		nodeapi.UsageRequest{Epoch: epoch, Usage: measured, Series: series}, nil)

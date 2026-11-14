@@ -200,6 +200,118 @@ type Result struct {
 	// a connection still left untimed then is one whose new event came before
 	// the job was watched or was not read within replyMatch of its start.
 	RepliesTimed bool
+	// Openings is the same traffic again, split by when each connection
+	// opened: per destination, per bucket of OpeningWidth, at most MaxOpenings,
+	// ordered by destination and then by time. It is what lets a report say
+	// which step of the job talked to which destination.
+	Openings     []Opening
+	OpeningWidth time.Duration
+}
+
+// MaxOpenings bounds a job's openings. A job whose connections open across
+// more buckets than this has its buckets widened, by doubling, until they fit:
+// a coarser answer, never a partial one, so the openings always add up to the
+// destinations' totals.
+const MaxOpenings = 2048
+
+// Opening is the traffic of the connections a job opened to one destination in
+// one bucket of time, a bucket being OpeningWidth from Start.
+//
+// BY WHEN A CONNECTION OPENED, NOT BY WHEN ITS BYTES MOVED: the tracker keeps a
+// connection's totals and not their times, so a connection that spans two
+// steps is the first one's.
+type Opening struct {
+	// Dest is the destination's index in Result.Destinations, or -1 for the
+	// traffic beyond them, Result.Other.
+	Dest                        int
+	Start                       time.Time
+	Sent, Received, Connections uint64
+}
+
+// openingKey is one destination's one bucket, the bucket a Unix second
+// divided by the width.
+type openingKey struct {
+	dest   int
+	bucket int64
+}
+
+// openingsOf splits a job's counted flows by destination and by the bucket each
+// opened in, widening the buckets until there are at most MaxOpenings of them.
+// index is each named destination's place in the result; an address it does not
+// name is the traffic beyond them.
+//
+// IT ALWAYS FITS: one bucket wide enough to hold every flow leaves one opening
+// per destination, at most MaxDestinations+1, under the bound.
+func openingsOf(counted map[entry]Flow, index map[netip.Addr]int) ([]Opening, time.Duration) {
+	perSecond := map[openingKey]*Opening{}
+	for id := range counted {
+		f := counted[id]
+		dest, ok := index[f.Dest]
+		if !ok {
+			dest = -1
+		}
+		k := openingKey{dest: dest, bucket: f.Start.Unix()}
+		o := perSecond[k]
+		if o == nil {
+			o = &Opening{Dest: dest}
+			perSecond[k] = o
+		}
+		o.Sent += f.OrigBytes
+		o.Received += f.ReplyBytes
+		o.Connections++
+	}
+
+	width := int64(1)
+	buckets := perSecond
+	for len(buckets) > MaxOpenings {
+		width *= 2
+		buckets = map[openingKey]*Opening{}
+		for k, o := range perSecond {
+			wide := openingKey{dest: k.dest, bucket: floorDiv(k.bucket, width)}
+			w := buckets[wide]
+			if w == nil {
+				w = &Opening{Dest: k.dest}
+				buckets[wide] = w
+			}
+			w.Sent += o.Sent
+			w.Received += o.Received
+			w.Connections += o.Connections
+		}
+	}
+
+	out := make([]Opening, 0, len(buckets))
+	for k, o := range buckets {
+		o.Start = time.Unix(k.bucket*width, 0).UTC()
+		out = append(out, *o)
+	}
+	// THE OTHER TRAFFIC LAST, as the destinations it is beyond are listed first.
+	slices.SortFunc(out, func(x, y Opening) int {
+		xd, yd := x.Dest, y.Dest
+		if xd < 0 {
+			xd = len(index)
+		}
+		if yd < 0 {
+			yd = len(index)
+		}
+		if c := cmp.Compare(xd, yd); c != 0 {
+			return c
+		}
+
+		return x.Start.Compare(y.Start)
+	})
+
+	return out, time.Duration(width) * time.Second
+}
+
+// floorDiv is a divided by b rounded down, for a second before 1970 as for one
+// after it.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if (a%b != 0) && ((a < 0) != (b < 0)) {
+		q--
+	}
+
+	return q
 }
 
 // Accountant attributes flows to watched jobs. Safe for concurrent use: the
@@ -725,6 +837,13 @@ func summarize(w *watch) Result {
 	if r.Incomplete {
 		r.IncompleteWhy = slices.Sorted(maps.Keys(w.why))
 	}
+
+	named := min(len(all), MaxDestinations)
+	index := make(map[netip.Addr]int, named)
+	for i := range named {
+		index[all[i].Addr] = i
+	}
+	r.Openings, r.OpeningWidth = openingsOf(w.counted, index)
 
 	if len(all) > MaxDestinations {
 		for _, d := range all[MaxDestinations:] {

@@ -3,6 +3,7 @@ package lease
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"slices"
 )
@@ -45,6 +46,48 @@ type JobDestinations struct {
 	// whose reply events were not all read, says nothing about how fast
 	// anything answered.
 	RepliesTimed bool `json:"replies_timed,omitempty"`
+	// Openings is the same traffic split by when each connection opened: per
+	// destination, per bucket of OpeningSeconds, so a report can say which step
+	// of the job talked to which destination. Empty, with OpeningSeconds zero,
+	// from a node or a wire before VersionDestinationOpenings, which says
+	// nothing of when.
+	//
+	// BY WHEN A CONNECTION OPENED, NOT WHEN ITS BYTES MOVED: the host's tracker
+	// keeps a connection's totals and not their times, so a connection open
+	// across two steps is counted in the one it opened in.
+	Openings       []DestinationOpening `json:"openings,omitempty"`
+	OpeningSeconds int64                `json:"opening_seconds,omitempty"`
+}
+
+// MaxDestinationOpenings is how many openings one report carries, the node's
+// flows.MaxOpenings, which widens its buckets until a job's fit.
+const MaxDestinationOpenings = 2048
+
+// maxOpeningSeconds bounds a bucket's width: a power of two past any job's
+// length, which the node never needs to reach.
+const maxOpeningSeconds = 1 << 24
+
+// DestinationOpening is the traffic of the connections a job opened to one
+// destination in one bucket of time.
+type DestinationOpening struct {
+	// Ordinal is the destination's index in Destinations, or
+	// MaxJobDestinations for the traffic beyond them, as the ledger numbers
+	// the rows.
+	Ordinal int `json:"ordinal"`
+	// Start is the bucket's start, in Unix seconds, a multiple of the report's
+	// OpeningSeconds.
+	Start         int64 `json:"start"`
+	SentBytes     int64 `json:"sent_bytes"`
+	ReceivedBytes int64 `json:"received_bytes"`
+	Connections   int64 `json:"connections"`
+}
+
+// WithoutOpenings is d as a wire before the openings carries it: no split by
+// time, which says less, never something else.
+func (d JobDestinations) WithoutOpenings() JobDestinations {
+	d.Openings, d.OpeningSeconds = nil, 0
+
+	return d
 }
 
 // JobDestination is the traffic a job exchanged with one remote address, from
@@ -148,7 +191,85 @@ func (d JobDestinations) Validate() error {
 			d.Tap.SentBytes, d.Tap.ReceivedBytes)
 	}
 
+	return d.validateOpenings()
+}
+
+// validateOpenings refuses openings no split of these destinations gives: more
+// than are kept, a width that is not a power of two, a bucket off its width or
+// before 1970, an ordinal naming no destination, two openings out of order or
+// for the same bucket, a negative count, or a destination whose openings add up
+// to more than its totals.
+//
+// MORE THAN THE TOTALS, NOT OTHER THAN THEM: a node keeps a total too large for
+// the ledger at its largest, and the openings it clamped then add up to less.
+func (d JobDestinations) validateOpenings() error {
+	if d.OpeningSeconds == 0 {
+		if len(d.Openings) > 0 {
+			return fmt.Errorf("alloc: a usage report has %d openings and no width", len(d.Openings))
+		}
+
+		return nil
+	}
+	w := d.OpeningSeconds
+	if w < 1 || w > maxOpeningSeconds || w&(w-1) != 0 {
+		return fmt.Errorf("alloc: a usage report's openings are %d seconds wide, which is not a power of two "+
+			"from 1 to %d", w, maxOpeningSeconds)
+	}
+	if len(d.Openings) > MaxDestinationOpenings {
+		return fmt.Errorf("alloc: a usage report has %d openings, and at most %d are kept",
+			len(d.Openings), MaxDestinationOpenings)
+	}
+
+	type sum struct{ sent, received, connections int64 }
+	sums := map[int]*sum{}
+	for i, o := range d.Openings {
+		if o.Ordinal < 0 || (o.Ordinal >= len(d.Destinations) && o.Ordinal != MaxJobDestinations) {
+			return fmt.Errorf("alloc: opening %d names destination %d of %d", i, o.Ordinal, len(d.Destinations))
+		}
+		if o.Start <= 0 || o.Start%w != 0 {
+			return fmt.Errorf("alloc: opening %d starts at %d, which is not a %d-second bucket after 1970",
+				i, o.Start, w)
+		}
+		if o.SentBytes < 0 || o.ReceivedBytes < 0 || o.Connections < 0 {
+			return fmt.Errorf("alloc: opening %d has a negative total", i)
+		}
+		if i > 0 {
+			p := d.Openings[i-1]
+			if p.Ordinal > o.Ordinal || (p.Ordinal == o.Ordinal && p.Start >= o.Start) {
+				return fmt.Errorf("alloc: opening %d is not after the one before it", i)
+			}
+		}
+		s := sums[o.Ordinal]
+		if s == nil {
+			s = &sum{}
+			sums[o.Ordinal] = s
+		}
+		// Each count is at most MaxInt64 and there are at most 2048 of them, so
+		// a sum past MaxInt64 saturates rather than wrapping.
+		s.sent, s.received, s.connections = addCapped(s.sent, o.SentBytes), addCapped(s.received, o.ReceivedBytes),
+			addCapped(s.connections, o.Connections)
+	}
+	for ordinal, s := range sums {
+		dest := d.Other
+		if ordinal != MaxJobDestinations {
+			dest = d.Destinations[ordinal]
+		}
+		if s.sent > dest.SentBytes || s.received > dest.ReceivedBytes || s.connections > dest.Connections {
+			return fmt.Errorf("alloc: the openings of destination %d add up to more than its totals", ordinal)
+		}
+	}
+
 	return nil
+}
+
+// addCapped is a+b for two counts that are not negative, held at the largest
+// int64 rather than wrapping.
+func addCapped(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+
+	return a + b
 }
 
 func (d JobDestination) validateTotals(name string, unansweredCounted, repliesTimed bool) error {

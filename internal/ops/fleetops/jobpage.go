@@ -116,6 +116,9 @@ type pageStep struct {
 	Note string
 	// Usage is the step's window, one cell a group; nil when it has none.
 	Usage []pageField
+	// Destinations is where the step's connections went, as stepDestinations
+	// words it; empty when the job's destinations were not split by time.
+	Destinations string
 	// Bar places the step among the steps (thousandths of their span); HasBar
 	// is false for a step with no length.
 	HasBar     bool
@@ -406,6 +409,9 @@ func stepRow(step github.JobStep, tl *usage.Timeline, measured *alloc.RecordedUs
 		return row
 	}
 	row.Took = took.String()
+	if measured != nil {
+		row.Destinations = stepDestinations(measured.Destinations, step.StartedAt, step.CompletedAt)
+	}
 	if tl == nil || measured == nil {
 		row.Note = "could not tell"
 		return row

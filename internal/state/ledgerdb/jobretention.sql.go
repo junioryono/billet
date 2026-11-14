@@ -9,6 +9,21 @@ import (
 	"context"
 )
 
+const deleteRetiredJobDestinationOpenings = `-- name: DeleteRetiredJobDestinationOpenings :execrows
+DELETE FROM job_destination_openings
+ WHERE lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST($1 AS TEXT))
+`
+
+// The destinations' split by when each connection opened, of the jobs a batch
+// stamped.
+func (q *Queries) DeleteRetiredJobDestinationOpenings(ctx context.Context, stamp string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteRetiredJobDestinationOpenings, stamp)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const deleteRetiredJobDestinations = `-- name: DeleteRetiredJobDestinations :execrows
 DELETE FROM job_destinations
  WHERE lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST($1 AS TEXT))

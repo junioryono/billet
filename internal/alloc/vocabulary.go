@@ -24,11 +24,14 @@ type (
 	JobDestinations  = lease.JobDestinations
 	JobDestination   = lease.JobDestination
 	TapTotals        = lease.TapTotals
-	GuestReport      = lease.GuestReport
-	JobEgress        = lease.JobEgress
-	EgressRefusal    = lease.EgressRefusal
-	EgressNames      = lease.EgressNames
-	EgressDenial     = lease.EgressDenial
+	// DestinationOpening is a job's traffic to one destination in one bucket of
+	// when its connections opened.
+	DestinationOpening = lease.DestinationOpening
+	GuestReport        = lease.GuestReport
+	JobEgress          = lease.JobEgress
+	EgressRefusal      = lease.EgressRefusal
+	EgressNames        = lease.EgressNames
+	EgressDenial       = lease.EgressDenial
 )
 
 const (
@@ -87,6 +90,7 @@ const (
 	UsageSeriesCodecGaps    = lease.UsageSeriesCodecGaps
 	MaxUsageSeriesBytes     = lease.MaxUsageSeriesBytes
 	MaxJobDestinations      = lease.MaxJobDestinations
+	MaxDestinationOpenings  = lease.MaxDestinationOpenings
 	SlowReplyMillis         = lease.SlowReplyMillis
 	GuestReportCodec        = lease.GuestReportCodec
 	MaxEgressRefusedNames   = lease.MaxEgressRefusedNames

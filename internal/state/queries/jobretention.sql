@@ -77,6 +77,12 @@ DELETE FROM job_series
 DELETE FROM job_destinations
  WHERE lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST(@stamp AS TEXT));
 
+-- name: DeleteRetiredJobDestinationOpenings :execrows
+-- The destinations' split by when each connection opened, of the jobs a batch
+-- stamped.
+DELETE FROM job_destination_openings
+ WHERE lease_id IN (SELECT lease_id FROM job_history WHERE detail_retired_at = CAST(@stamp AS TEXT));
+
 -- name: ForgetRetiredJobDestinationTotals :exec
 -- The usage summary's verdict on the destinations of the jobs a batch stamped,
 -- and the tap's totals read beside them. A verdict is the summary's claim that
