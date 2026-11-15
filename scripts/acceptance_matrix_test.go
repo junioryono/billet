@@ -1608,7 +1608,19 @@ const fakeDispatchGH = `case "$1 $2" in
 		jq -cn --argjson id "$n" --arg t "${w%.yml} $label $tag" '{databaseId: $id, displayTitle: $t}'
 	done <"$FAKE/sent" | jq -s . | jq -r "$filter"
 	;;
+"api -X")
+	# api -X POST repos/<repo>/actions/runs/<id>/force-cancel: recorded, and the run is
+	# completed after it unless $FAKE/sticky-<id> says the cancel does not land.
+	id=$(echo "$4" | sed -n 's#.*/actions/runs/\([0-9]*\)/force-cancel$#\1#p')
+	[ -n "$id" ] || exit 9
+	echo "$id" >>"$FAKE/cancelled"
+	# A RUN THAT ENDED ON ITS OWN JUST BEFORE THE CANCEL: refused, and completed after.
+	if [ -f "$FAKE/ended-$id" ]; then : >"$FAKE/done-$id"; exit 1; fi
+	[ -f "$FAKE/cancel.exit" ] && exit "$(cat "$FAKE/cancel.exit")"
+	[ -f "$FAKE/sticky-$id" ] || : >"$FAKE/done-$id"
+	;;
 "run view")
+	[ -f "$FAKE/unreadable-$3" ] && exit 1
 	if [ -f "$FAKE/done-all" ] || [ -f "$FAKE/done-$3" ]; then
 		case "$*" in *conclusion*) echo success ;; *) echo completed ;; esac
 	else
@@ -1820,6 +1832,80 @@ func TestTheMatrixDispatchersLostPhaseNamesEachHeldWriter(t *testing.T) {
 		if got, err := os.ReadFile(runs + ".lost"); err == nil && len(got) > 0 {
 			t.Errorf("%s: named %q to lose", name, got)
 		}
+	}
+}
+
+// A FAILED OR CANCELLED LANE CANCELS WHAT IT SENT, and only that: every run the runs file
+// names that is still going, never one completed and never one it did not send; a run it
+// could not read or cancel fails the step, the rest still asked; and a lane that sent
+// nothing has nothing to cancel.
+func TestTheMatrixDispatcherCancelsTheRunsItSentThatAreStillGoing(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-2", "")
+	runs := filepath.Join(t.TempDir(), "runs")
+	if err := os.WriteFile(runs, []byte("1\n2\n\n3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1", runs, "-")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	if got, err := os.ReadFile(filepath.Join(f.dir, "cancelled")); err != nil || string(got) != "1\n3\n" {
+		t.Fatalf("cancelled %q (%v); want runs 1 and 3, the two still going", got, err)
+	}
+
+	for name, fixture := range map[string]string{
+		"a run it cannot read": "unreadable-1", "a cancel refused": "cancel.exit", "a cancel that does not land": "sticky-1",
+	} {
+		f := newMatrixFakes(t, "jq")
+		f.command(t, "gh", fakeDispatchGH)
+		body := ""
+		if fixture == "cancel.exit" {
+			body = "1"
+		}
+		f.fixture(t, fixture, body)
+		runs := filepath.Join(t.TempDir(), "runs")
+		if err := os.WriteFile(runs, []byte("1\n3\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1", runs, "-")
+		if code != 1 {
+			t.Errorf("%s: exit %d, want 1:\n%s", name, code, out)
+		}
+		if got, err := os.ReadFile(filepath.Join(f.dir, "cancelled")); err != nil || !strings.Contains(string(got), "3\n") {
+			t.Errorf("%s: cancelled %q (%v); run 3 must still be asked", name, got, err)
+		}
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1",
+		filepath.Join(t.TempDir(), "runs"), "-"); code != 0 || !strings.Contains(out, "sent nothing to cancel") {
+		t.Errorf("with no runs file: exit %d\n%s", code, out)
+	}
+	// A RUN THAT ENDED BETWEEN THE READ AND THE CANCEL IS WHAT THE CANCEL WANTED: GitHub
+	// refuses the cancel, and the run reads completed after.
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "ended-1", "")
+	ended := filepath.Join(t.TempDir(), "runs")
+	if err := os.WriteFile(ended, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1",
+		ended, "-"); code != 0 || !strings.Contains(out, "completed on its own") {
+		t.Errorf("a run that ended before its cancel: exit %d\n%s", code, out)
+	}
+	// A RUNS FILE THAT CANNOT BE READ IS NOT ONE THAT LISTS NOTHING.
+	unreadable := filepath.Join(t.TempDir(), "runs")
+	if err := os.Mkdir(unreadable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1",
+		unreadable, "-"); code != 1 || !strings.Contains(out, "could not be read") {
+		t.Errorf("with a runs file that cannot be read: exit %d\n%s", code, out)
 	}
 }
 

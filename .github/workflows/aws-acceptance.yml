@@ -531,6 +531,26 @@ jobs:
           set -euo pipefail
           read -r -a labels <<<"$LABELS"
           scripts/acceptance/matrix-dispatch.sh store-unreachable "$REPO" "$RUN" out/runs "${labels[@]}"
+      # A FAILED OR CANCELLED RUN'S MATRIX RUNS ARE CANCELLED FIRST, before any cleanup
+      # that waits on the host, since GitHub ends a cancelled job's cleanup before its end:
+      # one left queued keeps its labels, which the next run's tiers share, so the next
+      # run's node launches for jobs that are not its own (2026-11-15). A token of its own,
+      # as the phase's may have lapsed.
+      - id: cancel-token
+        if: ${{ (failure() || cancelled()) && steps.labels.outcome == 'success' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Cancel the matrix runs this run sent that are still going
+        if: ${{ (failure() || cancelled()) && steps.cancel-token.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.cancel-token.outputs.token }}
+          MATRIX_TIMEOUT: "120"
+          MATRIX_POLL: "5"
+        run: scripts/acceptance/matrix-dispatch.sh cancel "$REPO" "$RUN" out/runs -
       # WHATEVER HAPPENED, the block step included: a cancelled step leaves its command
       # running on the host, and the lift is recorded there before it waits for the lock
       # that command holds, so a block still arriving installs nothing.
