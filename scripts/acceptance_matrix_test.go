@@ -1614,6 +1614,8 @@ const fakeDispatchGH = `case "$1 $2" in
 	id=$(echo "$4" | sed -n 's#.*/actions/runs/\([0-9]*\)/force-cancel$#\1#p')
 	[ -n "$id" ] || exit 9
 	echo "$id" >>"$FAKE/cancelled"
+	# A RUN THAT ENDED ON ITS OWN JUST BEFORE THE CANCEL: refused, and completed after.
+	if [ -f "$FAKE/ended-$id" ]; then : >"$FAKE/done-$id"; exit 1; fi
 	[ -f "$FAKE/cancel.exit" ] && exit "$(cat "$FAKE/cancel.exit")"
 	[ -f "$FAKE/sticky-$id" ] || : >"$FAKE/done-$id"
 	;;
@@ -1882,6 +1884,19 @@ func TestTheMatrixDispatcherCancelsTheRunsItSentThatAreStillGoing(t *testing.T) 
 	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1",
 		filepath.Join(t.TempDir(), "runs"), "-"); code != 0 || !strings.Contains(out, "sent nothing to cancel") {
 		t.Errorf("with no runs file: exit %d\n%s", code, out)
+	}
+	// A RUN THAT ENDED BETWEEN THE READ AND THE CANCEL IS WHAT THE CANCEL WANTED: GitHub
+	// refuses the cancel, and the run reads completed after.
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "ended-1", "")
+	ended := filepath.Join(t.TempDir(), "runs")
+	if err := os.WriteFile(ended, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1",
+		ended, "-"); code != 0 || !strings.Contains(out, "completed on its own") {
+		t.Errorf("a run that ended before its cancel: exit %d\n%s", code, out)
 	}
 	// A RUNS FILE THAT CANNOT BE READ IS NOT ONE THAT LISTS NOTHING.
 	unreadable := filepath.Join(t.TempDir(), "runs")

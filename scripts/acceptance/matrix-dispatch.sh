@@ -280,6 +280,9 @@ cancel)
 		# for self-hosted runners: it stays queued (cancel-superseded.yml, 2026-09-25).
 		if gh api -X POST "repos/$repo/actions/runs/$id/force-cancel" >/dev/null; then
 			going+=("$id")
+		elif [ "$(gh run view "$id" -R "$repo" --json status --jq .status)" = completed ]; then
+			# IT ENDED BETWEEN THE READ AND THE CANCEL, which GitHub refuses with a 409.
+			echo "run $id completed on its own"
 		else
 			echo "could not cancel run $id (it is $status)" >&2
 			failed=1
