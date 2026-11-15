@@ -106,25 +106,27 @@ printf '{"ready":true}\n'
 	}
 }
 
-// THE GUEST WAITS FOR THE NODE TO OPEN SETTLEMENT, HOWEVER LATE, UP TO ITS DEADLINE: a
+// THE GUEST WAITS FOR THE NODE TO OPEN SETTLEMENT, HOWEVER LATE, UP TO ITS BOUND: a
 // node runs its destroys one at a time, so a job's settlement can open minutes after the
 // job ended, behind another job's publication, and a guest that stops asking discards
-// the store the node is about to publish. Past the deadline it gives the store back.
+// the store the node is about to publish. Past the bound it gives the store back.
 func TestDockerCacheWaitsForALateSettlement(t *testing.T) {
 	t.Parallel()
+	if !strings.Contains(DockerCacheScript, "asks=${BILLET_DOCKER_SETTLE_ASKS:-3600}") {
+		t.Fatal("the guest's default bound is no longer 3600 asks, an hour at a second apart")
+	}
 	for _, tc := range []struct {
 		name string
 		// refusals is how many readiness asks the node answers 409 before it opens.
 		refusals string
-		// clock is what date answers, in order, the last repeating.
-		clock    []string
-		want     string
-		wantNone string
+		// bound is BILLET_DOCKER_SETTLE_ASKS, empty for the script's own.
+		bound     string
+		wantAsks  int
+		discarded bool
 	}{
-		{name: "opened after 150 asks", refusals: "150", clock: []string{"1000"},
-			want: "/v1/docker-store/ready", wantNone: "/v1/volumes/0/discard"},
-		{name: "never opened within the hour", refusals: "1000000", clock: []string{"1000", "1000", "4601"},
-			want: "/v1/volumes/0/discard"},
+		// Four times the 100 asks that lost arm64's store, under the default bound.
+		{name: "opened after 400 refusals", refusals: "400", wantAsks: 401},
+		{name: "never opened within the bound", refusals: "1000000", bound: "5", wantAsks: 5, discarded: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -141,22 +143,11 @@ func TestDockerCacheWaitsForALateSettlement(t *testing.T) {
 			shadow := t.TempDir()
 			logPath := filepath.Join(shadow, "curl.log")
 			asks := filepath.Join(shadow, "asks")
-			clock := filepath.Join(shadow, "clock")
-			if err := os.WriteFile(clock, []byte(strings.Join(tc.clock, "\n")+"\n"), 0o600); err != nil {
-				t.Fatalf("write clock: %v", err)
-			}
 			for _, name := range []string{"systemctl", "sync", "umount", "e2fsck", "sleep"} {
 				writeStub(t, shadow, name, "exit 0\n")
 			}
 			writeStub(t, shadow, "docker", "printf 'new\\n'\n")
 			writeStub(t, shadow, "blkid", "printf 'x\\n'\n")
-			// date answers the clock's next line, keeping the last.
-			writeStub(t, shadow, "date", `
-head -n 1 "$BILLET_TEST_CLOCK"
-if [ "$(wc -l < "$BILLET_TEST_CLOCK")" -gt 1 ]; then
-	tail -n +2 "$BILLET_TEST_CLOCK" > "$BILLET_TEST_CLOCK.next" && mv "$BILLET_TEST_CLOCK.next" "$BILLET_TEST_CLOCK"
-fi
-`)
 			writeStub(t, shadow, "curl", `
 printf '%s\n' "$*" >> "$BILLET_TEST_CURL_LOG"
 case "$*" in
@@ -182,8 +173,10 @@ esac
 				"BILLET_TEST_CURL_LOG="+logPath,
 				"BILLET_TEST_ASKS="+asks,
 				"BILLET_TEST_REFUSALS="+tc.refusals,
-				"BILLET_TEST_CLOCK="+clock,
 			)
+			if tc.bound != "" {
+				run.Env = append(run.Env, "BILLET_DOCKER_SETTLE_ASKS="+tc.bound)
+			}
 			output, err := combinedOutputRetry(t, run)
 			if err != nil {
 				t.Fatalf("complete returned %v:\n%s", err, output)
@@ -192,11 +185,15 @@ esac
 			if err != nil {
 				t.Fatalf("read cache requests: %v", err)
 			}
-			if !strings.Contains(string(called), tc.want) {
-				t.Errorf("the guest never called %s:\n%s", tc.want, output)
+			asked, err := os.ReadFile(asks)
+			if err != nil {
+				t.Fatalf("read the readiness asks: %v", err)
 			}
-			if tc.wantNone != "" && strings.Contains(string(called), tc.wantNone) {
-				t.Errorf("the guest called %s:\n%s", tc.wantNone, output)
+			if len(asked) != tc.wantAsks {
+				t.Errorf("the guest asked for readiness %d times, want %d:\n%s", len(asked), tc.wantAsks, output)
+			}
+			if got := strings.Contains(string(called), "/v1/volumes/0/discard"); got != tc.discarded {
+				t.Errorf("the guest gave the store back: %t, want %t:\n%s", got, tc.discarded, output)
 			}
 		})
 	}

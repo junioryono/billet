@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -433,30 +434,39 @@ func TestACompletedJobThatWillNotPublishSaysWhy(t *testing.T) {
 		}
 	})
 
-	// A trusted-only tier's settlement says the same, for the case a node met on
-	// 2026-11-15: the guest gave the store back before its settlement opened.
-	t.Run("a trusted-only store the guest discarded before settlement", func(t *testing.T) {
-		t.Parallel()
+	// A trusted-only tier's settlement says so too, for the case a node met on
+	// 2026-11-15: the guest gave the store back before its settlement opened. A
+	// session without the Docker cache says nothing.
+	for _, docker := range []bool{true, false} {
+		t.Run(fmt.Sprintf("a trusted-only session with nothing to settle, Docker cache %t", docker),
+			func(t *testing.T) {
+				t.Parallel()
 
-		spec := config.Tier{Cache: &config.TierCache{Publish: config.CachePublishTrustedOnly}}.EffectiveCache()
-		service, token, instance := scopedService(t, provider.TrustTrusted, &spec, nil, &fakeCacheStore{})
-		var said lockedBuffer
-		service.log = slog.New(slog.NewTextHandler(&said, nil))
+				spec := config.CacheSpec{Publish: config.CachePublishTrustedOnly,
+					Docker: config.CacheSetting{Enabled: docker}}
+				service, token, instance := scopedService(t, provider.TrustTrusted, &spec, nil, &fakeCacheStore{})
+				var said lockedBuffer
+				service.log = slog.New(slog.NewTextHandler(&said, nil))
 
-		if response := cacheRequest(t, service, token, "/v1/docker-store",
-			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
-			t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
-		}
-		if response := cacheRequest(t, service, token, "/v1/volumes/0/discard", nil); response.Code != http.StatusOK {
-			t.Fatalf("discard status = %d: %s", response.Code, response.Body.String())
-		}
-		if err := service.SettleCompleted(t.Context(), instance, true, dispatch.CacheAuthority{}); err != nil {
-			t.Fatalf("SettleCompleted = %v", err)
-		}
-		if !strings.Contains(said.String(), "discarded before it was proved ready") {
-			t.Errorf("the log says %q, want the store's discard named", said.String())
-		}
-	})
+				if docker {
+					if response := cacheRequest(t, service, token, "/v1/docker-store",
+						map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+						t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+					}
+					if response := cacheRequest(t, service, token, "/v1/volumes/0/discard",
+						nil); response.Code != http.StatusOK {
+						t.Fatalf("discard status = %d: %s", response.Code, response.Body.String())
+					}
+				}
+				if err := service.SettleCompleted(t.Context(), instance, true,
+					dispatch.CacheAuthority{}); err != nil {
+					t.Fatalf("SettleCompleted = %v", err)
+				}
+				if got := strings.Contains(said.String(), "none was mounted and still there to settle"); got != docker {
+					t.Errorf("the log says %q; want the store's absence said: %t", said.String(), docker)
+				}
+			})
+	}
 }
 
 // THE RUNNER HANDS A COMPLETION'S AUTHORITY TO THE CACHE, through the path a

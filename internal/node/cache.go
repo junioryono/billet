@@ -1690,11 +1690,16 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 	}
 	attachment, err := s.awaitDockerReady(ctx, session)
 	if errors.Is(err, errNoDockerStore) {
-		// SAID, as the default-branch path says it: a store the guest discarded
-		// before settlement opened is a publication that never happened, and on
-		// 2026-11-15 a node's log was silent about one.
-		s.log.Info("a completed job's Docker image store will not publish: it was discarded "+
-			"before it was proved ready", "instance", instance)
+		// SAID WHEREVER THE SESSION HAD THE CACHE: a session that never asked for a
+		// store has nothing to say, and one that did published nothing, which on
+		// 2026-11-15 a node's log was silent about while its guest had given the
+		// store back before settlement opened. Which of the reasons below it was,
+		// the node cannot tell from a slot that is empty.
+		if sessionSetting(session, config.CacheDocker).Enabled {
+			s.log.Info("a completed job's Docker image store will not publish: none was mounted "+
+				"and still there to settle (the guest gave it back, never mounted one, or "+
+				"replaced it)", "instance", instance)
+		}
 
 		return nil
 	}

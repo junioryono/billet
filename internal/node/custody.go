@@ -757,9 +757,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		r.settleHeldUsage(ctx, c, r.heldFinal(c), epochCurrent)
 		c.unconfirmed.Store(false)
 		r.cleanupCache(ctx, c.name)
-		r.logReleased(c, "absent")
-
-		return r.finish(ctx, c)
+		return r.finishReleased(ctx, c, "absent")
 	}
 
 	// Seen it now, whatever it was before. A stray that has finally materialised
@@ -780,9 +778,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		r.settleHeldUsage(ctx, c, r.heldFinal(c), epochCurrent)
 		c.unconfirmed.Store(false)
 		r.cleanupCache(ctx, c.name)
-		r.logReleased(c, "terminal")
-
-		return r.finish(ctx, c)
+		return r.finishReleased(ctx, c, "terminal")
 	}
 
 	// An adopted instance that is still running is left alone. This is the case
@@ -841,19 +837,24 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// rather than with custody.
 	c.unconfirmed.Store(false)
 	r.cleanupCache(ctx, c.name)
-	r.logReleased(c, "stopped")
-
-	return r.finish(ctx, c)
+	return r.finishReleased(ctx, c, "stopped")
 }
 
-// logReleased says custody let compute go and on which proof: the backend's
-// confirmed stop, its terminal record, or an absence held through the grace.
-// Every release says it; on 2026-11-15 two releases on EC2's terminal record
-// left no line, and when a job's compute went had to be read from timestamps.
-func (r *Runner) logReleased(c *custody, proof string) {
+// finishReleased finishes an entry whose compute is proved gone and says so once,
+// with the proof: the backend's confirmed stop, its terminal record, or an
+// absence held through the grace. Said after the release, so a release that
+// fails and is retried on the next tend is said only when it lands. On
+// 2026-11-15 two releases on EC2's terminal record left no line, and when a
+// job's compute went had to be read from timestamps.
+func (r *Runner) finishReleased(ctx context.Context, c *custody, proof string) error {
+	if err := r.finish(ctx, c); err != nil {
+		return err
+	}
 	r.log.Info("released compute that was being held",
 		"name", c.name, "lease", c.leaseID, "adopted", !c.discard, "proof", proof,
 		"held_for", r.now().Sub(c.since).Round(time.Second))
+
+	return nil
 }
 
 // recordFailure makes an entry's failed outcome durable, once.
