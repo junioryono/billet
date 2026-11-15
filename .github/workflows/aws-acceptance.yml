@@ -105,8 +105,8 @@ jobs:
         env:
           LANES: ${{ inputs.lanes || '["ec2", "pool"]' }}
         run: |
-          jq -e 'type == "array" and length > 0 and (unique | length) == length and
-            all(.[]; . == "ec2" or . == "pool")' <<<"$LANES" >/dev/null ||
+          jq -se 'length == 1 and (.[0] | type == "array" and length > 0 and
+            (unique | length) == length and all(.[]; . == "ec2" or . == "pool"))' <<<"$LANES" >/dev/null ||
             { echo "lanes is $LANES; it is a list of ec2 and pool, each once" >&2; exit 1; }
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6

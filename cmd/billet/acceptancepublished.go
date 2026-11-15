@@ -46,7 +46,8 @@ func cmdMatrixPublished(ctx context.Context, env cli.Env, args []string) error {
 		return &cli.ExitError{Code: publishedCouldNot, Msg: err.Error(), Err: err}
 	}
 
-	return waitPublished(ctx, env.Stdout, current, namespace, covered, wait, publishedPollEvery)
+	return waitPublished(ctx, env.Stdout, current, namespace, covered, wait, publishedPollEvery,
+		publishedNoteEvery)
 }
 
 // publishedStore reads the flags and the workspace, and opens the run's ebs-s3 store.
@@ -96,16 +97,17 @@ func publishedStore(env cli.Env, args []string) (
 }
 
 // waitPublished asks current for each architecture's image store until every one has a
-// generation or wait passes. It answers in three ways: nil once every one is published;
-// publishedMissing when the store answered a miss for one to the end; publishedCouldNot
-// when the last answer for one was not an answer, which is never read as a miss.
+// generation or wait passes, saying every note what each one still waiting last answered.
+// It answers in three ways: nil once every one is published; publishedMissing when the
+// store answered a miss for one to the end; publishedCouldNot when the last answer for one
+// was not an answer, which is never read as a miss.
 func waitPublished(
 	ctx context.Context, out io.Writer, current func(context.Context, string) (string, error),
-	namespace string, archs []config.Arch, wait, poll time.Duration,
+	namespace string, archs []config.Arch, wait, poll, note time.Duration,
 ) error {
 	begun := time.Now()
 	deadline := begun.Add(wait)
-	nextNote := begun.Add(publishedNoteEvery)
+	nextNote := begun.Add(note)
 	pending := map[config.Arch]error{}
 	for _, a := range archs {
 		pending[a] = storecontract.ErrMiss
@@ -140,7 +142,7 @@ func waitPublished(
 			break
 		}
 		if !time.Now().Before(nextNote) {
-			nextNote = time.Now().Add(publishedNoteEvery)
+			nextNote = time.Now().Add(note)
 			for _, a := range archs {
 				err, ok := pending[a]
 				switch {
