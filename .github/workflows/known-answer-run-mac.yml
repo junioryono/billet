@@ -6,8 +6,8 @@ name: Known-answer run (Mac)
 # on Tart that only macos-01 serves, so every loaded job's idle reference ran on the
 # same Mac. The kit's scripts are fetched from this run's own commit.
 #
-# THE LOADS FIT THE TIER, 4 vCPU and 12 GiB: two CPU workers, so the guest's own
-# setup has vCPUs beside them; a 6 GiB memory load, half the guest, since a Tart VM's
+# THE LOADS FIT THE TIER, 4 vCPU and 12 GiB: two CPU workers, leaving two vCPUs for
+# the guest's and the runner's own background work; a 6 GiB memory load, half the guest, since a Tart VM's
 # memory is its process's physical footprint and that holds what the guest touched,
 # setup's page cache included; 2 GiB written, as on Linux. The network load is the
 # same Linux tarball known-answer-run.yml downloads, for the reason it gives.
