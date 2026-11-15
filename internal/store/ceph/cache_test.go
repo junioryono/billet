@@ -631,6 +631,11 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 		if id, ok := f.imageIDs[tail[0]]; ok {
 			info["id"] = id
 		}
+		// rbd answers in prose unless asked for json, as a caller that forgot to ask
+		// would read it.
+		if !slices.Contains(all, "json") {
+			return fmt.Appendf(nil, "rbd image '%s':\n\tsize 1 GiB\n\tid: %v\n", tail[0], info["id"]), nil
+		}
 
 		return json.Marshal(info)
 	case "rm":
