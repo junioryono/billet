@@ -98,6 +98,16 @@ jobs:
       # halted metal instance bills no compute. Longer than the lane's own six hours.
       POOL_HOST_LIFETIME_MINUTES: "390"
     steps:
+      # A LANE IS ec2 OR pool, named once each, before anything is held or stood up: every
+      # other name would stand an ec2 deployment up and skip the steps only ec2 takes,
+      # and then wait out its jobs' count.
+      - name: The lanes are ones this workflow runs
+        env:
+          LANES: ${{ inputs.lanes || '["ec2", "pool"]' }}
+        run: |
+          jq -e 'type == "array" and length > 0 and (unique | length) == length and
+            all(.[]; . == "ec2" or . == "pool")' <<<"$LANES" >/dev/null ||
+            { echo "lanes is $LANES; it is a list of ec2 and pool, each once" >&2; exit 1; }
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:

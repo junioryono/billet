@@ -142,8 +142,14 @@ func waitPublished(
 		if !time.Now().Before(nextNote) {
 			nextNote = time.Now().Add(publishedNoteEvery)
 			for _, a := range archs {
-				if err, ok := pending[a]; ok {
-					fmt.Fprintf(out, "%s: no image store is published yet, after %s (%v)\n", a,
+				err, ok := pending[a]
+				switch {
+				case !ok:
+				case errors.Is(err, storecontract.ErrMiss):
+					fmt.Fprintf(out, "%s: no image store is published yet, after %s\n", a,
+						time.Since(begun).Round(time.Second))
+				default:
+					fmt.Fprintf(out, "%s: the store could not be asked, after %s: %v\n", a,
 						time.Since(begun).Round(time.Second), err)
 				}
 			}
