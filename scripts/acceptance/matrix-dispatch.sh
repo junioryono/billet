@@ -135,6 +135,12 @@ holding() {
 				echo "run $id's writer holds its disk and GitHub names no runner for it" >&2
 				return 1
 			fi
+			# ONLY A NAME BILLET GIVES, which is its lease's: the caller puts it on a command
+			# line run on the acceptance host, and nothing GitHub says is quoted there.
+			if ! [[ "$runner" =~ ^billet-[0-9a-f]{32}$ ]]; then
+				echo "run $id's writer holds its disk on a runner billet would not name; nothing is recorded" >&2
+				return 1
+			fi
 			if ! echo "$label $runner" >>"$runs.lost"; then
 				echo "run $id's writer holds its disk on $runner, and that could not be recorded in $runs.lost" >&2
 				return 1

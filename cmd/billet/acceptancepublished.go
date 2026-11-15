@@ -38,44 +38,59 @@ var matrixGuestArch = map[config.Arch]string{config.ArchX64: "amd64", config.Arc
 // 43590137207) arm64's was first attached 19 minutes after its cold job ended, so a warm
 // run sent after a fixed 150 s found it cold.
 func cmdMatrixPublished(ctx context.Context, env cli.Env, args []string) error {
+	current, namespace, covered, wait, err := publishedStore(env, args)
+	if err != nil {
+		// NOT ASKED IS NOT A MISS: everything short of asking the store answers 2.
+		return &cli.ExitError{Code: publishedCouldNot, Msg: err.Error(), Err: err}
+	}
+
+	return waitPublished(ctx, env.Stdout, current, namespace, covered, wait, publishedPollEvery)
+}
+
+// publishedStore reads the flags and the workspace, and opens the run's ebs-s3 store.
+func publishedStore(env cli.Env, args []string) (
+	func(context.Context, string) (string, error), string, []config.Arch, time.Duration, error,
+) {
 	fs := cli.NewFlagSet("billet acceptance matrix published", env.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
 	archs := fs.String("archs", "", "the architectures whose image store must be published, comma-separated")
 	wait := fs.Duration("wait", 30*time.Minute, "how long to wait for every one")
 	if err := cli.Parse(fs, args); err != nil {
-		return err
+		return nil, "", nil, 0, err
 	}
 	covered, err := parseMatrixArchs(*archs)
 	if err != nil {
-		return err
+		return nil, "", nil, 0, err
 	}
 	if len(covered) == 0 {
-		return errors.New("--archs: name the architectures whose image store must be published")
+		return nil, "", nil, 0, errors.New("--archs: name the architectures whose image store must be published")
 	}
 	if *wait <= 0 {
-		return fmt.Errorf("--wait must be positive, got %s", *wait)
+		return nil, "", nil, 0, fmt.Errorf("--wait must be positive, got %s", *wait)
 	}
 	ws, err := requireAcceptanceWorkspace(*workspace)
 	if err != nil {
-		return err
+		return nil, "", nil, 0, err
 	}
 	cfg, err := config.Load(ws.ConfigPath)
 	if err != nil {
-		return err
+		return nil, "", nil, 0, err
 	}
 	if cfg.Node == nil || cfg.Node.EBSS3 == nil {
-		return errors.New("the workspace's node has no ebs-s3 store, so there is no publication to wait for")
+		return nil, "", nil, 0, errors.New("the workspace's node has no ebs-s3 store, so there is no " +
+			"publication to wait for")
 	}
 	if ws.DeploymentID == "" {
-		return errors.New("the workspace records no deployment id, so its store's namespace is unknown")
+		return nil, "", nil, 0, errors.New("the workspace records no deployment id, so its store's namespace " +
+			"is unknown")
 	}
 	namespace := app.CacheNamespace(ws.DeploymentID, cfg.Node.Site)
 	store, err := ebss3.New(*cfg.Node.EBSS3, namespace, awscreds.Default())
 	if err != nil {
-		return fmt.Errorf("the node's ebs-s3 store: %w", err)
+		return nil, "", nil, 0, fmt.Errorf("the node's ebs-s3 store: %w", err)
 	}
 
-	return waitPublished(ctx, env.Stdout, store.Current, namespace, covered, *wait, publishedPollEvery)
+	return store.Current, namespace, covered, *wait, nil
 }
 
 // waitPublished asks current for each architecture's image store until every one has a

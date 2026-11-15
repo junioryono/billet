@@ -1079,25 +1079,30 @@ func TestTheMatrixHostLosesExactlyTheWritersInstance(t *testing.T) {
 		terminated         bool
 	}{
 		"the one instance": {runner: runner, deployment: deployment,
-			fixtures: map[string]string{"describe": "i-0abc\n", "terminate": "shutting-down\n"},
-			says:     "i-0abc (" + runner + ") is lost: shutting-down", terminated: true},
-		"no instance by that name": {runner: runner, deployment: deployment, fixtures: map[string]string{"describe": ""},
+			fixtures: map[string]string{"describe": `["i-0abc1234"]`, "terminate": "shutting-down\n"},
+			says:     "i-0abc1234 (" + runner + ") is lost: shutting-down", terminated: true},
+		"no instance by that name": {runner: runner, deployment: deployment, fixtures: map[string]string{"describe": "[]"},
 			code: 1, says: "is 0 live instances"},
 		"two by that name": {runner: runner, deployment: deployment,
-			fixtures: map[string]string{"describe": "i-0abc\ti-0def\n"}, code: 1, says: "is 2 live instances"},
+			fixtures: map[string]string{"describe": "[\n  \"i-0abc1234\",\n  \"i-0def5678\"\n]\n"}, code: 1,
+			says: "is 2 live instances"},
+		"an answer that is not a list": {runner: runner, deployment: deployment,
+			fixtures: map[string]string{"describe": "i-0abc1234\n"}, code: 2, says: "would not read as a list"},
+		"an instance id that is not one": {runner: runner, deployment: deployment,
+			fixtures: map[string]string{"describe": `["i-0abc; reboot"]`}, code: 2, says: "nothing is terminated"},
 		"EC2 that will not say": {runner: runner, deployment: deployment,
 			fixtures: map[string]string{"describe.exit": "254"}, code: 2, says: "could not say which instance"},
 		"a termination refused": {runner: runner, deployment: deployment,
-			fixtures: map[string]string{"describe": "i-0abc\n", "terminate.exit": "254"}, code: 1,
+			fixtures: map[string]string{"describe": `["i-0abc1234"]`, "terminate.exit": "254"}, code: 1,
 			says: "refused to terminate", terminated: true},
 		"a state that is not going": {runner: runner, deployment: deployment,
-			fixtures: map[string]string{"describe": "i-0abc\n", "terminate": "running\n"}, code: 1,
+			fixtures: map[string]string{"describe": `["i-0abc1234"]`, "terminate": "running\n"}, code: 1,
 			says: "is running after its termination was asked", terminated: true},
 		"a name billet would not give": {runner: "i-0abc", deployment: deployment, code: 2,
 			says: "not a billet runner's name"},
 		"no deployment named": {runner: runner, deployment: "", code: 2, says: "names no deployment"},
 	} {
-		f := newMatrixFakes(t)
+		f := newMatrixFakes(t, "jq")
 		f.command(t, "aws", fakeLoseAWS)
 		for k, v := range c.fixtures {
 			f.fixture(t, k, v)
@@ -1120,7 +1125,7 @@ func TestTheMatrixHostLosesExactlyTheWritersInstance(t *testing.T) {
 		if terminated != c.terminated {
 			t.Errorf("%s: a termination was asked: %v, want %v\n%s", name, terminated, c.terminated, calls)
 		}
-		if terminated && !strings.Contains(string(calls), "--instance-ids i-0abc ") {
+		if terminated && !strings.Contains(string(calls), "--instance-ids i-0abc1234 ") {
 			t.Errorf("%s: terminated something other than the one instance found:\n%s", name, calls)
 		}
 		if strings.Contains(string(calls), "describe-instances") &&
@@ -1793,6 +1798,7 @@ func TestTheMatrixDispatchersLostPhaseNamesEachHeldWriter(t *testing.T) {
 		"a writer not yet holding":           {writerJobs("queued", "in_progress", x64), "did not hold its disk within"},
 		"a writer that ended first":          {writerJobs("completed", "completed", x64), "ended before it held its disk"},
 		"a writer GitHub names no runner of": {writerJobs("in_progress", "in_progress", ""), "names no runner"},
+		"a runner billet would not name":     {writerJobs("in_progress", "in_progress", "billet-x'; reboot; '"), "billet would not name"},
 		"a run GitHub will not describe":     {"", "did not hold its disk within"},
 	} {
 		f := newMatrixFakes(t, "jq")

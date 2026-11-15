@@ -531,27 +531,36 @@ lose)
 		echo "matrix: $run_dir/deployment names no deployment; nothing is terminated" >&2
 		exit 2
 	fi
-	# EXACTLY ONE LIVE INSTANCE OF THIS DEPLOYMENT BY THAT NAME, or nothing is touched.
-	if ! ids=$(aws ec2 describe-instances --region "$region" --output text \
+	# EXACTLY ONE LIVE INSTANCE OF THIS DEPLOYMENT BY THAT NAME, or nothing is touched. As
+	# JSON, counted whole: text output puts each reservation on a line of its own.
+	if ! ids=$(aws ec2 describe-instances --region "$region" --output json \
 		--filters "Name=tag:Name,Values=$runner" "Name=tag:sh.billet.owner,Values=$deployment" \
 		"Name=instance-state-name,Values=pending,running" --query 'Reservations[].Instances[].InstanceId'); then
 		echo "matrix: EC2 could not say which instance $runner is; nothing is terminated" >&2
 		exit 2
 	fi
-	read -r -a found <<<"$ids"
-	if [ "${#found[@]}" -ne 1 ]; then
-		echo "matrix: $runner is ${#found[@]} live instances of deployment $deployment, not one; nothing is terminated" >&2
+	if ! count=$(jq -er 'if type == "array" and all(.[]; type == "string") then length else error end' <<<"$ids"); then
+		echo "matrix: EC2's answer about $runner would not read as a list of instances; nothing is terminated" >&2
+		exit 2
+	fi
+	if [ "$count" -ne 1 ]; then
+		echo "matrix: $runner is $count live instances of deployment $deployment, not one; nothing is terminated" >&2
 		exit 1
 	fi
-	if ! state=$(aws ec2 terminate-instances --region "$region" --instance-ids "${found[0]}" --output text \
+	instance=$(jq -r '.[0]' <<<"$ids")
+	if ! [[ "$instance" =~ ^i-[0-9a-f]{8,17}$ ]]; then
+		echo "matrix: EC2 named $runner's instance \"$instance\"; nothing is terminated" >&2
+		exit 2
+	fi
+	if ! state=$(aws ec2 terminate-instances --region "$region" --instance-ids "$instance" --output text \
 		--query 'TerminatingInstances[0].CurrentState.Name'); then
-		echo "matrix: EC2 refused to terminate ${found[0]} ($runner)" >&2
+		echo "matrix: EC2 refused to terminate $instance ($runner)" >&2
 		exit 1
 	fi
 	case "$state" in
-	shutting-down | terminated) echo "matrix: ${found[0]} ($runner) is lost: $state" ;;
+	shutting-down | terminated) echo "matrix: $instance ($runner) is lost: $state" ;;
 	*)
-		echo "matrix: ${found[0]} ($runner) is $state after its termination was asked" >&2
+		echo "matrix: $instance ($runner) is $state after its termination was asked" >&2
 		exit 1
 		;;
 	esac

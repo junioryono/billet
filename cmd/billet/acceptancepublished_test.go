@@ -111,6 +111,26 @@ func TestTheWarmImageRunsWaitForTheColdRunsPublication(t *testing.T) {
 	}
 }
 
+// A STORE THAT WAS NEVER ASKED IS COULD-NOT-TELL, NEVER A MISS: whatever stops the
+// command before it asks (its flags, a missing workspace) answers 2, which the lane reads
+// apart from a cold run that published nothing.
+func TestAPublicationNeverAskedForIsNotAMiss(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	env := cli.Env{Stdout: &out, Stderr: &out}
+	missing := filepath.Join(t.TempDir(), "no-workspace")
+	for name, args := range map[string][]string{
+		"no workspace":            {"--archs", "x64", "--workspace", missing},
+		"no architecture":         {"--workspace", missing},
+		"a wait that is no wait":  {"--archs", "x64", "--wait", "0s", "--workspace", missing},
+		"an architecture unknown": {"--archs", "sparc", "--workspace", missing},
+	} {
+		if err := cmdMatrixPublished(t.Context(), env, args); cli.ExitStatus(err) != publishedCouldNot {
+			t.Errorf("%s: exit %d (%v), want %d", name, cli.ExitStatus(err), err, publishedCouldNot)
+		}
+	}
+}
+
 // THE ARCHITECTURE'S NAME IS THE GUEST'S: the image store's key ends with what the
 // guest's docker-cache.sh sends, which maps uname's x86_64 and aarch64.
 func TestTheMatrixNamesEachArchitectureAsTheGuestDoes(t *testing.T) {

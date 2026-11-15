@@ -463,6 +463,11 @@ jobs:
         run: |
           set -euo pipefail
           while read -r label runner; do
+            # A NAME BILLET GIVES, OR NOTHING IS SENT: it goes into the host's command line.
+            if ! [[ "$runner" =~ ^billet-[0-9a-f]{32}$ ]]; then
+              echo "\"$runner\" is not a runner billet would name; nothing is lost" >&2
+              exit 1
+            fi
             echo "losing $label's writer, $runner"
             scripts/acceptance/ssm-run.sh run "$HOST" 120 "bash '$RUN_DIR/matrix-host.sh' lose '$RUN_DIR' '$AWS_REGION' '$runner'"
           done <out/runs.lost
