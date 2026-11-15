@@ -78,7 +78,8 @@ func runGuestBoot(t *testing.T, env []string) string {
 		t.Fatal("the entry point no longer marks the runner's start with runner_started=")
 	}
 	script = script[:launch] + "echo REACHED THE RUNNER\n" +
-		"printf 'ENV %s\\n' \"${runner_env[@]}\"\n" +
+		// GUARDED, as the entry point guards it: an empty array is unbound to Bash 3.2.
+		"printf 'ENV %s\\n' ${runner_env[@]+\"${runner_env[@]}\"}\n" +
 		"cat \"$BAZELRC_FILE\" \"$GITCONFIG_FILE\" 2>/dev/null || true\n"
 	for path, stand := range map[string]string{
 		guestCachesPath:                      lib,
