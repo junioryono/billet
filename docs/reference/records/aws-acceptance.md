@@ -144,7 +144,12 @@ The teardown, again, left nothing.
 - **The guest had given up.** `docker-cache.sh complete` asked for readiness 100 times a second apart, about 105 s, and then gave the store back, so the settlement found none, published nothing, and logged nothing.
 - **Since #899** the guest asks for at least an hour, the node says when a session with the cache had no store left to settle, and custody says every release with its proof: these two runs' releases, on EC2's terminal records, had left no line either. The guest's half reaches a lane once its images are rebuilt with it.
 
-**Run `43762524818`, 2026-11-15, the ec2 lane on x64 alone.** EC2_X64_PLACEHOLDER
+**Run `43762524818`, 2026-11-15, the ec2 lane on x64 alone, from #897's merge: every x64 cell passed.** With one architecture there is no second store to settle behind the first, and x64's was published 2 minutes 46 seconds into the wait. All 26 x64 cells the lane runs passed, in 72 minutes from dispatch to the host stopped, about $0.18 of instances by the cells' estimates:
+- **The image store, sticky disks, the Docker builder, the Actions cache, Git, Go, Bazel and npm, cold and warm**, both two-writer cells and the failed writer, on the images rebuilt that day. Bazel warm passed with #878's read of billet at boot in the image.
+- **The instance lost mid-job, its first run.** The writer reached its hold on `billet-40dfadf249207286281f159a1fdff0f8`, `matrix-host.sh lose` terminated that one instance and passed once EC2 said `shutting-down`, and the reader read its sticky disk `warm` with the seed's marker: the lost writer published nothing over it.
+- **The store out of reach**, all six cells: the image store read `unavailable` and the other five `bypassed`, as on 2026-11-14.
+
+The teardown left nothing: the host stopped and no instance carrying billet's owner tag was live.
 
 ### The lane, made real (2026-09-04)
 
