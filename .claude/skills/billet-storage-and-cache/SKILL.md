@@ -65,6 +65,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Guest volumes never become host file authority.**
 - **Every cache is on by default where the tier can have it, and a default that cannot run is off, never refused.**
 - **Default-branch publication is deferred, journaled and off the command path.**
+- **A trusted-only tier's Docker store is published in line, so the guest waits for its settlement as long as the node may take.**
 
 ### Sticky disks, the Go and Bazel caches and the Git proxy: [references/build-caches.md](references/build-caches.md)
 

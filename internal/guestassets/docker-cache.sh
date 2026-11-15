@@ -264,15 +264,21 @@ complete() {
 		prepared=0
 		if body=$(jq -nc --arg type "$type" --arg uuid "$uuid" --argjson clean "$clean" \
 			'{filesystem:{type:$type,uuid:$uuid,clean:$clean}}'); then
-			i=0
-			while [ "$i" -lt 100 ]; do
+			# ASKED UNTIL THE NODE OPENS SETTLEMENT, for up to an hour, never a count:
+			# the node opens it only when its destroy for this job runs, and a node runs
+			# its destroys one at a time, each publishing its own store first. On
+			# 2026-11-15 an EC2 node opened arm64's 130 s after the job ended, behind
+			# x64's publication, and a guest that gave up after 100 asks (about 105 s)
+			# had already discarded the store. The node ends this guest once it has
+			# settled, so waiting costs nothing.
+			deadline=$(($(date +%s) + 3600))
+			while [ "$(date +%s)" -lt "$deadline" ]; do
 				if response=$(cache_call "/v1/docker-store/ready" "$body" 2 2>/dev/null) &&
 					printf '%s' "$response" | jq -e '.ready == true' >/dev/null 2>&1; then
 					prepared=1
 
 					break
 				fi
-				i=$((i + 1))
 				sleep 1
 			done
 		fi

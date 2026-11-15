@@ -757,6 +757,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		r.settleHeldUsage(ctx, c, r.heldFinal(c), epochCurrent)
 		c.unconfirmed.Store(false)
 		r.cleanupCache(ctx, c.name)
+		r.logReleased(c, "absent")
 
 		return r.finish(ctx, c)
 	}
@@ -779,6 +780,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		r.settleHeldUsage(ctx, c, r.heldFinal(c), epochCurrent)
 		c.unconfirmed.Store(false)
 		r.cleanupCache(ctx, c.name)
+		r.logReleased(c, "terminal")
 
 		return r.finish(ctx, c)
 	}
@@ -839,12 +841,19 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// rather than with custody.
 	c.unconfirmed.Store(false)
 	r.cleanupCache(ctx, c.name)
-
-	r.log.Info("released compute that was being held",
-		"name", c.name, "lease", c.leaseID, "adopted", !c.discard,
-		"held_for", r.now().Sub(c.since).Round(time.Second))
+	r.logReleased(c, "stopped")
 
 	return r.finish(ctx, c)
+}
+
+// logReleased says custody let compute go and on which proof: the backend's
+// confirmed stop, its terminal record, or an absence held through the grace.
+// Every release says it; on 2026-11-15 two releases on EC2's terminal record
+// left no line, and when a job's compute went had to be read from timestamps.
+func (r *Runner) logReleased(c *custody, proof string) {
+	r.log.Info("released compute that was being held",
+		"name", c.name, "lease", c.leaseID, "adopted", !c.discard, "proof", proof,
+		"held_for", r.now().Sub(c.since).Round(time.Second))
 }
 
 // recordFailure makes an entry's failed outcome durable, once.

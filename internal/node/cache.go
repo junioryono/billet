@@ -1690,6 +1690,12 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 	}
 	attachment, err := s.awaitDockerReady(ctx, session)
 	if errors.Is(err, errNoDockerStore) {
+		// SAID, as the default-branch path says it: a store the guest discarded
+		// before settlement opened is a publication that never happened, and on
+		// 2026-11-15 a node's log was silent about one.
+		s.log.Info("a completed job's Docker image store will not publish: it was discarded "+
+			"before it was proved ready", "instance", instance)
+
 		return nil
 	}
 	if err != nil {

@@ -106,6 +106,102 @@ printf '{"ready":true}\n'
 	}
 }
 
+// THE GUEST WAITS FOR THE NODE TO OPEN SETTLEMENT, HOWEVER LATE, UP TO ITS DEADLINE: a
+// node runs its destroys one at a time, so a job's settlement can open minutes after the
+// job ended, behind another job's publication, and a guest that stops asking discards
+// the store the node is about to publish. Past the deadline it gives the store back.
+func TestDockerCacheWaitsForALateSettlement(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		// refusals is how many readiness asks the node answers 409 before it opens.
+		refusals string
+		// clock is what date answers, in order, the last repeating.
+		clock    []string
+		want     string
+		wantNone string
+	}{
+		{name: "opened after 150 asks", refusals: "150", clock: []string{"1000"},
+			want: "/v1/docker-store/ready", wantNone: "/v1/volumes/0/discard"},
+		{name: "never opened within the hour", refusals: "1000000", clock: []string{"1000", "1000", "4601"},
+			want: "/v1/volumes/0/discard"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := t.TempDir()
+			for name, body := range map[string]string{
+				"slot": "0\n", "device": "/dev/test-cache\n", "images-before": "old\n",
+			} {
+				if err := os.WriteFile(filepath.Join(state, name), []byte(body), 0o600); err != nil {
+					t.Fatalf("write %s: %v", name, err)
+				}
+			}
+
+			shadow := t.TempDir()
+			logPath := filepath.Join(shadow, "curl.log")
+			asks := filepath.Join(shadow, "asks")
+			clock := filepath.Join(shadow, "clock")
+			if err := os.WriteFile(clock, []byte(strings.Join(tc.clock, "\n")+"\n"), 0o600); err != nil {
+				t.Fatalf("write clock: %v", err)
+			}
+			for _, name := range []string{"systemctl", "sync", "umount", "e2fsck", "sleep"} {
+				writeStub(t, shadow, name, "exit 0\n")
+			}
+			writeStub(t, shadow, "docker", "printf 'new\\n'\n")
+			writeStub(t, shadow, "blkid", "printf 'x\\n'\n")
+			// date answers the clock's next line, keeping the last.
+			writeStub(t, shadow, "date", `
+head -n 1 "$BILLET_TEST_CLOCK"
+if [ "$(wc -l < "$BILLET_TEST_CLOCK")" -gt 1 ]; then
+	tail -n +2 "$BILLET_TEST_CLOCK" > "$BILLET_TEST_CLOCK.next" && mv "$BILLET_TEST_CLOCK.next" "$BILLET_TEST_CLOCK"
+fi
+`)
+			writeStub(t, shadow, "curl", `
+printf '%s\n' "$*" >> "$BILLET_TEST_CURL_LOG"
+case "$*" in
+*/v1/docker-store/ready*)
+	printf x >> "$BILLET_TEST_ASKS"
+	if [ "$(wc -c < "$BILLET_TEST_ASKS")" -le "$BILLET_TEST_REFUSALS" ]; then
+		exit 22
+	fi
+	printf '{"ready":true}\n' ;;
+esac
+`)
+
+			script := filepath.Join(shadow, "docker-cache.sh")
+			if err := writeExecutable(script, []byte(DockerCacheScript), 0o755); err != nil {
+				t.Fatalf("write Docker cache script: %v", err)
+			}
+			run := exec.CommandContext(t.Context(), script, "complete", "100")
+			run.Env = append(os.Environ(),
+				"PATH="+shadow+":"+os.Getenv("PATH"),
+				"BILLET_CACHE_ENDPOINT=http://cache.test",
+				"BILLET_CACHE_TOKEN=test-token",
+				"BILLET_DOCKER_CACHE_STATE_DIR="+state,
+				"BILLET_TEST_CURL_LOG="+logPath,
+				"BILLET_TEST_ASKS="+asks,
+				"BILLET_TEST_REFUSALS="+tc.refusals,
+				"BILLET_TEST_CLOCK="+clock,
+			)
+			output, err := combinedOutputRetry(t, run)
+			if err != nil {
+				t.Fatalf("complete returned %v:\n%s", err, output)
+			}
+			called, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("read cache requests: %v", err)
+			}
+			if !strings.Contains(string(called), tc.want) {
+				t.Errorf("the guest never called %s:\n%s", tc.want, output)
+			}
+			if tc.wantNone != "" && strings.Contains(string(called), tc.wantNone) {
+				t.Errorf("the guest called %s:\n%s", tc.wantNone, output)
+			}
+		})
+	}
+}
+
 func TestDockerCachePreservesTheRunnerServiceExitContract(t *testing.T) {
 	t.Parallel()
 

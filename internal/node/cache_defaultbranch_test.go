@@ -432,6 +432,31 @@ func TestACompletedJobThatWillNotPublishSaysWhy(t *testing.T) {
 			t.Errorf("the log says %q, want the store's discard named", said.String())
 		}
 	})
+
+	// A trusted-only tier's settlement says the same, for the case a node met on
+	// 2026-11-15: the guest gave the store back before its settlement opened.
+	t.Run("a trusted-only store the guest discarded before settlement", func(t *testing.T) {
+		t.Parallel()
+
+		spec := config.Tier{Cache: &config.TierCache{Publish: config.CachePublishTrustedOnly}}.EffectiveCache()
+		service, token, instance := scopedService(t, provider.TrustTrusted, &spec, nil, &fakeCacheStore{})
+		var said lockedBuffer
+		service.log = slog.New(slog.NewTextHandler(&said, nil))
+
+		if response := cacheRequest(t, service, token, "/v1/docker-store",
+			map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+			t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+		}
+		if response := cacheRequest(t, service, token, "/v1/volumes/0/discard", nil); response.Code != http.StatusOK {
+			t.Fatalf("discard status = %d: %s", response.Code, response.Body.String())
+		}
+		if err := service.SettleCompleted(t.Context(), instance, true, dispatch.CacheAuthority{}); err != nil {
+			t.Fatalf("SettleCompleted = %v", err)
+		}
+		if !strings.Contains(said.String(), "discarded before it was proved ready") {
+			t.Errorf("the log says %q, want the store's discard named", said.String())
+		}
+	})
 }
 
 // THE RUNNER HANDS A COMPLETION'S AUTHORITY TO THE CACHE, through the path a
