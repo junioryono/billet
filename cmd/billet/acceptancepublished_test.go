@@ -137,7 +137,9 @@ func TestTheWaitsNotesSayWhatEachArchitectureLastAnswered(t *testing.T) {
 		f := &fakeCurrent{answers: c.answers}
 		var out bytes.Buffer
 		if err := waitPublished(t.Context(), &out, f.current, publishedNS,
-			[]config.Arch{config.ArchX64, config.ArchARM64}, 50*time.Millisecond, time.Millisecond,
+			// A SECOND, not 50 ms: the deadline is checked before a note, so a first pass
+			// slowed past the deadline (the race suite, coverage) would print none.
+			[]config.Arch{config.ArchX64, config.ArchARM64}, time.Second, time.Millisecond,
 			time.Millisecond); err == nil {
 			t.Errorf("%s: the wait passed with an architecture never published", name)
 		}
