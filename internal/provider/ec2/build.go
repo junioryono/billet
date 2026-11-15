@@ -1520,7 +1520,13 @@ func entryPointScript() string {
 	b.WriteString("cache_endpoint=${BILLET_CACHE_ENDPOINT:-}\n")
 	b.WriteString("cache_token=${BILLET_CACHE_TOKEN:-}\n")
 	b.WriteString("buildkit_cache_mount_limit_bytes=${BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES:-}\n")
+	// AND WHAT THE AGENT SETS OUTSIDE THE SHARED REGIONS that the regions read, declared
+	// empty: the library runs under -u, and the registry mirrors' authority, read by the
+	// environment region since #739, left every guest of an image built after it without
+	// a runner (`registry_mirrors_ca_file: unbound variable`, 2026-11-15).
+	// TestTheGuestsBootReachesTheRunnersStart runs the boot to prove it.
 	b.WriteString("registry_mirrors_json=\n")
+	b.WriteString("registry_mirrors_ca_file=\n")
 	b.WriteString("runner_env=()\n")
 	b.WriteString(". " + guestCachesPath + "\n")
 
