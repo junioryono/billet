@@ -82,7 +82,7 @@ func TestTheWarmImageRunsWaitForTheColdRunsPublication(t *testing.T) {
 		f := &fakeCurrent{answers: c.answers}
 		var out bytes.Buffer
 		err := waitPublished(t.Context(), &out, f.current, publishedNS, []config.Arch{config.ArchX64, config.ArchARM64},
-			50*time.Millisecond, time.Millisecond)
+			50*time.Millisecond, time.Millisecond, time.Hour)
 		switch {
 		case c.code == 0 && err != nil:
 			t.Errorf("%s: %v", name, err)
@@ -94,8 +94,8 @@ func TestTheWarmImageRunsWaitForTheColdRunsPublication(t *testing.T) {
 				t.Errorf("%s: %v does not say %q", name, err, s)
 			}
 		}
-		if c.code == 0 && (!strings.Contains(out.String(), "x64: the image store is published as snap-x") ||
-			!strings.Contains(out.String(), "arm64: the image store is published as snap-a")) {
+		if c.code == 0 && (!strings.Contains(out.String(), "x64: the image store is published as snap-x, after ") ||
+			!strings.Contains(out.String(), "arm64: the image store is published as snap-a, after ")) {
 			t.Errorf("%s: printed %q", name, out.String())
 		}
 		for _, k := range f.asked {
@@ -107,6 +107,51 @@ func TestTheWarmImageRunsWaitForTheColdRunsPublication(t *testing.T) {
 		if n := slices.Index(f.asked, x64); c.answers[x64][0].generation != "" && n >= 0 &&
 			slices.Index(f.asked[n+1:], x64) >= 0 {
 			t.Errorf("%s: asked for x64's store again after it was published", name)
+		}
+	}
+}
+
+// THE NOTES SAY A MISS APART FROM A STORE THAT COULD NOT BE ASKED, with the error, and say
+// nothing of an architecture already published.
+func TestTheWaitsNotesSayWhatEachArchitectureLastAnswered(t *testing.T) {
+	t.Parallel()
+	x64, arm := publishedNS+"/docker-images/amd64", publishedNS+"/docker-images/arm64"
+	broken := errors.New("s3: connection reset")
+	for name, c := range map[string]struct {
+		answers map[string][]fakeAnswer
+		says    []string
+		never   []string
+	}{
+		"a miss and a store not asked": {
+			answers: map[string][]fakeAnswer{x64: {{err: storecontract.ErrMiss}}, arm: {{err: broken}}},
+			says: []string{"x64: no image store is published yet, after ",
+				"arm64: the store could not be asked, after ", "connection reset"},
+			never: []string{"x64: the store could not be asked", "arm64: no image store is published yet"},
+		},
+		"one already published": {
+			answers: map[string][]fakeAnswer{x64: {{generation: "snap-x"}}, arm: {{err: storecontract.ErrMiss}}},
+			says:    []string{"arm64: no image store is published yet, after "},
+			never:   []string{"x64: no image store", "x64: the store could not be asked"},
+		},
+	} {
+		f := &fakeCurrent{answers: c.answers}
+		var out bytes.Buffer
+		if err := waitPublished(t.Context(), &out, f.current, publishedNS,
+			// A SECOND, not 50 ms: the deadline is checked before a note, so a first pass
+			// slowed past the deadline (the race suite, coverage) would print none.
+			[]config.Arch{config.ArchX64, config.ArchARM64}, time.Second, time.Millisecond,
+			time.Millisecond); err == nil {
+			t.Errorf("%s: the wait passed with an architecture never published", name)
+		}
+		for _, s := range c.says {
+			if !strings.Contains(out.String(), s) {
+				t.Errorf("%s: the notes %q do not say %q", name, out.String(), s)
+			}
+		}
+		for _, s := range c.never {
+			if strings.Contains(out.String(), s) {
+				t.Errorf("%s: the notes %q say %q", name, out.String(), s)
+			}
 		}
 	}
 }
