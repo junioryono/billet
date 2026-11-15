@@ -1524,7 +1524,7 @@ func entryPointScript() string {
 	// empty: the library runs under -u, and the registry mirrors' authority, read by the
 	// environment region since #739, left every guest of an image built after it without
 	// a runner (`registry_mirrors_ca_file: unbound variable`, 2026-11-15).
-	// TestEveryNameTheGuestLibraryReadsIsAssigned holds the list.
+	// TestTheGuestsBootReachesTheRunnersStart runs the boot to prove it.
 	b.WriteString("registry_mirrors_json=\n")
 	b.WriteString("registry_mirrors_ca_file=\n")
 	b.WriteString("runner_env=()\n")
