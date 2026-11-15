@@ -1,0 +1,93 @@
+name: matrix-instance-lost
+# billet's acceptance matrix (#554), an instance lost mid-job: a seed publishes a sticky
+# disk; a writer attaches it, writes over the seed's marker and holds it, and the lane
+# terminates the writer's instance while it holds the disk (`matrix-host.sh lose`), as a
+# host that dies or a spot reclaim would; then a reader must find the seed's marker, since
+# a job whose instance was lost published nothing. The job names are the matrix's;
+# cmd/billet/acceptancematrix.go judges the reader by name, and the lane finds the writer
+# by its hold step's name, which must not change.
+#
+# This file is copied from billet's scripts/acceptance/matrix into the repository the
+# acceptance App serves, and the run refuses a copy that differs.
+run-name: matrix-instance-lost ${{ inputs.runs_on }} ${{ inputs.tag }}
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: the acceptance tier's label
+        required: true
+      tag:
+        description: what makes this run's keys its own
+        required: true
+permissions:
+  contents: read
+# bash, so every step runs under -eo pipefail: GitHub's default shell on Linux is bash -e
+# alone.
+defaults:
+  run:
+    shell: bash
+jobs:
+  seed:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    steps:
+      - id: disk
+        uses: junioryono/billet/actions/stickydisk@main
+        with:
+          key: ${{ github.repository }}-matrix-lost-${{ inputs.runs_on }}-${{ inputs.tag }}
+          path: /mnt/matrix
+          size-gb: "5"
+      - name: The disk is new, and the seed's marker is written
+        env:
+          HIT: ${{ steps.disk.outputs.cache-hit }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          test "$HIT" != true
+          echo "seed-$TAG" | sudo tee /mnt/matrix/marker
+  writer:
+    needs: seed
+    runs-on: ${{ inputs.runs_on }}
+    # LONGER THAN THE LANE TAKES TO LOSE IT, so the job that holds the disk is ended by its
+    # instance's loss, never by this; a run whose instance was never lost fails its phase.
+    timeout-minutes: 45
+    steps:
+      - id: disk
+        uses: junioryono/billet/actions/stickydisk@main
+        with:
+          key: ${{ github.repository }}-matrix-lost-${{ inputs.runs_on }}-${{ inputs.tag }}
+          path: /mnt/matrix
+          size-gb: "5"
+      - name: The seed's disk is here, and the lost writer's marker is written over it
+        env:
+          HIT: ${{ steps.disk.outputs.cache-hit }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          test "$HIT" = true
+          test "$(cat /mnt/matrix/marker)" = "seed-$TAG"
+          echo "lost-$TAG" | sudo tee /mnt/matrix/marker
+          sync
+      - name: Hold the disk until the instance is lost
+        run: sleep 2400
+  reader:
+    needs: [seed, writer]
+    # WHATEVER THE WRITER CAME TO, which a lost instance makes a failure.
+    if: ${{ always() && needs.seed.result == 'success' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    steps:
+      - id: disk
+        uses: junioryono/billet/actions/stickydisk@main
+        with:
+          key: ${{ github.repository }}-matrix-lost-${{ inputs.runs_on }}-${{ inputs.tag }}
+          path: /mnt/matrix
+          size-gb: "5"
+      - name: The disk is the seed's, and the lost writer's marker is not on it
+        env:
+          HIT: ${{ steps.disk.outputs.cache-hit }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          test "$HIT" = true
+          test "$(cat /mnt/matrix/marker)" = "seed-$TAG"

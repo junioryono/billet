@@ -10,6 +10,8 @@
 #   matrix-host.sh down <run-dir>
 #   matrix-host.sh block-s3 <run-dir> <region> <expiry-seconds>
 #   matrix-host.sh unblock-s3 <run-dir> <region>
+#   matrix-host.sh published <run-dir> <archs> <seconds>
+#   matrix-host.sh lose <run-dir> <region> <runner>
 #
 # The acceptance matrix's half that runs on the acceptance host, beside the node its
 # instances dial (#554). <run-dir> holds this run's billet binary at <run-dir>/billet, and
@@ -83,10 +85,19 @@
 # which a block-s3 still on its way refuses to install past: cancelling the workflow's
 # step does not cancel the command SSM is running, so a block can still be arriving when
 # the lift is asked for. The two take <run-dir>/s3.lock, one at a time.
+#
+# published waits up to <seconds> for each of <archs>' Docker image store to have a
+# generation in the run's site store (`billet acceptance matrix published`), and exits
+# with its status: 0 every one published, 1 one still a miss, 2 the store not asked.
+#
+# lose terminates the one live instance of the run's deployment named <runner> (a billet
+# runner's name, its lease's), as a host that dies or a spot reclaim would end it mid-job,
+# and exits 0 only once EC2 says it is shutting down: 1 when no single instance is that
+# runner or EC2 refused, 2 when it could not tell which instance it is.
 set -uo pipefail
 
 usage() {
-	sed -n '2,12p' "$0" >&2
+	sed -n '2,14p' "$0" >&2
 	exit 2
 }
 
@@ -506,6 +517,69 @@ unblock-s3)
 		exit 1
 	fi
 	echo "matrix: S3 in $region answers this host again"
+	;;
+lose)
+	[ "$#" -eq 4 ] || usage
+	region=$3 runner=$4
+	# A RUNNER BILLET NAMED, whose name is its lease's: anything else could name an
+	# instance the run does not own.
+	if ! [[ "$runner" =~ ^billet-[0-9a-f]{32}$ ]]; then
+		echo "matrix: \"$runner\" is not a billet runner's name; nothing is terminated" >&2
+		exit 2
+	fi
+	if ! deployment=$(cat "$run_dir/deployment") || ! [[ "$deployment" =~ ^[0-9a-f]{32}$ ]]; then
+		echo "matrix: $run_dir/deployment names no deployment; nothing is terminated" >&2
+		exit 2
+	fi
+	# EXACTLY ONE LIVE INSTANCE OF THIS DEPLOYMENT BY THAT NAME, or nothing is touched. As
+	# JSON, counted whole: text output puts each reservation on a line of its own.
+	if ! ids=$(aws ec2 describe-instances --region "$region" --output json \
+		--filters "Name=tag:Name,Values=$runner" "Name=tag:sh.billet.owner,Values=$deployment" \
+		"Name=instance-state-name,Values=pending,running" --query 'Reservations[].Instances[].InstanceId'); then
+		echo "matrix: EC2 could not say which instance $runner is; nothing is terminated" >&2
+		exit 2
+	fi
+	# ONE JSON DOCUMENT, A LIST OF INSTANCE IDS, or the answer is not read at all: slurped,
+	# so a second document cannot add a count of its own after the first.
+	ids_check='if length == 1 and (.[0] | type == "array" and all(.[]; type == "string" and test("^i-[0-9a-f]{8,17}$")))
+		then .[0] else error("not one list of instance ids") end'
+	if ! count=$(jq -ers "$ids_check | length" <<<"$ids") || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+		echo "matrix: EC2's answer about $runner would not read as a list of instances; nothing is terminated" >&2
+		exit 2
+	fi
+	if [ "$count" -ne 1 ]; then
+		echo "matrix: $runner is $count live instances of deployment $deployment, not one; nothing is terminated" >&2
+		exit 1
+	fi
+	if ! instance=$(jq -ers "$ids_check | .[0]" <<<"$ids") || ! [[ "$instance" =~ ^i-[0-9a-f]{8,17}$ ]]; then
+		echo "matrix: EC2 named $runner's instance \"$instance\"; nothing is terminated" >&2
+		exit 2
+	fi
+	if ! state=$(aws ec2 terminate-instances --region "$region" --instance-ids "$instance" --output text \
+		--query 'TerminatingInstances[0].CurrentState.Name'); then
+		echo "matrix: EC2 refused to terminate $instance ($runner)" >&2
+		exit 1
+	fi
+	case "$state" in
+	shutting-down | terminated) echo "matrix: $instance ($runner) is lost: $state" ;;
+	*)
+		echo "matrix: $instance ($runner) is $state after its termination was asked" >&2
+		exit 1
+		;;
+	esac
+	;;
+published)
+	[ "$#" -eq 4 ] || usage
+	archs=$3 seconds=$4
+	case "$seconds" in
+	'' | *[!0-9]*)
+		echo "matrix: \"$seconds\" is not a number of seconds" >&2
+		exit 2
+		;;
+	esac
+	# ITS OWN STATUS: 1 is a store that answered a miss to the end, 2 one that could not be
+	# asked, and the workflow fails the phase on either.
+	"$billet" acceptance matrix published --workspace "$ws" --archs "$archs" --wait "${seconds}s"
 	;;
 *)
 	usage

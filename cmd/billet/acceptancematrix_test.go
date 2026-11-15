@@ -332,22 +332,24 @@ func TestTheMatrixJobCountIsTheWorkflowsJobs(t *testing.T) {
 	t.Parallel()
 	n := 0
 	for _, file := range matrixWorkflowFiles(t) {
-		if file != matrixUnreachableWorkflow {
-			n += len(matrixWorkflowJobs(t, file))
+		jobs := len(matrixWorkflowJobs(t, file))
+		if laneOnly, ok := matrixLaneOnly[file]; ok {
+			if jobs != laneOnly {
+				t.Errorf("%s runs %d jobs; matrixLaneOnly says %d", file, jobs, laneOnly)
+			}
+
+			continue
 		}
+		n += jobs
 	}
 	if n != matrixJobsPerArch {
 		t.Fatalf("the workflows every backend runs run %d jobs per tier; matrixJobsPerArch says %d", n,
 			matrixJobsPerArch)
 	}
-	if n := len(matrixWorkflowJobs(t, matrixUnreachableWorkflow)); n != matrixUnreachableJobs {
-		t.Fatalf("%s runs %d jobs; matrixUnreachableJobs says %d", matrixUnreachableWorkflow, n,
-			matrixUnreachableJobs)
-	}
-	// A BACKEND WAITS FOR THE STORE-UNREACHABLE JOBS ONLY IF IT IS SENT THEM: a pool's run
-	// would otherwise wait out --wait for six jobs nobody dispatched.
+	// A BACKEND WAITS FOR A LANE-ONLY WORKFLOW'S JOBS ONLY IF IT IS SENT THEM: a pool's run
+	// would otherwise wait out --wait for jobs nobody dispatched.
 	for backend, want := range map[string]int{
-		"ec2":                   matrixJobsPerArch + matrixUnreachableJobs,
+		"ec2":                   matrixJobsPerArch + 6 + 3,
 		"firecracker/aws-metal": matrixJobsPerArch,
 	} {
 		if got := matrixJobsFor(backend); got != want {
@@ -366,6 +368,48 @@ func TestTheMatrixJobCountIsTheWorkflowsJobs(t *testing.T) {
 	} {
 		if err := cmdMatrixJobs(env, args); err == nil {
 			t.Errorf("%v: answered a count", args)
+		}
+	}
+}
+
+// AN INSTANCE LOST MID-JOB IS JUDGED BY THE READER AFTER IT, which must find the seed's
+// disk warm: a cold reader means the seed was lost with the writer, and anything else is
+// not the sticky disk the case is about. The caches no workflow loses an instance for say
+// so, and the ones that have no writer to lose are not offered.
+func TestTheInstanceLostCellsJudgeTheReaderAfterTheLoss(t *testing.T) {
+	t.Parallel()
+	cell := cellOf(t, config.ArchARM64, "sticky-disks", "instance-lost")
+	if cell.Run == nil || cell.Run.Workflow != matrixLostWorkflow || cell.Run.Job != "reader" {
+		t.Fatalf("sticky-disks/instance-lost is %+v", cell)
+	}
+	for token, verdict := range map[string]matrixVerdict{
+		"warm": verdictPass, "cold": verdictFail, "unavailable": verdictFail, "bypassed": verdictFail, "": verdictFail,
+	} {
+		job := coldGitJob()
+		job.Tier, job.InstanceType = "accept-arm", "c7g.2xlarge"
+		job.WorkflowRef = strings.Replace(job.WorkflowRef, "matrix-cold.yml", matrixLostWorkflow, 1)
+		job.JobName, job.Cache = "reader", acceptanceCache{StickyDisks: token}
+		if got := judgeCell(cell, []acceptanceJob{job}, matrixScope{tiers: matrixTestTiers()}); got.Verdict != verdict {
+			t.Errorf("the reader observed %q: %s %q, want %s", token, got.Verdict, got.Reason, verdict)
+		}
+	}
+	// THE WRITER IS NOT THE CELL'S: its instance was lost, and GitHub fails it.
+	writer := coldGitJob()
+	writer.Tier = "accept-arm"
+	writer.WorkflowRef = strings.Replace(writer.WorkflowRef, "matrix-cold.yml", matrixLostWorkflow, 1)
+	writer.JobName, writer.GitHub, writer.Cache = "writer", "failed", acceptanceCache{StickyDisks: "warm"}
+	if got := judgeCell(cell, []acceptanceJob{writer}, matrixScope{tiers: matrixTestTiers()}); got.Verdict != verdictNotRun {
+		t.Errorf("the lost writer alone: %s %q, want not run", got.Verdict, got.Reason)
+	}
+	for _, cache := range []string{"docker-builder", "git"} {
+		if c := cellOf(t, config.ArchX64, cache, "instance-lost"); !c.Unsupported || c.Why == "" {
+			t.Errorf("%s: %+v, want unsupported with a reason", cache, c)
+		}
+	}
+	for _, cache := range []string{"docker-images", "actions", "go", "bazel", "buck2", "npm"} {
+		if c := cellOf(t, config.ArchX64, cache, "instance-lost"); c.Run != nil || c.Unsupported ||
+			!strings.Contains(c.Why, "no workflow yet loses an instance") {
+			t.Errorf("%s: %+v, want not run, saying no workflow loses one yet", cache, c)
 		}
 	}
 }
@@ -721,11 +765,11 @@ func TestAPoolsCellsAreDeclaredAndRunWhereTheLaneOrders(t *testing.T) {
 		key := string(c.Arch) + "/" + c.Cache + "/" + c.Case
 		switch c.Source {
 		case config.PoolSourceAWSMetal:
-			// BUT THE STORE OUT OF REACH, which only the acceptance host's own node is cut
-			// off for.
-			if c.Case == "store-unreachable" {
-				if c.Run != nil || c.Why == "" {
-					t.Errorf("aws-metal %s: %+v; want not run, with the reason", key, c)
+			// BUT A LANE-ONLY WORKFLOW'S, which only the per-job EC2 lane can run: its host is
+			// the one cut off from S3, and its guests are the instances it can lose.
+			if ec2 := ec2Run[key]; ec2 != nil && poolLaneOnlyWhy[ec2.Workflow] != "" {
+				if c.Run != nil || c.Why != poolLaneOnlyWhy[ec2.Workflow] {
+					t.Errorf("aws-metal %s: %+v; want not run, saying %q", key, c, poolLaneOnlyWhy[ec2.Workflow])
 				}
 
 				continue

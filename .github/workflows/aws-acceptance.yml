@@ -64,8 +64,9 @@ jobs:
     # THE BUDGET, inside GitHub's six hours for a hosted job: the host's run waits 210
     # minutes for its jobs, 20 more for its compute barrier and 5 for each service's stop
     # (SSM gives it 250), then the judge (15) and the teardown (`stopped` and `down`, at
-    # most 30 and 40). Six dispatch phases of at most 45 minutes each (images, cold, warm,
-    # each architecture's two-writer runs, and the store out of reach) can outlast the
+    # most 30 and 40). Its phases, each bounded (the image store's cold runs, the wait for
+    # their publication, the warm image runs, cold, warm, each architecture's two-writer
+    # runs, the instance lost, and the store out of reach), can together outlast the
     # host's wait; a run that
     # does fails its phase or its jobs' count, and never passes. A POOL'S run waits 125
     # minutes for its jobs and 85 more for the pool to release its hosts, inside the same
@@ -299,20 +300,12 @@ jobs:
           private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
           owner: ${{ steps.repo.outputs.owner }}
           repositories: ${{ steps.repo.outputs.name }}
-      - name: Dispatch the image store's runs, alone on each tier, and wait for them
-        if: ${{ env.LANE == 'ec2' }}
-        env:
-          GH_TOKEN: ${{ steps.images-token.outputs.token }}
-          LABELS: ${{ steps.labels.outputs.labels }}
-        run: |
-          set -euo pipefail
-          read -r -a labels <<<"$LABELS"
-          scripts/acceptance/matrix-dispatch.sh images "$REPO" "$RUN" out/runs "${labels[@]}"
-      # A POOL'S TIER HAS NO HOST UNTIL ITS FIRST JOB ASKS FOR ONE, and a host takes about
-      # 45 minutes to boot, join and import the guest image, so the image store's cold run
-      # is sent, waited for under a token and a deadline of its own, and then the warm one.
-      - name: Send the image store's cold runs to the pool, which orders a host for them
-        if: ${{ env.LANE == 'pool' }}
+      # THE IMAGE STORE'S RUNS GO ALONE ON EACH TIER, cold first and then warm, because
+      # every guest that attaches the image store publishes a generation of it. The cold
+      # runs are sent and waited for under a token and a deadline of their own, since a
+      # pool's tier has no host until its first job asks for one, and a host takes about
+      # 45 minutes to boot, join and import the guest image.
+      - name: Send the image store's cold runs, which on a pool order its host
         env:
           GH_TOKEN: ${{ steps.images-token.outputs.token }}
           LABELS: ${{ steps.labels.outputs.labels }}
@@ -321,32 +314,38 @@ jobs:
           read -r -a labels <<<"$LABELS"
           scripts/acceptance/matrix-dispatch.sh images-cold "$REPO" "$RUN" out/runs "${labels[@]}"
       - id: host-token
-        if: ${{ env.LANE == 'pool' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
           private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
           owner: ${{ steps.repo.outputs.owner }}
           repositories: ${{ steps.repo.outputs.name }}
-      - name: Wait for the pool's host to boot, join and run them
-        if: ${{ env.LANE == 'pool' }}
+      - name: Wait for the image store's cold runs
         env:
           GH_TOKEN: ${{ steps.host-token.outputs.token }}
           MATRIX_TIMEOUT: "3300"
         run: scripts/acceptance/matrix-dispatch.sh await "$REPO" "$RUN" out/runs -
+      # PER-JOB EC2 PUBLISHES A JOB'S IMAGE STORE ONLY ONCE THE GUEST IS PROVED GONE, so the
+      # warm runs wait for each architecture's publication in the store itself, never for a
+      # time: on 2026-11-14 arm64's landed 19 minutes after its cold job ended. A pool's
+      # control plane holds no grant on its hosts' store while it runs, so its warm runs
+      # still wait MATRIX_SETTLE.
+      - name: Wait for each architecture's image store to be published
+        if: ${{ env.LANE == 'ec2' }}
+        run: |
+          scripts/acceptance/ssm-run.sh run "$HOST" 2000 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' published '$RUN_DIR' '$ARCHS' 1800"
       - id: images-warm-token
-        if: ${{ env.LANE == 'pool' }}
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
           private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
           owner: ${{ steps.repo.outputs.owner }}
           repositories: ${{ steps.repo.outputs.name }}
-      - name: Dispatch the image store's warm runs to the pool, and wait for them
-        if: ${{ env.LANE == 'pool' }}
+      - name: Dispatch the image store's warm runs, and wait for them
         env:
           GH_TOKEN: ${{ steps.images-warm-token.outputs.token }}
           LABELS: ${{ steps.labels.outputs.labels }}
+          MATRIX_SETTLE: ${{ env.LANE == 'ec2' && '0' || '150' }}
         run: |
           set -euo pipefail
           read -r -a labels <<<"$LABELS"
@@ -435,6 +434,57 @@ jobs:
           GH_TOKEN: ${{ steps.writers-arm64-token.outputs.token }}
           LABEL: ${{ steps.labels.outputs.label_arm64 }}
         run: scripts/acceptance/matrix-dispatch.sh writers "$REPO" "$RUN" out/runs "$LABEL"
+      # AN INSTANCE LOST MID-JOB, ON PER-JOB EC2: each architecture's writer holds a sticky
+      # disk it wrote over, the host terminates that writer's instance as a host that dies
+      # or a spot reclaim would, and the reader after it must find the seed's disk. The loss
+      # is proved here, by EC2 accepting the termination of exactly that instance; the
+      # reader's cell is judged from the ledger. A pool's guests are microVMs on a host the
+      # lane sends no command to.
+      - id: lost-token
+        if: ${{ env.LANE == 'ec2' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Send the instance-lost runs, and wait for each writer to hold its disk
+        if: ${{ env.LANE == 'ec2' }}
+        env:
+          GH_TOKEN: ${{ steps.lost-token.outputs.token }}
+          LABELS: ${{ steps.labels.outputs.labels }}
+          MATRIX_TIMEOUT: "1500"
+        run: |
+          set -euo pipefail
+          read -r -a labels <<<"$LABELS"
+          scripts/acceptance/matrix-dispatch.sh lost "$REPO" "$RUN" out/runs "${labels[@]}"
+      - name: Lose each writer's instance
+        if: ${{ env.LANE == 'ec2' }}
+        run: |
+          set -euo pipefail
+          while read -r label runner; do
+            # A NAME BILLET GIVES, OR NOTHING IS SENT: it goes into the host's command line.
+            if ! [[ "$runner" =~ ^billet-[0-9a-f]{32}$ ]]; then
+              echo "\"$runner\" is not a runner billet would name; nothing is lost" >&2
+              exit 1
+            fi
+            echo "losing $label's writer, $runner"
+            scripts/acceptance/ssm-run.sh run "$HOST" 120 "bash '$RUN_DIR/matrix-host.sh' lose '$RUN_DIR' '$AWS_REGION' '$runner'"
+          done <out/runs.lost
+      - id: lost-await-token
+        if: ${{ env.LANE == 'ec2' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ACCEPTANCE_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.ACCEPTANCE_DISPATCH_KEY }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+      - name: Wait for the instance-lost runs
+        if: ${{ env.LANE == 'ec2' }}
+        env:
+          GH_TOKEN: ${{ steps.lost-await-token.outputs.token }}
+          MATRIX_TIMEOUT: "1800"
+        run: scripts/acceptance/matrix-dispatch.sh await "$REPO" "$RUN" out/runs -
       # THE STORE OUT OF REACH LAST, with nothing else on the deployment: the host drops
       # every packet it sends to its region's S3, so the node's site store hangs as #531's
       # did, and the breaker that opens sends every job on the node cold. The block lifts
