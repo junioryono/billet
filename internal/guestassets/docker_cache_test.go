@@ -143,9 +143,13 @@ func TestDockerCacheWaitsForALateSettlement(t *testing.T) {
 			shadow := t.TempDir()
 			logPath := filepath.Join(shadow, "curl.log")
 			asks := filepath.Join(shadow, "asks")
-			for _, name := range []string{"systemctl", "sync", "umount", "e2fsck", "sleep"} {
+			for _, name := range []string{"systemctl", "sync", "umount", "e2fsck"} {
 				writeStub(t, shadow, name, "exit 0\n")
 			}
+			// THE SECOND BETWEEN ASKS IS WHAT MAKES THE COUNT AN HOUR, so every sleep is
+			// recorded with what it was asked.
+			sleeps := filepath.Join(shadow, "sleeps")
+			writeStub(t, shadow, "sleep", "printf '%s\\n' \"$*\" >> \"$BILLET_TEST_SLEEPS\"\n")
 			writeStub(t, shadow, "docker", "printf 'new\\n'\n")
 			writeStub(t, shadow, "blkid", "printf 'x\\n'\n")
 			writeStub(t, shadow, "curl", `
@@ -173,10 +177,11 @@ esac
 				"BILLET_TEST_CURL_LOG="+logPath,
 				"BILLET_TEST_ASKS="+asks,
 				"BILLET_TEST_REFUSALS="+tc.refusals,
+				"BILLET_TEST_SLEEPS="+sleeps,
+				// ALWAYS SET, empty for the script's own bound, so an inherited value
+				// never stands in for the default.
+				"BILLET_DOCKER_SETTLE_ASKS="+tc.bound,
 			)
-			if tc.bound != "" {
-				run.Env = append(run.Env, "BILLET_DOCKER_SETTLE_ASKS="+tc.bound)
-			}
 			output, err := combinedOutputRetry(t, run)
 			if err != nil {
 				t.Fatalf("complete returned %v:\n%s", err, output)
@@ -195,8 +200,27 @@ esac
 			if got := strings.Contains(string(called), "/v1/volumes/0/discard"); got != tc.discarded {
 				t.Errorf("the guest gave the store back: %t, want %t:\n%s", got, tc.discarded, output)
 			}
+			// ONE SECOND AFTER EVERY REFUSED ASK, and none after the one that was answered.
+			slept, err := os.ReadFile(sleeps)
+			if err != nil {
+				t.Fatalf("read the sleeps: %v", err)
+			}
+			refused := tc.wantAsks
+			if !tc.discarded {
+				refused--
+			}
+			if want := strings.Repeat("1\n", refused); string(slept) != want {
+				t.Errorf("the guest slept %d times (%q...), want %d sleeps of a second",
+					strings.Count(string(slept), "\n"), firstLine(string(slept)), refused)
+			}
 		})
 	}
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+
+	return line
 }
 
 func TestDockerCachePreservesTheRunnerServiceExitContract(t *testing.T) {
