@@ -124,8 +124,8 @@ func matrixCells() []matrixCell {
 					switch waits, ok := poolCellsNotRun[b.source]; {
 					case ok:
 						cell = waits
-					case b.source != "" && k == "store-unreachable" && cell.Run != nil:
-						cell = matrixCell{Why: poolUnreachableWhy}
+					case b.source != "" && cell.Run != nil && poolLaneOnlyWhy[cell.Run.Workflow] != "":
+						cell = matrixCell{Why: poolLaneOnlyWhy[cell.Run.Workflow]}
 					}
 					cell.Backend, cell.Source, cell.Arch, cell.Cache, cell.Case = b.kind, b.source, a, c, k
 					out = append(out, cell)
@@ -238,8 +238,22 @@ func matrixCellFor(cache, kase string) matrixCell {
 
 		return matrixCell{Why: "no workflow yet fails a job after it writes a " + cache + " entry"}
 	case "instance-lost":
-		return matrixCell{Why: "timed from the site store's writer state by hand " +
-			"(docs/reference/records/site-acceptance.md); not automated yet"}
+		switch cache {
+		case "sticky-disks":
+			// THE READER, after a writer whose instance was lost while it held the disk:
+			// what it must find is the seed's generation, so a job lost mid-write
+			// published nothing. The loss itself is proved by the lane, which terminates
+			// exactly the writer's instance and fails unless EC2 accepts it.
+			return matrixCell{Run: &matrixRun{Workflow: matrixLostWorkflow, Job: "reader",
+				GitHub: alloc.ResultSucceeded, Observe: observe, Want: string(lease.BuildCacheWarm)}}
+		case "docker-builder":
+			return matrixCell{Unsupported: true, Why: "the builder's state is a sticky disk; an instance lost " +
+				"while it holds one is the sticky-disks cell"}
+		case "git":
+			return matrixCell{Unsupported: true, Why: "the node fetches the mirror; no job writes it"}
+		}
+
+		return matrixCell{Why: "no workflow yet loses an instance while it writes a " + cache + " entry"}
 	case "store-unreachable":
 		return storeUnreachableCell(cache, observe)
 	}
@@ -252,6 +266,24 @@ func matrixCellFor(cache, kase string) matrixCell {
 // (`matrix-host.sh block-s3`), so the site's store hangs rather than refuses, as #531's
 // did.
 const matrixUnreachableWorkflow = "matrix-store-unreachable.yml"
+
+// matrixLostWorkflow is the instance-lost case's, whose writer's instance the lane
+// terminates while it holds a sticky disk (`matrix-host.sh lose`).
+const matrixLostWorkflow = "matrix-instance-lost.yml"
+
+// matrixLaneOnly are the workflows only a lane that can reach its compute's host runs:
+// the per-job EC2 lane cuts its own host off from S3 and terminates its own guests, and a
+// pool's guests run on hosts the lane sends no command to. A backend whose cells name
+// one of them is sent it, and waits for its jobs.
+var matrixLaneOnly = map[string]int{matrixUnreachableWorkflow: 6, matrixLostWorkflow: 3}
+
+// poolLaneOnlyWhy is why a pool's cells of a lane-only workflow are not run.
+var poolLaneOnlyWhy = map[string]string{
+	matrixUnreachableWorkflow: "the lane cuts the acceptance host off from its store, and a pool host reaches " +
+		"its store from itself, where the lane sends no command",
+	matrixLostWorkflow: "the lane loses a per-job EC2 guest by terminating its instance; a pool's guests are " +
+		"microVMs on a host the lane sends no command to",
+}
 
 // storeUnreachableCell says how a cache's store-unreachable case is run: the job must
 // succeed, and the node must say the store was out of reach, in either of its two words
@@ -280,10 +312,6 @@ func storeUnreachableCell(cache, observe string) matrixCell {
 	return matrixCell{Run: &matrixRun{Workflow: matrixUnreachableWorkflow, Job: cache, GitHub: alloc.ResultSucceeded,
 		Observe: observe, Want: want, Or: []string{or}}}
 }
-
-// poolUnreachableWhy is why a pool's store-unreachable cells are not run.
-const poolUnreachableWhy = "the lane cuts the acceptance host off from its store, and a pool host reaches " +
-	"its store from itself, where the lane sends no command"
 
 // wants says whether a token is one a cell accepts.
 func (r *matrixRun) wants(got string) bool {
@@ -596,10 +624,12 @@ func cmdAcceptanceMatrix(ctx context.Context, env cli.Env, args []string) error 
 		return cmdMatrixPoolHostIAM(ctx, env, args[1:])
 	case "pool-consoles":
 		return cmdMatrixPoolConsoles(ctx, env, args[1:])
+	case "published":
+		return cmdMatrixPublished(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf("billet acceptance matrix %s: unknown subcommand; it is cells, tiers, jobs, judge, "+
-		"teardown-policy, pool-init-args, pool-host-iam or pool-consoles", args[0])
+		"teardown-policy, pool-init-args, pool-host-iam, pool-consoles or published", args[0])
 }
 
 // cmdMatrixTeardownPolicy prints the IAM policy a run's teardown needs beside the node's
@@ -675,25 +705,28 @@ func matrixTeardownPolicy(cfg *config.Config, deployment string) (awspolicy.Poli
 
 // matrixJobsPerArch is how many jobs one dispatch of every matrix workflow every backend
 // runs puts on one tier: the image store's cold and warm one each, the cold and warm
-// runs' seven each, the two-writer run's eight and the failed writer's three.
-// matrixUnreachableJobs is the store-unreachable run's, which only a backend that runs
-// those cells is sent. `billet acceptance run --jobs` waits for this many per
-// architecture, and a test holds both to the workflow files.
-const (
-	matrixJobsPerArch     = 27
-	matrixUnreachableJobs = 6
-)
+// runs' seven each, the two-writer run's eight and the failed writer's three; a backend
+// whose cells name a lane-only workflow (matrixLaneOnly) is sent that one's jobs too.
+// `billet acceptance run --jobs` waits for this many per architecture, and a test holds
+// both to the workflow files.
+const matrixJobsPerArch = 27
 
-// matrixJobsFor is how many jobs one tier of a backend runs: a backend whose
-// store-unreachable cells are run is sent that workflow as well.
+// matrixJobsFor is how many jobs one tier of a backend runs.
 func matrixJobsFor(backend string) int {
+	sent := map[string]bool{}
 	for _, c := range matrixCells() {
-		if matrixBackendName(&c) == backend && c.Run != nil && c.Run.Workflow == matrixUnreachableWorkflow {
-			return matrixJobsPerArch + matrixUnreachableJobs
+		if matrixBackendName(&c) == backend && c.Run != nil {
+			sent[c.Run.Workflow] = true
+		}
+	}
+	n := matrixJobsPerArch
+	for workflow, jobs := range matrixLaneOnly {
+		if sent[workflow] {
+			n += jobs
 		}
 	}
 
-	return matrixJobsPerArch
+	return n
 }
 
 // cmdMatrixJobs prints how many jobs a run of the matrix on these architectures waits for.

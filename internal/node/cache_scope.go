@@ -40,6 +40,14 @@ func sessionSetting(session *cacheSession, kind config.CacheKind) config.CacheSe
 	return legacy.Setting(kind)
 }
 
+// DockerStoreKey is the store key of a trusted-only or off tier's Docker image store
+// for one guest architecture (the guest's name for it: amd64 or arm64), under a node's
+// cache namespace. The acceptance matrix asks the store for it to know a cold run's
+// image store has been published.
+func DockerStoreKey(namespace, architecture string) string {
+	return namespace + "/" + dockerStoreKey + architecture
+}
+
 // cacheKeyFor is the store key a session's cache of one kind uses. EVERY key a
 // session's cache reads or writes is built here.
 //
@@ -54,7 +62,7 @@ func (s *CacheService) cacheKeyFor(session *cacheSession, kind config.CacheKind,
 	legacyKind := kind == config.CacheDocker || kind == config.CacheSticky
 	if legacyKind && sessionPolicy(session) != config.CachePublishDefaultBranch {
 		if kind == config.CacheDocker {
-			return s.qualifiedKey(dockerStoreKey + arch)
+			return DockerStoreKey(s.namespace, arch)
 		}
 
 		return s.qualifiedKey(rest)

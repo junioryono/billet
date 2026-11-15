@@ -1045,6 +1045,122 @@ get-command-invocation)
 esac
 `
 
+// fakeLoseAWS answers `aws ec2 describe-instances` with $FAKE/describe (and exits
+// $FAKE/describe.exit) and `aws ec2 terminate-instances` with $FAKE/terminate (exiting
+// $FAKE/terminate.exit), appending each call to $FAKE/calls.
+const fakeLoseAWS = `echo "aws $*" >>"$FAKE/calls"
+case "$1 $2" in
+"ec2 describe-instances")
+	cat "$FAKE/describe" 2>/dev/null
+	exit "$(cat "$FAKE/describe.exit" 2>/dev/null || echo 0)"
+	;;
+"ec2 terminate-instances")
+	cat "$FAKE/terminate" 2>/dev/null
+	exit "$(cat "$FAKE/terminate.exit" 2>/dev/null || echo 0)"
+	;;
+esac
+exit 9
+`
+
+// AN INSTANCE IS LOST ONLY WHEN IT IS EXACTLY ONE LIVE INSTANCE OF THIS DEPLOYMENT BY
+// THAT RUNNER'S NAME, and only once EC2 says it is going: no instance, two, a name billet
+// would not give, a deployment the run does not name, a refusal and a state that is not
+// shutting down each terminate nothing or fail, and a question EC2 did not answer is could
+// not tell.
+func TestTheMatrixHostLosesExactlyTheWritersInstance(t *testing.T) {
+	t.Parallel()
+	runner := "billet-" + strings.Repeat("c", 32)
+	deployment := strings.Repeat("d", 32)
+	for name, c := range map[string]struct {
+		runner, deployment string
+		fixtures           map[string]string
+		code               int
+		says               string
+		terminated         bool
+	}{
+		"the one instance": {runner: runner, deployment: deployment,
+			fixtures: map[string]string{"describe": "i-0abc\n", "terminate": "shutting-down\n"},
+			says:     "i-0abc (" + runner + ") is lost: shutting-down", terminated: true},
+		"no instance by that name": {runner: runner, deployment: deployment, fixtures: map[string]string{"describe": ""},
+			code: 1, says: "is 0 live instances"},
+		"two by that name": {runner: runner, deployment: deployment,
+			fixtures: map[string]string{"describe": "i-0abc\ti-0def\n"}, code: 1, says: "is 2 live instances"},
+		"EC2 that will not say": {runner: runner, deployment: deployment,
+			fixtures: map[string]string{"describe.exit": "254"}, code: 2, says: "could not say which instance"},
+		"a termination refused": {runner: runner, deployment: deployment,
+			fixtures: map[string]string{"describe": "i-0abc\n", "terminate.exit": "254"}, code: 1,
+			says: "refused to terminate", terminated: true},
+		"a state that is not going": {runner: runner, deployment: deployment,
+			fixtures: map[string]string{"describe": "i-0abc\n", "terminate": "running\n"}, code: 1,
+			says: "is running after its termination was asked", terminated: true},
+		"a name billet would not give": {runner: "i-0abc", deployment: deployment, code: 2,
+			says: "not a billet runner's name"},
+		"no deployment named": {runner: runner, deployment: "", code: 2, says: "names no deployment"},
+	} {
+		f := newMatrixFakes(t)
+		f.command(t, "aws", fakeLoseAWS)
+		for k, v := range c.fixtures {
+			f.fixture(t, k, v)
+		}
+		dir := t.TempDir()
+		if c.deployment != "" {
+			if err := os.WriteFile(filepath.Join(dir, "deployment"), []byte(c.deployment+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		out, code := f.run(t, "acceptance/matrix-host.sh", nil, "lose", dir, "us-west-2", c.runner)
+		if code != c.code || !strings.Contains(out, c.says) {
+			t.Errorf("%s: exit %d, want %d saying %q:\n%s", name, code, c.code, c.says, out)
+		}
+		calls, err := os.ReadFile(filepath.Join(f.dir, "calls"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		terminated := strings.Contains(string(calls), "terminate-instances")
+		if terminated != c.terminated {
+			t.Errorf("%s: a termination was asked: %v, want %v\n%s", name, terminated, c.terminated, calls)
+		}
+		if terminated && !strings.Contains(string(calls), "--instance-ids i-0abc ") {
+			t.Errorf("%s: terminated something other than the one instance found:\n%s", name, calls)
+		}
+		if strings.Contains(string(calls), "describe-instances") &&
+			(!strings.Contains(string(calls), "Name=tag:Name,Values="+runner) ||
+				!strings.Contains(string(calls), "Name=tag:sh.billet.owner,Values="+deployment) ||
+				!strings.Contains(string(calls), "Name=instance-state-name,Values=pending,running")) {
+			t.Errorf("%s: looked the instance up by something other than its name, this deployment and a live "+
+				"state:\n%s", name, calls)
+		}
+	}
+}
+
+// THE WAIT FOR A PUBLICATION IS BILLET'S, AND SO IS ITS STATUS: the host passes the run's
+// workspace, the architectures and the bound, and exits with billet's own answer, so a
+// store that could not be asked (2) is never read as one not yet published (1).
+func TestTheMatrixHostWaitsForThePublicationWithBilletsAnswer(t *testing.T) {
+	t.Parallel()
+	for status := range []int{0, 1, 2} {
+		f := newMatrixFakes(t)
+		f.command(t, "billet", `echo "billet $*" >>"$FAKE/billet.log"
+exit "$(cat "$FAKE/published.exit")"
+`)
+		f.fixture(t, "published.exit", strconv.Itoa(status))
+		dir := hostRunDir(t, f)
+		if _, code := f.run(t, "acceptance/matrix-host.sh", nil, "published", dir, "x64,arm64", "1800"); code != status {
+			t.Errorf("billet answered %d; the host exited %d", status, code)
+		}
+		if log := billetLog(t, f); !strings.Contains(log, "billet acceptance matrix published --workspace "+dir+
+			"/ws --archs x64,arm64 --wait 1800s") {
+			t.Errorf("billet was asked %q", log)
+		}
+	}
+	f := newMatrixFakes(t)
+	f.command(t, "billet", "exit 0\n")
+	if out, code := f.run(t, "acceptance/matrix-host.sh", nil, "published", hostRunDir(t, f), "x64", "30m"); code != 2 ||
+		!strings.Contains(out, "not a number of seconds") {
+		t.Errorf("a bound that is not seconds: exit %d\n%s", code, out)
+	}
+}
+
 // The block on S3's fakes each append their call to $FAKE/calls. curl serves
 // $FAKE/ip-ranges.json for AWS's ranges ($FAKE/fetch.exit fails it), and answers a request
 // to S3 with $FAKE/reach-blocked (default 28, no answer in time) while a table is installed
@@ -1491,8 +1607,28 @@ const fakeDispatchGH = `case "$1 $2" in
 		echo in_progress
 	fi
 	;;
+"api repos/"*)
+	# repos/<owner>/<repo>/actions/runs/<id>/jobs: $FAKE/jobs-<id>.json through the --jq
+	# filter, or nothing at all, as an unreadable answer.
+	id=$(echo "$2" | sed -n 's#.*/actions/runs/\([0-9]*\)/jobs$#\1#p')
+	filter="" prev=""
+	for a in "$@"; do
+		[ "$prev" = --jq ] && filter=$a
+		prev=$a
+	done
+	[ -f "$FAKE/jobs-$id.json" ] || exit 1
+	jq -r "$filter" "$FAKE/jobs-$id.json"
+	;;
 esac
 `
+
+// writerJobs is a run's jobs as GitHub's API answers them, its writer at the hold step
+// in the state given and on the runner named.
+func writerJobs(holdStatus, jobStatus, runner string) string {
+	return fmt.Sprintf(`{"jobs":[{"name":"seed","status":"completed","runner_name":"billet-0000"},`+
+		`{"name":"writer","status":%q,"runner_name":%q,"steps":[{"name":"Set up job","status":"completed"},`+
+		`{"name":"Hold the disk until the instance is lost","status":%q}]}]}`, jobStatus, runner, holdStatus)
+}
 
 func dispatchSent(t *testing.T, f matrixFakes) []string {
 	t.Helper()
@@ -1621,6 +1757,61 @@ func TestTheMatrixDispatchersWritersPhaseRunsOneArchitectureAtATime(t *testing.T
 	}
 }
 
+// THE LOST PHASE RETURNS ONCE EVERY WRITER HOLDS ITS DISK, naming each one's runner for
+// the lane to lose, and never before: a writer not yet at its hold step is waited for, and
+// one that ended first, one whose runner GitHub does not name, or one never there within
+// the deadline fails the phase, naming nothing to lose.
+func TestTheMatrixDispatchersLostPhaseNamesEachHeldWriter(t *testing.T) {
+	t.Parallel()
+	x64, arm := "billet-"+strings.Repeat("a", 32), "billet-"+strings.Repeat("b", 32)
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "jobs-1.json", writerJobs("in_progress", "in_progress", x64))
+	f.fixture(t, "jobs-2.json", writerJobs("in_progress", "in_progress", arm))
+	runs := filepath.Join(t.TempDir(), "runs")
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "lost", "billet-testbed/m", "t1", runs,
+		"accept-x64", "accept-arm")
+	if code != 0 || !strings.Contains(out, "every instance-lost writer holds its disk") {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	want := []string{"matrix-instance-lost.yml accept-x64 t1", "matrix-instance-lost.yml accept-arm t1"}
+	if got := dispatchSent(t, f); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", got, want)
+	}
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "1\n2\n" {
+		t.Fatalf("the runs file is %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(runs + ".lost"); err != nil ||
+		string(got) != "accept-x64 "+x64+"\naccept-arm "+arm+"\n" {
+		t.Fatalf("the writers to lose are %q, %v", got, err)
+	}
+
+	for name, c := range map[string]struct {
+		jobs string
+		says string
+	}{
+		"a writer not yet holding":           {writerJobs("queued", "in_progress", x64), "did not hold its disk within"},
+		"a writer that ended first":          {writerJobs("completed", "completed", x64), "ended before it held its disk"},
+		"a writer GitHub names no runner of": {writerJobs("in_progress", "in_progress", ""), "names no runner"},
+		"a run GitHub will not describe":     {"", "did not hold its disk within"},
+	} {
+		f := newMatrixFakes(t, "jq")
+		f.command(t, "gh", fakeDispatchGH)
+		if c.jobs != "" {
+			f.fixture(t, "jobs-1.json", c.jobs)
+		}
+		runs := filepath.Join(t.TempDir(), "runs")
+		out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "lost", "billet-testbed/m", "t2", runs,
+			"accept-x64")
+		if code != 1 || !strings.Contains(out, c.says) {
+			t.Errorf("%s: exit %d, want 1 saying %q:\n%s", name, code, c.says, out)
+		}
+		if got, err := os.ReadFile(runs + ".lost"); err == nil && len(got) > 0 {
+			t.Errorf("%s: named %q to lose", name, got)
+		}
+	}
+}
+
 // THE STORE-UNREACHABLE PHASE SENDS EVERY LABEL'S RUN AT ONCE, records each, and waits
 // for every one: a run still going fails the phase, whichever architecture it is.
 func TestTheMatrixDispatchersStoreUnreachablePhaseWaitsForEveryArchitecture(t *testing.T) {
@@ -1696,50 +1887,11 @@ func TestTheMatrixDispatchersWritersApartPhaseSendsEveryArchitectureAtOnce(t *te
 	}
 }
 
-// THE IMAGE STORE'S PAIR RUNS ALONE: its cold run for every label, then, only once each
-// has finished, its warm one, and nothing else is sent; a cold run still running sends no
-// warm one.
-func TestTheMatrixDispatchersImagePhaseRunsThePairAlone(t *testing.T) {
-	t.Parallel()
-	f := newMatrixFakes(t, "jq")
-	f.command(t, "gh", fakeDispatchGH)
-	f.fixture(t, "done-all", "")
-	runs := filepath.Join(t.TempDir(), "runs")
-	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images", "billet-testbed/m", "t1", runs,
-		"accept-x64", "accept-arm"); code != 0 {
-		t.Fatalf("exit %d:\n%s", code, out)
-	}
-	want := []string{
-		"matrix-images-cold.yml accept-x64 t1", "matrix-images-cold.yml accept-arm t1",
-		"matrix-images-warm.yml accept-x64 t1", "matrix-images-warm.yml accept-arm t1",
-	}
-	if got := dispatchSent(t, f); strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Fatalf("sent %q, want %q", got, want)
-	}
-	if got, err := os.ReadFile(runs); err != nil || string(got) != "1\n2\n3\n4\n" {
-		t.Fatalf("the runs file is %q, %v", got, err)
-	}
-
-	f = newMatrixFakes(t, "jq")
-	f.command(t, "gh", fakeDispatchGH)
-	f.fixture(t, "done-1", "")
-	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images", "billet-testbed/m", "t2",
-		filepath.Join(t.TempDir(), "runs"), "accept-x64", "accept-arm")
-	if code != 1 || !strings.Contains(out, "run 2 did not complete") {
-		t.Fatalf("an arm cold run still running: exit %d\n%s", code, out)
-	}
-	for _, line := range dispatchSent(t, f) {
-		if strings.HasPrefix(line, "matrix-images-warm") {
-			t.Fatalf("a warm run was sent before every cold one finished: %q", dispatchSent(t, f))
-		}
-	}
-}
-
-// A POOL'S IMAGE PAIR IS THREE STEPS: the cold runs are sent and nothing is waited for,
-// the wait is a step of its own over every run sent, and only then are the warm runs sent
-// and waited for; a cold run still running at the wait's deadline fails it, sending no
-// warm one.
-func TestTheMatrixDispatchersPoolImageStepsWaitForTheHost(t *testing.T) {
+// THE IMAGE PAIR IS THREE STEPS, ON EVERY LANE: the cold runs are sent and nothing is
+// waited for, the wait is a step of its own over every run sent, and only then are the
+// warm runs sent and waited for; a cold run still running at the wait's deadline fails
+// it, sending no warm one.
+func TestTheMatrixDispatchersImageStepsSendTheWarmRunsLast(t *testing.T) {
 	t.Parallel()
 	f := newMatrixFakes(t, "jq")
 	f.command(t, "gh", fakeDispatchGH)
@@ -1804,12 +1956,12 @@ func TestTheMatrixDispatcherFindsTheRunByItsExactTitle(t *testing.T) {
 	f.fixture(t, "done-all", "")
 	f.fixture(t, "sent", "matrix-images-cold.yml accept-x64 t10\nmatrix-images-cold.yml accept-x64-old t1\n")
 	runs := filepath.Join(t.TempDir(), "runs")
-	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images", "billet-testbed/m", "t1", runs,
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images-cold", "billet-testbed/m", "t1", runs,
 		"accept-x64"); code != 0 {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
-	if got, err := os.ReadFile(runs); err != nil || string(got) != "3\n4\n" {
-		t.Fatalf("the runs file is %q, %v; want this run's own ids, 3 and 4", got, err)
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "3\n" {
+		t.Fatalf("the runs file is %q, %v; want this run's own id, 3", got, err)
 	}
 }
 
@@ -1826,7 +1978,7 @@ func TestTheMatrixDispatcherFailsOnARunItCouldNotRecord(t *testing.T) {
 	if err := os.Mkdir(runs, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images", "billet-testbed/m", "t1",
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "images-cold", "billet-testbed/m", "t1",
 		runs, "accept-x64")
 	if code != 1 || !strings.Contains(out, "dispatched run 1 of matrix-images-cold.yml for accept-x64, and could not record it") {
 		t.Fatalf("exit %d:\n%s", code, out)

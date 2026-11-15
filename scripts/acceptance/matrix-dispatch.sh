@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Usage:
-#   matrix-dispatch.sh images <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh images-cold <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh await <owner/repo> <tag> <runs-file> -
 #   matrix-dispatch.sh images-warm <owner/repo> <tag> <runs-file> <label>...
@@ -8,19 +7,20 @@
 #   matrix-dispatch.sh warm <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh writers <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh writers-apart <owner/repo> <tag> <runs-file> <label>...
+#   matrix-dispatch.sh lost <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh store-unreachable <owner/repo> <tag> <runs-file> <label>...
 #
 # Dispatches the acceptance matrix's workflows in <owner/repo> for each tier label and
 # appends the id of every run it starts to <runs-file>, which is what `billet acceptance
-# matrix judge --runs` reads. `images` runs first and alone on each tier: it sends the
-# image store's cold run, waits for it, waits MATRIX_SETTLE seconds, and sends and waits
-# for the warm one, because every job on a tier publishes an image-store generation and
-# none may run beside that pair. A pool's tier has no host until its first job asks for one,
-# and a host takes about 45 minutes to boot, join and import the guest image (#829), so
-# for it `images` is three steps, each with a token of its own: `images-cold` sends the
-# cold runs and waits for nothing, `await` waits for every run in <runs-file> within
-# MATRIX_TIMEOUT, and `images-warm` waits MATRIX_SETTLE seconds and sends and waits for
-# the warm ones. `cold` sends the cold and failed-writer runs and waits for
+# matrix judge --runs` reads. The image store's runs go first and alone on each tier,
+# because every job on a tier publishes an image-store generation and none may run beside
+# the cold and warm pair, in three steps, each with a token of its own, since a pool's tier
+# has no host until its first job asks for one and a host takes about 45 minutes to boot,
+# join and import the guest image (#829): `images-cold` sends the cold runs and waits for
+# nothing, `await` waits for every run in <runs-file> within MATRIX_TIMEOUT, and
+# `images-warm` waits MATRIX_SETTLE seconds and sends and waits for the warm ones (the
+# per-job EC2 lane waits for the cold runs' publication itself, and settles 0). `cold`
+# sends the cold and failed-writer runs and waits for
 # the cold ones to finish; `warm` waits MATRIX_SETTLE seconds more, so the cold runs'
 # publications have time to land, sends the warm runs with the same tag, and waits for
 # every run in <runs-file> to finish. `writers` comes last, and sends each label's
@@ -29,7 +29,10 @@
 # slot (the workflow calls it once per architecture, so each has its own deadline).
 # `writers-apart` sends every label's at once and waits for them all, for tiers that share
 # no host, as a pool's architectures do: one waiting for another would leave its host
-# idle long enough for the pool to release it. `store-unreachable` sends every label's
+# idle long enough for the pool to release it. `lost` sends every label's instance-lost run
+# and returns once each one's writer is holding its disk, appending "<label> <runner>" for
+# each to <runs-file>.lost, the runner being the writer's instance name, which the caller
+# terminates; `await` then waits for the runs. `store-unreachable` sends every label's
 # store-unreachable run at once and waits for them all; the caller has cut the node off
 # from its store first, and nothing else may run beside them, since the breaker they open
 # sends every job on the node cold. Every
@@ -48,7 +51,7 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,11p' "$0" >&2
+	sed -n '2,12p' "$0" >&2
 	exit 2
 }
 
@@ -113,24 +116,45 @@ await() {
 	done
 }
 
+# holding waits, within the phase's deadline, for a run's writer to be holding its disk
+# (its hold step running) and appends "<label> <runner>" to <runs-file>.lost. A writer that
+# ended first, or one whose runner GitHub does not name, fails the phase: it can no longer
+# be lost while it holds the disk.
+holding() {
+	local id=$1 label=$2 line status runner step
+	while :; do
+		# JOINED ON A CHARACTER IFS DOES NOT FOLD: with a tab, an empty runner name between
+		# two fields collapsed, and the step's state was read as the runner's.
+		line=$(gh api "repos/$repo/actions/runs/$id/jobs" --jq '.jobs[] | select(.name == "writer") |
+			[.status, (.runner_name // ""),
+			 ([.steps[]? | select(.name == "Hold the disk until the instance is lost") | .status][0] // "")] |
+			join("|")')
+		IFS='|' read -r status runner step <<<"$line"
+		if [ "$step" = in_progress ]; then
+			if [ -z "$runner" ]; then
+				echo "run $id's writer holds its disk and GitHub names no runner for it" >&2
+				return 1
+			fi
+			if ! echo "$label $runner" >>"$runs.lost"; then
+				echo "run $id's writer holds its disk on $runner, and that could not be recorded in $runs.lost" >&2
+				return 1
+			fi
+			echo "run $id's writer holds its disk on $runner"
+			return 0
+		fi
+		if [ "$status" = completed ]; then
+			echo "run $id's writer ended before it held its disk" >&2
+			return 1
+		fi
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			echo "run $id's writer did not hold its disk within the phase's ${timeout}s (it is ${status:-unknown})" >&2
+			return 1
+		fi
+		sleep "$poll"
+	done
+}
+
 case "$phase" in
-images)
-	cold=()
-	for label in "$@"; do
-		id=$(dispatch matrix-images-cold.yml "$label") || exit 1
-		cold+=("$id")
-	done
-	await "${cold[@]}" || exit 1
-	echo "the image store's cold runs are done; its warm ones are sent in ${settle}s"
-	sleep "$settle"
-	warm=()
-	for label in "$@"; do
-		id=$(dispatch matrix-images-warm.yml "$label") || exit 1
-		warm+=("$id")
-	done
-	await "${warm[@]}" || exit 1
-	echo "the image store's runs are done"
-	;;
 images-cold)
 	for label in "$@"; do
 		dispatch matrix-images-cold.yml "$label" >/dev/null || exit 1
@@ -202,6 +226,17 @@ writers-apart)
 	done
 	await "${writers[@]}" || exit 1
 	echo "the two-writer runs are done"
+	;;
+lost)
+	lost=()
+	for label in "$@"; do
+		id=$(dispatch matrix-instance-lost.yml "$label") || exit 1
+		lost+=("$id:$label")
+	done
+	for sent in "${lost[@]}"; do
+		holding "${sent%%:*}" "${sent#*:}" || exit 1
+	done
+	echo "every instance-lost writer holds its disk"
 	;;
 store-unreachable)
 	unreachable=()
