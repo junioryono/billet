@@ -1608,9 +1608,14 @@ const fakeDispatchGH = `case "$1 $2" in
 		jq -cn --argjson id "$n" --arg t "${w%.yml} $label $tag" '{databaseId: $id, displayTitle: $t}'
 	done <"$FAKE/sent" | jq -s . | jq -r "$filter"
 	;;
-"run cancel")
-	echo "$3" >>"$FAKE/cancelled"
-	exit "$(cat "$FAKE/cancel.exit" 2>/dev/null || echo 0)"
+"api -X")
+	# api -X POST repos/<repo>/actions/runs/<id>/force-cancel: recorded, and the run is
+	# completed after it unless $FAKE/sticky-<id> says the cancel does not land.
+	id=$(echo "$4" | sed -n 's#.*/actions/runs/\([0-9]*\)/force-cancel$#\1#p')
+	[ -n "$id" ] || exit 9
+	echo "$id" >>"$FAKE/cancelled"
+	[ -f "$FAKE/cancel.exit" ] && exit "$(cat "$FAKE/cancel.exit")"
+	[ -f "$FAKE/sticky-$id" ] || : >"$FAKE/done-$id"
 	;;
 "run view")
 	[ -f "$FAKE/unreadable-$3" ] && exit 1
@@ -1849,7 +1854,9 @@ func TestTheMatrixDispatcherCancelsTheRunsItSentThatAreStillGoing(t *testing.T) 
 		t.Fatalf("cancelled %q (%v); want runs 1 and 3, the two still going", got, err)
 	}
 
-	for name, fixture := range map[string]string{"a run it cannot read": "unreadable-1", "a cancel refused": "cancel.exit"} {
+	for name, fixture := range map[string]string{
+		"a run it cannot read": "unreadable-1", "a cancel refused": "cancel.exit", "a cancel that does not land": "sticky-1",
+	} {
 		f := newMatrixFakes(t, "jq")
 		f.command(t, "gh", fakeDispatchGH)
 		body := ""
@@ -1875,6 +1882,15 @@ func TestTheMatrixDispatcherCancelsTheRunsItSentThatAreStillGoing(t *testing.T) 
 	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1",
 		filepath.Join(t.TempDir(), "runs"), "-"); code != 0 || !strings.Contains(out, "sent nothing to cancel") {
 		t.Errorf("with no runs file: exit %d\n%s", code, out)
+	}
+	// A RUNS FILE THAT CANNOT BE READ IS NOT ONE THAT LISTS NOTHING.
+	unreadable := filepath.Join(t.TempDir(), "runs")
+	if err := os.Mkdir(unreadable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1",
+		unreadable, "-"); code != 1 || !strings.Contains(out, "could not be read") {
+		t.Errorf("with a runs file that cannot be read: exit %d\n%s", code, out)
 	}
 }
 

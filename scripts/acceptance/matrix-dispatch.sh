@@ -36,10 +36,11 @@
 # terminates; `await` then waits for the runs. `store-unreachable` sends every label's
 # store-unreachable run at once and waits for them all; the caller has cut the node off
 # from its store first, and nothing else may run beside them, since the breaker they open
-# sends every job on the node cold. `cancel` cancels every run <runs-file> names that is not
-# completed, for a failed or cancelled lane, whose runs would otherwise stay queued on the
-# labels the next run's tiers share; a missing <runs-file> sent nothing, and a run it
-# could not read or cancel fails it, the rest still asked. Every
+# sends every job on the node cold. `cancel` force-cancels every run <runs-file> names that
+# is not completed, for a failed or cancelled lane, whose runs would otherwise stay queued
+# on the labels the next run's tiers share, and waits within MATRIX_TIMEOUT for each to
+# complete; a missing <runs-file> sent nothing, and one that cannot be read, or a run it
+# could not read, cancel or see complete, fails it, the rest still asked. Every
 # phase is a step of its own with an installation token of its own, because a token lasts
 # an hour.
 #
@@ -255,11 +256,18 @@ lost)
 	echo "every instance-lost writer holds its disk"
 	;;
 cancel)
-	if [ ! -e "$runs" ]; then
+	# ABSENT IS NOTHING SENT; anything else that cannot be read is a failure, never a
+	# list with nothing in it.
+	if [ ! -e "$runs" ] && [ ! -L "$runs" ]; then
 		echo "$runs does not exist; this run sent nothing to cancel"
 		exit 0
 	fi
+	if [ ! -f "$runs" ] || ! sent=$(cat "$runs"); then
+		echo "$runs could not be read; whatever this run sent may still be queued" >&2
+		exit 1
+	fi
 	failed=0
+	going=()
 	while read -r id; do
 		[ -n "$id" ] || continue
 		if ! status=$(gh run view "$id" -R "$repo" --json status --jq .status); then
@@ -268,13 +276,31 @@ cancel)
 			continue
 		fi
 		[ "$status" = completed ] && continue
-		if gh run cancel "$id" -R "$repo" >/dev/null; then
-			echo "cancelled run $id (it was $status)"
+		# FORCED, because an ordinary cancel does not land on a run whose jobs are queued
+		# for self-hosted runners: it stays queued (cancel-superseded.yml, 2026-09-25).
+		if gh api -X POST "repos/$repo/actions/runs/$id/force-cancel" >/dev/null; then
+			going+=("$id")
 		else
 			echo "could not cancel run $id (it is $status)" >&2
 			failed=1
 		fi
-	done <"$runs"
+	done <<<"$sent"
+	# AND CONFIRMED: a cancel GitHub accepted is not a run that ended.
+	for id in ${going[@]+"${going[@]}"}; do
+		while :; do
+			status=$(gh run view "$id" -R "$repo" --json status --jq .status)
+			if [ "$status" = completed ]; then
+				echo "cancelled run $id"
+				break
+			fi
+			if [ "$SECONDS" -ge "$deadline" ]; then
+				echo "run $id is still ${status:-unknown} ${timeout}s after it was cancelled" >&2
+				failed=1
+				break
+			fi
+			sleep "$poll"
+		done
+	done
 	exit "$failed"
 	;;
 store-unreachable)
