@@ -31,24 +31,64 @@ func TestAnInterruptedTrashMoveIsFinishedAndDeleted(t *testing.T) {
 	}
 }
 
-// NOT WHILE THE POOL STILL HOLDS THE NAME: moving it would move that live image
-// into the trash. The entry is left and said, and the live image is untouched.
-func TestAnInterruptedMoveIsNotResumedWhileThePoolHoldsTheName(t *testing.T) {
+// A MOVE INTERRUPTED BEFORE IT TOOK THE NAME OUT OF THE DIRECTORY IS FINISHED TOO:
+// the name still resolves, to the entry's own id, and `trash mv` of it completes the
+// move (measured 2026-11-15, Ceph 20.2.0, the state a timed-out move left on
+// ubuntu-01 that day).
+func TestAMoveInterruptedWithItsNameStillResolvingIsFinishedAndDeleted(t *testing.T) {
 	t.Parallel()
 
 	f := newCacheFake()
 	f.trashMoving = map[string]bool{"id-moving": true}
-	f.trash["id-moving"] = "cache-v-1794148981-5ffb13c7646acb490f1ceff2"
-	f.images["billet-cache/cache-v-1794148981-5ffb13c7646acb490f1ceff2"] = true
+	f.trash["id-moving"] = "cache-v-1794735511-4d4ec80bdc783ac3265dffbc"
+	f.images["billet-cache/cache-v-1794735511-4d4ec80bdc783ac3265dffbc"] = true
+	f.imageIDs = map[string]string{"billet-cache/cache-v-1794735511-4d4ec80bdc783ac3265dffbc": "id-moving"}
 	c := cacheClient(t, f)
 
-	_, err := c.PurgeTrash(t.Context())
-	if err == nil || !strings.Contains(err.Error(), "still in the pool") {
-		t.Fatalf("PurgeTrash = %v, want the live name refused", err)
+	purged, err := c.PurgeTrash(t.Context())
+	if err != nil || purged != 1 {
+		t.Fatalf("PurgeTrash = %d, %v; want the interrupted move finished and deleted", purged, err)
 	}
-	if !f.images["billet-cache/cache-v-1794148981-5ffb13c7646acb490f1ceff2"] ||
-		f.countCalls("trash", "mv") != 0 {
-		t.Fatal("a live image of the same name was moved into the trash")
+	if _, ok := f.trash["id-moving"]; ok || f.images["billet-cache/cache-v-1794735511-4d4ec80bdc783ac3265dffbc"] {
+		t.Fatal("the entry or its name is still there")
+	}
+}
+
+// NOT WHILE THE POOL HOLDS THE NAME FOR ANOTHER IMAGE, or cannot say which: moving
+// it would move that live image into the trash. The entry is left and said, and the
+// live image is untouched.
+func TestAnInterruptedMoveIsNotResumedWhileThePoolHoldsTheName(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		ids  map[string]string
+		said string
+	}{
+		"another image": {
+			ids:  map[string]string{"billet-cache/cache-v-1794148981-5ffb13c7646acb490f1ceff2": "id-other"},
+			said: "still in the pool as another image",
+		},
+		"an image whose id rbd does not say": {said: "could not tell which image"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newCacheFake()
+			f.trashMoving = map[string]bool{"id-moving": true}
+			f.trash["id-moving"] = "cache-v-1794148981-5ffb13c7646acb490f1ceff2"
+			f.images["billet-cache/cache-v-1794148981-5ffb13c7646acb490f1ceff2"] = true
+			f.imageIDs = tc.ids
+			c := cacheClient(t, f)
+
+			_, err := c.PurgeTrash(t.Context())
+			if err == nil || !strings.Contains(err.Error(), tc.said) {
+				t.Fatalf("PurgeTrash = %v, want the live name refused: %s", err, tc.said)
+			}
+			if !f.images["billet-cache/cache-v-1794148981-5ffb13c7646acb490f1ceff2"] ||
+				f.countCalls("trash", "mv") != 0 {
+				t.Fatal("a live image of the same name was moved into the trash")
+			}
+		})
 	}
 }
 
@@ -138,10 +178,12 @@ func TestAnInterruptedMoveThatCannotBeFinishedIsHeld(t *testing.T) {
 	}
 }
 
-// errorf117 is librbd's refusal of an entry still marked moving.
+// errorf117 is librbd's refusal of an entry still marked moving, as the runner
+// reported ubuntu-01's rbd on 2026-11-15: exit 117 with the last line rbd printed,
+// its progress line, and not librbd's words, which came on an earlier line.
 func errorf117() error {
 	return fmt.Errorf("exit status 117: %w", cacheExitError{
-		code: 117, message: "librbd::api::Trash: remove: error: image is pending moving to the trash.",
+		code: 117, message: "Removing image: 0% complete...failed.",
 	})
 }
 

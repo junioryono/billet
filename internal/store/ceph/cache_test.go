@@ -27,8 +27,10 @@ type cacheFake struct {
 	// interrupted: `trash rm` refuses them with EUCLEAN, and `trash mv` of their
 	// name, which the pool no longer holds, finishes the move (Ceph v20.2.0).
 	trashMoving map[string]bool
-	// infoFailures makes `rbd info` of an image answer its error.
+	// infoFailures makes `rbd info` of an image answer its error, and imageIDs is the
+	// id `rbd info` reports for an image, by handle.
 	infoFailures        map[string]error
+	imageIDs            map[string]string
 	metadata            map[string]map[string]string
 	mappings            map[string]string
 	lockCookie          string
@@ -218,6 +220,16 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 		}
 
 		_, name, _ := strings.Cut(image, "/")
+		// AND ONE INTERRUPTED BEFORE IT TOOK THE NAME OUT OF THE DIRECTORY, whose name
+		// still resolves to the entry's own id (measured 2026-11-15, Ceph 20.2.0).
+		for id := range f.trashMoving {
+			if f.trash[id] == name && f.imageIDs[image] == id {
+				delete(f.trashMoving, id)
+				delete(f.images, image)
+
+				return nil, nil
+			}
+		}
 		id := "id-" + name
 		f.trash[id] = name
 		delete(f.images, image)
@@ -250,10 +262,9 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 			return nil, errors.New("rbd: (2) No such file or directory")
 		}
 		if f.trashMoving[id] {
-			// As ubuntu-01's rbd answered on 2026-11-09.
-			return nil, fmt.Errorf("exit status 117: %w", cacheExitError{
-				code: 117, message: "librbd::api::Trash: remove: error: image is pending moving to the trash.",
-			})
+			// As the runner reported ubuntu-01's rbd on 2026-11-15: the last line of
+			// what it printed, which was its progress line, not librbd's words.
+			return nil, errorf117()
 		}
 
 		image := "billet-cache/" + name
@@ -612,14 +623,21 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 			return nil, errors.New("rbd: (2) No such file or directory")
 		}
 
+		info := map[string]any{"size": 1073741824}
 		if created, ok := f.created[tail[0]]; ok {
 			// ctime in the rbd process's zone, as rbd info prints it.
-			return json.Marshal(map[string]any{
-				"size": 1073741824, "create_timestamp": created.In(time.Local).Format(time.ANSIC),
-			})
+			info["create_timestamp"] = created.In(time.Local).Format(time.ANSIC)
+		}
+		if id, ok := f.imageIDs[tail[0]]; ok {
+			info["id"] = id
+		}
+		// rbd answers in prose unless asked for json, as a caller that forgot to ask
+		// would read it.
+		if !slices.Contains(all, "json") {
+			return fmt.Appendf(nil, "rbd image '%s':\n\tsize 1 GiB\n\tid: %v\n", tail[0], info["id"]), nil
 		}
 
-		return []byte(`{"size":1073741824}`), nil
+		return json.Marshal(info)
 	case "rm":
 		if f.failRemove {
 			return nil, errors.New("injected remove failure")
