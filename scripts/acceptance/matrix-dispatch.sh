@@ -123,11 +123,17 @@ await() {
 holding() {
 	local id=$1 label=$2 line status runner step
 	while :; do
-		# JOINED ON A CHARACTER IFS DOES NOT FOLD: with a tab, an empty runner name between
-		# two fields collapsed, and the step's state was read as the runner's.
-		line=$(gh api "repos/$repo/actions/runs/$id/jobs" --jq '.jobs[] | select(.name == "writer") |
-			[.status, (.runner_name // ""),
-			 ([.steps[]? | select(.name == "Hold the disk until the instance is lost") | .status][0] // "")] |
+		# EVERY FIELD CHECKED IN jq, BEFORE IT IS JOINED: a runner name carrying the joining
+		# character or a newline could otherwise forge the fields after it. A field that is
+		# not what GitHub's API gives is "!", which nothing below accepts. Joined on a
+		# character IFS does not fold, since with a tab an empty runner collapsed and the
+		# step's state was read as the runner's. The first writer only.
+		line=$(gh api "repos/$repo/actions/runs/$id/jobs" --jq '
+			def word: if type == "string" and test("^[a-z_]*$") then . else "!" end;
+			[.jobs[] | select(.name == "writer")] | first // empty |
+			[(.status // "" | word),
+			 (.runner_name // "" | if type == "string" and test("^(billet-[0-9a-f]{32})?$") then . else "!" end),
+			 ([.steps[]? | select(.name == "Hold the disk until the instance is lost") | .status][0] // "" | word)] |
 			join("|")')
 		IFS='|' read -r status runner step <<<"$line"
 		if [ "$step" = in_progress ]; then

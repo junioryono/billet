@@ -1090,6 +1090,9 @@ func TestTheMatrixHostLosesExactlyTheWritersInstance(t *testing.T) {
 			fixtures: map[string]string{"describe": "i-0abc1234\n"}, code: 2, says: "would not read as a list"},
 		"an instance id that is not one": {runner: runner, deployment: deployment,
 			fixtures: map[string]string{"describe": `["i-0abc; reboot"]`}, code: 2, says: "nothing is terminated"},
+		"two documents, the first one instance": {runner: runner, deployment: deployment,
+			fixtures: map[string]string{"describe": "[\"i-0abc1234\"] [\"\"]\n"}, code: 2,
+			says: "would not read as a list"},
 		"EC2 that will not say": {runner: runner, deployment: deployment,
 			fixtures: map[string]string{"describe.exit": "254"}, code: 2, says: "could not say which instance"},
 		"a termination refused": {runner: runner, deployment: deployment,
@@ -1799,7 +1802,9 @@ func TestTheMatrixDispatchersLostPhaseNamesEachHeldWriter(t *testing.T) {
 		"a writer that ended first":          {writerJobs("completed", "completed", x64), "ended before it held its disk"},
 		"a writer GitHub names no runner of": {writerJobs("in_progress", "in_progress", ""), "names no runner"},
 		"a runner billet would not name":     {writerJobs("in_progress", "in_progress", "billet-x'; reboot; '"), "billet would not name"},
-		"a run GitHub will not describe":     {"", "did not hold its disk within"},
+		"a runner that forges the fields after it": {writerJobs("queued", "in_progress",
+			"billet-"+strings.Repeat("a", 32)+"|in_progress\n"), "did not hold its disk within"},
+		"a run GitHub will not describe": {"", "did not hold its disk within"},
 	} {
 		f := newMatrixFakes(t, "jq")
 		f.command(t, "gh", fakeDispatchGH)

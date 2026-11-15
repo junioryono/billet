@@ -539,7 +539,11 @@ lose)
 		echo "matrix: EC2 could not say which instance $runner is; nothing is terminated" >&2
 		exit 2
 	fi
-	if ! count=$(jq -er 'if type == "array" and all(.[]; type == "string") then length else error end' <<<"$ids"); then
+	# ONE JSON DOCUMENT, A LIST OF INSTANCE IDS, or the answer is not read at all: slurped,
+	# so a second document cannot add a count of its own after the first.
+	ids_check='if length == 1 and (.[0] | type == "array" and all(.[]; type == "string" and test("^i-[0-9a-f]{8,17}$")))
+		then .[0] else error("not one list of instance ids") end'
+	if ! count=$(jq -ers "$ids_check | length" <<<"$ids") || ! [[ "$count" =~ ^[0-9]+$ ]]; then
 		echo "matrix: EC2's answer about $runner would not read as a list of instances; nothing is terminated" >&2
 		exit 2
 	fi
@@ -547,8 +551,7 @@ lose)
 		echo "matrix: $runner is $count live instances of deployment $deployment, not one; nothing is terminated" >&2
 		exit 1
 	fi
-	instance=$(jq -r '.[0]' <<<"$ids")
-	if ! [[ "$instance" =~ ^i-[0-9a-f]{8,17}$ ]]; then
+	if ! instance=$(jq -ers "$ids_check | .[0]" <<<"$ids") || ! [[ "$instance" =~ ^i-[0-9a-f]{8,17}$ ]]; then
 		echo "matrix: EC2 named $runner's instance \"$instance\"; nothing is terminated" >&2
 		exit 2
 	fi
