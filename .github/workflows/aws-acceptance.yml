@@ -41,6 +41,10 @@ on:
         description: the architectures to cover, comma-separated
         required: false
         default: x64
+      lanes:
+        description: the lanes to run, as a JSON list of ec2 and pool (the weekly run takes both)
+        required: false
+        default: '["ec2", "pool"]'
   schedule:
     - cron: "17 9 * * 1"
 permissions:
@@ -60,7 +64,9 @@ jobs:
       max-parallel: 1
       fail-fast: false
       matrix:
-        lane: [ec2, pool]
+        # A DISPATCH MAY RUN ONE LANE ALONE, so a change to one does not cost the other's
+        # hosts; the schedule passes no inputs and runs both.
+        lane: ${{ fromJSON(inputs.lanes || '["ec2", "pool"]') }}
     # THE BUDGET, inside GitHub's six hours for a hosted job: the host's run waits 210
     # minutes for its jobs, 20 more for its compute barrier and 5 for each service's stop
     # (SSM gives it 250), then the judge (15) and the teardown (`stopped` and `down`, at
@@ -325,15 +331,17 @@ jobs:
           GH_TOKEN: ${{ steps.host-token.outputs.token }}
           MATRIX_TIMEOUT: "3300"
         run: scripts/acceptance/matrix-dispatch.sh await "$REPO" "$RUN" out/runs -
-      # PER-JOB EC2 PUBLISHES A JOB'S IMAGE STORE ONLY ONCE THE GUEST IS PROVED GONE, so the
-      # warm runs wait for each architecture's publication in the store itself, never for a
-      # time: on 2026-11-14 arm64's landed 19 minutes after its cold job ended. A pool's
-      # control plane holds no grant on its hosts' store while it runs, so its warm runs
-      # still wait MATRIX_SETTLE.
+      # PER-JOB EC2 PUBLISHES A JOB'S IMAGE STORE ONLY ONCE THE GUEST IS PROVED GONE AND ITS
+      # SNAPSHOT IS COMPLETE, so the warm runs wait for each architecture's publication in
+      # the store itself, never for a time. How long that takes varies widely: on
+      # 2026-11-14 x64's landed about two minutes after its cold job ended and arm64's 19,
+      # and on 2026-11-15 neither had landed after 30, so the wait is 75 minutes and says
+      # how long each took. A pool's control plane holds no grant on its hosts' store while
+      # it runs, so its warm runs still wait MATRIX_SETTLE.
       - name: Wait for each architecture's image store to be published
         if: ${{ env.LANE == 'ec2' }}
         run: |
-          scripts/acceptance/ssm-run.sh run "$HOST" 2000 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' published '$RUN_DIR' '$ARCHS' 1800"
+          scripts/acceptance/ssm-run.sh run "$HOST" 4700 "runuser -u ubuntu -- bash '$RUN_DIR/matrix-host.sh' published '$RUN_DIR' '$ARCHS' 4500"
       - id: images-warm-token
         uses: actions/create-github-app-token@v2
         with:

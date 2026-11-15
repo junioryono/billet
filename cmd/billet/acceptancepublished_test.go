@@ -94,8 +94,8 @@ func TestTheWarmImageRunsWaitForTheColdRunsPublication(t *testing.T) {
 				t.Errorf("%s: %v does not say %q", name, err, s)
 			}
 		}
-		if c.code == 0 && (!strings.Contains(out.String(), "x64: the image store is published as snap-x") ||
-			!strings.Contains(out.String(), "arm64: the image store is published as snap-a")) {
+		if c.code == 0 && (!strings.Contains(out.String(), "x64: the image store is published as snap-x, after ") ||
+			!strings.Contains(out.String(), "arm64: the image store is published as snap-a, after ")) {
 			t.Errorf("%s: printed %q", name, out.String())
 		}
 		for _, k := range f.asked {
