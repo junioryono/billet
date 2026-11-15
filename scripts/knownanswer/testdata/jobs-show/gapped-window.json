@@ -90,6 +90,7 @@
     "energy_idle_uj": 600000000,
     "energy_source": "rapl"
   },
+  "energy_estimate": null,
   "prediction": null,
   "guest": null,
   "egress": null,

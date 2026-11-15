@@ -1857,9 +1857,9 @@ func (h *handler) leaseUsage(w http.ResponseWriter, r *http.Request) {
 	// COUNTERS, DESTINATIONS, CAUSES, METER ENERGY AND UNANSWERED COUNTS ONLY
 	// FROM A WIRE THAT CARRIES THEM: a pairing that negotiated below
 	// VersionJobCounters, VersionJobDestinations, VersionSeriesGaps,
-	// VersionMeterEnergy, VersionUnansweredFlows or VersionReplyTimes has its
-	// report kept without them, the series whole, since the plane does not
-	// re-encode one.
+	// VersionMeterEnergy, VersionUnansweredFlows, VersionReplyTimes or
+	// VersionDestinationOpenings has its report kept without them, the series
+	// whole, since the plane does not re-encode one.
 	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
 		r.Header.Get(nodeapi.HeaderIncarnation)); known {
 		if wire < nodeapi.VersionMeterEnergy {
@@ -1877,6 +1877,10 @@ func (h *handler) leaseUsage(w http.ResponseWriter, r *http.Request) {
 		}
 		if wire < nodeapi.VersionReplyTimes && req.Usage.Destinations != nil {
 			without := req.Usage.Destinations.WithoutReplyTimes()
+			req.Usage.Destinations = &without
+		}
+		if wire < nodeapi.VersionDestinationOpenings && req.Usage.Destinations != nil {
+			without := req.Usage.Destinations.WithoutOpenings()
 			req.Usage.Destinations = &without
 		}
 		if wire < nodeapi.VersionSeriesGaps && req.Series != nil && req.Series.Codec == alloc.UsageSeriesCodecGaps {

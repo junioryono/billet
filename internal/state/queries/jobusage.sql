@@ -107,6 +107,19 @@ SELECT CAST(@lease_id AS TEXT),
        CAST(NULLIF(rtrim(substr(rec, 157, 19)), '') AS BIGINT)
   FROM slot;
 
+-- name: RecordJobDestinationOpenings :exec
+-- A job's destinations split by when each connection opened (migration 83),
+-- packed by internal/alloc packOpenings, written only by the usage report that
+-- won RecordJobUsage, in its transaction, beside its destination rows.
+INSERT INTO job_destination_openings (lease_id, width_seconds, row_count, packed)
+VALUES (@lease_id, @width_seconds, @row_count, @packed)
+ON CONFLICT (lease_id) DO NOTHING;
+
+-- name: ReadJobDestinationOpenings :one
+-- One lease's openings. sql.ErrNoRows means its report carried none, which is
+-- not a job that talked to nothing.
+SELECT width_seconds, row_count, packed FROM job_destination_openings WHERE lease_id = @lease_id;
+
 -- name: ReadJobDestinations :many
 -- One lease's destinations in the order the node gave them, the total beyond
 -- them last.

@@ -1,0 +1,7 @@
+{
+  "store": "CacheStoreRequest.store",
+  "state": "CacheStoreRequest.state",
+  "since": "CacheStoreRequest.since",
+  "failures": 1838098581,
+  "reason": "CacheStoreRequest.reason"
+}

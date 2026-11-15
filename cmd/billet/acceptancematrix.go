@@ -108,6 +108,9 @@ type matrixRun struct {
 	// Want the token it must hold.
 	Observe string `json:"observe"`
 	Want    string `json:"want"`
+	// Or are the other tokens that pass, for a case whose outcome the node may record in
+	// more than one word.
+	Or []string `json:"or,omitempty"`
 }
 
 // matrixCells is the whole declaration: every combination of the axes, in their order.
@@ -118,8 +121,11 @@ func matrixCells() []matrixCell {
 			for _, c := range matrixCaches {
 				for _, k := range matrixCases {
 					cell := matrixCellFor(c, k)
-					if waits, ok := poolCellsNotRun[b.source]; ok {
+					switch waits, ok := poolCellsNotRun[b.source]; {
+					case ok:
 						cell = waits
+					case b.source != "" && k == "store-unreachable" && cell.Run != nil:
+						cell = matrixCell{Why: poolUnreachableWhy}
 					}
 					cell.Backend, cell.Source, cell.Arch, cell.Cache, cell.Case = b.kind, b.source, a, c, k
 					out = append(out, cell)
@@ -235,10 +241,63 @@ func matrixCellFor(cache, kase string) matrixCell {
 		return matrixCell{Why: "timed from the site store's writer state by hand " +
 			"(docs/reference/records/site-acceptance.md); not automated yet"}
 	case "store-unreachable":
-		return matrixCell{Why: "waits for the site store's breaker (#531)"}
+		return storeUnreachableCell(cache, observe)
 	}
 
 	return matrixCell{Why: "an unknown case"}
+}
+
+// matrixUnreachableWorkflow is the store-unreachable case's, which runs while the host
+// that serves the deployment's node drops every packet to its region's S3
+// (`matrix-host.sh block-s3`), so the site's store hangs rather than refuses, as #531's
+// did.
+const matrixUnreachableWorkflow = "matrix-store-unreachable.yml"
+
+// storeUnreachableCell says how a cache's store-unreachable case is run: the job must
+// succeed, and the node must say the store was out of reach, in either of its two words
+// for it. UNAVAILABLE is a call that waited out the store's deadline, or a session's next
+// call while its first is still out; BYPASSED is a call the breaker did not let ask,
+// once three sessions' calls have failed. Which one a job records depends on when it
+// asked, so either is the case passing, and nothing else is.
+func storeUnreachableCell(cache, observe string) matrixCell {
+	switch cache {
+	case "git", "npm":
+		return matrixCell{Unsupported: true, Why: "served from the node's own disk, never the site's store, so " +
+			"a store out of reach does not reach it"}
+	case "buck2":
+		return matrixCell{Why: "no workflow yet: the matrix has no Buck2 project to build"}
+	}
+	var want, or string
+	switch observe {
+	case "image":
+		want, or = string(lease.ImageCacheUnavailable), string(lease.ImageCacheBypassed)
+	case "actions":
+		want, or = string(lease.ActionsCacheUnavailable), string(lease.ActionsCacheBypassed)
+	default:
+		want, or = string(lease.BuildCacheUnavailable), string(lease.BuildCacheBypassed)
+	}
+
+	return matrixCell{Run: &matrixRun{Workflow: matrixUnreachableWorkflow, Job: cache, GitHub: alloc.ResultSucceeded,
+		Observe: observe, Want: want, Or: []string{or}}}
+}
+
+// poolUnreachableWhy is why a pool's store-unreachable cells are not run.
+const poolUnreachableWhy = "the lane cuts the acceptance host off from its store, and a pool host reaches " +
+	"its store from itself, where the lane sends no command"
+
+// wants says whether a token is one a cell accepts.
+func (r *matrixRun) wants(got string) bool {
+	return got == r.Want || slices.Contains(r.Or, got)
+}
+
+// wanted is every token a cell accepts, as a reason names them.
+func (r *matrixRun) wanted() string {
+	quoted := make([]string, 0, 1+len(r.Or))
+	for _, w := range append([]string{r.Want}, r.Or...) {
+		quoted = append(quoted, strconv.Quote(w))
+	}
+
+	return strings.Join(quoted, " or ")
 }
 
 // observed is the token the node recorded for one observation of a job.
@@ -483,9 +542,9 @@ func judgeCell(cell matrixCell, jobs []acceptanceJob, scope matrixScope) matrixR
 		case got == "":
 			wrong = append(wrong, fmt.Sprintf("%s: the node recorded no %s observation", j.LeaseID,
 				cell.Run.Observe))
-		case got != cell.Run.Want:
-			wrong = append(wrong, fmt.Sprintf("%s: the node observed %s %q, want %q", j.LeaseID,
-				cell.Run.Observe, got, cell.Run.Want))
+		case !cell.Run.wants(got):
+			wrong = append(wrong, fmt.Sprintf("%s: the node observed %s %q, want %s", j.LeaseID,
+				cell.Run.Observe, got, cell.Run.wanted()))
 		}
 		measureJob(&r, j, scope.prices)
 	}
@@ -614,16 +673,34 @@ func matrixTeardownPolicy(cfg *config.Config, deployment string) (awspolicy.Poli
 	return policy, true, nil
 }
 
-// matrixJobsPerArch is how many jobs one dispatch of every matrix workflow runs on one
-// tier: the image store's cold and warm one each, the cold and warm runs' seven each, the
-// two-writer run's eight and the failed writer's three. `billet acceptance run --jobs` waits for this many per architecture,
-// and a test holds it to the workflow files.
-const matrixJobsPerArch = 27
+// matrixJobsPerArch is how many jobs one dispatch of every matrix workflow every backend
+// runs puts on one tier: the image store's cold and warm one each, the cold and warm
+// runs' seven each, the two-writer run's eight and the failed writer's three.
+// matrixUnreachableJobs is the store-unreachable run's, which only a backend that runs
+// those cells is sent. `billet acceptance run --jobs` waits for this many per
+// architecture, and a test holds both to the workflow files.
+const (
+	matrixJobsPerArch     = 27
+	matrixUnreachableJobs = 6
+)
+
+// matrixJobsFor is how many jobs one tier of a backend runs: a backend whose
+// store-unreachable cells are run is sent that workflow as well.
+func matrixJobsFor(backend string) int {
+	for _, c := range matrixCells() {
+		if matrixBackendName(&c) == backend && c.Run != nil && c.Run.Workflow == matrixUnreachableWorkflow {
+			return matrixJobsPerArch + matrixUnreachableJobs
+		}
+	}
+
+	return matrixJobsPerArch
+}
 
 // cmdMatrixJobs prints how many jobs a run of the matrix on these architectures waits for.
 func cmdMatrixJobs(env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet acceptance matrix jobs", env.Stdout)
 	archs := fs.String("archs", "", "the architectures the run covers, comma-separated")
+	backend := fs.String("backend", "ec2", "the backend the run serves (ec2, firecracker/aws-metal)")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -634,7 +711,14 @@ func cmdMatrixJobs(env cli.Env, args []string) error {
 	if len(covered) == 0 {
 		return errors.New("--archs: name the architectures the run covers")
 	}
-	fmt.Fprintln(env.Stdout, matrixJobsPerArch*len(covered))
+	served, err := parseMatrixBackends(*backend)
+	if err != nil {
+		return err
+	}
+	if len(served) != 1 {
+		return fmt.Errorf("--backend: name one backend, not %v", served)
+	}
+	fmt.Fprintln(env.Stdout, matrixJobsFor(served[0])*len(covered))
 
 	return nil
 }
@@ -727,7 +811,8 @@ func cmdMatrixCells(env cli.Env, args []string) error {
 		run, want := "not run", "-"
 		switch {
 		case c.Run != nil:
-			run, want = c.Run.Workflow+"/"+c.Run.Job, c.Run.Observe+"="+c.Run.Want
+			run, want = c.Run.Workflow+"/"+c.Run.Job, c.Run.Observe+"="+strings.Join(append([]string{c.Run.Want},
+				c.Run.Or...), "|")
 		case c.Unsupported:
 			run = "unsupported"
 		}

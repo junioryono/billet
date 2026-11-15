@@ -1,0 +1,3 @@
+AttachSpec.lease string
+AttachSpec.stream string
+AttachSpec.token string

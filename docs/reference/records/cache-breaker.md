@@ -71,10 +71,35 @@ From 04:19:02 to 04:25:26 an nftables rule dropped the node's own connections to
 
 So with no monitors, as with no cache pool, the outage is capacity's and not the breaker's, and the docs say so.
 
+## S3 out of reach on an ebs-s3 site (2026-11-14)
+
+The acceptance lane's store-unreachable phase ran in run `43590137207` ([aws-acceptance](aws-acceptance.md)). The acceptance host dropped every packet it sent to its region's S3, so its EC2 node's ebs-s3 store hung while the node's launches and volumes went on through the EC2 API. Twelve jobs were dispatched together, six each on x64 (`c7i.2xlarge`) and arm64 (`c7g.2xlarge`), on keys earlier runs had filled.
+
+| UTC | What happened |
+|---|---|
+| 13:02:19 | Three x64 guests ask for their image store. |
+| 13:02:33 | A fourth asks, 14 s later. |
+| 13:02:49 | The first three wait the full deadline (30.001 s) and go cold. The breaker opens: `failures=3 reason=timeout last="a clone"`. |
+| 13:03:03 | The fourth, whose call was already out, goes cold at its own deadline, 30.001 s after it asked. |
+| 13:03:25 onward | Every later call is answered at once, with the store unasked. The four jobs' sticky disks, builder state and Actions cache, and all eight later jobs' caches, record `bypassed`. |
+| 13:03:33 to 13:11:26 | As each job ends: "the site's store is not answering, so this job's Docker image store is not published". |
+
+**What the 12 jobs recorded.** All 12 succeeded, and none found what the store held.
+
+| Image store | Its cache | Jobs |
+|---|---|---|
+| unavailable | unused (the image store job) | 1 |
+| unavailable | bypassed | 3 |
+| bypassed | bypassed, or unused | 8 |
+
+**The Actions cache's finalisations went to GitHub.** "Actions cache interception failed; retrying through GitHub ... the site's store is not answering, so it was not asked". GitHub's own cache took the save, and the jobs passed.
+
+**The recovery was not seen.** The block was lifted at the end of the phase, and its step proved S3 answered the host again. The run then reached its job count and stopped the node before a probe could move the breaker. The node's log has no "answering again" line, so the Ceph rehearsal above stays the record of a breaker that closes.
+
 ## What this does not establish
 
-- **A real ebs-s3 site.** Only EBS's latency was measured there, not the breaker.
-- **A bare host.** Every timing here is under nested virtualization.
-- **The metric.** `billet_cache_breaker_open` was not scraped, because the node had no metrics address. The breaker's report reached `billet status` through the ledger.
-- **Warm Docker image stores.** The tier was untrusted, so it published no image store, and every attach was a fresh volume. Sticky disks were warm, and those were clones.
+- **An ebs-s3 store that comes back.** The breaker opened on a real ebs-s3 site (above); its probe, probation and close were measured on Ceph only.
+- **A bare host.** Every timing from the 2026-11-05 Ceph rehearsal is under nested virtualization. The ebs-s3 node was an ordinary EC2 instance launching per-job guests, with no nesting.
+- **The metric.** `billet_cache_breaker_open` was not scraped in either run, because neither node had a metrics address. On Ceph the breaker's report reached `billet status` through the ledger.
+- **Warm Docker image stores on Ceph.** The Ceph tier was untrusted, so it published no image store, and every attach was a fresh volume. Sticky disks were warm, and those were clones. The ebs-s3 tiers were trusted, and their image stores had been published before the store was cut off.
 - **One thing seen and not fixed here.** After the OSD leg and a restart, deferred sticky-disk publications verified device paths that by then held other images, a guest's root disk among them, and each failed closed until its window ended: #743.
