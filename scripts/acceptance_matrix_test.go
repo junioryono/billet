@@ -1608,7 +1608,12 @@ const fakeDispatchGH = `case "$1 $2" in
 		jq -cn --argjson id "$n" --arg t "${w%.yml} $label $tag" '{databaseId: $id, displayTitle: $t}'
 	done <"$FAKE/sent" | jq -s . | jq -r "$filter"
 	;;
+"run cancel")
+	echo "$3" >>"$FAKE/cancelled"
+	exit "$(cat "$FAKE/cancel.exit" 2>/dev/null || echo 0)"
+	;;
 "run view")
+	[ -f "$FAKE/unreadable-$3" ] && exit 1
 	if [ -f "$FAKE/done-all" ] || [ -f "$FAKE/done-$3" ]; then
 		case "$*" in *conclusion*) echo success ;; *) echo completed ;; esac
 	else
@@ -1820,6 +1825,56 @@ func TestTheMatrixDispatchersLostPhaseNamesEachHeldWriter(t *testing.T) {
 		if got, err := os.ReadFile(runs + ".lost"); err == nil && len(got) > 0 {
 			t.Errorf("%s: named %q to lose", name, got)
 		}
+	}
+}
+
+// A FAILED OR CANCELLED LANE CANCELS WHAT IT SENT, and only that: every run the runs file
+// names that is still going, never one completed and never one it did not send; a run it
+// could not read or cancel fails the step, the rest still asked; and a lane that sent
+// nothing has nothing to cancel.
+func TestTheMatrixDispatcherCancelsTheRunsItSentThatAreStillGoing(t *testing.T) {
+	t.Parallel()
+	f := newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	f.fixture(t, "done-2", "")
+	runs := filepath.Join(t.TempDir(), "runs")
+	if err := os.WriteFile(runs, []byte("1\n2\n\n3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1", runs, "-")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	if got, err := os.ReadFile(filepath.Join(f.dir, "cancelled")); err != nil || string(got) != "1\n3\n" {
+		t.Fatalf("cancelled %q (%v); want runs 1 and 3, the two still going", got, err)
+	}
+
+	for name, fixture := range map[string]string{"a run it cannot read": "unreadable-1", "a cancel refused": "cancel.exit"} {
+		f := newMatrixFakes(t, "jq")
+		f.command(t, "gh", fakeDispatchGH)
+		body := ""
+		if fixture == "cancel.exit" {
+			body = "1"
+		}
+		f.fixture(t, fixture, body)
+		runs := filepath.Join(t.TempDir(), "runs")
+		if err := os.WriteFile(runs, []byte("1\n3\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1", runs, "-")
+		if code != 1 {
+			t.Errorf("%s: exit %d, want 1:\n%s", name, code, out)
+		}
+		if got, err := os.ReadFile(filepath.Join(f.dir, "cancelled")); err != nil || !strings.Contains(string(got), "3\n") {
+			t.Errorf("%s: cancelled %q (%v); run 3 must still be asked", name, got, err)
+		}
+	}
+
+	f = newMatrixFakes(t, "jq")
+	f.command(t, "gh", fakeDispatchGH)
+	if out, code := f.run(t, "acceptance/matrix-dispatch.sh", dispatchEnv, "cancel", "billet-testbed/m", "t1",
+		filepath.Join(t.TempDir(), "runs"), "-"); code != 0 || !strings.Contains(out, "sent nothing to cancel") {
+		t.Errorf("with no runs file: exit %d\n%s", code, out)
 	}
 }
 
