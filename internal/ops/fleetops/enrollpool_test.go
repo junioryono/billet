@@ -6,6 +6,8 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -407,6 +409,72 @@ func TestACancelledJoinStopsAskingAgain(t *testing.T) { //nolint:paralleltest //
 		if !errors.Is(err, context.Canceled) || asks > 4 {
 			t.Fatalf("%s: answered %v after %d asks", name, err, asks)
 		}
+	}
+}
+
+// THE CANCELLATION WINS OVER THE ATTEMPT IT CUT SHORT, staged without a race: an attempt
+// that sees its join cancelled and still answers that the answer was lost, as main's CI
+// met when the server's abort reached the transport first (run 43783057468), ends the
+// join cancelled with no attempt after it. A verdict is still itself with the join done,
+// and a join past its deadline says so.
+func TestACancellationLandingOnALostAnswerEndsTheJoinCancelled(t *testing.T) { //nolint:paralleltest // shared vars
+	lostAnswer := fmt.Errorf("%w: %w", nodeclient.ErrUnreachable, io.EOF)
+	for _, tc := range []struct {
+		name, stage string
+		answer      error
+		expired     bool
+		want        error
+		says        string
+	}{
+		{name: "the authority, lost", stage: "authority", answer: lostAnswer, want: context.Canceled},
+		{name: "the enrollment, lost", stage: "enrollment", answer: lostAnswer, want: context.Canceled},
+		{name: "the enrollment, denied", stage: "enrollment", answer: nodeclient.ErrDenied, says: "denied"},
+		{name: "the authority, past its deadline", stage: "authority", answer: lostAnswer, expired: true,
+			want: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, srv, cfg, ca, _ := servePoolJoin(t, nil)
+			ctx, cancel := context.WithCancel(bounded(t))
+			defer cancel()
+			if tc.expired {
+				var cancelDeadline context.CancelFunc
+				ctx, cancelDeadline = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer cancelDeadline()
+			}
+			wasFetch, wasEnroll := fetchAuthority, enrollWith
+			t.Cleanup(func() { fetchAuthority, enrollWith = wasFetch, wasEnroll })
+			asks := 0
+			if tc.stage == "authority" {
+				fetchAuthority = func(context.Context, string, string) ([]byte, string, error) {
+					asks++
+					cancel()
+
+					return nil, "", tc.answer
+				}
+			} else {
+				enrollWith = func(context.Context, string, string, string, []byte, []byte,
+					nodeclient.Identity,
+				) ([]byte, []byte, error) {
+					asks++
+					cancel()
+
+					return nil, nil, tc.answer
+				}
+			}
+
+			var out bytes.Buffer
+			err := EnrollNode(ctx, cli.Env{Stdout: &out, Stderr: &out}, cfg, srv.URL, ca.Fingerprint(), "tok", "pa")
+			if asks != 1 {
+				t.Errorf("asked %d times, want once", asks)
+			}
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Errorf("answered %v, want %v", err, tc.want)
+			}
+			if tc.says != "" && (err == nil || errors.Is(err, context.Canceled) ||
+				!strings.Contains(err.Error(), tc.says)) {
+				t.Errorf("answered %v, want the verdict, which says %q", err, tc.says)
+			}
+		})
 	}
 }
 

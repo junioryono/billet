@@ -60,6 +60,17 @@ func lost(err error) error {
 	return fmt.Errorf("%w: %w", ErrUnreachable, err)
 }
 
+// lostReading is lost for an answer whose body failed to decode, saying what was being
+// read: a TLS alert while the body arrives is the same verdict as one on the request,
+// and anything else is an answer cut off.
+func lostReading(what string, err error) error {
+	if !errors.Is(lost(err), ErrUnreachable) {
+		return fmt.Errorf("nodeclient: %s: %w", what, err)
+	}
+
+	return fmt.Errorf("%w: %s: %w", ErrUnreachable, what, err)
+}
+
 // is reports whether err's chain holds a T.
 func is[T error](err error) bool {
 	_, ok := errors.AsType[T](err)
@@ -140,7 +151,7 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 
 	var body nodeapi.CAResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return nil, "", fmt.Errorf("%w: decode the authority: %w", ErrUnreachable, err)
+		return nil, "", lostReading("decode the authority", err)
 	}
 
 	got, err := wirecert.FingerprintOfCAPEM([]byte(body.CAPEM))
@@ -238,7 +249,7 @@ func ConfirmAuthority(ctx context.Context, base string, caPEM []byte, fingerprin
 
 	var body nodeapi.CAResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return "", nil, fmt.Errorf("%w: decode the authority: %w", ErrUnreachable, err)
+		return "", nil, lostReading("decode the authority", err)
 	}
 
 	return body.Deployment, pinned, nil
@@ -376,7 +387,7 @@ func EnrollWithIdentity(
 
 	var body nodeapi.EnrollResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return nil, nil, fmt.Errorf("%w: decode the enrollment response: %w", ErrUnreachable, err)
+		return nil, nil, lostReading("decode the enrollment response", err)
 	}
 
 	switch body.State {
