@@ -1,0 +1,9 @@
+# Installed by billet's host role on a host it gives Ceph. needrestart must never
+# restart a Ceph daemon here: this host's kernel maps billet's volumes from the
+# same OSDs, and an OSD's start runs `ceph-volume`, whose `lvs` reads every block
+# device, the mapped volumes too, whose writeback waits on the OSDs being started.
+# On 2026-11-13 a libc6 upgrade restarted both OSDs of the reference deployment
+# that way, neither came back, and its fleet ran nothing for nine hours. Ceph's
+# daemons are restarted by an operator, with no billet volume mapped or with the
+# OSDs' activation in hand.
+$nrconf{override_rc}{qr(^ceph-)} = 0;

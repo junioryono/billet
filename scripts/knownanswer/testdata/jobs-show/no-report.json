@@ -50,6 +50,7 @@
   },
   "detail_retired_at": "",
   "usage": null,
+  "energy_estimate": null,
   "prediction": null,
   "guest": null,
   "egress": null,

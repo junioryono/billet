@@ -25,6 +25,8 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A candidate is verified as it is published, not only as it was written.**
 - **A Firecracker node on AWS metal attaches its site's volumes to its own instance, and detaches one only on proof nothing holds it (ADR-030, #827).**
 - **EC2 carries one instance's attachments out in order, so a self-attaching store detaches one at a time, after its waiting attaches (#861).**
+- **Every device billet maps fails an OSD request after five minutes, rather than waiting for ever.**
+- **A volume whose writes never reached its storage is discarded, never published, and the kernel says so once.**
 - **A recorded device number is never acted on until the kernel's table proves it is still the volume's.**
 - **A discard is storage, not compute, and never runs on the node's command path (#223).**
 - **On Ceph, a discard moves to the trash and the node's sweep deletes (#280, #292).**
@@ -63,6 +65,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Guest volumes never become host file authority.**
 - **Every cache is on by default where the tier can have it, and a default that cannot run is off, never refused.**
 - **Default-branch publication is deferred, journaled and off the command path.**
+- **A trusted-only tier's Docker store is published in line, so the guest waits for its settlement as long as the node may take.**
 
 ### Sticky disks, the Go and Bazel caches and the Git proxy: [references/build-caches.md](references/build-caches.md)
 

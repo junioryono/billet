@@ -3,6 +3,7 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -270,6 +271,8 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 		}
 	})
 
+	// AN OPEN THAT FAILS LEAVES THE WRITE-BACK TO THE VMM'S CLOSE; A WRITE-BACK THAT
+	// FAILS LOST WRITES. Both still detach, and only the second says so.
 	for name, failure := range map[string]struct{ open, sync error }{
 		"an open that fails":      {open: errors.New("no such device")},
 		"a write-back that fails": {sync: errors.New("input/output error")},
@@ -285,8 +288,14 @@ func TestADetachWritesTheDeviceBackBeforeItReplacesTheDrive(t *testing.T) {
 
 				return syncedDisk{closes: &closes, sync: func() error { return failure.sync }}, nil
 			}
-			if err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1"); err != nil {
-				t.Fatalf("a detach whose write-back failed: %v", err)
+			err := h.p.DetachVolume(t.Context(), id, 0, "/dev/nvme9n1")
+			switch {
+			case failure.sync != nil && !errors.Is(err, provider.ErrWritesLost):
+				t.Fatalf("a detach whose write-back failed answered %v, want provider.ErrWritesLost", err)
+			case failure.sync != nil && !strings.Contains(err.Error(), "input/output error"):
+				t.Errorf("the lost writes' answer %q does not carry the fsync's error", err)
+			case failure.sync == nil && err != nil:
+				t.Fatalf("a detach whose device could not be opened: %v", err)
 			}
 			if cache0Patches(vmm) != 2 {
 				t.Errorf("cache0 had %d PATCH(es); a failed write-back must still detach", cache0Patches(vmm))
@@ -417,6 +426,455 @@ func TestAWriteBackInFlightIsWaitedOnNotRepeated(t *testing.T) {
 			t.Errorf("the device was opened %d times; want once for the first, waited on, then once after", opens)
 		}
 	})
+}
+
+// A WRITE-BACK'S LOST WRITES REACH EVERY CALLER WAITING ON IT. The kernel tells the
+// one fsync, so a caller that joined a write-back already in flight, after the first
+// caller's time ran out, is told what that fsync found, never success.
+func TestAWriteBackThatFailedTellsEveryCallerWaitingOnIt(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p := &Provider{log: slog.New(slog.DiscardHandler)}
+		release := make(chan struct{})
+		var once sync.Once
+		releaseAll := func() { once.Do(func() { close(release) }) }
+		defer releaseAll()
+		p.openDisk = func(string) (diskHandle, error) {
+			return syncedDisk{sync: func() error {
+				<-release
+
+				return errors.New("input/output error")
+			}}, nil
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := p.flushBefore(ctx, "/dev/nvme9n1"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a caller whose time ran out answered %v", err)
+		}
+
+		joined := make(chan error, 1)
+		go func() { joined <- p.flushBefore(t.Context(), "/dev/nvme9n1") }()
+		synctest.Wait()
+		releaseAll()
+
+		if err := <-joined; !errors.Is(err, provider.ErrWritesLost) {
+			t.Fatalf("a caller that joined a write-back that failed answered %v, want provider.ErrWritesLost", err)
+		}
+	})
+}
+
+// LOST WRITES NOBODY WAITED TO HEAR ARE TOLD TO THE NEXT CALLER, ONCE. Every caller gave
+// up while the fsync ran, and the fsync then failed; the kernel tells that fsync and no
+// other, so the next caller is told before anything is opened again, and the one after
+// opens and writes back as usual. A different disk that took the name is told nothing.
+func TestLostWritesNobodyWaitedForAreToldToTheNextCaller(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		seqThen, seqNow string
+		told            bool
+	}{
+		"the same disk":                 {seqThen: "41", seqNow: "41", told: true},
+		"a disk that took its name":     {seqThen: "41", seqNow: "57"},
+		"a disk whose number is unread": {seqThen: "41", told: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				p := &Provider{log: slog.New(slog.DiscardHandler)}
+				seq := tc.seqThen
+				p.diskSeq = func(string) (string, bool) { return seq, seq != "" }
+				release := make(chan struct{})
+				var once sync.Once
+				releaseAll := func() { once.Do(func() { close(release) }) }
+				defer releaseAll()
+				opens := 0
+				p.openDisk = func(string) (diskHandle, error) {
+					opens++
+					first := opens == 1
+
+					return syncedDisk{sync: func() error {
+						if !first {
+							return nil
+						}
+						<-release
+
+						return errors.New("input/output error")
+					}}, nil
+				}
+
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				synctest.Wait()
+				if err := p.flushBefore(ctx, "/dev/rbd4"); !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("a caller whose time ran out answered %v", err)
+				}
+				releaseAll()
+				synctest.Wait()
+
+				seq = tc.seqNow
+				err := p.flushBefore(t.Context(), "/dev/rbd4")
+				if told := errors.Is(err, provider.ErrWritesLost); told != tc.told {
+					t.Fatalf("the next caller was told %v, want lost writes told %v", err, tc.told)
+				}
+				wantOpens := map[bool]int{true: 1, false: 2}[tc.told]
+				if opens != wantOpens {
+					t.Errorf("the device was opened %d time(s), want %d", opens, wantOpens)
+				}
+				if err := p.flushBefore(t.Context(), "/dev/rbd4"); err != nil {
+					t.Errorf("the caller after that was told %v, want the write-back it made", err)
+				}
+			})
+		})
+	}
+}
+
+// A WRITE-BACK OF THE DISK THAT HAD THE NAME BEFORE IS NO ANSWER FOR THE ONE THAT HAS
+// IT NOW: a caller that joins one in flight after the name passed to another disk is
+// told neither its loss nor its success, and the loss stays the old disk's, never
+// told to the new one.
+func TestAWriteBackOfAnotherDiskIsNoAnswer(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		p := &Provider{log: slog.New(slog.DiscardHandler)}
+		seq := "41"
+		p.diskSeq = func(string) (string, bool) { return seq, true }
+		release := make(chan struct{})
+		var once sync.Once
+		releaseAll := func() { once.Do(func() { close(release) }) }
+		defer releaseAll()
+		opens := 0
+		p.openDisk = func(string) (diskHandle, error) {
+			opens++
+			first := opens == 1
+
+			return syncedDisk{sync: func() error {
+				if !first {
+					return nil
+				}
+				<-release
+
+				return errors.New("input/output error")
+			}}, nil
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := p.flushBefore(ctx, "/dev/rbd4"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a caller whose time ran out answered %v", err)
+		}
+
+		// THE WRITE-BACK IS BLOCKED ON ITS RELEASE, so it read its disk's number before
+		// the name passes to another.
+		synctest.Wait()
+		seq = "57"
+		joined := make(chan error, 1)
+		go func() { joined <- p.flushBefore(t.Context(), "/dev/rbd4") }()
+		synctest.Wait()
+		releaseAll()
+		if err := <-joined; err == nil || errors.Is(err, provider.ErrWritesLost) {
+			t.Fatalf("a caller for the disk that took the name was told %v, want neither success nor the "+
+				"other disk's loss", err)
+		}
+		synctest.Wait()
+		// THE LOSS IS THE OLD DISK'S, named while its descriptor was held, so the new
+		// disk's next caller writes back its own.
+		if err := p.flushBefore(t.Context(), "/dev/rbd4"); err != nil || opens != 2 {
+			t.Errorf("the new disk's next caller was told %v after %d open(s), want its own write-back, "+
+				"a second open", err, opens)
+		}
+	})
+}
+
+// A DETACH THAT GAVE UP WHILE ITS WRITE-BACK RAN LEAVES ITS ANSWER FOR THE SLOT'S NEXT,
+// even one handed no device, as a detach whose proof of the device failed is: the
+// device the slot's write-back was of is asked again while the slot still holds it.
+func TestAWriteBackADetachGaveUpOnIsToldToTheSlotsNext(t *testing.T) {
+	t.Parallel()
+
+	// WHETHER OR NOT THE SLOT CAN BE PROVED TO HOLD THE DEVICE, whether the write-back
+	// has ended or is still in flight when the next detach comes, and whether that one
+	// gives up while it waits.
+	for name, tc := range map[string]struct{ holds, inFlight, giveUp bool }{
+		"the slot proved to hold it":                   {holds: true},
+		"a proof that cannot tell":                     {},
+		"a proof that cannot tell, still going":        {inFlight: true},
+		"a proof that cannot tell, given up meanwhile": {inFlight: true, giveUp: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			gaveUpThenRetried(t, tc.holds, tc.inFlight, tc.giveUp)
+		})
+	}
+}
+
+func gaveUpThenRetried(t *testing.T, holds, inFlight, giveUp bool) {
+	t.Helper()
+
+	h := newHarness(t)
+	var vmm *fakeVMM
+	h.onJailer = func(id string) { vmm = h.serveVMM(t, id) }
+	spec := aSpec()
+	spec.CacheEndpoint = "http://172.20.0.1:7718"
+	spec.CacheToken = strings.Repeat("b", 64)
+	spec.BuildKitCacheMountLimit = 4 << 30
+	inst, err := h.p.Launch(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := h.p.AttachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); err != nil {
+		t.Fatalf("AttachVolume: %v", err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var opens atomic.Int32
+	h.p.openDisk = func(string) (diskHandle, error) {
+		if opens.Add(1) > 1 {
+			return syncedDisk{}, nil
+		}
+
+		return syncedDisk{sync: func() error {
+			close(entered)
+			<-release
+
+			return errors.New("input/output error")
+		}}, nil
+	}
+	h.p.diskSeq = func(string) (string, bool) { return "7", true }
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		<-entered
+		cancel()
+	}()
+	if err := h.p.DetachVolume(ctx, inst.ID, 0, "/dev/nvme9n1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a detach whose time ran out during its write-back answered %v", err)
+	}
+
+	var asked []string
+	var askedMu sync.Mutex
+	h.p.slotHolds = func(_, device string) bool {
+		askedMu.Lock()
+		asked = append(asked, device)
+		askedMu.Unlock()
+
+		return holds
+	}
+	if !inFlight {
+		close(release)
+		forgotten(t, h.p)
+	} else {
+		// THE NEXT DETACH WAITS ON THE WRITE-BACK, and stays waiting until it ends: it
+		// cannot be told success while the write-back that may lose writes runs.
+		waiting := make(chan struct{})
+		var once sync.Once
+		h.p.awaiting = func(string) { once.Do(func() { close(waiting) }) }
+		retryCtx, giveUpRetry := context.WithCancel(t.Context())
+		defer giveUpRetry()
+		retried := make(chan error, 1)
+		go func() { retried <- h.p.DetachVolume(retryCtx, inst.ID, 0, "") }()
+		select {
+		case <-waiting:
+		case err := <-retried:
+			t.Fatalf("the next detach answered %v without waiting on the write-back in flight", err)
+		}
+		select {
+		case err := <-retried:
+			t.Fatalf("the next detach answered %v while the write-back it waits on still ran", err)
+		default:
+		}
+		if giveUp {
+			giveUpRetry()
+			if err := <-retried; !errors.Is(err, context.Canceled) {
+				t.Fatalf("a detach that gave up waiting answered %v, want its cancellation", err)
+			}
+		}
+		close(release)
+		if !giveUp {
+			if err := <-retried; !errors.Is(err, provider.ErrWritesLost) {
+				t.Fatalf("the waiting detach answered %v, want the lost writes", err)
+			}
+		}
+		forgotten(t, h.p)
+	}
+
+	if !inFlight || giveUp {
+		if err := h.p.DetachVolume(t.Context(), inst.ID, 0, ""); !errors.Is(err, provider.ErrWritesLost) {
+			t.Fatalf("the slot's next detach, handed no device, answered %v, want the lost writes", err)
+		}
+	}
+	// TOLD ONCE: the slot's next detach, and its device's, hear nothing more.
+	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, ""); errors.Is(err, provider.ErrWritesLost) {
+		t.Errorf("a detach after the lost writes were told was told them again: %v", err)
+	}
+	h.p.flushMu.Lock()
+	kept := len(h.p.unreported)
+	h.p.flushMu.Unlock()
+	if kept != 0 {
+		t.Errorf("%d loss(es) still kept for a device after the slot was told", kept)
+	}
+	askedMu.Lock()
+	defer askedMu.Unlock()
+	if len(asked) == 0 || asked[0] != "/dev/nvme9n1" {
+		t.Errorf("the next detach asked whether the slot holds %q, want the device its write-back was of", asked)
+	}
+	if cache0Patches(vmm) < 2 {
+		t.Errorf("cache0 had %d PATCH(es); the detach told the lost writes must still detach", cache0Patches(vmm))
+	}
+}
+
+// A WAIT ON A WRITE-BACK IN FLIGHT WAITS UNTIL IT ENDS, OR UNTIL ITS CALLER GIVES UP,
+// and opens nothing; with none in flight it returns at once. In a bubble, so being
+// blocked is proved, not guessed from timing.
+func TestAWaitOnAWriteBackInFlightWaitsForItsEnd(t *testing.T) {
+	t.Parallel()
+
+	for name, giveUp := range map[string]bool{"until it ends": false, "until its caller gives up": true} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				p := &Provider{log: slog.New(slog.DiscardHandler)}
+				if err := p.awaitWriteBack(t.Context(), "/dev/rbd4"); err != nil {
+					t.Fatalf("a wait with nothing in flight answered %v", err)
+				}
+
+				release := make(chan struct{})
+				var once sync.Once
+				releaseAll := func() { once.Do(func() { close(release) }) }
+				defer releaseAll()
+				var opens atomic.Int32
+				p.openDisk = func(string) (diskHandle, error) {
+					opens.Add(1)
+
+					return syncedDisk{sync: func() error {
+						<-release
+
+						return nil
+					}}, nil
+				}
+				first, cancelFirst := context.WithTimeout(t.Context(), time.Second)
+				defer cancelFirst()
+				if err := p.flushBefore(first, "/dev/rbd4"); !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("the caller that started the write-back answered %v", err)
+				}
+
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				waited := make(chan error, 1)
+				go func() { waited <- p.awaitWriteBack(ctx, "/dev/rbd4") }()
+				synctest.Wait()
+				select {
+				case err := <-waited:
+					t.Fatalf("the wait returned %v while the write-back still ran", err)
+				default:
+				}
+
+				if giveUp {
+					cancel()
+					if err := <-waited; !errors.Is(err, context.Canceled) {
+						t.Errorf("a wait whose caller gave up answered %v", err)
+					}
+				} else {
+					releaseAll()
+					if err := <-waited; err != nil {
+						t.Errorf("a wait on a write-back that ended answered %v", err)
+					}
+				}
+				if opens.Load() != 1 {
+					t.Errorf("the device was opened %d time(s); a wait opens nothing", opens.Load())
+				}
+			})
+		})
+	}
+}
+
+// A WRITE-BACK OF THE DISK THAT HAD THE NAME BEFORE IS TOLD TO NO SLOT OF ANOTHER: a
+// name can pass to another VM's volume while an old write-back finishes, and that
+// slot, which remembers the disk it holds, is not told the old disk's loss.
+func TestAnOldDisksLossReachesNoSlotOfANewOne(t *testing.T) {
+	t.Parallel()
+
+	p := &Provider{log: slog.New(slog.DiscardHandler)}
+	seq := "57"
+	p.diskSeq = func(string) (string, bool) { return seq, true }
+	p.rememberSlotDevice("billet-new", 0, "/dev/rbd4")
+	p.keepLoss("/dev/rbd4", "41", fmt.Errorf("%w: old disk", provider.ErrWritesLost))
+	if lost := p.takeSlotLoss("billet-new", 0); lost != nil {
+		t.Errorf("the new disk's slot was told the old disk's loss: %v", lost)
+	}
+
+	p.rememberSlotDevice("billet-same", 0, "/dev/rbd5")
+	p.keepLoss("/dev/rbd5", "57", fmt.Errorf("%w: same disk", provider.ErrWritesLost))
+	if lost := p.takeSlotLoss("billet-same", 0); !errors.Is(lost, provider.ErrWritesLost) {
+		t.Errorf("the slot of the disk that lost writes was told %v", lost)
+	}
+}
+
+// A DETACH THAT FAILED IS NOT ONE THAT LOST WRITES, AND KEEPS THEM FOR THE NEXT.
+// ErrWritesLost promises the volume is detached, so a PATCH that failed answers only
+// its failure, and the next detach, whose PATCH goes through, is told what was lost.
+func TestADetachThatFailedKeepsItsLostWritesForTheNext(t *testing.T) {
+	t.Parallel()
+
+	// THE NEXT DETACH IS HANDED THE DEVICE, OR NONE, as one whose proof of the device
+	// failed is; either is told.
+	for name, retryDevice := range map[string]string{"handed the device": "/dev/nvme9n1", "handed none": ""} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			detachThatFailedThenRetried(t, retryDevice)
+		})
+	}
+}
+
+func detachThatFailedThenRetried(t *testing.T, retryDevice string) {
+	t.Helper()
+
+	h := newHarness(t)
+	var vmm *fakeVMM
+	h.onJailer = func(id string) { vmm = h.serveVMM(t, id) }
+	spec := aSpec()
+	spec.CacheEndpoint = "http://172.20.0.1:7718"
+	spec.CacheToken = strings.Repeat("b", 64)
+	spec.BuildKitCacheMountLimit = 4 << 30
+	inst, err := h.p.Launch(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := h.p.AttachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1"); err != nil {
+		t.Fatalf("AttachVolume: %v", err)
+	}
+	var failed atomic.Bool
+	h.p.openDisk = func(string) (diskHandle, error) {
+		if failed.Swap(true) {
+			return syncedDisk{}, nil
+		}
+
+		return syncedDisk{sync: func() error { return errors.New("input/output error") }}, nil
+	}
+	h.p.diskSeq = func(string) (string, bool) { return "7", true }
+	// THE PLACEHOLDER GOES IN BEFORE THE PATCH, so once the first detach has run the
+	// slot no longer holds the device, as a real one does not.
+	placed := false
+	h.p.slotHolds = func(string, string) bool { return !placed }
+	vmm.mu.Lock()
+	vmm.failDrivePatches = 1
+	vmm.mu.Unlock()
+
+	err = h.p.DetachVolume(t.Context(), inst.ID, 0, "/dev/nvme9n1")
+	placed = true
+	if err == nil || errors.Is(err, provider.ErrWritesLost) {
+		t.Fatalf("a detach whose PATCH failed answered %v, want its failure and not lost writes", err)
+	}
+	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, retryDevice); !errors.Is(err, provider.ErrWritesLost) {
+		t.Fatalf("the next detach answered %v, want the lost writes the failed one heard", err)
+	}
+	if err := h.p.DetachVolume(t.Context(), inst.ID, 0, retryDevice); errors.Is(err, provider.ErrWritesLost) {
+		t.Errorf("a third detach was told the lost writes again: %v", err)
+	}
 }
 
 // A SLOW OPEN HOLDS NO OTHER DEVICE'S DETACH, AND ONE THAT ENDS AFTER EVERY CALLER GAVE UP

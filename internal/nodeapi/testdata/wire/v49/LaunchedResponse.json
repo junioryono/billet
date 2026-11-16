@@ -1,0 +1,8 @@
+{
+  "lease_ids": {
+    "LaunchedResponse.lease_ids.key": true
+  },
+  "quarantined": {
+    "LaunchedResponse.quarantined.key": true
+  }
+}

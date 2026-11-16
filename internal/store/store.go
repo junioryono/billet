@@ -26,6 +26,13 @@ var ErrDeviceUnknown = errors.New("store: could not tell where the volume is map
 // ErrConflict means the expected generation or fencing token is no longer current.
 var ErrConflict = errors.New("store: publication conflict")
 
+// ErrWritesLost means writes made to a volume never reached its storage: the
+// kernel's write-back of them failed, and nothing writes them back again. A
+// volume that answered it is discarded, never published. The kernel reports a
+// failed write-back once, to the first fsync that asks, so a caller records this
+// answer before anything else: a later attempt is told nothing.
+var ErrWritesLost = errors.New("store: writes to the volume were lost")
+
 // Volume is one writable, per-job clone mapped on the node that owns it.
 //
 // Device is the concrete host path a compute backend can attach. Handle is the

@@ -107,6 +107,7 @@ var migrationsAreFrozen = map[int]struct{ Name, Sum string }{
 	80: {"pool_clearance", "eaadc9ce7310f5c5280218363874f0d7e059bd78f7f9b3a7ce5c4dbee0f2cbde"},
 	81: {"job_history_node", "4ff409a04d0ef6af835e29f6a0a427b7b58be5dcf1dbf9dbe22c57bc4abbbbb0"},
 	82: {"node_cache_stores", "a9c00ca0f9d75ab14385ef87b4707198b8ee1df5f89ed7591a799b9f010f5ec7"},
+	83: {"job_destination_openings", "fd107e847a9d9db2944295d51949832c11c937db34ef89f0945d7a1adb51486c"},
 }
 
 func TestNoShippedMigrationHasBeenEdited(t *testing.T) {

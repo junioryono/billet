@@ -43,3 +43,26 @@
     mode: "0644"
   become: true
   when: billet_needrestart_presence.results | selectattr('stat.exists') | list | length > 0
+
+# NOR CEPH'S, on a host the role gives Ceph: an OSD restarted there deadlocks on
+# the volumes this host's kernel maps from it (the template says how, and when).
+# The role's own file, separate from the package's 90-billet.conf, which is the
+# package's bytes; removed where the role gives no Ceph.
+- name: Keep needrestart from restarting Ceph's daemons where the role gives Ceph
+  ansible.builtin.template:
+    src: needrestart-ceph.conf.j2
+    dest: "{{ billet_needrestart_dir }}/conf.d/91-billet-ceph.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when:
+    - billet_ceph_enabled | bool
+    - billet_needrestart_presence.results | selectattr('stat.exists') | list | length > 0
+
+- name: Remove the Ceph exclusion where the role gives no Ceph
+  ansible.builtin.file:
+    path: "{{ billet_needrestart_dir }}/conf.d/91-billet-ceph.conf"
+    state: absent
+  become: true
+  when: not billet_ceph_enabled | bool

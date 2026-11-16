@@ -331,11 +331,20 @@ func TestAStartTheSamplerNeverTookIsBaselinedByTheNextTick(t *testing.T) {
 	r.m.limit = 10 * time.Millisecond
 	r.m.Start("late", processTarget, 6)
 	r.m.limit = lifecycleLimit
+	if r.m.Baselined("late") {
+		t.Error("a start the sampler never took says it is baselined")
+	}
 	close(release)
 	<-ticked
 
 	r.m.opts.Meter = func() (float64, error) { return 20, nil }
 	r.advance()
+	if !r.m.Baselined("late") {
+		t.Error("a start the next tick baselined says it is not")
+	}
+	if r.m.Baselined("unknown") {
+		t.Error("an unknown key says it is baselined")
+	}
 	r.advance()
 
 	// The baseline, the two ticks after it and the final read: a job left

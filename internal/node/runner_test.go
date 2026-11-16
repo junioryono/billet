@@ -596,6 +596,34 @@ func TestAnUnobservedTeardownKeepsCapacityAcrossTheFirstAbsentInventory(t *testi
 	}
 }
 
+// A RELEASE ON A TERMINAL RECORD SAYS SO, naming its proof, as a confirmed stop's
+// does: on 2026-11-15 two EC2 releases on terminal records left no line at all.
+func TestAReleaseOnATerminalRecordSaysSo(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderEC2, asyncTeardown: true}
+	a, host := newAllocatorWithEC2Host(t)
+	var said bytes.Buffer
+	r := New(a, host, &fakeJIT{setID: 7}, p, slog.New(slog.NewTextHandler(&said, nil)))
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 13, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := r.Destroy(t.Context(), 13); !errors.Is(err, dispatch.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+	p.terminate(provider.InstanceName(lease.ID))
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after EC2 reported the instance terminated: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("the terminal record left the capacity held: %v", err)
+	}
+	if !strings.Contains(said.String(), "released compute that was being held") ||
+		!strings.Contains(said.String(), "proof=terminal") {
+		t.Errorf("the release said %q, want it named with its proof", said.String())
+	}
+}
+
 // A remote inventory can move from present to absent and back while EC2's
 // eventually consistent replicas converge. One missing response after a sighting
 // is therefore not causal proof that the machine stopped.

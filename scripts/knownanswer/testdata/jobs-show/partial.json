@@ -94,6 +94,7 @@
     "energy_active_uj": 0,
     "energy_idle_uj": 0
   },
+  "energy_estimate": null,
   "prediction": null,
   "guest": null,
   "egress": null,

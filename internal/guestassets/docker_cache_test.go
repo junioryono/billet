@@ -106,6 +106,123 @@ printf '{"ready":true}\n'
 	}
 }
 
+// THE GUEST WAITS FOR THE NODE TO OPEN SETTLEMENT, HOWEVER LATE, UP TO ITS BOUND: a
+// node runs its destroys one at a time, so a job's settlement can open minutes after the
+// job ended, behind another job's publication, and a guest that stops asking discards
+// the store the node is about to publish. Past the bound it gives the store back.
+func TestDockerCacheWaitsForALateSettlement(t *testing.T) {
+	t.Parallel()
+	if !strings.Contains(DockerCacheScript, "asks=${BILLET_DOCKER_SETTLE_ASKS:-3600}") {
+		t.Fatal("the guest's default bound is no longer 3600 asks, an hour at a second apart")
+	}
+	for _, tc := range []struct {
+		name string
+		// refusals is how many readiness asks the node answers 409 before it opens.
+		refusals string
+		// bound is BILLET_DOCKER_SETTLE_ASKS, empty for the script's own.
+		bound     string
+		wantAsks  int
+		discarded bool
+	}{
+		// Four times the 100 asks that lost arm64's store, under the default bound.
+		{name: "opened after 400 refusals", refusals: "400", wantAsks: 401},
+		{name: "never opened within the bound", refusals: "1000000", bound: "5", wantAsks: 5, discarded: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := t.TempDir()
+			for name, body := range map[string]string{
+				"slot": "0\n", "device": "/dev/test-cache\n", "images-before": "old\n",
+			} {
+				if err := os.WriteFile(filepath.Join(state, name), []byte(body), 0o600); err != nil {
+					t.Fatalf("write %s: %v", name, err)
+				}
+			}
+
+			shadow := t.TempDir()
+			logPath := filepath.Join(shadow, "curl.log")
+			asks := filepath.Join(shadow, "asks")
+			for _, name := range []string{"systemctl", "sync", "umount", "e2fsck"} {
+				writeStub(t, shadow, name, "exit 0\n")
+			}
+			// THE SECOND BETWEEN ASKS IS WHAT MAKES THE COUNT AN HOUR, so every sleep is
+			// recorded with what it was asked.
+			sleeps := filepath.Join(shadow, "sleeps")
+			writeStub(t, shadow, "sleep", "printf '%s\\n' \"$*\" >> \"$BILLET_TEST_SLEEPS\"\n")
+			writeStub(t, shadow, "docker", "printf 'new\\n'\n")
+			writeStub(t, shadow, "blkid", "printf 'x\\n'\n")
+			writeStub(t, shadow, "curl", `
+printf '%s\n' "$*" >> "$BILLET_TEST_CURL_LOG"
+case "$*" in
+*/v1/docker-store/ready*)
+	printf x >> "$BILLET_TEST_ASKS"
+	if [ "$(wc -c < "$BILLET_TEST_ASKS")" -le "$BILLET_TEST_REFUSALS" ]; then
+		exit 22
+	fi
+	printf '{"ready":true}\n' ;;
+esac
+`)
+
+			script := filepath.Join(shadow, "docker-cache.sh")
+			if err := writeExecutable(script, []byte(DockerCacheScript), 0o755); err != nil {
+				t.Fatalf("write Docker cache script: %v", err)
+			}
+			run := exec.CommandContext(t.Context(), script, "complete", "100")
+			run.Env = append(os.Environ(),
+				"PATH="+shadow+":"+os.Getenv("PATH"),
+				"BILLET_CACHE_ENDPOINT=http://cache.test",
+				"BILLET_CACHE_TOKEN=test-token",
+				"BILLET_DOCKER_CACHE_STATE_DIR="+state,
+				"BILLET_TEST_CURL_LOG="+logPath,
+				"BILLET_TEST_ASKS="+asks,
+				"BILLET_TEST_REFUSALS="+tc.refusals,
+				"BILLET_TEST_SLEEPS="+sleeps,
+				// ALWAYS SET, empty for the script's own bound, so an inherited value
+				// never stands in for the default.
+				"BILLET_DOCKER_SETTLE_ASKS="+tc.bound,
+			)
+			output, err := combinedOutputRetry(t, run)
+			if err != nil {
+				t.Fatalf("complete returned %v:\n%s", err, output)
+			}
+			called, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("read cache requests: %v", err)
+			}
+			asked, err := os.ReadFile(asks)
+			if err != nil {
+				t.Fatalf("read the readiness asks: %v", err)
+			}
+			if len(asked) != tc.wantAsks {
+				t.Errorf("the guest asked for readiness %d times, want %d:\n%s", len(asked), tc.wantAsks, output)
+			}
+			if got := strings.Contains(string(called), "/v1/volumes/0/discard"); got != tc.discarded {
+				t.Errorf("the guest gave the store back: %t, want %t:\n%s", got, tc.discarded, output)
+			}
+			// ONE SECOND AFTER EVERY REFUSED ASK, and none after the one that was answered.
+			slept, err := os.ReadFile(sleeps)
+			if err != nil {
+				t.Fatalf("read the sleeps: %v", err)
+			}
+			refused := tc.wantAsks
+			if !tc.discarded {
+				refused--
+			}
+			if want := strings.Repeat("1\n", refused); string(slept) != want {
+				t.Errorf("the guest slept %d times (%q...), want %d sleeps of a second",
+					strings.Count(string(slept), "\n"), firstLine(string(slept)), refused)
+			}
+		})
+	}
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+
+	return line
+}
+
 func TestDockerCachePreservesTheRunnerServiceExitContract(t *testing.T) {
 	t.Parallel()
 

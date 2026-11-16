@@ -16,6 +16,12 @@ type actionsVolumeManager interface {
 	// content-addressed cache volume is.
 	MountWritable(ctx context.Context, device, target string) error
 	Trim(ctx context.Context, target string) error
+	// SyncWrites writes back the filesystem mounted at target and answers whether
+	// everything written to it since it was mounted reached its volume: an error
+	// wrapping store.ErrWritesLost when some never did, nil when nothing is mounted
+	// there. A publication asks it before the unmount that comes before its
+	// snapshot, because an unmount writes back without asking (writtenback.go).
+	SyncWrites(ctx context.Context, target string) error
 	Unmount(ctx context.Context, target string) error
 	// Mounted reports whether something is mounted at target in this process's
 	// mount namespace; an error is could-not-tell, never "no".
@@ -44,12 +50,27 @@ func (hostActionsVolumeManager) MountNew(ctx context.Context, device, target str
 		return fmt.Errorf("node: format Actions cache volume: %w: %s", err, boundedOutput(output))
 	}
 
-	return mountActionsVolume(ctx, device, target, "noatime,nodev,nosuid,noexec")
+	return mountActionsVolume(ctx, device, target, writableMountOptions)
 }
 
 func (hostActionsVolumeManager) MountWritable(ctx context.Context, device, target string) error {
-	return mountActionsVolume(ctx, device, target, "noatime,nodev,nosuid,noexec")
+	return mountActionsVolume(ctx, device, target, writableMountOptions)
 }
+
+// writableMountOptions mount a volume the node writes.
+//
+// DATA THAT NEVER LANDED IS NEVER NAMED. Every device billet maps fails an OSD
+// request after osd_request_timeout, and ext4's default (data_err=ignore) only logs
+// a failed write of a file's data in ordered mode, so the journal can still commit
+// a name for data that is not there; a restart, whose new mount has heard of no
+// failure, would then publish it. data_err=abort aborts the journal instead, so the
+// filesystem goes read-only (later writes fail, and SyncWrites reports it) and
+// nothing committed names lost data. Measured 2026-11-13 on kernel 7.0 with the only
+// OSD stopped: a file written during the outage was absent after the OSD returned
+// and the volume was mounted again, the one written before it intact, e2fsck
+// clean. A total outage aborts the journal either way, since its commit fails too;
+// the option is for a partial one, where data and journal sit on different OSDs.
+const writableMountOptions = "noatime,nodev,nosuid,noexec,data_err=abort"
 
 func (hostActionsVolumeManager) MountReadOnly(ctx context.Context, device, target string) error {
 	return mountActionsVolume(ctx, device, target, "ro,noload,nodev,nosuid,noexec")
@@ -131,6 +152,18 @@ func (hostActionsVolumeManager) Mounted(ctx context.Context, target string) (boo
 	}
 
 	return true, nil
+}
+
+func (m hostActionsVolumeManager) SyncWrites(ctx context.Context, target string) error {
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	mounted, err := m.Mounted(ctx, target)
+	if err != nil || !mounted {
+		return err
+	}
+
+	return syncFilesystem(target)
 }
 
 func (m hostActionsVolumeManager) Unmount(ctx context.Context, target string) error {

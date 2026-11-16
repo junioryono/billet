@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -343,11 +344,33 @@ func checkDamage(ctx context.Context, device string) (bool, error) {
 	return checkDamageWith(ctx, e2fsck, device)
 }
 
-// checkDamageWith is checkDamage with the e2fsck to run. Its output is
-// discarded, never buffered: a badly damaged filesystem's report is as long as
-// its damage.
+// checkDamageWith is checkDamage with the e2fsck to run. Its output is watched
+// for a failed read and otherwise discarded, never buffered: a badly damaged
+// filesystem's report is as long as its damage.
+//
+// A CHECK WHOSE READS FAILED PROVES NOTHING, WHATEVER IT EXITS. Every device billet
+// maps fails an OSD request after osd_request_timeout, and e2fsck reads what it
+// could not read as damage: measured 2026-11-13 with e2fsprogs 1.47.2 on a healthy
+// filesystem whose only OSD stopped partway through the check, it answered "Error
+// reading block 545 (Input/output error)", then "The journal superblock is
+// corrupt", and exited 12, as a really corrupt journal superblock does
+// (e2fsckUncorrected). Read so, a healthy newest generation would be replaced by an
+// older one. A check that printed one of e2fsprogs' messages for a read that failed
+// is could-not-tell, wherever in a line it appears (pass 1B prints a block number and
+// then, with no newline between, the read error it met); the messages name a block or
+// the extent tree, which a file's name in a report of real damage does not. The check
+// runs in the C locale, since e2fsck translates its messages and these are the
+// English ones.
 func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
-	err := exec.CommandContext(ctx, e2fsck, "-f", "-n", device).Run()
+	watch := readFailureWatcher()
+	cmd := exec.CommandContext(ctx, e2fsck, "-f", "-n", device)
+	cmd.Env = append(cmd.Environ(), "LC_ALL=C")
+	cmd.Stdout, cmd.Stderr = watch, watch
+	err := cmd.Run()
+	if watch.seen {
+		return false, fmt.Errorf("check the filesystem on %s: e2fsck could not read all of it, "+
+			"so what it found says nothing (exit %v)", device, err)
+	}
 	if err == nil {
 		return false, nil
 	}
@@ -357,4 +380,55 @@ func checkDamageWith(ctx context.Context, e2fsck, device string) (bool, error) {
 	}
 
 	return false, fmt.Errorf("check the filesystem on %s: %w", device, err)
+}
+
+// readFailure is e2fsprogs 1.47.2's words for a read that failed: "Error reading
+// block 545 (Input/output error)" measured 2026-11-13, and from its source the
+// extended attribute block's (problem.c PR_1_READ_EA_BLOCK), the extent tree's
+// (PR_1_READ_EXTENT) and a short read's (unix_io).
+//
+// EACH IN ITS OWN CONTEXT: a block's read error carries its errno in parentheses, the
+// others name the inode, so a directory entry named "Error reading block 1" in a
+// report of real damage is not one. A name can still be made to contain any of them,
+// and text alone cannot tell it from e2fsck's own words; the check is asked only of a
+// content-addressed volume (GenerationDamaged's one caller), whose every name is a
+// digest or a table the node chose, and a name taken for a read failure answers
+// could-not-tell, which publishes nothing.
+var readFailure = regexp.MustCompile(`Error reading block [0-9]+ \(|` +
+	`Error reading extended attribute block [0-9]+ for inode|` +
+	`Error while reading over extent tree in inode|resulted in short read`)
+
+// readFailureWatcher watches e2fsck's output for a read that failed.
+func readFailureWatcher() *patternWatcher {
+	return &patternWatcher{pattern: readFailure, keep: 128}
+}
+
+// patternWatcher is a writer that remembers whether pattern matched what passed
+// through it, keeping no more of what it was written than keep bytes, so a match
+// split across writes is still seen as long as it is shorter than keep. One
+// goroutine writes to it at a time: os/exec copies stdout and stderr through one
+// writer when they are the same.
+type patternWatcher struct {
+	pattern *regexp.Regexp
+	keep    int
+	tail    []byte
+	seen    bool
+}
+
+func (w *patternWatcher) Write(p []byte) (int, error) {
+	if w.seen {
+		return len(p), nil
+	}
+	joined := make([]byte, 0, len(w.tail)+len(p))
+	joined = append(append(joined, w.tail...), p...)
+	if w.pattern.Match(joined) {
+		w.seen = true
+		w.tail = nil
+
+		return len(p), nil
+	}
+	keep := min(len(joined), w.keep)
+	w.tail = append(w.tail[:0:0], joined[len(joined)-keep:]...)
+
+	return len(p), nil
 }

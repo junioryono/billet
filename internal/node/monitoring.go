@@ -1,6 +1,7 @@
 package node
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -438,12 +439,18 @@ func jobDestinationsOf(res flows.Result, c tapComparison) (*alloc.JobDestination
 		Connections: clamp(res.Other.Connections)}
 	other.Unanswered = unanswered(clamp(res.Other.Unanswered), other.Connections)
 	replies(&other, clamp(res.Other.TimedReplies), clamp(res.Other.SlowReplies), res.Other.SlowestReply)
-	for _, d := range res.Destinations {
+	// ordinals is where each of the tracker's destinations ends up: its place
+	// among the named ones, or the traffic beyond them, which the openings are
+	// numbered by.
+	ordinals := make([]int, len(res.Destinations))
+	for i, d := range res.Destinations {
 		dest := alloc.JobDestination{Addr: d.Addr.String(), SentBytes: clamp(d.Sent),
 			ReceivedBytes: clamp(d.Received), Connections: clamp(d.Connections)}
 		dest.Unanswered = unanswered(clamp(d.Unanswered), dest.Connections)
 		replies(&dest, clamp(d.TimedReplies), clamp(d.SlowReplies), d.SlowestReply)
+		ordinals[i] = len(out.Destinations)
 		if !d.Addr.IsValid() || len(out.Destinations) == alloc.MaxJobDestinations {
+			ordinals[i] = alloc.MaxJobDestinations
 			other.SentBytes = add(other.SentBytes, dest.SentBytes)
 			other.ReceivedBytes = add(other.ReceivedBytes, dest.ReceivedBytes)
 			other.Connections = add(other.Connections, dest.Connections)
@@ -456,6 +463,7 @@ func jobDestinationsOf(res flows.Result, c tapComparison) (*alloc.JobDestination
 		out.Destinations = append(out.Destinations, dest)
 	}
 	out.Other = other
+	out.Openings, out.OpeningSeconds = openingsOf(res, ordinals, clamp, add)
 	out.Incomplete = out.Incomplete || saturated
 	out.RepliesTimed = true
 	if res.UnansweredUnknown {
@@ -469,6 +477,49 @@ func jobDestinationsOf(res flows.Result, c tapComparison) (*alloc.JobDestination
 	}
 
 	return out, saturated
+}
+
+// openingsOf is the tracker's openings as a report carries them, numbered as
+// the report's destinations are: a destination the report folded into the
+// traffic beyond them has its openings folded there too, merged with any of the
+// same bucket. None, with no width, where the tracker split nothing by time.
+func openingsOf(res flows.Result, ordinals []int, clamp func(uint64) int64, add func(a, b int64) int64,
+) ([]alloc.DestinationOpening, int64) {
+	width := int64(res.OpeningWidth / time.Second)
+	if width < 1 || len(res.Openings) == 0 {
+		return nil, 0
+	}
+
+	type key struct {
+		ordinal int
+		start   int64
+	}
+	merged := map[key]*alloc.DestinationOpening{}
+	for _, o := range res.Openings {
+		ordinal := alloc.MaxJobDestinations
+		if o.Dest >= 0 && o.Dest < len(ordinals) {
+			ordinal = ordinals[o.Dest]
+		}
+		k := key{ordinal: ordinal, start: o.Start.Unix()}
+		m := merged[k]
+		if m == nil {
+			m = &alloc.DestinationOpening{Ordinal: ordinal, Start: k.start}
+			merged[k] = m
+		}
+		m.SentBytes = add(m.SentBytes, clamp(o.Sent))
+		m.ReceivedBytes = add(m.ReceivedBytes, clamp(o.Received))
+		m.Connections = add(m.Connections, clamp(o.Connections))
+	}
+
+	out := make([]alloc.DestinationOpening, 0, len(merged))
+	for _, m := range merged {
+		out = append(out, *m)
+	}
+	slices.SortFunc(out, func(x, y alloc.DestinationOpening) int {
+		return cmp.Or(cmp.Compare(x.Ordinal, y.Ordinal), cmp.Compare(x.Start, y.Start))
+	})
+
+	return out, width
 }
 
 // tapComparison is what a job's destinations attributed, beside its tap's own

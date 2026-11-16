@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Usage:
-#   matrix-dispatch.sh images <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh images-cold <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh await <owner/repo> <tag> <runs-file> -
 #   matrix-dispatch.sh images-warm <owner/repo> <tag> <runs-file> <label>...
@@ -8,18 +7,21 @@
 #   matrix-dispatch.sh warm <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh writers <owner/repo> <tag> <runs-file> <label>...
 #   matrix-dispatch.sh writers-apart <owner/repo> <tag> <runs-file> <label>...
+#   matrix-dispatch.sh lost <owner/repo> <tag> <runs-file> <label>...
+#   matrix-dispatch.sh store-unreachable <owner/repo> <tag> <runs-file> <label>...
+#   matrix-dispatch.sh cancel <owner/repo> <tag> <runs-file> -
 #
 # Dispatches the acceptance matrix's workflows in <owner/repo> for each tier label and
 # appends the id of every run it starts to <runs-file>, which is what `billet acceptance
-# matrix judge --runs` reads. `images` runs first and alone on each tier: it sends the
-# image store's cold run, waits for it, waits MATRIX_SETTLE seconds, and sends and waits
-# for the warm one, because every job on a tier publishes an image-store generation and
-# none may run beside that pair. A pool's tier has no host until its first job asks for one,
-# and a host takes about 45 minutes to boot, join and import the guest image (#829), so
-# for it `images` is three steps, each with a token of its own: `images-cold` sends the
-# cold runs and waits for nothing, `await` waits for every run in <runs-file> within
-# MATRIX_TIMEOUT, and `images-warm` waits MATRIX_SETTLE seconds and sends and waits for
-# the warm ones. `cold` sends the cold and failed-writer runs and waits for
+# matrix judge --runs` reads. The image store's runs go first and alone on each tier,
+# because every job on a tier publishes an image-store generation and none may run beside
+# the cold and warm pair, in three steps, each with a token of its own, since a pool's tier
+# has no host until its first job asks for one and a host takes about 45 minutes to boot,
+# join and import the guest image (#829): `images-cold` sends the cold runs and waits for
+# nothing, `await` waits for every run in <runs-file> within MATRIX_TIMEOUT, and
+# `images-warm` waits MATRIX_SETTLE seconds and sends and waits for the warm ones (the
+# per-job EC2 lane waits for the cold runs' publication itself, and settles 0). `cold`
+# sends the cold and failed-writer runs and waits for
 # the cold ones to finish; `warm` waits MATRIX_SETTLE seconds more, so the cold runs'
 # publications have time to land, sends the warm runs with the same tag, and waits for
 # every run in <runs-file> to finish. `writers` comes last, and sends each label's
@@ -28,7 +30,17 @@
 # slot (the workflow calls it once per architecture, so each has its own deadline).
 # `writers-apart` sends every label's at once and waits for them all, for tiers that share
 # no host, as a pool's architectures do: one waiting for another would leave its host
-# idle long enough for the pool to release it. Every
+# idle long enough for the pool to release it. `lost` sends every label's instance-lost run
+# and returns once each one's writer is holding its disk, appending "<label> <runner>" for
+# each to <runs-file>.lost, the runner being the writer's instance name, which the caller
+# terminates; `await` then waits for the runs. `store-unreachable` sends every label's
+# store-unreachable run at once and waits for them all; the caller has cut the node off
+# from its store first, and nothing else may run beside them, since the breaker they open
+# sends every job on the node cold. `cancel` force-cancels every run <runs-file> names that
+# is not completed, for a failed or cancelled lane, whose runs would otherwise stay queued
+# on the labels the next run's tiers share, and waits within MATRIX_TIMEOUT for each to
+# complete; a missing <runs-file> sent nothing, and one that cannot be read, or a run it
+# could not read, cancel or see complete, fails it, the rest still asked. Every
 # phase is a step of its own with an installation token of its own, because a token lasts
 # an hour.
 #
@@ -44,7 +56,7 @@
 set -uo pipefail
 
 usage() {
-	sed -n '2,10p' "$0" >&2
+	sed -n '2,13p' "$0" >&2
 	exit 2
 }
 
@@ -109,24 +121,57 @@ await() {
 	done
 }
 
+# holding waits, within the phase's deadline, for a run's writer to be holding its disk
+# (its hold step running) and appends "<label> <runner>" to <runs-file>.lost. A writer that
+# ended first, or one whose runner GitHub does not name, fails the phase: it can no longer
+# be lost while it holds the disk.
+holding() {
+	local id=$1 label=$2 line status runner step
+	while :; do
+		# EVERY FIELD CHECKED IN jq, BEFORE IT IS JOINED: a runner name carrying the joining
+		# character or a newline could otherwise forge the fields after it. A field that is
+		# not what GitHub's API gives is "!", which nothing below accepts. Joined on a
+		# character IFS does not fold, since with a tab an empty runner collapsed and the
+		# step's state was read as the runner's. The first writer only.
+		line=$(gh api "repos/$repo/actions/runs/$id/jobs" --jq '
+			def word: if type == "string" and test("^[a-z_]*$") then . else "!" end;
+			[.jobs[] | select(.name == "writer")] | first // empty |
+			[(.status // "" | word),
+			 (.runner_name // "" | if type == "string" and test("^(billet-[0-9a-f]{32})?$") then . else "!" end),
+			 ([.steps[]? | select(.name == "Hold the disk until the instance is lost") | .status][0] // "" | word)] |
+			join("|")')
+		IFS='|' read -r status runner step <<<"$line"
+		if [ "$step" = in_progress ]; then
+			if [ -z "$runner" ]; then
+				echo "run $id's writer holds its disk and GitHub names no runner for it" >&2
+				return 1
+			fi
+			# ONLY A NAME BILLET GIVES, which is its lease's: the caller puts it on a command
+			# line run on the acceptance host, and nothing GitHub says is quoted there.
+			if ! [[ "$runner" =~ ^billet-[0-9a-f]{32}$ ]]; then
+				echo "run $id's writer holds its disk on a runner billet would not name; nothing is recorded" >&2
+				return 1
+			fi
+			if ! echo "$label $runner" >>"$runs.lost"; then
+				echo "run $id's writer holds its disk on $runner, and that could not be recorded in $runs.lost" >&2
+				return 1
+			fi
+			echo "run $id's writer holds its disk on $runner"
+			return 0
+		fi
+		if [ "$status" = completed ]; then
+			echo "run $id's writer ended before it held its disk" >&2
+			return 1
+		fi
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			echo "run $id's writer did not hold its disk within the phase's ${timeout}s (it is ${status:-unknown})" >&2
+			return 1
+		fi
+		sleep "$poll"
+	done
+}
+
 case "$phase" in
-images)
-	cold=()
-	for label in "$@"; do
-		id=$(dispatch matrix-images-cold.yml "$label") || exit 1
-		cold+=("$id")
-	done
-	await "${cold[@]}" || exit 1
-	echo "the image store's cold runs are done; its warm ones are sent in ${settle}s"
-	sleep "$settle"
-	warm=()
-	for label in "$@"; do
-		id=$(dispatch matrix-images-warm.yml "$label") || exit 1
-		warm+=("$id")
-	done
-	await "${warm[@]}" || exit 1
-	echo "the image store's runs are done"
-	;;
 images-cold)
 	for label in "$@"; do
 		dispatch matrix-images-cold.yml "$label" >/dev/null || exit 1
@@ -198,6 +243,77 @@ writers-apart)
 	done
 	await "${writers[@]}" || exit 1
 	echo "the two-writer runs are done"
+	;;
+lost)
+	lost=()
+	for label in "$@"; do
+		id=$(dispatch matrix-instance-lost.yml "$label") || exit 1
+		lost+=("$id:$label")
+	done
+	for sent in "${lost[@]}"; do
+		holding "${sent%%:*}" "${sent#*:}" || exit 1
+	done
+	echo "every instance-lost writer holds its disk"
+	;;
+cancel)
+	# ABSENT IS NOTHING SENT; anything else that cannot be read is a failure, never a
+	# list with nothing in it.
+	if [ ! -e "$runs" ] && [ ! -L "$runs" ]; then
+		echo "$runs does not exist; this run sent nothing to cancel"
+		exit 0
+	fi
+	if [ ! -f "$runs" ] || ! sent=$(cat "$runs"); then
+		echo "$runs could not be read; whatever this run sent may still be queued" >&2
+		exit 1
+	fi
+	failed=0
+	going=()
+	while read -r id; do
+		[ -n "$id" ] || continue
+		if ! status=$(gh run view "$id" -R "$repo" --json status --jq .status); then
+			echo "could not read run $id; it may still be queued" >&2
+			failed=1
+			continue
+		fi
+		[ "$status" = completed ] && continue
+		# FORCED, because an ordinary cancel does not land on a run whose jobs are queued
+		# for self-hosted runners: it stays queued (cancel-superseded.yml, 2026-09-25).
+		if gh api -X POST "repos/$repo/actions/runs/$id/force-cancel" >/dev/null; then
+			going+=("$id")
+		elif [ "$(gh run view "$id" -R "$repo" --json status --jq .status)" = completed ]; then
+			# IT ENDED BETWEEN THE READ AND THE CANCEL, which GitHub refuses with a 409.
+			echo "run $id completed on its own"
+		else
+			echo "could not cancel run $id (it is $status)" >&2
+			failed=1
+		fi
+	done <<<"$sent"
+	# AND CONFIRMED: a cancel GitHub accepted is not a run that ended.
+	for id in ${going[@]+"${going[@]}"}; do
+		while :; do
+			status=$(gh run view "$id" -R "$repo" --json status --jq .status)
+			if [ "$status" = completed ]; then
+				echo "cancelled run $id"
+				break
+			fi
+			if [ "$SECONDS" -ge "$deadline" ]; then
+				echo "run $id is still ${status:-unknown} ${timeout}s after it was cancelled" >&2
+				failed=1
+				break
+			fi
+			sleep "$poll"
+		done
+	done
+	exit "$failed"
+	;;
+store-unreachable)
+	unreachable=()
+	for label in "$@"; do
+		id=$(dispatch matrix-store-unreachable.yml "$label") || exit 1
+		unreachable+=("$id")
+	done
+	await "${unreachable[@]}" || exit 1
+	echo "the store-unreachable runs are done"
 	;;
 *)
 	usage

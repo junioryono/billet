@@ -141,6 +141,9 @@ type JobRecord struct {
 	GitHubRunnerAssignedAt   string
 	GitHubFinishedAt         string
 	BoughtAt                 string
+	// ResultAt is when GitHub's result reached billet, on billet's clock; empty
+	// while the job has none.
+	ResultAt string
 	// DetailRetiredAt is when the job's series, destinations and guest report
 	// were deleted past their retention, empty while they are kept or for a job
 	// that never had them.
@@ -188,6 +191,13 @@ func (r JobRecord) Runtime() (time.Duration, bool) {
 	return between(parseStamp(r.StartedAt), parseStamp(r.FinishedAt))
 }
 
+// Duration is how long the job ran, from GitHub starting it to GitHub's result
+// reaching billet, as `billet jobs stats` takes it (JobFact.Duration), and false
+// while either is not recorded. The lease's teardown is not in it.
+func (r JobRecord) Duration() (time.Duration, bool) {
+	return between(parseStamp(r.StartedAt), parseStamp(r.ResultAt))
+}
+
 // Job reads one lease's history row. A lease that was never assigned a job is
 // ErrLeaseNotFound.
 func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) {
@@ -226,7 +236,7 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			CustodyAt: row.CustodyAt, TeardownAt: row.TeardownAt, QuarantinedAt: row.QuarantinedAt,
 			LaunchIncarnation: row.LaunchIncarnation, HolderIncarnation: row.HolderIncarnation,
 			RerunDecision: RerunDecision(row.RerunDecision), RerunDecidedAt: row.RerunDecidedAt,
-			RerunAttempt: row.RerunAttempt,
+			RerunAttempt: row.RerunAttempt, ResultAt: row.ResultAt,
 		}
 		return nil
 	})

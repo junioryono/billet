@@ -1,0 +1,4 @@
+UpgradeSpec.version string
+UpgradeSpec.manifest_sha256 string
+UpgradeSpec.rollout_id string
+UpgradeSpec.generation int64

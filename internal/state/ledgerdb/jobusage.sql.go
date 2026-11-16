@@ -10,6 +10,25 @@ import (
 	"database/sql"
 )
 
+const readJobDestinationOpenings = `-- name: ReadJobDestinationOpenings :one
+SELECT width_seconds, row_count, packed FROM job_destination_openings WHERE lease_id = $1
+`
+
+type ReadJobDestinationOpeningsRow struct {
+	WidthSeconds int64
+	RowCount     int64
+	Packed       string
+}
+
+// One lease's openings. sql.ErrNoRows means its report carried none, which is
+// not a job that talked to nothing.
+func (q *Queries) ReadJobDestinationOpenings(ctx context.Context, leaseID string) (ReadJobDestinationOpeningsRow, error) {
+	row := q.db.QueryRowContext(ctx, readJobDestinationOpenings, leaseID)
+	var i ReadJobDestinationOpeningsRow
+	err := row.Scan(&i.WidthSeconds, &i.RowCount, &i.Packed)
+	return i, err
+}
+
 const readJobDestinations = `-- name: ReadJobDestinations :many
 SELECT ordinal, addr, sent_bytes, received_bytes, connections, unanswered,
        timed_replies, slow_replies, slowest_reply_ms
@@ -140,6 +159,32 @@ func (q *Queries) ReadJobUsage(ctx context.Context, leaseID string) (JobUsage, e
 		&i.TapReceivedBytes,
 	)
 	return i, err
+}
+
+const recordJobDestinationOpenings = `-- name: RecordJobDestinationOpenings :exec
+INSERT INTO job_destination_openings (lease_id, width_seconds, row_count, packed)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (lease_id) DO NOTHING
+`
+
+type RecordJobDestinationOpeningsParams struct {
+	LeaseID      string
+	WidthSeconds int64
+	RowCount     int64
+	Packed       string
+}
+
+// A job's destinations split by when each connection opened (migration 83),
+// packed by internal/alloc packOpenings, written only by the usage report that
+// won RecordJobUsage, in its transaction, beside its destination rows.
+func (q *Queries) RecordJobDestinationOpenings(ctx context.Context, arg RecordJobDestinationOpeningsParams) error {
+	_, err := q.db.ExecContext(ctx, recordJobDestinationOpenings,
+		arg.LeaseID,
+		arg.WidthSeconds,
+		arg.RowCount,
+		arg.Packed,
+	)
+	return err
 }
 
 const recordJobDestinations = `-- name: RecordJobDestinations :exec

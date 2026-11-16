@@ -3,8 +3,10 @@
 # temporary tree, as the role runs them (escalated, so the drop-in is root's):
 # nothing is created on a host without needrestart, the drop-in is the package's
 # bytes wherever either needrestart path exists, a second converge changes
-# nothing, and an operator's edit is replaced by the role's file. The package's
-# own seeding is exercised by deploy/postinstall_test.go.
+# nothing, and an operator's edit is replaced by the role's file. Beside it, the
+# role's own Ceph exclusion is installed where the role gives Ceph and removed
+# where it does not. The package's own seeding is exercised by
+# deploy/postinstall_test.go.
 - name: The host role keeps needrestart from restarting billet's services
   hosts: localhost
   gather_facts: false
@@ -89,6 +91,33 @@
               {{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/90-billet.conf is not the
               packaged drop-in installed root:root 0644.
 
+        # CASE 2b: the role gives this host Ceph (billet_ceph_enabled defaults to
+        # true), so its Ceph exclusion is beside billet's, root's, 0644, and its
+        # one effective line keeps needrestart from restarting a ceph- unit.
+        - name: Inspect the Ceph drop-in after the first converge
+          ansible.builtin.stat:
+            path: "{{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/91-billet-ceph.conf"
+          register: billet_gate_ceph
+
+        - name: Read the Ceph drop-in after the first converge
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/91-billet-ceph.conf"
+          register: billet_gate_ceph_bytes
+
+        - name: The Ceph drop-in excludes Ceph's units, root's, 0644
+          ansible.builtin.assert:
+            that:
+              - billet_gate_ceph.stat.isreg
+              - billet_gate_ceph.stat.pw_name == 'root'
+              - billet_gate_ceph.stat.mode == '0644'
+              - >-
+                (billet_gate_ceph_bytes.content | b64decode).splitlines()
+                | reject('match', '^#') | map('trim') | reject('equalto', '') | list
+                == ['$nrconf{override_rc}{qr(^ceph-)} = 0;']
+            fail_msg: >-
+              91-billet-ceph.conf is not root's 0644 file whose one effective line excludes
+              ceph- units: {{ billet_gate_ceph_bytes.content | b64decode }}
+
         # CASE 3: a second converge changes nothing. The inode and mtime are the
         # witness, because an include_role reports no per-task result.
         - name: Converge the same host again
@@ -168,6 +197,34 @@
           ansible.builtin.assert:
             that: billet_gate_binary_only.content == billet_gate_packaged.content
             fail_msg: The role installed nothing on a host whose needrestart has no configuration directory yet.
+
+        # CASE 6: the role no longer gives the host Ceph. Its Ceph exclusion goes,
+        # and billet's own drop-in stays the package's bytes.
+        - name: Converge the host with Ceph turned off
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: needrestart
+          vars:
+            billet_needrestart_dir: "{{ billet_gate_tree.path }}/dir/etc/needrestart"
+            billet_needrestart_binary: "{{ billet_gate_tree.path }}/dir/usr/sbin/needrestart"
+            billet_ceph_enabled: false
+
+        - name: Inspect the drop-ins without Ceph
+          ansible.builtin.stat:
+            path: "{{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/91-billet-ceph.conf"
+          register: billet_gate_no_ceph
+
+        - name: Read billet's drop-in without Ceph
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/90-billet.conf"
+          register: billet_gate_no_ceph_billet
+
+        - name: Without Ceph the Ceph exclusion is gone and billet's stays
+          ansible.builtin.assert:
+            that:
+              - not billet_gate_no_ceph.stat.exists
+              - billet_gate_no_ceph_billet.content == billet_gate_packaged.content
+            fail_msg: The role left its Ceph exclusion on a host it gives no Ceph, or touched billet's drop-in.
 
       always:
         - name: Remove the tree

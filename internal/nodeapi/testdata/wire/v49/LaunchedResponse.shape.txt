@@ -1,0 +1,5 @@
+LaunchedResponse.lease_ids map string
+LaunchedResponse.lease_ids{} bool
+LaunchedResponse.quarantined tag omitempty
+LaunchedResponse.quarantined map string
+LaunchedResponse.quarantined{} bool

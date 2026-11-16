@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,7 @@ import (
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/node/reapi"
 	"github.com/junioryono/billet/internal/provider"
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 // deviceVolumes is a mount manager that gives every device a directory of its
@@ -43,6 +45,10 @@ type deviceVolumes struct {
 	// damaged are the devices that refuse every mount the way the kernel
 	// refuses a corrupt ext4.
 	damaged map[string]bool
+	// lostSuffix answers SyncWrites with lost writes for a target ending with it,
+	// and synced records every target SyncWrites was asked about.
+	lostSuffix string
+	synced     []string
 }
 
 func newDeviceVolumes(t *testing.T) *deviceVolumes {
@@ -109,6 +115,17 @@ func (d *deviceVolumes) MountReadOnly(_ context.Context, device, target string) 
 }
 
 func (d *deviceVolumes) Trim(context.Context, string) error { return nil }
+
+func (d *deviceVolumes) SyncWrites(_ context.Context, target string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.synced = append(d.synced, target)
+	if d.lostSuffix != "" && strings.HasSuffix(target, d.lostSuffix) {
+		return fmt.Errorf("%w: the filesystem at %s: input/output error", storecontract.ErrWritesLost, target)
+	}
+
+	return nil
+}
 
 // Mounted reports a link, which is what this manager's mount makes.
 func (d *deviceVolumes) Mounted(_ context.Context, target string) (bool, error) {

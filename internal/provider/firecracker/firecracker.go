@@ -178,6 +178,9 @@ type Provider struct {
 	// goarch is this host's machine, and so its guests'. A seam because the other
 	// machine's boot arguments would otherwise be unreachable from a test.
 	goarch string
+	// kvmClock boots an x86 guest on kvm-clock, which a golden needs so that a
+	// restore's clock_realtime brings each fork's clock to the host's (ADR-017).
+	kvmClock bool
 	// digests remembers the digests of the VMM binary and the guest kernels.
 	digests fileDigests
 	// jailWrote reports whether a file in a jail is one its VMM wrote. A seam
@@ -197,9 +200,20 @@ type Provider struct {
 	slotHolds func(slot, device string) bool
 	openDisk  func(device string) (diskHandle, error)
 	// flushing is each device's write-back in flight before a detach, closed when it
-	// ends (flushBefore).
-	flushMu  sync.Mutex
-	flushing map[string]*writeBack
+	// ends (flushBefore), and unreported each device's lost writes no detach has been
+	// told yet; diskSeq reads a device's kernel disk sequence number (readDiskSeq),
+	// which a test's devices have none of.
+	flushMu    sync.Mutex
+	flushing   map[string]*writeBack
+	unreported map[string]writesLoss
+	diskSeq    func(device string) (string, bool)
+	// slotLosses is the lost writes a detach that then failed heard, by instance and
+	// slot (slotKey), told to the slot's next detach whatever device it is handed;
+	// slotDevices the device, and its disk, each slot's unfinished detach wrote back;
+	// awaiting, a test's, is told when a detach waits on a write-back in flight.
+	slotLosses  map[string]error
+	slotDevices map[string]slotDisk
+	awaiting    func(device string)
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -319,6 +333,15 @@ func withDurability(file func(*os.File) error, dir func(string) error) Option {
 	}
 }
 
+// withKVMClock boots every x86 guest with clocksource=kvm-clock, as a golden is
+// built: Firecracker's clock_realtime corrects only a guest keeping time on
+// kvm-clock, and a guest left on tsc resumes with its clock where the capture left
+// it (measured, docs/reference/records/workspace-snapshots.md). A cold boot keeps
+// the kernel's own choice.
+func withKVMClock() Option {
+	return func(p *Provider) { p.kvmClock = true }
+}
+
 // WithBootWait bounds how long Launch waits for a new VMM to answer.
 func WithBootWait(d time.Duration) Option {
 	return func(p *Provider) {
@@ -388,6 +411,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	p.flushDisk = flushDevice
 	p.slotHolds = sameBlockDevice
 	p.openDisk = openDiskDevice
+	p.diskSeq = readDiskSeq
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt
@@ -1068,7 +1092,7 @@ func (p *Provider) configure(
 		}},
 		{"/boot-source", map[string]any{
 			"kernel_image_path": "/" + guestKernel,
-			"boot_args":         bootArgs(p.goarch),
+			"boot_args":         p.bootArgs(),
 		}},
 		{"/drives/rootfs", map[string]any{
 			"drive_id":       "rootfs",
@@ -1305,6 +1329,18 @@ func bootArgs(goarch string) string {
 
 	return "reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd " +
 		"root=/dev/vda rw"
+}
+
+// bootArgs is the command line this provider boots its guests with: the
+// machine's, and kvm-clock for a golden on x86. An arm64 guest keeps time on the
+// architected timer, which has no kvm-clock to choose.
+func (p *Provider) bootArgs() string {
+	args := bootArgs(p.goarch)
+	if p.kvmClock && p.goarch != "arm64" {
+		args += " clocksource=kvm-clock"
+	}
+
+	return args
 }
 
 // guestInterface is the one network device a guest gets.

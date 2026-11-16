@@ -817,6 +817,29 @@ func (s *CacheService) releaseCASVolume(
 	// mounting, and the discard after it then cannot unmap a device still mounted
 	// here, so it retried every half minute for hours (2026-11-06). Unmount asks the
 	// kernel, and leaves alone what is not mounted.
+	//
+	// A PUBLICATION ASKS FIRST WHETHER ITS WRITES LANDED, since the unmount writes
+	// back without asking, and lost writes abandon it in its journal BEFORE the
+	// unmount, because the kernel says it once (writeslost.go): an unmount that then
+	// failed would leave the next pass told the volume is fine. Nothing is mounted to
+	// ask once an earlier pass unmounted it, and that pass asked.
+	if hv.Intent != nil && hv.Dirty && (hv.Journal == nil || hv.Journal.Phase == "") {
+		err := s.actionIO.SyncWrites(ctx, s.casMountPath(session, hv.Kind))
+		switch {
+		case writesLost(err):
+			if hv.Journal == nil {
+				hv.Journal = &publishJournal{}
+			}
+			hv.Journal.Phase, hv.Journal.Reason = phaseAbandoned, err.Error()
+			s.log.Warn("writes to a content-addressed cache are not proved to have reached its volume; "+
+				"it is discarded, never published", "instance", session.instance, "kind", hv.Kind, "error", err)
+			if err := s.persistSession(session); err != nil {
+				return false, err
+			}
+		case err != nil:
+			return false, fmt.Errorf("write the %s cache back: %w", hv.Kind, err)
+		}
+	}
 	if err := s.actionIO.Unmount(ctx, s.casMountPath(session, hv.Kind)); err != nil {
 		return false, fmt.Errorf("unmount the %s cache: %w", hv.Kind, err)
 	}
@@ -1072,6 +1095,12 @@ func (s *CacheService) mergeCASVolume(
 	}
 	if err := copyMissingObjects(ctx, source, target); err != nil {
 		return "", false, release(err)
+	}
+	// WHAT THE COPY WROTE IS ASKED FOR BEFORE THE UNMOUNT, which writes back without
+	// asking (writeslost.go); any answer but nil ends the publication, as every
+	// failure of the merge does.
+	if err := s.actionIO.SyncWrites(ctx, target); err != nil {
+		return "", false, release(fmt.Errorf("write the merge back: %w", err))
 	}
 	if err := errors.Join(s.actionIO.Unmount(ctx, source), s.actionIO.Unmount(ctx, target)); err != nil {
 		return "", false, release(err)
