@@ -3,7 +3,9 @@ package nodeclient
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -113,5 +115,20 @@ func TestFetchCAReturnsOnlyThePinnedAuthority(t *testing.T) {
 	}
 	if !bytes.Equal(got, ca.CertPEM()) {
 		t.Fatalf("FetchCA returned %d bytes, want only the pinned certificate's %d", len(got), len(ca.CertPEM()))
+	}
+}
+
+// A TLS ALERT WHILE THE BODY ARRIVES IS THE SAME VERDICT AS ONE ON THE REQUEST, never an
+// answer cut off: a join that read it as lost would ask again for good, and a cancelled
+// one would hide it behind the cancellation. A body cut off is lost.
+func TestABodyThatFailsOnATLSAlertIsAVerdict(t *testing.T) {
+	t.Parallel()
+	alert := &net.OpError{Op: "remote error", Err: errors.New("tls: certificate required")}
+	if err := lostReading("decode the authority", alert); errors.Is(err, ErrUnreachable) || !errors.Is(err, alert) {
+		t.Errorf("a TLS alert in the body read as %v; want it kept as a verdict", err)
+	}
+	if err := lostReading("decode the authority", io.ErrUnexpectedEOF); !errors.Is(err, ErrUnreachable) ||
+		!errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("a body cut off read as %v; want it lost", err)
 	}
 }

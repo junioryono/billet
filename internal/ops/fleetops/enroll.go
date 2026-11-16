@@ -605,7 +605,7 @@ func EnrollNode(
 			}
 		}
 
-		certPEM, signedBy, err := nodeclient.EnrollWithIdentity(ctx, base, name, joinToken, caPEM, csrPEM, identity)
+		certPEM, signedBy, err := enrollWith(ctx, base, name, joinToken, caPEM, csrPEM, identity)
 
 		switch {
 		case err == nil:
@@ -669,7 +669,7 @@ func EnrollNode(
 // before the control plane is reachable still joins; a person sees the failure.
 func fetchCA(ctx context.Context, env cli.Env, base, caFingerprint string, unattended bool) ([]byte, string, error) {
 	for {
-		caPEM, deployment, err := nodeclient.FetchCA(ctx, base, caFingerprint)
+		caPEM, deployment, err := fetchAuthority(ctx, base, caFingerprint)
 		if err == nil || !unattended || !errors.Is(err, nodeclient.ErrUnreachable) {
 			return caPEM, deployment, err
 		}
@@ -699,6 +699,13 @@ func fetchCA(ctx context.Context, env cli.Env, base, caFingerprint string, unatt
 var (
 	consolePath      = "/dev/console"
 	instanceIdentity = func(ctx context.Context) ([]byte, string, error) { return awscreds.InstanceIdentity(ctx, "") }
+)
+
+// fetchAuthority and enrollWith are the two questions a join asks the control plane;
+// a test replaces them to stage what an attempt answers as the join is cancelled.
+var (
+	fetchAuthority = nodeclient.FetchCA
+	enrollWith     = nodeclient.EnrollWithIdentity
 )
 
 // announceOnConsole writes the pool host's line to the system console, opened for
