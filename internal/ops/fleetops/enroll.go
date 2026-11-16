@@ -644,6 +644,10 @@ func EnrollNode(
 			// the same key is handed again. A pool host's boot runs this once, so
 			// giving up here left an admitted host that never started its node.
 			fmt.Fprintf(env.Stdout, "  the control plane's answer did not arrive; asking again: %v\n", err)
+		case errors.Is(err, nodeclient.ErrUnreachable):
+			// A CANCELLED JOIN SAYS SO, as fetchCA's does: the lost answer was the
+			// cancellation's, whichever error the transport reported first.
+			return ctx.Err()
 		default:
 			return err
 		}
@@ -666,8 +670,14 @@ func EnrollNode(
 func fetchCA(ctx context.Context, env cli.Env, base, caFingerprint string, unattended bool) ([]byte, string, error) {
 	for {
 		caPEM, deployment, err := nodeclient.FetchCA(ctx, base, caFingerprint)
-		if err == nil || !unattended || !errors.Is(err, nodeclient.ErrUnreachable) || ctx.Err() != nil {
+		if err == nil || !unattended || !errors.Is(err, nodeclient.ErrUnreachable) {
 			return caPEM, deployment, err
+		}
+		// A CANCELLED JOIN SAYS SO, whatever the attempt it cut short answered: a
+		// cancellation can land while the connection is failing, and which error the
+		// transport reports first is a race.
+		if ctx.Err() != nil {
+			return nil, "", ctx.Err()
 		}
 
 		fmt.Fprintf(env.Stderr, "the control plane's authority did not arrive; asking again: %v\n", err)
