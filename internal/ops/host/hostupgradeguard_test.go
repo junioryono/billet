@@ -200,7 +200,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 
 	end := startLockHolder(t)
 
-	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, ErrUpgradeInProgress) {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, ""); !errors.Is(err, ErrUpgradeInProgress) {
 		t.Errorf("resume under a held lock: err = %v", err)
 	}
 
@@ -208,7 +208,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 
 	mustHold(t, "ci-1")
 
-	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, errGuardHeld) {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, ""); !errors.Is(err, errGuardHeld) {
 		t.Errorf("resume over a guard: err = %v", err)
 	}
 
@@ -220,7 +220,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, errGuardUnpublished) {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, ""); !errors.Is(err, errGuardUnpublished) {
 		t.Errorf("resume over an unpublished guard: err = %v", err)
 	}
 
@@ -229,7 +229,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); err != nil {
+		if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, ""); err != nil {
 			t.Errorf("resume with no claim: %v", err)
 		}
 	})
@@ -248,7 +248,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 
 	end = startLockHolder(t)
 
-	err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg)
+	err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, "")
 
 	end()
 
@@ -257,7 +257,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 	}
 
 	// And without the lock held, the classifier's answer is the resume's.
-	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, ""); err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Errorf("resume over a guard whose record is a FIFO: err = %v, want the classifier's refusal", err)
 	}
 

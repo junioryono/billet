@@ -1112,7 +1112,7 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 		guardHook = displace(t, f.guardFixture, outside)
 
 		out := capture(t, func() {
-			if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); err != nil {
+			if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, ""); err != nil {
 				t.Errorf("a resume over a root displaced under its lock: %v", err)
 			}
 		})
@@ -1288,7 +1288,7 @@ func TestAClaimTargetIsExactlyOneChildOfTheRootByItsText(t *testing.T) {
 			target := f.root + spelling
 			mustOK(t, os.Symlink(target, f.active()))
 
-			err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg)
+			err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, "")
 			if err == nil || !strings.Contains(err.Error(), "is not a recovery directory in") {
 				t.Errorf("a resume over the target %q: err = %v, want the refusal naming the root", target, err)
 			}
@@ -1414,7 +1414,7 @@ func TestARecoveryDirectoryAndItsJournalAreJudgedBeforeTheyAreBelieved(t *testin
 
 			plant(t, recovery)
 
-			if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, errTrustBoundary) {
+			if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, ""); !errors.Is(err, errTrustBoundary) {
 				t.Errorf("a resume over %s: err = %v, want the trust boundary", name, err)
 			}
 
@@ -1492,7 +1492,7 @@ func TestATrustedJournalTakesAResumeToTheBarrier(t *testing.T) {
 	writeJournalFixture(t, recovery, "staged")
 	mustOK(t, os.Symlink(recovery, f.active()))
 
-	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, errStoppedAtTheBarrier) {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg, ""); !errors.Is(err, errStoppedAtTheBarrier) {
 		t.Fatalf("a resume over a trusted journal: err = %v, want the barrier's", err)
 	}
 

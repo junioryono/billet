@@ -207,7 +207,7 @@ func TestAFinishedUpgradeRemovesOlderRecoveries(t *testing.T) {
 
 	env := cli.Env{Stdout: &out, Stderr: &out, Getenv: func(string) string { return "" }}
 
-	if err := finishHostUpgrade(t.Context(), env, root, journal, committedHost{}); err != nil {
+	if err := finishHostUpgrade(t.Context(), env, root, journal, committedHost{}, ""); err != nil {
 		t.Fatalf("finish: %v\n%s", err, out.String())
 	}
 

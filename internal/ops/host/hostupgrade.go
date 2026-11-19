@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -154,7 +155,7 @@ func Upgrade(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	if *resume {
-		err := resumeHostUpgrade(ctx, env, cfg)
+		err := resumeHostUpgrade(ctx, env, cfg, *cfgPath)
 		if err != nil {
 			ack.refuse(err)
 		} else {
@@ -1033,7 +1034,7 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 		return err
 	}
 
-	return finishHostUpgrade(ctx, env, tx.dir, journal, host)
+	return finishHostUpgrade(ctx, env, tx.dir, journal, host, cfgPath)
 }
 
 // ledgerKindFor says which shape of transaction a host's ledger needs.
@@ -1050,7 +1051,7 @@ func ledgerKindFor(cfg *config.Config) string {
 }
 
 // resumeHostUpgrade continues or unwinds the transaction already on this machine.
-func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config) error {
+func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath string) error {
 	// A LIVE UPDATER IS NOT AN ABANDONED ONE, and nothing here could tell the
 	// difference before this lock existed. The claim survives a crash on purpose,
 	// so its presence proves a transaction was STARTED and says nothing about
@@ -1157,7 +1158,7 @@ func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config) err
 		return err
 	}
 
-	return finishHostUpgrade(ctx, env, tx.dir, journal, host)
+	return finishHostUpgrade(ctx, env, tx.dir, journal, host, cfgPath)
 }
 
 // abandonUnstaged releases a transaction that never staged its candidate, the
@@ -1213,7 +1214,7 @@ func abandonUntouchedClaim(env cli.Env, tx *txLock) error {
 // build cannot classify — keeps it, because keeping it is what makes `--resume`
 // find the transaction and what stops a rollout starting a second one on top.
 func finishHostUpgrade(ctx context.Context, env cli.Env, root *os.File, journal *hostupgrade.Journal,
-	host hostupgrade.Host,
+	host hostupgrade.Host, cfgPath string,
 ) error {
 	err := hostupgrade.Run(ctx, hostupgrade.Request{Journal: journal, Host: host})
 
@@ -1237,6 +1238,10 @@ func finishHostUpgrade(ctx context.Context, env cli.Env, root *os.File, journal 
 		fmt.Fprintf(env.Stdout, "carries, or whether its compute exists is known. Look at it before\n")
 		fmt.Fprintf(env.Stdout, "starting anything else here.\n")
 
+		if errors.Is(err, hostupgrade.ErrUnrecorded) {
+			sayUnrecordedRecovery(env, journal, cfgPath, err)
+		}
+
 		return err
 	}
 
@@ -1256,6 +1261,62 @@ func finishHostUpgrade(ctx context.Context, env cli.Env, root *os.File, journal 
 	pruneRecoveriesSaying(env, root)
 
 	return err
+}
+
+// sayUnrecordedRecovery says how a machine is recovered from a failure its journal
+// could not record: what to free, which binary to run, with which configuration and
+// as whom, and what the resume will and will not do.
+//
+// SAID BECAUSE NOTHING ELSE SAYS IT. On 2026-11-08 a controller's rollback ran out
+// of disk writing this journal, and the cordon named only that, with billet-server
+// stopped and no binary at its installed path; recovery took a person who knew the
+// preserved release and --resume (#802).
+//
+// ONLY WHAT IS ON THE DISK IS NAMED: the installed binary while it is there, else
+// the copy preserved before anything stopped, else neither, said as such, since
+// the same full disk can stop the preserved copy being made. THE RESUME IS NOT
+// PROMISED AS A ROLLBACK: a failure the journal could not record is not in it, so a
+// resume continues from the last step it did record and may finish the upgrade.
+func sayUnrecordedRecovery(env cli.Env, journal *hostupgrade.Journal, cfgPath string, err error) {
+	fmt.Fprintf(env.Stdout, "\nThe failure itself could not be written to the journal.\n")
+
+	if errors.Is(err, syscall.ENOSPC) {
+		fmt.Fprintf(env.Stdout, "The filesystem holding %s is full. Free room on it first: local\n", journal.Dir)
+		fmt.Fprintf(env.Stdout, "backups the bucket holds, or older recovery directories under %s.\n", upgradeRoot)
+	}
+
+	binary := resumeBinary(journal.Dir)
+	if binary == "" {
+		fmt.Fprintf(env.Stdout, "Neither %s nor %s is on the disk; put the release this machine ran (%s) at\n",
+			installedBinary, filepath.Join(journal.Dir, "preserved", "billet"), journal.FromVersion)
+		fmt.Fprintf(env.Stdout, "%s before resuming.\n", installedBinary)
+
+		binary = installedBinary
+	}
+
+	account := "the account that ran this upgrade"
+	if u, userErr := user.Current(); userErr == nil && u.Username != "" {
+		account = u.Username + ", the account that ran this upgrade"
+	}
+
+	fmt.Fprintf(env.Stdout, "Then, as %s, run:\n\n  %s host-upgrade --resume --config %s\n\n",
+		account, binary, cfgPath)
+	fmt.Fprintf(env.Stdout, "It continues from the last step the journal recorded, which may finish the\n")
+	fmt.Fprintf(env.Stdout, "upgrade rather than roll it back. If the failure says the new release may still\n")
+	fmt.Fprintf(env.Stdout, "be running, prove it has stopped before resuming.\n")
+}
+
+// resumeBinary is the billet a resume can run: the installed one while it is there,
+// else the copy the transaction preserved before it stopped anything, else none.
+func resumeBinary(dir string) string {
+	for _, candidate := range []string{installedBinary, filepath.Join(dir, "preserved", "billet")} {
+		//nolint:gosec // A Stat that only chooses which path a message names; nothing is opened or written.
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return candidate
+		}
+	}
+
+	return ""
 }
 
 // pruneRecoveriesSaying runs pruneRecoveries under the transaction lock the

@@ -297,7 +297,7 @@ func TestAResumeOfATransactionThatNeverStagedAbandonsIt(t *testing.T) {
 		FromVersion: "v0.34.0", ToVersion: "v0.35.0", Step: hostupgrade.StepClaimed,
 	})
 
-	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}); err != nil {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}, ""); err != nil {
 		t.Fatalf("resuming a transaction that never staged: %v", err)
 	}
 	if _, err := os.Lstat(activePath()); !os.IsNotExist(err) {
