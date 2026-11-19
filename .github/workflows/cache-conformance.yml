@@ -1122,10 +1122,13 @@ jobs:
       - name: Refuse a non-billet runner
         run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
       - name: Query the service through the mapped port from a host step
+        # -q, because psql prints each -c command's status (CREATE TABLE, INSERT 0
+        # 1) before the SELECT's row, into the file compared below; without it the
+        # job printed the right row and failed its own comparison (#747).
         run: |
           set -euo pipefail
           docker run --rm --network host -e PGPASSWORD=billet postgres:16-alpine \
-            psql -h 127.0.0.1 -p 5432 -U postgres -v ON_ERROR_STOP=1 \
+            psql -q -h 127.0.0.1 -p 5432 -U postgres -v ON_ERROR_STOP=1 \
             -c 'create table conformance (run text)' \
             -c "insert into conformance values ('billet-${{ github.run_id }}-${{ github.run_attempt }}')" \
             -tA -c 'select run from conformance' | tee answer
@@ -1185,9 +1188,10 @@ jobs:
       - name: Query the service by hostname from inside the job container
         env:
           PGPASSWORD: billet
+        # -q for the same reason as services-host: the statuses would precede the row.
         run: |
           set -euo pipefail
-          psql -h postgres -U postgres -v ON_ERROR_STOP=1 \
+          psql -q -h postgres -U postgres -v ON_ERROR_STOP=1 \
             -c 'create table conformance (run text)' \
             -c "insert into conformance values ('billet-${{ github.run_id }}-${{ github.run_attempt }}-container')" \
             -tA -c 'select run from conformance' | tee answer
