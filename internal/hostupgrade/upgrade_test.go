@@ -31,6 +31,9 @@ type fakeHost struct {
 	// failWith is the error failAt fails with, when the shape of the error is the
 	// subject; nil means a plain one.
 	failWith error
+	// onFail runs as failAt fails, for a test that changes the machine at that
+	// moment (a journal that can no longer be written).
+	onFail func()
 
 	recordedDigest  string
 	recordedVersion string
@@ -44,6 +47,10 @@ func (h *fakeHost) record(what string) error {
 	}
 
 	if !h.rollingBack && what == h.failAt {
+		if h.onFail != nil {
+			h.onFail()
+		}
+
 		if h.failWith != nil {
 			return h.failWith
 		}

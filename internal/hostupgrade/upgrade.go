@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"syscall"
 )
 
 // Host is everything this package does to a machine.
@@ -434,11 +436,32 @@ func finish(ctx context.Context, req Request, log *slog.Logger) error {
 // operator asserting the candidate is gone.
 func beginRollback(ctx context.Context, req Request, log *slog.Logger, cause error) error {
 	if failErr := req.Journal.Fail(cause); failErr != nil {
-		return fmt.Errorf("%w: %w (and the journal could not record it: %w)",
-			ErrCordoned, cause, failErr)
+		return unrecorded(req.Journal, cause, failErr)
 	}
 
 	return rollBack(ctx, req, log, cause)
+}
+
+// unrecorded is the cordon for a failure the journal itself could not record, and
+// says how the host is recovered from it.
+//
+// THE WAY OUT IS NAMED, because nothing else will: on 2026-11-08 a controller's
+// rollback ran out of disk writing this journal, and the error said only that,
+// with billet-server stopped and no binary at its installed path (#802). The
+// installed binary may be hidden by then, so the resume is the preserved one
+// (the preserve step copies each installed file into <dir>/preserved under its
+// base name), and a full disk is said as the room to free first.
+func unrecorded(j *Journal, cause, failErr error) error {
+	resume := filepath.Join(j.Dir, "preserved", "billet") + " host-upgrade --resume"
+
+	if errors.Is(failErr, syscall.ENOSPC) {
+		return fmt.Errorf("%w: %w (and the journal could not record it, because the filesystem holding %s "+
+			"is full: %w). Free room on it, then run `%s`, the release this host was running, to finish "+
+			"the rollback", ErrCordoned, cause, j.Dir, failErr, resume)
+	}
+
+	return fmt.Errorf("%w: %w (and the journal could not record it: %w). Once %s can be written, run `%s`, "+
+		"the release this host was running, to finish the rollback", ErrCordoned, cause, failErr, j.Dir, resume)
 }
 
 // cordonWithoutRestoring records the failure and stops, restoring nothing,
@@ -452,8 +475,7 @@ func cordonWithoutRestoring(req Request, log *slog.Logger, cause error) error {
 		"from", j.FromVersion, "to", j.ToVersion, "step", j.Step, "dir", j.Dir, "error", cause)
 
 	if failErr := j.Fail(cause); failErr != nil {
-		return fmt.Errorf("%w: %w (and the journal could not record it: %w)",
-			ErrCordoned, cause, failErr)
+		return unrecorded(j, cause, failErr)
 	}
 
 	return fmt.Errorf("%w: %w (nothing was restored, because the candidate may still be "+
