@@ -15,9 +15,11 @@ import (
 func fakePython(t *testing.T, bin, name, version string, works bool, calls string) {
 	t.Helper()
 
-	ansibleExit := "0"
+	// THE FAILURE #792 SAW: a traceback whose last line names the import that broke.
+	ansible := `echo "ansible [core 2.21.2] python ` + version + `"\nexit 0\n`
 	if !works {
-		ansibleExit = "1"
+		ansible = `echo "Traceback (most recent call last):" >&2\n` +
+			`echo "AttributeError: module dataclasses has no attribute _is_type" >&2\nexit 1\n`
 	}
 
 	body := fmt.Sprintf(`#!/bin/sh
@@ -26,15 +28,17 @@ if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
   printf 'venv %[1]s\n' >>%[3]q
   mkdir -p "$3/bin"
   printf '#!/bin/sh\nexit 0\n' >"$3/bin/python"
-  printf '#!/bin/sh\necho "ansible [core 2.21.2] python %[1]s"\nexit %[2]s\n' >"$3/bin/ansible"
+  printf '#!/bin/sh\n%[2]s' >"$3/bin/ansible"
   printf '#!/bin/sh\nexit 0\n' >"$3/bin/ansible-galaxy"
   chmod +x "$3/bin/python" "$3/bin/ansible" "$3/bin/ansible-galaxy"
   exit 0
 fi
 exit 2
-`, version, ansibleExit, calls)
+`, version, ansible, calls)
 
-	if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+	// FORK-SAFE, because these tests run in parallel and an executable another
+	// test's fork inherited open for writing cannot be exec'd (ETXTBSY).
+	if err := forkSafeWriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -123,8 +127,13 @@ func TestInstallAnsibleRefusesWhenNoPythonRunsThePin(t *testing.T) {
 		t.Fatalf("the installer succeeded with no Python the pin runs under:\n%s", out)
 	}
 
-	if !strings.Contains(out, "tried: python3 (3.15) python3.12 (3.12)") {
-		t.Errorf("the refusal does not name what was tried:\n%s", out)
+	for _, want := range []string{
+		"tried: python3 (3.15): AttributeError: module dataclasses has no attribute _is_type;",
+		"python3.12 (3.12): AttributeError: module dataclasses has no attribute _is_type;",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the refusal does not name what was tried and what it said (%q):\n%s", want, out)
+		}
 	}
 
 	if ghPath != "" {

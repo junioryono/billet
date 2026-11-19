@@ -40,6 +40,7 @@ posix_version=$(tr -d '[:space:]' <"$tests/ansible-posix-version")
 # names what was tried.
 venv="$RUNNER_TEMP/billet-ansible"
 chosen=""
+banner=""
 tried=()
 seen=" "
 for py in python3 python3.14 python3.13 python3.12; do
@@ -58,7 +59,12 @@ for py in python3 python3.14 python3.13 python3.12; do
     chosen="$py ($version)"
     break
   fi
-  tried+=("$py ($version)")
+  # WHAT IT SAID, so a refusal carries the cause (#792's was the last line of an
+  # import traceback) rather than only the names of what was tried.
+  said=${banner:-the venv or the pip install failed}
+  echo "ansible-core ${core_version} did not run under $py ($version): ${said##*$'\n'}"
+  tried+=("$py ($version): ${said##*$'\n'};")
+  banner=""
 done
 if [[ -z $chosen ]]; then
   echo "::error::ansible-core ${core_version} could not be installed and run under any Python here; tried: ${tried[*]:-no python3 at all}. Install one it supports (python3.12 to python3.14 are tried by name) and converge again; nothing has touched a host"
