@@ -1195,15 +1195,24 @@ fi
 # THE SHIM IS WHAT MAKES `type=gha` FROM A CONTAINER-DRIVER BUILDER WORK WITH
 # NO WORKFLOW CHANGE: it points the buildx client's cache URL at the adapter,
 # because the runner sets that URL per step and nothing else billet controls can.
+#
+# THE TWO COPIES DIFFER IN THEIR FIRST LINE ONLY: the host's runs under bash, which
+# keeps the runner's hyphenated `docker exec -e INPUT_...` variables dash drops
+# (#746), and the one a job container mounts stays on /bin/sh. So the host's copy is
+# compared with the shared one given bash, under pipefail.
 DOCKER_SHIM="$MNT/usr/local/bin/docker"
 if [ -x "$DOCKER_SHIM" ] && grep -Fq 'ACTIONS_RESULTS_URL=$BILLET_ACTIONS_CACHE_URL' "$DOCKER_SHIM" &&
 	grep -Fq 'exec "$real" "$@"' "$DOCKER_SHIM" &&
-	[ -x "$MNT/opt/billet/bin/docker" ] && cmp -s "$DOCKER_SHIM" "$MNT/opt/billet/bin/docker"; then
+	[ -x "$MNT/opt/billet/bin/docker" ] &&
+	[ "$(head -n 1 "$DOCKER_SHIM")" = "#!/bin/bash" ] &&
+	[ "$(head -n 1 "$MNT/opt/billet/bin/docker")" = "#!/bin/sh" ] &&
+	sed '1s|^#!/bin/sh$|#!/bin/bash|' "$MNT/opt/billet/bin/docker" | cmp -s - "$DOCKER_SHIM"; then
 	pass "the docker shim points a build's BuildKit cache client at billet's adapter"
 else
-	fail "no docker shim at /usr/local/bin/docker and /opt/billet/bin/docker; on an interception
-        tier a type=gha export from a container-driver builder fails with an x509 error
-        unless the workflow names the adapter itself"
+	fail "no docker shim at /usr/local/bin/docker (under bash) and /opt/billet/bin/docker (under sh),
+        the same script past their first line; on an interception tier a type=gha export from a
+        container-driver builder fails with an x509 error unless the workflow names the adapter
+        itself, and a hyphenated action input never reaches a job container"
 fi
 
 # THE IMAGE REDISTRIBUTES BILLET AND THE CONTAINER HOOK, and their licenses require

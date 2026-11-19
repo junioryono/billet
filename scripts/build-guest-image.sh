@@ -1315,8 +1315,18 @@ IMAGEINFO
 	# PATH, and /opt/billet/bin/docker is what the container hook bind-mounts into
 	# a job container and the job hook prepends to GITHUB_PATH, so the shim is
 	# first wherever a step runs and finds the image's client behind itself.
-	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/docker-shim.sh" \
-		"$rootfs/usr/local/bin/docker"
+	# THE HOST'S COPY RUNS UNDER BASH: the runner's container hook calls it with
+	# `docker exec -e INPUT_INCLUDE-HIDDEN-FILES`, and dash, Ubuntu's /bin/sh, drops
+	# every variable whose name is not a shell identifier before the script runs
+	# (#746). The bind-mounted copy stays on /bin/sh, for a job image without bash.
+	sed '1s|^#!/bin/sh$|#!/bin/bash|' "$SCRIPT_DIR/../internal/guestassets/docker-shim.sh" \
+		>"$rootfs/usr/local/bin/docker"
+	chmod 0755 "$rootfs/usr/local/bin/docker"
+	IFS= read -r shim_shebang <"$rootfs/usr/local/bin/docker"
+	if [ "$shim_shebang" != "#!/bin/bash" ]; then
+		echo "the host's docker shim starts '$shim_shebang', not #!/bin/bash" >&2
+		exit 1
+	fi
 	install -D -m 0755 "$SCRIPT_DIR/../internal/guestassets/docker-shim.sh" \
 		"$rootfs/opt/billet/bin/docker"
 

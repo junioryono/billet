@@ -1,7 +1,10 @@
 // Package guestassets carries scripts installed into every managed runner image.
 package guestassets
 
-import _ "embed"
+import (
+	_ "embed"
+	"strings"
+)
 
 // DockerCacheScript mounts and settles the transparent Docker image store.
 //
@@ -42,6 +45,18 @@ var DockerDaemonJSON string
 //
 //go:embed docker-shim.sh
 var DockerShimScript string
+
+// DockerHostShimScript is the same shim under bash, for the host's own copy
+// (/usr/local/bin/docker), which the runner's container hook runs.
+//
+// BASH, BECAUSE DASH DROPS WHAT IT CANNOT NAME. Ubuntu's /bin/sh is dash, and dash
+// removes every environment variable whose name is not a shell identifier before
+// the script runs, so the runner's `docker exec -e INPUT_INCLUDE-HIDDEN-FILES`
+// reached the real client with nothing to forward and an action's hyphenated
+// input never arrived (#746, measured 2026-11-05). The copy bind-mounted into a
+// job container (/opt/billet/bin/docker) stays on /bin/sh, because a job's image
+// need not carry bash.
+var DockerHostShimScript = strings.Replace(DockerShimScript, "#!/bin/sh\n", "#!/bin/bash\n", 1)
 
 // The container hook's wrapper, the pin of GitHub's hook it wraps, and that hook's
 // notices, for an image built from a binary rather than a checkout.

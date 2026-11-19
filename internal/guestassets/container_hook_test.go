@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/guestassets"
 )
 
 // nodeOrSkip is the runner's own node stood in for by the host's; the hook is
@@ -274,6 +276,73 @@ func TestTheContainerHookPropagatesTheReferenceHooksExitStatus(t *testing.T) {
 	patchShimPath(t, index, filepath.Join(t.TempDir(), "absent"))
 	if code, _ := runHook(t, node, index, map[string]any{"command": "cleanup_job", "args": map[string]any{}}); code != 3 {
 		t.Fatalf("hook exited %d, want the reference hook's 3", code)
+	}
+}
+
+// THE REFERENCE HOOK'S `docker` IS THE HOST'S SHIM, NOT THE ONE A CONTAINER MOUNTS.
+// The runner hands the hook the job's PATH, with the shim's directory first from
+// GITHUB_PATH, and that copy runs under /bin/sh; on Ubuntu, dash drops a variable
+// such as INPUT_INCLUDE-HIDDEN-FILES before the script runs (#746). Here the shared
+// shim is first on PATH, the host's bash copy is behind it, and the client is env
+// itself: a fake reference hook runs `docker` with the hyphenated variable and
+// records what the client was handed.
+func TestTheReferenceHookRunsTheHostsShim(t *testing.T) {
+	t.Parallel()
+	node := nodeOrSkip(t)
+	envPath, err := exec.LookPath("env")
+	if err != nil {
+		t.Skip("no env on PATH to stand in for the client")
+	}
+
+	dir := t.TempDir()
+	shared, host, behind := filepath.Join(dir, "opt-billet-bin"), filepath.Join(dir, "usr-local-bin"),
+		filepath.Join(dir, "usr-bin")
+	for _, d := range []string{shared, host, behind} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := guestassets.WriteExecutable(filepath.Join(shared, "docker"),
+		[]byte(guestassets.DockerShimScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := guestassets.WriteExecutable(filepath.Join(host, "docker"),
+		[]byte(guestassets.DockerHostShimScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(envPath, filepath.Join(behind, "docker")); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := os.ReadFile("container-hook.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(dir, "record.txt")
+	upstream := "const fs=require('fs');const {spawnSync}=require('child_process');" +
+		"process.stdin.resume();process.stdin.on('end',()=>{" +
+		"const r=spawnSync('docker',[],{env:Object.assign({},process.env,{'INPUT_INCLUDE-HIDDEN-FILES':'true'})});" +
+		"fs.writeFileSync(" + jsString(record) + ",String(r.stdout)+String(r.stderr));process.exit(0);});"
+	if err := os.WriteFile(filepath.Join(dir, "upstream.js"), []byte(upstream), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	index := filepath.Join(dir, "index.js")
+	if err := os.WriteFile(index, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	patchShimPath(t, index, filepath.Join(shared, "docker"))
+
+	code, out := runHook(t, node, index, map[string]any{"command": "cleanup_job", "args": map[string]any{}},
+		"PATH="+shared+":"+host+":"+behind+":/usr/bin:/bin")
+	if code != 0 {
+		t.Fatalf("hook exited %d:\n%s", code, out)
+	}
+	got, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "INPUT_INCLUDE-HIDDEN-FILES=true\n") {
+		t.Fatalf("the client the reference hook ran was not handed the hyphenated variable; it saw:\n%s", got)
 	}
 }
 

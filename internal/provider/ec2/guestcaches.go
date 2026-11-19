@@ -148,8 +148,9 @@ func guestCacheInstall() (string, error) {
 	b.WriteString("install -m 0755 " + assets + "/actions-proxy.py /usr/local/bin/billet-actions-proxy\n")
 	b.WriteString("install -m 0755 " + assets + "/dns-upstreams.py /usr/local/bin/billet-dns-upstreams\n")
 	// THE SHIM SITS AHEAD OF THE REAL CLIENT, in both places the guest build puts it,
-	// and does nothing on a job the adapter is not serving.
-	b.WriteString("install -m 0755 " + assets + "/docker-shim.sh /usr/local/bin/docker\n")
+	// and does nothing on a job the adapter is not serving. The host's own copy runs
+	// under bash, which keeps a hyphenated variable dash would drop (#746).
+	b.WriteString("install -m 0755 " + assets + "/docker-shim-host.sh /usr/local/bin/docker\n")
 	b.WriteString("install -D -m 0755 " + assets + "/docker-shim.sh /opt/billet/bin/docker\n")
 	b.WriteString("install -d -m 0755 /usr/local/lib/billet\n")
 	b.WriteString("install -m 0644 " + assets + "/guest-caches.sh " + guestCachesPath + "\n")
@@ -187,6 +188,7 @@ func guestCacheAssets() (map[string]string, error) {
 		"actions-proxy.py":       guestassets.ActionsProxyScript,
 		"dns-upstreams.py":       guestassets.DNSUpstreamsScript,
 		"docker-shim.sh":         guestassets.DockerShimScript,
+		"docker-shim-host.sh":    guestassets.DockerHostShimScript,
 		"container-hook.pin":     guestassets.ContainerHookPin,
 		"container-hook.LICENSE": guestassets.ContainerHookLicense,
 		"container-hook.NOTICE":  guestassets.ContainerHookNotice,

@@ -70,6 +70,28 @@ function addBilletMounts(request, env, paths) {
   return request;
 }
 
+// hostEnv is the environment the reference hook runs in: this process's, with the
+// shim's directory taken off PATH.
+//
+// THE HOOK RUNS ON THE HOST, AND ITS `docker` MUST BE THE HOST'S SHIM. The runner
+// applies the job's GITHUB_PATH to the hook, and the job-started hook prepends
+// /opt/billet/bin there, so the reference hook found the copy a job container
+// mounts, which runs under /bin/sh. On Ubuntu that is dash, which drops every
+// variable whose name is not a shell identifier, so `docker exec -e
+// INPUT_INCLUDE-HIDDEN-FILES` forwarded nothing (#746). Off that directory, PATH
+// reaches /usr/local/bin/docker, the same shim under bash. A container's own PATH
+// comes from the request, not from here, so it is untouched.
+function hostEnv(env) {
+  const out = { ...env };
+  if (typeof out.PATH === 'string') {
+    const shimDir = path.dirname(SHIM);
+    out.PATH = out.PATH.split(':')
+      .filter((dir) => dir.replace(/\/+$/, '') !== shimDir)
+      .join(':');
+  }
+  return out;
+}
+
 function main() {
   const chunks = [];
   process.stdin.on('data', (chunk) => chunks.push(chunk));
@@ -83,7 +105,7 @@ function main() {
     }
     const child = spawn(process.execPath, [UPSTREAM], {
       stdio: ['pipe', 'inherit', 'inherit'],
-      env: process.env,
+      env: hostEnv(process.env),
     });
     child.on('error', (err) => {
       process.stderr.write(`billet container hook: cannot run the reference hook: ${err.message}\n`);
@@ -100,4 +122,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { addBilletMounts };
+module.exports = { addBilletMounts, hostEnv };
