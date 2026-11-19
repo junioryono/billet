@@ -325,3 +325,80 @@ func markDeregistered(t *testing.T, a *Allocator, leaseID string) {
 		t.Fatalf("mark deregistered: %v", err)
 	}
 }
+
+// A STARTED JOB IS TOLD FROM A WAITING RUNNER BY ITS HISTORY, NOT ITS PHASE: a pool
+// runner's lease stays at launching through its whole job (#795), so a drain that
+// read the phase called a build in the middle of its steps "launching".
+func TestQuiescenceSaysWhichLeasesHaveAStartedJob(t *testing.T) {
+	t.Parallel()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	mustRegister(t, a, NodeRegistration{Name: "epyc-1", Provider: config.ProviderFirecracker,
+		VCPU: 8, Memory: 16 * config.GiB, Incarnation: "process-1"})
+
+	launch := func(runnerID int64) *Lease {
+		t.Helper()
+
+		lease := reserve(t, a, "linux")
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 500, runnerID); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, PhaseLaunching); err != nil {
+			t.Fatalf("Advance(launching): %v", err)
+		}
+		if err := a.RegisterPoolRunner(t.Context(), PoolRunner{LeaseID: lease.ID, Tier: "linux",
+			LaunchRequestID: runnerID, RunnerID: runnerID, RunnerName: "billet-" + lease.ID, Minted: true}); err != nil {
+			t.Fatalf("RegisterPoolRunner: %v", err)
+		}
+
+		return lease
+	}
+
+	running := launch(91)
+	waiting := launch(92)
+	held := launch(93)
+
+	for _, l := range []struct {
+		lease    *Lease
+		runnerID int64
+	}{{running, 91}, {held, 93}} {
+		if _, err := a.StartPoolRunner(t.Context(), l.lease.ID, "linux", l.runnerID, "billet-"+l.lease.ID,
+			l.runnerID, 500, "job-"+l.lease.ID, JobIdentity{}); err != nil {
+			t.Fatalf("StartPoolRunner: %v", err)
+		}
+	}
+
+	// A FAILED JOB WHOSE VM IS HELD: its result is in, its start stays, and the
+	// phase still never moved.
+	if err := a.RecordJobResult(t.Context(), held.ID, "failed", 500); err != nil {
+		t.Fatalf("RecordJobResult: %v", err)
+	}
+
+	type seen struct{ started, finished bool }
+
+	got := map[string]seen{}
+	for _, o := range quiescence(t, a).Outstanding {
+		if o.Phase != PhaseLaunching {
+			t.Errorf("lease %s is %s, want launching: the case this covers is a phase that never moves", o.ID, o.Phase)
+		}
+		got[o.ID] = seen{o.JobStarted, o.JobFinished}
+	}
+
+	for _, c := range []struct {
+		name  string
+		lease *Lease
+		want  seen
+	}{
+		{"the lease whose job started", running, seen{started: true}},
+		{"the lease with no job recorded", waiting, seen{}},
+		{"the finished job whose VM is held", held, seen{started: true, finished: true}},
+	} {
+		if s, ok := got[c.lease.ID]; !ok || s != c.want {
+			t.Errorf("%s reads %+v (listed %v), want %+v", c.name, s, ok, c.want)
+		}
+	}
+}

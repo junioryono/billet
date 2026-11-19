@@ -921,6 +921,44 @@ func stillDraining(env cli.Env, err error) error {
 	return errWaitInterrupted
 }
 
+// describeOutstanding says what a lease is doing in words an operator recognises.
+//
+// BY WHAT THE LEDGER KNOWS, NOT BY ITS PHASE: nothing advances a lease past
+// launching (#795), so a phase read as it stands calls a build in the middle of
+// its steps "launching". Whether its job started is what tells the two apart.
+func describeOutstanding(o alloc.Outstanding) string {
+	switch o.Phase {
+	case alloc.PhaseCapacity:
+		return "capacity no job has started on"
+	case alloc.PhaseAssigned:
+		return "assigned, not yet launched"
+	case alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy:
+		// THE RESULT FIRST: a failed job's VM held for debugging keeps its start. And a
+		// start without a result is said as that, not as running: the listener logs a
+		// failed result write and carries on, so an ended job can lack its result.
+		switch {
+		case o.JobFinished:
+			// NOT "compute held": a destroy that succeeded before a failed release
+			// leaves this same lease open with nothing behind it.
+			return "job finished, lease still open"
+		case o.JobStarted:
+			return "job started, no result recorded"
+		default:
+			// NO MORE THAN THE LEDGER KNOWS: a launch still working towards its
+			// compute and a busy runner reinstated without a start both read this.
+			return "launching or running, no job start recorded"
+		}
+	case alloc.PhaseCustody:
+		return "in custody"
+	case alloc.PhaseTeardown:
+		return "being destroyed"
+	case alloc.PhaseQuarantine:
+		return "quarantined"
+	default:
+		return string(o.Phase)
+	}
+}
+
 // outstandingSummary is one line an operator can act on: how much is left, and
 // what it is.
 //
@@ -949,7 +987,7 @@ func OutstandingSummary(q alloc.Quiescence) string {
 			break
 		}
 
-		fmt.Fprintf(&b, "\n  %s %s", o.Tier, o.Phase)
+		fmt.Fprintf(&b, "\n  %s %s", o.Tier, describeOutstanding(o))
 
 		if o.RunID != "" {
 			fmt.Fprintf(&b, " run %s", o.RunID)

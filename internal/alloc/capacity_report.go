@@ -166,7 +166,9 @@ func (a *Allocator) capacityReports(ctx context.Context, labels []string) (map[s
 		if err != nil {
 			return err
 		}
-		for _, lease := range rows {
+		for i := range rows {
+			lease := &rows[i]
+
 			report, ok := out[lease.Tier]
 			if !ok {
 				continue
