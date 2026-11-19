@@ -348,6 +348,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		// the archive was needed. ADVISORY throughout: this reports, and nothing
 		// here decides whether the deployment may run.
 		reportLocalBackupAge(ctx, env)
+		reportLedgerRoom(env, cfg)
 		reportBackupAge(ctx, env, cfg, skipNetworkProbes)
 		reportTimer(ctx, env, "updates", deploy.UpgradeTimerName,
 			"a recorded rollout waits on this host until somebody runs "+

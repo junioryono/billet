@@ -31,7 +31,7 @@ func TestAResumeRefusesWhileAnUpgradeIsRunning(t *testing.T) {
 
 	defer tx.release()
 
-	err = resumeHostUpgrade(t.Context(), processEnv(), &config.Config{})
+	err = resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}, "")
 	if !errors.Is(err, ErrUpgradeInProgress) {
 		t.Fatalf("a resume beside a live upgrade returned %v, want ErrUpgradeInProgress", err)
 	}
@@ -46,7 +46,7 @@ func TestAResumeRefusesWhileAnUpgradeIsRunning(t *testing.T) {
 	// signal; nothing durable is left behind by releasing it.
 	tx.release()
 
-	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}); err != nil {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}, ""); err != nil {
 		t.Errorf("a resume after the upgrade ended: %v", err)
 	}
 }
@@ -108,7 +108,7 @@ func TestASupersededTransactionThatTouchedNothingIsAbandoned(t *testing.T) {
 		Step: hostupgrade.StepClaimed,
 	})
 
-	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}); err != nil {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}, ""); err != nil {
 		t.Fatalf("abandoning a superseded transaction: %v", err)
 	}
 
@@ -324,7 +324,7 @@ func TestAResumeUsesTheDirectoryItFoundRatherThanTheOneRecorded(t *testing.T) {
 
 	// Superseded and untouched, so this abandons — using the directory the claim
 	// pointed at, which is the only one it has any evidence about.
-	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}); err != nil {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}, ""); err != nil {
 		t.Fatalf("resuming a journal that names the wrong directory: %v", err)
 	}
 

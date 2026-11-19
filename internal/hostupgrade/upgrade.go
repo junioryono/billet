@@ -434,11 +434,35 @@ func finish(ctx context.Context, req Request, log *slog.Logger) error {
 // operator asserting the candidate is gone.
 func beginRollback(ctx context.Context, req Request, log *slog.Logger, cause error) error {
 	if failErr := req.Journal.Fail(cause); failErr != nil {
-		return fmt.Errorf("%w: %w (and the journal could not record it: %w)",
-			ErrCordoned, cause, failErr)
+		return unrecorded(cause, failErr)
 	}
 
 	return rollBack(ctx, req, log, cause)
+}
+
+// ErrUnrecorded marks a cordon whose failure the journal itself could not record,
+// so the caller, which knows the host's configuration, its account and which binary
+// is on the disk, can say how the machine is recovered (#802). Always wrapped with
+// ErrCordoned, by way of a JournalWriteError.
+var ErrUnrecorded = errors.New("hostupgrade: the journal could not record the failure")
+
+// JournalWriteError is the journal's own failed write, kept apart from the failure
+// it was recording, so a caller reads what filled the journal's disk from this write
+// alone and not from the cause, which may be a full disk somewhere else.
+type JournalWriteError struct {
+	Err error
+}
+
+func (e *JournalWriteError) Error() string { return ErrUnrecorded.Error() + ": " + e.Err.Error() }
+
+func (e *JournalWriteError) Unwrap() error { return e.Err }
+
+// Is makes a JournalWriteError ErrUnrecorded.
+func (e *JournalWriteError) Is(target error) bool { return target == ErrUnrecorded }
+
+// unrecorded is the cordon for a failure the journal itself could not record.
+func unrecorded(cause, failErr error) error {
+	return fmt.Errorf("%w: %w (%w)", ErrCordoned, cause, &JournalWriteError{Err: failErr})
 }
 
 // cordonWithoutRestoring records the failure and stops, restoring nothing,
@@ -452,8 +476,7 @@ func cordonWithoutRestoring(req Request, log *slog.Logger, cause error) error {
 		"from", j.FromVersion, "to", j.ToVersion, "step", j.Step, "dir", j.Dir, "error", cause)
 
 	if failErr := j.Fail(cause); failErr != nil {
-		return fmt.Errorf("%w: %w (and the journal could not record it: %w)",
-			ErrCordoned, cause, failErr)
+		return unrecorded(cause, failErr)
 	}
 
 	return fmt.Errorf("%w: %w (nothing was restored, because the candidate may still be "+

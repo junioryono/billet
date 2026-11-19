@@ -300,3 +300,57 @@ func TestAnUnreadableRoomPrunesOnlyPastTheCount(t *testing.T) {
 		t.Errorf("removed %v, want only day-a, the one past the count", removed)
 	}
 }
+
+// `billet check` WARNS WHILE THE LEDGER'S FILESYSTEM HOLDS UNDER TWO LEDGERS, reads
+// the ledger's own directory, says when it could not tell, and says nothing for a
+// host with no SQLite ledger (#802).
+func TestCheckWarnsWhenTheLedgersFilesystemIsShort(t *testing.T) {
+	const db, wal = 3 << 20, 1 << 20
+
+	server := serverWithLedger(t, db, wal)
+	twice := int64(2 * (db + wal))
+
+	for _, tc := range []struct {
+		name    string
+		cfg     *config.Config
+		free    int64
+		readErr error
+		want    string
+	}{
+		{"exactly twice the ledger", server, twice, nil, "room     8 MiB free beside a 4 MiB ledger\n"},
+		{"a byte under twice", server, twice - 1, nil, "room     WARNING: "},
+		{"a reading that failed", server, 0, errors.New("statfs refused"), "room     UNCHECKED: "},
+		{"a host with no SQLite ledger", nodeConfig, 0, nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var asked string
+
+			withFreeBytes(t, func(path string) (int64, error) {
+				asked = path
+
+				return tc.free, tc.readErr
+			})
+
+			var out strings.Builder
+
+			reportLedgerRoom(cli.Env{Stdout: &out, Stderr: &out}, tc.cfg)
+
+			got := out.String()
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("a host with no SQLite ledger reported %q", got)
+				}
+
+				return
+			}
+
+			if !strings.HasPrefix(got, tc.want) {
+				t.Fatalf("reported %q, want it to begin %q", got, tc.want)
+			}
+
+			if asked != tc.cfg.Server.IdentityDir {
+				t.Errorf("read the room of %q, want the ledger's directory %q", asked, tc.cfg.Server.IdentityDir)
+			}
+		})
+	}
+}

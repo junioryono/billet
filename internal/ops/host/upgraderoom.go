@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -104,4 +105,49 @@ func sqliteLedgerBytes(cfg *config.Config) (int64, error) {
 // mib renders a byte count for an operator.
 func mib(n int64) string {
 	return fmt.Sprintf("%d MiB", n>>20)
+}
+
+// ledgerRoomFactor is how many ledgers' worth of free room the ledger's filesystem
+// should keep: an upgrade's snapshot and a backup's copy each take about one.
+const ledgerRoomFactor = 2
+
+// reportLedgerRoom says how much room the SQLite ledger's filesystem has left, and
+// warns while it is under twice the ledger's size. ADVISORY: it reports, and
+// decides nothing; the upgrade's own preflight (refuseShortOfRoom) is what refuses.
+//
+// THE WARNING COMES BEFORE THE NIGHT IT IS NEEDED. On 2026-11-08 a controller's
+// backups and recovery directories left it 0.7 GiB beside a 943 MiB ledger, and
+// the next upgrade's snapshot ran out of room with the control plane stopped
+// (#802). A line in `billet check` is how an operator sees that coming.
+func reportLedgerRoom(env cli.Env, cfg *config.Config) {
+	ledger, err := sqliteLedgerBytes(cfg)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "room     UNCHECKED: could not tell how large the ledger is: %v\n", err)
+
+		return
+	}
+
+	if ledger == 0 {
+		return
+	}
+
+	dir := cfg.Server.IdentityDir
+
+	free, err := freeBytes(dir)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "room     UNCHECKED: could not read how much room %s has: %v\n", dir, err)
+
+		return
+	}
+
+	if free < ledgerRoomFactor*ledger {
+		fmt.Fprintf(env.Stdout, "room     WARNING: %s has %s free beside a %s ledger, under twice its size; "+
+			"the next upgrade's snapshot and backup each need about the ledger's size there, so free room on "+
+			"that filesystem (local backups the bucket holds, old recovery directories) before then\n",
+			dir, mib(free), mib(ledger))
+
+		return
+	}
+
+	fmt.Fprintf(env.Stdout, "room     %s free beside a %s ledger\n", mib(free), mib(ledger))
 }

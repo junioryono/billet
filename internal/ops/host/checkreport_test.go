@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/app"
@@ -150,6 +151,30 @@ func TestRunCheckReportsWhatTheGitHubProbeEstablished(t *testing.T) {
 				t.Errorf("the GitHub probe reports %s, want %s:\n%s", report.github, tc.want, out)
 			}
 		})
+	}
+}
+
+// `billet check` ON A CONTROLLER SAYS WHEN THE LEDGER'S DISK IS SHORT, through the
+// command itself, so a check that stopped calling the report fails here rather
+// than only the report's own test (#802).
+func TestTheCheckWarnsWhenTheLedgersDiskIsShort(t *testing.T) {
+	t.Setenv("BILLET_MAINTENANCE", "")
+
+	cfgPath := checkConfigFixture(t)
+	pointGitHubAt(t, exactInstallation)
+	withFreeBytes(t, func(string) (int64, error) { return 0, nil })
+
+	var err error
+
+	out := capture(t, func() {
+		_, err = runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath})
+	})
+	if err != nil {
+		t.Fatalf("the check failed: %v\n%s", err, out)
+	}
+
+	if !strings.Contains(out, "room     WARNING: ") {
+		t.Fatalf("the check did not warn of a ledger disk with no room:\n%s", out)
 	}
 }
 
