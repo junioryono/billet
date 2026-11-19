@@ -24,7 +24,7 @@ func TestADrainSaysWhatEachLeasesJobIsDoing(t *testing.T) {
 	}})
 
 	for _, want := range []string{
-		"\n  linux-8 running a job run 41 on epyc-1",
+		"\n  linux-8 job started, no result recorded run 41 on epyc-1",
 		"\n  linux-4 launching or running, no job start recorded run 42 on epyc-1",
 		"\n  linux-2 job finished, compute still held run 43 on epyc-1",
 		"\n  linux-1 in custody run 44 on epyc-1",

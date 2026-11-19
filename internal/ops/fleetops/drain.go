@@ -933,12 +933,14 @@ func describeOutstanding(o alloc.Outstanding) string {
 	case alloc.PhaseAssigned:
 		return "assigned, not yet launched"
 	case alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy:
-		// THE RESULT FIRST: a failed job's VM held for debugging keeps its start.
+		// THE RESULT FIRST: a failed job's VM held for debugging keeps its start. And a
+		// start without a result is said as that, not as running: the listener logs a
+		// failed result write and carries on, so an ended job can lack its result.
 		switch {
 		case o.JobFinished:
 			return "job finished, compute still held"
 		case o.JobStarted:
-			return "running a job"
+			return "job started, no result recorded"
 		default:
 			// NO MORE THAN THE LEDGER KNOWS: a launch still working towards its
 			// compute and a busy runner reinstated without a start both read this.
