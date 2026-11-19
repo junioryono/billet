@@ -109,7 +109,7 @@ func TestAFullDiskAndAMissingBinaryAreSaid(t *testing.T) {
 
 	journal := &hostupgrade.Journal{Dir: filepath.Join(t.TempDir(), "upgrade-1"), FromVersion: "v0.40.0"}
 	full := &fs.PathError{Op: "write", Path: journal.Dir + "/journal.json.new", Err: syscall.ENOSPC}
-	err := errors.Join(hostupgrade.ErrCordoned, hostupgrade.ErrUnrecorded, full)
+	err := errors.Join(hostupgrade.ErrCordoned, &hostupgrade.JournalWriteError{Err: full})
 
 	var out bytes.Buffer
 
@@ -123,5 +123,47 @@ func TestAFullDiskAndAMissingBinaryAreSaid(t *testing.T) {
 		if !strings.Contains(out.String(), line) {
 			t.Errorf("the report lacks %q:\n%s", line, out.String())
 		}
+	}
+}
+
+// A FULL DISK IN THE CAUSE IS NOT THE JOURNAL'S: the failure being recorded can be a
+// full /usr while the journal's write failed for another reason, and the journal's
+// filesystem must not be named as the one to free.
+func TestAFullDiskElsewhereIsNotBlamedOnTheJournal(t *testing.T) {
+	withInstalledBinary(t, filepath.Join(t.TempDir(), "billet"))
+
+	journal := &hostupgrade.Journal{Dir: filepath.Join(t.TempDir(), "upgrade-1")}
+	cause := &fs.PathError{Op: "write", Path: "/usr/bin/billet", Err: syscall.ENOSPC}
+	readOnly := &fs.PathError{Op: "write", Path: journal.Dir + "/journal.json.new", Err: syscall.EROFS}
+	err := errors.Join(hostupgrade.ErrCordoned, cause, &hostupgrade.JournalWriteError{Err: readOnly})
+
+	var out bytes.Buffer
+
+	sayUnrecordedRecovery(cli.Env{Stdout: &out}, journal, "/etc/billet/billet.yaml", err)
+
+	if strings.Contains(out.String(), "is full") {
+		t.Fatalf("a full disk in the cause was blamed on the journal's filesystem:\n%s", out.String())
+	}
+}
+
+// THE COMMAND IS ONE A SHELL RUNS AS WRITTEN: the macOS default config lives under
+// "Application Support", and a path can hold a quote.
+func TestTheResumeCommandIsQuotedForAShell(t *testing.T) {
+	installed := filepath.Join(t.TempDir(), "billet")
+	if err := os.WriteFile(installed, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	withInstalledBinary(t, installed)
+
+	journal := &hostupgrade.Journal{Dir: filepath.Join(t.TempDir(), "upgrade-1")}
+	err := errors.Join(hostupgrade.ErrCordoned, &hostupgrade.JournalWriteError{Err: errors.New("refused")})
+
+	var out bytes.Buffer
+
+	sayUnrecordedRecovery(cli.Env{Stdout: &out}, journal, "/Users/o'neil/Library/Application Support/billet/billet.yaml", err)
+
+	want := "--config '/Users/o'\\''neil/Library/Application Support/billet/billet.yaml'\n"
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("the command does not quote the config as %q:\n%s", want, out.String())
 	}
 }

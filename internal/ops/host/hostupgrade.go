@@ -1153,7 +1153,10 @@ func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config, cfg
 		return err
 	}
 
-	host, err := newHostFor(env, cfg, "", filepath.Join(dir, "billet"), journal)
+	// THE CONFIGURATION THIS RESUME LOADED, so its probes and migration read the
+	// deployment it was given, as a fresh upgrade's do; an empty path fell back to
+	// the service's default whatever --config said.
+	host, err := newHostFor(env, cfg, cfgPath, filepath.Join(dir, "billet"), journal)
 	if err != nil {
 		return err
 	}
@@ -1280,7 +1283,10 @@ func finishHostUpgrade(ctx context.Context, env cli.Env, root *os.File, journal 
 func sayUnrecordedRecovery(env cli.Env, journal *hostupgrade.Journal, cfgPath string, err error) {
 	fmt.Fprintf(env.Stdout, "\nThe failure itself could not be written to the journal.\n")
 
-	if errors.Is(err, syscall.ENOSPC) {
+	// THE JOURNAL'S OWN WRITE, NOT THE WHOLE CHAIN: the failure it was recording may
+	// be a full disk elsewhere (an install into /usr), and naming the journal's
+	// filesystem for it would send the operator to free the wrong one.
+	if write, ok := errors.AsType[*hostupgrade.JournalWriteError](err); ok && errors.Is(write.Err, syscall.ENOSPC) {
 		fmt.Fprintf(env.Stdout, "The filesystem holding %s is full. Free room on it first: local\n", journal.Dir)
 		fmt.Fprintf(env.Stdout, "backups the bucket holds, or older recovery directories under %s.\n", upgradeRoot)
 	}
@@ -1299,11 +1305,22 @@ func sayUnrecordedRecovery(env cli.Env, journal *hostupgrade.Journal, cfgPath st
 		account = u.Username + ", the account that ran this upgrade"
 	}
 
+	// QUOTED FOR A SHELL: the macOS default config lives under "Application Support".
 	fmt.Fprintf(env.Stdout, "Then, as %s, run:\n\n  %s host-upgrade --resume --config %s\n\n",
-		account, binary, cfgPath)
+		account, quoteForShell(binary), quoteForShell(cfgPath))
 	fmt.Fprintf(env.Stdout, "It continues from the last step the journal recorded, which may finish the\n")
 	fmt.Fprintf(env.Stdout, "upgrade rather than roll it back. If the failure says the new release may still\n")
 	fmt.Fprintf(env.Stdout, "be running, prove it has stopped before resuming.\n")
+}
+
+// quoteForShell is s as one word to a POSIX shell: as it is when it holds nothing a
+// shell reads specially, else in single quotes with each quote spelled '\”.
+func quoteForShell(s string) string {
+	if s != "" && strings.Trim(s, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+:@,=") == "" {
+		return s
+	}
+
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // resumeBinary is the billet a resume can run: the installed one while it is there,

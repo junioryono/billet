@@ -443,13 +443,26 @@ func beginRollback(ctx context.Context, req Request, log *slog.Logger, cause err
 // ErrUnrecorded marks a cordon whose failure the journal itself could not record,
 // so the caller, which knows the host's configuration, its account and which binary
 // is on the disk, can say how the machine is recovered (#802). Always wrapped with
-// ErrCordoned.
+// ErrCordoned, by way of a JournalWriteError.
 var ErrUnrecorded = errors.New("hostupgrade: the journal could not record the failure")
 
-// unrecorded is the cordon for a failure the journal itself could not record. The
-// write's own error is kept, so a full disk is still errors.Is ENOSPC.
+// JournalWriteError is the journal's own failed write, kept apart from the failure
+// it was recording, so a caller reads what filled the journal's disk from this write
+// alone and not from the cause, which may be a full disk somewhere else.
+type JournalWriteError struct {
+	Err error
+}
+
+func (e *JournalWriteError) Error() string { return ErrUnrecorded.Error() + ": " + e.Err.Error() }
+
+func (e *JournalWriteError) Unwrap() error { return e.Err }
+
+// Is makes a JournalWriteError ErrUnrecorded.
+func (e *JournalWriteError) Is(target error) bool { return target == ErrUnrecorded }
+
+// unrecorded is the cordon for a failure the journal itself could not record.
 func unrecorded(cause, failErr error) error {
-	return fmt.Errorf("%w: %w (%w: %w)", ErrCordoned, cause, ErrUnrecorded, failErr)
+	return fmt.Errorf("%w: %w (%w)", ErrCordoned, cause, &JournalWriteError{Err: failErr})
 }
 
 // cordonWithoutRestoring records the failure and stops, restoring nothing,
