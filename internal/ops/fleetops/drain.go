@@ -938,7 +938,9 @@ func describeOutstanding(o alloc.Outstanding) string {
 		// failed result write and carries on, so an ended job can lack its result.
 		switch {
 		case o.JobFinished:
-			return "job finished, compute still held"
+			// NOT "compute held": a destroy that succeeded before a failed release
+			// leaves this same lease open with nothing behind it.
+			return "job finished, lease still open"
 		case o.JobStarted:
 			return "job started, no result recorded"
 		default:
