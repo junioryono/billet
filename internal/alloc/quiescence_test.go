@@ -360,24 +360,45 @@ func TestQuiescenceSaysWhichLeasesHaveAStartedJob(t *testing.T) {
 
 	running := launch(91)
 	waiting := launch(92)
+	held := launch(93)
 
-	if _, err := a.StartPoolRunner(t.Context(), running.ID, "linux", 91, "billet-"+running.ID, 91, 500,
-		"job-1", JobIdentity{}); err != nil {
-		t.Fatalf("StartPoolRunner: %v", err)
+	for _, l := range []struct {
+		lease    *Lease
+		runnerID int64
+	}{{running, 91}, {held, 93}} {
+		if _, err := a.StartPoolRunner(t.Context(), l.lease.ID, "linux", l.runnerID, "billet-"+l.lease.ID,
+			l.runnerID, 500, "job-"+l.lease.ID, JobIdentity{}); err != nil {
+			t.Fatalf("StartPoolRunner: %v", err)
+		}
 	}
 
-	started := map[string]bool{}
+	// A FAILED JOB WHOSE VM IS HELD: its result is in, its start stays, and the
+	// phase still never moved.
+	if err := a.RecordJobResult(t.Context(), held.ID, "failed", 500); err != nil {
+		t.Fatalf("RecordJobResult: %v", err)
+	}
+
+	type seen struct{ started, finished bool }
+
+	got := map[string]seen{}
 	for _, o := range quiescence(t, a).Outstanding {
 		if o.Phase != PhaseLaunching {
 			t.Errorf("lease %s is %s, want launching: the case this covers is a phase that never moves", o.ID, o.Phase)
 		}
-		started[o.ID] = o.JobStarted
+		got[o.ID] = seen{o.JobStarted, o.JobFinished}
 	}
 
-	if got, ok := started[running.ID]; !ok || !got {
-		t.Errorf("the lease whose job started reads JobStarted=%v (listed %v), want true", got, ok)
-	}
-	if got, ok := started[waiting.ID]; !ok || got {
-		t.Errorf("the lease still waiting for its job reads JobStarted=%v (listed %v), want false", got, ok)
+	for _, c := range []struct {
+		name  string
+		lease *Lease
+		want  seen
+	}{
+		{"the lease whose job started", running, seen{started: true}},
+		{"the lease with no job recorded", waiting, seen{}},
+		{"the finished job whose VM is held", held, seen{started: true, finished: true}},
+	} {
+		if s, ok := got[c.lease.ID]; !ok || s != c.want {
+			t.Errorf("%s reads %+v (listed %v), want %+v", c.name, s, ok, c.want)
+		}
 	}
 }

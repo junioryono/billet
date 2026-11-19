@@ -21,10 +21,12 @@ type Outstanding struct {
 	// A lease that still carries one is work GitHub can route to; one without is
 	// compute billet is still destroying.
 	Deregistered bool
-	// JobStarted says whether GitHub has told billet the lease's job started. It
-	// is what tells a running build from a runner still waiting for one, which
+	// JobStarted and JobFinished say whether billet has heard the lease's job start
+	// and GitHub's result for it. They are what tell a running build from a runner
+	// with no job recorded, or from a finished job whose VM is still held, which
 	// the phase cannot: nothing advances a lease past launching (#795).
-	JobStarted bool
+	JobStarted  bool
+	JobFinished bool
 }
 
 // Quiescence is what a deployment is still holding.
@@ -159,7 +161,8 @@ func (a *Allocator) Quiescence(ctx context.Context) (Quiescence, error) {
 			return fmt.Errorf("alloc: list outstanding leases: %w", err)
 		}
 
-		for _, row := range rows {
+		for i := range rows {
+			row := &rows[i]
 			q.Outstanding = append(q.Outstanding, Outstanding{
 				ID:           row.ID,
 				Tier:         row.Tier,
@@ -169,6 +172,7 @@ func (a *Allocator) Quiescence(ctx context.Context) (Quiescence, error) {
 				Since:        row.Since,
 				Deregistered: row.Deregistered == 1,
 				JobStarted:   row.JobStartedAt != "",
+				JobFinished:  row.JobResultAt != "",
 			})
 		}
 

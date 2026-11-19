@@ -77,14 +77,16 @@ UPDATE leases
 -- SECOND barrier that asks the hosts directly. See internal/state/queries/
 -- barrier.sql.
 --
--- job_started_at IS WHAT SAYS A JOB IS RUNNING, never the phase: nothing advances a
--- lease past `launching` (#795), so a running build and a runner still waiting for
--- its job share one phase, and only the job's history tells them apart.
+-- THE JOB'S HISTORY SAYS WHAT A LEASE IS DOING, never the phase: nothing advances a
+-- lease past `launching` (#795), so a running build, a runner still waiting for its
+-- job and a finished job whose VM is held all share one phase. job_started_at is
+-- when billet heard the job start, job_result_at when it heard GitHub's result.
 SELECT l.id, l.tier, COALESCE(l.node, l.target_node, '') AS node, l.phase,
        CAST(COALESCE(CAST(l.run_id AS TEXT), '') AS TEXT) AS run_id,
        CAST(CASE WHEN l.held_at = '' THEN l.created_at ELSE l.held_at END AS TEXT) AS since,
        l.deregistered,
-       CAST(COALESCE(h.started_at, '') AS TEXT) AS job_started_at
+       CAST(COALESCE(h.started_at, '') AS TEXT) AS job_started_at,
+       CAST(COALESCE(h.result_at, '') AS TEXT) AS job_result_at
   FROM leases l
   LEFT JOIN job_history h ON h.lease_id = l.id
  WHERE l.phase IN ('capacity','assigned','launching','online','busy',

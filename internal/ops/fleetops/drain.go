@@ -933,11 +933,17 @@ func describeOutstanding(o alloc.Outstanding) string {
 	case alloc.PhaseAssigned:
 		return "assigned, not yet launched"
 	case alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy:
-		if o.JobStarted {
+		// THE RESULT FIRST: a failed job's VM held for debugging keeps its start.
+		switch {
+		case o.JobFinished:
+			return "job finished, compute still held"
+		case o.JobStarted:
 			return "running a job"
+		default:
+			// NO MORE THAN THE LEDGER KNOWS: a launch still working towards its
+			// compute and a busy runner reinstated without a start both read this.
+			return "launching or running, no job start recorded"
 		}
-
-		return "launched, waiting for its job"
 	case alloc.PhaseCustody:
 		return "in custody"
 	case alloc.PhaseTeardown:

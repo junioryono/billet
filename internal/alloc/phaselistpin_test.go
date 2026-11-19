@@ -74,7 +74,8 @@ func TestTheDrainStatementIsWhatTheGoSliceSays(t *testing.T) {
 		       CAST(COALESCE(CAST(l.run_id AS TEXT), '') AS TEXT) AS run_id,
 		       CAST(CASE WHEN l.held_at = '' THEN l.created_at ELSE l.held_at END AS TEXT) AS since,
 		       l.deregistered,
-		       CAST(COALESCE(h.started_at, '') AS TEXT) AS job_started_at
+		       CAST(COALESCE(h.started_at, '') AS TEXT) AS job_started_at,
+		       CAST(COALESCE(h.result_at, '') AS TEXT) AS job_result_at
 		  FROM leases l
 		  LEFT JOIN job_history h ON h.lease_id = l.id
 		 WHERE l.` + phaseIn(quiescencePhases) + `
