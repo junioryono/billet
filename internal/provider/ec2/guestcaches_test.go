@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -78,6 +79,54 @@ func TestTheGuestCacheInstallParsesAndNamesWhatIsInstalled(t *testing.T) {
 // starts, then what listens on its bridge, then the node asked, and what names the node
 // only once it has answered. Each of these has a test of its own and none of that proves
 // it is called.
+// THE VERIFIER EXPECTS WHAT THE INSTALL PUTS THERE, byte for byte, read from the
+// install itself rather than from the verifier's own list: when the host's docker
+// shim moved to bash (#746) the verifier still expected the shared copy at
+// /usr/local/bin/docker, and every image built would have failed its verification
+// while fixtures made from the verifier's list agreed with it.
+func TestTheVerifierExpectsWhatTheInstallPutsThere(t *testing.T) {
+	t.Parallel()
+
+	install, err := guestCacheInstall()
+	if err != nil {
+		t.Fatalf("guestCacheInstall: %v", err)
+	}
+	assets, err := guestCacheAssets()
+	if err != nil {
+		t.Fatalf("guestCacheAssets: %v", err)
+	}
+	files, err := guestCacheFiles()
+	if err != nil {
+		t.Fatalf("guestCacheFiles: %v", err)
+	}
+
+	installed := map[string]string{}
+	for _, m := range regexp.MustCompile(`(?m)^install (?:-D )?-m 0[67][0-7][0-7] \S*/internal/guestassets/(\S+) (\S+)$`).
+		FindAllStringSubmatch(install, -1) {
+		body, ok := assets[m[1]]
+		if !ok {
+			t.Fatalf("the install copies %s, which the payload does not carry", m[1])
+		}
+		installed[m[2]] = body
+	}
+
+	checked := 0
+	for _, f := range files {
+		body, ok := installed[f.path]
+		if !ok {
+			continue
+		}
+		checked++
+		if body != f.body {
+			t.Errorf("the verifier expects other bytes at %s than the install puts there", f.path)
+		}
+	}
+	if checked < 4 {
+		t.Fatalf("matched %d of the verifier's files to install lines, want at least the four the payload "+
+			"installs; the install's lines changed shape", checked)
+	}
+}
+
 func TestTheEntryPointRunsTheGuestCachesInOrder(t *testing.T) {
 	t.Parallel()
 	script := entryPointScript()

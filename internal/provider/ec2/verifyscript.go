@@ -646,7 +646,8 @@ func guestCacheFiles() ([]struct{ path, body string }, error) {
 		{guestCachesPath, library},
 		{"/usr/local/bin/billet-actions-proxy", guestassets.ActionsProxyScript},
 		{"/usr/local/bin/billet-dns-upstreams", guestassets.DNSUpstreamsScript},
-		{"/usr/local/bin/docker", guestassets.DockerShimScript},
+		// The host's copy under bash, the one a job container mounts under sh (#746).
+		{"/usr/local/bin/docker", guestassets.DockerHostShimScript},
 		{"/opt/billet/bin/docker", guestassets.DockerShimScript},
 		{"/usr/local/lib/billet/container-hook/index.js", guestassets.ContainerHookScript},
 	}, nil
