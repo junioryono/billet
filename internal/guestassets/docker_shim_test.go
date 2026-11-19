@@ -209,3 +209,52 @@ func TestTheDockerShimSkipsEverySiblingShimOnPath(t *testing.T) {
 		t.Fatalf("want exit 127 naming the missing client, got err=%v\n%s", err, out)
 	}
 }
+
+// THE HOST'S SHIM KEEPS A VARIABLE NO SHELL CAN NAME. The runner's container hook
+// runs `docker exec -e INPUT_INCLUDE-HIDDEN-FILES` through it, and dash, Ubuntu's
+// /bin/sh, drops such a variable before the script runs, so an action's hyphenated
+// input never reached a job container (#746). The client behind the shim here is
+// env itself, which prints exactly the environment it was handed.
+func TestTheHostsDockerShimForwardsAVariableNoShellCanName(t *testing.T) {
+	t.Parallel()
+
+	envPath, err := exec.LookPath("env")
+	if err != nil {
+		t.Skip("no env on PATH to stand in for the client")
+	}
+
+	front := t.TempDir()
+	behind := t.TempDir()
+	if err := guestassets.WriteExecutable(filepath.Join(front, "docker"),
+		[]byte(guestassets.DockerHostShimScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(envPath, filepath.Join(behind, "docker")); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), filepath.Join(front, "docker"))
+	cmd.Env = []string{"PATH=" + front + ":" + behind + ":/usr/bin:/bin", "INPUT_INCLUDE-HIDDEN-FILES=true"}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the shim did not exec the client: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "INPUT_INCLUDE-HIDDEN-FILES=true\n") {
+		t.Fatalf("the client was not handed the hyphenated variable; its environment was:\n%s", out)
+	}
+}
+
+// ONLY THE FIRST LINE CHANGES between the two copies, so the host's shim is the
+// same program as the one a job container runs.
+func TestTheHostsDockerShimIsTheSameScriptUnderBash(t *testing.T) {
+	t.Parallel()
+
+	host, shared := guestassets.DockerHostShimScript, guestassets.DockerShimScript
+	if !strings.HasPrefix(host, "#!/bin/bash\n") || !strings.HasPrefix(shared, "#!/bin/sh\n") {
+		t.Fatalf("want the host's copy under bash and the shared one under sh, got %q and %q",
+			strings.SplitN(host, "\n", 2)[0], strings.SplitN(shared, "\n", 2)[0])
+	}
+	if strings.TrimPrefix(host, "#!/bin/bash\n") != strings.TrimPrefix(shared, "#!/bin/sh\n") {
+		t.Fatal("the host's copy differs from the shared shim past its first line")
+	}
+}

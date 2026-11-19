@@ -56,7 +56,9 @@ func TestTheGuestCacheInstallParsesAndNamesWhatIsInstalled(t *testing.T) {
 	}
 	for _, want := range []string{
 		" /usr/local/bin/billet-actions-proxy\n", " /usr/local/bin/billet-dns-upstreams\n",
-		" /usr/local/bin/docker\n", " /opt/billet/bin/docker\n", " " + guestCachesPath + "\n",
+		// The host's copy under bash, the one a job container mounts under sh (#746).
+		"/docker-shim-host.sh /usr/local/bin/docker\n", "/docker-shim.sh /opt/billet/bin/docker\n",
+		" " + guestCachesPath + "\n",
 		" " + guestBilletPath + "\n", guestBilletPath + " version >/dev/null\n",
 		"/opt/billet/bin/bazel-credential-helper\n", "install_container_hook /\n",
 		"BILLET_RUNNER_HOME=" + guestRunnerHome + " install_cache_sudoers /\n",
