@@ -921,6 +921,34 @@ func stillDraining(env cli.Env, err error) error {
 	return errWaitInterrupted
 }
 
+// describeOutstanding says what a lease is doing in words an operator recognises.
+//
+// BY WHAT THE LEDGER KNOWS, NOT BY ITS PHASE: nothing advances a lease past
+// launching (#795), so a phase read as it stands calls a build in the middle of
+// its steps "launching". Whether its job started is what tells the two apart.
+func describeOutstanding(o alloc.Outstanding) string {
+	switch o.Phase {
+	case alloc.PhaseCapacity:
+		return "capacity no job has started on"
+	case alloc.PhaseAssigned:
+		return "assigned, not yet launched"
+	case alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy:
+		if o.JobStarted {
+			return "running a job"
+		}
+
+		return "launched, waiting for its job"
+	case alloc.PhaseCustody:
+		return "in custody"
+	case alloc.PhaseTeardown:
+		return "being destroyed"
+	case alloc.PhaseQuarantine:
+		return "quarantined"
+	default:
+		return string(o.Phase)
+	}
+}
+
 // outstandingSummary is one line an operator can act on: how much is left, and
 // what it is.
 //
@@ -949,7 +977,7 @@ func OutstandingSummary(q alloc.Quiescence) string {
 			break
 		}
 
-		fmt.Fprintf(&b, "\n  %s %s", o.Tier, o.Phase)
+		fmt.Fprintf(&b, "\n  %s %s", o.Tier, describeOutstanding(o))
 
 		if o.RunID != "" {
 			fmt.Fprintf(&b, " run %s", o.RunID)

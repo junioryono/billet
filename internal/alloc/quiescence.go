@@ -21,6 +21,10 @@ type Outstanding struct {
 	// A lease that still carries one is work GitHub can route to; one without is
 	// compute billet is still destroying.
 	Deregistered bool
+	// JobStarted says whether GitHub has told billet the lease's job started. It
+	// is what tells a running build from a runner still waiting for one, which
+	// the phase cannot: nothing advances a lease past launching (#795).
+	JobStarted bool
 }
 
 // Quiescence is what a deployment is still holding.
@@ -164,6 +168,7 @@ func (a *Allocator) Quiescence(ctx context.Context) (Quiescence, error) {
 				RunID:        row.RunID,
 				Since:        row.Since,
 				Deregistered: row.Deregistered == 1,
+				JobStarted:   row.JobStartedAt != "",
 			})
 		}
 

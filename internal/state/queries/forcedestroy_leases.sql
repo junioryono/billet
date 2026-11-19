@@ -76,11 +76,17 @@ UPDATE leases
 -- IT CANNOT SEE COMPUTE WHOSE LEASE HAS ALREADY GONE, which is why a drain has a
 -- SECOND barrier that asks the hosts directly. See internal/state/queries/
 -- barrier.sql.
-SELECT id, tier, COALESCE(node, target_node, '') AS node, phase,
-       CAST(COALESCE(CAST(run_id AS TEXT), '') AS TEXT) AS run_id,
-       CAST(CASE WHEN held_at = '' THEN created_at ELSE held_at END AS TEXT) AS since,
-       deregistered
-  FROM leases
- WHERE phase IN ('capacity','assigned','launching','online','busy',
-                 'custody','teardown','quarantine')
- ORDER BY CASE WHEN held_at = '' THEN created_at ELSE held_at END, id;
+--
+-- job_started_at IS WHAT SAYS A JOB IS RUNNING, never the phase: nothing advances a
+-- lease past `launching` (#795), so a running build and a runner still waiting for
+-- its job share one phase, and only the job's history tells them apart.
+SELECT l.id, l.tier, COALESCE(l.node, l.target_node, '') AS node, l.phase,
+       CAST(COALESCE(CAST(l.run_id AS TEXT), '') AS TEXT) AS run_id,
+       CAST(CASE WHEN l.held_at = '' THEN l.created_at ELSE l.held_at END AS TEXT) AS since,
+       l.deregistered,
+       CAST(COALESCE(h.started_at, '') AS TEXT) AS job_started_at
+  FROM leases l
+  LEFT JOIN job_history h ON h.lease_id = l.id
+ WHERE l.phase IN ('capacity','assigned','launching','online','busy',
+                   'custody','teardown','quarantine')
+ ORDER BY CASE WHEN l.held_at = '' THEN l.created_at ELSE l.held_at END, l.id;

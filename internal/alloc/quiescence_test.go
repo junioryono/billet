@@ -325,3 +325,59 @@ func markDeregistered(t *testing.T, a *Allocator, leaseID string) {
 		t.Fatalf("mark deregistered: %v", err)
 	}
 }
+
+// A STARTED JOB IS TOLD FROM A WAITING RUNNER BY ITS HISTORY, NOT ITS PHASE: a pool
+// runner's lease stays at launching through its whole job (#795), so a drain that
+// read the phase called a build in the middle of its steps "launching".
+func TestQuiescenceSaysWhichLeasesHaveAStartedJob(t *testing.T) {
+	t.Parallel()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	mustRegister(t, a, NodeRegistration{Name: "epyc-1", Provider: config.ProviderFirecracker,
+		VCPU: 8, Memory: 16 * config.GiB, Incarnation: "process-1"})
+
+	launch := func(runnerID int64) *Lease {
+		t.Helper()
+
+		lease := reserve(t, a, "linux")
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 500, runnerID); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, PhaseLaunching); err != nil {
+			t.Fatalf("Advance(launching): %v", err)
+		}
+		if err := a.RegisterPoolRunner(t.Context(), PoolRunner{LeaseID: lease.ID, Tier: "linux",
+			LaunchRequestID: runnerID, RunnerID: runnerID, RunnerName: "billet-" + lease.ID, Minted: true}); err != nil {
+			t.Fatalf("RegisterPoolRunner: %v", err)
+		}
+
+		return lease
+	}
+
+	running := launch(91)
+	waiting := launch(92)
+
+	if _, err := a.StartPoolRunner(t.Context(), running.ID, "linux", 91, "billet-"+running.ID, 91, 500,
+		"job-1", JobIdentity{}); err != nil {
+		t.Fatalf("StartPoolRunner: %v", err)
+	}
+
+	started := map[string]bool{}
+	for _, o := range quiescence(t, a).Outstanding {
+		if o.Phase != PhaseLaunching {
+			t.Errorf("lease %s is %s, want launching: the case this covers is a phase that never moves", o.ID, o.Phase)
+		}
+		started[o.ID] = o.JobStarted
+	}
+
+	if got, ok := started[running.ID]; !ok || !got {
+		t.Errorf("the lease whose job started reads JobStarted=%v (listed %v), want true", got, ok)
+	}
+	if got, ok := started[waiting.ID]; !ok || got {
+		t.Errorf("the lease still waiting for its job reads JobStarted=%v (listed %v), want false", got, ok)
+	}
+}
