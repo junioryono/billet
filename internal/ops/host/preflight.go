@@ -911,7 +911,42 @@ func checkCephCluster(ctx context.Context, env cli.Env, cfg *config.CephConfig) 
 			"this host could launch anything: %w", err)
 	}
 
+	reportCachePoolFill(ctx, env, cfg, client)
+
 	return nil
+}
+
+// cachePoolFiller is what reportCachePoolFill reads: the Ceph client, or a test's.
+type cachePoolFiller interface {
+	CachePoolFill(ctx context.Context) (float64, error)
+}
+
+// reportCachePoolFill says how full the cache pool is against the fill at which
+// eviction stops waiting for retention, and warns at or past it. ADVISORY: a fill it
+// cannot read is said, and fails nothing.
+//
+// SAID BEFORE CEPH SAYS IT. On 2026-11-07 the reference cluster went HEALTH_ERR with
+// its cache pool full, and on 2026-11-12 its fuller OSD passed nearfull, each first
+// seen as Ceph's own warning (#798). Pressure eviction now acts on this same
+// reading; this puts it where an operator looks.
+func reportCachePoolFill(ctx context.Context, env cli.Env, cfg *config.CephConfig, client cachePoolFiller) {
+	fill, err := client.CachePoolFill(ctx)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "pool     UNCHECKED: could not read how full %s is: %v\n", cfg.CachePool, err)
+
+		return
+	}
+
+	if fill >= ceph.PressureFill {
+		fmt.Fprintf(env.Stdout, "pool     WARNING: %s is %.0f%% full, at or past the %.0f%% where the node evicts the "+
+			"least recently used cache generations whatever their retention; if it keeps rising, the cache "+
+			"outgrows this cluster\n", cfg.CachePool, fill*100, ceph.PressureFill*100)
+
+		return
+	}
+
+	fmt.Fprintf(env.Stdout, "pool     %s is %.0f%% full (eviction under pressure starts at %.0f%%)\n",
+		cfg.CachePool, fill*100, ceph.PressureFill*100)
 }
 
 // printCephReport puts what the cluster said on the operator's terminal.

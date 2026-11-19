@@ -1,6 +1,8 @@
 package host
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/store/ceph"
@@ -269,6 +272,63 @@ func TestACloneV1ClusterFailsTheCheck(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "set-require-min-compat-client mimic") {
 		t.Errorf("the error does not carry the command that fixes it: %v", err)
+	}
+}
+
+// THE CHECK SAYS HOW FULL THE CACHE POOL IS, and a fill it cannot read is said and
+// fails nothing: the stub answers `ceph df` with a pool listing rather than usage,
+// so the line must say it could not tell, and the check must still pass (#798).
+func TestTheCheckSaysHowFullTheCachePoolIs(t *testing.T) {
+	stubCluster(t, "mimic")
+
+	var out bytes.Buffer
+
+	env := cli.Env{Stdout: &out, Stderr: &out, Getenv: func(string) string { return "" }}
+	if err := checkCephCluster(t.Context(), env, &config.CephConfig{
+		User:      config.DefaultCephUser,
+		ImagePool: "billet-images",
+		CachePool: "billet-cache",
+	}); err != nil {
+		t.Fatalf("an unreadable fill failed the check: %v\n%s", err, out.String())
+	}
+
+	if !strings.Contains(out.String(), "pool     UNCHECKED: could not read how full billet-cache is") {
+		t.Fatalf("the check did not say it could not read the cache pool's fill:\n%s", out.String())
+	}
+}
+
+// fixedFill is a cache pool whose fill is known.
+type fixedFill struct {
+	fill float64
+	err  error
+}
+
+func (f fixedFill) CachePoolFill(context.Context) (float64, error) { return f.fill, f.err }
+
+// THE FILL IS SAID AGAINST WHERE EVICTION STARTS, and warned of at or past it.
+func TestTheCachePoolFillIsSaidAgainstWhereEvictionStarts(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		fill fixedFill
+		want string
+	}{
+		{"below", fixedFill{fill: 0.5}, "pool     billet-cache is 50% full (eviction under pressure starts at 75%)\n"},
+		{"at the threshold", fixedFill{fill: ceph.PressureFill}, "pool     WARNING: billet-cache is 75% full"},
+		{"unreadable", fixedFill{err: errors.New("ceph df refused")}, "pool     UNCHECKED: "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var out bytes.Buffer
+
+			reportCachePoolFill(t.Context(), cli.Env{Stdout: &out}, &config.CephConfig{CachePool: "billet-cache"}, tc.fill)
+
+			if !strings.HasPrefix(out.String(), tc.want) {
+				t.Fatalf("reported %q, want it to begin %q", out.String(), tc.want)
+			}
+		})
 	}
 }
 
