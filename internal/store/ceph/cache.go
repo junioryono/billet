@@ -1877,6 +1877,16 @@ func (c *Client) EvictUnderPressure(ctx context.Context) (PressureReport, error)
 	return report, err
 }
 
+// PressureFill is the cache pool's fill past which eviction stops waiting for
+// retention, for a report that says how close the pool is to it.
+const PressureFill = pressureFill
+
+// CachePoolFill is the cache pool's fill as eviction reads it, for `billet check`
+// to say how full the pool is before Ceph's nearfull warning does (#798).
+func (c *Client) CachePoolFill(ctx context.Context) (float64, error) {
+	return c.cachePoolFill(ctx)
+}
+
 // cachePoolFill is the cache pool's `percent_used` from `ceph df`: its share of
 // the room the fullest OSD it maps to can still take, which is what nearfull and
 // full are measured against.
