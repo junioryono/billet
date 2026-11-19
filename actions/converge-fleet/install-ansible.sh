@@ -29,10 +29,42 @@ posix_version=$(tr -d '[:space:]' <"$tests/ansible-posix-version")
   exit 1
 }
 
+# THE INTERPRETER IS THE FIRST ONE THE PIN ACTUALLY RUNS UNDER, tried rather than
+# guessed. ansible-core supports a range of Pythons, and a machine's default
+# python3 can move past it: on 2026-11-07 a Mac's Homebrew python3 became 3.15, the
+# pinned ansible-core failed inside its own import ("module 'dataclasses' has no
+# attribute '_is_type'"), and the laptop converge, the break-glass path, failed
+# before touching a host (#792). So the default is tried first, then the named
+# versions newest first, each in a fresh venv, and the first under which the pinned
+# ansible-core installs and answers --version is kept. None is a refusal that
+# names what was tried.
 venv="$RUNNER_TEMP/billet-ansible"
-python3 -m venv "$venv"
-"$venv/bin/python" -m pip install --disable-pip-version-check --quiet "ansible-core==${core_version}"
-"$venv/bin/ansible" --version | head -n1
+chosen=""
+tried=()
+seen=" "
+for py in python3 python3.14 python3.13 python3.12; do
+  command -v "$py" >/dev/null 2>&1 || continue
+  if ! version=$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null); then
+    tried+=("$py (would not report its version)")
+    continue
+  fi
+  # ONE ATTEMPT PER VERSION: python3 is often the same interpreter as one named.
+  [[ $seen == *" $version "* ]] && continue
+  seen="$seen$version "
+  rm -rf "$venv"
+  if "$py" -m venv "$venv" &&
+    "$venv/bin/python" -m pip install --disable-pip-version-check --quiet "ansible-core==${core_version}" &&
+    banner=$("$venv/bin/ansible" --version 2>&1); then
+    chosen="$py ($version)"
+    break
+  fi
+  tried+=("$py ($version)")
+done
+if [[ -z $chosen ]]; then
+  echo "::error::ansible-core ${core_version} could not be installed and run under any Python here; tried: ${tried[*]:-no python3 at all}. Install one it supports (python3.12 to python3.14 are tried by name) and converge again; nothing has touched a host"
+  exit 1
+fi
+echo "ansible-core ${core_version} under ${chosen}: ${banner%%$'\n'*}"
 echo "$venv/bin" >>"$GITHUB_PATH"
 
 collections="$RUNNER_TEMP/billet-collections"
