@@ -1478,7 +1478,7 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) poll(w http.ResponseWriter, r *http.Request) {
 	cmd, ok, err := h.plane.Poll(r.Context(), r.PathValue("node"),
-		r.Header.Get(nodeapi.HeaderIncarnation))
+		r.Header.Get(nodeapi.HeaderIncarnation), destroysRunning(r)...)
 	if err != nil {
 		writeStoreErr(w, err)
 
@@ -1495,6 +1495,22 @@ func (h *handler) poll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, cmd)
+}
+
+// destroysRunning is the destroy command ids a poll says its node holds
+// (HeaderDestroysRunning): none when the header is absent, as from a node below
+// VersionDestroysBeside, and at most nodeapi.MaxDestroysRunning, the most a node
+// holds.
+func destroysRunning(r *http.Request) []string {
+	var ids []string
+
+	for _, id := range strings.Split(r.Header.Get(nodeapi.HeaderDestroysRunning), ",") {
+		if id = strings.TrimSpace(id); id != "" && len(ids) < nodeapi.MaxDestroysRunning {
+			ids = append(ids, id)
+		}
+	}
+
+	return ids
 }
 
 func (h *handler) actionsCachePolicy(w http.ResponseWriter, r *http.Request) {

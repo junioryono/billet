@@ -1,0 +1,3 @@
+LogChunkRequest.lease string
+LogChunkRequest.first_line int64
+LogChunkRequest.data bytes

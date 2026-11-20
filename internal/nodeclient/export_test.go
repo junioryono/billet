@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/netip"
 	"time"
+
+	"github.com/junioryono/billet/internal/nodeapi"
 )
 
 // The record writer's two seams, for the fixtures in the external test
@@ -78,3 +80,13 @@ func SetConnectForTest(c *Client, i int, f func(ctx context.Context, network, ad
 
 // AddrsInForTest is addrsIn: a lookup's answer in a network, zones kept.
 func AddrsInForTest(ips []net.IPAddr, network string) []netip.Addr { return addrsIn(ips, network) }
+
+// SetInLineHookForTest has the loop tell f of each command it runs in line, as it
+// begins to wait for what runs beside it.
+func SetInLineHookForTest(opts *LoopOptions, f func(kind string)) {
+	opts.inLine = func(kind nodeapi.CommandKind) { f(string(kind)) }
+}
+
+// SetWaitsBehindHookForTest has the loop tell f of each launch, by request, as it
+// begins to wait for a destroy of its request the node holds.
+func SetWaitsBehindHookForTest(opts *LoopOptions, f func(request int64)) { opts.waitsBehind = f }

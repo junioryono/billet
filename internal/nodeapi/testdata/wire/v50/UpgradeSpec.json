@@ -1,0 +1,6 @@
+{
+  "version": "UpgradeSpec.version",
+  "manifest_sha256": "UpgradeSpec.manifest_sha256",
+  "rollout_id": "UpgradeSpec.rollout_id",
+  "generation": 1300889606
+}

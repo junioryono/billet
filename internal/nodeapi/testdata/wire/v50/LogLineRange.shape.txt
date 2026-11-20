@@ -1,0 +1,2 @@
+LogLineRange.first int64
+LogLineRange.last int64

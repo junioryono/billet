@@ -1,0 +1,11 @@
+LogReadResult.held bool
+LogReadResult.cut tag omitempty
+LogReadResult.cut bool
+LogReadResult.unreadable tag omitempty
+LogReadResult.unreadable int
+LogReadResult.lines tag omitempty
+LogReadResult.lines slice
+LogReadResult.lines[].line int64
+LogReadResult.lines[].at_ms tag omitempty
+LogReadResult.lines[].at_ms int64
+LogReadResult.lines[].text string

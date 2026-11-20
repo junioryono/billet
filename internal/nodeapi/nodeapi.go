@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 49
+	Version = 50
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -655,6 +655,20 @@ const (
 	// sends one anyway has the report kept with the split dropped, which reads
 	// as not split by time rather than as no traffic in any step.
 	VersionDestinationOpenings = 49
+
+	// VersionDestroysBeside is the version from which a node may run destroys
+	// beside its command loop, and names the destroys it still holds on every poll
+	// (HeaderDestroysRunning), so the plane hands over the next command instead of
+	// giving one of those back as lost.
+	//
+	// GATED BY THE NODE, because the plane's half is safe at any version: below it
+	// a node runs a destroy in line and polls only after reporting it, so a poll
+	// with one unanswered means it was lost, and the plane gives it again. A node
+	// that ran destroys beside the loop against a plane older than this would be
+	// handed the same destroy on every poll and never the launch behind it, so it
+	// keeps them in line there. The header itself is additive: an older plane
+	// ignores it, and an older node sends none, which reads as holding nothing.
+	VersionDestroysBeside = 50
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -970,6 +984,20 @@ type RegisterResponse struct {
 // registration is where an incarnation is CLAIMED; this is how each later
 // request proves it is still the process that claimed it.
 const HeaderIncarnation = "Billet-Incarnation"
+
+// HeaderDestroysRunning carries, on a poll, the command ids of the destroys the
+// node holds: queued or running beside its loop. The plane gives back as lost only
+// a destroy this process was handed and does not name here (VersionDestroysBeside).
+// Comma-separated; absent means none.
+const HeaderDestroysRunning = "Billet-Destroys-Running"
+
+// MaxDestroysRunning is the most destroys a node holds beside its loop, and so the
+// most HeaderDestroysRunning names: a node at it runs the next destroy in line, and
+// a plane reads no more. ONE BOUND FOR BOTH SIDES, because a destroy a node holds
+// and its poll leaves out is given back as lost on every poll. Sized so the header
+// stays far inside the node wire's 16 KiB header limit (128 ids of 32 hex digits
+// is about 4 KiB).
+const MaxDestroysRunning = 128
 
 // Command is one instruction, delivered in answer to a long poll.
 //

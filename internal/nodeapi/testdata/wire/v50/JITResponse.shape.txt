@@ -1,0 +1,3 @@
+JITResponse.config string
+JITResponse.runner_id int64
+JITResponse.runner_name string

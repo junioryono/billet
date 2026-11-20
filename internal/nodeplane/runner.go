@@ -261,7 +261,7 @@ func (r *Runner) DestroyCompletedBound(
 	if incarnation == "" {
 		return completionHolderUnavailable(nodeName, requestID)
 	}
-	if r.plane.tookCommand(pend) != incarnation {
+	if took, _ := r.plane.tookCommand(pend); took != incarnation {
 		return completionHolderUnavailable(nodeName, requestID)
 	}
 	if !res.OK {
@@ -331,9 +331,10 @@ func (r *Runner) destroy(ctx context.Context, requestID int64, result string,
 	// runs on shutdown and on completion paths, where blocking for minutes turns
 	// one bad host into a stalled control plane.
 	type leg struct {
-		node        string
-		incarnation string
-		err         error
+		node         string
+		incarnation  string
+		ownersBefore uint64
+		err          error
 	}
 
 	var (
@@ -348,12 +349,12 @@ func (r *Runner) destroy(ctx context.Context, requestID int64, result string,
 		go func() {
 			defer wg.Done()
 
-			incarnation, err := r.destroyOn(ctx, n, requestID, result, authority)
+			incarnation, ownersBefore, err := r.destroyOn(ctx, n, requestID, result, authority)
 
 			mu.Lock()
 			defer mu.Unlock()
 
-			legs = append(legs, leg{node: n.name, incarnation: incarnation, err: err})
+			legs = append(legs, leg{node: n.name, incarnation: incarnation, ownersBefore: ownersBefore, err: err})
 		}()
 	}
 
@@ -365,6 +366,14 @@ func (r *Runner) destroy(ctx context.Context, requestID int64, result string,
 	// while the earlier reading still says the owner is current.
 	confirmed := !known
 
+	// WHAT THE CONFIRMATION ANSWERS FOR (forgetForRequest): the owner's leg, or, where
+	// no owner was known, each answering leg for its own node, since each node's
+	// destroy was taken at its own moment.
+	var (
+		upTo   uint64
+		byNode = map[string]uint64{}
+	)
+
 	var errs []error
 
 	for _, l := range legs {
@@ -374,8 +383,11 @@ func (r *Runner) destroy(ctx context.Context, requestID int64, result string,
 			continue
 		}
 
+		byNode[l.node] = l.ownersBefore
+
 		if known && l.node == owner.Node && l.incarnation == owner.Incarnation {
 			confirmed = true
+			upTo = l.ownersBefore
 		}
 	}
 
@@ -384,8 +396,11 @@ func (r *Runner) destroy(ctx context.Context, requestID int64, result string,
 	// owner had already destroyed its container and would later drain to nothing,
 	// after which every future destroy saw a superseded owner and reported custody
 	// forever for compute that no longer existed.
-	if confirmed {
-		r.plane.forgetForRequest(requestID)
+	switch {
+	case confirmed && known:
+		r.plane.forgetForRequest(requestID, upTo)
+	case confirmed:
+		r.plane.forgetForRequestOn(requestID, byNode)
 	}
 
 	if len(errs) > 0 {
@@ -570,10 +585,10 @@ func (r *Runner) destroyOn(
 	requestID int64,
 	result string,
 	authority *nodeapi.CacheAuthority,
-) (string, error) {
+) (string, uint64, error) {
 	id, err := commandID()
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	pend := &pending{
@@ -586,7 +601,7 @@ func (r *Runner) destroyOn(
 
 	res, err := r.plane.dispatch(ctx, n, pend)
 	if err != nil {
-		return "", fmt.Errorf("node %s: %w", n.name, err)
+		return "", 0, fmt.Errorf("node %s: %w", n.name, err)
 	}
 
 	if !res.OK {
@@ -605,10 +620,10 @@ func (r *Runner) destroyOn(
 		// and forgetting it here would let a later destroy be answered by a
 		// replacement that truthfully knows nothing about it.
 		if res.Custody {
-			return "", fmt.Errorf("%w: node %s: %s", dispatch.ErrCustody, n.name, res.Error)
+			return "", 0, fmt.Errorf("%w: node %s: %s", dispatch.ErrCustody, n.name, res.Error)
 		}
 
-		return "", fmt.Errorf("node %s could not destroy request %d: %s",
+		return "", 0, fmt.Errorf("node %s could not destroy request %d: %s",
 			n.name, requestID, res.Error)
 	}
 
@@ -616,7 +631,9 @@ func (r *Runner) destroyOn(
 	// only thing that can confirm a destroy: the node NAME is shared by a
 	// superseded process and its replacement, and the replacement answers
 	// truthfully that it has nothing to remove.
-	return r.plane.tookCommand(pend), nil
+	incarnation, ownersBefore := r.plane.tookCommand(pend)
+
+	return incarnation, ownersBefore, nil
 }
 
 // dispatch queues a command and waits for its result.
@@ -914,7 +931,7 @@ func (p *Plane) abandonLocked(n *node, pend *pending, cause error) error {
 		// necessary — a late success is the only proof the compute is gone, and
 		// discarding it left the plane reporting custody forever for a container
 		// that had already been removed.
-		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
+		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now(), pend.ownersBefore)
 
 		if pend.cmd.Kind == nodeapi.CommandLaunch {
 			return fmt.Errorf("%w: %w, so whether compute started is unknown",

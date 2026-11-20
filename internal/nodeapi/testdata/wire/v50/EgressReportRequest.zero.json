@@ -1,0 +1,34 @@
+{
+  "epoch": 0,
+  "report": {
+    "listed": false,
+    "queries": 0,
+    "refused_queries": 0,
+    "refused_names": [
+      {
+        "name": "",
+        "count": 0
+      }
+    ],
+    "names": [
+      {
+        "addr": "",
+        "names": [
+          ""
+        ]
+      }
+    ],
+    "denied_packets": 0,
+    "outside_resolver_packets": 0,
+    "ipv6_packets": 0,
+    "denied": [
+      {
+        "addr": "",
+        "protocol": "",
+        "port": 0,
+        "packets": 0
+      }
+    ],
+    "incomplete": false
+  }
+}
