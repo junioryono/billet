@@ -20,10 +20,27 @@ type launchSet struct {
 
 	mu  sync.Mutex
 	err error
+	// running is one channel per launch in flight, closed when it returns, so a
+	// destroy can wait for exactly the launches it arrived behind.
+	running map[chan struct{}]struct{}
 }
 
 func newLaunchSet(limit int) *launchSet {
-	return &launchSet{slots: make(chan struct{}, max(limit, 1))}
+	return &launchSet{slots: make(chan struct{}, max(limit, 1)), running: map[chan struct{}]struct{}{}}
+}
+
+// inFlight is a channel for each launch running now, each closed when that launch
+// returns. Launches started afterwards are not in it.
+func (s *launchSet) inFlight() []<-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]<-chan struct{}, 0, len(s.running))
+	for done := range s.running {
+		out = append(out, done)
+	}
+
+	return out
 }
 
 // start runs launch once a slot is free, reporting false if ctx ended first, in
@@ -35,8 +52,20 @@ func (s *launchSet) start(ctx context.Context, launch func() error) bool {
 		return false
 	}
 
+	done := make(chan struct{})
+
+	s.mu.Lock()
+	s.running[done] = struct{}{}
+	s.mu.Unlock()
+
 	s.wg.Go(func() {
 		defer func() { <-s.slots }()
+		defer func() {
+			s.mu.Lock()
+			delete(s.running, done)
+			s.mu.Unlock()
+			close(done)
+		}()
 
 		if err := launch(); err != nil {
 			s.mu.Lock()
@@ -48,6 +77,46 @@ func (s *launchSet) start(ctx context.Context, launch func() error) bool {
 	})
 
 	return true
+}
+
+// startBehind runs launch once every channel in behind has closed and then a slot is
+// free, without the caller waiting for either.
+//
+// IN FLIGHT FROM NOW, so a destroy queued while it waits waits for it in turn; AND
+// HOLDING NO SLOT WHILE IT WAITS, so launches waiting on teardowns never leave the
+// loop blocked behind them for a slot an unrelated launch needs. It always runs: one
+// whose command the node has stopped serving by then is refused by the launch
+// itself, and reported.
+func (s *launchSet) startBehind(behind []<-chan struct{}, launch func() error) {
+	done := make(chan struct{})
+
+	s.mu.Lock()
+	s.running[done] = struct{}{}
+	s.mu.Unlock()
+
+	s.wg.Go(func() {
+		defer func() {
+			s.mu.Lock()
+			delete(s.running, done)
+			s.mu.Unlock()
+			close(done)
+		}()
+
+		for _, earlier := range behind {
+			<-earlier
+		}
+
+		s.slots <- struct{}{}
+		defer func() { <-s.slots }()
+
+		if err := launch(); err != nil {
+			s.mu.Lock()
+			if s.err == nil {
+				s.err = err
+			}
+			s.mu.Unlock()
+		}
+	})
 }
 
 // tryStart runs work if a slot is free now, and reports false if none is, in which case work

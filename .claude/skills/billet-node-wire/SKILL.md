@@ -30,7 +30,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Incarnation and epoch are different fences.**
 - **A superseded process's claim takes back a lease the current process holds only by adoption (#685).**
 - **A withdrawn process's leases move to the node's next process when it adopts them (#374).**
-- **Commands are a queue with a ten-minute timeout that starts when queued, and only launches run beside each other.**
+- **Commands are a queue with a ten-minute timeout that starts when queued; launches, and on Firecracker from VersionDestroysBeside the destroys, run beside the loop.**
 - **Placement reads do not hold the shared plane mutex.**
 - **A stream is a connection a node dials back on a command's single-use token, and neither end of the wire reads it (ADR-032).**
 

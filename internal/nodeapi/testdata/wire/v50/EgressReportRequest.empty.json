@@ -1,0 +1,12 @@
+{
+  "epoch": 0,
+  "report": {
+    "listed": false,
+    "queries": 0,
+    "refused_queries": 0,
+    "denied_packets": 0,
+    "outside_resolver_packets": 0,
+    "ipv6_packets": 0,
+    "incomplete": false
+  }
+}

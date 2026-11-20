@@ -235,6 +235,15 @@ type LoopOptions struct {
 	// an error reports nothing, and its caller records the failure. Nil records
 	// nothing.
 	Ended func(ending nodeending.Ending, drainRequested bool)
+
+	// inLine is told of each command the loop runs in line, as it begins to wait for
+	// what runs beside it, and of a tend or a sweep in the destroys' line, as it begins
+	// to wait for custody: a test's proof of where the node is. Set only by
+	// SetInLineHookForTest.
+	inLine func(nodeapi.CommandKind)
+	// waitsBehind is told of each launch, by request, as it begins to wait for a
+	// destroy of its request this node holds. Set only by SetWaitsBehindHookForTest.
+	waitsBehind func(request int64)
 }
 
 // ended reports how the stop ended, when the caller asked.
@@ -1446,6 +1455,12 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	// re-registration never runs beside a launch begun under the last one. The
 	// wait comes before the cancel: the other order would cancel what it waits for.
 	launches := newLaunchSet(opts.LaunchConcurrency)
+	// DESTROYS RUN BESIDE THE LOOP where launches may overlap (destroyQueue), and on
+	// it where the provider runs one command at a time, as a node always did.
+	destroys := newDestroyQueue(opts.Hurry)
+	// ONLY WHERE THE PLANE IS TOLD WHICH IT HOLDS (VersionDestroysBeside): an older
+	// plane gives back a destroy polled past as lost, on every poll.
+	destroysBeside := opts.LaunchConcurrency > 1 && c.WireVersion() >= nodeapi.VersionDestroysBeside
 	// A SESSION ENDS WITH THIS serve, not only with ctx: a node superseded or unregistered returns
 	// from here with ctx still live, and an idle terminal must not hold up what its caller does
 	// next. Cancelled before the join, once the reads that start sessions have finished.
@@ -1460,6 +1475,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 
 	defer func() {
 		launches.wait()
+		destroys.wait()
 		stopSaying()
 		endLaunches()
 	}()
@@ -1480,8 +1496,36 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		return compute.Tend(ctx)
 	}
 
+	maintain := func() {
+		custody.Lock()
+		err := compute.Sweep(ctx)
+		custody.Unlock()
+		// NOT FATAL. A sweep that fails leaves orphans for the next one; a node
+		// that stopped serving because of it would leave every job queued
+		// instead. AND NOT A FAILURE WHEN THE NODE IS STOPPING: a sweep or a
+		// Tend still running when the signal lands returns the cancellation,
+		// and logging that as a failure puts a broken-looking line in front of
+		// whoever is watching the stop. The drain's Tend keeps the same rule.
+		if err != nil && ctx.Err() == nil {
+			log.Error("sweep failed; orphaned compute may be left behind", "error", err)
+		}
+
+		// TENDED ON THE SAME CADENCE. Custody entries are what let go of a
+		// lease once the compute behind it is confirmed gone; without this the
+		// janitor renews them forever and the capacity is never returned. The
+		// keepalive goroutine only holds them — this is what ends them.
+		if err := tend(); err != nil && ctx.Err() == nil {
+			log.Error("could not advance custody; leases for compute that may already be "+
+				"gone will keep being renewed until this succeeds", "error", err)
+		}
+	}
+
 	for {
 		if err := launches.failed(); err != nil {
+			return err
+		}
+
+		if err := destroys.failed(); err != nil {
 			return err
 		}
 
@@ -1494,33 +1538,22 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		// in that time renews; one that does not is not running anyway.
 		renewIfDue(ctx, c, log, opts)
 
+		// NOT BESIDE A DESTROY: a sweep reads the host's compute against the leases,
+		// and one mid-teardown is neither. While destroys run beside the loop the
+		// sweep takes its turn in their line, behind those queued now and ahead of
+		// any that come after, so a node always tearing down still sweeps. Only this
+		// goroutine queues destroys, so none starts beside a sweep run here.
 		if opts.SweepEvery > 0 && time.Now().After(sweepAt) {
-			custody.Lock()
-			err := compute.Sweep(ctx)
-			custody.Unlock()
-			// NOT FATAL. A sweep that fails leaves orphans for the next one; a node
-			// that stopped serving because of it would leave every job queued
-			// instead. AND NOT A FAILURE WHEN THE NODE IS STOPPING: a sweep or a
-			// Tend still running when the signal lands returns the cancellation,
-			// and logging that as a failure puts a broken-looking line in front of
-			// whoever is watching the stop. The drain's Tend keeps the same rule.
-			if err != nil && ctx.Err() == nil {
-				log.Error("sweep failed; orphaned compute may be left behind", "error", err)
-			}
-
-			// TENDED ON THE SAME CADENCE. Custody entries are what let go of a
-			// lease once the compute behind it is confirmed gone; without this the
-			// janitor renews them forever and the capacity is never returned. The
-			// keepalive goroutine only holds them — this is what ends them.
-			if err := tend(); err != nil && ctx.Err() == nil {
-				log.Error("could not advance custody; leases for compute that may already be "+
-					"gone will keep being renewed until this succeeds", "error", err)
+			if destroys.busy() {
+				destroys.turn(maintain)
+			} else {
+				maintain()
 			}
 
 			sweepAt = time.Now().Add(opts.SweepEvery)
 		}
 
-		cmd, ok, err := c.Poll(ctx)
+		cmd, ok, err := c.PollHolding(ctx, destroys.held())
 		if err != nil {
 			if errors.Is(err, ErrUnregistered) || errors.Is(err, ErrSuperseded) || ctx.Err() != nil {
 				return err
@@ -1570,7 +1603,9 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// commonly finishes an asynchronous termination between two sweeps; waiting
 			// for the next five-minute sweep keeps a slot charged after its instance is
 			// already gone.
-			if compute.Holding() {
+			// AND NOT BESIDE A DESTROY, for the same reason as the sweep: the next idle
+			// poll after it tends.
+			if compute.Holding() && !destroys.busy() {
 				if err := tend(); err != nil && ctx.Err() == nil {
 					log.Error("could not advance custody after the command poll; leases for "+
 						"compute that may already be gone will keep being renewed until this succeeds",
@@ -1630,16 +1665,81 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 
 		// A LAUNCH RUNS BESIDE THE LOOP when the provider allows it, and the poll
 		// that follows can hand over the next one at once. A draining node refuses
-		// launches, which is immediate, so that stays in line.
-		if cmd.Kind == nodeapi.CommandLaunch && opts.LaunchConcurrency > 1 && !draining &&
-			launches.start(ctx, run) {
+		// launches, which is immediate, so that stays in line. A LAUNCH AFTER A
+		// DESTROY OF ITS OWN REQUEST waits for it, read here, on the goroutine that
+		// queues destroys, so it names only those queued before it; it holds no slot
+		// while it waits, and counts as in flight for the destroys queued after it.
+		if cmd.Kind == nodeapi.CommandLaunch && opts.LaunchConcurrency > 1 && !draining {
+			if earlier := destroys.pending(cmd.RequestIDOf()); len(earlier) > 0 {
+				launches.startBehind(earlier, run)
+				if opts.waitsBehind != nil {
+					opts.waitsBehind(cmd.RequestIDOf())
+				}
+
+				continue
+			}
+
+			if launches.start(ctx, run) {
+				continue
+			}
+		}
+
+		// A DESTROY RUNS BESIDE THE LOOP where launches may overlap, behind the
+		// launches in flight now and every destroy before it (destroyQueue), so a
+		// teardown that waits on a guest never keeps the next launch from being
+		// taken. A draining node keeps it on the loop, where a stop's ordering was
+		// measured. One past the most a poll names, which a plane counting what this
+		// node names never gives, waits for a place, so its poll can name it.
+		if cmd.Kind == nodeapi.CommandDestroy && destroysBeside && !draining {
+			destroys.waitRoom()
+			destroys.submit(cmd.ID, cmd.RequestIDOf(), launches.inFlight(), run)
+
 			continue
 		}
 
-		// EVERYTHING ELSE WAITS FOR THE LAUNCHES IN FLIGHT, so it acts on the node
-		// as it would have when commands ran one at a time.
+		// THE CONTROL PLANE'S TEND AND SWEEP TAKE A TURN IN THE DESTROYS' LINE, behind
+		// the launches in flight now, as they waited for both in line: the reaper sends
+		// both every thirty seconds, and in line each held the loop until every queued
+		// teardown had settled, which is the stall the line exists to end. An
+		// inventory and an upgrade still wait on the loop: what they answer is the
+		// node as it stands once everything before them has run.
+		// UNDER THE CUSTODY MUTEX, as the node's own sweep and tend run: a launch taken
+		// since may be taking custody of its own lost report, and in line neither could
+		// overlap the other. Released before the report, which may take it.
+		if (cmd.Kind == nodeapi.CommandTend || cmd.Kind == nodeapi.CommandSweep) && destroysBeside && !draining {
+			destroys.after(launches.inFlight(), func() error {
+				if opts.inLine != nil {
+					opts.inLine(cmd.Kind)
+				}
+
+				custody.Lock()
+				// THE SECOND SIGNAL MAY HAVE COME while it waited for custody: then it
+				// does not start, as nothing queued does.
+				if destroys.stopped() {
+					custody.Unlock()
+
+					return nil
+				}
+				res := executePolled(ctx, launchCtx, &executing, compute, cmd, draining, c.reqTimeout, c.WireVersion())
+				custody.Unlock()
+
+				return reportOutcome(ctx, launchCtx, c, compute, log, &custody, cmd, res)
+			})
+
+			continue
+		}
+
+		// EVERYTHING ELSE WAITS FOR THE LAUNCHES AND DESTROYS IN FLIGHT, so it acts
+		// on the node as it would have when commands ran one at a time.
+		if opts.inLine != nil {
+			opts.inLine(cmd.Kind)
+		}
 		launches.wait()
+		destroys.wait()
 		if err := launches.failed(); err != nil {
+			return err
+		}
+		if err := destroys.failed(); err != nil {
 			return err
 		}
 

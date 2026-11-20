@@ -1,0 +1,15 @@
+CacheAuthority.lease_id string
+CacheAuthority.job_id string
+CacheAuthority.run_id int64
+CacheAuthority.owner string
+CacheAuthority.repository string
+CacheAuthority.event string
+CacheAuthority.ref tag omitempty
+CacheAuthority.ref string
+CacheAuthority.base_ref tag omitempty
+CacheAuthority.base_ref string
+CacheAuthority.default_ref tag omitempty
+CacheAuthority.default_ref string
+CacheAuthority.proven bool
+CacheAuthority.write_own_ref bool
+CacheAuthority.publish_default bool

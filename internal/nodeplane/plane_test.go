@@ -1511,7 +1511,7 @@ func TestOnlyLaunchesAndDestroysAreTombstoned(t *testing.T) {
 		nodeapi.CommandSweep, nodeapi.CommandTend,
 		nodeapi.CommandLaunch, nodeapi.CommandDestroy,
 	} {
-		n.rememberAbandoned(nodeapi.Command{ID: string(kind), Kind: kind}, "first", time.Now())
+		n.rememberAbandoned(nodeapi.Command{ID: string(kind), Kind: kind}, "first", time.Now(), 0)
 	}
 
 	got := len(n.abandoned)

@@ -1,0 +1,2 @@
+RemoveRunnerRequest.runner_id int64
+RemoveRunnerRequest.runner_name string

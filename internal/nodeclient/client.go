@@ -23,6 +23,7 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1027,7 +1028,20 @@ func (c *Client) PollWindow() time.Duration {
 // ordinary outcome on an idle fleet and not an error — the same shape the plane
 // uses on the other side, for the same reason.
 func (c *Client) Poll(ctx context.Context) (nodeapi.Command, bool, error) {
+	return c.PollHolding(ctx, nil)
+}
+
+// destroysRunningKey carries a poll's HeaderDestroysRunning to doStatus.
+type destroysRunningKey struct{}
+
+// PollHolding is Poll naming the destroy commands this node holds beside its loop,
+// so the plane gives none of them back as lost (VersionDestroysBeside).
+func (c *Client) PollHolding(ctx context.Context, holding []string) (nodeapi.Command, bool, error) {
 	var cmd nodeapi.Command
+
+	if len(holding) > 0 {
+		ctx = context.WithValue(ctx, destroysRunningKey{}, strings.Join(holding, ","))
+	}
 
 	// BOUNDED BY THE NEGOTIATED WINDOW, not by the request timeout. This is the
 	// one call that is meant to block, and the only call whose deadline comes
@@ -1730,6 +1744,10 @@ func (c *Client) doStatus(ctx context.Context, at *target, method, path string, 
 	// process that made it, which is what lets the control plane tell a restart
 	// from a second host wearing the same name.
 	req.Header.Set(nodeapi.HeaderIncarnation, c.incarnation)
+
+	if held, ok := ctx.Value(destroysRunningKey{}).(string); ok && held != "" {
+		req.Header.Set(nodeapi.HeaderDestroysRunning, held)
+	}
 
 	resp, err := at.http.Do(req)
 	if err != nil {

@@ -86,6 +86,9 @@ type Plane struct {
 	// its replacement by design, so ownership tied to liveness would vanish exactly when
 	// the drain still needed to renew.
 	owners map[string]leaseOwner
+	// ownerSeq counts the ownership records launches have made, in the order
+	// they were delivered (leaseOwner.seq).
+	ownerSeq uint64
 	// withdrawn names, per node, the incarnations that withdrew: processes that
 	// said they will never poll again. adoptOwnershipLocked hands what one of them
 	// owned to the node's next process when that process's inventory holds it.
@@ -340,10 +343,15 @@ type abandonedCmd struct {
 	incarnation string
 	requestID   int64
 	at          time.Time
+	// ownersBefore is pending.ownersBefore, for a late destroy's answer.
+	ownersBefore uint64
+	// leaseID is a launch's lease, for a late failure, which ends that lease's
+	// ownership and no other of its request's.
+	leaseID string
 }
 
 // rememberAbandoned records a command the plane gave up waiting for.
-func (n *node) rememberAbandoned(cmd nodeapi.Command, takenBy string, at time.Time) {
+func (n *node) rememberAbandoned(cmd nodeapi.Command, takenBy string, at time.Time, ownersBefore uint64) {
 	// ONLY THE KINDS WHOSE LATE ANSWER MEANS SOMETHING. A sweep or a tend result
 	// arriving late tells the plane nothing it acts on, and letting them share a
 	// bounded budget with launches and destroys let a burst of them EVICT a
@@ -377,10 +385,16 @@ func (n *node) rememberAbandoned(cmd nodeapi.Command, takenBy string, at time.Ti
 	}
 
 	n.abandoned[cmd.ID] = abandonedCmd{
-		kind:        cmd.Kind,
-		incarnation: takenBy,
-		requestID:   cmd.RequestIDOf(),
-		at:          at,
+		kind:         cmd.Kind,
+		incarnation:  takenBy,
+		requestID:    cmd.RequestIDOf(),
+		at:           at,
+		ownersBefore: ownersBefore,
+	}
+	if cmd.Lease != nil {
+		entry := n.abandoned[cmd.ID]
+		entry.leaseID = cmd.Lease.ID
+		n.abandoned[cmd.ID] = entry
 	}
 }
 
@@ -429,6 +443,10 @@ type pending struct {
 	// timeout is AMBIGUOUS rather than a failure, because the node may be acting
 	// on it right now.
 	delivered bool
+	// ownersBefore is Plane.ownerSeq when a node took this command: a destroy
+	// answers for the launches of its request delivered before it, and never for
+	// one delivered after, which the node ran behind it.
+	ownersBefore uint64
 }
 
 // leaseOwner is the node process responsible for a lease.
@@ -439,6 +457,9 @@ type leaseOwner struct {
 	// an ordinary job can end its ownership too. That destroy is the only signal
 	// the wire gets: the lease itself is released in-process by the listener.
 	requestID int64
+	// seq is when a launch's delivery made this record (Plane.ownerSeq), and zero
+	// for one an adoption or a claim made, which every destroy of its request ends.
+	seq uint64
 }
 
 // Option configures a Plane.
@@ -506,6 +527,22 @@ func (p *Plane) WaitersForTest(name string) int {
 	}
 
 	return n.waiters
+}
+
+// InflightForTest reports how many commands a node has taken and not answered.
+//
+// Exported for tests only, for QueuedForTest's reason: a test that needs a command
+// to be in the node's hands before it queues the next cannot see that otherwise.
+func (p *Plane) InflightForTest(name string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		return 0
+	}
+
+	return len(n.inflight)
 }
 
 // QueuedForTest reports how many commands are waiting to be taken.
@@ -1427,7 +1464,7 @@ func (p *Plane) register(
 		// superseded before it reports, and discarding that late result leaves the
 		// ownership record alive after that process exits, so the plane reports custody
 		// forever for a container that has already been removed.
-		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
+		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now(), pend.ownersBefore)
 
 		p.answerLocked(pend, nodeapi.CommandResult{
 			ID:      id,
@@ -1777,16 +1814,39 @@ func (p *Plane) ownedByLocked(requestID int64, node, incarnation string) bool {
 // signal for an ordinary successful job: its lease is then released through the
 // allocator, in-process, without ever touching this wire. Without this, every
 // completed job left an entry for the life of the installation.
-func (p *Plane) forgetForRequest(requestID int64) {
+//
+// ONLY THE RECORDS MADE BY THE TIME upTo (Plane.ownerSeq when the destroy that proves
+// it was taken): a launch of the same request delivered after that destroy ran
+// after it, on compute the destroy never touched, and forgetting its record would
+// leave its compute owned by no process.
+func (p *Plane) forgetForRequest(requestID int64, upTo uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.forgetForRequestLocked(requestID)
+	p.forgetForRequestLocked(requestID, upTo)
 }
 
-func (p *Plane) forgetForRequestLocked(requestID int64) {
+func (p *Plane) forgetForRequestLocked(requestID int64, upTo uint64) {
 	for id, owner := range p.owners {
-		if owner.requestID == requestID {
+		if owner.requestID == requestID && owner.seq <= upTo {
+			delete(p.owners, id)
+		}
+	}
+}
+
+// forgetForRequestOn is forgetForRequest for a destroy asked of every node, each of
+// which took it at its own moment: a record on a node is forgotten up to when that
+// node took it, and one no delivery made (seq zero) wherever it is.
+func (p *Plane) forgetForRequestOn(requestID int64, upTo map[string]uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for id, owner := range p.owners {
+		if owner.requestID != requestID {
+			continue
+		}
+
+		if took, answered := upTo[owner.node]; owner.seq == 0 || answered && owner.seq <= took {
 			delete(p.owners, id)
 		}
 	}
@@ -1815,11 +1875,11 @@ func (p *Plane) forgetOwnedBy(node, leaseID, incarnation string) bool {
 }
 
 // tookCommand reports which process was handed this command.
-func (p *Plane) tookCommand(pend *pending) string {
+func (p *Plane) tookCommand(pend *pending) (string, uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	return pend.incarnation
+	return pend.incarnation, pend.ownersBefore
 }
 
 // OwnerOfRequest reports which process holds the compute a request was launched
@@ -1993,7 +2053,7 @@ func (p *Plane) adoptOwnershipLocked(
 			p.owners[id] = leaseOwner{node: node, incarnation: incarnation}
 		case inventoryKnown && owner.node == node && owner.incarnation != incarnation &&
 			p.withdrawn[node][owner.incarnation]:
-			p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: owner.requestID}
+			p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: owner.requestID, seq: owner.seq}
 		}
 	}
 
@@ -2098,7 +2158,7 @@ func (p *Plane) ClaimCustody(node, incarnation string, claims []CustodyClaim) ([
 			continue
 		}
 
-		p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: claim.RequestID}
+		p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: claim.RequestID, seq: owner.seq}
 		held = append(held, id)
 		added = append(added, id)
 	}
@@ -2331,7 +2391,8 @@ func (p *Plane) Nodes() []string {
 //
 // An empty command with ok=false is how a quiet poll ends. The node re-polls
 // immediately; that is not an error and must not be treated as one.
-func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi.Command, bool, error) {
+func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string, holding ...string,
+) (nodeapi.Command, bool, error) {
 	p.mu.Lock()
 
 	n, ok := p.nodes[nodeName]
@@ -2354,7 +2415,7 @@ func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi
 
 	n.lastSeen = p.now()
 
-	if cmd, took := p.takeLocked(n, incarnation); took {
+	if cmd, took := p.takeLocked(n, incarnation, holding); took {
 		p.mu.Unlock()
 
 		return cmd, true, nil
@@ -2386,7 +2447,7 @@ func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi
 		case <-wait:
 		}
 
-		cmd, took, err := p.takeAfterWake(nodeName, incarnation)
+		cmd, took, err := p.takeAfterWake(nodeName, incarnation, holding)
 		if err != nil || took {
 			return cmd, took, err
 		}
@@ -2400,7 +2461,7 @@ func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi
 
 // takeAfterWake takes the node's next command once a poll has been woken,
 // checking again that the poller still owns the name.
-func (p *Plane) takeAfterWake(nodeName, incarnation string) (nodeapi.Command, bool, error) {
+func (p *Plane) takeAfterWake(nodeName, incarnation string, holding []string) (nodeapi.Command, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -2415,7 +2476,7 @@ func (p *Plane) takeAfterWake(nodeName, incarnation string) (nodeapi.Command, bo
 		return nodeapi.Command{}, false, err
 	}
 
-	cmd, took := p.takeLocked(n, incarnation)
+	cmd, took := p.takeLocked(n, incarnation, holding)
 
 	return cmd, took, nil
 }
@@ -2446,16 +2507,18 @@ func supersededLocked(n *node, name, incarnation string) error {
 
 // lostDestroyLocked returns a destroy this process was given and has not answered.
 //
-// A PROCESS THAT POLLS AGAIN HAS LOST IT. A node runs a destroy in line and
-// reports it before its next poll, so an unanswered one means the answer never
-// came or the command never arrived: a long poll the node had abandoned, whose
+// A PROCESS THAT POLLS AGAIN HAS LOST IT, UNLESS IT NAMES IT. A node below
+// VersionDestroysBeside runs a destroy in line and reports it before its next poll,
+// so an unanswered one means the answer never came or the command never arrived;
+// one at or above it may run destroys beside its loop and names each it holds in
+// holding (HeaderDestroysRunning), and only those it does not name are lost: a long poll the node had abandoned, whose
 // handler the server had not yet seen go, can take a command and write it to a
 // closed connection. That happens when a node turns from its ordinary loop to a
 // drain, and without this the destroy waited out the whole command timeout
 // while the process that should run it polled beside it. A destroy is addressed
 // by request id and is idempotent, so giving it again is safe; a launch or an
 // upgrade is not, and is never given twice.
-func lostDestroyLocked(n *node, incarnation string) (nodeapi.Command, bool) {
+func lostDestroyLocked(n *node, incarnation string, holding []string) (nodeapi.Command, bool) {
 	if incarnation == "" {
 		return nodeapi.Command{}, false
 	}
@@ -2464,6 +2527,12 @@ func lostDestroyLocked(n *node, incarnation string) (nodeapi.Command, bool) {
 
 	for _, pend := range n.inflight {
 		if pend.cmd.Kind != nodeapi.CommandDestroy || pend.incarnation != incarnation {
+			continue
+		}
+
+		// A DESTROY THE NODE SAYS IT HOLDS IS NOT LOST: it is running beside the
+		// node's loop, or queued there (VersionDestroysBeside).
+		if slices.Contains(holding, pend.cmd.ID) {
 			continue
 		}
 
@@ -2483,14 +2552,70 @@ func lostDestroyLocked(n *node, incarnation string) (nodeapi.Command, bool) {
 // it. A launch is rendered for one provider before it enters this queue, so a
 // replacement process using another provider gets a clean failure rather than
 // a command it cannot interpret.
-func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) {
-	if cmd, lost := lostDestroyLocked(n, incarnation); lost {
+func (p *Plane) takeLocked(n *node, incarnation string, holding []string) (nodeapi.Command, bool) {
+	if cmd, lost := lostDestroyLocked(n, incarnation, holding); lost {
 		return cmd, true
 	}
 
-	for len(n.queue) > 0 {
-		pend := n.queue[0]
-		n.queue = n.queue[1:]
+	// HELD BACK, AND LEFT IN THE QUEUE IN ORDER: a destroy past the most a node holds
+	// (nodeapi.MaxDestroysRunning), a launch of a request whose destroy is out, and
+	// everything of a request behind one of its own held back. A node may run destroys
+	// beside its loop (VersionDestroysBeside): one given more than its poll names would
+	// have the rest given back as lost on every poll, and a launch given while its
+	// request's destroy runs could be torn down by it, since a destroy names a request.
+	// NOTHING ELSE THAT IS NOT A LAUNCH OR A DESTROY passes a command held back, but a
+	// log read or a terminal: an inventory or an upgrade is fenced on what was
+	// dispatched before it. A node that
+	// runs commands one at a time has at most one destroy out, and polls only once it
+	// is answered.
+	//
+	// OUT IS WHAT THIS PLANE GAVE AND WHAT THE NODE SAYS IT HOLDS, together: a destroy
+	// answered, or given up on after its timeout, can still be in the node's hands
+	// until its report's reply reaches it, and this poll names it.
+	out := map[string]bool{}
+	for _, id := range holding {
+		out[id] = true
+	}
+	destroying := map[int64]bool{}
+	for _, pend := range n.inflight {
+		if pend.cmd.Kind == nodeapi.CommandDestroy {
+			out[pend.cmd.ID] = true
+			destroying[pend.cmd.RequestIDOf()] = true
+		}
+	}
+	destroysOut := len(out)
+	behind := map[int64]bool{}
+	heldBack, barrier := false, false
+
+	for i := 0; i < len(n.queue); {
+		pend := n.queue[i]
+		request := pend.cmd.RequestIDOf()
+		ordered := pend.cmd.Kind == nodeapi.CommandLaunch || pend.cmd.Kind == nodeapi.CommandDestroy
+		// A LOG READ OR A TERMINAL touches no lease and runs beside everything on the
+		// node, so nothing holds it back and it holds back nothing.
+		independent := pend.cmd.Kind == nodeapi.CommandReadLog || pend.cmd.Kind == nodeapi.CommandAttach
+
+		switch {
+		case independent:
+		case barrier, heldBack && (!ordered || request == 0):
+			// A BARRIER BEHIND A COMMAND HELD BACK, and everything behind it but the
+			// independent, stays.
+			barrier = true
+			i++
+
+			continue
+		case request == 0 || !ordered:
+		case behind[request],
+			pend.cmd.Kind == nodeapi.CommandDestroy && destroysOut >= nodeapi.MaxDestroysRunning,
+			pend.cmd.Kind == nodeapi.CommandLaunch && destroying[request]:
+			behind[request] = true
+			heldBack = true
+			i++
+
+			continue
+		}
+
+		n.queue = slices.Delete(n.queue, i, i+1)
 
 		if pend.expectedIncarnation != "" && pend.expectedIncarnation != incarnation {
 			p.answerLocked(pend, nodeapi.CommandResult{
@@ -2535,6 +2660,7 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 		pend.delivered = true
 		pend.incarnation = incarnation
 		pend.takenLedgerEpoch = n.ledgerEpoch
+		pend.ownersBefore = p.ownerSeq
 		n.inflight[pend.cmd.ID] = pend
 
 		// THE LEASE FOLLOWS THE PROCESS THAT WAS GIVEN IT. This is what lets a
@@ -2546,7 +2672,9 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 				p.owners = make(map[string]leaseOwner)
 			}
 
+			p.ownerSeq++
 			p.owners[pend.cmd.Lease.ID] = leaseOwner{
+				seq:         p.ownerSeq,
 				node:        n.name,
 				incarnation: incarnation,
 				requestID:   pend.cmd.RequestIDOf(),
@@ -2610,6 +2738,16 @@ func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) 
 	}
 
 	delete(n.inflight, res.ID)
+
+	// A DESTROY ANSWERED MAY FREE WHAT takeLocked HELD BACK behind it, which a poll
+	// parked now would otherwise not see until its window ended. A signal, not a
+	// queue, as dispatch sends it.
+	if pend.cmd.Kind == nodeapi.CommandDestroy && len(n.queue) > 0 {
+		select {
+		case n.waiting <- struct{}{}:
+		default:
+		}
+	}
 
 	// OWNERSHIP OUTLIVES THE COMMAND, and tying it to the command was a way to
 	// lose a container. A launch that SUCCEEDS leaves a container running; deleting
@@ -2778,7 +2916,7 @@ func (p *Plane) Withdraw(ctx context.Context, name, incarnation string) error {
 		// own report was lost — or is still inside the handler, cut on the client
 		// side by the stop signal, which is why the tombstone has to survive the
 		// record it lives on (see lateResults).
-		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
+		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now(), pend.ownersBefore)
 
 		p.answerLocked(pend, nodeapi.CommandResult{
 			ID:      id,
@@ -2929,21 +3067,26 @@ func (p *Plane) settleAbandonedLocked(
 		// so every later destroy is answered by its replacement — which
 		// cannot confirm somebody else's ownership — and the plane reports
 		// custody forever while the listener heartbeats its capacity.
-		p.forgetForRequestLocked(entry.requestID)
+		p.forgetForRequestLocked(entry.requestID, entry.ownersBefore)
 
 		return nil
 
 	case entry.kind == nodeapi.CommandLaunch && res.OK:
 		return ErrTakeCustody
 
-	case entry.kind == nodeapi.CommandLaunch && !res.Custody &&
-		(entry.incarnation == "" || p.ownedByLocked(entry.requestID, nodeName, entry.incarnation)):
+	case entry.kind == nodeapi.CommandLaunch && !res.Custody:
 		// A FAILED LATE LAUNCH NEEDS NO HANDOFF: nothing is running, so there
-		// is nothing to hold — and nothing left to own either. ONLY WHILE ITS OWN
-		// PROCESS OWNS IT: a lease since handed to the node's next process (#374)
-		// is that process's record, and a failure that may have left compute
-		// (Custody) keeps whatever owns it.
-		p.forgetForRequestLocked(entry.requestID)
+		// is nothing to hold — and nothing left to own either. ITS OWN LEASE'S
+		// RECORD ALONE, AND ONLY WHILE ITS OWN PROCESS HOLDS IT: a later launch of
+		// the same request is another lease, whose compute may be running; a lease
+		// since handed to the node's next process (#374) is that process's record;
+		// and a failure that may have left compute (Custody) keeps whatever owns it.
+		// A launch that named no lease ends nothing.
+		owner, owned := p.owners[entry.leaseID]
+		if entry.leaseID != "" && owned && owner.requestID == entry.requestID && owner.node == nodeName &&
+			(entry.incarnation == "" || owner.incarnation == entry.incarnation) {
+			delete(p.owners, entry.leaseID)
+		}
 
 		return nil
 
