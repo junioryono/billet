@@ -191,7 +191,18 @@ func (l *Listener) launchReporting(ctx context.Context, lease *alloc.Lease, job 
 	l.order.launchBegins(l.tier)
 	err := l.runner.Launch(ctx, lease, job)
 	l.order.launchEnds(l.tier)
-	l.order.launchResult(l.tier, err != nil)
+
+	return l.launchSettled(ctx, lease, job, err)
+}
+
+// launchSettled is what follows a launch's call: err is what it returned, or
+// dispatch.ErrWithdrawn for a launch withdrawn before it was ever called.
+func (l *Listener) launchSettled(ctx context.Context, lease *alloc.Lease, job dispatch.Job, err error) (bool, error) {
+	// A WITHDRAWAL SAYS NOTHING OF THE HOST, failed or well: GitHub cancelled the job
+	// before any node took its launch.
+	if !errors.Is(err, dispatch.ErrWithdrawn) {
+		l.order.launchResult(l.tier, err != nil)
+	}
 
 	if err == nil {
 		// STILL OURS? The mutex was released for the duration of the launch, and
@@ -274,9 +285,14 @@ func (l *Listener) launchReporting(ctx context.Context, lease *alloc.Lease, job 
 		return false, nil
 	}
 
-	l.log.Error("could not start the compute for an assigned job; handing the capacity back",
-		"tier", l.tier, "request", job.RequestID, "run", job.RunID,
-		"lease", lease.ID, "error", err)
+	if errors.Is(err, dispatch.ErrWithdrawn) {
+		l.log.Info("handing back the capacity of a launch withdrawn before any node took it",
+			"tier", l.tier, "request", job.RequestID, "run", job.RunID, "lease", lease.ID)
+	} else {
+		l.log.Error("could not start the compute for an assigned job; handing the capacity back",
+			"tier", l.tier, "request", job.RequestID, "run", job.RunID,
+			"lease", lease.ID, "error", err)
+	}
 
 	// Not fatal. The launch already failed; failing the listener as well would
 	// take every tier down over one job that GitHub will simply reassign.

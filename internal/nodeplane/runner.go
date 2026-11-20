@@ -200,11 +200,34 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Jo
 		return fmt.Errorf("%w: node %s: %s", dispatch.ErrCustody, n.name, res.Error)
 	}
 
+	if r.plane.wasWithdrawn(pend) {
+		return fmt.Errorf("%w: lease %s, queued for node %s", dispatch.ErrWithdrawn, lease.ID, n.name)
+	}
+
 	if res.Draining {
 		r.plane.markDraining(ctx, n.name, pend)
 	}
 
 	return fmt.Errorf("node %s could not launch lease %s: %s", n.name, lease.ID, res.Error)
+}
+
+// WithdrawLaunch takes back the launch of leaseID if no node has taken it yet; that
+// launch then returns dispatch.ErrWithdrawn.
+func (r *Runner) WithdrawLaunch(leaseID string) bool {
+	return r.plane.withdrawQueuedLaunch(leaseID)
+}
+
+// ForgetWithdrawal drops a withdrawal remembered for a launch that has returned.
+func (r *Runner) ForgetWithdrawal(leaseID string) {
+	r.plane.forgetWithdrawal(leaseID)
+}
+
+// wasWithdrawn reports whether a launch was taken back before any node took it.
+func (p *Plane) wasWithdrawn(pend *pending) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return pend.withdrawn
 }
 
 // Destroy asks whichever node holds a request's compute to remove it.
@@ -843,6 +866,17 @@ func (p *Plane) holderReplacedLocked(nodeName string, owner leaseOwner) bool {
 // ONLY A LAUNCH TAKES IT. A destroy, sweep, tend or inventory cannot create
 // compute, and charging them would void proofs for nothing.
 func (p *Plane) queueLocked(ctx context.Context, n *node, pend *pending) error {
+	// A LAUNCH WITHDRAWN BEFORE IT ARRIVED is refused here, queued nowhere and fenced
+	// nowhere: nothing started (withdrawQueuedLaunch).
+	if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil {
+		if _, withdrawn := p.withdrawnLaunches[pend.cmd.Lease.ID]; withdrawn {
+			delete(p.withdrawnLaunches, pend.cmd.Lease.ID)
+
+			return fmt.Errorf("%w: lease %s, before it was queued for node %s",
+				dispatch.ErrWithdrawn, pend.cmd.Lease.ID, n.name)
+		}
+	}
+
 	if pend.cmd.Kind == nodeapi.CommandLaunch && p.registrar != nil {
 		if _, err := p.registrar.BumpDispatch(ctx, n.name); err != nil {
 			// THE LAUNCH FAILS RATHER THAN GOING OUT UNFENCED, the same answer a
@@ -975,6 +1009,9 @@ func commandID() (string, error) {
 // Compile-time proof that a remote node is substitutable for a local one. If
 // dispatch.Runner grows a method, this fails here rather than at the wiring.
 var _ dispatch.Runner = (*Runner)(nil)
+
+// And that it can take back a launch no node has taken.
+var _ dispatch.LaunchWithdrawer = (*Runner)(nil)
 
 var _ = errors.Is
 

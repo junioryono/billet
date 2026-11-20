@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +38,21 @@ type launchFlight struct {
 	leaseID    string
 	requestID  int64
 	runnerName string
-	done       chan struct{}
+	// jobID is GitHub's identity of the job the launch was bought for, which a
+	// cancellation is matched on: a request id can be reused, and a cancellation
+	// matched on it alone could withdraw another job's launch.
+	jobID string
+	// runID is the workflow run the job belongs to, which a cancellation must also
+	// name, or not contradict: a job id alone is not unique across runs
+	// (sameActualJob).
+	runID int64
+	// withdrawAsked records that this launch's withdrawal was asked for, once.
+	// Guarded by the listener's mutex.
+	withdrawAsked bool
+	// withdrawn closes when this launch's withdrawal is asked for, so one still waiting
+	// for a slot takes none.
+	withdrawn chan struct{}
+	done      chan struct{}
 }
 
 // startLaunch runs the launch of an already-bought lease beside the poll goroutine.
@@ -50,6 +65,9 @@ func (l *Listener) startLaunch(ctx context.Context, lease *alloc.Lease, job disp
 		leaseID:    lease.ID,
 		requestID:  job.RequestID,
 		runnerName: provider.InstanceName(lease.ID),
+		jobID:      job.JobID,
+		runID:      job.RunID,
+		withdrawn:  make(chan struct{}),
 		done:       make(chan struct{}),
 	}
 
@@ -65,7 +83,16 @@ func (l *Listener) startLaunch(ctx context.Context, lease *alloc.Lease, job disp
 	l.mu.Unlock()
 
 	l.launches.Go(func() {
-		slots <- struct{}{}
+		// A LAUNCH WITHDRAWN WHILE IT WAITS FOR ITS TURN takes no turn: it settles as
+		// one that started nothing, at once, rather than behind launches it has nothing
+		// to do with.
+		select {
+		case slots <- struct{}{}:
+		case <-flight.withdrawn:
+			l.withdrawnBeforeItsTurn(ctx, flight, lease, job)
+
+			return
+		}
 
 		// A LAUNCH HANDED OFF IS FINISHED, NOT CANCELLED, BY A STOP (#393): cancelled
 		// partway, it cannot verify what it started or settle its lease, and a drain then
@@ -91,31 +118,56 @@ func (l *Listener) startLaunch(ctx context.Context, lease *alloc.Lease, job disp
 
 		<-slots
 
-		l.mu.Lock()
-		delete(l.flights, lease.ID)
-		// UNKNOWN UNTIL COUNTED AGAIN: a launch can fail and release its lease with
-		// no error, and a demand published as met while its job waits is what a
-		// drain would read as drained. The wake below counts it, except in a drain,
-		// whose next empty exchange does.
-		l.demandKnown = false
-		if err != nil && l.launchFailure == nil {
-			l.launchFailure = err
-		}
-		l.mu.Unlock()
-
-		close(flight.done)
-
-		// ONLY A LAUNCH THAT STARTED SOMETHING WAKES THE LOOP TO BUY THE NEXT, or one that
-		// must stop it. launch settles an ordinary failure itself and returns no error,
-		// and waking on that would buy and fail again at once for as long as the node
-		// refuses, with nothing to slow it. A failure's retry waits for the next poll, as
-		// it did when the loop waited for every launch.
-		if !started && err == nil {
-			return
-		}
-
-		l.wakeLoop()
+		l.endFlight(flight, lease, started, err)
 	})
+}
+
+// withdrawnBeforeItsTurn settles a launch withdrawn while it waited for a slot, as a
+// launch that started nothing: the runner was never called.
+func (l *Listener) withdrawnBeforeItsTurn(ctx context.Context, flight *launchFlight, lease *alloc.Lease,
+	job dispatch.Job,
+) {
+	started, err := l.launchSettled(context.WithoutCancel(ctx), lease, job, dispatch.ErrWithdrawn)
+	l.endFlight(flight, lease, started, err)
+}
+
+// endFlight is what every launch flight ends with, its launch called or not.
+func (l *Listener) endFlight(flight *launchFlight, lease *alloc.Lease, started bool, err error) {
+	l.mu.Lock()
+	delete(l.flights, lease.ID)
+	asked := flight.withdrawAsked
+	l.mu.Unlock()
+
+	// A WITHDRAWAL THE RUNNER REMEMBERED FOR THIS LAUNCH ENDS WITH IT, refused or
+	// not: it was for this call alone. Asked after the flight is gone, so no
+	// withdrawal can be asked for it after this.
+	if withdrawer, ok := l.runner.(dispatch.LaunchWithdrawer); ok && asked {
+		withdrawer.ForgetWithdrawal(lease.ID)
+	}
+
+	l.mu.Lock()
+	// UNKNOWN UNTIL COUNTED AGAIN: a launch can fail and release its lease with
+	// no error, and a demand published as met while its job waits is what a
+	// drain would read as drained. The wake below counts it, except in a drain,
+	// whose next empty exchange does.
+	l.demandKnown = false
+	if err != nil && l.launchFailure == nil {
+		l.launchFailure = err
+	}
+	l.mu.Unlock()
+
+	close(flight.done)
+
+	// ONLY A LAUNCH THAT STARTED SOMETHING WAKES THE LOOP TO BUY THE NEXT, or one that
+	// must stop it. launch settles an ordinary failure itself and returns no error,
+	// and waking on that would buy and fail again at once for as long as the node
+	// refuses, with nothing to slow it. A failure's retry waits for the next poll, as
+	// it did when the loop waited for every launch.
+	if !started && err == nil {
+		return
+	}
+
+	l.wakeLoop()
 }
 
 // wakeLoop asks the loop to reconcile again, beside a poll that may be out for a while.
@@ -336,11 +388,83 @@ func (l *Listener) awaitFlightsNamedBy(ctx context.Context, msg *Message) error 
 		}
 	}
 
+	// BEFORE ANY WAIT, by the job's own identity, never a request id alone, which can
+	// be reused: a cancellation that names a request would otherwise wait below for
+	// the very launch it should withdraw.
+	for i := range msg.Completed {
+		if job := msg.Completed[i]; job.RunnerName == "" && job.JobID != "" && job.RunID != 0 &&
+			strings.EqualFold(job.Result, resultCanceled) {
+			l.withdrawCancelledLaunch(job)
+		}
+	}
+
 	_, err := l.awaitFlights(ctx, func(flight *launchFlight) bool {
 		return names[flight.runnerName] || requests[flight.requestID]
 	})
 
 	return err
+}
+
+// withdrawCancelledLaunch takes back, before any node has taken it, the launch of a job
+// GitHub cancelled before a runner took it, and the message that names the job then
+// waits for nothing.
+//
+// MATCHED EXACTLY: by GitHub's job id and run, both named by the cancellation and by
+// the launch's own assignment, and only when exactly one launch in flight is that job.
+// A request id alone can be reused, a job id alone is not unique across runs, and an
+// assignment that named no run says nothing about which run it was; a cancellation that
+// cannot be matched so withdraws nothing, and is waited for as before.
+//
+// A LAUNCH NO NODE HAS TAKEN IS WAITED FOR UNTIL THE COMMAND'S TIMEOUT OTHERWISE, and
+// this tier hears nothing from GitHub meanwhile. On 2026-11-20 a node did not take a
+// launch for ten minutes; GitHub cancelled the assignment at five, assigned the job
+// again, and cancelled that too, all while this tier's message path waited on the
+// first launch, so the second assignment was read together with its cancellation and
+// never bought. GitHub did not offer the job a third time. ONLY ONE NO NODE HAS TAKEN
+// (dispatch.LaunchWithdrawer): a launch already handed over may be starting compute,
+// and is waited for as before.
+func (l *Listener) withdrawCancelledLaunch(job dispatch.Job) {
+	withdrawer, ok := l.runner.(dispatch.LaunchWithdrawer)
+	if !ok {
+		return
+	}
+
+	l.mu.Lock()
+	var only *launchFlight
+	for _, flight := range l.flights {
+		// AND THE REQUEST, where the cancellation names one: the resolver finds the
+		// cancelled job by it, and a withdrawn launch's lease is gone by then. One that
+		// names none finds a direct assignment by the identity its job id keys, which a
+		// request below zero is (dispatch.Job).
+		if flight.jobID != job.JobID || flight.runID != job.RunID ||
+			job.RequestID != flight.requestID && (job.RequestID != 0 || flight.requestID >= 0) {
+			continue
+		}
+		if only != nil {
+			l.mu.Unlock()
+
+			return
+		}
+		only = flight
+	}
+	if only == nil || only.withdrawAsked {
+		l.mu.Unlock()
+
+		return
+	}
+	// ASKED UNDER THE MUTEX THE FLIGHT ENDS UNDER, so the withdrawal is made either
+	// before the flight's end reads that it was asked, and is forgotten after, or not at
+	// all, the flight being gone. The runner's call takes only its own lock, and nothing
+	// that holds that lock waits for this one.
+	only.withdrawAsked = true
+	close(only.withdrawn)
+	withdrawn := withdrawer.WithdrawLaunch(only.leaseID)
+	l.mu.Unlock()
+
+	if withdrawn {
+		l.log.Info("GitHub cancelled a job before any node took its launch; the launch was "+
+			"withdrawn, and its capacity is handed back", "tier", l.tier, "lease", only.leaseID)
+	}
 }
 
 // awaitFlightsResolved waits for the launches a resolved message's completions turn

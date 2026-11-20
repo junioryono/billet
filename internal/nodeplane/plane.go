@@ -86,6 +86,9 @@ type Plane struct {
 	// its replacement by design, so ownership tied to liveness would vanish exactly when
 	// the drain still needed to renew.
 	owners map[string]leaseOwner
+	// withdrawnLaunches is the leases whose launch was withdrawn before it was
+	// queued (withdrawQueuedLaunch), until the listener forgets it.
+	withdrawnLaunches map[string]struct{}
 	// ownerSeq counts the ownership records launches have made, in the order
 	// they were delivered (leaseOwner.seq).
 	ownerSeq uint64
@@ -443,6 +446,9 @@ type pending struct {
 	// timeout is AMBIGUOUS rather than a failure, because the node may be acting
 	// on it right now.
 	delivered bool
+	// withdrawn records a launch taken back before any node took it
+	// (withdrawQueuedLaunch), which its caller is told as dispatch.ErrWithdrawn.
+	withdrawn bool
 	// ownersBefore is Plane.ownerSeq when a node took this command: a destroy
 	// answers for the launches of its request delivered before it, and never for
 	// one delivered after, which the node ran behind it.
@@ -1579,6 +1585,68 @@ func (p *Plane) wireResponse(negotiated int, node string) nodeapi.RegisterRespon
 //
 // The channel is buffered and written once; a caller that has already given up
 // leaves nobody reading, and this must not stall the plane's mutex on that.
+// withdrawQueuedLaunch takes back a launch of leaseID that no node has taken, and
+// reports whether it found one. ONLY ONE NO NODE HAS: a launch already handed over may
+// be starting compute, and its answer is the node's to give. The queue holds only
+// commands no node has taken (takeLocked moves one to inflight as it hands it over),
+// and this looks in one hold of the mutex, so no poll can take it between the look
+// and the removal.
+//
+// AND ONE NOT QUEUED YET: the listener publishes a launch before it has a slot to send
+// it, so a cancellation can come first. The withdrawal is then remembered, and the
+// launch is refused as it arrives (queueLocked), until the listener says that launch's
+// call has returned (forgetWithdrawal); no clock ends it, since a launch can wait for a
+// slot for as long as the launches ahead of it take. Only a launch some node is holding
+// is not withdrawn.
+func (p *Plane) withdrawQueuedLaunch(leaseID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	isLaunch := func(pend *pending) bool {
+		return pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil && pend.cmd.Lease.ID == leaseID
+	}
+
+	for _, n := range p.nodes {
+		for _, pend := range n.inflight {
+			if isLaunch(pend) {
+				return false
+			}
+		}
+	}
+
+	for _, n := range p.nodes {
+		for i, pend := range n.queue {
+			if !isLaunch(pend) {
+				continue
+			}
+
+			n.queue = slices.Delete(n.queue, i, i+1)
+			pend.withdrawn = true
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID, Error: "withdrawn before any node took it",
+			})
+
+			return true
+		}
+	}
+
+	if p.withdrawnLaunches == nil {
+		p.withdrawnLaunches = make(map[string]struct{})
+	}
+	p.withdrawnLaunches[leaseID] = struct{}{}
+
+	return true
+}
+
+// forgetWithdrawal drops what withdrawQueuedLaunch remembered for leaseID, once the
+// launch it was for has returned.
+func (p *Plane) forgetWithdrawal(leaseID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.withdrawnLaunches, leaseID)
+}
+
 func (p *Plane) answerLocked(pend *pending, res nodeapi.CommandResult) {
 	select {
 	case pend.done <- res:
