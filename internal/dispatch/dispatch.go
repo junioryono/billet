@@ -65,6 +65,22 @@ type BoundCompletionAwareRunner interface {
 // still running on it.
 var ErrCustody = errors.New("dispatch: the runner is holding this lease's capacity")
 
+// LaunchWithdrawer is a Runner that can take back a launch no host has taken yet.
+//
+// WithdrawLaunch reports whether it did; a launch already handed to a host is never
+// withdrawn, since it may be starting compute. A withdrawn launch returns
+// ErrWithdrawn, and so does one whose withdrawal came before it reached the runner,
+// which the runner remembers until ForgetWithdrawal: the caller says when that
+// launch's call has returned.
+type LaunchWithdrawer interface {
+	WithdrawLaunch(leaseID string) bool
+	ForgetWithdrawal(leaseID string)
+}
+
+// ErrWithdrawn means a launch was taken back before any host took it, so nothing
+// started and the caller releases the lease. It is not a host's failure.
+var ErrWithdrawn = errors.New("dispatch: the launch was withdrawn before any host took it")
+
 // ErrHolderUnavailable means result-dependent teardown has not reached the
 // process that holds the compute, so its durable completion must be retried.
 var ErrHolderUnavailable = errors.New("dispatch: the completion holder is unavailable")
