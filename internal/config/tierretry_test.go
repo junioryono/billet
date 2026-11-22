@@ -91,3 +91,46 @@ func TestOnlyATierThatRerunsAsksItsTargetForActionsWrite(t *testing.T) {
 		}
 	}
 }
+
+// RETRY.STRANDED IS OFF UNLESS WRITTEN TRUE, and a tier that sets it asks its
+// target, and only its target, for actions: write, as one that re-runs does.
+func TestRetryStrandedIsOptInAndAsksItsTargetForActionsWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name, block string
+		want        bool
+	}{
+		{name: "absent is off", block: ""},
+		{name: "false is off", block: "    retry: {stranded: false}\n"},
+		{name: "true", block: "    retry: {stranded: true}\n", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, withRetry(tc.block)))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			tier, ok := cfg.TierByLabel("billet-8vcpu-ubuntu-2404")
+			if !ok {
+				t.Fatal("the tier is gone")
+			}
+			if got := tier.RecoversStranded(); got != tc.want {
+				t.Errorf("RecoversStranded = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	cfg := &Config{
+		Targets: []GitHubConfig{
+			{Name: "api", Org: "acme", AppID: 1, InstallationID: 1, PrivateKeyPath: "/k1"},
+			{Name: "web", Org: "other", AppID: 2, InstallationID: 2, PrivateKeyPath: "/k2"},
+		},
+		Tiers: []Tier{
+			{Label: "a", Target: "api", Retry: &TierRetry{Stranded: true}},
+			{Label: "b", Target: "web", Retry: &TierRetry{}},
+		},
+	}
+	for name, want := range map[string]bool{"api": true, "web": false} {
+		if got := cfg.TargetNeedsActionsWrite(name); got != want {
+			t.Errorf("TargetNeedsActionsWrite(%q) = %v, want %v", name, got, want)
+		}
+	}
+}

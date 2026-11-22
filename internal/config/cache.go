@@ -435,13 +435,14 @@ func (c *Config) TargetNeedsRunEvidence(name string) bool {
 }
 
 // TargetNeedsActionsWrite reports whether a tier of the named target re-runs a
-// job billet disrupted, which is what asks that target's GitHub App for
-// `actions: write`. PER TARGET for TargetNeedsRunEvidence's reason, and it is a
-// wider grant than that one, so a target with no such tier refuses it.
+// job billet disrupted or recovers one GitHub stopped offering, which is what asks
+// that target's GitHub App for `actions: write`. PER TARGET for
+// TargetNeedsRunEvidence's reason, and it is a wider grant than that one, so a
+// target with no such tier refuses it.
 func (c *Config) TargetNeedsActionsWrite(name string) bool {
 	for i := range c.Tiers {
 		target, ok := c.TierTarget(&c.Tiers[i])
-		if ok && target.Name == name && c.Tiers[i].DisruptedReruns() > 0 {
+		if ok && target.Name == name && (c.Tiers[i].DisruptedReruns() > 0 || c.Tiers[i].RecoversStranded()) {
 			return true
 		}
 	}

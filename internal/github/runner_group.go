@@ -99,6 +99,10 @@ var errNoAnswer = errors.New("github: GitHub did not answer in full")
 // errNotSent marks a request that could not be built, which drew on no budget.
 var errNotSent = errors.New("github: the request was not sent")
 
+// ErrNotSent marks a request that never left: it could not be built, or no
+// installation token could be had for it. Nothing it asked for can have happened.
+var ErrNotSent = errNotSent
+
 // NewRunnerGroupPolicyClientAt builds the policy client for one target on the
 // REST API at base, on an HTTP client of its own.
 //

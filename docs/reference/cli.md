@@ -125,7 +125,7 @@ Create the GitHub App in a browser, install it on the organization or the reposi
 | `--name` | a suggested App name |
 | `--no-browser` | print URLs instead of opening a browser |
 | `--actions-read` | request `actions: read` (default `true`), which default-branch cache publication needs to prove a job's branch from GitHub's record of its run; `--actions-read=false` leaves it out |
-| `--actions-write` | request `actions: write`, which a tier with `retry.disrupted` needs to re-run a job billet disrupted. It includes read, and GitHub's grant also covers dispatching workflows and deleting logs, artifacts and caches, none of which billet does |
+| `--actions-write` | request `actions: write`, which a tier with `retry.disrupted` needs to re-run a job billet disrupted, and one with `retry.stranded` to cancel and re-run a run whose job GitHub stopped offering. It includes read, and GitHub's grant also covers dispatching workflows and deleting logs, artifacts and caches, none of which billet does |
 | `--port` | a fixed loopback callback port, for `ssh -L` |
 
 ### `billet broker serve --config broker.yaml`

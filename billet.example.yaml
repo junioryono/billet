@@ -1202,6 +1202,19 @@ tiers:
   # (`billet github-app create --actions-write`), and `billet check` refuses an App
   # holding it where no tier asks. ADR-029.
   #
+  # RECOVERING A JOB GITHUB STOPPED OFFERING. When billet's launch for a job starts
+  # nothing, GitHub cancels the assignment and offers the job again, but after two
+  # it may stop, and the run waits for good. billet reports that with the run's URL.
+  # A tier can ask billet to recover it too:
+  #
+  #   retry:
+  #     stranded: true   # absent or false only reports it
+  #
+  # IT CANCELS THE RUN and re-runs its failed jobs, which runs the stranded job and
+  # any other job of the run that was queued with no runner again. Only while
+  # nothing of the run is running, only for a launch that ended after the tier
+  # asked, and once per run. The App needs `actions: write`. ADR-029's amendment.
+  #
   # RESERVING A FLOOR. Every tier shares one budget, and headroom is whatever is
   # left — so a tier with steady demand can hold all of it. The others then
   # advertise zero capacity, their jobs queue at GitHub indefinitely, and nothing

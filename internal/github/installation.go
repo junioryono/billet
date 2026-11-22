@@ -218,7 +218,7 @@ func actionsHint(name string) string {
 	}
 
 	return " (billet asks for read where a tier publishes caches from a default branch or an alert rule " +
-		"names a branch or a step, and write where a tier sets retry.disrupted)"
+		"names a branch or a step, and write where a tier sets retry.disrupted or retry.stranded)"
 }
 
 // ErrAppUnverifiable wraps failures that say NOTHING about the credential —

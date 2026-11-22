@@ -192,6 +192,12 @@ type ReadOps interface {
 		arg ledgerdb.ListJobsAwaitingQueueTimeParams) ([]ledgerdb.ListJobsAwaitingQueueTimeRow, error)
 	ListJobsOfRun(ctx context.Context, arg ledgerdb.ListJobsOfRunParams) ([]string, error)
 	ListLaunchMisses(ctx context.Context, arg ledgerdb.ListLaunchMissesParams) ([]ledgerdb.ListLaunchMissesRow, error)
+	ListStrandedTiers(ctx context.Context) ([]ledgerdb.StrandedTier, error)
+	ListStrandedToRecover(ctx context.Context,
+		arg ledgerdb.ListStrandedToRecoverParams) ([]ledgerdb.ListStrandedToRecoverRow, error)
+	CountOpenStrandedRecoveriesOfRun(ctx context.Context, arg ledgerdb.CountOpenStrandedRecoveriesOfRunParams) (int64, error)
+	ListOpenStrandedRecoveries(ctx context.Context,
+		arg ledgerdb.ListOpenStrandedRecoveriesParams) ([]ledgerdb.ListOpenStrandedRecoveriesRow, error)
 	CountLaterLeasesOfJob(ctx context.Context,
 		arg ledgerdb.CountLaterLeasesOfJobParams) (ledgerdb.CountLaterLeasesOfJobRow, error)
 	ListUsageSince(ctx context.Context, arg ledgerdb.ListUsageSinceParams) ([]ledgerdb.ListUsageSinceRow, error)
@@ -347,6 +353,12 @@ type WriteOps interface {
 	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
 	DecideStranded(ctx context.Context, arg ledgerdb.DecideStrandedParams) (int64, error)
 	DecideJobStranded(ctx context.Context, arg ledgerdb.DecideJobStrandedParams) (int64, error)
+	AskStrandedForTier(ctx context.Context, arg ledgerdb.AskStrandedForTierParams) error
+	ForgetStrandedTier(ctx context.Context, tier string) error
+	BeginStrandedRecovery(ctx context.Context, arg ledgerdb.BeginStrandedRecoveryParams) (int64, error)
+	MoveStrandedRecovery(ctx context.Context, arg ledgerdb.MoveStrandedRecoveryParams) (int64, error)
+	RefuseStrandedCancel(ctx context.Context, arg ledgerdb.RefuseStrandedCancelParams) (int64, error)
+	SettleStrandedRecovery(ctx context.Context, arg ledgerdb.SettleStrandedRecoveryParams) (int64, error)
 	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
 	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error
 	InsertRerunIntent(ctx context.Context, arg ledgerdb.InsertRerunIntentParams) error

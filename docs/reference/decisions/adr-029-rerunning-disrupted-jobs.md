@@ -30,7 +30,7 @@ Until now billet re-ran nothing, and said so in that report, for one reason that
 
 ### `actions: write`
 
-The request needs the App to hold `actions: write`, and GitHub offers nothing narrower: the same level also covers dispatching a workflow and deleting logs, artifacts and caches. billet uses it for the two re-run requests and nothing else.
+The request needs the App to hold `actions: write`, and GitHub offers nothing narrower: the same level also covers dispatching a workflow and deleting logs, artifacts and caches. billet uses it for the two re-run requests and, for a tier with `retry.stranded` ([below](#amendment-2026-11-22-recovering-a-job-github-stopped-offering)), to cancel a run, and nothing else.
 
 It stays on the runner App, opt-in. A target requires exactly `write` when one of its tiers sets `retry.disrupted`, and refuses it otherwise (`app.ActionsAccessOf`, `PermissionMismatches`), so `billet check` holds the claim in both directions as it does every other permission. Unlike `actions: read`, which billet requests by default and so tolerates unneeded, an App holding write where no tier asks is refused. `billet github-app create --actions-write` requests it and says what it also grants; an existing App needs the permission added on its settings page and accepted on its installation. A deployment whose tokens come from a token broker ([ADR-025](adr-025-installation-tokens-from-a-broker.md)) has its installation registered there with `actions_write`, since a broker's token carries only what its registration grants.
 
@@ -54,3 +54,42 @@ The cost is real: a stolen App key can now dispatch workflows and delete logs on
 - A job re-run this way runs its steps again, deploys included. `retry.disrupted` is for tiers whose jobs can bear that.
 - A request GitHub accepted and a person's re-run in the same instant are not told apart: the row settles as accepted, which only makes billet ask less.
 - What GitHub's job list says of a run with several jobs is documented rather than measured, as the [record](../records/job-reruns.md) sets out, and so is whether a re-run of one job also runs the jobs that need it. A job re-run through an App holding `actions: write` was not measured, because the shared test App holds `actions: read`.
+
+## Amendment, 2026-11-22: recovering a job GitHub stopped offering
+
+Issue #911. On 2026-11-20 a consumer's job whose launch started nothing was assigned, cancelled unrun twice by GitHub, and never offered again; its run sat queued for ten hours. Since v0.45.0 billet finds such a job and says so, with the run's URL. A person recovers it by cancelling the run and re-running its failed jobs, because GitHub refuses a re-run of a run still in progress, and a re-run of the queued job alone is not possible either.
+
+**A tier may ask billet to do that, with `retry.stranded: true`, and the default is never.** The same reason holds as for `retry.disrupted`, and more strongly: a cancel is a side effect on somebody's whole run, not one job of it.
+
+**Only what billet can prove, read in the same pass, and only what ends nothing running.**
+
+- **A cancel is sent only when all of these hold:**
+  - The launch was decided stranded (#915), and ended after its tier started asking (`stranded_tiers`).
+  - The ledger holds no assignment of the tier for the run since then that is, or may be, the job, asked again in the transaction that authorises the cancel, and again for every cancel sent again.
+  - GitHub's record of the run's latest attempt, read just before, has the job of that name queued with no runner.
+  - Every job of that attempt is queued with no runner or over, so the cancel ends nothing that is running.
+- **A run is recovered once, on any attempt.** A job that strands again after billet's re-run is reported, never cancelled again. It does not begin while a re-run of a disrupted job of the run may have landed, and a re-run of a disrupted job of a run being recovered waits for the recovery, whose re-run of the run's failed jobs runs that job too: the two never race for one attempt.
+
+**Two requests in order, with the ledger between them.** A recovery is a row of `stranded_recoveries` (migration 85), written `cancelling` before the cancel leaves.
+
+- **The re-run.** It is sent only once GitHub records that very attempt completed, after the row moves to `rerunning`. Each move is made only from the state the row was read in, so a restart between the requests neither cancels twice nor leaves the run cancelled.
+- **A cancel that has not landed.** A landed cancel completes the run within seconds (measured), so if the run is still in progress it is sent again, only while the run is still safe to cancel and three sends at most. Nothing but the run's end, or its day, ends a recovery whose cancel GitHub may have taken: a run that ends cancelled is re-run, one that ends any other way finished on its own and is left alone (`superseded`), and a job running or an assignment since only stops billet sending more. A cancel GitHub definitely refused (a run already over, a refusal of the App, a throttle) is counted on the row (`refused`), and while every cancel sent was refused none can have landed: a run that then ends cancelled was cancelled by someone else and is not re-run, the recovery ends `failed` once its sends are used, and its expiry is no ERROR.
+- **A re-run whose answer was lost.** It is settled by reading the run: a run going, or on a later attempt, took it.
+- **A run moved on by another hand.** A run on a later attempt before billet asked is someone else's and is left alone (`superseded`).
+- **A recovery that keeps failing.** A re-run sent three times ends it `failed`; anything still under way after a day ends `expired`, an ERROR where its cancel may have landed. No cancel leaves more than a day after the stranded launch ended, a rule the row alone answers, asked after every read and write before the cancel.
+- **A run billet cancelled and could not re-run.** This is logged as an ERROR with the run's URL and what to do.
+
+**Measured, 2026-11-22**, with the organization owner's token on the shared test organization, on a run whose one job was queued with no runner:
+
+- the cancel answered 202, and the run read `completed`, its job `cancelled`, 3.5 s later;
+- a second cancel answered 409, "Cannot cancel a workflow run that is completed.";
+- re-running its failed jobs answered 201 and ran the cancelled job again as attempt 2;
+- re-running them again while that ran answered 403, "This workflow is already running".
+
+The same recovery by hand ran every job of the consumer's run on 2026-11-20. Neither request was measured through an App token, because the shared test App holds `actions: read`.
+
+**Residual.**
+
+- A cancel also cancels the run's other jobs queued with no runner, on this deployment's other tiers or anywhere else, and the re-run runs them again with the stranded one. That is why the cancel waits while anything is running, and why it is opt-in.
+- A person who cancels the run in the instant before billet's cancel lands cannot be told from billet: the run then reads completed on the attempt billet asked about, and billet re-runs its failed jobs.
+- An assignment whose job is never named holds every launch of its run undecided, and so unrecovered, until it expires.

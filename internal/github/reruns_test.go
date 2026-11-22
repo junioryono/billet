@@ -29,6 +29,8 @@ type rerunServer struct {
 
 	run, jobs   string
 	failed, one atomic.Int32
+	cancels     atomic.Int32
+	tokenFails  atomic.Bool
 	jobReads    atomic.Int32
 	answer      func(w http.ResponseWriter)
 	seenFilter  atomic.Value
@@ -41,6 +43,11 @@ func newRerunServer(t *testing.T) *rerunServer {
 	s := &rerunServer{answer: func(w http.ResponseWriter) { w.WriteHeader(http.StatusCreated) }}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /app/installations/22/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+		if s.tokenFails.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+
+			return
+		}
 		w.WriteHeader(http.StatusCreated)
 		fmt.Fprintf(w, `{"token":"installation-secret","expires_at":%q}`,
 			time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
@@ -62,6 +69,10 @@ func newRerunServer(t *testing.T) *rerunServer {
 	})
 	mux.HandleFunc("POST /repos/acme/api/actions/jobs/77/rerun", func(w http.ResponseWriter, _ *http.Request) {
 		s.one.Add(1)
+		s.answer(w)
+	})
+	mux.HandleFunc("POST /repos/acme/api/actions/runs/31/cancel", func(w http.ResponseWriter, _ *http.Request) {
+		s.cancels.Add(1)
 		s.answer(w)
 	})
 	srv := httptest.NewServer(mux)

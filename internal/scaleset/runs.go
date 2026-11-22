@@ -260,3 +260,64 @@ func (c *Client) JobsNamed(ctx context.Context, owner, repository string, runID 
 
 	return out, nil
 }
+
+var _ server.RunRecovery = (*Client)(nil)
+
+// QueuedAttempt reads, through the target's App client, whether a run is over, the
+// attempt it is on and, unless it is over, every job of that attempt, in the
+// server's terms (#911).
+func (c *Client) QueuedAttempt(ctx context.Context, owner, repository string, runID int64,
+) (server.QueuedAttempt, error) {
+	recoverer, err := c.strandedRecoverer()
+	if err != nil {
+		return server.QueuedAttempt{}, err
+	}
+	attempt, err := recoverer.QueuedAttempt(ctx, owner, repository, runID)
+	if err != nil {
+		return server.QueuedAttempt{}, installationError(err, server.ErrRerunThrottled, server.ErrRerunRefused)
+	}
+
+	out := server.QueuedAttempt{Completed: attempt.Completed, Cancelled: attempt.Cancelled, Attempt: attempt.Attempt}
+	for _, job := range attempt.Jobs {
+		out.Jobs = append(out.Jobs, server.QueuedJob{Name: job.Name, Attempt: job.Attempt,
+			Unstarted: job.Status == billetgithub.JobStatusQueued && job.RunnerName == "",
+			Done:      job.Status == billetgithub.RunStatusCompleted})
+	}
+
+	return out, nil
+}
+
+// CancelRun asks GitHub to cancel a run, in the server's terms: a run already over
+// is server.ErrRunCompleted.
+func (c *Client) CancelRun(ctx context.Context, owner, repository string, runID int64) error {
+	recoverer, err := c.strandedRecoverer()
+	if err != nil {
+		return err
+	}
+	err = recoverer.CancelRun(ctx, owner, repository, runID)
+	switch {
+	case errors.Is(err, billetgithub.ErrRunAlreadyCompleted):
+		return fmt.Errorf("scaleset: %w: %w", server.ErrRunCompleted, err)
+	case errors.Is(err, billetgithub.ErrNotSent):
+		return fmt.Errorf("scaleset: %w: %w", server.ErrNotSent, err)
+	}
+
+	// ANY 4XX IS GITHUB'S OWN REFUSAL, which cancelled nothing, beside what it says
+	// about the installation: a 401, a 403 or a throttle still pauses it.
+	mapped := rerunError(err)
+	if api, ok := errors.AsType[*billetgithub.APIError](err); ok && api.Status >= http.StatusBadRequest &&
+		api.Status < http.StatusInternalServerError {
+		return fmt.Errorf("%w: %w", server.ErrCancelRefused, mapped)
+	}
+
+	return mapped
+}
+
+func (c *Client) strandedRecoverer() (billetgithub.StrandedRecoverer, error) {
+	recoverer, ok := c.policy.(billetgithub.StrandedRecoverer)
+	if c.policy == nil || !ok {
+		return nil, billetgithub.ErrRunEvidenceUnavailable
+	}
+
+	return recoverer, nil
+}

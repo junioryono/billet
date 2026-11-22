@@ -132,6 +132,7 @@ var (
 	_ server.RESTHeadroom    = Provisioner{}
 	_ server.RunReruns       = Provisioner{}
 	_ server.RunQueue        = Provisioner{}
+	_ server.RunRecovery     = Provisioner{}
 	_ server.RunJobSteps     = Provisioner{}
 )
 
@@ -431,4 +432,15 @@ func (n NodeJIT) ValidateTrustedRunnerGroup(ctx context.Context, group string,
 func (p Provisioner) JobsNamed(ctx context.Context, owner, repository string, runID int64, name string,
 ) (server.NamedJobs, error) {
 	return p.Client.JobsNamed(ctx, owner, repository, runID, name)
+}
+
+// QueuedAttempt forwards to the target's client.
+func (p Provisioner) QueuedAttempt(ctx context.Context, owner, repository string, runID int64,
+) (server.QueuedAttempt, error) {
+	return p.Client.QueuedAttempt(ctx, owner, repository, runID)
+}
+
+// CancelRun forwards to the target's client.
+func (p Provisioner) CancelRun(ctx context.Context, owner, repository string, runID int64) error {
+	return p.Client.CancelRun(ctx, owner, repository, runID)
 }

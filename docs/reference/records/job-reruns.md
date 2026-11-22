@@ -40,6 +40,19 @@ The two refusals on a running run were read with an owner's token, and the App's
 
 Straight after a 201 the run reads `status: queued`, `conclusion: null`, **still on the attempt it was on**, and `jobs?filter=latest` answers `total_count: 0`. So whether a request landed is read from the run's status before its attempt says so, and an empty job list straight after a request means nothing about which jobs failed. Within a minute the run was on attempt 2 with a new job id, on a new runner, and `filter=latest` listed only that attempt while `filter=all` listed both. The run keeps its id across attempts. A job's own failure re-run this way failed again and concluded the attempt in seconds.
 
+## What a cancel answers, for a stranded job (2026-11-22)
+
+Measured for `retry.stranded` ([ADR-029's amendment](../decisions/adr-029-rerunning-disrupted-jobs.md#amendment-2026-11-22-recovering-a-job-github-stopped-offering)). The run was a `queue` run of `billet-testbed/jobs` whose one job sat queued with no runner on a label nothing served, the shape a job GitHub stopped offering leaves. Every request used the organization owner's token, since the test App holds `actions: read`.
+
+| Request | Answer |
+|---|---|
+| `POST .../actions/runs/{run}/cancel`, the run queued | 202; the run read `completed`, `cancelled`, 3.5 s later, its job `completed`, `cancelled`, with `runner_name` empty |
+| the same, the run completed | 409 `Cannot cancel a workflow run that is completed.` |
+| `POST .../rerun-failed-jobs` on the cancelled run | 201; the run read `queued` on attempt 2 six seconds later, the cancelled job queued again on that attempt |
+| the same while attempt 2 was queued | 403 `This workflow is already running` |
+
+So a re-run of a cancelled run's failed jobs runs its cancelled jobs, which is what the recovery is made of, and the cancel's own refusal of a completed run is a 409, not the 403 a re-run of a running one answers.
+
 ## What this did not measure
 
 The test workflow has one job. So these rest on GitHub's documentation, not on a measurement, because creating a repository with a wider workflow was out of bounds for the run:

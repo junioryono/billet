@@ -13,7 +13,15 @@ import (
 )
 
 // newestMigration is the version rewindNewest takes back off a ledger.
-const newestMigration = 84
+const newestMigration = 85
+
+// undoStrandedRecoveries is what migration 85 added, taken back with its record.
+var undoStrandedRecoveries = []string{
+	`DROP INDEX job_history_stranded_idx`,
+	`DROP TABLE stranded_tiers`,
+	`DROP TABLE stranded_recoveries`,
+	`DELETE FROM schema_migrations WHERE version = 85`,
+}
 
 // undoJobStranded is what migration 84 added, taken back with its record: the index
 // first, since it names the columns.
@@ -70,7 +78,7 @@ func rewindNewest(t *testing.T, db *DB) {
 	}
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		for _, stmt := range undoJobStranded {
+		for _, stmt := range undoStrandedRecoveries {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
 			}
@@ -97,7 +105,7 @@ func ledgerAt78(t *testing.T) string {
 	rewindNewest(t, db)
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		for _, stmt := range append(slices.Concat(undoJobDestinationOpenings, undoNodeCacheStores, undoJobHistoryNode, undoPoolClearance),
+		for _, stmt := range append(slices.Concat(undoJobStranded, undoJobDestinationOpenings, undoNodeCacheStores, undoJobHistoryNode, undoPoolClearance),
 			`ALTER TABLE pool_orders DROP COLUMN release_contradicted`,
 			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
 			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,
