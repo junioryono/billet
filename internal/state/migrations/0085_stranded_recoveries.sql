@@ -19,9 +19,9 @@
 -- stranded launch's lease ended, from which every cancel asks the ledger again
 -- whether the tier has since been assigned what may be the job. tries counts the
 -- sends of the current request and bounds them, each counted before it leaves, and
--- refused counts the cancels GitHub definitely refused: while every one sent was, no
--- cancel of billet's can have landed, and a run that ends cancelled is not billet's
--- to re-run. detail is billet's own text around GitHub's
+-- refused is how far an unbroken run of cancels GitHub definitely refused reaches
+-- from the first: while it reaches tries, no cancel of billet's can have landed, and
+-- a run that ends cancelled is not billet's to re-run. detail is billet's own text around GitHub's
 -- decoded message: nothing a guest wrote.
 --
 -- stranded_tiers is when each tier started asking, as rerun_tiers is for re-runs: a

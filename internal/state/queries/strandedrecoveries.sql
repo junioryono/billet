@@ -67,11 +67,13 @@ UPDATE stranded_recoveries SET state = @to_state, tries = @tries
  WHERE repo = @repo AND run_id = @run_id AND run_attempt = @run_attempt AND state = @from_state;
 
 -- name: RefuseStrandedCancel :execrows
--- Count a cancel GitHub definitely refused, the one most recently sent, never more
--- than were sent.
-UPDATE stranded_recoveries SET refused = refused + 1
+-- Record that GitHub definitely refused the cancel most recently sent, the one tries
+-- counts. refused is how far an unbroken run of refused sends reaches from the first,
+-- so it moves only from the send before to this one: written twice it changes
+-- nothing, and a refusal after a send that may have landed is not taken for one.
+UPDATE stranded_recoveries SET refused = tries
  WHERE repo = @repo AND run_id = @run_id AND run_attempt = @run_attempt AND state = 'cancelling'
-   AND tries = @tries AND refused < tries;
+   AND tries = @tries AND refused = tries - 1;
 
 -- name: SettleStrandedRecovery :execrows
 -- End a recovery, only from the state it was read in: a settled recovery's end

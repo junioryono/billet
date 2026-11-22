@@ -800,6 +800,7 @@ func TestARefusedCancelIsNeverTakenForBilletsOwn(t *testing.T) {
 		{"refused", ErrRerunRefused},
 		{"throttled", ErrRerunThrottled},
 		{"never sent", ErrNotSent},
+		{"any other refusal of GitHub's", ErrCancelRefused},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

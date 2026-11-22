@@ -76,6 +76,8 @@ func TestACancelsAnswerIsTheServersSentinel(t *testing.T) {
 	}{
 		{"a run already over", billetgithub.ErrRunAlreadyCompleted, server.ErrRunCompleted},
 		{"never sent", billetgithub.ErrNotSent, server.ErrNotSent},
+		{"a run gone", &billetgithub.APIError{Status: 404}, server.ErrCancelRefused},
+		{"a refusal is a refusal of the cancel too", &billetgithub.APIError{Status: 403}, server.ErrCancelRefused},
 		{"no actions: write", &billetgithub.APIError{Status: 403}, server.ErrRerunRefused},
 		{"a throttle", &billetgithub.APIError{Status: 429, RateLimited: true}, server.ErrRerunThrottled},
 	} {

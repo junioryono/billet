@@ -289,9 +289,9 @@ func (q *Queries) MoveStrandedRecovery(ctx context.Context, arg MoveStrandedReco
 }
 
 const refuseStrandedCancel = `-- name: RefuseStrandedCancel :execrows
-UPDATE stranded_recoveries SET refused = refused + 1
+UPDATE stranded_recoveries SET refused = tries
  WHERE repo = $1 AND run_id = $2 AND run_attempt = $3 AND state = 'cancelling'
-   AND tries = $4 AND refused < tries
+   AND tries = $4 AND refused = tries - 1
 `
 
 type RefuseStrandedCancelParams struct {
@@ -301,8 +301,10 @@ type RefuseStrandedCancelParams struct {
 	Tries      int64
 }
 
-// Count a cancel GitHub definitely refused, the one most recently sent, never more
-// than were sent.
+// Record that GitHub definitely refused the cancel most recently sent, the one tries
+// counts. refused is how far an unbroken run of refused sends reaches from the first,
+// so it moves only from the send before to this one: written twice it changes
+// nothing, and a refusal after a send that may have landed is not taken for one.
 func (q *Queries) RefuseStrandedCancel(ctx context.Context, arg RefuseStrandedCancelParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, refuseStrandedCancel,
 		arg.Repo,

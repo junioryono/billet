@@ -47,6 +47,10 @@ var ErrRunCompleted = errors.New("server: the run is already completed")
 // ErrNotSent is a request that never left, so nothing it asked for happened.
 var ErrNotSent = errors.New("server: the request was not sent")
 
+// ErrCancelRefused is a cancel GitHub answered with a refusal of its own, a 4xx: it
+// cancelled nothing.
+var ErrCancelRefused = errors.New("server: GitHub refused the cancel")
+
 const (
 	// strandedRecoveryReadsPerInstallation is how many recoveries under way one pass
 	// reads through one App installation, beside the detector's share, and
@@ -392,7 +396,7 @@ func (s *Server) sendCancel(ctx context.Context, client RunRecovery, sweep *reru
 	// was over, that the App may not, or that it is throttled, or a cancel that never
 	// left. Anything else, a lost answer above all, may have landed.
 	if errors.Is(err, ErrRunCompleted) || errors.Is(err, ErrRerunRefused) || errors.Is(err, ErrRerunThrottled) ||
-		errors.Is(err, ErrNotSent) {
+		errors.Is(err, ErrNotSent) || errors.Is(err, ErrCancelRefused) {
 		s.recordRefusal(ctx, sweep, recovery)
 	}
 	if !errors.Is(err, ErrRunCompleted) {
@@ -416,7 +420,7 @@ func (s *Server) recordRefusal(ctx context.Context, sweep *rerunSweep, recovery 
 	}
 	delete(sweep.unrecordedRefusals, recoveryRun(recovery))
 	if counted {
-		recovery.Refused++
+		recovery.Refused = recovery.Tries
 	}
 
 	return true

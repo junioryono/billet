@@ -260,13 +260,17 @@ func (c *runnerGroupPolicyClient) post(ctx context.Context, endpoint, operation 
 		c.rest.answered(operation, status, header, time.Now())
 	}
 	// THE STATUS FIRST: an accepted answer whose body broke off was still accepted,
-	// and reading it as a failed try would ask again for a run already going. A refusal
-	// whose body broke off is still GitHub's refusal, and is read from its status
-	// alone; anything else that broke off may have landed.
+	// and reading it as a failed try would ask again for a run already going. A cancel's
+	// refusal whose body broke off is still GitHub's refusal, read from its status
+	// alone, since a cancel counted as one that may have landed lets billet take
+	// someone else's for its own; a re-run's needs its words, which tell a run already
+	// going from a refused App, and anything else that broke off may have landed.
 	if status == accepted {
 		return nil
 	}
-	if err != nil && (status < http.StatusBadRequest || status >= http.StatusInternalServerError) {
+	refusedCancel := accepted == http.StatusAccepted && status >= http.StatusBadRequest &&
+		status < http.StatusInternalServerError
+	if err != nil && !refusedCancel {
 		return fmt.Errorf("github: %s: %w", operation, err)
 	}
 

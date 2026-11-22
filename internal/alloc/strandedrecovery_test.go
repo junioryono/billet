@@ -154,6 +154,35 @@ func TestEveryCancelAsksTheLedgerAgainInItsOwnWrite(t *testing.T) {
 	}
 }
 
+// A REFUSAL AFTER A SEND THAT MAY HAVE LANDED IS NOT TAKEN FOR NONE LANDING: the first
+// cancel was not refused, so the second's refusal leaves the recovery one whose
+// cancel may have landed.
+func TestARefusalAfterASendThatMayHaveLandedCountsForNothing(t *testing.T) {
+	t.Parallel()
+
+	decided := time.Date(2026, 11, 22, 7, 55, 45, 0, time.UTC)
+	a := recoveryLedger(t, decided)
+
+	r := StrandedRecovery{Repository: "acme/app", RunID: 43, Attempt: 1, Tier: "billet-4vcpu", LeaseID: "first",
+		JobName: "Lint App", Ended: decided.Add(-20 * time.Minute), State: RecoveryCancelling, Tries: 1}
+	if begun, err := a.BeginStrandedRecovery(t.Context(), r); err != nil || !begun {
+		t.Fatalf("begin = %v, %v", begun, err)
+	}
+	if moved, err := a.MoveStrandedRecovery(t.Context(), r, RecoveryCancelling, 2); err != nil || !moved {
+		t.Fatalf("a second send = %v, %v", moved, err)
+	}
+	r.Tries = 2
+	if counted, err := a.RefuseStrandedCancel(t.Context(), r); err != nil || counted {
+		t.Fatalf("the second send's refusal = %v, %v; want not counted after a send that may have landed",
+			counted, err)
+	}
+
+	open, err := a.OpenStrandedRecoveries(t.Context(), RecoveryCursor{}, 10)
+	if err != nil || len(open) != 1 || !open[0].MayHaveCancelled() {
+		t.Fatalf("OpenStrandedRecoveries = %+v, %v; want a cancel that may have landed", open, err)
+	}
+}
+
 // A RECOVERY MOVES AND ENDS ONLY FROM THE STATE IT WAS READ IN, and only into the
 // states each allows.
 func TestARecoveryMovesOnlyFromTheStateItWasReadIn(t *testing.T) {
@@ -184,6 +213,22 @@ func TestARecoveryMovesOnlyFromTheStateItWasReadIn(t *testing.T) {
 	if open, err := a.OpenStrandedRecoveries(t.Context(), RecoveryCursor{}, 10); err != nil || len(open) != 1 ||
 		open[0].Refused != 1 || open[0].MayHaveCancelled() {
 		t.Fatalf("OpenStrandedRecoveries = %+v, %v; want one refusal, no cancel that may have landed", open, err)
+	}
+
+	// A SECOND SEND REFUSED TOO EXTENDS THE RUN OF REFUSALS, and written twice moves
+	// nothing.
+	if moved, err := a.MoveStrandedRecovery(t.Context(), r, RecoveryCancelling, 2); err != nil || !moved {
+		t.Fatalf("a second send = %v, %v", moved, err)
+	}
+	r.Tries = 2
+	for range 2 {
+		if _, err := a.RefuseStrandedCancel(t.Context(), r); err != nil {
+			t.Fatalf("refuse the second send: %v", err)
+		}
+	}
+	if open, err := a.OpenStrandedRecoveries(t.Context(), RecoveryCursor{}, 10); err != nil || len(open) != 1 ||
+		open[0].Refused != 2 || open[0].MayHaveCancelled() {
+		t.Fatalf("OpenStrandedRecoveries = %+v, %v; want both sends refused", open, err)
 	}
 
 	stale := r

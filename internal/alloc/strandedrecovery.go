@@ -53,7 +53,8 @@ type StrandedRecovery struct {
 	Ended time.Time
 	State StrandedRecoveryState
 	// Tries is how many times the current request was sent, each counted before it
-	// left, and Refused how many of the cancels GitHub definitely refused.
+	// left, and Refused how far an unbroken run of cancels GitHub definitely refused
+	// reaches from the first.
 	Tries   int64
 	Refused int64
 	Created time.Time
@@ -292,8 +293,9 @@ func (a *Allocator) MoveStrandedRecovery(ctx context.Context, r StrandedRecovery
 	return moved, err
 }
 
-// RefuseStrandedCancel counts that GitHub definitely refused r's most recent cancel,
-// the one its Tries counts, and says whether it was counted.
+// RefuseStrandedCancel records that GitHub definitely refused r's most recent cancel,
+// the one its Tries counts, where every one before it was refused too, and says
+// whether this call moved the record. Written twice, it moves nothing.
 func (a *Allocator) RefuseStrandedCancel(ctx context.Context, r StrandedRecovery) (bool, error) {
 	var counted bool
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {

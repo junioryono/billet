@@ -302,7 +302,15 @@ func (c *Client) CancelRun(ctx context.Context, owner, repository string, runID 
 		return fmt.Errorf("scaleset: %w: %w", server.ErrNotSent, err)
 	}
 
-	return rerunError(err)
+	// ANY 4XX IS GITHUB'S OWN REFUSAL, which cancelled nothing, beside what it says
+	// about the installation: a 401, a 403 or a throttle still pauses it.
+	mapped := rerunError(err)
+	if api, ok := errors.AsType[*billetgithub.APIError](err); ok && api.Status >= http.StatusBadRequest &&
+		api.Status < http.StatusInternalServerError {
+		return fmt.Errorf("%w: %w", server.ErrCancelRefused, mapped)
+	}
+
+	return mapped
 }
 
 func (c *Client) strandedRecoverer() (billetgithub.StrandedRecoverer, error) {

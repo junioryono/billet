@@ -171,24 +171,7 @@ func TestACancelsAnswerIsClassified(t *testing.T) {
 			t.Parallel()
 
 			s := newRerunServer(t)
-			s.answer = func(w http.ResponseWriter) {
-				hijacker, ok := w.(http.Hijacker)
-				if !ok {
-					t.Error("the test server cannot hand over its connection")
-
-					return
-				}
-				conn, buf, err := hijacker.Hijack()
-				if err != nil {
-					t.Errorf("hijack: %v", err)
-
-					return
-				}
-				fmt.Fprintf(buf, "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"mess",
-					tc.status)
-				_ = buf.Flush()
-				_ = conn.Close()
-			}
+			s.answer = cutShort(t, tc.status)
 
 			err := s.CancelRun(t.Context(), "acme", "api", 31)
 			api, ok := errors.AsType[*APIError](err)
@@ -200,6 +183,20 @@ func TestACancelsAnswerIsClassified(t *testing.T) {
 			}
 		})
 	}
+
+	// AND A RE-RUN'S IS NOT: its 403 needs the words that tell a run already going from
+	// a refused App, so one cut short stays a lost answer, as it was.
+	t.Run("a re-run's 403 cut short", func(t *testing.T) {
+		t.Parallel()
+
+		s := newRerunServer(t)
+		s.answer = cutShort(t, "403 Forbidden")
+
+		err := s.RerunFailedJobs(t.Context(), "acme", "api", 31)
+		if api, ok := errors.AsType[*APIError](err); ok || err == nil {
+			t.Fatalf("RerunFailedJobs = %v (refusal %+v), want a lost answer, not GitHub's refusal", err, api)
+		}
+	})
 
 	// A CANCEL THAT NEVER LEFT SAYS SO: no installation token, no request.
 	t.Run("no token", func(t *testing.T) {
@@ -224,5 +221,28 @@ func TestACancelsAnswerIsClassified(t *testing.T) {
 	}
 	if err := s.RerunFailedJobs(t.Context(), "acme", "api", 31); err == nil || errors.Is(err, ErrRunAlreadyCompleted) {
 		t.Fatalf("a re-run's 409 = %v, want a refusal that is not a run already over", err)
+	}
+}
+
+// cutShort answers with status and a body that breaks off after a few bytes.
+func cutShort(t *testing.T, status string) func(http.ResponseWriter) {
+	t.Helper()
+
+	return func(w http.ResponseWriter) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("the test server cannot hand over its connection")
+
+			return
+		}
+		conn, buf, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+
+			return
+		}
+		fmt.Fprintf(buf, "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"mess", status)
+		_ = buf.Flush()
+		_ = conn.Close()
 	}
 }
