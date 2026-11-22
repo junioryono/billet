@@ -494,6 +494,11 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 	}
 
 	verdict := rule.Judge(condition, &job, now)
+	// A JOB THAT RAN IS A MISS ON STRANDED, which counts in no streak, so it is recorded
+	// as it is, without a read of GitHub that would spend the share stranded jobs need.
+	if condition == alerts.Stranded && verdict == alerts.Miss {
+		return s.recordAlert(ctx, rule, condition, &job, alloc.AlertMiss, job.HeadBranch, sweep, pass, now)
+	}
 	if verdict == alerts.Later {
 		switch {
 		// A WAIT GITHUB NEVER GAVE A QUEUE TIME FOR is recorded as unknown just before the

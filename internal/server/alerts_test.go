@@ -686,6 +686,26 @@ func TestAStrandedJobIsNotHeldByAnotherJobsStreak(t *testing.T) {
 	}
 }
 
+// A JOB THAT RAN IS A MISS ON STRANDED WITHOUT A READ OF GITHUB: ordinary jobs never
+// spend the share of reads a stranded job's branch needs.
+func TestAJobThatRanCostsAStrandedRuleNoRead(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Stranded: true}, "0s", "main"
+	}))
+	r.seed(jobRow{lease: "ran", result: "failed", ran: time.Second, age: 30 * time.Second})
+
+	r.pass()
+
+	if got := r.record.readCount(); got != 0 {
+		t.Fatalf("a job that ran cost the stranded rule %d reads of GitHub", got)
+	}
+	if got := r.outcome("ran", "stranded"); got != string(alloc.AlertMiss) {
+		t.Fatalf("the job that ran came to %q, want a miss", got)
+	}
+}
+
 // THE STRANDED JOBS ARE READ ON PAST A PAGE: one decided after a page of others is told
 // in its turn.
 func TestStrandedJobsAreReadOnPastAPage(t *testing.T) {
