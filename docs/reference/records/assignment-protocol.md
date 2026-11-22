@@ -33,7 +33,14 @@ Every assignment, in every measurement, arrived as `JobAssigned` with `runnerReq
 - **Lowering an advertisement does not take back a fresh assignment; it only stops new ones.** In U3 and U4-DROP the assignments were cancelled at GitHub's own five minutes and nothing was assigned again while the advertisement stayed at 0: which is why the seal lowers the advertisement and the drain counts assigned work separately (#140). What happens to an assignment already in its long-kept third cycle when the advertisement falls is not measured.
 - **The ceiling is the scale set's total, running work included,** as `steadyAdvertisement` assumes: advertising what is committed while draining is the right number, and `TotalAssignedJobs` less the runners covering it is the count of work waiting.
 - **No field billet reads tells a cancellation's cause,** so billet attributes a `canceled` completion by its own records, never by the message.
+- **A cancellation names the assignment it ends, and a reassignment is a new job id.** In the U4 report every `JobCompleted` `canceled` carried `runnerRequestId: 0`, the run's `workflowRunId` and the same `jobId` as the assignment it ended, and each reassignment that followed came under a new `jobId` in the same run. That is what lets billet withdraw a cancelled job's launch no node has taken: a zero-request cancellation withdraws only the one launch in flight of a direct assignment with the same job id and run, whose request is the negative identity its job id keys, and never the reassignment's (#910).
 - **A restart's view of the queue is right:** a new session's statistics carry the acknowledged backlog, which is what `reportOrphanedBacklog` and the first reconciliation rely on.
+
+## A job GitHub stopped offering, in production
+
+Not a measurement but an observation, on a consumer's deployment on 2026-11-20. A direct assignment was received at 07:45:45 UTC, and its launch went untaken by the node for the command's ten minutes (#909). The tier's message path waited on that launch meanwhile, so GitHub's cancellation at about five minutes, its reassignment of the job and that reassignment's own cancellation were all read together, at 07:55:45 and 07:55:47 (#910). No lease was bought for the reassignment. GitHub did not assign the job a third time: its REST API showed it `queued`, with no runner, until 17:48, while the tier stayed healthy and advertised capacity. Cancelling the run and then rerunning its failed jobs (`gh run rerun --failed`) had it offered again at once, and it ran.
+
+So two cancellations of unrun assignments can end GitHub's offers of a job, as U2 saw for two of its jobs within its 30 minutes, although U4's job was assigned a third time 1–2 s after its second cancellation. What decides between the two is not measured. #911 is the detector for it.
 
 ## U7: many sessions on one installation
 
