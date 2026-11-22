@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -50,13 +51,15 @@ const (
 // GitHub kept offering its job (#911).
 //
 // ONLY ON GITHUB'S WORD AND BILLET'S OWN RECORD, NEVER A TIMER ALONE. A job is
-// stranded when GitHub's REST record of its run still has a job of its name queued with
-// no runner, long after the failure, while its tier was unsealed, advertising capacity
-// and waiting for room for nothing, and the tier has bought nothing for a job of that name in the run since.
-// Each of those excludes a reason the same job would legitimately wait: an advertisement
-// of 0 or a seal stops GitHub offering anything, and a tier waiting for room is offered
-// work it cannot buy for. A read that fails is could-not-tell, and the launch is asked
-// again on a later pass, until a day has passed.
+// stranded when GitHub's REST record of its run still has a job of its name queued
+// with no runner, long after the failure, while its tier was unsealed, advertising
+// capacity and waiting for room for nothing, and the tier has been assigned nothing
+// for the run since that is, or may be, a job of that name. Each of those excludes a
+// reason the same job would legitimately wait: an advertisement of 0 or a seal stops
+// GitHub offering anything, a tier waiting for room is offered work it cannot buy
+// for, and a later assignment may be the job itself. A read that fails is
+// could-not-tell, and the launch is asked again on a later pass, until a day has
+// passed.
 func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sweep *rerunSweep,
 	budgets map[string][]RESTHeadroom, now time.Time,
 ) {
@@ -68,9 +71,36 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 
 		return
 	}
-	if len(misses) == 0 {
+
+	due := make([]*alloc.LaunchMiss, 0, len(misses))
+	for i := range misses {
+		miss := &misses[i]
+		age := now.Sub(miss.Ended)
+
+		if miss.Ended.IsZero() || miss.Owner == "" || miss.Repository == "" || miss.RunID <= 0 ||
+			miss.JobName == "" || age > strandedWindow {
+			s.decideStranded(ctx, sweep, miss, alloc.StrandedExpired, now)
+
+			continue
+		}
+		// OLDEST FIRST, so every launch after this one is younger still.
+		if age < strandedAfter {
+			break
+		}
+		if asked, ok := sweep.strandedAsked[miss.LeaseID]; ok && now.Sub(asked) < strandedAgain {
+			continue
+		}
+		due = append(due, miss)
+	}
+	if len(due) == 0 {
 		return
 	}
+
+	// LEAST RECENTLY ASKED FIRST, a launch never asked before any that was, so launches
+	// GitHub's record never decides cannot keep another unread by giving way in turn.
+	slices.SortStableFunc(due, func(a, b *alloc.LaunchMiss) int {
+		return sweep.strandedAsked[a.LeaseID].Compare(sweep.strandedAsked[b.LeaseID])
+	})
 
 	admission, err := s.alloc.Admission(ctx)
 	if err != nil {
@@ -82,27 +112,9 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 	}
 
 	read := map[string]int{}
-	for i := range misses {
+	for _, miss := range due {
 		if ctx.Err() != nil {
 			return
-		}
-
-		miss := &misses[i]
-		age := now.Sub(miss.Ended)
-
-		switch {
-		case miss.Ended.IsZero() || miss.Owner == "" || miss.Repository == "" || miss.RunID <= 0 || miss.JobName == "",
-			age > strandedWindow:
-			s.decideStranded(ctx, sweep, miss, alloc.StrandedExpired, now)
-
-			continue
-		// OLDEST FIRST, so every launch after this one is younger still.
-		case age < strandedAfter:
-			return
-		}
-
-		if asked, ok := sweep.strandedAsked[miss.LeaseID]; ok && now.Sub(asked) < strandedAgain {
-			continue
 		}
 
 		target := targets[miss.Tier]
@@ -123,12 +135,16 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 		}
 
 		later, err := s.alloc.LaterLeasesOfJob(ctx, miss.Tier, miss.RunID, miss.JobName, miss.Ended)
-		if err != nil {
+		switch {
+		case err != nil:
 			continue
-		}
-		if later > 0 {
+		case later.Same > 0:
 			s.decideStranded(ctx, sweep, miss, alloc.StrandedOffered, now)
 
+			continue
+		// AN ASSIGNMENT WHOSE JOB IS NOT NAMED YET may be this one offered again, and is
+		// named when its job starts: until then, nothing is decided.
+		case later.Unnamed > 0:
 			continue
 		}
 
@@ -147,7 +163,7 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 		case jobs.Unstarted > 0 && jobs.Taken == 0:
 			if s.decideStranded(ctx, sweep, miss, alloc.StrandedJob, now) {
 				s.log.Error("GitHub has stopped offering a job: it is still queued with no runner, "+
-					fmt.Sprintf("%s after billet's launch for it started nothing, ", age.Round(time.Minute))+
+					fmt.Sprintf("%s after billet's launch for it started nothing, ", now.Sub(miss.Ended).Round(time.Minute))+
 					"while its tier advertised capacity and waited for nothing. GitHub does not offer a "+
 					"job again after two cancelled assignments; cancel the run and re-run its failed jobs "+
 					"to have it offered again",

@@ -15,12 +15,16 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo, CAST(COALESCE(run_id, 0) AS B
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: CountLaterLeasesOfJob :one
--- How many leases a tier bought for a run's job of one name after a moment: GitHub
--- offering that job to the tier again, which a job it stopped offering never is. Only
--- the name: a lease bought for another job of the same run says nothing about this one.
-SELECT CAST(COUNT(*) AS BIGINT) AS later
+-- The leases a tier was assigned for a run after a moment, as two counts: those whose
+-- job is the one of this name, GitHub offering it to the tier again, which a job it
+-- stopped offering never is; and those whose job is not named yet, since an
+-- assignment's row learns its job's name only when the job starts, ends or its launch
+-- fails, so one of them may be this job offered again. A lease named for another job
+-- of the same run says nothing about this one.
+SELECT CAST(COALESCE(SUM(CASE WHEN job_name = @job_name THEN 1 ELSE 0 END), 0) AS BIGINT) AS same,
+       CAST(COALESCE(SUM(CASE WHEN job_name = '' THEN 1 ELSE 0 END), 0) AS BIGINT) AS unnamed
   FROM job_history
- WHERE tier = @tier AND run_id = @run_id AND job_name = @job_name AND queued_at > @after;
+ WHERE tier = @tier AND run_id = @run_id AND queued_at > @after;
 
 -- name: DecideStranded :execrows
 -- Record whether GitHub kept offering a launch's job, once: a row already decided

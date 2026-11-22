@@ -11,31 +11,40 @@ import (
 )
 
 const countLaterLeasesOfJob = `-- name: CountLaterLeasesOfJob :one
-SELECT CAST(COUNT(*) AS BIGINT) AS later
+SELECT CAST(COALESCE(SUM(CASE WHEN job_name = $1 THEN 1 ELSE 0 END), 0) AS BIGINT) AS same,
+       CAST(COALESCE(SUM(CASE WHEN job_name = '' THEN 1 ELSE 0 END), 0) AS BIGINT) AS unnamed
   FROM job_history
- WHERE tier = $1 AND run_id = $2 AND job_name = $3 AND queued_at > $4
+ WHERE tier = $2 AND run_id = $3 AND queued_at > $4
 `
 
 type CountLaterLeasesOfJobParams struct {
+	JobName string
 	Tier    string
 	RunID   sql.NullInt64
-	JobName string
 	After   string
 }
 
-// How many leases a tier bought for a run's job of one name after a moment: GitHub
-// offering that job to the tier again, which a job it stopped offering never is. Only
-// the name: a lease bought for another job of the same run says nothing about this one.
-func (q *Queries) CountLaterLeasesOfJob(ctx context.Context, arg CountLaterLeasesOfJobParams) (int64, error) {
+type CountLaterLeasesOfJobRow struct {
+	Same    int64
+	Unnamed int64
+}
+
+// The leases a tier was assigned for a run after a moment, as two counts: those whose
+// job is the one of this name, GitHub offering it to the tier again, which a job it
+// stopped offering never is; and those whose job is not named yet, since an
+// assignment's row learns its job's name only when the job starts, ends or its launch
+// fails, so one of them may be this job offered again. A lease named for another job
+// of the same run says nothing about this one.
+func (q *Queries) CountLaterLeasesOfJob(ctx context.Context, arg CountLaterLeasesOfJobParams) (CountLaterLeasesOfJobRow, error) {
 	row := q.db.QueryRowContext(ctx, countLaterLeasesOfJob,
+		arg.JobName,
 		arg.Tier,
 		arg.RunID,
-		arg.JobName,
 		arg.After,
 	)
-	var later int64
-	err := row.Scan(&later)
-	return later, err
+	var i CountLaterLeasesOfJobRow
+	err := row.Scan(&i.Same, &i.Unnamed)
+	return i, err
 }
 
 const decideStranded = `-- name: DecideStranded :execrows

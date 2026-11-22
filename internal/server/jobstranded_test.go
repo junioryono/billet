@@ -157,6 +157,12 @@ func TestAJobGitHubStoppedOfferingIsFoundOnlyOnItsWord(t *testing.T) {
 		{"the tier bought for another job of the run", func(r *strandedStack) {
 			r.lease("other", 42, "Build iOS", 5*time.Minute)
 		}, "stranded", 1},
+		{"the tier bought for a job of the name in another run", func(r *strandedStack) {
+			r.lease("elsewhere", 7, "Lint App", 5*time.Minute)
+		}, "stranded", 1},
+		{"an assignment for the run whose job is not named yet", func(r *strandedStack) {
+			r.lease("booting", 42, "", 5*time.Minute)
+		}, "", 0},
 		{"the tier bought for the job before the launch", func(r *strandedStack) {
 			r.lease("before", 42, "Lint App", 30*time.Minute)
 		}, "stranded", 1},
@@ -328,6 +334,31 @@ func TestUndecidedLaunchesGiveWayToTheOthers(t *testing.T) {
 
 	want := []string{"acme/app Lint App", "acme/app Test App", "acme/app Build App",
 		"acme/app Lint App", "acme/app Test App"}
+	if !slices.Equal(r.github.asked, want) {
+		t.Fatalf("asked %q, want %q", r.github.asked, want)
+	}
+}
+
+// A LAUNCH NEVER ASKED ABOUT GOES BEFORE ONE THAT WAS, however old: launches that
+// become due again together cannot keep a younger one unread by taking every pass's
+// reads in the order the ledger lists them.
+func TestTheLaunchAskedLeastRecentlyGoesFirst(t *testing.T) {
+	t.Parallel()
+
+	r := newStrandedStack(t)
+	r.miss("first", "acme/app", 42, "Lint App", 22*time.Minute)
+	r.miss("second", "acme/app", 42, "Test App", 21*time.Minute)
+	r.miss("third", "acme/app", 42, "Build App", 20*time.Minute)
+	r.github.jobs = NamedJobs{}
+
+	start := r.now
+	for _, at := range []time.Duration{0, strandedAgain + time.Minute} {
+		r.now = start.Add(at)
+		r.advertises(4, 0)
+		r.pass()
+	}
+
+	want := []string{"acme/app Lint App", "acme/app Test App", "acme/app Build App", "acme/app Lint App"}
 	if !slices.Equal(r.github.asked, want) {
 		t.Fatalf("asked %q, want %q", r.github.asked, want)
 	}
