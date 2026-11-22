@@ -105,6 +105,9 @@ const (
 	// one App installation, each cached for the pass. It decides nothing about a
 	// runner, so it is as small as the queue-time sweep's share.
 	alertRunsPerInstallation = 3
+	// alertStrandedRunsPerInstallation is the share a stranded job's branch reads come
+	// from, apart from the others' (#911).
+	alertStrandedRunsPerInstallation = 1
 	// alertReadsRemembered bounds the branches kept between passes: a run's branch does
 	// not change, and a rule about a branch asks of every run.
 	alertReadsRemembered = 4096
@@ -720,10 +723,16 @@ func (s *Server) narrowAlert(ctx context.Context, rule *alerts.Rule, condition a
 
 // spendAlertRead takes one of the pass's reads through a target's installation,
 // costing up to pages requests, and only while those pages leave the reserve, a fifth
-// of the installation's hour, to what decides whether a runner starts.
-func spendAlertRead(target Target, pass *alertPass, now time.Time, pages int64) bool {
+// of the installation's hour, to what decides whether a runner starts. A stranded
+// job's read comes from a share of its own, so neither the jobs that ran nor the
+// stranded ones can spend the reads the others need.
+func spendAlertRead(target Target, pass *alertPass, now time.Time, pages int64, stranded bool) bool {
 	installation := installationOf(target)
-	if pass.spent[installation] >= alertRunsPerInstallation {
+	share, limit := installation, alertRunsPerInstallation
+	if stranded {
+		share, limit = installation+"\x00stranded", alertStrandedRunsPerInstallation
+	}
+	if pass.spent[share] >= limit {
 		return false
 	}
 	for _, h := range pass.budgets[installation] {
@@ -732,7 +741,7 @@ func spendAlertRead(target Target, pass *alertPass, now time.Time, pages int64) 
 			return false
 		}
 	}
-	pass.spent[installation]++
+	pass.spent[share]++
 
 	return true
 }
@@ -762,7 +771,7 @@ func (s *Server) alertBranch(ctx context.Context, target Target, owner, reposito
 	if !ok {
 		return "", fmt.Errorf("%w: this target cannot read a workflow run", errAlertUnreadable)
 	}
-	if !spendAlertRead(target, pass, time.Now(), 1) {
+	if !spendAlertRead(target, pass, time.Now(), 1, !job.StrandedAt.IsZero()) {
 		return "", errAlertNoRead
 	}
 	ask()
@@ -806,7 +815,7 @@ func (s *Server) alertSteps(ctx context.Context, target Target, owner, repositor
 		if !ok {
 			return nil, fmt.Errorf("%w: this target cannot read a job's steps", errAlertUnreadable)
 		}
-		if !spendAlertRead(target, pass, time.Now(), alertStepPages) {
+		if !spendAlertRead(target, pass, time.Now(), alertStepPages, false) {
 			return nil, errAlertNoRead
 		}
 		ask()

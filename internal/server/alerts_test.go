@@ -713,6 +713,36 @@ func TestAStrandedJobIsJudgedBeforeTheJobsThatRan(t *testing.T) {
 	}
 }
 
+// STRANDED JOBS READ FROM A SHARE OF THEIR OWN, so three of them needing their
+// branches leave a job that failed its read in the same pass.
+func TestStrandedReadsLeaveTheOthersTheirShare(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Failed: true, Stranded: true}, "0s", "main"
+	}))
+	r.record.branch = "main"
+	for i, run := range []int64{61, 62, 63} {
+		lease := fmt.Sprintf("stranded-%d", i)
+		r.stranded(lease, r.now)
+		if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET run_id = $1 WHERE lease_id = $2`, run, lease)
+
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.seed(jobRow{lease: "failed", result: "failed", ran: time.Second, age: 30 * time.Second, run: 70})
+	r.now = r.now.Add(alertSettledAfter + time.Second)
+
+	r.pass()
+
+	if owed := r.owedLeases(); !slices.Contains(owed, "failed:failed") {
+		t.Fatalf("owed = %v, want the failed job told beside the stranded ones' reads", owed)
+	}
+}
+
 // A JOB THAT RAN IS A MISS ON STRANDED WITHOUT A READ OF GITHUB: ordinary jobs never
 // spend the share of reads a stranded job's branch needs.
 func TestAJobThatRanCostsAStrandedRuleNoRead(t *testing.T) {
