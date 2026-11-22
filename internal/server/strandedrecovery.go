@@ -250,6 +250,11 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 	if !recoverable(attempt, job.JobName) {
 		return
 	}
+	// NOT PAST THE DAY THE DECISION LEAVES FOR A RECOVERY, on the clock as it is after the
+	// read: a cancel is a day's news at most.
+	if sweep.clock(now).Sub(job.Decided) > strandedRecoveryWindow {
+		return
+	}
 
 	recovery := alloc.StrandedRecovery{Repository: job.Repository, RunID: job.RunID, Attempt: attempt.Attempt,
 		Tier: job.Tier, LeaseID: job.LeaseID, JobName: job.JobName, Ended: job.Ended,
@@ -338,14 +343,15 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		recovery.MayHaveCancelled():
 		// THE ATTEMPT BILLET CANCELLED ENDED CANCELLED, by a cancel of billet's that may
 		// have landed, so its failed jobs, the cancelled one among them, can be run again.
-		if s.recoveryExpired(ctx, sweep, recovery, now) {
-			return
-		}
 		moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryRerunning, 1)
 		if err != nil || !moved {
 			return
 		}
 		recovery.State, recovery.Tries = alloc.RecoveryRerunning, 1
+		// AND AGAIN AFTER THE WRITE, which may have waited for the ledger.
+		if s.recoveryExpired(ctx, sweep, recovery, now) {
+			return
+		}
 		s.sendRerunOfRecovery(ctx, client, sweep, installation, recovery, owner, name, now)
 	case recovery.State == alloc.RecoveryCancelling && attempt.Completed:
 		// THE RUN ENDED, AND NOT BY BILLET: on its own, or cancelled by someone while
@@ -365,14 +371,15 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		if !recoverable(attempt, recovery.JobName) || recovery.Tries >= strandedRecoveryTries {
 			return
 		}
-		if s.recoveryExpired(ctx, sweep, recovery, now) {
-			return
-		}
 		moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryCancelling, recovery.Tries+1)
 		if err != nil || !moved {
 			return
 		}
 		recovery.Tries++
+		// AND AGAIN AFTER THE WRITE, which may have waited for the ledger.
+		if s.recoveryExpired(ctx, sweep, recovery, now) {
+			return
+		}
 		s.sendCancel(ctx, client, sweep, installation, recovery, owner, name, now)
 	case !attempt.Completed:
 		// A RUN GOING ON THE ATTEMPT A RE-RUN WAS ASKED OF took it: straight after the
@@ -381,14 +388,15 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 	case recovery.Tries >= strandedRecoveryTries:
 		s.endRecovery(ctx, recovery, alloc.RecoveryFailed, "GitHub did not take the re-run")
 	default:
-		if s.recoveryExpired(ctx, sweep, recovery, now) {
-			return
-		}
 		moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryRerunning, recovery.Tries+1)
 		if err != nil || !moved {
 			return
 		}
 		recovery.Tries++
+		// AND AGAIN AFTER THE WRITE, which may have waited for the ledger.
+		if s.recoveryExpired(ctx, sweep, recovery, now) {
+			return
+		}
 		s.sendRerunOfRecovery(ctx, client, sweep, installation, recovery, owner, name, now)
 	}
 }

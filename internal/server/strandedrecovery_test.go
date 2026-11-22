@@ -849,6 +849,23 @@ func TestNoRequestLeavesPastTheDay(t *testing.T) {
 	}
 }
 
+// NOR DOES A FIRST CANCEL LEAVE PAST ITS DECISION'S DAY, however slow the read before it.
+func TestNoFirstCancelLeavesPastItsDecisionsDay(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.strand("missed", 42, 20*time.Minute)
+	r.exec(`UPDATE job_history SET stranded_at = '` + stamp(r.now.Add(-strandedRecoveryWindow+2*time.Minute)) +
+		`' WHERE lease_id = 'missed'`)
+	r.github.onRead = func() { r.sweep.began = r.sweep.began.Add(-5 * time.Minute) }
+
+	r.pass()
+
+	if r.github.cancels != 0 {
+		t.Fatalf("sent a first cancel %d times after its decision's day had passed", r.github.cancels)
+	}
+}
+
 // A RECOVERY DOES NOT BEGIN WHILE A RE-RUN OF A DISRUPTED JOB OF THE RUN MAY HAVE
 // LANDED: the two never race for one attempt.
 func TestARecoveryWaitsForARerunInDoubt(t *testing.T) {
