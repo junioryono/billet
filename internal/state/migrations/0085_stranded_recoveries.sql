@@ -15,8 +15,10 @@
 -- closed in Go rather than by a CHECK, for the reason migration 35 gives: SQLite
 -- cannot extend a column CHECK in place.
 --
--- The key is the rule: one recovery per attempt of a run. tries counts the sends of
--- the current request and bounds them. detail is billet's own text around GitHub's
+-- The key is the rule: one recovery per attempt of a run. ended_at is when the
+-- stranded launch's lease ended, from which every cancel asks the ledger again
+-- whether the tier has since been assigned what may be the job. tries counts the
+-- sends of the current request and bounds them. detail is billet's own text around GitHub's
 -- decoded message: nothing a guest wrote.
 --
 -- stranded_tiers is when each tier started asking, as rerun_tiers is for re-runs: a
@@ -39,6 +41,7 @@ CREATE TABLE stranded_recoveries (
     tier TEXT NOT NULL,
     lease_id TEXT NOT NULL,
     job_name TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
     state TEXT NOT NULL,
     tries INTEGER NOT NULL DEFAULT 0 CHECK (tries >= 0),
     created_at TEXT NOT NULL,

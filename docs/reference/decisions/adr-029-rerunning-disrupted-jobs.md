@@ -65,7 +65,7 @@ Issue #911. On 2026-11-20 a consumer's job whose launch started nothing was assi
 
 - **A cancel is sent only when all of these hold:**
   - The launch was decided stranded (#915), and ended after its tier started asking (`stranded_tiers`).
-  - The ledger holds no assignment of the tier for the run since then that is, or may be, the job.
+  - The ledger holds no assignment of the tier for the run since then that is, or may be, the job, asked again in the transaction that authorises the cancel, and again for every cancel sent again.
   - GitHub's record of the run's latest attempt, read just before, has the job of that name queued with no runner.
   - Every job of that attempt is queued with no runner or over, so the cancel ends nothing that is running.
 - **A run is recovered once, on any attempt.** A job that strands again after billet's re-run is reported, never cancelled again.

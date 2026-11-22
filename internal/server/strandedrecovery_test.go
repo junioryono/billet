@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,43 +18,70 @@ import (
 type recoveryGitHub struct {
 	*strandedGitHub
 
-	attempt   QueuedAttempt
+	// attempts is each run as GitHub records it, and fallback a run it has no entry
+	// for.
+	attempts  map[int64]QueuedAttempt
+	fallback  QueuedAttempt
+	readErr   map[int64]error
 	reads     int
 	cancels   int
 	reruns    int
+	cancelled map[int64]int
+	rerun     map[int64]int
 	cancelErr error
 	rerunErr  error
 	// lands says whether a request GitHub took changes the run, as it does unless a
 	// test is about one that did not.
 	cancelLands, rerunLands bool
+	// onRead, when set, runs inside each read, before it answers.
+	onRead func()
 }
 
-func (g *recoveryGitHub) QueuedAttempt(context.Context, string, string, int64) (QueuedAttempt, error) {
+func (g *recoveryGitHub) get(run int64) QueuedAttempt {
+	if attempt, ok := g.attempts[run]; ok {
+		return attempt
+	}
+
+	return g.fallback
+}
+
+// set is what GitHub records of run from now on.
+func (g *recoveryGitHub) set(run int64, attempt QueuedAttempt) { g.attempts[run] = attempt }
+
+func (g *recoveryGitHub) QueuedAttempt(_ context.Context, _, _ string, run int64) (QueuedAttempt, error) {
 	g.reads++
+	if g.onRead != nil {
+		g.onRead()
+	}
+	if err := g.readErr[run]; err != nil {
+		return QueuedAttempt{}, err
+	}
 
-	return g.attempt, nil
+	return g.get(run), nil
 }
 
-func (g *recoveryGitHub) CancelRun(context.Context, string, string, int64) error {
+func (g *recoveryGitHub) CancelRun(_ context.Context, _, _ string, run int64) error {
 	g.cancels++
+	g.cancelled[run]++
 	if g.cancelErr != nil {
 		return g.cancelErr
 	}
 	if g.cancelLands {
-		g.attempt = QueuedAttempt{Completed: true, Attempt: g.attempt.Attempt}
+		g.set(run, QueuedAttempt{Completed: true, Attempt: g.get(run).Attempt})
 	}
 
 	return nil
 }
 
-func (g *recoveryGitHub) RerunFailedJobs(context.Context, string, string, int64) error {
+func (g *recoveryGitHub) RerunFailedJobs(_ context.Context, _, _ string, run int64) error {
 	g.reruns++
+	g.rerun[run]++
 	if g.rerunErr != nil {
 		return g.rerunErr
 	}
 	if g.rerunLands {
-		next := g.attempt.Attempt + 1
-		g.attempt = QueuedAttempt{Attempt: next, Jobs: []QueuedJob{{Name: "Lint App", Attempt: next, Unstarted: true}}}
+		next := g.get(run).Attempt + 1
+		g.set(run, QueuedAttempt{Attempt: next, Jobs: []QueuedJob{{Name: "Lint App", Attempt: next, Unstarted: true}}})
 	}
 
 	return nil
@@ -96,7 +124,8 @@ func newRecoveryStack(t *testing.T, recovers bool) *recoveryStack {
 	r.a, r.s = a, New(a, nil, tiers, "owner", nil)
 
 	github := &recoveryGitHub{strandedGitHub: &strandedGitHub{fakeProvisioner: &fakeProvisioner{}},
-		attempt: queued(), cancelLands: true, rerunLands: true}
+		attempts: map[int64]QueuedAttempt{}, fallback: queued(), readErr: map[int64]error{},
+		cancelled: map[int64]int{}, rerun: map[int64]int{}, cancelLands: true, rerunLands: true}
 	r.github = github.strandedGitHub
 	target := Target{Config: config.GitHubTarget{Name: "default", Org: "acme", InstallationID: 7}, Provisioner: github}
 	r.targets = map[string]Target{strandedTier: target, "billet-2vcpu-b": target}
@@ -241,7 +270,7 @@ func TestNothingRunningIsCancelled(t *testing.T) {
 			t.Parallel()
 
 			r := newRecoveryStack(t, true)
-			r.github.attempt = tc.attempt
+			r.github.set(42, tc.attempt)
 			r.strand("missed", 42, 20*time.Minute)
 
 			r.pass()
@@ -257,7 +286,7 @@ func TestNothingRunningIsCancelled(t *testing.T) {
 
 	// AND A FINISHED SIBLING IS NOT RUNNING: the run is cancelled.
 	r := newRecoveryStack(t, true)
-	r.github.attempt = queued(QueuedJob{Name: "Detect Changes", Attempt: 1, Done: true})
+	r.github.set(42, queued(QueuedJob{Name: "Detect Changes", Attempt: 1, Done: true}))
 	r.strand("missed", 42, 20*time.Minute)
 	r.pass()
 	if r.github.cancels != 1 {
@@ -326,7 +355,7 @@ func TestARunSomeoneElseReRanIsLeftAlone(t *testing.T) {
 	r.strand("missed", 42, 20*time.Minute)
 	r.pass()
 
-	r.github.attempt = QueuedAttempt{Attempt: 2, Jobs: []QueuedJob{{Name: "Lint App", Attempt: 2, Unstarted: true}}}
+	r.github.set(42, QueuedAttempt{Attempt: 2, Jobs: []QueuedJob{{Name: "Lint App", Attempt: 2, Unstarted: true}}})
 	r.pass()
 
 	if r.github.reruns != 0 {
@@ -373,7 +402,7 @@ func TestACancelIsSentAgainOnlyWhileTheRunIsSafeToCancel(t *testing.T) {
 		t.Fatalf("sent the cancel %d times over two passes, want twice", r.github.cancels)
 	}
 
-	r.github.attempt = queued(QueuedJob{Name: "Build iOS", Attempt: 1})
+	r.github.set(42, queued(QueuedJob{Name: "Build iOS", Attempt: 1}))
 	r.pass()
 	r.pass()
 
@@ -419,7 +448,7 @@ func TestAReRunWhoseAnswerWasLostIsNotSentAgain(t *testing.T) {
 	r.pass()
 	r.pass()
 
-	r.github.attempt = queued()
+	r.github.set(42, queued())
 	r.pass()
 	r.pass()
 
@@ -461,12 +490,128 @@ func TestARunIsRecoveredOnce(t *testing.T) {
 	r.pass()
 	r.pass()
 
-	r.github.attempt = QueuedAttempt{Attempt: 2, Jobs: []QueuedJob{{Name: "Lint App", Attempt: 2, Unstarted: true}}}
+	r.github.set(42, QueuedAttempt{Attempt: 2, Jobs: []QueuedJob{{Name: "Lint App", Attempt: 2, Unstarted: true}}})
 	r.strand("again", 42, 15*time.Minute)
 	r.pass()
 	r.pass()
 
 	if r.github.cancels != 1 {
 		t.Fatalf("cancelled the run %d times, want once whatever strands on it after", r.github.cancels)
+	}
+}
+
+// AN ASSIGNMENT RECORDED WHILE GITHUB WAS BEING READ HOLDS THE FIRST CANCEL: the write
+// that authorises it asks the ledger again.
+func TestAnAssignmentDuringTheReadHoldsTheCancel(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.strand("missed", 42, 20*time.Minute)
+	r.github.onRead = func() { r.lease("booting", 42, "", time.Minute) }
+
+	r.pass()
+
+	if r.github.cancels != 0 {
+		t.Fatalf("cancelled the run %d times with an assignment recorded during the read", r.github.cancels)
+	}
+	if got := r.recovery(42); got != "" {
+		t.Fatalf("a recovery %q was begun", got)
+	}
+}
+
+// AN ASSIGNMENT SINCE HOLDS A CANCEL SENT AGAIN: the recovery ends rather than cancel
+// what may be the job offered again, across a restart too.
+func TestAnAssignmentSinceHoldsACancelSentAgain(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.github.cancelLands = false
+	r.strand("missed", 42, 20*time.Minute)
+	r.pass()
+
+	r.lease("booting", 42, "", 5*time.Minute)
+	r.sweep = newRerunSweep()
+	r.pass()
+	r.pass()
+
+	if r.github.cancels != 1 {
+		t.Fatalf("sent the cancel %d times, want once: an assignment since may be the job", r.github.cancels)
+	}
+	if got := r.recovery(42); got != string(alloc.RecoverySuperseded) {
+		t.Fatalf("the recovery is %q, want superseded", got)
+	}
+}
+
+// RECOVERIES GITHUB CANNOT BE READ ABOUT KEEP NONE WAITING: the one read longest ago
+// goes first, so a run billet cancelled is re-run whatever the others do.
+func TestUnreadableRecoveriesKeepNoneWaiting(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	for i, run := range []int64{41, 42, 43} {
+		ended := r.now.Add(-20 * time.Minute)
+		r.strand(fmt.Sprintf("missed-%d", run), run, 20*time.Minute)
+		if begun, err := r.a.BeginStrandedRecovery(t.Context(), alloc.StrandedRecovery{Repository: "acme/app",
+			RunID: run, Attempt: 1, Tier: strandedTier, LeaseID: fmt.Sprintf("missed-%d", run), JobName: "Lint App",
+			Ended: ended}); err != nil || !begun {
+			t.Fatalf("begin run %d = %v, %v", run, begun, err)
+		}
+		r.now = r.now.Add(time.Second * time.Duration(i+1))
+	}
+	r.github.readErr[41] = errors.New("connection reset")
+	r.github.readErr[42] = errors.New("connection reset")
+	r.github.set(43, QueuedAttempt{Completed: true, Attempt: 1})
+
+	for range 3 {
+		r.pass()
+	}
+
+	if r.github.rerun[43] != 1 {
+		t.Fatalf("run 43, cancelled and over, was re-run %d times behind two runs that could not be read, "+
+			"want once", r.github.rerun[43])
+	}
+}
+
+// A STRANDED JOB NEVER ASKED ABOUT GOES BEFORE ONES THAT WERE, so launches that stay
+// unsafe to cancel cannot keep another from its turn.
+func TestAStrandedJobNeverAskedAboutGoesFirst(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.github.fallback = queued(QueuedJob{Name: "Build iOS", Attempt: 1})
+	r.strand("first", 41, 22*time.Minute)
+	r.strand("second", 42, 21*time.Minute)
+	r.strand("third", 43, 20*time.Minute)
+	r.github.set(43, queued())
+
+	r.pass()
+	r.now = r.now.Add(strandedAgain + time.Minute)
+	r.pass()
+
+	if r.github.cancelled[43] != 1 {
+		t.Fatalf("the launch never asked about was cancelled %d times on the second pass, want once",
+			r.github.cancelled[43])
+	}
+}
+
+// A STRANDED JOB PAST THE FIRST PAGE IS TAKEN IN ITS TURN: a page of launches that stay
+// unsafe to cancel cannot keep it from being listed.
+func TestAStrandedJobPastTheFirstPageIsTaken(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.github.fallback = queued(QueuedJob{Name: "Build iOS", Attempt: 1})
+	for i := range strandedRecoveryRows {
+		r.strand(fmt.Sprintf("old-%03d", i), int64(100+i), 40*time.Minute-time.Duration(i)*time.Second)
+	}
+	r.strand("tail", 7, 20*time.Minute)
+	r.github.set(7, queued())
+
+	r.pass()
+	r.pass()
+
+	if r.github.cancelled[7] != 1 {
+		t.Fatalf("the launch past the first page was cancelled %d times over two passes, want once",
+			r.github.cancelled[7])
 	}
 }

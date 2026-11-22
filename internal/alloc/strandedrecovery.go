@@ -3,6 +3,7 @@ package alloc
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -34,6 +35,11 @@ const (
 // open says whether a state is between the two requests.
 func (s StrandedRecoveryState) open() bool { return s == RecoveryCancelling || s == RecoveryRerunning }
 
+// ErrMayBeOffered is a cancel the ledger refused because the tier has been assigned,
+// since the stranded launch ended, what is or may be its job: GitHub may be offering
+// it after all.
+var ErrMayBeOffered = errors.New("alloc: the tier has since been assigned what may be the job")
+
 // StrandedRecovery is one attempt of a run billet is recovering, or recovered.
 type StrandedRecovery struct {
 	// Repository is the run's repository, owner/name.
@@ -43,7 +49,9 @@ type StrandedRecovery struct {
 	Tier       string
 	LeaseID    string
 	JobName    string
-	State      StrandedRecoveryState
+	// Ended is when the stranded launch's lease ended.
+	Ended time.Time
+	State StrandedRecoveryState
 	// Tries is how many times the current request was sent.
 	Tries   int64
 	Created time.Time
@@ -59,6 +67,18 @@ type StrandedLaunch struct {
 	JobName    string
 	Ended      time.Time
 	Decided    time.Time
+}
+
+// StrandedCursor is where a listing of StrandedToRecover resumes: just past the
+// launch it names, or from the start for the zero value.
+type StrandedCursor struct {
+	Decided time.Time
+	LeaseID string
+}
+
+// After is the cursor just past l.
+func (l *StrandedLaunch) After() StrandedCursor {
+	return StrandedCursor{Decided: l.Decided, LeaseID: l.LeaseID}
 }
 
 // AskStranded records that tiers ask for stranded jobs to be recovered, forgets
@@ -101,21 +121,30 @@ func (a *Allocator) AskStranded(ctx context.Context, tiers []string) (map[string
 	return since, err
 }
 
-// StrandedToRecover is the launches decided stranded since since whose run billet
-// has never tried to recover, oldest decision first, at most maxRows.
-func (a *Allocator) StrandedToRecover(ctx context.Context, since time.Time, maxRows int) ([]StrandedLaunch, error) {
+// StrandedToRecover is the launches decided stranded since since, of a tier that
+// asks, that ended after it asked, and whose run billet has never tried to recover:
+// oldest decision first from just past after, at most maxRows.
+func (a *Allocator) StrandedToRecover(ctx context.Context, since time.Time, after StrandedCursor, maxRows int,
+) ([]StrandedLaunch, error) {
+	// THE START IS AN EMPTY STAMP, which every recorded one sorts after.
+	afterDecided := ""
+	if !after.Decided.IsZero() {
+		afterDecided = ts(after.Decided)
+	}
+
 	var out []StrandedLaunch
 	err := a.db.View(ctx, func(q querier) error {
 		rows, err := state.ReadQueries(q).ListStrandedToRecover(ctx, ledgerdb.ListStrandedToRecoverParams{
-			Since: ts(since), MaxRows: int64(maxRows),
+			Since: ts(since), AfterDecided: afterDecided, AfterLease: after.LeaseID, MaxRows: int64(maxRows),
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: list the stranded jobs to recover: %w", err)
 		}
 
 		for _, row := range rows {
-			out = append(out, StrandedLaunch{LeaseID: row.LeaseID, Tier: row.Tier, Repository: row.Repo, RunID: row.RunID,
-				JobName: row.JobName, Ended: parseStamp(row.FinishedAt), Decided: parseStamp(row.StrandedAt)})
+			out = append(out, StrandedLaunch{LeaseID: row.LeaseID, Tier: row.Tier, Repository: row.Repo,
+				RunID: row.RunID, JobName: row.JobName, Ended: parseStamp(row.FinishedAt),
+				Decided: parseStamp(row.StrandedAt)})
 		}
 
 		return nil
@@ -134,10 +163,11 @@ func (a *Allocator) OpenStrandedRecoveries(ctx context.Context, maxRows int) ([]
 			return fmt.Errorf("alloc: list the stranded-job recoveries in progress: %w", err)
 		}
 
-		for _, row := range rows {
+		for i := range rows {
+			row := &rows[i]
 			out = append(out, StrandedRecovery{Repository: row.Repo, RunID: row.RunID, Attempt: row.RunAttempt,
-				Tier: row.Tier, LeaseID: row.LeaseID, JobName: row.JobName, State: StrandedRecoveryState(row.State), Tries: row.Tries,
-				Created: parseStamp(row.CreatedAt)})
+				Tier: row.Tier, LeaseID: row.LeaseID, JobName: row.JobName, Ended: parseStamp(row.EndedAt),
+				State: StrandedRecoveryState(row.State), Tries: row.Tries, Created: parseStamp(row.CreatedAt)})
 		}
 
 		return nil
@@ -146,20 +176,43 @@ func (a *Allocator) OpenStrandedRecoveries(ctx context.Context, maxRows int) ([]
 	return out, err
 }
 
+// mayBeOffered asks, inside the transaction that authorises a cancel, whether the
+// tier has been assigned since r's launch ended what is or may be its job.
+func mayBeOffered(ctx context.Context, tx *sql.Tx, r *StrandedRecovery) (bool, error) {
+	later, err := state.ReadQueries(tx).CountLaterLeasesOfJob(ctx, ledgerdb.CountLaterLeasesOfJobParams{
+		Tier: r.Tier, RunID: sql.NullInt64{Int64: r.RunID, Valid: true}, JobName: r.JobName, After: ts(r.Ended),
+	})
+	if err != nil {
+		return false, fmt.Errorf("alloc: count tier %s's leases of run %d since its stranded launch: %w",
+			r.Tier, r.RunID, err)
+	}
+
+	return later.Same > 0 || later.Unnamed > 0, nil
+}
+
 // BeginStrandedRecovery writes that billet is about to cancel r's attempt, before
 // the cancel leaves, and says whether this call began it: false for a run billet
-// has tried to recover before, on any attempt.
+// has tried to recover before, on any attempt, and ErrMayBeOffered for one whose
+// tier has since been assigned what may be the job.
 func (a *Allocator) BeginStrandedRecovery(ctx context.Context, r StrandedRecovery) (bool, error) {
-	if r.RunID <= 0 || r.Attempt <= 0 || r.Repository == "" {
-		return false, fmt.Errorf("alloc: a recovery needs a repository, a run and an attempt, not %q %d %d",
-			r.Repository, r.RunID, r.Attempt)
+	if r.RunID <= 0 || r.Attempt <= 0 || r.Repository == "" || r.JobName == "" || r.Ended.IsZero() {
+		return false, fmt.Errorf("alloc: a recovery needs a repository, a run, an attempt, a job and when its "+
+			"launch ended, not %q %d %d %q %v", r.Repository, r.RunID, r.Attempt, r.JobName, r.Ended)
 	}
 
 	var begun bool
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		offered, err := mayBeOffered(ctx, tx, &r)
+		if err != nil {
+			return err
+		}
+		if offered {
+			return ErrMayBeOffered
+		}
+
 		n, err := state.WriteQueries(tx).BeginStrandedRecovery(ctx, ledgerdb.BeginStrandedRecoveryParams{
 			Repo: r.Repository, RunID: r.RunID, RunAttempt: r.Attempt, Tier: r.Tier, LeaseID: r.LeaseID,
-			JobName: r.JobName, CreatedAt: ts(a.now().UTC()),
+			JobName: r.JobName, EndedAt: ts(r.Ended), CreatedAt: ts(a.now().UTC()),
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: begin recovering run %d of %s: %w", r.RunID, r.Repository, err)
@@ -173,7 +226,9 @@ func (a *Allocator) BeginStrandedRecovery(ctx context.Context, r StrandedRecover
 }
 
 // MoveStrandedRecovery moves r from the state it was read in to to, with tries
-// sends of that request, and says whether it moved.
+// sends of that request, and says whether it moved. A move to `cancelling`
+// authorises a cancel sent again, and is refused with ErrMayBeOffered where the
+// tier has since been assigned what may be the job.
 func (a *Allocator) MoveStrandedRecovery(ctx context.Context, r StrandedRecovery, to StrandedRecoveryState,
 	tries int64,
 ) (bool, error) {
@@ -183,6 +238,16 @@ func (a *Allocator) MoveStrandedRecovery(ctx context.Context, r StrandedRecovery
 
 	var moved bool
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		if to == RecoveryCancelling {
+			offered, err := mayBeOffered(ctx, tx, &r)
+			if err != nil {
+				return err
+			}
+			if offered {
+				return ErrMayBeOffered
+			}
+		}
+
 		n, err := state.WriteQueries(tx).MoveStrandedRecovery(ctx, ledgerdb.MoveStrandedRecoveryParams{
 			ToState: string(to), Tries: tries, Repo: r.Repository, RunID: r.RunID, RunAttempt: r.Attempt,
 			FromState: string(r.State),

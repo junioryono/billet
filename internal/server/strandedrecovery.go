@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -91,7 +92,8 @@ func (s *Server) recoverStranded(ctx context.Context, targets map[string]Target,
 	read := map[string]int{}
 
 	// WHAT IS UNDER WAY FIRST, whether or not its tier still asks: a run billet may have
-	// cancelled must not be left cancelled because the config changed.
+	// cancelled must not be left cancelled because the config changed. The one read
+	// longest ago first, so recoveries GitHub cannot be read about keep none waiting.
 	open, err := s.alloc.OpenStrandedRecoveries(ctx, strandedRecoveryRows)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -100,6 +102,25 @@ func (s *Server) recoverStranded(ctx context.Context, targets map[string]Target,
 
 		return
 	}
+	// WHAT THE PASS REMEMBERS IS OF WHAT IS STILL LISTED, so it does not grow with time.
+	underWay := make(map[rerunRun]bool, len(open))
+	for i := range open {
+		underWay[recoveryRun(&open[i])] = true
+	}
+	for run := range sweep.recoveryRead {
+		if !underWay[run] {
+			delete(sweep.recoveryRead, run)
+		}
+	}
+	for lease, at := range sweep.recoveryAsked {
+		if now.Sub(at) > strandedRecoveryWindow {
+			delete(sweep.recoveryAsked, lease)
+		}
+	}
+
+	slices.SortStableFunc(open, func(a, b alloc.StrandedRecovery) int {
+		return sweep.recoveryRead[recoveryRun(&a)].Compare(sweep.recoveryRead[recoveryRun(&b)])
+	})
 	for i := range open {
 		if ctx.Err() != nil {
 			return
@@ -111,7 +132,11 @@ func (s *Server) recoverStranded(ctx context.Context, targets map[string]Target,
 		return
 	}
 
-	jobs, err := s.alloc.StrandedToRecover(ctx, now.Add(-strandedRecoveryWindow), strandedRecoveryRows)
+	// ONE PAGE A PASS, FROM WHERE THE LAST ENDED, and from the start once a page comes
+	// back short, so launches that stay unsafe to cancel cannot keep another from
+	// being listed. The list holds only what a tier asking may take.
+	jobs, err := s.alloc.StrandedToRecover(ctx, now.Add(-strandedRecoveryWindow), sweep.recoveryFrom,
+		strandedRecoveryRows)
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn("could not list the stranded jobs to recover; trying again", "error", err)
@@ -119,12 +144,33 @@ func (s *Server) recoverStranded(ctx context.Context, targets map[string]Target,
 
 		return
 	}
+	sweep.recoveryFrom = alloc.StrandedCursor{}
+	if len(jobs) == strandedRecoveryRows {
+		sweep.recoveryFrom = jobs[len(jobs)-1].After()
+	}
+
+	// LEAST RECENTLY ASKED FIRST, a launch never asked before any that was.
+	due := make([]*alloc.StrandedLaunch, 0, len(jobs))
 	for i := range jobs {
+		if at, ok := sweep.recoveryAsked[jobs[i].LeaseID]; ok && now.Sub(at) < strandedAgain {
+			continue
+		}
+		due = append(due, &jobs[i])
+	}
+	slices.SortStableFunc(due, func(a, b *alloc.StrandedLaunch) int {
+		return sweep.recoveryAsked[a.LeaseID].Compare(sweep.recoveryAsked[b.LeaseID])
+	})
+	for _, job := range due {
 		if ctx.Err() != nil {
 			return
 		}
-		s.beginRecovery(ctx, targets, sweep, budgets, read, &jobs[i], now)
+		s.beginRecovery(ctx, targets, sweep, budgets, read, job, now)
 	}
+}
+
+// recoveryRun is the run a recovery is of.
+func recoveryRun(r *alloc.StrandedRecovery) rerunRun {
+	return rerunRun{repository: r.Repository, run: r.RunID}
 }
 
 // recoveryReader is the client, installation and repository a recovery reads its
@@ -158,18 +204,9 @@ func (s *Server) recoveryReader(targets map[string]Target, sweep *rerunSweep, bu
 func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, sweep *rerunSweep,
 	budgets map[string][]RESTHeadroom, read map[string]int, job *alloc.StrandedLaunch, now time.Time,
 ) {
-	// ONLY WHAT ENDED AFTER THE TIER STARTED ASKING, so turning this on never cancels a
-	// run that stranded before.
-	asked, asking := sweep.strandedAsking[job.Tier]
-	if !asking || job.Ended.Before(asked) {
-		return
-	}
-	if at, ok := sweep.recoveryAsked[job.LeaseID]; ok && now.Sub(at) < strandedAgain {
-		return
-	}
-
 	// THE LEDGER AGAIN, as the decision read it: an assignment since that is, or may
-	// be, the job means GitHub may be offering it after all.
+	// be, the job means GitHub may be offering it after all. Asked here to spare a read
+	// of GitHub, and again in the write that authorises the cancel.
 	later, err := s.alloc.LaterLeasesOfJob(ctx, job.Tier, job.RunID, job.JobName, job.Ended)
 	if err != nil || later.Same > 0 || later.Unnamed > 0 {
 		return
@@ -193,10 +230,11 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 	}
 
 	recovery := alloc.StrandedRecovery{Repository: job.Repository, RunID: job.RunID, Attempt: attempt.Attempt,
-		Tier: job.Tier, LeaseID: job.LeaseID, JobName: job.JobName, State: alloc.RecoveryCancelling, Tries: 1}
+		Tier: job.Tier, LeaseID: job.LeaseID, JobName: job.JobName, Ended: job.Ended,
+		State: alloc.RecoveryCancelling, Tries: 1}
 	begun, err := s.alloc.BeginStrandedRecovery(ctx, recovery)
 	if err != nil || !begun {
-		if err != nil && ctx.Err() == nil {
+		if err != nil && !errors.Is(err, alloc.ErrMayBeOffered) && ctx.Err() == nil {
 			s.log.Warn("could not record a stranded-job recovery; trying again", "tier", job.Tier,
 				"run", job.RunID, "error", err)
 		}
@@ -248,6 +286,7 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		return
 	}
 
+	sweep.recoveryRead[recoveryRun(recovery)] = now
 	attempt, err := client.QueuedAttempt(ctx, owner, name, recovery.RunID)
 	if err != nil {
 		s.recoveryFailed(ctx, sweep, installation, recovery.Tier, recovery.Repository, recovery.RunID, err, now)
@@ -284,6 +323,12 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 			s.endRecovery(ctx, recovery, alloc.RecoveryFailed, "GitHub did not take the cancel")
 		default:
 			moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryCancelling, recovery.Tries+1)
+			if errors.Is(err, alloc.ErrMayBeOffered) {
+				s.endRecovery(ctx, recovery, alloc.RecoverySuperseded, "the tier has since been assigned what may "+
+					"be the job")
+
+				return
+			}
 			if err != nil || !moved {
 				return
 			}

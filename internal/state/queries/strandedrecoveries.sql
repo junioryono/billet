@@ -16,22 +16,29 @@ SELECT tier, asked_since FROM stranded_tiers ORDER BY tier;
 DELETE FROM stranded_tiers WHERE tier = @tier;
 
 -- name: ListStrandedToRecover :many
--- The launches decided stranded since a moment whose run billet has never tried to
--- recover, oldest decision first and bounded. The WHERE leads with the partial
--- index's, word for word.
-SELECT lease_id, tier, COALESCE(repo, '') AS repo, CAST(COALESCE(run_id, 0) AS BIGINT) AS run_id,
-       job_name, COALESCE(finished_at, '') AS finished_at, stranded_at
-  FROM job_history
- WHERE stranded = 'stranded'
-   AND stranded_at >= @since
+-- The launches decided stranded since a moment, of a tier that asks, whose lease
+-- ended after the tier started asking and whose run billet has never tried to
+-- recover: oldest decision first from just past a cursor, (after_decided,
+-- after_lease), the last row of the page before, an empty after_decided the start,
+-- and bounded. What it leaves out is ineligible for good, so a page is only of what a
+-- pass may take; the cursor goes round it. The WHERE leads with the partial index's,
+-- word for word.
+SELECT h.lease_id, h.tier, COALESCE(h.repo, '') AS repo, CAST(COALESCE(h.run_id, 0) AS BIGINT) AS run_id,
+       h.job_name, COALESCE(h.finished_at, '') AS finished_at, h.stranded_at
+  FROM job_history AS h
+  JOIN stranded_tiers AS t ON t.tier = h.tier
+ WHERE h.stranded = 'stranded'
+   AND h.stranded_at >= @since
+   AND COALESCE(h.finished_at, '') >= t.asked_since
+   AND (h.stranded_at > @after_decided OR (h.stranded_at = @after_decided AND h.lease_id > @after_lease))
    AND NOT EXISTS (SELECT 1 FROM stranded_recoveries AS r
-                    WHERE r.repo = COALESCE(job_history.repo, '') AND r.run_id = job_history.run_id)
- ORDER BY stranded_at, lease_id
+                    WHERE r.repo = COALESCE(h.repo, '') AND r.run_id = h.run_id)
+ ORDER BY h.stranded_at, h.lease_id
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: ListOpenStrandedRecoveries :many
 -- Every recovery between its two requests, oldest first and bounded.
-SELECT repo, run_id, run_attempt, tier, lease_id, job_name, state, tries, created_at
+SELECT repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries, created_at
   FROM stranded_recoveries
  WHERE state IN ('cancelling', 'rerunning')
  ORDER BY created_at, repo, run_id
@@ -40,9 +47,11 @@ SELECT repo, run_id, run_attempt, tier, lease_id, job_name, state, tries, create
 -- name: BeginStrandedRecovery :execrows
 -- Write that billet is about to cancel one attempt of a run, BEFORE the cancel
 -- leaves. A run billet has tried to recover once, on any attempt, is never tried
--- again, and the rows changed say whether this one began.
-INSERT INTO stranded_recoveries (repo, run_id, run_attempt, tier, lease_id, job_name, state, tries, created_at)
-SELECT @repo, @run_id, @run_attempt, @tier, @lease_id, @job_name, 'cancelling', 1, @created_at
+-- again, and the rows changed say whether this one began. The transaction that
+-- writes it has asked CountLaterLeasesOfJob first.
+INSERT INTO stranded_recoveries (repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries,
+                                 created_at)
+SELECT @repo, @run_id, @run_attempt, @tier, @lease_id, @job_name, @ended_at, 'cancelling', 1, @created_at
  WHERE NOT EXISTS (SELECT 1 FROM stranded_recoveries AS r WHERE r.repo = @repo AND r.run_id = @run_id);
 
 -- name: MoveStrandedRecovery :execrows

@@ -125,6 +125,10 @@ type rerunSweep struct {
 	// was last read to begin a recovery and left alone.
 	strandedAsking map[string]time.Time
 	recoveryAsked  map[string]time.Time
+	// recoveryRead is when each recovery under way was last read, and recoveryFrom
+	// where the next pass lists stranded jobs to recover from.
+	recoveryRead map[rerunRun]time.Time
+	recoveryFrom alloc.StrandedCursor
 	// began is when the pass began on the wall clock, which clock measures from.
 	began time.Time
 }
@@ -142,7 +146,8 @@ func (s *rerunSweep) clock(now time.Time) time.Time {
 func newRerunSweep() *rerunSweep {
 	return &rerunSweep{retries: map[rerunRun]queueTimeRetry{}, paused: map[string]time.Time{},
 		reserved: map[string]bool{}, failures: map[rerunRun]string{}, tried: map[rerunRun]time.Time{},
-		strandedAsked: map[string]time.Time{}, recoveryAsked: map[string]time.Time{}}
+		strandedAsked: map[string]time.Time{}, recoveryAsked: map[string]time.Time{},
+		recoveryRead: map[rerunRun]time.Time{}}
 }
 
 // rerunWork is one run a pass will read, through the first target that serves it.

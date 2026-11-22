@@ -30,8 +30,9 @@ func (q *Queries) AskStrandedForTier(ctx context.Context, arg AskStrandedForTier
 }
 
 const beginStrandedRecovery = `-- name: BeginStrandedRecovery :execrows
-INSERT INTO stranded_recoveries (repo, run_id, run_attempt, tier, lease_id, job_name, state, tries, created_at)
-SELECT $1, $2, $3, $4, $5, $6, 'cancelling', 1, $7
+INSERT INTO stranded_recoveries (repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries,
+                                 created_at)
+SELECT $1, $2, $3, $4, $5, $6, $7, 'cancelling', 1, $8
  WHERE NOT EXISTS (SELECT 1 FROM stranded_recoveries AS r WHERE r.repo = $1 AND r.run_id = $2)
 `
 
@@ -42,12 +43,14 @@ type BeginStrandedRecoveryParams struct {
 	Tier       string
 	LeaseID    string
 	JobName    string
+	EndedAt    string
 	CreatedAt  string
 }
 
 // Write that billet is about to cancel one attempt of a run, BEFORE the cancel
 // leaves. A run billet has tried to recover once, on any attempt, is never tried
-// again, and the rows changed say whether this one began.
+// again, and the rows changed say whether this one began. The transaction that
+// writes it has asked CountLaterLeasesOfJob first.
 func (q *Queries) BeginStrandedRecovery(ctx context.Context, arg BeginStrandedRecoveryParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, beginStrandedRecovery,
 		arg.Repo,
@@ -56,6 +59,7 @@ func (q *Queries) BeginStrandedRecovery(ctx context.Context, arg BeginStrandedRe
 		arg.Tier,
 		arg.LeaseID,
 		arg.JobName,
+		arg.EndedAt,
 		arg.CreatedAt,
 	)
 	if err != nil {
@@ -75,7 +79,7 @@ func (q *Queries) ForgetStrandedTier(ctx context.Context, tier string) error {
 }
 
 const listOpenStrandedRecoveries = `-- name: ListOpenStrandedRecoveries :many
-SELECT repo, run_id, run_attempt, tier, lease_id, job_name, state, tries, created_at
+SELECT repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries, created_at
   FROM stranded_recoveries
  WHERE state IN ('cancelling', 'rerunning')
  ORDER BY created_at, repo, run_id
@@ -89,6 +93,7 @@ type ListOpenStrandedRecoveriesRow struct {
 	Tier       string
 	LeaseID    string
 	JobName    string
+	EndedAt    string
 	State      string
 	Tries      int64
 	CreatedAt  string
@@ -111,6 +116,7 @@ func (q *Queries) ListOpenStrandedRecoveries(ctx context.Context, maxRows int64)
 			&i.Tier,
 			&i.LeaseID,
 			&i.JobName,
+			&i.EndedAt,
 			&i.State,
 			&i.Tries,
 			&i.CreatedAt,
@@ -157,20 +163,25 @@ func (q *Queries) ListStrandedTiers(ctx context.Context) ([]StrandedTier, error)
 }
 
 const listStrandedToRecover = `-- name: ListStrandedToRecover :many
-SELECT lease_id, tier, COALESCE(repo, '') AS repo, CAST(COALESCE(run_id, 0) AS BIGINT) AS run_id,
-       job_name, COALESCE(finished_at, '') AS finished_at, stranded_at
-  FROM job_history
- WHERE stranded = 'stranded'
-   AND stranded_at >= $1
+SELECT h.lease_id, h.tier, COALESCE(h.repo, '') AS repo, CAST(COALESCE(h.run_id, 0) AS BIGINT) AS run_id,
+       h.job_name, COALESCE(h.finished_at, '') AS finished_at, h.stranded_at
+  FROM job_history AS h
+  JOIN stranded_tiers AS t ON t.tier = h.tier
+ WHERE h.stranded = 'stranded'
+   AND h.stranded_at >= $1
+   AND COALESCE(h.finished_at, '') >= t.asked_since
+   AND (h.stranded_at > $2 OR (h.stranded_at = $2 AND h.lease_id > $3))
    AND NOT EXISTS (SELECT 1 FROM stranded_recoveries AS r
-                    WHERE r.repo = COALESCE(job_history.repo, '') AND r.run_id = job_history.run_id)
- ORDER BY stranded_at, lease_id
- LIMIT CAST($2 AS BIGINT)
+                    WHERE r.repo = COALESCE(h.repo, '') AND r.run_id = h.run_id)
+ ORDER BY h.stranded_at, h.lease_id
+ LIMIT CAST($4 AS BIGINT)
 `
 
 type ListStrandedToRecoverParams struct {
-	Since   string
-	MaxRows int64
+	Since        string
+	AfterDecided string
+	AfterLease   string
+	MaxRows      int64
 }
 
 type ListStrandedToRecoverRow struct {
@@ -183,11 +194,20 @@ type ListStrandedToRecoverRow struct {
 	StrandedAt string
 }
 
-// The launches decided stranded since a moment whose run billet has never tried to
-// recover, oldest decision first and bounded. The WHERE leads with the partial
-// index's, word for word.
+// The launches decided stranded since a moment, of a tier that asks, whose lease
+// ended after the tier started asking and whose run billet has never tried to
+// recover: oldest decision first from just past a cursor, (after_decided,
+// after_lease), the last row of the page before, an empty after_decided the start,
+// and bounded. What it leaves out is ineligible for good, so a page is only of what a
+// pass may take; the cursor goes round it. The WHERE leads with the partial index's,
+// word for word.
 func (q *Queries) ListStrandedToRecover(ctx context.Context, arg ListStrandedToRecoverParams) ([]ListStrandedToRecoverRow, error) {
-	rows, err := q.db.QueryContext(ctx, listStrandedToRecover, arg.Since, arg.MaxRows)
+	rows, err := q.db.QueryContext(ctx, listStrandedToRecover,
+		arg.Since,
+		arg.AfterDecided,
+		arg.AfterLease,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}

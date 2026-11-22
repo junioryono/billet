@@ -13,6 +13,7 @@ CREATE TABLE stranded_recoveries (
     tier text NOT NULL,
     lease_id text NOT NULL,
     job_name text NOT NULL,
+    ended_at text NOT NULL,
     state text NOT NULL,
     tries bigint NOT NULL DEFAULT 0 CHECK (tries >= 0),
     created_at text NOT NULL,
