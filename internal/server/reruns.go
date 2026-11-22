@@ -270,6 +270,10 @@ func (s *Server) rerunOnce(ctx context.Context, targets map[string]Target, limit
 
 		s.afterRerun(ctx, w, s.decideRerun(ctx, w, limits, sweep, now), sweep, now)
 	}
+
+	// AND ON THE SAME PASS, within its own share of each installation: whether GitHub
+	// kept offering the job of a launch that started nothing (#911).
+	s.findStranded(ctx, targets, sweep, budgets, now)
 }
 
 // settleOverdue settles, without a read, the request in doubt of a run this pass does

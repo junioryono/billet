@@ -191,6 +191,8 @@ type ReadOps interface {
 	ListJobsAwaitingQueueTime(ctx context.Context,
 		arg ledgerdb.ListJobsAwaitingQueueTimeParams) ([]ledgerdb.ListJobsAwaitingQueueTimeRow, error)
 	ListJobsOfRun(ctx context.Context, arg ledgerdb.ListJobsOfRunParams) ([]string, error)
+	ListLaunchMisses(ctx context.Context, arg ledgerdb.ListLaunchMissesParams) ([]ledgerdb.ListLaunchMissesRow, error)
+	CountLaterLeasesOfRun(ctx context.Context, arg ledgerdb.CountLaterLeasesOfRunParams) (int64, error)
 	ListUsageSince(ctx context.Context, arg ledgerdb.ListUsageSinceParams) ([]ledgerdb.ListUsageSinceRow, error)
 	ReadUsageRecord(ctx context.Context, usageSeq int64) (ledgerdb.ReadUsageRecordRow, error)
 	ListUnnumberedUsage(ctx context.Context, maxRows int64) ([]string, error)
@@ -342,6 +344,7 @@ type WriteOps interface {
 	RecordJobAssignment(ctx context.Context, arg ledgerdb.RecordJobAssignmentParams) error
 	RecordJobResult(ctx context.Context, arg ledgerdb.RecordJobResultParams) error
 	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
+	DecideStranded(ctx context.Context, arg ledgerdb.DecideStrandedParams) (int64, error)
 	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
 	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error
 	InsertRerunIntent(ctx context.Context, arg ledgerdb.InsertRerunIntentParams) error

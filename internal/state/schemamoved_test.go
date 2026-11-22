@@ -13,7 +13,22 @@ import (
 )
 
 // newestMigration is the version rewindNewest takes back off a ledger.
-const newestMigration = 83
+const newestMigration = 84
+
+// undoJobStranded is what migration 84 added, taken back with its record: the index
+// first, since it names the columns.
+var undoJobStranded = []string{
+	`DROP INDEX job_history_launch_miss_idx`,
+	`ALTER TABLE job_history DROP COLUMN stranded_at`,
+	`ALTER TABLE job_history DROP COLUMN stranded`,
+	`DELETE FROM schema_migrations WHERE version = 84`,
+}
+
+// undoJobDestinationOpenings is what migration 83 added, taken back with its record.
+var undoJobDestinationOpenings = []string{
+	`DROP TABLE job_destination_openings`,
+	`DELETE FROM schema_migrations WHERE version = 83`,
+}
 
 // undoNodeCacheStores is what migration 82 added, taken back with its record.
 var undoNodeCacheStores = []string{
@@ -55,10 +70,7 @@ func rewindNewest(t *testing.T, db *DB) {
 	}
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		for _, stmt := range []string{
-			`DROP TABLE job_destination_openings`,
-			`DELETE FROM schema_migrations WHERE version = 83`,
-		} {
+		for _, stmt := range undoJobStranded {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
 			}
@@ -85,7 +97,7 @@ func ledgerAt78(t *testing.T) string {
 	rewindNewest(t, db)
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		for _, stmt := range append(slices.Concat(undoNodeCacheStores, undoJobHistoryNode, undoPoolClearance),
+		for _, stmt := range append(slices.Concat(undoJobDestinationOpenings, undoNodeCacheStores, undoJobHistoryNode, undoPoolClearance),
 			`ALTER TABLE pool_orders DROP COLUMN release_contradicted`,
 			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
 			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,

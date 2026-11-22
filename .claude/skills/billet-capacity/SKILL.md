@@ -36,6 +36,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Exactly one party renews a lease, and every defect here was a moment when that count was zero.**
 - **An inventory that shrinks is capacity that gets resold.**
 - **billet attributes a lost job, and re-runs one only for a tier that asks and only on GitHub's proof of a lost runner.**
+- **A job GitHub stopped offering is found on GitHub's word and billet's own record, never on a timer alone, and decided once (#911).**
 - **A reserved fleet's claim is released by a proof.**
 
 ### Custody, quarantine, drains and sessions: [references/custody-and-drains.md](references/custody-and-drains.md)
