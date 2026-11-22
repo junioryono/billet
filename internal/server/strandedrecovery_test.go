@@ -786,3 +786,72 @@ func TestADisagreeingReadLeavesTheRecoveryUnderWay(t *testing.T) {
 		t.Fatalf("re-ran the run %d times once a read agreed it was over, want once", r.github.reruns)
 	}
 }
+
+// A CANCEL GITHUB REFUSED IS NEVER TAKEN FOR ONE THAT LANDED: a run someone cancels
+// later, after billet's every cancel was refused, is theirs, and is not re-run.
+func TestARefusedCancelIsNeverTakenForBilletsOwn(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.github.cancelErr = ErrRerunRefused
+	r.strand("missed", 42, 20*time.Minute)
+	r.pass()
+
+	r.github.cancelErr = nil
+	r.now = r.now.Add(rerunRefused + time.Minute)
+	r.github.set(42, QueuedAttempt{Completed: true, Cancelled: true, Attempt: 1})
+	r.pass()
+
+	if r.github.reruns != 0 {
+		t.Fatalf("re-ran a run someone else cancelled %d times, though GitHub refused billet's cancel",
+			r.github.reruns)
+	}
+	if got := r.recovery(42); got != string(alloc.RecoverySuperseded) {
+		t.Fatalf("the recovery is %q, want superseded", got)
+	}
+}
+
+// A RECOVERY THAT EXPIRES WITH EVERY CANCEL REFUSED IS NO ERROR: no cancel of billet's
+// can have landed, and nobody has a run to put right.
+func TestAnExpiryWithEveryCancelRefusedIsNoError(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	var logged bytes.Buffer
+	r.s.log = slog.New(slog.NewTextHandler(&logged, nil))
+	r.github.cancelErr = ErrRerunRefused
+	r.strand("missed", 42, 20*time.Minute)
+	r.pass()
+
+	r.now = r.now.Add(strandedRecoveryWindow + time.Hour)
+	r.pass()
+
+	if got := r.recovery(42); got != string(alloc.RecoveryExpired) {
+		t.Fatalf("the recovery is %q, want expired", got)
+	}
+	if strings.Contains(logged.String(), "level=ERROR") {
+		t.Fatalf("an expiry with every cancel refused was an ERROR:\n%s", logged.String())
+	}
+}
+
+// A RECOVERY WHOSE EVERY CANCEL WAS REFUSED ENDS ONCE ITS TRIES ARE USED: none can
+// land, so there is nothing to wait for.
+func TestEveryCancelRefusedEndsTheRecovery(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.github.cancelErr = ErrRerunThrottled
+	r.strand("missed", 42, 20*time.Minute)
+
+	for range strandedRecoveryTries + 1 {
+		r.pass()
+		r.now = r.now.Add(rerunThrottled + time.Minute)
+	}
+
+	if r.github.cancels != strandedRecoveryTries {
+		t.Fatalf("sent the cancel %d times, want %d", r.github.cancels, strandedRecoveryTries)
+	}
+	if got := r.recovery(42); got != string(alloc.RecoveryFailed) {
+		t.Fatalf("the recovery is %q, want failed", got)
+	}
+}

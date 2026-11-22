@@ -79,7 +79,7 @@ func (q *Queries) ForgetStrandedTier(ctx context.Context, tier string) error {
 }
 
 const listOpenStrandedRecoveries = `-- name: ListOpenStrandedRecoveries :many
-SELECT repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries, created_at
+SELECT repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries, refused, created_at
   FROM stranded_recoveries
  WHERE state IN ('cancelling', 'rerunning')
    AND (created_at > $1
@@ -106,6 +106,7 @@ type ListOpenStrandedRecoveriesRow struct {
 	EndedAt    string
 	State      string
 	Tries      int64
+	Refused    int64
 	CreatedAt  string
 }
 
@@ -137,6 +138,7 @@ func (q *Queries) ListOpenStrandedRecoveries(ctx context.Context, arg ListOpenSt
 			&i.EndedAt,
 			&i.State,
 			&i.Tries,
+			&i.Refused,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -279,6 +281,34 @@ func (q *Queries) MoveStrandedRecovery(ctx context.Context, arg MoveStrandedReco
 		arg.RunID,
 		arg.RunAttempt,
 		arg.FromState,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const refuseStrandedCancel = `-- name: RefuseStrandedCancel :execrows
+UPDATE stranded_recoveries SET refused = refused + 1
+ WHERE repo = $1 AND run_id = $2 AND run_attempt = $3 AND state = 'cancelling'
+   AND tries = $4 AND refused < tries
+`
+
+type RefuseStrandedCancelParams struct {
+	Repo       string
+	RunID      int64
+	RunAttempt int64
+	Tries      int64
+}
+
+// Count a cancel GitHub definitely refused, the one most recently sent, never more
+// than were sent.
+func (q *Queries) RefuseStrandedCancel(ctx context.Context, arg RefuseStrandedCancelParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, refuseStrandedCancel,
+		arg.Repo,
+		arg.RunID,
+		arg.RunAttempt,
+		arg.Tries,
 	)
 	if err != nil {
 		return 0, err

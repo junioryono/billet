@@ -18,7 +18,10 @@
 -- The key is the rule: one recovery per attempt of a run. ended_at is when the
 -- stranded launch's lease ended, from which every cancel asks the ledger again
 -- whether the tier has since been assigned what may be the job. tries counts the
--- sends of the current request and bounds them. detail is billet's own text around GitHub's
+-- sends of the current request and bounds them, each counted before it leaves, and
+-- refused counts the cancels GitHub definitely refused: while every one sent was, no
+-- cancel of billet's can have landed, and a run that ends cancelled is not billet's
+-- to re-run. detail is billet's own text around GitHub's
 -- decoded message: nothing a guest wrote.
 --
 -- stranded_tiers is when each tier started asking, as rerun_tiers is for re-runs: a
@@ -44,6 +47,7 @@ CREATE TABLE stranded_recoveries (
     ended_at TEXT NOT NULL,
     state TEXT NOT NULL,
     tries INTEGER NOT NULL DEFAULT 0 CHECK (tries >= 0),
+    refused INTEGER NOT NULL DEFAULT 0 CHECK (refused >= 0),
     created_at TEXT NOT NULL,
     settled_at TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',

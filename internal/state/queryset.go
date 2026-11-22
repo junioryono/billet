@@ -356,6 +356,7 @@ type WriteOps interface {
 	ForgetStrandedTier(ctx context.Context, tier string) error
 	BeginStrandedRecovery(ctx context.Context, arg ledgerdb.BeginStrandedRecoveryParams) (int64, error)
 	MoveStrandedRecovery(ctx context.Context, arg ledgerdb.MoveStrandedRecoveryParams) (int64, error)
+	RefuseStrandedCancel(ctx context.Context, arg ledgerdb.RefuseStrandedCancelParams) (int64, error)
 	SettleStrandedRecovery(ctx context.Context, arg ledgerdb.SettleStrandedRecoveryParams) (int64, error)
 	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
 	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error

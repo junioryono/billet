@@ -52,10 +52,16 @@ type StrandedRecovery struct {
 	// Ended is when the stranded launch's lease ended.
 	Ended time.Time
 	State StrandedRecoveryState
-	// Tries is how many times the current request was sent.
+	// Tries is how many times the current request was sent, each counted before it
+	// left, and Refused how many of the cancels GitHub definitely refused.
 	Tries   int64
+	Refused int64
 	Created time.Time
 }
+
+// MayHaveCancelled says whether a cancel of billet's may have landed: one was sent
+// that GitHub did not definitely refuse.
+func (r *StrandedRecovery) MayHaveCancelled() bool { return r.Refused < r.Tries }
 
 // StrandedLaunch is a launch decided stranded that a recovery may start from.
 type StrandedLaunch struct {
@@ -189,7 +195,8 @@ func (a *Allocator) OpenStrandedRecoveries(ctx context.Context, after RecoveryCu
 			row := &rows[i]
 			out = append(out, StrandedRecovery{Repository: row.Repo, RunID: row.RunID, Attempt: row.RunAttempt,
 				Tier: row.Tier, LeaseID: row.LeaseID, JobName: row.JobName, Ended: parseStamp(row.EndedAt),
-				State: StrandedRecoveryState(row.State), Tries: row.Tries, Created: parseStamp(row.CreatedAt)})
+				State: StrandedRecoveryState(row.State), Tries: row.Tries, Refused: row.Refused,
+				Created: parseStamp(row.CreatedAt)})
 		}
 
 		return nil
@@ -283,6 +290,25 @@ func (a *Allocator) MoveStrandedRecovery(ctx context.Context, r StrandedRecovery
 	})
 
 	return moved, err
+}
+
+// RefuseStrandedCancel counts that GitHub definitely refused r's most recent cancel,
+// the one its Tries counts, and says whether it was counted.
+func (a *Allocator) RefuseStrandedCancel(ctx context.Context, r StrandedRecovery) (bool, error) {
+	var counted bool
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		n, err := state.WriteQueries(tx).RefuseStrandedCancel(ctx, ledgerdb.RefuseStrandedCancelParams{
+			Repo: r.Repository, RunID: r.RunID, RunAttempt: r.Attempt, Tries: r.Tries,
+		})
+		if err != nil {
+			return fmt.Errorf("alloc: count a refused cancel of run %d: %w", r.RunID, err)
+		}
+		counted = n > 0
+
+		return nil
+	})
+
+	return counted, err
 }
 
 // SettleStrandedRecovery ends r from the state it was read in, and says whether

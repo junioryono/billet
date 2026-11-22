@@ -41,7 +41,7 @@ SELECT h.lease_id, h.tier, COALESCE(h.repo, '') AS repo, CAST(COALESCE(h.run_id,
 -- (after_created, after_repo, after_run), the last row of the page before, an empty
 -- after_created the start, and bounded: a pass reads a page and the cursor goes
 -- round, so none waits behind a page of others for ever.
-SELECT repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries, created_at
+SELECT repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries, refused, created_at
   FROM stranded_recoveries
  WHERE state IN ('cancelling', 'rerunning')
    AND (created_at > @after_created
@@ -65,6 +65,13 @@ SELECT @repo, @run_id, @run_attempt, @tier, @lease_id, @job_name, @ended_at, 'ca
 -- of the same one, only from the state it was read in.
 UPDATE stranded_recoveries SET state = @to_state, tries = @tries
  WHERE repo = @repo AND run_id = @run_id AND run_attempt = @run_attempt AND state = @from_state;
+
+-- name: RefuseStrandedCancel :execrows
+-- Count a cancel GitHub definitely refused, the one most recently sent, never more
+-- than were sent.
+UPDATE stranded_recoveries SET refused = refused + 1
+ WHERE repo = @repo AND run_id = @run_id AND run_attempt = @run_attempt AND state = 'cancelling'
+   AND tries = @tries AND refused < tries;
 
 -- name: SettleStrandedRecovery :execrows
 -- End a recovery, only from the state it was read in: a settled recovery's end

@@ -313,9 +313,10 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		// THE RUN MOVED ON WITHOUT BILLET'S RE-RUN: a person re-ran it, and it is theirs.
 		s.endRecovery(ctx, recovery, alloc.RecoverySuperseded, "the run moved to a later attempt before billet "+
 			"asked for one")
-	case recovery.State == alloc.RecoveryCancelling && attempt.Completed && attempt.Cancelled:
-		// THE ATTEMPT BILLET CANCELLED ENDED CANCELLED, so its failed jobs, the cancelled
-		// one among them, can be run again.
+	case recovery.State == alloc.RecoveryCancelling && attempt.Completed && attempt.Cancelled &&
+		recovery.MayHaveCancelled():
+		// THE ATTEMPT BILLET CANCELLED ENDED CANCELLED, by a cancel of billet's that may
+		// have landed, so its failed jobs, the cancelled one among them, can be run again.
 		moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryRerunning, 1)
 		if err != nil || !moved {
 			return
@@ -323,9 +324,14 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		recovery.State, recovery.Tries = alloc.RecoveryRerunning, 1
 		s.sendRerunOfRecovery(ctx, client, sweep, installation, recovery, owner, name, now)
 	case recovery.State == alloc.RecoveryCancelling && attempt.Completed:
-		// THE RUN ENDED ON ITS OWN, not cancelled: billet's cancel ended nothing, and
-		// what failed in it is the run's own.
-		s.endRecovery(ctx, recovery, alloc.RecoverySuperseded, "the run finished before billet's cancel ended it")
+		// THE RUN ENDED, AND NOT BY BILLET: on its own, or cancelled by someone while
+		// GitHub refused every cancel billet sent. What failed in it is not billet's to
+		// run again.
+		s.endRecovery(ctx, recovery, alloc.RecoverySuperseded, "the run ended, and not by a cancel of billet's")
+	case recovery.State == alloc.RecoveryCancelling && recovery.Tries >= strandedRecoveryTries &&
+		!recovery.MayHaveCancelled():
+		// EVERY CANCEL REFUSED, none can land: the run is as it was.
+		s.endRecovery(ctx, recovery, alloc.RecoveryFailed, "GitHub refused every cancel billet sent")
 	case recovery.State == alloc.RecoveryCancelling:
 		// THE CANCEL HAS NOT LANDED, and one GitHub took may still: nothing but the run's
 		// end, read above, ends the recovery, and its day is the last word. It is sent
@@ -363,9 +369,20 @@ func (s *Server) sendCancel(ctx context.Context, client RunRecovery, sweep *reru
 	recovery *alloc.StrandedRecovery, owner, name string, now time.Time,
 ) {
 	err := client.CancelRun(ctx, owner, name, recovery.RunID)
-	switch {
-	case err == nil, errors.Is(err, ErrRunCompleted):
-	default:
+	if err == nil {
+		return
+	}
+
+	// A DEFINITE REFUSAL LANDED NOTHING, and is counted so a run someone else cancels
+	// later is never taken for one billet's cancel ended: GitHub's word that the run
+	// was over, that the App may not, or that it is throttled. Anything else, a lost
+	// answer above all, may have landed.
+	if errors.Is(err, ErrRunCompleted) || errors.Is(err, ErrRerunRefused) || errors.Is(err, ErrRerunThrottled) {
+		if counted, rerr := s.alloc.RefuseStrandedCancel(ctx, *recovery); rerr == nil && counted {
+			recovery.Refused++
+		}
+	}
+	if !errors.Is(err, ErrRunCompleted) {
 		s.recoveryFailed(ctx, sweep, installation, recovery.Tier, recovery.Repository, recovery.RunID, err, now)
 	}
 }
@@ -410,7 +427,7 @@ func (s *Server) endRecovery(ctx context.Context, recovery *alloc.StrandedRecove
 	case recovery.State == alloc.RecoveryRerunning:
 		s.log.Error("billet cancelled a run to recover a job GitHub stopped offering, and could not re-run it; "+
 			"re-run its failed jobs", append(attrs, "came_to", to, "detail", detail)...)
-	case recovery.State == alloc.RecoveryCancelling && to == alloc.RecoveryExpired:
+	case recovery.State == alloc.RecoveryCancelling && to == alloc.RecoveryExpired && recovery.MayHaveCancelled():
 		// A CANCEL THAT MAY HAVE LANDED, not read since: the run may be cancelled and
 		// never re-run, which is a person's to see to.
 		s.log.Error("billet may have cancelled a run to recover a job GitHub stopped offering, and did not re-run "+

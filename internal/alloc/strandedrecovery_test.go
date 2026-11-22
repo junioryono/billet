@@ -168,6 +168,24 @@ func TestARecoveryMovesOnlyFromTheStateItWasReadIn(t *testing.T) {
 		t.Fatalf("begin = %v, %v", begun, err)
 	}
 
+	// A REFUSAL IS COUNTED ONCE FOR THE SEND THAT HAD IT, never for one not sent.
+	r.Tries = 1
+	other := r
+	other.Tries = 2
+	if counted, err := a.RefuseStrandedCancel(t.Context(), other); err != nil || counted {
+		t.Fatalf("a refusal of a send not made = %v, %v; want not counted", counted, err)
+	}
+	if counted, err := a.RefuseStrandedCancel(t.Context(), r); err != nil || !counted {
+		t.Fatalf("refuse = %v, %v; want counted", counted, err)
+	}
+	if counted, err := a.RefuseStrandedCancel(t.Context(), r); err != nil || counted {
+		t.Fatalf("a second refusal of one send = %v, %v; want not counted", counted, err)
+	}
+	if open, err := a.OpenStrandedRecoveries(t.Context(), RecoveryCursor{}, 10); err != nil || len(open) != 1 ||
+		open[0].Refused != 1 || open[0].MayHaveCancelled() {
+		t.Fatalf("OpenStrandedRecoveries = %+v, %v; want one refusal, no cancel that may have landed", open, err)
+	}
+
 	stale := r
 	stale.State = RecoveryRerunning
 	if moved, err := a.MoveStrandedRecovery(t.Context(), stale, RecoveryRerunning, 2); err != nil || moved {

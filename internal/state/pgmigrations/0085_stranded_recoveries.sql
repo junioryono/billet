@@ -16,6 +16,7 @@ CREATE TABLE stranded_recoveries (
     ended_at text NOT NULL,
     state text NOT NULL,
     tries bigint NOT NULL DEFAULT 0 CHECK (tries >= 0),
+    refused bigint NOT NULL DEFAULT 0 CHECK (refused >= 0),
     created_at text NOT NULL,
     settled_at text NOT NULL DEFAULT '',
     detail text NOT NULL DEFAULT '',
