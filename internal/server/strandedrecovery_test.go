@@ -826,6 +826,29 @@ func TestARefusedCancelIsNeverTakenForBilletsOwn(t *testing.T) {
 	}
 }
 
+// NO REQUEST LEAVES PAST THE DAY, however slow the read before it: the day is asked
+// again on the clock as it is after the read.
+func TestNoRequestLeavesPastTheDay(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.github.cancelLands = false
+	r.strand("missed", 42, 20*time.Minute)
+	r.pass()
+
+	r.now = r.now.Add(strandedRecoveryWindow - 2*time.Minute)
+	// A READ THAT TAKES THE PASS PAST THE DAY.
+	r.github.onRead = func() { r.sweep.began = r.sweep.began.Add(-5 * time.Minute) }
+	r.pass()
+
+	if r.github.cancels != 1 {
+		t.Fatalf("sent the cancel %d times, want once: the second would have left past the day", r.github.cancels)
+	}
+	if got := r.recovery(42); got != string(alloc.RecoveryExpired) {
+		t.Fatalf("the recovery is %q, want expired", got)
+	}
+}
+
 // A RECOVERY DOES NOT BEGIN WHILE A RE-RUN OF A DISRUPTED JOB OF THE RUN MAY HAVE
 // LANDED: the two never race for one attempt.
 func TestARecoveryWaitsForARerunInDoubt(t *testing.T) {

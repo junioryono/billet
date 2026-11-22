@@ -305,9 +305,7 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		recovery.Refused = refused.Refused
 	}
 
-	if now.Sub(recovery.Created) > strandedRecoveryWindow {
-		s.endRecovery(ctx, recovery, alloc.RecoveryExpired, "it was not finished within a day")
-
+	if s.recoveryExpired(ctx, sweep, recovery, now) {
 		return
 	}
 
@@ -340,6 +338,9 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		recovery.MayHaveCancelled():
 		// THE ATTEMPT BILLET CANCELLED ENDED CANCELLED, by a cancel of billet's that may
 		// have landed, so its failed jobs, the cancelled one among them, can be run again.
+		if s.recoveryExpired(ctx, sweep, recovery, now) {
+			return
+		}
 		moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryRerunning, 1)
 		if err != nil || !moved {
 			return
@@ -364,6 +365,9 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		if !recoverable(attempt, recovery.JobName) || recovery.Tries >= strandedRecoveryTries {
 			return
 		}
+		if s.recoveryExpired(ctx, sweep, recovery, now) {
+			return
+		}
 		moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryCancelling, recovery.Tries+1)
 		if err != nil || !moved {
 			return
@@ -377,6 +381,9 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 	case recovery.Tries >= strandedRecoveryTries:
 		s.endRecovery(ctx, recovery, alloc.RecoveryFailed, "GitHub did not take the re-run")
 	default:
+		if s.recoveryExpired(ctx, sweep, recovery, now) {
+			return
+		}
 		moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryRerunning, recovery.Tries+1)
 		if err != nil || !moved {
 			return
@@ -445,6 +452,20 @@ func (s *Server) sendRerunOfRecovery(ctx context.Context, client RunRecovery, sw
 	default:
 		s.recoveryFailed(ctx, sweep, installation, recovery.Tier, recovery.Repository, recovery.RunID, err, now)
 	}
+}
+
+// recoveryExpired ends a recovery past its day and says so. ON THE CLOCK AS IT IS NOW,
+// after whatever the pass has read, so no request leaves past the day however slow
+// GitHub was: it is asked again right before each one.
+func (s *Server) recoveryExpired(ctx context.Context, sweep *rerunSweep, recovery *alloc.StrandedRecovery,
+	now time.Time,
+) bool {
+	if sweep.clock(now).Sub(recovery.Created) <= strandedRecoveryWindow {
+		return false
+	}
+	s.endRecovery(ctx, recovery, alloc.RecoveryExpired, "it was not finished within a day")
+
+	return true
 }
 
 // endRecovery settles a recovery, and says what it came to: an ERROR for a run billet
