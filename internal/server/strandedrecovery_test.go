@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -676,6 +679,56 @@ func TestUnreadableRecoveriesDoNotKeepOneFromBeginning(t *testing.T) {
 	}
 }
 
+// A CANCEL LANDING BETWEEN THE RUN'S READ AND ITS JOBS' DECIDES NOTHING: the run reads
+// unfinished and its jobs already over, which is neither a run going on nor one safe
+// to cancel, and the next read finds it over and re-runs it.
+func TestACancelLandingMidReadLeavesTheRecoveryUnderWay(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.github.cancelLands = false
+	r.strand("missed", 42, 20*time.Minute)
+	r.pass()
+
+	r.github.set(42, QueuedAttempt{Attempt: 1, Jobs: []QueuedJob{{Name: "Lint App", Attempt: 1, Done: true}}})
+	r.pass()
+	if got := r.recovery(42); got != string(alloc.RecoveryCancelling) {
+		t.Fatalf("the recovery is %q after a read caught mid-cancel, want still cancelling", got)
+	}
+	if r.github.cancels != 1 {
+		t.Fatalf("sent the cancel %d times, want no more on a read that decides nothing", r.github.cancels)
+	}
+
+	r.github.set(42, QueuedAttempt{Completed: true, Attempt: 1})
+	r.pass()
+	if r.github.reruns != 1 {
+		t.Fatalf("re-ran the run %d times once it read over, want once", r.github.reruns)
+	}
+}
+
+// A RECOVERY THAT EXPIRES WITH ITS CANCEL MAYBE LANDED SAYS SO AS AN ERROR, with what a
+// person does: the run may be cancelled and never re-run.
+func TestAnExpiredCancelSaysWhatAPersonDoes(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	var logged bytes.Buffer
+	r.s.log = slog.New(slog.NewTextHandler(&logged, nil))
+	r.strand("missed", 42, 20*time.Minute)
+	r.pass()
+
+	r.now = r.now.Add(strandedRecoveryWindow + time.Hour)
+	r.pass()
+
+	if got := r.recovery(42); got != string(alloc.RecoveryExpired) {
+		t.Fatalf("the recovery is %q, want expired", got)
+	}
+	if !strings.Contains(logged.String(), "level=ERROR") ||
+		!strings.Contains(logged.String(), "if the run is cancelled, re-run its failed jobs") {
+		t.Fatalf("an expired cancel was not an ERROR saying what to do:\n%s", logged.String())
+	}
+}
+
 // A READ THAT DISAGREES WITH ITSELF DECIDES NOTHING: a recovery whose cancel has not
 // landed stays under way, and is re-run once a read that agrees shows it over.
 func TestADisagreeingReadLeavesTheRecoveryUnderWay(t *testing.T) {
@@ -690,6 +743,9 @@ func TestADisagreeingReadLeavesTheRecoveryUnderWay(t *testing.T) {
 	r.pass()
 	if got := r.recovery(42); got != string(alloc.RecoveryCancelling) {
 		t.Fatalf("the recovery is %q after a read that disagreed with itself, want still cancelling", got)
+	}
+	if r.github.cancels != 1 {
+		t.Fatalf("sent the cancel %d times, want no more on a read that disagreed with itself", r.github.cancels)
 	}
 
 	r.github.set(42, QueuedAttempt{Completed: true, Attempt: 1})
