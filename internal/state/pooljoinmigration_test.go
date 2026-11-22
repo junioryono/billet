@@ -16,8 +16,8 @@ import (
 func ledgerAt75(t *testing.T) string {
 	t.Helper()
 
-	if latest := LatestSchemaVersion(); latest != 83 {
-		t.Fatalf("this binary's newest migration is %d; ledgerAt75 undoes 83 through 76 and must be "+
+	if latest := LatestSchemaVersion(); latest != 84 {
+		t.Fatalf("this binary's newest migration is %d; ledgerAt75 undoes 84 through 76 and must be "+
 			"taught each migration after 75 before it can stand for a ledger at 75", latest)
 	}
 
@@ -31,7 +31,7 @@ func ledgerAt75(t *testing.T) string {
 	rewindNewest(t, db)
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		for _, stmt := range append(slices.Concat(undoNodeCacheStores, undoJobHistoryNode, undoPoolClearance),
+		for _, stmt := range append(slices.Concat(undoJobDestinationOpenings, undoNodeCacheStores, undoJobHistoryNode, undoPoolClearance),
 			`ALTER TABLE pool_orders DROP COLUMN release_contradicted`,
 			`ALTER TABLE pool_orders DROP COLUMN release_reason`,
 			`ALTER TABLE pool_orders DROP COLUMN release_requested_at`,

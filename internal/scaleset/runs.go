@@ -233,3 +233,30 @@ func (c *Client) runEvidence() (billetgithub.RunEvidence, error) {
 
 	return evidence, nil
 }
+
+var _ server.RunQueue = (*Client)(nil)
+
+// JobsNamed reads, through the target's App client, whether a run is over and, if not,
+// what its latest attempt's jobs of one name are doing, in the server's terms (#911).
+func (c *Client) JobsNamed(ctx context.Context, owner, repository string, runID int64, name string,
+) (server.NamedJobs, error) {
+	queue, ok := c.policy.(billetgithub.RunQueue)
+	if c.policy == nil || !ok {
+		return server.NamedJobs{}, billetgithub.ErrRunEvidenceUnavailable
+	}
+	jobs, err := queue.JobsNamed(ctx, owner, repository, runID, name)
+	if err != nil {
+		return server.NamedJobs{}, installationError(err, server.ErrRerunThrottled, server.ErrRerunRefused)
+	}
+
+	out := server.NamedJobs{Completed: jobs.Completed}
+	for _, job := range jobs.Jobs {
+		if job.Status == billetgithub.JobStatusQueued && job.RunnerName == "" {
+			out.Unstarted++
+		} else {
+			out.Taken++
+		}
+	}
+
+	return out, nil
+}

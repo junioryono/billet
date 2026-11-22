@@ -131,6 +131,7 @@ var (
 	_ server.QueueTimes      = Provisioner{}
 	_ server.RESTHeadroom    = Provisioner{}
 	_ server.RunReruns       = Provisioner{}
+	_ server.RunQueue        = Provisioner{}
 	_ server.RunJobSteps     = Provisioner{}
 )
 
@@ -424,4 +425,10 @@ func (n NodeJIT) ValidateTrustedRunnerGroup(ctx context.Context, group string,
 	workflows []string,
 ) error {
 	return n.Client.ValidateTrustedRunnerGroup(ctx, group, workflows)
+}
+
+// JobsNamed reads whether a run is over and what its jobs of one name are doing.
+func (p Provisioner) JobsNamed(ctx context.Context, owner, repository string, runID int64, name string,
+) (server.NamedJobs, error) {
+	return p.Client.JobsNamed(ctx, owner, repository, runID, name)
 }
