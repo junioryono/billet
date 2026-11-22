@@ -50,6 +50,15 @@ SELECT repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tri
  ORDER BY created_at, repo, run_id
  LIMIT CAST(@max_rows AS BIGINT);
 
+-- name: CountOpenStrandedRecoveriesOfRun :one
+-- Whether a run has a recovery between its two requests: a re-run of one of its
+-- disrupted jobs waits for it, since the recovery's re-run of the run's failed jobs
+-- runs that job too, and one that took the next attempt first would leave the job
+-- billet cancelled without its re-run.
+SELECT CAST(COUNT(*) AS BIGINT) AS open
+  FROM stranded_recoveries
+ WHERE repo = @repo AND run_id = @run_id AND state IN ('cancelling', 'rerunning');
+
 -- name: BeginStrandedRecovery :execrows
 -- Write that billet is about to cancel one attempt of a run, BEFORE the cancel
 -- leaves. A run billet has tried to recover once, on any attempt, is never tried

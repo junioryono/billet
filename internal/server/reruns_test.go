@@ -278,6 +278,38 @@ func TestAProvedJobIsRerunOnce(t *testing.T) {
 	}
 }
 
+// A RUN BILLET IS RECOVERING A STRANDED JOB OF WAITS FOR THAT RECOVERY: the recovery's
+// re-run of the run's failed jobs runs the disrupted one too, and a request for it
+// alone taking the next attempt first would leave the job billet cancelled without
+// its re-run (#911).
+func TestARerunWaitsForTheRunsStrandedRecovery(t *testing.T) {
+	t.Parallel()
+
+	r := newRerunStack(t)
+	r.job("lost", 31, 10*time.Minute)
+	r.lists(1, listed("lost", 77, true))
+
+	recovery := alloc.StrandedRecovery{Repository: "acme/api", RunID: 31, Attempt: 1, Tier: rerunTier,
+		LeaseID: "stranded", JobName: "Build iOS", Ended: r.now, State: alloc.RecoveryCancelling, Tries: 1}
+	if begun, err := r.a.BeginStrandedRecovery(t.Context(), recovery); err != nil || !begun {
+		t.Fatalf("begin the recovery = %v, %v", begun, err)
+	}
+
+	r.pass()
+	if got := r.github.asked(); got != 0 {
+		t.Fatalf("asked for %d re-runs while the run's stranded recovery was under way, want none", got)
+	}
+
+	if settled, err := r.a.SettleStrandedRecovery(t.Context(), recovery, alloc.RecoverySuperseded, "test"); err != nil ||
+		!settled {
+		t.Fatalf("settle the recovery = %v, %v", settled, err)
+	}
+	r.after(5 * time.Minute).pass()
+	if got := r.github.asked(); got != 1 {
+		t.Fatalf("asked for %d re-runs once the recovery was over, want one", got)
+	}
+}
+
 // A JOB THAT FAILED ON ITS OWN IS LEFT ALONE, even on a lease with a disruption: the
 // disruption is what made it a candidate, and GitHub's record says it was not the cause.
 func TestAJobWhoseRecordShowsItsOwnFailureIsLeftAlone(t *testing.T) {

@@ -68,6 +68,28 @@ func (q *Queries) BeginStrandedRecovery(ctx context.Context, arg BeginStrandedRe
 	return result.RowsAffected()
 }
 
+const countOpenStrandedRecoveriesOfRun = `-- name: CountOpenStrandedRecoveriesOfRun :one
+SELECT CAST(COUNT(*) AS BIGINT) AS open
+  FROM stranded_recoveries
+ WHERE repo = $1 AND run_id = $2 AND state IN ('cancelling', 'rerunning')
+`
+
+type CountOpenStrandedRecoveriesOfRunParams struct {
+	Repo  string
+	RunID int64
+}
+
+// Whether a run has a recovery between its two requests: a re-run of one of its
+// disrupted jobs waits for it, since the recovery's re-run of the run's failed jobs
+// runs that job too, and one that took the next attempt first would leave the job
+// billet cancelled without its re-run.
+func (q *Queries) CountOpenStrandedRecoveriesOfRun(ctx context.Context, arg CountOpenStrandedRecoveriesOfRunParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countOpenStrandedRecoveriesOfRun, arg.Repo, arg.RunID)
+	var open int64
+	err := row.Scan(&open)
+	return open, err
+}
+
 const forgetStrandedTier = `-- name: ForgetStrandedTier :exec
 DELETE FROM stranded_tiers WHERE tier = $1
 `

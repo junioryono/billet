@@ -715,6 +715,17 @@ func (s *Server) decideRerun(ctx context.Context, w *rerunWork, limits map[strin
 		return err
 	}
 
+	// A RUN BILLET IS RECOVERING A STRANDED JOB OF WAITS FOR THAT RECOVERY: its re-run of
+	// the run's failed jobs runs these too, and a request taking the next attempt first
+	// would leave the job billet cancelled without its re-run (#911).
+	recovering, err := s.alloc.RecoveringRun(ctx, w.run.repository, w.run.run)
+	if err != nil {
+		return err
+	}
+	if recovering {
+		return errRunUnfinished
+	}
+
 	leases := make([]string, 0, len(proved))
 	for i := range proved {
 		leases = append(leases, proved[i].candidate.LeaseID)

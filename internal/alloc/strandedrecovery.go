@@ -206,6 +206,23 @@ func (a *Allocator) OpenStrandedRecoveries(ctx context.Context, after RecoveryCu
 	return out, err
 }
 
+// RecoveringRun says whether a run has a recovery between its two requests.
+func (a *Allocator) RecoveringRun(ctx context.Context, repository string, runID int64) (bool, error) {
+	var open int64
+	err := a.db.View(ctx, func(q querier) error {
+		var err error
+		open, err = state.ReadQueries(q).CountOpenStrandedRecoveriesOfRun(ctx,
+			ledgerdb.CountOpenStrandedRecoveriesOfRunParams{Repo: repository, RunID: runID})
+		if err != nil {
+			return fmt.Errorf("alloc: read whether run %d of %s is being recovered: %w", runID, repository, err)
+		}
+
+		return nil
+	})
+
+	return open > 0, err
+}
+
 // mayBeOffered asks, inside the transaction that authorises a cancel, whether the
 // tier has been assigned since r's launch ended what is or may be its job.
 func mayBeOffered(ctx context.Context, tx *sql.Tx, r *StrandedRecovery) (bool, error) {

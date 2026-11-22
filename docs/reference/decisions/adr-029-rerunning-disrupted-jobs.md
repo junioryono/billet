@@ -68,7 +68,7 @@ Issue #911. On 2026-11-20 a consumer's job whose launch started nothing was assi
   - The ledger holds no assignment of the tier for the run since then that is, or may be, the job, asked again in the transaction that authorises the cancel, and again for every cancel sent again.
   - GitHub's record of the run's latest attempt, read just before, has the job of that name queued with no runner.
   - Every job of that attempt is queued with no runner or over, so the cancel ends nothing that is running.
-- **A run is recovered once, on any attempt.** A job that strands again after billet's re-run is reported, never cancelled again.
+- **A run is recovered once, on any attempt.** A job that strands again after billet's re-run is reported, never cancelled again. It does not begin while a re-run of a disrupted job of the run may have landed, and a re-run of a disrupted job of a run being recovered waits for the recovery, whose re-run of the run's failed jobs runs that job too: the two never race for one attempt.
 
 **Two requests in order, with the ledger between them.** A recovery is a row of `stranded_recoveries` (migration 85), written `cancelling` before the cancel leaves.
 

@@ -826,6 +826,23 @@ func TestARefusedCancelIsNeverTakenForBilletsOwn(t *testing.T) {
 	}
 }
 
+// A RECOVERY DOES NOT BEGIN WHILE A RE-RUN OF A DISRUPTED JOB OF THE RUN MAY HAVE
+// LANDED: the two never race for one attempt.
+func TestARecoveryWaitsForARerunInDoubt(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.strand("missed", 42, 20*time.Minute)
+	r.exec(`INSERT INTO job_reruns (repo, run_id, run_attempt, kind, state, tries, created_at)
+		VALUES ('acme/app', 42, 1, 'failed-jobs', 'asking', 1, '` + stamp(r.now.Add(-time.Minute)) + `')`)
+
+	r.pass()
+
+	if r.github.cancels != 0 {
+		t.Fatalf("cancelled the run %d times while a re-run of it was in doubt", r.github.cancels)
+	}
+}
+
 // A REFUSAL THE LEDGER COULD NOT COUNT IS COUNTED BEFORE THE RECOVERY GOES ON: a
 // failed write never leaves a refused cancel taken for one that may have landed.
 func TestARefusalTheLedgerCouldNotCountIsCountedFirst(t *testing.T) {

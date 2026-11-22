@@ -227,6 +227,11 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 	if err != nil || later.Same > 0 || later.Unnamed > 0 {
 		return
 	}
+	// NOR WHILE A RE-RUN OF A DISRUPTED JOB OF THE RUN MAY HAVE LANDED: what it started is
+	// read first, and the two never race for one attempt.
+	if _, doubted, err := s.alloc.OpenRerun(ctx, job.Repository, job.RunID); err != nil || doubted {
+		return
+	}
 
 	client, installation, owner, name, ok := s.recoveryReader(targets, sweep, budgets, read, strandedBeginsPerInstallation,
 		job.Tier,
