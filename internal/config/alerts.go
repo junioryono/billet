@@ -84,7 +84,8 @@ type AlertConditions struct {
 	RunningLongerThan string `yaml:"running_longer_than,omitempty"`
 	WaitedLongerThan  string `yaml:"waited_longer_than,omitempty"`
 	// Stranded is a job GitHub stopped offering after billet's launch for it started
-	// nothing, told when billet decides it (#911). It needs the App's `actions: read`.
+	// nothing, told when billet decides it (#911), each one on its own: in_a_row does not
+	// apply to it. It needs the App's `actions: read`.
 	Stranded bool `yaml:"stranded,omitempty"`
 }
 
@@ -135,8 +136,11 @@ func (r *AlertRule) CooldownDuration() (time.Duration, error) {
 }
 
 // NeedsRunRecords says whether a rule reads GitHub's record of a run or a job, which
-// is what asks the App for `actions: read`.
-func (r *AlertRule) NeedsRunRecords() bool { return r.Match.Branch != "" || r.Match.Step != "" }
+// is what asks the App for `actions: read`. A rule on `stranded` does through billet:
+// a job is decided stranded only on GitHub's record of its run.
+func (r *AlertRule) NeedsRunRecords() bool {
+	return r.Match.Branch != "" || r.Match.Step != "" || r.On.Stranded
+}
 
 // alertName is what a rule or a destination is called: it is a ledger key, a metric
 // label, and a word in a message.

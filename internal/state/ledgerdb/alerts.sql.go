@@ -569,13 +569,16 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, w
        CAST(COALESCE(run_id, 0) AS BIGINT) AS run_id, head_branch, stranded_at
   FROM job_history
  WHERE stranded = 'stranded' AND stranded_at >= $1
+   AND (stranded_at > $2 OR (stranded_at = $2 AND lease_id > $3))
  ORDER BY stranded_at, lease_id
- LIMIT CAST($2 AS BIGINT)
+ LIMIT CAST($4 AS BIGINT)
 `
 
 type ListStrandedJobsForAlertsParams struct {
-	Since   string
-	MaxRows int64
+	Since        string
+	AfterDecided string
+	AfterLease   string
+	MaxRows      int64
 }
 
 type ListStrandedJobsForAlertsRow struct {
@@ -590,11 +593,18 @@ type ListStrandedJobsForAlertsRow struct {
 	StrandedAt  string
 }
 
-// The launches decided stranded since a moment (#911), oldest decision first and
+// The launches decided stranded since a moment (#911), oldest decision first from just
+// past a cursor, (after_decided, after_lease), an empty after_decided the start, and
 // bounded: a job GitHub stopped offering, which never started, so neither list above
-// holds it. The WHERE leads with migration 85's partial index, word for word.
+// holds it. A pass reads a page and the cursor goes round. The WHERE leads with
+// migration 85's partial index, word for word.
 func (q *Queries) ListStrandedJobsForAlerts(ctx context.Context, arg ListStrandedJobsForAlertsParams) ([]ListStrandedJobsForAlertsRow, error) {
-	rows, err := q.db.QueryContext(ctx, listStrandedJobsForAlerts, arg.Since, arg.MaxRows)
+	rows, err := q.db.QueryContext(ctx, listStrandedJobsForAlerts,
+		arg.Since,
+		arg.AfterDecided,
+		arg.AfterLease,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -69,7 +69,7 @@ An empty string is not recorded. `condition` is one of `failed`, `cancelled`, `d
 | `disrupted` | billet recorded a [disruption](status-and-leases.md#what-leases-failures-is-and-is-not) against the job, at once, while it may still be running | a run ending undisrupted |
 | `running_longer_than` | the job is still running past the duration, or ended after it | a run ending under it |
 | `waited_longer_than` | the job started after waiting past the duration, from GitHub's queue time | a run that waited less |
-| `stranded` | billet decided GitHub stopped offering the job after billet's launch for it started nothing ([troubleshooting](troubleshooting.md#a-job-sits-in-the-queue)): told once, when billet decides it, about 15 minutes after the launch | a run of the job that started |
+| `stranded` | billet decided GitHub stopped offering the job after billet's launch for it started nothing ([troubleshooting](troubleshooting.md#a-job-sits-in-the-queue)): told once, when billet decides it, about 15 minutes after the launch; each one is told on its own, `in_a_row` does not apply to it, and the App needs `actions: read`, which `billet check` holds the App to for a rule on it | nothing: it counts in no streak |
 
 A job GitHub cancelled before it started is not one of these, except a stranded one. GitHub cancels and reassigns an assignment nobody ran, and that is nobody's failure. And `waited_longer_than` is judged once a job has started: a job still waiting has no row to judge, so use `billet_tier_waiting_seconds` for that. A job whose queue time GitHub's record never gave is not judged either way.
 

@@ -605,27 +605,16 @@ func TestAnArchivedDisruptionIsToldAtOnce(t *testing.T) {
 func TestAStrandedJobIsToldWhenDecided(t *testing.T) {
 	t.Parallel()
 
-	r := started(t, atRule(func(c *config.AlertRule) { c.On = config.AlertConditions{Stranded: true} }))
-	for _, row := range []struct {
-		lease   string
-		decided time.Time
-	}{{"missed", r.now}, {"before", r.now.Add(-time.Hour)}} {
-		if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
-			_, err := tx.ExecContext(t.Context(), `INSERT INTO job_history
-				(lease_id, tier, queued_at, finished_at, repo, workflow_ref, job_name, run_id, failure_reason,
-				 stranded, stranded_at)
-				VALUES ($1, $2, $3, $3, 'acme/api', 'acme/api/.github/workflows/deploy.yml@refs/heads/main', 'deploy',
-				        31, 'billet:launch-failed', 'stranded', $3)`, row.lease, alertTier, stamp(row.decided))
-
-			return err
-		}); err != nil {
-			t.Fatalf("seed %s: %v", row.lease, err)
-		}
-	}
+	// NO COOLDOWN, so only the judgement itself keeps a second pass from telling it again.
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown = config.AlertConditions{Stranded: true}, "0s"
+	}))
+	r.stranded("missed", r.now)
+	r.stranded("before", r.now.Add(-time.Hour))
 	r.seed(jobRow{lease: "ran", result: "succeeded", ran: 10 * time.Second, age: 30 * time.Second})
 
 	r.pass()
-	r.now = r.now.Add(time.Minute)
+	r.now = r.now.Add(2 * time.Hour)
 	r.pass()
 
 	if got := r.owedLeases(); len(got) != 1 || got[0] != "missed:stranded" {
@@ -633,6 +622,64 @@ func TestAStrandedJobIsToldWhenDecided(t *testing.T) {
 	}
 	if got := r.outcome("ran", "stranded"); got != string(alloc.AlertMiss) {
 		t.Fatalf("the job that ran came to %q on stranded, want a miss", got)
+	}
+}
+
+// stranded seeds a launch billet decided stranded at decided.
+func (r *alertStack) stranded(lease string, decided time.Time) {
+	r.t.Helper()
+
+	if err := r.db.Tx(r.t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(r.t.Context(), `INSERT INTO job_history
+			(lease_id, tier, queued_at, finished_at, repo, workflow_ref, job_name, run_id, failure_reason,
+			 stranded, stranded_at)
+			VALUES ($1, $2, $3, $3, 'acme/api', 'acme/api/.github/workflows/deploy.yml@refs/heads/main', 'deploy',
+			        31, 'billet:launch-failed', 'stranded', $3)`, lease, alertTier, stamp(decided))
+
+		return err
+	}); err != nil {
+		r.t.Fatalf("seed %s: %v", lease, err)
+	}
+}
+
+// A STRANDED JOB COUNTS IN NO STREAK: each decision is told on its own, whatever the
+// rule's in_a_row, since a streak would have to order decisions against the jobs that
+// ran across lists read apart.
+func TestAStrandedJobCountsInNoStreak(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.InARow, c.Cooldown = config.AlertConditions{Stranded: true}, 2, "0s"
+	}))
+	r.stranded("missed", r.now)
+
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "missed:stranded" {
+		t.Fatalf("owed = %v, want the one stranded job told though the rule counts two in a row", got)
+	}
+}
+
+// THE STRANDED JOBS ARE READ ON PAST A PAGE: one decided after a page of others is told
+// in its turn.
+func TestStrandedJobsAreReadOnPastAPage(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown = config.AlertConditions{Stranded: true}, "0s"
+	}))
+	r.sweep.rows = 1
+	for i, lease := range []string{"first", "second", "third"} {
+		r.stranded(lease, r.now.Add(time.Duration(i)*time.Second))
+	}
+
+	for range 4 {
+		r.pass()
+		r.now = r.now.Add(time.Minute)
+	}
+
+	if got := r.owedLeases(); len(got) != 3 {
+		t.Fatalf("owed = %v, want all three stranded jobs told a page at a time", got)
 	}
 }
 

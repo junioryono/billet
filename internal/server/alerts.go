@@ -169,6 +169,8 @@ type alertSweep struct {
 	scanning bool
 	scan     alloc.AlertCursor
 	held     map[string]bool
+	// strandedFrom is where the next pass reads the launches decided stranded from.
+	strandedFrom alloc.AlertCursor
 	// until is where a cycle of scans ends: the moment its first pass began. A scan
 	// that chases results arriving faster than it reads still reaches it.
 	until time.Time
@@ -274,7 +276,7 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 		sweep.until = now
 	}
 
-	var running, stranded []alloc.AlertJob
+	var running []alloc.AlertJob
 
 	readAll := false
 	for n := range alertEndedPages {
@@ -286,7 +288,7 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 			return
 		}
 		if n == 0 {
-			running, stranded = read.Running, read.Stranded
+			running = read.Running
 		}
 
 		next := alloc.AlertCursor{}
@@ -344,7 +346,18 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 	}
 
 	// AND THE LAUNCHES DECIDED STRANDED, which never started, so neither list above holds
-	// them (#911): each is judged as a job not ended, after every one that ran.
+	// them (#911): a page a pass from where the last ended, the cursor going round, each
+	// told on its own, since a stranded job counts in no streak.
+	stranded, err := s.alloc.StrandedAlertJobs(ctx, now.Add(-alertEndedWindow), sweep.strandedFrom, rows)
+	if err != nil {
+		s.log.Warn("could not list the stranded jobs for alerts; trying again", "error", err)
+
+		return
+	}
+	sweep.strandedFrom = alloc.AlertCursor{}
+	if len(stranded) == rows {
+		sweep.strandedFrom = stranded[len(stranded)-1].Cursor
+	}
 	for i := range stranded {
 		if ctx.Err() != nil {
 			return
@@ -590,7 +603,7 @@ func (s *Server) recordAlert(ctx context.Context, rule *alerts.Rule, condition a
 ) bool {
 	mark := alloc.AlertMark{Rule: rule.Name, LeaseID: job.LeaseID, Condition: string(condition)}
 	judgement := &alloc.AlertJudgement{Rule: rule.Name, LeaseID: job.LeaseID, Condition: string(condition),
-		Key: job.Key(condition), Outcome: outcome, InARow: rule.InARow, Cooldown: rule.Cooldown}
+		Key: job.Key(condition), Outcome: outcome, InARow: alertInARow(rule, condition), Cooldown: rule.Cooldown}
 	if outcome == alloc.AlertHit {
 		judgement.Notices = s.renderAlert(rule, condition, job, branch, now)
 	}
@@ -612,6 +625,18 @@ func (s *Server) recordAlert(ctx context.Context, rule *alerts.Rule, condition a
 	}
 
 	return true
+}
+
+// alertInARow is how many hits in a row fire a rule on a condition. A job GitHub
+// stopped offering is told each time, whatever the rule's in_a_row: it is news on its
+// own, not a pattern to count, and a streak would have to order decisions against
+// jobs that ran across lists read apart (#911).
+func alertInARow(rule *alerts.Rule, condition alerts.Condition) int64 {
+	if condition == alerts.Stranded {
+		return 1
+	}
+
+	return rule.InARow
 }
 
 // alertJob is a ledger row in a rule's terms.

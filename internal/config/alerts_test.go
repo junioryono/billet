@@ -236,4 +236,13 @@ func TestOnlyARuleReadingGitHubAsksForRunRecords(t *testing.T) {
 			t.Errorf("a rule naming a %s did not ask", name)
 		}
 	}
+
+	// A RULE ON STRANDED ASKS TOO: billet decides a job stranded only on GitHub's record
+	// of its run, so without `actions: read` the rule could never fire.
+	stranded := &Config{Server: &ServerConfig{Alerts: &AlertsConfig{Rules: []AlertRule{
+		{On: AlertConditions{Stranded: true}},
+	}}}}
+	if !stranded.AlertsNeedRunRecords() {
+		t.Error("a rule on stranded did not ask")
+	}
 }

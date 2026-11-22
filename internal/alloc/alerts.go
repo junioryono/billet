@@ -49,10 +49,10 @@ type AlertCursor struct {
 	LeaseID  string
 }
 
-// AlertJobsRead is what one pass judges: the jobs running now, the ended ones and the
-// launches decided stranded, each oldest first.
+// AlertJobsRead is what one pass judges: the jobs running now and the ended ones,
+// each oldest first.
 type AlertJobsRead struct {
-	Running, Ended, Stranded []AlertJob
+	Running, Ended []AlertJob
 }
 
 // AlertJobs reads the jobs a pass judges: those running that started since
@@ -70,10 +70,7 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 		reads := state.ReadQueries(q)
 		started := ts(runningSince.UTC())
 
-		var (
-			running  []ledgerdb.ListRunningJobsForAlertsRow
-			stranded []ledgerdb.ListStrandedJobsForAlertsRow
-		)
+		var running []ledgerdb.ListRunningJobsForAlertsRow
 		if withRunning {
 			var err error
 
@@ -84,15 +81,6 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 			})
 			if err != nil {
 				return fmt.Errorf("alloc: list the running jobs for alerts: %w", err)
-			}
-
-			// DECIDED SINCE THE ENDED JOBS' WINDOW, as a result is: a stranded job is told
-			// once, when billet decides it, which is as late as it can be known.
-			stranded, err = reads.ListStrandedJobsForAlerts(ctx, ledgerdb.ListStrandedJobsForAlertsParams{
-				Since: ts(endedSince.UTC()), MaxRows: int64(limit),
-			})
-			if err != nil {
-				return fmt.Errorf("alloc: list the stranded jobs for alerts: %w", err)
 			}
 		}
 
@@ -121,12 +109,34 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 				ResultAt: parseStamp(r.ResultAt), QueuedAt: parseStamp(r.GithubQueuedAt),
 				Cursor: AlertCursor{ResultAt: r.ResultAt, LeaseID: r.LeaseID}})
 		}
-		out.Stranded = make([]AlertJob, 0, len(stranded))
-		for i := range stranded {
-			r := &stranded[i]
-			out.Stranded = append(out.Stranded, AlertJob{LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node,
-				Repository: r.Repo, WorkflowRef: r.WorkflowRef, JobName: r.JobName, RunID: r.RunID,
-				HeadBranch: r.HeadBranch, StrandedAt: parseStamp(r.StrandedAt)})
+
+		return nil
+	})
+
+	return out, err
+}
+
+// StrandedAlertJobs reads the launches decided stranded since since (#911), oldest
+// decision first from just past after, at most limit. Each one's Cursor is where it
+// stands in that order, its decision in ResultAt's place.
+func (a *Allocator) StrandedAlertJobs(ctx context.Context, since time.Time, after AlertCursor, limit int,
+) ([]AlertJob, error) {
+	var out []AlertJob
+
+	err := a.db.View(ctx, func(q querier) error {
+		rows, err := state.ReadQueries(q).ListStrandedJobsForAlerts(ctx, ledgerdb.ListStrandedJobsForAlertsParams{
+			Since: ts(since.UTC()), AfterDecided: after.ResultAt, AfterLease: after.LeaseID, MaxRows: int64(limit),
+		})
+		if err != nil {
+			return fmt.Errorf("alloc: list the stranded jobs for alerts: %w", err)
+		}
+
+		out = make([]AlertJob, 0, len(rows))
+		for i := range rows {
+			r := &rows[i]
+			out = append(out, AlertJob{LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node, Repository: r.Repo,
+				WorkflowRef: r.WorkflowRef, JobName: r.JobName, RunID: r.RunID, HeadBranch: r.HeadBranch,
+				StrandedAt: parseStamp(r.StrandedAt), Cursor: AlertCursor{ResultAt: r.StrandedAt, LeaseID: r.LeaseID}})
 		}
 
 		return nil
