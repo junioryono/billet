@@ -127,8 +127,9 @@ type rerunSweep struct {
 	recoveryAsked  map[string]time.Time
 	// recoveryRead is when each recovery under way was last read, and recoveryFrom
 	// where the next pass lists stranded jobs to recover from.
-	recoveryRead map[rerunRun]time.Time
-	recoveryFrom alloc.StrandedCursor
+	recoveryRead     map[rerunRun]time.Time
+	recoveryFrom     alloc.StrandedCursor
+	recoveryOpenFrom alloc.RecoveryCursor
 	// began is when the pass began on the wall clock, which clock measures from.
 	began time.Time
 }

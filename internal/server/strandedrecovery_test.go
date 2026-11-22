@@ -584,12 +584,15 @@ func TestAStrandedJobNeverAskedAboutGoesFirst(t *testing.T) {
 	r.strand("third", 43, 20*time.Minute)
 	r.github.set(43, queued())
 
+	// ONE BEGINNING READ A PASS: the first and the second are asked about, then both are
+	// due again together with the third, which has never been.
+	r.pass()
 	r.pass()
 	r.now = r.now.Add(strandedAgain + time.Minute)
 	r.pass()
 
 	if r.github.cancelled[43] != 1 {
-		t.Fatalf("the launch never asked about was cancelled %d times on the second pass, want once",
+		t.Fatalf("the launch never asked about was cancelled %d times on the third pass, want once",
 			r.github.cancelled[43])
 	}
 }
@@ -613,5 +616,85 @@ func TestAStrandedJobPastTheFirstPageIsTaken(t *testing.T) {
 	if r.github.cancelled[7] != 1 {
 		t.Fatalf("the launch past the first page was cancelled %d times over two passes, want once",
 			r.github.cancelled[7])
+	}
+}
+
+// beginOpen records a recovery under way of run, cancelling its first attempt.
+func (r *recoveryStack) beginOpen(run int64) {
+	r.t.Helper()
+
+	lease := fmt.Sprintf("open-%d", run)
+	r.strand(lease, run, 20*time.Minute)
+	if begun, err := r.a.BeginStrandedRecovery(r.t.Context(), alloc.StrandedRecovery{Repository: "acme/app",
+		RunID: run, Attempt: 1, Tier: strandedTier, LeaseID: lease, JobName: "Lint App",
+		Ended: r.now.Add(-20 * time.Minute)}); err != nil || !begun {
+		r.t.Fatalf("begin run %d = %v, %v", run, begun, err)
+	}
+}
+
+// A RECOVERY PAST THE FIRST PAGE IS TAKEN IN ITS TURN: a page of recoveries GitHub
+// cannot be read about cannot keep a run billet cancelled from its re-run.
+func TestARecoveryPastTheFirstPageIsTaken(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	for i := range strandedRecoveryRows {
+		run := int64(100 + i)
+		r.beginOpen(run)
+		r.github.readErr[run] = errors.New("connection reset")
+	}
+	r.now = r.now.Add(time.Second)
+	r.beginOpen(7)
+	r.github.set(7, QueuedAttempt{Completed: true, Attempt: 1})
+
+	r.pass()
+	r.pass()
+
+	if r.github.rerun[7] != 1 {
+		t.Fatalf("the recovery past the first page was re-run %d times over two passes, want once",
+			r.github.rerun[7])
+	}
+}
+
+// RECOVERIES GITHUB CANNOT BE READ ABOUT DO NOT KEEP ONE FROM BEGINNING: beginning has
+// a share of its own.
+func TestUnreadableRecoveriesDoNotKeepOneFromBeginning(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	for _, run := range []int64{41, 42} {
+		r.beginOpen(run)
+		r.github.readErr[run] = errors.New("connection reset")
+	}
+	r.strand("missed", 43, 20*time.Minute)
+
+	r.pass()
+
+	if r.github.cancelled[43] != 1 {
+		t.Fatalf("the stranded job was cancelled %d times beside two unreadable recoveries, want once",
+			r.github.cancelled[43])
+	}
+}
+
+// A READ THAT DISAGREES WITH ITSELF DECIDES NOTHING: a recovery whose cancel has not
+// landed stays under way, and is re-run once a read that agrees shows it over.
+func TestADisagreeingReadLeavesTheRecoveryUnderWay(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.github.cancelLands = false
+	r.strand("missed", 42, 20*time.Minute)
+	r.pass()
+
+	r.github.set(42, queued(QueuedJob{Name: "Build iOS", Attempt: 2}))
+	r.pass()
+	if got := r.recovery(42); got != string(alloc.RecoveryCancelling) {
+		t.Fatalf("the recovery is %q after a read that disagreed with itself, want still cancelling", got)
+	}
+
+	r.github.set(42, QueuedAttempt{Completed: true, Attempt: 1})
+	r.pass()
+	if r.github.reruns != 1 {
+		t.Fatalf("re-ran the run %d times once a read agreed it was over, want once", r.github.reruns)
 	}
 }

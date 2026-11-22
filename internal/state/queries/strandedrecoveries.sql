@@ -37,10 +37,16 @@ SELECT h.lease_id, h.tier, COALESCE(h.repo, '') AS repo, CAST(COALESCE(h.run_id,
  LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: ListOpenStrandedRecoveries :many
--- Every recovery between its two requests, oldest first and bounded.
+-- The recoveries between their two requests, oldest first from just past a cursor,
+-- (after_created, after_repo, after_run), the last row of the page before, an empty
+-- after_created the start, and bounded: a pass reads a page and the cursor goes
+-- round, so none waits behind a page of others for ever.
 SELECT repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries, created_at
   FROM stranded_recoveries
  WHERE state IN ('cancelling', 'rerunning')
+   AND (created_at > @after_created
+        OR (created_at = @after_created
+            AND (repo > @after_repo OR (repo = @after_repo AND run_id > @after_run))))
  ORDER BY created_at, repo, run_id
  LIMIT CAST(@max_rows AS BIGINT);
 

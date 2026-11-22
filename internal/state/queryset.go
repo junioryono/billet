@@ -195,7 +195,8 @@ type ReadOps interface {
 	ListStrandedTiers(ctx context.Context) ([]ledgerdb.StrandedTier, error)
 	ListStrandedToRecover(ctx context.Context,
 		arg ledgerdb.ListStrandedToRecoverParams) ([]ledgerdb.ListStrandedToRecoverRow, error)
-	ListOpenStrandedRecoveries(ctx context.Context, maxRows int64) ([]ledgerdb.ListOpenStrandedRecoveriesRow, error)
+	ListOpenStrandedRecoveries(ctx context.Context,
+		arg ledgerdb.ListOpenStrandedRecoveriesParams) ([]ledgerdb.ListOpenStrandedRecoveriesRow, error)
 	CountLaterLeasesOfJob(ctx context.Context,
 		arg ledgerdb.CountLaterLeasesOfJobParams) (ledgerdb.CountLaterLeasesOfJobRow, error)
 	ListUsageSince(ctx context.Context, arg ledgerdb.ListUsageSinceParams) ([]ledgerdb.ListUsageSinceRow, error)

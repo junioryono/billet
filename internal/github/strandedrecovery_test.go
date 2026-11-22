@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -58,8 +59,6 @@ func TestARunsQueuedAttemptIsReadAsGitHubKeepsIt(t *testing.T) {
 			`{"total_count":1,"jobs":[{"id":2,"name":"Lint App","status":"queued","runner_name":null}]}`},
 		{"a job that does not say its name", `{"id":31,"status":"queued","run_attempt":1}`,
 			`{"total_count":1,"jobs":[{"id":2,"status":"queued","run_attempt":1,"runner_name":null}]}`},
-		{"a run past the bound", `{"id":31,"status":"queued","run_attempt":1}`,
-			`{"total_count":101,"jobs":[{"id":2,"name":"Lint App","status":"queued","run_attempt":1}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -72,6 +71,25 @@ func TestARunsQueuedAttemptIsReadAsGitHubKeepsIt(t *testing.T) {
 			}
 		})
 	}
+
+	// A RUN PAST THE BOUND, every record of it whole, is refused for its size on the
+	// first page: the read never costs more than its bound.
+	t.Run("a run past the bound", func(t *testing.T) {
+		t.Parallel()
+
+		s := newRerunServer(t)
+		s.run = `{"id":31,"status":"queued","run_attempt":1}`
+		s.jobs = `{"total_count":101,"jobs":[{"id":2,"name":"Lint App","status":"queued","run_attempt":1,` +
+			`"runner_name":null}]}`
+
+		_, err := s.QueuedAttempt(t.Context(), "acme", "api", 31)
+		if err == nil || !strings.Contains(err.Error(), "lists 101 jobs, more than the 100 billet reads") {
+			t.Fatalf("QueuedAttempt = %v, want a refusal for the run's size", err)
+		}
+		if n := s.jobReads.Load(); n != 1 {
+			t.Fatalf("read %d pages of a run past the bound, want the one that counts it", n)
+		}
+	})
 }
 
 // A CANCEL IS TAKEN ON GITHUB'S 202 ALONE, and a cancel of a run already over is told

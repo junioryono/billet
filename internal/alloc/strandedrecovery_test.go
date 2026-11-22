@@ -181,7 +181,7 @@ func TestARecoveryMovesOnlyFromTheStateItWasReadIn(t *testing.T) {
 	}
 	r.State = RecoveryRerunning
 
-	open, err := a.OpenStrandedRecoveries(t.Context(), 10)
+	open, err := a.OpenStrandedRecoveries(t.Context(), RecoveryCursor{}, 10)
 	if err != nil || len(open) != 1 || !open[0].Ended.Equal(r.Ended) || open[0].JobName != r.JobName {
 		t.Fatalf("OpenStrandedRecoveries = %+v, %v; want the one, with its launch's end and job", open, err)
 	}
@@ -196,7 +196,7 @@ func TestARecoveryMovesOnlyFromTheStateItWasReadIn(t *testing.T) {
 		t.Fatalf("a second end = %v, %v; want the first to stand", settled, err)
 	}
 
-	if open, err := a.OpenStrandedRecoveries(t.Context(), 10); err != nil || len(open) != 0 {
+	if open, err := a.OpenStrandedRecoveries(t.Context(), RecoveryCursor{}, 10); err != nil || len(open) != 0 {
 		t.Fatalf("OpenStrandedRecoveries = %+v, %v; want none once it ended", open, err)
 	}
 }

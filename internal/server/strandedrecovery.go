@@ -43,9 +43,13 @@ type QueuedJob struct {
 var ErrRunCompleted = errors.New("server: the run is already completed")
 
 const (
-	// strandedRecoveryReadsPerInstallation is how many runs one pass reads through
-	// one App installation to recover a stranded job, beside the detector's share.
+	// strandedRecoveryReadsPerInstallation is how many recoveries under way one pass
+	// reads through one App installation, beside the detector's share, and
+	// strandedBeginsPerInstallation how many stranded jobs it reads to begin one: a
+	// share each, so recoveries GitHub cannot be read about never keep one from
+	// beginning.
 	strandedRecoveryReadsPerInstallation = 2
+	strandedBeginsPerInstallation        = 1
 	// strandedRecoveryTries is how many times one of a recovery's two requests is
 	// sent before the recovery is given up.
 	strandedRecoveryTries = 3
@@ -89,26 +93,10 @@ func (s *Server) recoverStranded(ctx context.Context, targets map[string]Target,
 		sweep.strandedAsking = asking
 	}
 
-	read := map[string]int{}
-
-	// WHAT IS UNDER WAY FIRST, whether or not its tier still asks: a run billet may have
-	// cancelled must not be left cancelled because the config changed. The one read
-	// longest ago first, so recoveries GitHub cannot be read about keep none waiting.
-	open, err := s.alloc.OpenStrandedRecoveries(ctx, strandedRecoveryRows)
-	if err != nil {
-		if ctx.Err() == nil {
-			s.log.Warn("could not list the stranded-job recoveries under way; trying again", "error", err)
-		}
-
-		return
-	}
-	// WHAT THE PASS REMEMBERS IS OF WHAT IS STILL LISTED, so it does not grow with time.
-	underWay := make(map[rerunRun]bool, len(open))
-	for i := range open {
-		underWay[recoveryRun(&open[i])] = true
-	}
-	for run := range sweep.recoveryRead {
-		if !underWay[run] {
+	// WHAT THE PASS REMEMBERS OUTLIVES NOTHING IT IS ABOUT: a recovery ends within its
+	// window, and a launch leaves the list after it.
+	for run, at := range sweep.recoveryRead {
+		if now.Sub(at) > strandedRecoveryWindow {
 			delete(sweep.recoveryRead, run)
 		}
 	}
@@ -118,14 +106,32 @@ func (s *Server) recoverStranded(ctx context.Context, targets map[string]Target,
 		}
 	}
 
+	// WHAT IS UNDER WAY FIRST, whether or not its tier still asks, within a share of its
+	// own: a run billet may have cancelled must not be left cancelled because the config
+	// changed. One page a pass from where the last ended, and the one read longest ago
+	// first, so recoveries GitHub cannot be read about keep none waiting.
+	open, err := s.alloc.OpenStrandedRecoveries(ctx, sweep.recoveryOpenFrom, strandedRecoveryRows)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log.Warn("could not list the stranded-job recoveries under way; trying again", "error", err)
+		}
+
+		return
+	}
+	sweep.recoveryOpenFrom = alloc.RecoveryCursor{}
+	if len(open) == strandedRecoveryRows {
+		sweep.recoveryOpenFrom = open[len(open)-1].After()
+	}
+
 	slices.SortStableFunc(open, func(a, b alloc.StrandedRecovery) int {
 		return sweep.recoveryRead[recoveryRun(&a)].Compare(sweep.recoveryRead[recoveryRun(&b)])
 	})
+	advanced := map[string]int{}
 	for i := range open {
 		if ctx.Err() != nil {
 			return
 		}
-		s.advanceRecovery(ctx, targets, sweep, budgets, read, &open[i], now)
+		s.advanceRecovery(ctx, targets, sweep, budgets, advanced, &open[i], now)
 	}
 
 	if len(sweep.strandedAsking) == 0 {
@@ -160,11 +166,12 @@ func (s *Server) recoverStranded(ctx context.Context, targets map[string]Target,
 	slices.SortStableFunc(due, func(a, b *alloc.StrandedLaunch) int {
 		return sweep.recoveryAsked[a.LeaseID].Compare(sweep.recoveryAsked[b.LeaseID])
 	})
+	begun := map[string]int{}
 	for _, job := range due {
 		if ctx.Err() != nil {
 			return
 		}
-		s.beginRecovery(ctx, targets, sweep, budgets, read, job, now)
+		s.beginRecovery(ctx, targets, sweep, budgets, begun, job, now)
 	}
 }
 
@@ -176,7 +183,7 @@ func recoveryRun(r *alloc.StrandedRecovery) rerunRun {
 // recoveryReader is the client, installation and repository a recovery reads its
 // run through, false where it cannot be read on this pass.
 func (s *Server) recoveryReader(targets map[string]Target, sweep *rerunSweep, budgets map[string][]RESTHeadroom,
-	read map[string]int, tier, repository string, now time.Time,
+	read map[string]int, share int, tier, repository string, now time.Time,
 ) (RunRecovery, string, string, string, bool) {
 	owner, name, ok := config.SplitRepository(repository)
 	if !ok {
@@ -189,7 +196,7 @@ func (s *Server) recoveryReader(targets map[string]Target, sweep *rerunSweep, bu
 		return nil, "", "", "", false
 	}
 	installation := installationOf(target)
-	if read[installation] >= strandedRecoveryReadsPerInstallation || now.Before(sweep.paused[installation]) {
+	if read[installation] >= share || now.Before(sweep.paused[installation]) {
 		return nil, "", "", "", false
 	}
 	if _, _, _, low := inReserve(budgets[installation], now); low {
@@ -212,7 +219,8 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 		return
 	}
 
-	client, installation, owner, name, ok := s.recoveryReader(targets, sweep, budgets, read, job.Tier,
+	client, installation, owner, name, ok := s.recoveryReader(targets, sweep, budgets, read, strandedBeginsPerInstallation,
+		job.Tier,
 		job.Repository, now)
 	if !ok {
 		return
@@ -225,7 +233,7 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 
 		return
 	}
-	if !recoverable(attempt, job.JobName) {
+	if safe, _ := recoverable(attempt, job.JobName); !safe {
 		return
 	}
 
@@ -252,22 +260,27 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 // recoverable says whether a run's latest attempt may be cancelled to recover its
 // job named name: GitHub has a job of that name queued with no runner, and every
 // job of the attempt is queued with no runner or over, so a cancel ends nothing
-// running. A job listed against another attempt is a read that disagrees with
-// itself, and decides nothing. A completed attempt lists no jobs, so none waits.
-func recoverable(attempt QueuedAttempt, name string) bool {
+// running, and says it is known. A completed attempt lists no jobs, so none waits. It
+// is not known for a read that disagrees with itself, a job listed against another
+// attempt, which decides nothing either way.
+func recoverable(attempt QueuedAttempt, name string) (bool, bool) {
+	for _, job := range attempt.Jobs {
+		if job.Attempt != attempt.Attempt {
+			return false, false
+		}
+	}
+
 	waiting := false
 	for _, job := range attempt.Jobs {
 		switch {
-		case job.Attempt != attempt.Attempt:
-			return false
 		case !job.Unstarted && !job.Done:
-			return false
+			return false, true
 		case job.Unstarted && job.Name == name:
 			waiting = true
 		}
 	}
 
-	return waiting
+	return waiting, true
 }
 
 // advanceRecovery takes one recovery under way one step further.
@@ -280,7 +293,8 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		return
 	}
 
-	client, installation, owner, name, ok := s.recoveryReader(targets, sweep, budgets, read, recovery.Tier,
+	client, installation, owner, name, ok := s.recoveryReader(targets, sweep, budgets, read,
+		strandedRecoveryReadsPerInstallation, recovery.Tier,
 		recovery.Repository, now)
 	if !ok {
 		return
@@ -315,9 +329,12 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		s.sendRerunOfRecovery(ctx, client, sweep, installation, recovery, owner, name, now)
 	case recovery.State == alloc.RecoveryCancelling:
 		// THE CANCEL HAS NOT LANDED: a landed one completes the run within seconds. Sent
-		// again only while the run is still safe to cancel.
+		// again only while the run is still safe to cancel, and a read that disagrees
+		// with itself decides nothing.
+		safe, known := recoverable(attempt, recovery.JobName)
 		switch {
-		case !recoverable(attempt, recovery.JobName):
+		case !known:
+		case !safe:
 			s.endRecovery(ctx, recovery, alloc.RecoverySuperseded, "the run went on before billet's cancel landed")
 		case recovery.Tries >= strandedRecoveryTries:
 			s.endRecovery(ctx, recovery, alloc.RecoveryFailed, "GitHub did not take the cancel")

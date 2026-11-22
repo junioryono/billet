@@ -82,9 +82,19 @@ const listOpenStrandedRecoveries = `-- name: ListOpenStrandedRecoveries :many
 SELECT repo, run_id, run_attempt, tier, lease_id, job_name, ended_at, state, tries, created_at
   FROM stranded_recoveries
  WHERE state IN ('cancelling', 'rerunning')
+   AND (created_at > $1
+        OR (created_at = $1
+            AND (repo > $2 OR (repo = $2 AND run_id > $3))))
  ORDER BY created_at, repo, run_id
- LIMIT CAST($1 AS BIGINT)
+ LIMIT CAST($4 AS BIGINT)
 `
+
+type ListOpenStrandedRecoveriesParams struct {
+	AfterCreated string
+	AfterRepo    string
+	AfterRun     int64
+	MaxRows      int64
+}
 
 type ListOpenStrandedRecoveriesRow struct {
 	Repo       string
@@ -99,9 +109,17 @@ type ListOpenStrandedRecoveriesRow struct {
 	CreatedAt  string
 }
 
-// Every recovery between its two requests, oldest first and bounded.
-func (q *Queries) ListOpenStrandedRecoveries(ctx context.Context, maxRows int64) ([]ListOpenStrandedRecoveriesRow, error) {
-	rows, err := q.db.QueryContext(ctx, listOpenStrandedRecoveries, maxRows)
+// The recoveries between their two requests, oldest first from just past a cursor,
+// (after_created, after_repo, after_run), the last row of the page before, an empty
+// after_created the start, and bounded: a pass reads a page and the cursor goes
+// round, so none waits behind a page of others for ever.
+func (q *Queries) ListOpenStrandedRecoveries(ctx context.Context, arg ListOpenStrandedRecoveriesParams) ([]ListOpenStrandedRecoveriesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listOpenStrandedRecoveries,
+		arg.AfterCreated,
+		arg.AfterRepo,
+		arg.AfterRun,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}

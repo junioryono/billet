@@ -153,12 +153,34 @@ func (a *Allocator) StrandedToRecover(ctx context.Context, since time.Time, afte
 	return out, err
 }
 
-// OpenStrandedRecoveries is every recovery between its two requests, oldest first,
-// at most maxRows.
-func (a *Allocator) OpenStrandedRecoveries(ctx context.Context, maxRows int) ([]StrandedRecovery, error) {
+// RecoveryCursor is where a listing of OpenStrandedRecoveries resumes: just past the
+// recovery it names, or from the start for the zero value.
+type RecoveryCursor struct {
+	Created    time.Time
+	Repository string
+	RunID      int64
+}
+
+// After is the cursor just past r.
+func (r *StrandedRecovery) After() RecoveryCursor {
+	return RecoveryCursor{Created: r.Created, Repository: r.Repository, RunID: r.RunID}
+}
+
+// OpenStrandedRecoveries is the recoveries between their two requests, oldest first
+// from just past after, at most maxRows.
+func (a *Allocator) OpenStrandedRecoveries(ctx context.Context, after RecoveryCursor, maxRows int,
+) ([]StrandedRecovery, error) {
+	// THE START IS AN EMPTY STAMP, which every recorded one sorts after.
+	afterCreated := ""
+	if !after.Created.IsZero() {
+		afterCreated = ts(after.Created)
+	}
+
 	var out []StrandedRecovery
 	err := a.db.View(ctx, func(q querier) error {
-		rows, err := state.ReadQueries(q).ListOpenStrandedRecoveries(ctx, int64(maxRows))
+		rows, err := state.ReadQueries(q).ListOpenStrandedRecoveries(ctx, ledgerdb.ListOpenStrandedRecoveriesParams{
+			AfterCreated: afterCreated, AfterRepo: after.Repository, AfterRun: after.RunID, MaxRows: int64(maxRows),
+		})
 		if err != nil {
 			return fmt.Errorf("alloc: list the stranded-job recoveries in progress: %w", err)
 		}
