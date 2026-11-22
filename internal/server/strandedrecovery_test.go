@@ -864,6 +864,10 @@ func TestNoFirstCancelLeavesPastItsDecisionsDay(t *testing.T) {
 	if r.github.cancels != 0 {
 		t.Fatalf("sent a first cancel %d times after its decision's day had passed", r.github.cancels)
 	}
+	// AND THE CANCEL THAT NEVER LEFT IS COUNTED AS NONE: no ERROR, nothing to put right.
+	if got := r.recovery(42); got != string(alloc.RecoveryExpired) {
+		t.Fatalf("the recovery is %q, want expired", got)
+	}
 }
 
 // A RECOVERY DOES NOT BEGIN WHILE A RE-RUN OF A DISRUPTED JOB OF THE RUN MAY HAVE

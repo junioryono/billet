@@ -250,12 +250,6 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 	if !recoverable(attempt, job.JobName) {
 		return
 	}
-	// NOT PAST THE DAY THE DECISION LEAVES FOR A RECOVERY, on the clock as it is after the
-	// read: a cancel is a day's news at most.
-	if sweep.clock(now).Sub(job.Decided) > strandedRecoveryWindow {
-		return
-	}
-
 	recovery := alloc.StrandedRecovery{Repository: job.Repository, RunID: job.RunID, Attempt: attempt.Attempt,
 		Tier: job.Tier, LeaseID: job.LeaseID, JobName: job.JobName, Ended: job.Ended,
 		State: alloc.RecoveryCancelling, Tries: 1}
@@ -269,6 +263,17 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 		return
 	}
 	delete(sweep.recoveryAsked, job.LeaseID)
+
+	// NOT PAST THE DAY THE DECISION LEAVES FOR A RECOVERY, on the clock as it is after the
+	// read and the write, either of which may have waited: a cancel is a day's news at
+	// most. The cancel the row is ready for never leaves, and is counted as such.
+	if sweep.clock(now).Sub(job.Decided) > strandedRecoveryWindow {
+		if s.recordRefusal(ctx, sweep, &recovery) {
+			s.endRecovery(ctx, &recovery, alloc.RecoveryExpired, "its decision's day passed before the cancel left")
+		}
+
+		return
+	}
 
 	s.log.Warn("cancelling a run to recover a job GitHub stopped offering; its failed jobs are re-run once it "+
 		"is cancelled", "tier", job.Tier, "repository", job.Repository, "run", job.RunID, "attempt", attempt.Attempt,
