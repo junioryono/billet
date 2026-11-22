@@ -114,6 +114,9 @@ type rerunSweep struct {
 	asked    map[string]time.Time
 	tried    map[rerunRun]time.Time
 	listed   alloc.RerunCursor
+	// strandedAsked is when each launch that started nothing was last asked about and
+	// left undecided, so it gives way to the others until strandedAgain has passed.
+	strandedAsked map[string]time.Time
 	// began is when the pass began on the wall clock, which clock measures from.
 	began time.Time
 }
@@ -130,7 +133,8 @@ func (s *rerunSweep) clock(now time.Time) time.Time {
 
 func newRerunSweep() *rerunSweep {
 	return &rerunSweep{retries: map[rerunRun]queueTimeRetry{}, paused: map[string]time.Time{},
-		reserved: map[string]bool{}, failures: map[rerunRun]string{}, tried: map[rerunRun]time.Time{}}
+		reserved: map[string]bool{}, failures: map[rerunRun]string{}, tried: map[rerunRun]time.Time{},
+		strandedAsked: map[string]time.Time{}}
 }
 
 // rerunWork is one run a pass will read, through the first target that serves it.

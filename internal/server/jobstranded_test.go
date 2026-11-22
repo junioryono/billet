@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -49,20 +50,22 @@ const strandedTier = "billet-4vcpu-a"
 func newStrandedStack(t *testing.T) *strandedStack {
 	t.Helper()
 
-	db := openState(t)
+	r := &strandedStack{t: t, db: openState(t), sweep: newRerunSweep(), now: time.Now()}
 	tiers := []config.Tier{tier(strandedTier)}
-	now := time.Now()
-	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithClock(func() time.Time { return now }))
+	a, err := alloc.New(r.db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithClock(func() time.Time { return r.now }))
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
 
-	github := &strandedGitHub{fakeProvisioner: &fakeProvisioner{}, jobs: NamedJobs{Unstarted: 1}}
-	target := Target{Config: config.GitHubTarget{Name: "default", Org: "acme", InstallationID: 7}, Provisioner: github}
+	r.a, r.s = a, New(a, nil, tiers, "owner", nil)
+	r.github = &strandedGitHub{fakeProvisioner: &fakeProvisioner{}, jobs: NamedJobs{Unstarted: 1}}
+	r.targets = map[string]Target{strandedTier: {
+		Config:      config.GitHubTarget{Name: "default", Org: "acme", InstallationID: 7},
+		Provisioner: r.github,
+	}}
 
-	return &strandedStack{t: t, s: New(a, nil, tiers, "owner", nil), a: a, db: db, github: github,
-		targets: map[string]Target{strandedTier: target}, sweep: newRerunSweep(), now: now}
+	return r
 }
 
 // miss seeds a launch that started nothing, its lease ended age before the clock,
@@ -84,13 +87,13 @@ func (r *strandedStack) miss(lease, repo string, run int64, job string, age time
 	}
 }
 
-// lease seeds a lease the tier bought for run age before the clock.
-func (r *strandedStack) lease(lease string, run int64, age time.Duration) {
+// lease seeds a lease the tier bought for run's job named job age before the clock.
+func (r *strandedStack) lease(lease string, run int64, job string, age time.Duration) {
 	r.t.Helper()
 
 	if err := r.db.Tx(r.t.Context(), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(r.t.Context(), `INSERT INTO job_history (lease_id, tier, queued_at, run_id)
-			VALUES ($1, $2, $3, $4)`, lease, strandedTier, stamp(r.now.Add(-age)), run)
+		_, err := tx.ExecContext(r.t.Context(), `INSERT INTO job_history (lease_id, tier, queued_at, run_id, job_name)
+			VALUES ($1, $2, $3, $4, $5)`, lease, strandedTier, stamp(r.now.Add(-age)), run, job)
 
 		return err
 	}); err != nil {
@@ -148,7 +151,15 @@ func TestAJobGitHubStoppedOfferingIsFoundOnlyOnItsWord(t *testing.T) {
 		{"no job of its name", func(r *strandedStack) { r.github.jobs = NamedJobs{} }, "", 1},
 		{"the tier waits for room", func(r *strandedStack) { r.advertises(4, 1) }, "", 0},
 		{"the tier advertises nothing", func(r *strandedStack) { r.advertises(0, 0) }, "", 0},
-		{"the tier bought for the run again", func(r *strandedStack) { r.lease("again", 42, 5*time.Minute) }, "offered", 0},
+		{"the tier bought for the job again", func(r *strandedStack) {
+			r.lease("again", 42, "Lint App", 5*time.Minute)
+		}, "offered", 0},
+		{"the tier bought for another job of the run", func(r *strandedStack) {
+			r.lease("other", 42, "Build iOS", 5*time.Minute)
+		}, "stranded", 1},
+		{"the tier bought for the job before the launch", func(r *strandedStack) {
+			r.lease("before", 42, "Lint App", 30*time.Minute)
+		}, "stranded", 1},
 		{"GitHub could not be read", func(r *strandedStack) { r.github.err = errors.New("connection reset") }, "", 1},
 		{"too soon to tell", func(r *strandedStack) { r.redo(10 * time.Minute) }, "", 0},
 		{"a day gone", func(r *strandedStack) { r.redo(25 * time.Hour) }, "expired", 0},
@@ -208,6 +219,11 @@ func TestAStrandedJobIsDecidedOnce(t *testing.T) {
 	if r.github.reads != 1 {
 		t.Fatalf("read GitHub %d times over two passes, want once", r.github.reads)
 	}
+	// AND THE PASS FORGETS IT: a decided launch is never listed again, so what the
+	// sweep remembered of it would otherwise be kept for the life of the process.
+	if n := len(r.sweep.strandedAsked); n != 0 {
+		t.Fatalf("the sweep still remembers %d decided launches", n)
+	}
 }
 
 // A LAUNCH WHOSE ROW NAMES TOO LITTLE TO ASK GITHUB ABOUT IS EXPIRED AT ONCE, not
@@ -248,7 +264,11 @@ func TestAThrottledReadPausesTheInstallation(t *testing.T) {
 		t.Fatal("a throttled installation was not paused")
 	}
 
+	// PAST THE LAUNCH'S OWN WAIT and still inside the installation's pause, so only the
+	// pause holds it.
 	r.github.err = nil
+	r.now = r.now.Add(strandedAgain + time.Minute)
+	r.advertises(4, 0)
 	r.pass()
 	if r.github.reads != 1 {
 		t.Fatalf("read GitHub %d times, want none while paused", r.github.reads)
@@ -284,5 +304,31 @@ func TestOnlyATierWaitingForNothingCounts(t *testing.T) {
 		if got := strandedTierWaitsForNothing(tc.sealed, tc.report, now); got != tc.want {
 			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TWO LAUNCHES GITHUB'S RECORD NEVER DECIDES DO NOT TAKE EVERY PASS'S READS: each
+// gives way for strandedAgain once asked, so a third is asked on the next pass, and
+// the first two again only once that has passed.
+func TestUndecidedLaunchesGiveWayToTheOthers(t *testing.T) {
+	t.Parallel()
+
+	r := newStrandedStack(t)
+	r.miss("first", "acme/app", 42, "Lint App", 22*time.Minute)
+	r.miss("second", "acme/app", 42, "Test App", 21*time.Minute)
+	r.miss("third", "acme/app", 42, "Build App", 20*time.Minute)
+	r.github.jobs = NamedJobs{}
+
+	start := r.now
+	for _, at := range []time.Duration{0, time.Minute, 2 * time.Minute, strandedAgain + time.Minute} {
+		r.now = start.Add(at)
+		r.advertises(4, 0)
+		r.pass()
+	}
+
+	want := []string{"acme/app Lint App", "acme/app Test App", "acme/app Build App",
+		"acme/app Lint App", "acme/app Test App"}
+	if !slices.Equal(r.github.asked, want) {
+		t.Fatalf("asked %q, want %q", r.github.asked, want)
 	}
 }

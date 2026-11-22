@@ -37,6 +37,10 @@ const (
 	// its reads of GitHub through one App installation.
 	strandedRows                 = 200
 	strandedReadsPerInstallation = 2
+	// strandedAgain is how long a launch GitHub's record left undecided gives way to
+	// the others before it is asked about again, so two that never decide cannot
+	// take every pass's reads from a third.
+	strandedAgain = 10 * time.Minute
 	// strandedObservedWithin is how recent a tier's own report of its capacity must be
 	// for what it says to count: a listener that stopped reporting says nothing.
 	strandedObservedWithin = 10 * time.Minute
@@ -48,7 +52,7 @@ const (
 // ONLY ON GITHUB'S WORD AND BILLET'S OWN RECORD, NEVER A TIMER ALONE. A job is
 // stranded when GitHub's REST record of its run still has a job of its name queued with
 // no runner, long after the failure, while its tier was unsealed, advertising capacity
-// and waiting for room for nothing, and the tier has bought nothing for the run since.
+// and waiting for room for nothing, and the tier has bought nothing for a job of that name in the run since.
 // Each of those excludes a reason the same job would legitimately wait: an advertisement
 // of 0 or a seal stops GitHub offering anything, and a tier waiting for room is offered
 // work it cannot buy for. A read that fails is could-not-tell, and the launch is asked
@@ -89,12 +93,16 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 		switch {
 		case miss.Ended.IsZero() || miss.Owner == "" || miss.Repository == "" || miss.RunID <= 0 || miss.JobName == "",
 			age > strandedWindow:
-			s.decideStranded(ctx, miss, alloc.StrandedExpired, now)
+			s.decideStranded(ctx, sweep, miss, alloc.StrandedExpired, now)
 
 			continue
 		// OLDEST FIRST, so every launch after this one is younger still.
 		case age < strandedAfter:
 			return
+		}
+
+		if asked, ok := sweep.strandedAsked[miss.LeaseID]; ok && now.Sub(asked) < strandedAgain {
+			continue
 		}
 
 		target := targets[miss.Tier]
@@ -114,17 +122,18 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 			continue
 		}
 
-		later, err := s.alloc.LaterLeasesOfRun(ctx, miss.Tier, miss.RunID, miss.Ended)
+		later, err := s.alloc.LaterLeasesOfJob(ctx, miss.Tier, miss.RunID, miss.JobName, miss.Ended)
 		if err != nil {
 			continue
 		}
 		if later > 0 {
-			s.decideStranded(ctx, miss, alloc.StrandedOffered, now)
+			s.decideStranded(ctx, sweep, miss, alloc.StrandedOffered, now)
 
 			continue
 		}
 
 		read[installation]++
+		sweep.strandedAsked[miss.LeaseID] = now
 		jobs, err := queue.JobsNamed(ctx, miss.Owner, miss.Repository, miss.RunID, miss.JobName)
 		if err != nil {
 			s.strandedReadFailed(ctx, miss, installation, err, sweep, now)
@@ -134,9 +143,9 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 
 		switch {
 		case jobs.Completed, jobs.Unstarted == 0 && jobs.Taken > 0:
-			s.decideStranded(ctx, miss, alloc.StrandedOffered, now)
+			s.decideStranded(ctx, sweep, miss, alloc.StrandedOffered, now)
 		case jobs.Unstarted > 0 && jobs.Taken == 0:
-			if s.decideStranded(ctx, miss, alloc.StrandedJob, now) {
+			if s.decideStranded(ctx, sweep, miss, alloc.StrandedJob, now) {
 				s.log.Error("GitHub has stopped offering a job: it is still queued with no runner, "+
 					fmt.Sprintf("%s after billet's launch for it started nothing, ", age.Round(time.Minute))+
 					"while its tier advertised capacity and waited for nothing. GitHub does not offer a "+
@@ -171,9 +180,10 @@ func strandedTierWaitsForNothing(sealed bool, report alloc.TierCapacity, now tim
 	return listener.Sent != nil && *listener.Sent > 0 && listener.Waiting == 0
 }
 
-// decideStranded records a decision and reports whether this call made it.
-func (s *Server) decideStranded(ctx context.Context, miss *alloc.LaunchMiss, decision alloc.StrandedDecision,
-	now time.Time,
+// decideStranded records a decision and reports whether this call made it. A launch
+// decided, by this call or another, is not asked about again.
+func (s *Server) decideStranded(ctx context.Context, sweep *rerunSweep, miss *alloc.LaunchMiss,
+	decision alloc.StrandedDecision, now time.Time,
 ) bool {
 	decided, err := s.alloc.DecideStranded(ctx, miss.LeaseID, decision, now)
 	if err != nil {
@@ -184,6 +194,7 @@ func (s *Server) decideStranded(ctx context.Context, miss *alloc.LaunchMiss, dec
 
 		return false
 	}
+	delete(sweep.strandedAsked, miss.LeaseID)
 
 	return decided
 }

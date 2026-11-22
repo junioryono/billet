@@ -33,9 +33,15 @@ const JobStatusQueued = "queued"
 
 var _ RunQueue = (*runnerGroupPolicyClient)(nil)
 
+// strandedMaxJobs bounds one JobsNamed to the run and four pages of jobs, so a
+// background read of a large run costs five requests, not forty-one. A latest attempt
+// with more jobs is an error: could-not-tell.
+const strandedMaxJobs = 4 * runJobsPerPage
+
 // JobsNamed reads a run's status and, unless the run is completed, every job of its
 // latest attempt named name. The whole list or an error, as listRunJobs is: a job
-// missing from a prefix is not a job GitHub stopped offering.
+// missing from a prefix is not a job GitHub stopped offering, and nor is one whose
+// record does not say its name, since it could be one of this name.
 func (c *runnerGroupPolicyClient) JobsNamed(ctx context.Context, owner, repository string, runID int64,
 	name string,
 ) (NamedJobs, error) {
@@ -72,10 +78,13 @@ func (c *runnerGroupPolicyClient) JobsNamed(ctx context.Context, owner, reposito
 	}
 
 	var out NamedJobs
-	err = c.listRunJobs(ctx, owner, repository, runID, "latest", MaxRunJobs, func(record jobRecord,
+	err = c.listRunJobs(ctx, owner, repository, runID, "latest", strandedMaxJobs, func(record jobRecord,
 		runner string,
 	) error {
-		if record.Name == nil || *record.Name != name {
+		if record.Name == nil {
+			return errors.New("github: a job of the run does not say its name")
+		}
+		if *record.Name != name {
 			return nil
 		}
 		if record.Status == nil {

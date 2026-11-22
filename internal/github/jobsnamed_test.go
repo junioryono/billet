@@ -48,6 +48,35 @@ func TestARunsJobsOfOneNameAreReadAsGitHubKeepsThem(t *testing.T) {
 		}
 	})
 
+	t.Run("a job that does not say its name", func(t *testing.T) {
+		t.Parallel()
+
+		s := newRerunServer(t)
+		s.run = `{"id":31,"status":"in_progress","run_attempt":1}`
+		s.jobs = `{"total_count":2,"jobs":[
+			{"id":2,"name":"Lint App","status":"queued","runner_name":null},
+			{"id":3,"status":"in_progress","runner_name":"billet-b"}]}`
+
+		if got, err := s.JobsNamed(t.Context(), "acme", "api", 31, "Lint App"); err == nil {
+			t.Fatalf("JobsNamed = %+v, want an error for a job that could be one of the name", got)
+		}
+	})
+
+	t.Run("a run larger than the read is bounded to", func(t *testing.T) {
+		t.Parallel()
+
+		s := newRerunServer(t)
+		s.run = `{"id":31,"status":"in_progress","run_attempt":1}`
+		s.jobs = `{"total_count":101,"jobs":[{"id":2,"name":"Lint App","status":"queued","runner_name":null}]}`
+
+		if got, err := s.JobsNamed(t.Context(), "acme", "api", 31, "Lint App"); err == nil {
+			t.Fatalf("JobsNamed = %+v, want an error for a run past the bound", got)
+		}
+		if n := s.jobReads.Load(); n != 1 {
+			t.Fatalf("read %d pages of a run past the bound, want the one that counts it", n)
+		}
+	})
+
 	t.Run("a job that does not say its status", func(t *testing.T) {
 		t.Parallel()
 

@@ -67,17 +67,19 @@ func (a *Allocator) LaunchMisses(ctx context.Context, since time.Time, maxRows i
 	return out, err
 }
 
-// LaterLeasesOfRun is how many leases tier bought for run after after: GitHub
-// offering the run's work to the tier again.
-func (a *Allocator) LaterLeasesOfRun(ctx context.Context, tier string, runID int64, after time.Time) (int64, error) {
+// LaterLeasesOfJob is how many leases tier bought for run's job named jobName after
+// after: GitHub offering that job to the tier again.
+func (a *Allocator) LaterLeasesOfJob(ctx context.Context, tier string, runID int64, jobName string,
+	after time.Time,
+) (int64, error) {
 	var n int64
 	err := a.db.View(ctx, func(q querier) error {
 		var err error
-		n, err = state.ReadQueries(q).CountLaterLeasesOfRun(ctx, ledgerdb.CountLaterLeasesOfRunParams{
-			Tier: tier, RunID: sql.NullInt64{Int64: runID, Valid: true}, After: ts(after),
+		n, err = state.ReadQueries(q).CountLaterLeasesOfJob(ctx, ledgerdb.CountLaterLeasesOfJobParams{
+			Tier: tier, RunID: sql.NullInt64{Int64: runID, Valid: true}, JobName: jobName, After: ts(after),
 		})
 		if err != nil {
-			return fmt.Errorf("alloc: count tier %s's leases of run %d: %w", tier, runID, err)
+			return fmt.Errorf("alloc: count tier %s's leases of run %d's job %q: %w", tier, runID, jobName, err)
 		}
 
 		return nil

@@ -10,22 +10,29 @@ import (
 	"database/sql"
 )
 
-const countLaterLeasesOfRun = `-- name: CountLaterLeasesOfRun :one
+const countLaterLeasesOfJob = `-- name: CountLaterLeasesOfJob :one
 SELECT CAST(COUNT(*) AS BIGINT) AS later
   FROM job_history
- WHERE tier = $1 AND run_id = $2 AND queued_at > $3
+ WHERE tier = $1 AND run_id = $2 AND job_name = $3 AND queued_at > $4
 `
 
-type CountLaterLeasesOfRunParams struct {
-	Tier  string
-	RunID sql.NullInt64
-	After string
+type CountLaterLeasesOfJobParams struct {
+	Tier    string
+	RunID   sql.NullInt64
+	JobName string
+	After   string
 }
 
-// How many leases a tier bought for a run after a moment: GitHub offering the run's
-// work to the tier again, which a job it stopped offering never is.
-func (q *Queries) CountLaterLeasesOfRun(ctx context.Context, arg CountLaterLeasesOfRunParams) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countLaterLeasesOfRun, arg.Tier, arg.RunID, arg.After)
+// How many leases a tier bought for a run's job of one name after a moment: GitHub
+// offering that job to the tier again, which a job it stopped offering never is. Only
+// the name: a lease bought for another job of the same run says nothing about this one.
+func (q *Queries) CountLaterLeasesOfJob(ctx context.Context, arg CountLaterLeasesOfJobParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countLaterLeasesOfJob,
+		arg.Tier,
+		arg.RunID,
+		arg.JobName,
+		arg.After,
+	)
 	var later int64
 	err := row.Scan(&later)
 	return later, err
