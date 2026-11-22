@@ -25,6 +25,8 @@ type RunRecovery interface {
 // is on and, unless it is over, every job of that attempt.
 type QueuedAttempt struct {
 	Completed bool
+	// Cancelled is a completed run GitHub concluded cancelled: one a cancel ended.
+	Cancelled bool
 	Attempt   int64
 	Jobs      []QueuedJob
 }
@@ -233,7 +235,7 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 
 		return
 	}
-	if recoverable(attempt, job.JobName) != runSafe {
+	if !recoverable(attempt, job.JobName) {
 		return
 	}
 
@@ -257,47 +259,23 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 	s.sendCancel(ctx, client, sweep, installation, &recovery, owner, name, now)
 }
 
-// runSafety is what a read of a run's latest attempt says about cancelling it.
-type runSafety int
-
-const (
-	// runUnclear is a read that decides nothing: one that disagrees with itself, a job
-	// listed against another attempt, or one with nothing running and no job of the
-	// name waiting, which a cancel landing between the run's read and its jobs' leaves.
-	// The zero value, because could-not-tell decides nothing.
-	runUnclear runSafety = iota
-	// runSafe is a run whose job of the name is queued with no runner and every other
-	// job queued with no runner or over: a cancel ends nothing running.
-	runSafe
-	// runGoing is a run with a job running, or taken by a runner: a cancel would end it.
-	runGoing
-)
-
-// recoverable says what a run's latest attempt says about cancelling it to recover its
-// job named name. A completed attempt lists no jobs, so it is unclear, and is read for
-// what it is by the caller.
-func recoverable(attempt QueuedAttempt, name string) runSafety {
-	for _, job := range attempt.Jobs {
-		if job.Attempt != attempt.Attempt {
-			return runUnclear
-		}
-	}
-
+// recoverable says whether a run's latest attempt may be cancelled to recover its
+// job named name: GitHub has a job of that name queued with no runner, and every job
+// of the attempt is queued with no runner or over, so a cancel ends nothing running.
+// A read that disagrees with itself, a job listed against another attempt, is not,
+// and nor is a completed attempt, which lists no jobs.
+func recoverable(attempt QueuedAttempt, name string) bool {
 	waiting := false
 	for _, job := range attempt.Jobs {
 		switch {
-		case !job.Unstarted && !job.Done:
-			return runGoing
+		case job.Attempt != attempt.Attempt, !job.Unstarted && !job.Done:
+			return false
 		case job.Unstarted && job.Name == name:
 			waiting = true
 		}
 	}
 
-	if waiting {
-		return runSafe
-	}
-
-	return runUnclear
+	return waiting
 }
 
 // advanceRecovery takes one recovery under way one step further.
@@ -335,40 +313,34 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		// THE RUN MOVED ON WITHOUT BILLET'S RE-RUN: a person re-ran it, and it is theirs.
 		s.endRecovery(ctx, recovery, alloc.RecoverySuperseded, "the run moved to a later attempt before billet "+
 			"asked for one")
-	case recovery.State == alloc.RecoveryCancelling && attempt.Completed:
-		// THE ATTEMPT BILLET CANCELLED IS OVER, so its failed jobs, the cancelled one
-		// among them, can be run again.
+	case recovery.State == alloc.RecoveryCancelling && attempt.Completed && attempt.Cancelled:
+		// THE ATTEMPT BILLET CANCELLED ENDED CANCELLED, so its failed jobs, the cancelled
+		// one among them, can be run again.
 		moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryRerunning, 1)
 		if err != nil || !moved {
 			return
 		}
 		recovery.State, recovery.Tries = alloc.RecoveryRerunning, 1
 		s.sendRerunOfRecovery(ctx, client, sweep, installation, recovery, owner, name, now)
+	case recovery.State == alloc.RecoveryCancelling && attempt.Completed:
+		// THE RUN ENDED ON ITS OWN, not cancelled: billet's cancel ended nothing, and
+		// what failed in it is the run's own.
+		s.endRecovery(ctx, recovery, alloc.RecoverySuperseded, "the run finished before billet's cancel ended it")
 	case recovery.State == alloc.RecoveryCancelling:
-		// THE CANCEL HAS NOT LANDED: a landed one completes the run within seconds. Sent
-		// again only while the run is still safe to cancel; only a job running ends the
-		// recovery, and a read that says neither decides nothing.
-		safety := recoverable(attempt, recovery.JobName)
-		switch {
-		case safety == runUnclear:
-		case safety == runGoing:
-			s.endRecovery(ctx, recovery, alloc.RecoverySuperseded, "the run went on before billet's cancel landed")
-		case recovery.Tries >= strandedRecoveryTries:
-			s.endRecovery(ctx, recovery, alloc.RecoveryFailed, "GitHub did not take the cancel")
-		default:
-			moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryCancelling, recovery.Tries+1)
-			if errors.Is(err, alloc.ErrMayBeOffered) {
-				s.endRecovery(ctx, recovery, alloc.RecoverySuperseded, "the tier has since been assigned what may "+
-					"be the job")
-
-				return
-			}
-			if err != nil || !moved {
-				return
-			}
-			recovery.Tries++
-			s.sendCancel(ctx, client, sweep, installation, recovery, owner, name, now)
+		// THE CANCEL HAS NOT LANDED, and one GitHub took may still: nothing but the run's
+		// end, read above, ends the recovery, and its day is the last word. It is sent
+		// again only while the run is still safe to cancel and its tries last; a run
+		// going, an assignment since that may be the job, or a read that decides nothing
+		// sends nothing more.
+		if !recoverable(attempt, recovery.JobName) || recovery.Tries >= strandedRecoveryTries {
+			return
 		}
+		moved, err := s.alloc.MoveStrandedRecovery(ctx, *recovery, alloc.RecoveryCancelling, recovery.Tries+1)
+		if err != nil || !moved {
+			return
+		}
+		recovery.Tries++
+		s.sendCancel(ctx, client, sweep, installation, recovery, owner, name, now)
 	case !attempt.Completed:
 		// A RUN GOING ON THE ATTEMPT A RE-RUN WAS ASKED OF took it: straight after the
 		// request GitHub answers `queued` on the old attempt (measured 2026-11-04).

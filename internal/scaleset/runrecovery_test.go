@@ -54,6 +54,14 @@ func TestAQueuedAttemptIsReadInTheServersWords(t *testing.T) {
 			t.Errorf("job %d = %+v, want %+v", i, got.Jobs[i], want[i])
 		}
 	}
+
+	// AND HOW A COMPLETED RUN ENDED, which is what a recovery re-runs on.
+	ended := &Client{policy: strandedPolicy{attempt: billetgithub.QueuedAttempt{Completed: true, Cancelled: true,
+		Attempt: 2}}}
+	if got, err := ended.QueuedAttempt(t.Context(), "acme", "api", 31); err != nil || !got.Completed ||
+		!got.Cancelled || got.Attempt != 2 {
+		t.Errorf("a run a cancel ended = %+v, %v; want completed and cancelled on attempt 2", got, err)
+	}
 }
 
 // A CANCEL'S ANSWER REACHES THE LOOP AS THE SERVER'S OWN SENTINEL: a run already over

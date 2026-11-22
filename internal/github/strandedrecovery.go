@@ -26,6 +26,8 @@ type StrandedRecoverer interface {
 // it is on and, unless it is over, every job of that attempt.
 type QueuedAttempt struct {
 	Completed bool
+	// Cancelled is a completed run GitHub concluded `cancelled`: one a cancel ended.
+	Cancelled bool
 	Attempt   int64
 	Jobs      []QueuedJob
 }
@@ -38,6 +40,10 @@ type QueuedJob struct {
 	Attempt    int64
 	RunnerName string
 }
+
+// runConclusionCancelled is how GitHub concludes a run a cancel ended (measured
+// 2026-11-22).
+const runConclusionCancelled = "cancelled"
 
 // ErrRunAlreadyCompleted says GitHub refused a cancel because the run is over.
 var ErrRunAlreadyCompleted = errors.New("github: the run is already completed")
@@ -64,6 +70,7 @@ func (c *runnerGroupPolicyClient) QueuedAttempt(ctx context.Context, owner, repo
 	var body struct {
 		ID         *int64  `json:"id"`
 		Status     *string `json:"status"`
+		Conclusion *string `json:"conclusion"`
 		RunAttempt *int64  `json:"run_attempt"`
 	}
 	if err := c.getJSON(ctx, endpoint+"/actions/runs/"+strconv.FormatInt(runID, 10),
@@ -80,6 +87,13 @@ func (c *runnerGroupPolicyClient) QueuedAttempt(ctx context.Context, owner, repo
 
 	out := QueuedAttempt{Completed: *body.Status == RunStatusCompleted, Attempt: *body.RunAttempt}
 	if out.Completed {
+		// A COMPLETED RUN SAYS HOW IT ENDED, and one that does not is could-not-tell: a
+		// recovery re-runs a run a cancel ended, and only that.
+		if body.Conclusion == nil {
+			return QueuedAttempt{}, errors.New("github: a completed workflow run does not say how it ended")
+		}
+		out.Cancelled = *body.Conclusion == runConclusionCancelled
+
 		return out, nil
 	}
 

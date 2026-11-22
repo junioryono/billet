@@ -15,20 +15,42 @@ import (
 func TestARunsQueuedAttemptIsReadAsGitHubKeepsIt(t *testing.T) {
 	t.Parallel()
 
-	t.Run("a completed run", func(t *testing.T) {
-		t.Parallel()
+	// A COMPLETED RUN SAYS HOW IT ENDED: cancelled is one a cancel ended, and one that
+	// does not say is could-not-tell.
+	for _, tc := range []struct {
+		name, run string
+		cancelled bool
+		refused   bool
+	}{
+		{name: "a run a cancel ended", run: `{"id":31,"status":"completed","conclusion":"cancelled","run_attempt":2}`,
+			cancelled: true},
+		{name: "a run that ended on its own", run: `{"id":31,"status":"completed","conclusion":"failure","run_attempt":2}`},
+		{name: "a completed run that does not say how", run: `{"id":31,"status":"completed","run_attempt":2}`,
+			refused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		s := newRerunServer(t)
-		s.run = `{"id":31,"status":"completed","run_attempt":2}`
+			s := newRerunServer(t)
+			s.run = tc.run
 
-		got, err := s.QueuedAttempt(t.Context(), "acme", "api", 31)
-		if err != nil || !got.Completed || got.Attempt != 2 || got.Jobs != nil {
-			t.Fatalf("QueuedAttempt = %+v, %v; want completed on attempt 2 and no jobs", got, err)
-		}
-		if n := s.jobReads.Load(); n != 0 {
-			t.Fatalf("a completed run's jobs were read %d times", n)
-		}
-	})
+			got, err := s.QueuedAttempt(t.Context(), "acme", "api", 31)
+			if tc.refused {
+				if err == nil {
+					t.Fatalf("QueuedAttempt = %+v, want an error", got)
+				}
+
+				return
+			}
+			if err != nil || !got.Completed || got.Cancelled != tc.cancelled || got.Attempt != 2 || got.Jobs != nil {
+				t.Fatalf("QueuedAttempt = %+v, %v; want completed on attempt 2, cancelled %v, no jobs", got, err,
+					tc.cancelled)
+			}
+			if n := s.jobReads.Load(); n != 0 {
+				t.Fatalf("a completed run's jobs were read %d times", n)
+			}
+		})
+	}
 
 	t.Run("an unfinished run", func(t *testing.T) {
 		t.Parallel()

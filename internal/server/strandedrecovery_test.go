@@ -70,7 +70,7 @@ func (g *recoveryGitHub) CancelRun(_ context.Context, _, _ string, run int64) er
 		return g.cancelErr
 	}
 	if g.cancelLands {
-		g.set(run, QueuedAttempt{Completed: true, Attempt: g.get(run).Attempt})
+		g.set(run, QueuedAttempt{Completed: true, Cancelled: true, Attempt: g.get(run).Attempt})
 	}
 
 	return nil
@@ -391,7 +391,9 @@ func TestAReRunThatDoesNotLandIsGivenUp(t *testing.T) {
 }
 
 // A CANCEL THAT DOES NOT LAND IS SENT AGAIN ONLY WHILE THE RUN IS STILL SAFE TO
-// CANCEL: once a job of it has a runner, the recovery is over and nothing is sent.
+// CANCEL: once a job of it has a runner nothing more is sent, and the recovery waits
+// on, since the cancel GitHub took may still land, until the run's end says what came
+// of it: one ended cancelled is re-run.
 func TestACancelIsSentAgainOnlyWhileTheRunIsSafeToCancel(t *testing.T) {
 	t.Parallel()
 
@@ -412,13 +414,42 @@ func TestACancelIsSentAgainOnlyWhileTheRunIsSafeToCancel(t *testing.T) {
 	if r.github.cancels != 2 {
 		t.Fatalf("sent the cancel %d times, want no more once a job of the run is running", r.github.cancels)
 	}
-	if got := r.recovery(42); got != string(alloc.RecoverySuperseded) {
+	if got := r.recovery(42); got != string(alloc.RecoveryCancelling) {
+		t.Fatalf("the recovery is %q with a cancel GitHub took still able to land, want still cancelling", got)
+	}
+
+	r.github.set(42, QueuedAttempt{Completed: true, Cancelled: true, Attempt: 1})
+	r.pass()
+	if r.github.reruns != 1 {
+		t.Fatalf("re-ran the run %d times once it ended cancelled, want once", r.github.reruns)
+	}
+}
+
+// A RUN THAT ENDS ON ITS OWN WHILE A CANCEL IS PENDING IS LEFT ALONE: billet's cancel
+// ended nothing, and what failed in it is the run's own, never re-run by billet.
+func TestARunThatEndsOnItsOwnIsLeftAlone(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.github.cancelLands = false
+	r.strand("missed", 43, 20*time.Minute)
+	r.pass()
+
+	r.github.set(43, QueuedAttempt{Completed: true, Attempt: 1})
+	r.pass()
+	r.pass()
+
+	if r.github.reruns != 0 {
+		t.Fatalf("re-ran a run that ended on its own %d times", r.github.reruns)
+	}
+	if got := r.recovery(43); got != string(alloc.RecoverySuperseded) {
 		t.Fatalf("the recovery is %q, want superseded", got)
 	}
 }
 
-// A CANCEL THAT NEVER LANDS IS GIVEN UP AFTER ITS TRIES, the run left as it was.
-func TestACancelThatNeverLandsIsGivenUp(t *testing.T) {
+// A CANCEL THAT NEVER LANDS IS SENT AT MOST ITS TRIES, and the recovery waits for the
+// run's end or its day, since one GitHub took may still land.
+func TestACancelThatNeverLandsIsSentAtMostItsTries(t *testing.T) {
 	t.Parallel()
 
 	r := newRecoveryStack(t, true)
@@ -433,8 +464,8 @@ func TestACancelThatNeverLandsIsGivenUp(t *testing.T) {
 		t.Fatalf("%d cancels and %d re-runs, want %d cancels and no re-run", r.github.cancels, r.github.reruns,
 			strandedRecoveryTries)
 	}
-	if got := r.recovery(43); got != string(alloc.RecoveryFailed) {
-		t.Fatalf("the recovery is %q, want failed", got)
+	if got := r.recovery(43); got != string(alloc.RecoveryCancelling) {
+		t.Fatalf("the recovery is %q, want still cancelling until the run ends or its day passes", got)
 	}
 }
 
@@ -522,8 +553,9 @@ func TestAnAssignmentDuringTheReadHoldsTheCancel(t *testing.T) {
 	}
 }
 
-// AN ASSIGNMENT SINCE HOLDS A CANCEL SENT AGAIN: the recovery ends rather than cancel
-// what may be the job offered again, across a restart too.
+// AN ASSIGNMENT SINCE HOLDS A CANCEL SENT AGAIN, across a restart too: nothing more is
+// sent that could cancel what may be the job offered again, and the recovery waits
+// for the run's end, since the cancel GitHub took may still land.
 func TestAnAssignmentSinceHoldsACancelSentAgain(t *testing.T) {
 	t.Parallel()
 
@@ -540,8 +572,8 @@ func TestAnAssignmentSinceHoldsACancelSentAgain(t *testing.T) {
 	if r.github.cancels != 1 {
 		t.Fatalf("sent the cancel %d times, want once: an assignment since may be the job", r.github.cancels)
 	}
-	if got := r.recovery(42); got != string(alloc.RecoverySuperseded) {
-		t.Fatalf("the recovery is %q, want superseded", got)
+	if got := r.recovery(42); got != string(alloc.RecoveryCancelling) {
+		t.Fatalf("the recovery is %q, want still cancelling", got)
 	}
 }
 
@@ -563,7 +595,7 @@ func TestUnreadableRecoveriesKeepNoneWaiting(t *testing.T) {
 	}
 	r.github.readErr[41] = errors.New("connection reset")
 	r.github.readErr[42] = errors.New("connection reset")
-	r.github.set(43, QueuedAttempt{Completed: true, Attempt: 1})
+	r.github.set(43, QueuedAttempt{Completed: true, Cancelled: true, Attempt: 1})
 
 	for range 3 {
 		r.pass()
@@ -648,7 +680,7 @@ func TestARecoveryPastTheFirstPageIsTaken(t *testing.T) {
 	}
 	r.now = r.now.Add(time.Second)
 	r.beginOpen(7)
-	r.github.set(7, QueuedAttempt{Completed: true, Attempt: 1})
+	r.github.set(7, QueuedAttempt{Completed: true, Cancelled: true, Attempt: 1})
 
 	r.pass()
 	r.pass()
@@ -699,7 +731,7 @@ func TestACancelLandingMidReadLeavesTheRecoveryUnderWay(t *testing.T) {
 		t.Fatalf("sent the cancel %d times, want no more on a read that decides nothing", r.github.cancels)
 	}
 
-	r.github.set(42, QueuedAttempt{Completed: true, Attempt: 1})
+	r.github.set(42, QueuedAttempt{Completed: true, Cancelled: true, Attempt: 1})
 	r.pass()
 	if r.github.reruns != 1 {
 		t.Fatalf("re-ran the run %d times once it read over, want once", r.github.reruns)
@@ -748,7 +780,7 @@ func TestADisagreeingReadLeavesTheRecoveryUnderWay(t *testing.T) {
 		t.Fatalf("sent the cancel %d times, want no more on a read that disagreed with itself", r.github.cancels)
 	}
 
-	r.github.set(42, QueuedAttempt{Completed: true, Attempt: 1})
+	r.github.set(42, QueuedAttempt{Completed: true, Cancelled: true, Attempt: 1})
 	r.pass()
 	if r.github.reruns != 1 {
 		t.Fatalf("re-ran the run %d times once a read agreed it was over, want once", r.github.reruns)

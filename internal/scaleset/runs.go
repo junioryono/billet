@@ -277,7 +277,7 @@ func (c *Client) QueuedAttempt(ctx context.Context, owner, repository string, ru
 		return server.QueuedAttempt{}, installationError(err, server.ErrRerunThrottled, server.ErrRerunRefused)
 	}
 
-	out := server.QueuedAttempt{Completed: attempt.Completed, Attempt: attempt.Attempt}
+	out := server.QueuedAttempt{Completed: attempt.Completed, Cancelled: attempt.Cancelled, Attempt: attempt.Attempt}
 	for _, job := range attempt.Jobs {
 		out.Jobs = append(out.Jobs, server.QueuedJob{Name: job.Name, Attempt: job.Attempt,
 			Unstarted: job.Status == billetgithub.JobStatusQueued && job.RunnerName == "",
