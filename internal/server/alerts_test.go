@@ -35,10 +35,12 @@ type alertRecord struct {
 	steps      map[string][]JobStep
 	unfinished bool
 	err        error
-	reads      int
-	asked      []string
-	remaining  int64
-	limit      int64
+	// failRuns is the runs whose record a read of fails, beside err for every run.
+	failRuns  map[int64]bool
+	reads     int
+	asked     []string
+	remaining int64
+	limit     int64
 }
 
 func (g *alertRecord) WorkflowRun(_ context.Context, owner, repository string, runID int64) (WorkflowRun, error) {
@@ -47,6 +49,10 @@ func (g *alertRecord) WorkflowRun(_ context.Context, owner, repository string, r
 
 	g.reads++
 	g.asked = append(g.asked, fmt.Sprintf("run %s/%s %d", owner, repository, runID))
+
+	if g.failRuns[runID] {
+		return WorkflowRun{}, errors.New("connection reset")
+	}
 
 	return WorkflowRun{ID: runID, HeadBranch: g.branch}, g.err
 }
@@ -740,6 +746,38 @@ func TestStrandedReadsLeaveTheOthersTheirShare(t *testing.T) {
 
 	if owed := r.owedLeases(); !slices.Contains(owed, "failed:failed") {
 		t.Fatalf("owed = %v, want the failed job told beside the stranded ones' reads", owed)
+	}
+}
+
+// STRANDED JOBS GITHUB CANNOT BE READ ABOUT KEEP NONE WAITING: the one tried longest
+// ago goes first, so a readable one behind them is told within a few passes.
+func TestUnreadableStrandedJobsKeepNoneWaiting(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Stranded: true}, "0s", "main"
+	}))
+	r.record.branch = "main"
+	r.record.failRuns = map[int64]bool{81: true, 82: true}
+	for i, run := range []int64{81, 82, 83} {
+		lease := fmt.Sprintf("stranded-%d", run)
+		r.stranded(lease, r.now.Add(time.Duration(i)*time.Second))
+		if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET run_id = $1 WHERE lease_id = $2`, run, lease)
+
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for range 3 {
+		r.pass()
+		r.now = r.now.Add(time.Minute)
+	}
+
+	if owed := r.owedLeases(); !slices.Contains(owed, "stranded-83:stranded") {
+		t.Fatalf("owed = %v, want the readable stranded job told behind two that could not be read", owed)
 	}
 }
 

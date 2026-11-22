@@ -174,6 +174,8 @@ type alertSweep struct {
 	held     map[string]bool
 	// strandedFrom is where the next pass reads the launches decided stranded from.
 	strandedFrom alloc.AlertCursor
+	// strandedTried is when each stranded job last asked GitHub, which orders the next.
+	strandedTried map[string]time.Time
 	// until is where a cycle of scans ends: the moment its first pass began. A scan
 	// that chases results arriving faster than it reads still reaches it.
 	until time.Time
@@ -187,7 +189,7 @@ type alertSweep struct {
 
 func newAlertSweep() *alertSweep {
 	return &alertSweep{judged: map[alloc.AlertMark]bool{}, branches: map[rerunRun]string{},
-		firstAsked: map[alloc.AlertMark]time.Time{}, rows: alertJobsRead}
+		firstAsked: map[alloc.AlertMark]time.Time{}, strandedTried: map[string]time.Time{}, rows: alertJobsRead}
 }
 
 // clock is the pass's now moved on by how long the pass has run, for a deadline
@@ -275,6 +277,16 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 		sweep.strandedFrom = alloc.AlertCursor{}
 		if len(stranded) == rows {
 			sweep.strandedFrom = stranded[len(stranded)-1].Cursor
+		}
+		// THE ONE TRIED LONGEST AGO FIRST, a job never tried before any that was, so those
+		// GitHub cannot be read about never keep the share from the rest of the page.
+		slices.SortStableFunc(stranded, func(a, b alloc.AlertJob) int {
+			return sweep.strandedTried[a.LeaseID].Compare(sweep.strandedTried[b.LeaseID])
+		})
+		for lease, at := range sweep.strandedTried {
+			if now.Sub(at) > alertEndedWindow {
+				delete(sweep.strandedTried, lease)
+			}
 		}
 		for i := range stranded {
 			if ctx.Err() != nil {
@@ -692,6 +704,10 @@ func (s *Server) narrowAlert(ctx context.Context, rule *alerts.Rule, condition a
 	ask := func() {
 		if _, ok := sweep.firstAsked[mark]; !ok {
 			sweep.firstAsked[mark] = now
+		}
+		// A STRANDED JOB THAT ASKED GOES BEHIND THOSE THAT HAVE NOT, on the next pass.
+		if !job.StrandedAt.IsZero() {
+			sweep.strandedTried[job.LeaseID] = now
 		}
 	}
 
