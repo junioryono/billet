@@ -260,6 +260,28 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 		steps: map[rerunRun]map[string]RunnerSteps{}, failed: map[rerunRun]error{},
 		unbranched: map[rerunRun]error{}, deferred: map[string]bool{}}
 
+	// THE LAUNCHES DECIDED STRANDED FIRST, which never started, so neither list below
+	// holds them (#911): a page a pass from where the last ended, the cursor going round,
+	// each told on its own, since a stranded job counts in no streak. First, because no
+	// order among the others binds them, and so the jobs that ran never spend the share
+	// of reads a stranded job's branch needs, nor a scan carried on keep them waiting.
+	stranded, err := s.alloc.StrandedAlertJobs(ctx, now.Add(-alertEndedWindow), sweep.strandedFrom, rows)
+	if err != nil {
+		s.log.Warn("could not list the stranded jobs for alerts; trying again", "error", err)
+	} else {
+		sweep.strandedFrom = alloc.AlertCursor{}
+		if len(stranded) == rows {
+			sweep.strandedFrom = stranded[len(stranded)-1].Cursor
+		}
+		for i := range stranded {
+			if ctx.Err() != nil {
+				return
+			}
+
+			s.judgeAll(ctx, &stranded[i], false, targets, sweep, pass, now)
+		}
+	}
+
 	// THE ENDED JOBS ARE READ ON TO THE END, page by page, before a running job is
 	// judged: a job held at the cursor does not keep the running ones from being
 	// judged, however many results follow it. A pass reads at most so many pages; the
@@ -343,27 +365,6 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 		}
 
 		s.judgeAll(ctx, &running[i], false, targets, sweep, pass, now)
-	}
-
-	// AND THE LAUNCHES DECIDED STRANDED, which never started, so neither list above holds
-	// them (#911): a page a pass from where the last ended, the cursor going round, each
-	// told on its own, since a stranded job counts in no streak.
-	stranded, err := s.alloc.StrandedAlertJobs(ctx, now.Add(-alertEndedWindow), sweep.strandedFrom, rows)
-	if err != nil {
-		s.log.Warn("could not list the stranded jobs for alerts; trying again", "error", err)
-
-		return
-	}
-	sweep.strandedFrom = alloc.AlertCursor{}
-	if len(stranded) == rows {
-		sweep.strandedFrom = stranded[len(stranded)-1].Cursor
-	}
-	for i := range stranded {
-		if ctx.Err() != nil {
-			return
-		}
-
-		s.judgeAll(ctx, &stranded[i], false, targets, sweep, pass, now)
 	}
 }
 

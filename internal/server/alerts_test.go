@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -660,29 +661,55 @@ func TestAStrandedJobCountsInNoStreak(t *testing.T) {
 	}
 }
 
-// NOTHING PUT OFF HOLDS A STRANDED JOB BACK: an ordinary run of the same job whose
-// branch cannot be read yet holds its streak, and a stranded job counts in none.
-func TestAStrandedJobIsNotHeldByAnotherJobsStreak(t *testing.T) {
+// NOTHING PUT OFF HOLDS A STRANDED JOB BACK: a pass that holds the job's streak, as a
+// judgement the ledger failed to take leaves it, holds a stranded job not at all, since
+// it counts in no streak.
+func TestAStrandedJobIsNotHeldByAStreakPutOff(t *testing.T) {
+	t.Parallel()
+
+	rule := atRule(func(c *config.AlertRule) { c.On, c.Cooldown = config.AlertConditions{Stranded: true}, "0s" })
+	r := started(t, rule)
+	r.stranded("missed", r.now)
+
+	rows, err := r.a.StrandedAlertJobs(t.Context(), r.now.Add(-time.Hour), alloc.AlertCursor{}, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("StrandedAlertJobs = %+v, %v", rows, err)
+	}
+	job := alertJob(&rows[0])
+	parsed := &r.s.alerts.Rules[0]
+	pass := &alertPass{spent: map[string]int{}, budgets: installationBudgets(r.targets),
+		steps: map[rerunRun]map[string]RunnerSteps{}, failed: map[rerunRun]error{},
+		unbranched: map[rerunRun]error{},
+		deferred:   map[string]bool{parsed.Name + "\x00" + job.Key(alerts.Stranded): true}}
+
+	r.s.judgeAll(t.Context(), &rows[0], false, r.targets, r.sweep, pass, r.now)
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "missed:stranded" {
+		t.Fatalf("owed = %v, want the stranded job told though its streak was put off", got)
+	}
+}
+
+// A STRANDED JOB IS JUDGED FIRST, so the jobs that ran never spend the share of reads
+// its branch needs: one pass with three of them waiting for their branches tells it.
+func TestAStrandedJobIsJudgedBeforeTheJobsThatRan(t *testing.T) {
 	t.Parallel()
 
 	r := started(t, atRule(func(c *config.AlertRule) {
-		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Stranded: true}, "0s", "main"
+		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Failed: true, Stranded: true}, "0s", "main"
 	}))
-	r.record.err = errors.New("connection reset")
-	r.seed(jobRow{lease: "ran", result: "failed", ran: time.Second, age: 30 * time.Second})
-	r.stranded("missed", r.now)
-	if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET head_branch = 'main' WHERE lease_id = 'missed'`)
-
-		return err
-	}); err != nil {
-		t.Fatal(err)
+	r.record.branch = "main"
+	for i, run := range []int64{41, 42, 43} {
+		r.seed(jobRow{lease: fmt.Sprintf("ran-%d", i), result: "failed", ran: time.Second, age: 30 * time.Second,
+			run: run})
 	}
+	r.stranded("missed", r.now)
+	r.now = r.now.Add(alertSettledAfter + time.Second)
 
 	r.pass()
 
-	if got := r.owedLeases(); len(got) != 1 || got[0] != "missed:stranded" {
-		t.Fatalf("owed = %v, want the stranded job told though another run of it was put off", got)
+	owed := r.owedLeases()
+	if !slices.Contains(owed, "missed:stranded") {
+		t.Fatalf("owed = %v, want the stranded job told in the first pass", owed)
 	}
 }
 
