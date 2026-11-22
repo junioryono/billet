@@ -218,6 +218,23 @@ func (r *strandedStack) redo(age time.Duration) {
 	r.miss("missed", "acme/app", 42, "Lint App", age)
 }
 
+// THE RE-RUN LOOP'S OWN PASS FINDS IT WHERE NO TIER ASKS FOR RE-RUNS, which is a
+// deployment's default: the detector rides that loop, and a pass with nothing to
+// re-run must still reach it.
+func TestAPassWithNoTierAskingForReRunsStillFindsIt(t *testing.T) {
+	t.Parallel()
+
+	r := newStrandedStack(t)
+	r.miss("missed", "acme/app", 42, "Lint App", 20*time.Minute)
+	r.advertises(4, 0)
+
+	r.s.rerunOnce(t.Context(), r.targets, map[string]int64{}, newRerunSweep(), r.now)
+
+	if got := r.decision("missed"); got != "stranded" {
+		t.Fatalf("a re-run pass with no tier asking decided %q, want stranded", got)
+	}
+}
+
 // A JOB DECIDED STRANDED IS DECIDED ONCE: a later pass neither reads GitHub about it
 // again nor says it again.
 func TestAStrandedJobIsDecidedOnce(t *testing.T) {
