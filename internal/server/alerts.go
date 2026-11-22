@@ -486,9 +486,10 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 	}
 
 	// A STREAK COUNTS ITS ENDED JOBS IN ORDER: one put off this pass holds every later
-	// one, running jobs included.
+	// one, running jobs included. A stranded job counts in no streak, so nothing put
+	// off holds it back, an ordinary run of the same job included.
 	streak := rule.Name + "\x00" + job.Key(condition)
-	if pass.deferred[streak] {
+	if condition != alerts.Stranded && pass.deferred[streak] {
 		return false
 	}
 

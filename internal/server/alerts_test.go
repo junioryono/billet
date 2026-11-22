@@ -660,6 +660,32 @@ func TestAStrandedJobCountsInNoStreak(t *testing.T) {
 	}
 }
 
+// NOTHING PUT OFF HOLDS A STRANDED JOB BACK: an ordinary run of the same job whose
+// branch cannot be read yet holds its streak, and a stranded job counts in none.
+func TestAStrandedJobIsNotHeldByAnotherJobsStreak(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Stranded: true}, "0s", "main"
+	}))
+	r.record.err = errors.New("connection reset")
+	r.seed(jobRow{lease: "ran", result: "failed", ran: time.Second, age: 30 * time.Second})
+	r.stranded("missed", r.now)
+	if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET head_branch = 'main' WHERE lease_id = 'missed'`)
+
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "missed:stranded" {
+		t.Fatalf("owed = %v, want the stranded job told though another run of it was put off", got)
+	}
+}
+
 // THE STRANDED JOBS ARE READ ON PAST A PAGE: one decided after a page of others is told
 // in its turn.
 func TestStrandedJobsAreReadOnPastAPage(t *testing.T) {
