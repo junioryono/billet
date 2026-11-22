@@ -29,6 +29,7 @@ type rerunServer struct {
 
 	run, jobs   string
 	failed, one atomic.Int32
+	cancels     atomic.Int32
 	jobReads    atomic.Int32
 	answer      func(w http.ResponseWriter)
 	seenFilter  atomic.Value
@@ -62,6 +63,10 @@ func newRerunServer(t *testing.T) *rerunServer {
 	})
 	mux.HandleFunc("POST /repos/acme/api/actions/jobs/77/rerun", func(w http.ResponseWriter, _ *http.Request) {
 		s.one.Add(1)
+		s.answer(w)
+	})
+	mux.HandleFunc("POST /repos/acme/api/actions/runs/31/cancel", func(w http.ResponseWriter, _ *http.Request) {
+		s.cancels.Add(1)
 		s.answer(w)
 	})
 	srv := httptest.NewServer(mux)

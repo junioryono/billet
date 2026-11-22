@@ -37,6 +37,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **An inventory that shrinks is capacity that gets resold.**
 - **billet attributes a lost job, and re-runs one only for a tier that asks and only on GitHub's proof of a lost runner.**
 - **A job GitHub stopped offering is found on GitHub's word and billet's own record, never on a timer alone, and decided once (#911).**
+- **A stranded job is recovered only for a tier that asks, by a cancel that ends nothing running and a re-run sent only once that very attempt is over, once per run, with the ledger between the two.**
 - **A reserved fleet's claim is released by a proof.**
 
 ### Custody, quarantine, drains and sessions: [references/custody-and-drains.md](references/custody-and-drains.md)

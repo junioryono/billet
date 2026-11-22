@@ -217,8 +217,8 @@ func (c *runnerGroupPolicyClient) RerunFailedJobs(
 		return err
 	}
 
-	return c.rerun(ctx, endpoint+"/actions/runs/"+strconv.FormatInt(runID, 10)+"/rerun-failed-jobs",
-		"re-run a run's failed jobs")
+	return c.post(ctx, endpoint+"/actions/runs/"+strconv.FormatInt(runID, 10)+"/rerun-failed-jobs",
+		"re-run a run's failed jobs", http.StatusCreated)
 }
 
 // RerunJob asks GitHub to run one job of a completed run again.
@@ -236,17 +236,19 @@ func (c *runnerGroupPolicyClient) RerunJob(
 		return err
 	}
 
-	return c.rerun(ctx, endpoint+"/actions/jobs/"+strconv.FormatInt(jobID, 10)+"/rerun",
-		"re-run a job")
+	return c.post(ctx, endpoint+"/actions/jobs/"+strconv.FormatInt(jobID, 10)+"/rerun",
+		"re-run a job", http.StatusCreated)
 }
 
-// rerun makes one request and says how GitHub answered. An answer other than
-// GitHub's 201 is GitHub's own error, or ErrRunAlreadyRunning beside it.
+// post makes one request and says how GitHub answered. An answer other than
+// accepted, the status GitHub answers this request with when it takes it, is
+// GitHub's own error, or ErrRunAlreadyRunning or ErrRunAlreadyCompleted beside it.
 //
-// A 201'S BODY IS NOT LOOKED AT. get refuses an answer that echoes the credential
-// because a reader may render what it says, and only the status of this one is
-// used; a refusal's message goes through apiErrorWithout, which removes it.
-func (c *runnerGroupPolicyClient) rerun(ctx context.Context, endpoint, operation string) error {
+// AN ACCEPTED ANSWER'S BODY IS NOT LOOKED AT. get refuses an answer that echoes
+// the credential because a reader may render what it says, and only the status of
+// this one is used; a refusal's message goes through apiErrorWithout, which removes
+// it.
+func (c *runnerGroupPolicyClient) post(ctx context.Context, endpoint, operation string, accepted int) error {
 	token, err := c.installationToken(ctx)
 	if err != nil {
 		return err
@@ -256,9 +258,9 @@ func (c *runnerGroupPolicyClient) rerun(ctx context.Context, endpoint, operation
 	if !errors.Is(err, errNotSent) {
 		c.rest.answered(operation, status, header, time.Now())
 	}
-	// THE STATUS FIRST: a 201 whose body broke off was still accepted, and reading it
-	// as a failed try would ask again for a run already going.
-	if status == http.StatusCreated {
+	// THE STATUS FIRST: an accepted answer whose body broke off was still accepted,
+	// and reading it as a failed try would ask again for a run already going.
+	if status == accepted {
 		return nil
 	}
 	if err != nil {
@@ -268,6 +270,11 @@ func (c *runnerGroupPolicyClient) rerun(ctx context.Context, endpoint, operation
 	refused := apiErrorWithout(status, body, token)
 	if api, ok := errors.AsType[*APIError](refused); ok && status == http.StatusForbidden && runningRefusal(api.Message) {
 		return fmt.Errorf("github: %s: %w: %w", operation, ErrRunAlreadyRunning, refused)
+	}
+	// MEASURED 2026-11-22: a cancel of a completed run is a 409, "Cannot cancel a
+	// workflow run that is completed."
+	if status == http.StatusConflict && accepted == http.StatusAccepted {
+		return fmt.Errorf("github: %s: %w: %w", operation, ErrRunAlreadyCompleted, refused)
 	}
 
 	return fmt.Errorf("github: %s: %w", operation, refused)

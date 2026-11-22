@@ -190,7 +190,7 @@ On a `firecracker` node it is the store of a Firecracker host on an AWS metal in
 | `intercept` | the deprecated spelling of `cache.actions.enabled`; refused beside `cache.actions` |
 | `network` | what the tier asks of its guests' network; see [`tiers[].network`](#tiersnetwork). Without it the tier is open, as a tier always was |
 | `max_concurrent`, `reserved` | a ceiling and a floor; a macOS tier's ceiling defaults to what its hosts permit between them |
-| `retry` | `disrupted`, 0 to 5, default 0: how many times billet asks GitHub to re-run a workflow run whose job on this tier it proved its own infrastructure ended. The App must hold `actions: write`. See [Re-running a job billet ended](../operating/status-and-leases.md#re-running-a-job-billet-ended) |
+| `retry` | `disrupted`, 0 to 5, default 0: how many times billet asks GitHub to re-run a workflow run whose job on this tier it proved its own infrastructure ended. See [Re-running a job billet ended](../operating/status-and-leases.md#re-running-a-job-billet-ended). `stranded`, default false: recover a job of this tier GitHub stopped offering after billet's launch for it started nothing, by cancelling its run and re-running the run's failed jobs, once per run and only while nothing of the run is running; false only reports it. See [ADR-029's amendment](decisions/adr-029-rerunning-disrupted-jobs.md#amendment-2026-11-22-recovering-a-job-github-stopped-offering). Either needs the App to hold `actions: write` |
 | `warm_pool` | refused when non-zero; no backend implements it |
 
 ### `tiers[].network`

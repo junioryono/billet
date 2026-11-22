@@ -251,6 +251,11 @@ type Rollout struct {
 	TerminalReason  string
 }
 
+type StrandedTier struct {
+	Tier       string
+	AskedSince string
+}
+
 type TierRelease struct {
 	Tier       string
 	Generation int64

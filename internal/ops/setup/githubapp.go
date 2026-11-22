@@ -88,7 +88,8 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 			"of its run; --actions-read=false leaves it out")
 	actionsWrite := fs.Bool("actions-write", false,
 		"request `actions: write`, which a tier with retry.disrupted needs to re-run a job billet "+
-			"disrupted; it includes read, and GitHub's grant also covers dispatching workflows and "+
+			"disrupted, and one with retry.stranded to cancel and re-run a run whose job GitHub stopped "+
+			"offering; it includes read, and GitHub's grant also covers dispatching workflows and "+
 			"deleting logs, artifacts and caches, none of which billet does")
 
 	if err := cli.Parse(fs, args); err != nil {
@@ -244,9 +245,10 @@ func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 
 	if actions == github.ActionsWrite {
 		// THE WIDER GRANT IS SAID OUT LOUD, as the repository one is above.
-		fmt.Fprintf(env.Stdout, "Actions write is the ONLY permission GitHub offers for re-running a job. It also\n"+
-			"covers dispatching workflows and deleting logs, artifacts and caches. billet uses\n"+
-			"it for the two re-run requests and nothing else (ADR-029).\n")
+		fmt.Fprintf(env.Stdout, "Actions write is the ONLY permission GitHub offers for re-running or cancelling a\n"+
+			"job. It also covers dispatching workflows and deleting logs, artifacts and caches.\n"+
+			"billet uses it for the two re-run requests and, for a tier with retry.stranded, to\n"+
+			"cancel a run whose job GitHub stopped offering, and nothing else (ADR-029).\n")
 	}
 
 	fmt.Fprintf(env.Stdout, "GitHub allows one hour to finish; if it lapses, just run this again.\n\n")

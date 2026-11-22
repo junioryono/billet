@@ -120,6 +120,11 @@ type rerunSweep struct {
 	// strandedFrom is where the next pass lists launches that started nothing from, so
 	// passes go round every one of them and not only the oldest page.
 	strandedFrom alloc.LaunchMissCursor
+	// strandedAsking is since when each tier that recovers stranded jobs has asked,
+	// nil until the first pass records it; recoveryAsked is when each stranded job
+	// was last read to begin a recovery and left alone.
+	strandedAsking map[string]time.Time
+	recoveryAsked  map[string]time.Time
 	// began is when the pass began on the wall clock, which clock measures from.
 	began time.Time
 }
@@ -137,7 +142,7 @@ func (s *rerunSweep) clock(now time.Time) time.Time {
 func newRerunSweep() *rerunSweep {
 	return &rerunSweep{retries: map[rerunRun]queueTimeRetry{}, paused: map[string]time.Time{},
 		reserved: map[string]bool{}, failures: map[rerunRun]string{}, tried: map[rerunRun]time.Time{},
-		strandedAsked: map[string]time.Time{}}
+		strandedAsked: map[string]time.Time{}, recoveryAsked: map[string]time.Time{}}
 }
 
 // rerunWork is one run a pass will read, through the first target that serves it.
@@ -281,6 +286,10 @@ func (s *Server) rerunOnce(ctx context.Context, targets map[string]Target, limit
 	// AND ON THE SAME PASS, within its own share of each installation: whether GitHub
 	// kept offering the job of a launch that started nothing (#911).
 	s.findStranded(ctx, targets, sweep, budgets, now)
+
+	// AND, where a tier asks, recovering what it found: cancelling the run and
+	// re-running its failed jobs, within a share of its own.
+	s.recoverStranded(ctx, targets, sweep, budgets, now)
 }
 
 // settleOverdue settles, without a read, the request in doubt of a run this pass does

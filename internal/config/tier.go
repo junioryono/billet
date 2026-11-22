@@ -228,6 +228,12 @@ type TierRetry struct {
 	// run's attempts. Zero, the default, is never. ADR-029 holds what counts as that
 	// proof, and the App must hold `actions: write` for a tier that sets it.
 	Disrupted int `yaml:"disrupted"`
+	// Stranded asks billet to recover a job of this tier GitHub stopped offering
+	// after billet's launch for it started nothing (#911): it cancels the job's run
+	// and asks GitHub to re-run its failed jobs, once per run. False, the default,
+	// only reports it. It cancels a run that may be someone's, so it is opt-in, and
+	// the App must hold `actions: write` for a tier that sets it.
+	Stranded bool `yaml:"stranded,omitempty"`
 }
 
 // DisruptedReruns is how many re-runs the tier allows, zero when it says nothing.
@@ -237,6 +243,12 @@ func (t Tier) DisruptedReruns() int {
 	}
 
 	return t.Retry.Disrupted
+}
+
+// RecoversStranded reports whether the tier asks billet to recover a job GitHub
+// stopped offering, false when it says nothing.
+func (t Tier) RecoversStranded() bool {
+	return t.Retry != nil && t.Retry.Stranded
 }
 
 // WorkloadTrust is the launch authority shared by a tier's runner pool.

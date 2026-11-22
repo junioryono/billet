@@ -129,7 +129,8 @@ type BrokerInstallation struct {
 	// cannot work at all.
 	ActionsRead bool `yaml:"actions_read,omitempty"`
 	// ActionsWrite adds `actions: write`, which includes read: what a deployment
-	// whose tier sets `retry.disrupted` needs to re-run a job billet disrupted.
+	// whose tier sets `retry.disrupted` needs to re-run a job billet disrupted, or
+	// `retry.stranded` to cancel and re-run a run whose job GitHub stopped offering.
 	ActionsWrite bool `yaml:"actions_write,omitempty"`
 }
 
