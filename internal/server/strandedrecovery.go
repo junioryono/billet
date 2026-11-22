@@ -44,6 +44,9 @@ type QueuedJob struct {
 // ErrRunCompleted is a cancel GitHub refused because the run is over.
 var ErrRunCompleted = errors.New("server: the run is already completed")
 
+// ErrNotSent is a request that never left, so nothing it asked for happened.
+var ErrNotSent = errors.New("server: the request was not sent")
+
 const (
 	// strandedRecoveryReadsPerInstallation is how many recoveries under way one pass
 	// reads through one App installation, beside the detector's share, and
@@ -282,6 +285,17 @@ func recoverable(attempt QueuedAttempt, name string) bool {
 func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target, sweep *rerunSweep,
 	budgets map[string][]RESTHeadroom, read map[string]int, recovery *alloc.StrandedRecovery, now time.Time,
 ) {
+	// A REFUSAL THE LEDGER COULD NOT TAKE FIRST: nothing is decided about a recovery
+	// whose row still counts a refused cancel as one that may have landed.
+	if tries, unrecorded := sweep.unrecordedRefusals[recoveryRun(recovery)]; unrecorded {
+		refused := *recovery
+		refused.Tries = tries
+		if !s.recordRefusal(ctx, sweep, &refused) {
+			return
+		}
+		recovery.Refused = refused.Refused
+	}
+
 	if now.Sub(recovery.Created) > strandedRecoveryWindow {
 		s.endRecovery(ctx, recovery, alloc.RecoveryExpired, "it was not finished within a day")
 
@@ -375,16 +389,37 @@ func (s *Server) sendCancel(ctx context.Context, client RunRecovery, sweep *reru
 
 	// A DEFINITE REFUSAL LANDED NOTHING, and is counted so a run someone else cancels
 	// later is never taken for one billet's cancel ended: GitHub's word that the run
-	// was over, that the App may not, or that it is throttled. Anything else, a lost
-	// answer above all, may have landed.
-	if errors.Is(err, ErrRunCompleted) || errors.Is(err, ErrRerunRefused) || errors.Is(err, ErrRerunThrottled) {
-		if counted, rerr := s.alloc.RefuseStrandedCancel(ctx, *recovery); rerr == nil && counted {
-			recovery.Refused++
-		}
+	// was over, that the App may not, or that it is throttled, or a cancel that never
+	// left. Anything else, a lost answer above all, may have landed.
+	if errors.Is(err, ErrRunCompleted) || errors.Is(err, ErrRerunRefused) || errors.Is(err, ErrRerunThrottled) ||
+		errors.Is(err, ErrNotSent) {
+		s.recordRefusal(ctx, sweep, recovery)
 	}
 	if !errors.Is(err, ErrRunCompleted) {
 		s.recoveryFailed(ctx, sweep, installation, recovery.Tier, recovery.Repository, recovery.RunID, err, now)
 	}
+}
+
+// recordRefusal counts a refusal of a recovery's most recent cancel. One the ledger
+// could not take is remembered and written before the recovery is taken any further,
+// so a failed write never leaves a refused cancel counted as one that may have landed.
+func (s *Server) recordRefusal(ctx context.Context, sweep *rerunSweep, recovery *alloc.StrandedRecovery) bool {
+	counted, err := s.alloc.RefuseStrandedCancel(ctx, *recovery)
+	if err != nil {
+		sweep.unrecordedRefusals[recoveryRun(recovery)] = recovery.Tries
+		if ctx.Err() == nil {
+			s.log.Warn("could not record that GitHub refused a cancel; recording it before the recovery goes on",
+				"run", recovery.RunID, "error", err)
+		}
+
+		return false
+	}
+	delete(sweep.unrecordedRefusals, recoveryRun(recovery))
+	if counted {
+		recovery.Refused++
+	}
+
+	return true
 }
 
 // sendRerunOfRecovery sends a recovery's re-run, and ends the recovery when GitHub

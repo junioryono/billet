@@ -130,6 +130,9 @@ type rerunSweep struct {
 	recoveryRead     map[rerunRun]time.Time
 	recoveryFrom     alloc.StrandedCursor
 	recoveryOpenFrom alloc.RecoveryCursor
+	// unrecordedRefusals is each recovery whose refused cancel the ledger could not yet
+	// count, with the send it was; it is written before the recovery goes on.
+	unrecordedRefusals map[rerunRun]int64
 	// began is when the pass began on the wall clock, which clock measures from.
 	began time.Time
 }
@@ -148,7 +151,7 @@ func newRerunSweep() *rerunSweep {
 	return &rerunSweep{retries: map[rerunRun]queueTimeRetry{}, paused: map[string]time.Time{},
 		reserved: map[string]bool{}, failures: map[rerunRun]string{}, tried: map[rerunRun]time.Time{},
 		strandedAsked: map[string]time.Time{}, recoveryAsked: map[string]time.Time{},
-		recoveryRead: map[rerunRun]time.Time{}}
+		recoveryRead: map[rerunRun]time.Time{}, unrecordedRefusals: map[rerunRun]int64{}}
 }
 
 // rerunWork is one run a pass will read, through the first target that serves it.

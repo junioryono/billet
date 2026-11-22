@@ -787,27 +787,78 @@ func TestADisagreeingReadLeavesTheRecoveryUnderWay(t *testing.T) {
 	}
 }
 
-// A CANCEL GITHUB REFUSED IS NEVER TAKEN FOR ONE THAT LANDED: a run someone cancels
-// later, after billet's every cancel was refused, is theirs, and is not re-run.
+// A CANCEL GITHUB REFUSED, OR ONE THAT NEVER LEFT, IS NEVER TAKEN FOR ONE THAT
+// LANDED: a run someone cancels later, after every cancel of billet's was refused or
+// never sent, is theirs, and is not re-run.
 func TestARefusedCancelIsNeverTakenForBilletsOwn(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"refused", ErrRerunRefused},
+		{"throttled", ErrRerunThrottled},
+		{"never sent", ErrNotSent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRecoveryStack(t, true)
+			r.github.cancelErr = tc.err
+			r.strand("missed", 42, 20*time.Minute)
+			r.pass()
+
+			r.github.cancelErr = nil
+			r.now = r.now.Add(rerunRefused + time.Minute)
+			r.github.set(42, QueuedAttempt{Completed: true, Cancelled: true, Attempt: 1})
+			r.pass()
+
+			if r.github.reruns != 0 {
+				t.Fatalf("re-ran a run someone else cancelled %d times, though billet's cancel did not land",
+					r.github.reruns)
+			}
+			if got := r.recovery(42); got != string(alloc.RecoverySuperseded) {
+				t.Fatalf("the recovery is %q, want superseded", got)
+			}
+		})
+	}
+}
+
+// A REFUSAL THE LEDGER COULD NOT COUNT IS COUNTED BEFORE THE RECOVERY GOES ON: a
+// failed write never leaves a refused cancel taken for one that may have landed.
+func TestARefusalTheLedgerCouldNotCountIsCountedFirst(t *testing.T) {
 	t.Parallel()
 
 	r := newRecoveryStack(t, true)
 	r.github.cancelErr = ErrRerunRefused
 	r.strand("missed", 42, 20*time.Minute)
+	r.exec(`CREATE TRIGGER refuse_fails BEFORE UPDATE OF refused ON stranded_recoveries
+		BEGIN SELECT RAISE(ABORT, 'injected'); END`)
 	r.pass()
 
+	r.exec(`DROP TRIGGER refuse_fails`)
 	r.github.cancelErr = nil
 	r.now = r.now.Add(rerunRefused + time.Minute)
 	r.github.set(42, QueuedAttempt{Completed: true, Cancelled: true, Attempt: 1})
 	r.pass()
 
 	if r.github.reruns != 0 {
-		t.Fatalf("re-ran a run someone else cancelled %d times, though GitHub refused billet's cancel",
-			r.github.reruns)
+		t.Fatalf("re-ran a run someone else cancelled %d times, though the ledger came to know billet's "+
+			"cancel was refused", r.github.reruns)
 	}
-	if got := r.recovery(42); got != string(alloc.RecoverySuperseded) {
-		t.Fatalf("the recovery is %q, want superseded", got)
+}
+
+// exec runs one statement against the stack's ledger, for a fault a test injects.
+func (r *recoveryStack) exec(statement string) {
+	r.t.Helper()
+
+	if err := r.db.Tx(r.t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(r.t.Context(), statement)
+
+		return err
+	}); err != nil {
+		r.t.Fatalf("%s: %v", statement, err)
 	}
 }
 

@@ -295,8 +295,11 @@ func (c *Client) CancelRun(ctx context.Context, owner, repository string, runID 
 		return err
 	}
 	err = recoverer.CancelRun(ctx, owner, repository, runID)
-	if errors.Is(err, billetgithub.ErrRunAlreadyCompleted) {
+	switch {
+	case errors.Is(err, billetgithub.ErrRunAlreadyCompleted):
 		return fmt.Errorf("scaleset: %w: %w", server.ErrRunCompleted, err)
+	case errors.Is(err, billetgithub.ErrNotSent):
+		return fmt.Errorf("scaleset: %w: %w", server.ErrNotSent, err)
 	}
 
 	return rerunError(err)

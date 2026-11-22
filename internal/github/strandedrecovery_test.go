@@ -155,6 +155,67 @@ func TestACancelsAnswerIsClassified(t *testing.T) {
 		})
 	}
 
+	// A REFUSAL WHOSE BODY BROKE OFF IS STILL GITHUB'S REFUSAL, read from its status: a
+	// cancel counted as one that may have landed would let billet take someone else's
+	// cancel for its own.
+	for _, tc := range []struct {
+		name      string
+		status    string
+		code      int
+		completed bool
+	}{
+		{"a 409 cut short", "409 Conflict", http.StatusConflict, true},
+		{"a 403 cut short", "403 Forbidden", http.StatusForbidden, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newRerunServer(t)
+			s.answer = func(w http.ResponseWriter) {
+				hijacker, ok := w.(http.Hijacker)
+				if !ok {
+					t.Error("the test server cannot hand over its connection")
+
+					return
+				}
+				conn, buf, err := hijacker.Hijack()
+				if err != nil {
+					t.Errorf("hijack: %v", err)
+
+					return
+				}
+				fmt.Fprintf(buf, "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"mess",
+					tc.status)
+				_ = buf.Flush()
+				_ = conn.Close()
+			}
+
+			err := s.CancelRun(t.Context(), "acme", "api", 31)
+			api, ok := errors.AsType[*APIError](err)
+			if !ok || api.Status != tc.code {
+				t.Fatalf("CancelRun = %v, want GitHub's refusal with status %d", err, tc.code)
+			}
+			if got := errors.Is(err, ErrRunAlreadyCompleted); got != tc.completed {
+				t.Fatalf("completed = %v, want %v: %v", got, tc.completed, err)
+			}
+		})
+	}
+
+	// A CANCEL THAT NEVER LEFT SAYS SO: no installation token, no request.
+	t.Run("no token", func(t *testing.T) {
+		t.Parallel()
+
+		s := newRerunServer(t)
+		s.tokenFails.Store(true)
+
+		if err := s.CancelRun(t.Context(), "acme", "api", 31); !errors.Is(err, ErrNotSent) {
+			t.Fatalf("CancelRun = %v, want ErrNotSent", err)
+		}
+		if n := s.cancels.Load(); n != 0 {
+			t.Fatalf("the cancel route was asked %d times without a token", n)
+		}
+	})
+
 	// AND A RE-RUN'S 409 IS NOT A CANCEL'S: only the cancel reads it as a run over.
 	s := newRerunServer(t)
 	s.answer = func(w http.ResponseWriter) {

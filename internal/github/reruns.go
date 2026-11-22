@@ -251,7 +251,8 @@ func (c *runnerGroupPolicyClient) RerunJob(
 func (c *runnerGroupPolicyClient) post(ctx context.Context, endpoint, operation string, accepted int) error {
 	token, err := c.installationToken(ctx)
 	if err != nil {
-		return err
+		// NOTHING LEFT: a caller that counts what may have landed counts this as nothing.
+		return fmt.Errorf("github: %s: %w: %w", operation, ErrNotSent, err)
 	}
 
 	status, header, body, err := c.exchange(withRESTOperation(ctx, operation), http.MethodPost, endpoint, token)
@@ -259,11 +260,13 @@ func (c *runnerGroupPolicyClient) post(ctx context.Context, endpoint, operation 
 		c.rest.answered(operation, status, header, time.Now())
 	}
 	// THE STATUS FIRST: an accepted answer whose body broke off was still accepted,
-	// and reading it as a failed try would ask again for a run already going.
+	// and reading it as a failed try would ask again for a run already going. A refusal
+	// whose body broke off is still GitHub's refusal, and is read from its status
+	// alone; anything else that broke off may have landed.
 	if status == accepted {
 		return nil
 	}
-	if err != nil {
+	if err != nil && (status < http.StatusBadRequest || status >= http.StatusInternalServerError) {
 		return fmt.Errorf("github: %s: %w", operation, err)
 	}
 
