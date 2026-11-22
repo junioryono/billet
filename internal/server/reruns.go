@@ -117,6 +117,9 @@ type rerunSweep struct {
 	// strandedAsked is when each launch that started nothing was last asked about and
 	// left undecided, so it gives way to the others until strandedAgain has passed.
 	strandedAsked map[string]time.Time
+	// strandedFrom is where the next pass lists launches that started nothing from, so
+	// passes go round every one of them and not only the oldest page.
+	strandedFrom alloc.LaunchMissCursor
 	// began is when the pass began on the wall clock, which clock measures from.
 	began time.Time
 }

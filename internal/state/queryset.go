@@ -346,6 +346,7 @@ type WriteOps interface {
 	RecordJobResult(ctx context.Context, arg ledgerdb.RecordJobResultParams) error
 	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
 	DecideStranded(ctx context.Context, arg ledgerdb.DecideStrandedParams) (int64, error)
+	DecideJobStranded(ctx context.Context, arg ledgerdb.DecideJobStrandedParams) (int64, error)
 	RecordJobPhase(ctx context.Context, arg ledgerdb.RecordJobPhaseParams) error
 	RecordJobRegistration(ctx context.Context, arg ledgerdb.RecordJobRegistrationParams) error
 	InsertRerunIntent(ctx context.Context, arg ledgerdb.InsertRerunIntentParams) error

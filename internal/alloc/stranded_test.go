@@ -34,7 +34,7 @@ func TestALaunchMissIsListedUntilItIsDecidedOnce(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	misses, err := a.LaunchMisses(t.Context(), ended.Add(-time.Hour), 10)
+	misses, err := a.LaunchMisses(t.Context(), ended.Add(-time.Hour), LaunchMissCursor{}, 10)
 	if err != nil {
 		t.Fatalf("LaunchMisses: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestALaunchMissIsListedUntilItIsDecidedOnce(t *testing.T) {
 		t.Fatalf("the row says %q, want the first decision", got)
 	}
 
-	if misses, err := a.LaunchMisses(t.Context(), ended.Add(-time.Hour), 10); err != nil || len(misses) != 0 {
+	if misses, err := a.LaunchMisses(t.Context(), ended.Add(-time.Hour), LaunchMissCursor{}, 10); err != nil || len(misses) != 0 {
 		t.Fatalf("a decided launch is still listed: %+v, %v", misses, err)
 	}
 }

@@ -47,6 +47,33 @@ func (q *Queries) CountLaterLeasesOfJob(ctx context.Context, arg CountLaterLease
 	return i, err
 }
 
+const decideJobStranded = `-- name: DecideJobStranded :execrows
+UPDATE job_history SET stranded = 'stranded', stranded_at = $1
+ WHERE job_history.lease_id = $2 AND job_history.stranded = ''
+   AND NOT EXISTS (SELECT 1 FROM job_history AS later
+                    WHERE later.tier = job_history.tier AND later.run_id = job_history.run_id
+                      AND later.queued_at > job_history.finished_at
+                      AND later.job_name IN (job_history.job_name, ''))
+`
+
+type DecideJobStrandedParams struct {
+	StrandedAt string
+	LeaseID    string
+}
+
+// Record that GitHub stopped offering a launch's job, once, and only while the tier has
+// been assigned nothing for the run since the launch's lease ended that is, or may be,
+// a job of its name: what CountLaterLeasesOfJob said before GitHub was read, said
+// again in the write, because an assignment recorded while the read was in flight may
+// be the job offered again.
+func (q *Queries) DecideJobStranded(ctx context.Context, arg DecideJobStrandedParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, decideJobStranded, arg.StrandedAt, arg.LeaseID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const decideStranded = `-- name: DecideStranded :execrows
 UPDATE job_history SET stranded = $1, stranded_at = $2
  WHERE lease_id = $3 AND stranded = ''
@@ -75,13 +102,16 @@ SELECT lease_id, tier, COALESCE(repo, '') AS repo, CAST(COALESCE(run_id, 0) AS B
   FROM job_history
  WHERE failure_reason = 'billet:launch-failed' AND stranded = ''
    AND finished_at >= $1
+   AND (finished_at > $2 OR (finished_at = $2 AND lease_id > $3))
  ORDER BY finished_at, lease_id
- LIMIT CAST($2 AS BIGINT)
+ LIMIT CAST($4 AS BIGINT)
 `
 
 type ListLaunchMissesParams struct {
-	Since   sql.NullString
-	MaxRows int64
+	Since      sql.NullString
+	AfterEnded sql.NullString
+	AfterLease string
+	MaxRows    int64
 }
 
 type ListLaunchMissesRow struct {
@@ -98,10 +128,17 @@ type ListLaunchMissesRow struct {
 // on whether GitHub kept offering their job, and the decision once made. Migration 84
 // holds why the decision lives on the row.
 // The launches that started nothing and are not yet decided, whose leases ended since
-// a moment, oldest first and bounded, with what GitHub's REST record of the run is read
-// by. The WHERE is the partial index's, word for word, so the read is the index.
+// a moment, oldest first from just past a cursor and bounded, with what GitHub's REST
+// record of the run is read by. The cursor is the last row a page listed, an empty
+// after_ended the start, so the pass can go round every launch and not only the
+// oldest page. The WHERE leads with the partial index's, word for word.
 func (q *Queries) ListLaunchMisses(ctx context.Context, arg ListLaunchMissesParams) ([]ListLaunchMissesRow, error) {
-	rows, err := q.db.QueryContext(ctx, listLaunchMisses, arg.Since, arg.MaxRows)
+	rows, err := q.db.QueryContext(ctx, listLaunchMisses,
+		arg.Since,
+		arg.AfterEnded,
+		arg.AfterLease,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}

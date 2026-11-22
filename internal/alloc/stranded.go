@@ -41,14 +41,35 @@ type LaunchMiss struct {
 	Ended time.Time
 }
 
+// LaunchMissCursor is where a listing of LaunchMisses resumes: just past the launch
+// it names, or from the start for the zero value.
+type LaunchMissCursor struct {
+	Ended   time.Time
+	LeaseID string
+}
+
+// After is the cursor just past miss.
+func (m *LaunchMiss) After() LaunchMissCursor {
+	return LaunchMissCursor{Ended: m.Ended, LeaseID: m.LeaseID}
+}
+
 // LaunchMisses is the launches that started nothing and still wait for a decision,
-// whose leases ended since since, oldest first, at most maxRows.
-func (a *Allocator) LaunchMisses(ctx context.Context, since time.Time, maxRows int) ([]LaunchMiss, error) {
+// whose leases ended since since, oldest first from just past after, at most maxRows.
+func (a *Allocator) LaunchMisses(ctx context.Context, since time.Time, after LaunchMissCursor, maxRows int,
+) ([]LaunchMiss, error) {
+	// THE START IS AN EMPTY STAMP, which every recorded one sorts after.
+	afterEnded := ""
+	if !after.Ended.IsZero() {
+		afterEnded = ts(after.Ended)
+	}
+
 	var out []LaunchMiss
 	err := a.db.View(ctx, func(q querier) error {
 		rows, err := state.ReadQueries(q).ListLaunchMisses(ctx, ledgerdb.ListLaunchMissesParams{
-			Since:   sql.NullString{String: ts(since), Valid: true},
-			MaxRows: int64(maxRows),
+			Since:      sql.NullString{String: ts(since), Valid: true},
+			AfterEnded: sql.NullString{String: afterEnded, Valid: true},
+			AfterLease: after.LeaseID,
+			MaxRows:    int64(maxRows),
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: list the launches that started nothing: %w", err)
@@ -110,9 +131,19 @@ func (a *Allocator) DecideStranded(ctx context.Context, leaseID string, decision
 
 	var decided bool
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		n, err := state.WriteQueries(tx).DecideStranded(ctx, ledgerdb.DecideStrandedParams{
-			Stranded: string(decision), StrandedAt: ts(at), LeaseID: leaseID,
-		})
+		var n int64
+		var err error
+		// STRANDED ONLY WHILE NOTHING SINCE MAY BE THE JOB, said again in the write: an
+		// assignment recorded while GitHub was being read may be the job offered again.
+		if decision == StrandedJob {
+			n, err = state.WriteQueries(tx).DecideJobStranded(ctx, ledgerdb.DecideJobStrandedParams{
+				StrandedAt: ts(at), LeaseID: leaseID,
+			})
+		} else {
+			n, err = state.WriteQueries(tx).DecideStranded(ctx, ledgerdb.DecideStrandedParams{
+				Stranded: string(decision), StrandedAt: ts(at), LeaseID: leaseID,
+			})
+		}
 		if err != nil {
 			return fmt.Errorf("alloc: decide whether lease %s's job is stranded: %w", leaseID, err)
 		}

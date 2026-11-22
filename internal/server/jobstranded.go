@@ -63,7 +63,7 @@ const (
 func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sweep *rerunSweep,
 	budgets map[string][]RESTHeadroom, now time.Time,
 ) {
-	misses, err := s.alloc.LaunchMisses(ctx, now.Add(-strandedWindow-time.Hour), strandedRows)
+	misses, err := s.alloc.LaunchMisses(ctx, now.Add(-strandedWindow-time.Hour), sweep.strandedFrom, strandedRows)
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn("could not list the launches that started nothing; asking again later", "error", err)
@@ -72,6 +72,10 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 		return
 	}
 
+	// ONE PAGE A PASS, FROM WHERE THE LAST ONE ENDED, and from the start again once a
+	// page reaches the launches too young to ask about or the end of the list, so
+	// launches older than the page cannot keep a younger one from being listed at all.
+	rounded := len(misses) < strandedRows
 	due := make([]*alloc.LaunchMiss, 0, len(misses))
 	for i := range misses {
 		miss := &misses[i]
@@ -85,12 +89,18 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 		}
 		// OLDEST FIRST, so every launch after this one is younger still.
 		if age < strandedAfter {
+			rounded = true
+
 			break
 		}
 		if asked, ok := sweep.strandedAsked[miss.LeaseID]; ok && now.Sub(asked) < strandedAgain {
 			continue
 		}
 		due = append(due, miss)
+	}
+	sweep.strandedFrom = alloc.LaunchMissCursor{}
+	if !rounded {
+		sweep.strandedFrom = misses[len(misses)-1].After()
 	}
 	if len(due) == 0 {
 		return

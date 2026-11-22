@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -22,12 +23,22 @@ type strandedGitHub struct {
 	err   error
 	reads int
 	asked []string
+	// byName, when it names a job, answers for it in place of jobs.
+	byName map[string]NamedJobs
+	// onRead, when set, runs inside each read, before it answers.
+	onRead func()
 }
 
 func (g *strandedGitHub) JobsNamed(_ context.Context, owner, repository string, _ int64, name string,
 ) (NamedJobs, error) {
 	g.reads++
 	g.asked = append(g.asked, owner+"/"+repository+" "+name)
+	if g.onRead != nil {
+		g.onRead()
+	}
+	if jobs, ok := g.byName[name]; ok {
+		return jobs, g.err
+	}
 
 	return g.jobs, g.err
 }
@@ -336,6 +347,52 @@ func TestUndecidedLaunchesGiveWayToTheOthers(t *testing.T) {
 		"acme/app Lint App", "acme/app Test App"}
 	if !slices.Equal(r.github.asked, want) {
 		t.Fatalf("asked %q, want %q", r.github.asked, want)
+	}
+}
+
+// AN ASSIGNMENT RECORDED WHILE GITHUB WAS BEING READ HOLDS THE DECISION: GitHub still
+// says the job is queued with no runner while billet starts a runner for what may be
+// that job offered again, so the write says again what the read said before it.
+func TestAnAssignmentDuringTheReadHoldsTheDecision(t *testing.T) {
+	t.Parallel()
+
+	r := newStrandedStack(t)
+	r.miss("missed", "acme/app", 42, "Lint App", 20*time.Minute)
+	r.advertises(4, 0)
+	r.github.onRead = func() { r.lease("booting", 42, "", time.Second) }
+
+	r.pass()
+
+	if got := r.decision("missed"); got != "" {
+		t.Fatalf("decided %q with an assignment for the run recorded during the read, want undecided", got)
+	}
+	if r.github.reads != 1 {
+		t.Fatalf("read GitHub %d times, want once", r.github.reads)
+	}
+}
+
+// A LAUNCH PAST THE FIRST PAGE IS STILL ASKED ABOUT: a page of older launches GitHub's
+// record never decides cannot keep a younger one from being listed until it expires.
+func TestALaunchPastTheFirstPageIsAskedAbout(t *testing.T) {
+	t.Parallel()
+
+	r := newStrandedStack(t)
+	for i := range strandedRows {
+		r.miss(fmt.Sprintf("old-%03d", i), "acme/app", int64(100+i), "Lint App",
+			time.Hour-time.Duration(i)*time.Second)
+	}
+	r.miss("tail", "acme/app", 42, "Build iOS", 20*time.Minute)
+	r.github.jobs = NamedJobs{}
+	r.github.byName = map[string]NamedJobs{"Build iOS": {Unstarted: 1}}
+
+	for range 2 {
+		r.advertises(4, 0)
+		r.pass()
+		r.now = r.now.Add(time.Minute)
+	}
+
+	if got := r.decision("tail"); got != "stranded" {
+		t.Fatalf("the launch past the first page was decided %q after two passes, want stranded", got)
 	}
 }
 
