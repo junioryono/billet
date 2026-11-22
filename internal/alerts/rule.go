@@ -24,6 +24,9 @@ const (
 	RanLong Condition = "running-long"
 	// WaitedLong is a job that started after waiting past the rule's duration.
 	WaitedLong Condition = "waited-long"
+	// Stranded is a job GitHub stopped offering after billet's launch for it started
+	// nothing, as billet decided it (#911).
+	Stranded Condition = "stranded"
 )
 
 // GitHub's words on a completed job. `succeeded` and `canceled` are the two the
@@ -57,6 +60,9 @@ type Job struct {
 	// FinishedAt is when a job with no result had its lease archived: it is not
 	// running, and how long it ran is GitHub's to say.
 	FinishedAt time.Time
+	// StrandedAt is when billet decided GitHub had stopped offering the job, zero for
+	// every job that was not.
+	StrandedAt time.Time
 }
 
 // Workflow is the job's workflow file within its repository,
@@ -120,6 +126,7 @@ type Rule struct {
 	Disrupted    bool
 	RunningOver  time.Duration
 	WaitedOver   time.Duration
+	Stranded     bool
 	InARow       int64
 	Cooldown     time.Duration
 	Destinations []string
@@ -143,7 +150,8 @@ func NewRule(r *config.AlertRule) (Rule, error) {
 	}
 
 	return Rule{Name: r.Name, Match: r.Match, Failed: r.On.Failed, Cancelled: r.On.Cancelled, Disrupted: r.On.Disrupted,
-		RunningOver: running, WaitedOver: waited, InARow: int64(r.InARowOrOne()), Cooldown: cooldown,
+		RunningOver: running, WaitedOver: waited, Stranded: r.On.Stranded,
+		InARow: int64(r.InARowOrOne()), Cooldown: cooldown,
 		Destinations: r.Notify}, nil
 }
 
@@ -164,6 +172,9 @@ func (r *Rule) Conditions() []Condition {
 	}
 	if r.WaitedOver > 0 {
 		out = append(out, WaitedLong)
+	}
+	if r.Stranded {
+		out = append(out, Stranded)
 	}
 
 	return out
@@ -243,6 +254,17 @@ func (r *Rule) Judge(condition Condition, j *Job, now time.Time) Verdict {
 		}
 	case RanLong:
 		return judgeDuration(j, r.RunningOver, now)
+	case Stranded:
+		// A JOB BILLET DECIDED GITHUB STOPPED OFFERING is a hit when decided, and one that
+		// ran is not one: it breaks a streak as a success breaks one of failures.
+		switch {
+		case !j.StrandedAt.IsZero():
+			return Hit
+		case !j.StartedAt.IsZero():
+			return Miss
+		default:
+			return Later
+		}
 	case WaitedLong:
 		// THE QUEUE TIME COMES FROM GITHUB'S REST RECORD, after the start, or never,
 		// and a wait nobody knows is neither long nor short.

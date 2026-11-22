@@ -83,6 +83,9 @@ type AlertConditions struct {
 	Disrupted         bool   `yaml:"disrupted,omitempty"`
 	RunningLongerThan string `yaml:"running_longer_than,omitempty"`
 	WaitedLongerThan  string `yaml:"waited_longer_than,omitempty"`
+	// Stranded is a job GitHub stopped offering after billet's launch for it started
+	// nothing, told when billet decides it (#911). It needs the App's `actions: read`.
+	Stranded bool `yaml:"stranded,omitempty"`
 }
 
 // RunningOver is RunningLongerThan, zero when absent.
@@ -266,15 +269,18 @@ func (r *AlertRule) errors(where string, destinations map[string]bool) []error {
 		errs = append(errs, fmt.Errorf("%s: on.waited_longer_than must be positive", where))
 	}
 
-	if !r.On.Failed && !r.On.Cancelled && !r.On.Disrupted && r.On.RunningLongerThan == "" && r.On.WaitedLongerThan == "" {
+	if !r.On.Failed && !r.On.Cancelled && !r.On.Disrupted && r.On.RunningLongerThan == "" &&
+		r.On.WaitedLongerThan == "" && !r.On.Stranded {
 		errs = append(errs, fmt.Errorf("%s: on names no condition, so the rule could never fire; "+
-			"name at least one of failed, cancelled, disrupted, running_longer_than and waited_longer_than", where))
+			"name at least one of failed, cancelled, disrupted, running_longer_than, waited_longer_than and "+
+			"stranded", where))
 	}
 
 	// A STEP ENDS ONE WAY OR ANOTHER, and only those two conditions are about how: a
-	// rule about a job running long, narrowed by a step, could never be judged.
+	// rule about a job running long, narrowed by a step, could never be judged, and a
+	// stranded job ran no step at all.
 	if r.Match.Step != "" && (r.On.Disrupted || r.On.RunningLongerThan != "" || r.On.WaitedLongerThan != "" ||
-		(!r.On.Failed && !r.On.Cancelled)) {
+		r.On.Stranded || (!r.On.Failed && !r.On.Cancelled)) {
 		errs = append(errs, fmt.Errorf("%s: match.step takes only on.failed and on.cancelled: a step says how a "+
 			"job ended, and the other conditions are not about that", where))
 	}

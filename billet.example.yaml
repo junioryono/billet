@@ -250,7 +250,7 @@ server:
   #   rules:
   #     - name: deploys
   #       match: {repository: "acme/*", workflow: deploy.yml, branch: main}
-  #       on: {failed: true, disrupted: true}
+  #       on: {failed: true, disrupted: true, stranded: true}
   #       notify: [oncall, pager]
   #     - name: slow-builds
   #       on: {running_longer_than: 2h, waited_longer_than: 15m}

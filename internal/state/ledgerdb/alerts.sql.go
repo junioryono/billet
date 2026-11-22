@@ -564,6 +564,68 @@ func (q *Queries) ListRunningJobsForAlerts(ctx context.Context, arg ListRunningJ
 	return items, nil
 }
 
+const listStrandedJobsForAlerts = `-- name: ListStrandedJobsForAlerts :many
+SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, workflow_ref, job_name,
+       CAST(COALESCE(run_id, 0) AS BIGINT) AS run_id, head_branch, stranded_at
+  FROM job_history
+ WHERE stranded = 'stranded' AND stranded_at >= $1
+ ORDER BY stranded_at, lease_id
+ LIMIT CAST($2 AS BIGINT)
+`
+
+type ListStrandedJobsForAlertsParams struct {
+	Since   string
+	MaxRows int64
+}
+
+type ListStrandedJobsForAlertsRow struct {
+	LeaseID     string
+	Tier        string
+	Node        string
+	Repo        string
+	WorkflowRef string
+	JobName     string
+	RunID       int64
+	HeadBranch  string
+	StrandedAt  string
+}
+
+// The launches decided stranded since a moment (#911), oldest decision first and
+// bounded: a job GitHub stopped offering, which never started, so neither list above
+// holds it. The WHERE leads with migration 85's partial index, word for word.
+func (q *Queries) ListStrandedJobsForAlerts(ctx context.Context, arg ListStrandedJobsForAlertsParams) ([]ListStrandedJobsForAlertsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listStrandedJobsForAlerts, arg.Since, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListStrandedJobsForAlertsRow
+	for rows.Next() {
+		var i ListStrandedJobsForAlertsRow
+		if err := rows.Scan(
+			&i.LeaseID,
+			&i.Tier,
+			&i.Node,
+			&i.Repo,
+			&i.WorkflowRef,
+			&i.JobName,
+			&i.RunID,
+			&i.HeadBranch,
+			&i.StrandedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const muteAlertRule = `-- name: MuteAlertRule :exec
 INSERT INTO alert_rules (name, first_seen_at, muted_until, muted_by)
 VALUES ($1, $2, $3, $4)

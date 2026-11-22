@@ -274,7 +274,7 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 		sweep.until = now
 	}
 
-	var running []alloc.AlertJob
+	var running, stranded []alloc.AlertJob
 
 	readAll := false
 	for n := range alertEndedPages {
@@ -286,7 +286,7 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 			return
 		}
 		if n == 0 {
-			running = read.Running
+			running, stranded = read.Running, read.Stranded
 		}
 
 		next := alloc.AlertCursor{}
@@ -341,6 +341,16 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 		}
 
 		s.judgeAll(ctx, &running[i], false, targets, sweep, pass, now)
+	}
+
+	// AND THE LAUNCHES DECIDED STRANDED, which never started, so neither list above holds
+	// them (#911): each is judged as a job not ended, after every one that ran.
+	for i := range stranded {
+		if ctx.Err() != nil {
+			return
+		}
+
+		s.judgeAll(ctx, &stranded[i], false, targets, sweep, pass, now)
 	}
 }
 
@@ -447,7 +457,7 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 
 	// A RULE IS ABOUT JOBS FROM WHEN IT WAS FIRST SEEN, so adding one does not page
 	// somebody about the last day's failures.
-	if first, ok := sweep.firstSeen[rule.Name]; !ok || row.StartedAt.Before(first) {
+	if first, ok := sweep.firstSeen[rule.Name]; !ok || alertSince(row).Before(first) {
 		return true
 	}
 
@@ -519,21 +529,40 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 	return s.recordAlert(ctx, rule, condition, &job, outcome, branch, sweep, pass, now)
 }
 
-// alertJudgedFrom is when a job's verdict became knowable: its result, or its start
-// for one still running.
+// alertJudgedFrom is when a job's verdict became knowable: its result, its start for
+// one still running, or billet's decision for a launch decided stranded.
 func alertJudgedFrom(j *alerts.Job) time.Time {
-	if !j.ResultAt.IsZero() {
+	switch {
+	case !j.ResultAt.IsZero():
 		return j.ResultAt
+	case !j.StrandedAt.IsZero():
+		return j.StrandedAt
 	}
 
 	return j.StartedAt
 }
 
+// alertSince is when a rule may first be about a job: its start, or billet's decision
+// for a launch decided stranded, which never started. A rule is about the jobs from
+// when it was first seen.
+func alertSince(row *alloc.AlertJob) time.Time {
+	if !row.StrandedAt.IsZero() {
+		return row.StrandedAt
+	}
+
+	return row.StartedAt
+}
+
 // alertReadDeadline is when a job is about to leave the read it is judged in, less a
 // margin of passes: the earliest of every way out of it. Every job leaves when its
 // start is older than the running window; an ended job when its result is older than
-// the ended window, and an archived one when its archiving is.
+// the ended window, and an archived one when its archiving is. A launch decided
+// stranded leaves when its decision is older than the ended window.
 func alertReadDeadline(job *alerts.Job, ended bool) time.Time {
+	if !job.StrandedAt.IsZero() {
+		return job.StrandedAt.Add(alertEndedWindow - alertLeaveMargin)
+	}
+
 	out := job.StartedAt.Add(alertRunningWindow)
 	switch {
 	case ended:
@@ -590,7 +619,7 @@ func alertJob(row *alloc.AlertJob) alerts.Job {
 	return alerts.Job{LeaseID: row.LeaseID, Tier: row.Tier, Node: row.Node, Repository: row.Repository,
 		WorkflowRef: row.WorkflowRef, JobName: row.JobName, RunID: row.RunID, Result: row.Result,
 		Disruption: row.Disruption, Rerun: row.Rerun, HeadBranch: row.HeadBranch, StartedAt: row.StartedAt,
-		ResultAt: row.ResultAt, QueuedAt: row.QueuedAt, FinishedAt: row.FinishedAt}
+		ResultAt: row.ResultAt, QueuedAt: row.QueuedAt, FinishedAt: row.FinishedAt, StrandedAt: row.StrandedAt}
 }
 
 // narrowAlert asks GitHub what a rule needs beyond the ledger, and says what the

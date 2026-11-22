@@ -34,6 +34,9 @@ type AlertJob struct {
 	// FinishedAt is when a job with no result yet had its lease archived: it is not
 	// running, and its result is still to come.
 	FinishedAt time.Time
+	// StrandedAt is when billet decided GitHub had stopped offering the job, zero for
+	// every job that was not (#911).
+	StrandedAt time.Time
 	// Cursor is where an ended job stands in the order AlertJobs reads them.
 	Cursor AlertCursor
 }
@@ -46,10 +49,10 @@ type AlertCursor struct {
 	LeaseID  string
 }
 
-// AlertJobsRead is what one pass judges: the jobs running now and the ended ones,
-// each oldest first.
+// AlertJobsRead is what one pass judges: the jobs running now, the ended ones and the
+// launches decided stranded, each oldest first.
 type AlertJobsRead struct {
-	Running, Ended []AlertJob
+	Running, Ended, Stranded []AlertJob
 }
 
 // AlertJobs reads the jobs a pass judges: those running that started since
@@ -67,7 +70,10 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 		reads := state.ReadQueries(q)
 		started := ts(runningSince.UTC())
 
-		var running []ledgerdb.ListRunningJobsForAlertsRow
+		var (
+			running  []ledgerdb.ListRunningJobsForAlertsRow
+			stranded []ledgerdb.ListStrandedJobsForAlertsRow
+		)
 		if withRunning {
 			var err error
 
@@ -78,6 +84,15 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 			})
 			if err != nil {
 				return fmt.Errorf("alloc: list the running jobs for alerts: %w", err)
+			}
+
+			// DECIDED SINCE THE ENDED JOBS' WINDOW, as a result is: a stranded job is told
+			// once, when billet decides it, which is as late as it can be known.
+			stranded, err = reads.ListStrandedJobsForAlerts(ctx, ledgerdb.ListStrandedJobsForAlertsParams{
+				Since: ts(endedSince.UTC()), MaxRows: int64(limit),
+			})
+			if err != nil {
+				return fmt.Errorf("alloc: list the stranded jobs for alerts: %w", err)
 			}
 		}
 
@@ -105,6 +120,13 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 				Rerun: r.RerunDecision, HeadBranch: r.HeadBranch, StartedAt: parseStamp(r.StartedAt),
 				ResultAt: parseStamp(r.ResultAt), QueuedAt: parseStamp(r.GithubQueuedAt),
 				Cursor: AlertCursor{ResultAt: r.ResultAt, LeaseID: r.LeaseID}})
+		}
+		out.Stranded = make([]AlertJob, 0, len(stranded))
+		for i := range stranded {
+			r := &stranded[i]
+			out.Stranded = append(out.Stranded, AlertJob{LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node,
+				Repository: r.Repo, WorkflowRef: r.WorkflowRef, JobName: r.JobName, RunID: r.RunID,
+				HeadBranch: r.HeadBranch, StrandedAt: parseStamp(r.StrandedAt)})
 		}
 
 		return nil

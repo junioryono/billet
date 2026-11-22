@@ -97,6 +97,8 @@ type ReadOps interface {
 	CountRunReruns(ctx context.Context, arg ledgerdb.CountRunRerunsParams) (int64, error)
 	ListRunningJobsForAlerts(ctx context.Context, arg ledgerdb.ListRunningJobsForAlertsParams) ([]ledgerdb.ListRunningJobsForAlertsRow, error)
 	ListEndedJobsForAlerts(ctx context.Context, arg ledgerdb.ListEndedJobsForAlertsParams) ([]ledgerdb.ListEndedJobsForAlertsRow, error)
+	ListStrandedJobsForAlerts(ctx context.Context,
+		arg ledgerdb.ListStrandedJobsForAlertsParams) ([]ledgerdb.ListStrandedJobsForAlertsRow, error)
 	ListAlertRules(ctx context.Context) ([]ledgerdb.AlertRule, error)
 	ReadAlertRuleMute(ctx context.Context, name string) (string, error)
 	ListAlertMarks(ctx context.Context, since string) ([]ledgerdb.ListAlertMarksRow, error)

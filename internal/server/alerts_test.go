@@ -599,6 +599,43 @@ func TestAnArchivedDisruptionIsToldAtOnce(t *testing.T) {
 	}
 }
 
+// A JOB GITHUB STOPPED OFFERING IS TOLD WHEN BILLET DECIDES IT (#911), once, though it
+// never started: a job that ran is not one, and one decided before the rule was first
+// seen is not its news.
+func TestAStrandedJobIsToldWhenDecided(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) { c.On = config.AlertConditions{Stranded: true} }))
+	for _, row := range []struct {
+		lease   string
+		decided time.Time
+	}{{"missed", r.now}, {"before", r.now.Add(-time.Hour)}} {
+		if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(), `INSERT INTO job_history
+				(lease_id, tier, queued_at, finished_at, repo, workflow_ref, job_name, run_id, failure_reason,
+				 stranded, stranded_at)
+				VALUES ($1, $2, $3, $3, 'acme/api', 'acme/api/.github/workflows/deploy.yml@refs/heads/main', 'deploy',
+				        31, 'billet:launch-failed', 'stranded', $3)`, row.lease, alertTier, stamp(row.decided))
+
+			return err
+		}); err != nil {
+			t.Fatalf("seed %s: %v", row.lease, err)
+		}
+	}
+	r.seed(jobRow{lease: "ran", result: "succeeded", ran: 10 * time.Second, age: 30 * time.Second})
+
+	r.pass()
+	r.now = r.now.Add(time.Minute)
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "missed:stranded" {
+		t.Fatalf("owed = %v, want the stranded job alone, once", got)
+	}
+	if got := r.outcome("ran", "stranded"); got != string(alloc.AlertMiss) {
+		t.Fatalf("the job that ran came to %q on stranded, want a miss", got)
+	}
+}
+
 // A JOB ON A BRANCH THE LEDGER SHOWS THE RULE DOES NOT NAME is not its job, and holds
 // nothing back even while it cannot be judged: a wait with no queue time yet on
 // another branch does not keep a wait on the rule's own branch waiting with it.

@@ -123,6 +123,8 @@ func (c Condition) sentence(seconds int64) string {
 		return "has run for " + long
 	case WaitedLong:
 		return "waited " + long + " for a runner"
+	case Stranded:
+		return "was stranded: GitHub stopped offering it after billet's launch for it started nothing"
 	}
 
 	return string(c)
