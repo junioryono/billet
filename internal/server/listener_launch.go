@@ -302,6 +302,15 @@ func (l *Listener) launchSettled(ctx context.Context, lease *alloc.Lease, job di
 	// for the report: `billet leases failures` shows a failure nothing explains
 	// as a row an operator cannot act on, and the node writes the same reason
 	// for a launch that failed after starting something.
+	//
+	// AND THE JOB IT WAS BOUGHT FOR, ON ITS ROW. A pooled runner's row names a job only
+	// once one starts on it, since GitHub can hand it another; but this launch started
+	// nothing and its lease ends here, so no job will ever claim the row, and the one it
+	// was bought for is the truth of it. What that names (the repository, the run, the
+	// job) is what a job GitHub stopped offering after such a launch is read by (#911).
+	if job.JobID != "" {
+		l.recordJobIdentity(ctx, lease.ID, job, job.RunID)
+	}
 	relErr := l.alloc.ReleaseFailed(ctx, lease.ID, lease.Epoch, alloc.LaunchFailedReason)
 	if relErr != nil {
 		l.log.Warn("could not release the lease of a job that failed to start",
