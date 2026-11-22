@@ -264,14 +264,7 @@ func (s *Server) beginRecovery(ctx context.Context, targets map[string]Target, s
 	}
 	delete(sweep.recoveryAsked, job.LeaseID)
 
-	// NOT PAST THE DAY THE DECISION LEAVES FOR A RECOVERY, on the clock as it is after the
-	// read and the write, either of which may have waited: a cancel is a day's news at
-	// most. The cancel the row is ready for never leaves, and is counted as such.
-	if sweep.clock(now).Sub(job.Decided) > strandedRecoveryWindow {
-		if s.recordRefusal(ctx, sweep, &recovery) {
-			s.endRecovery(ctx, &recovery, alloc.RecoveryExpired, "its decision's day passed before the cancel left")
-		}
-
+	if s.cancelTooLate(ctx, sweep, &recovery, now) {
 		return
 	}
 
@@ -382,7 +375,7 @@ func (s *Server) advanceRecovery(ctx context.Context, targets map[string]Target,
 		}
 		recovery.Tries++
 		// AND AGAIN AFTER THE WRITE, which may have waited for the ledger.
-		if s.recoveryExpired(ctx, sweep, recovery, now) {
+		if s.recoveryExpired(ctx, sweep, recovery, now) || s.cancelTooLate(ctx, sweep, recovery, now) {
 			return
 		}
 		s.sendCancel(ctx, client, sweep, installation, recovery, owner, name, now)
@@ -465,6 +458,25 @@ func (s *Server) sendRerunOfRecovery(ctx context.Context, client RunRecovery, sw
 	default:
 		s.recoveryFailed(ctx, sweep, installation, recovery.Tier, recovery.Repository, recovery.RunID, err, now)
 	}
+}
+
+// cancelTooLate says whether the cancel a recovery's row is ready for would leave more
+// than a day after the stranded launch ended, on the clock as it is after whatever the
+// pass read and wrote, and if so withholds it: counted as never sent, and the recovery
+// ended. A rule the row alone answers, so an end that failed to be written withholds
+// the cancel again on every pass: a cancel is a day's news at most.
+func (s *Server) cancelTooLate(ctx context.Context, sweep *rerunSweep, recovery *alloc.StrandedRecovery,
+	now time.Time,
+) bool {
+	if sweep.clock(now).Sub(recovery.Ended) <= strandedRecoveryWindow {
+		return false
+	}
+	if s.recordRefusal(ctx, sweep, recovery) {
+		s.endRecovery(ctx, recovery, alloc.RecoveryExpired, "a cancel leaves no later than a day after its launch "+
+			"ended")
+	}
+
+	return true
 }
 
 // recoveryExpired ends a recovery past its day and says so. ON THE CLOCK AS IT IS NOW,

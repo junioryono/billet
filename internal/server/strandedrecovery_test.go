@@ -849,24 +849,55 @@ func TestNoRequestLeavesPastTheDay(t *testing.T) {
 	}
 }
 
-// NOR DOES A FIRST CANCEL LEAVE PAST ITS DECISION'S DAY, however slow the read before it.
-func TestNoFirstCancelLeavesPastItsDecisionsDay(t *testing.T) {
+// strandLate seeds a launch decided stranded whose lease ended age before the clock,
+// on a tier that has asked since before it ended.
+func (r *recoveryStack) strandLate(lease string, run int64, age time.Duration) {
+	r.t.Helper()
+
+	r.exec(`UPDATE stranded_tiers SET asked_since = '` + stamp(r.now.Add(-2*strandedRecoveryWindow)) + `'`)
+	r.strand(lease, run, age)
+}
+
+// NO CANCEL LEAVES MORE THAN A DAY AFTER ITS LAUNCH ENDED, however slow the read and
+// the write before it: the cancel the row is ready for is withheld, counted as never
+// sent, and the recovery ends without the ERROR a cancel that may have landed earns.
+func TestNoCancelLeavesMoreThanADayAfterItsLaunch(t *testing.T) {
 	t.Parallel()
 
 	r := newRecoveryStack(t, true)
-	r.strand("missed", 42, 20*time.Minute)
-	r.exec(`UPDATE job_history SET stranded_at = '` + stamp(r.now.Add(-strandedRecoveryWindow+2*time.Minute)) +
-		`' WHERE lease_id = 'missed'`)
+	r.strandLate("missed", 42, strandedRecoveryWindow-2*time.Minute)
 	r.github.onRead = func() { r.sweep.began = r.sweep.began.Add(-5 * time.Minute) }
 
 	r.pass()
 
 	if r.github.cancels != 0 {
-		t.Fatalf("sent a first cancel %d times after its decision's day had passed", r.github.cancels)
+		t.Fatalf("sent a first cancel %d times more than a day after its launch ended", r.github.cancels)
 	}
-	// AND THE CANCEL THAT NEVER LEFT IS COUNTED AS NONE: no ERROR, nothing to put right.
 	if got := r.recovery(42); got != string(alloc.RecoveryExpired) {
 		t.Fatalf("the recovery is %q, want expired", got)
+	}
+}
+
+// A WITHHELD CANCEL STAYS WITHHELD WHEN ITS END COULD NOT BE WRITTEN: the rule is the
+// row's, so the next pass withholds it again rather than send it.
+func TestAWithheldCancelStaysWithheld(t *testing.T) {
+	t.Parallel()
+
+	r := newRecoveryStack(t, true)
+	r.strandLate("missed", 42, strandedRecoveryWindow-2*time.Minute)
+	r.exec(`CREATE TRIGGER settle_fails BEFORE UPDATE OF settled_at ON stranded_recoveries
+		BEGIN SELECT RAISE(ABORT, 'injected'); END`)
+	r.github.onRead = func() { r.sweep.began = r.sweep.began.Add(-5 * time.Minute) }
+	r.pass()
+
+	r.exec(`DROP TRIGGER settle_fails`)
+	r.github.onRead = nil
+	r.now = r.now.Add(10 * time.Minute)
+	r.pass()
+	r.pass()
+
+	if r.github.cancels != 0 {
+		t.Fatalf("sent a withheld cancel %d times once its end could be written", r.github.cancels)
 	}
 }
 
