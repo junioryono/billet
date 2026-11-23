@@ -34,6 +34,9 @@ type AlertJob struct {
 	// FinishedAt is when a job with no result yet had its lease archived: it is not
 	// running, and its result is still to come.
 	FinishedAt time.Time
+	// StrandedAt is when billet decided GitHub had stopped offering the job, zero for
+	// every job that was not (#911).
+	StrandedAt time.Time
 	// Cursor is where an ended job stands in the order AlertJobs reads them.
 	Cursor AlertCursor
 }
@@ -105,6 +108,35 @@ func (a *Allocator) AlertJobs(ctx context.Context, runningSince, endedSince time
 				Rerun: r.RerunDecision, HeadBranch: r.HeadBranch, StartedAt: parseStamp(r.StartedAt),
 				ResultAt: parseStamp(r.ResultAt), QueuedAt: parseStamp(r.GithubQueuedAt),
 				Cursor: AlertCursor{ResultAt: r.ResultAt, LeaseID: r.LeaseID}})
+		}
+
+		return nil
+	})
+
+	return out, err
+}
+
+// StrandedAlertJobs reads the launches decided stranded since since (#911), oldest
+// decision first from just past after, at most limit. Each one's Cursor is where it
+// stands in that order, its decision in ResultAt's place.
+func (a *Allocator) StrandedAlertJobs(ctx context.Context, since time.Time, after AlertCursor, limit int,
+) ([]AlertJob, error) {
+	var out []AlertJob
+
+	err := a.db.View(ctx, func(q querier) error {
+		rows, err := state.ReadQueries(q).ListStrandedJobsForAlerts(ctx, ledgerdb.ListStrandedJobsForAlertsParams{
+			Since: ts(since.UTC()), AfterDecided: after.ResultAt, AfterLease: after.LeaseID, MaxRows: int64(limit),
+		})
+		if err != nil {
+			return fmt.Errorf("alloc: list the stranded jobs for alerts: %w", err)
+		}
+
+		out = make([]AlertJob, 0, len(rows))
+		for i := range rows {
+			r := &rows[i]
+			out = append(out, AlertJob{LeaseID: r.LeaseID, Tier: r.Tier, Node: r.Node, Repository: r.Repo,
+				WorkflowRef: r.WorkflowRef, JobName: r.JobName, RunID: r.RunID, HeadBranch: r.HeadBranch,
+				StrandedAt: parseStamp(r.StrandedAt), Cursor: AlertCursor{ResultAt: r.StrandedAt, LeaseID: r.LeaseID}})
 		}
 
 		return nil

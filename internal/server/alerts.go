@@ -105,6 +105,9 @@ const (
 	// one App installation, each cached for the pass. It decides nothing about a
 	// runner, so it is as small as the queue-time sweep's share.
 	alertRunsPerInstallation = 3
+	// alertStrandedRunsPerInstallation is the share a stranded job's branch reads come
+	// from, apart from the others' (#911).
+	alertStrandedRunsPerInstallation = 1
 	// alertReadsRemembered bounds the branches kept between passes: a run's branch does
 	// not change, and a rule about a branch asks of every run.
 	alertReadsRemembered = 4096
@@ -169,6 +172,10 @@ type alertSweep struct {
 	scanning bool
 	scan     alloc.AlertCursor
 	held     map[string]bool
+	// strandedFrom is where the next pass reads the launches decided stranded from.
+	strandedFrom alloc.AlertCursor
+	// strandedTried is when each stranded job last asked GitHub, which orders the next.
+	strandedTried map[string]time.Time
 	// until is where a cycle of scans ends: the moment its first pass began. A scan
 	// that chases results arriving faster than it reads still reaches it.
 	until time.Time
@@ -182,7 +189,7 @@ type alertSweep struct {
 
 func newAlertSweep() *alertSweep {
 	return &alertSweep{judged: map[alloc.AlertMark]bool{}, branches: map[rerunRun]string{},
-		firstAsked: map[alloc.AlertMark]time.Time{}, rows: alertJobsRead}
+		firstAsked: map[alloc.AlertMark]time.Time{}, strandedTried: map[string]time.Time{}, rows: alertJobsRead}
 }
 
 // clock is the pass's now moved on by how long the pass has run, for a deadline
@@ -257,6 +264,38 @@ func (s *Server) evaluateAlertsOnce(ctx context.Context, targets map[string]Targ
 	pass := &alertPass{spent: map[string]int{}, budgets: installationBudgets(targets),
 		steps: map[rerunRun]map[string]RunnerSteps{}, failed: map[rerunRun]error{},
 		unbranched: map[rerunRun]error{}, deferred: map[string]bool{}}
+
+	// THE LAUNCHES DECIDED STRANDED FIRST, which never started, so neither list below
+	// holds them (#911): a page a pass from where the last ended, the cursor going round,
+	// each told on its own, since a stranded job counts in no streak. First, because no
+	// order among the others binds them, and so the jobs that ran never spend the share
+	// of reads a stranded job's branch needs, nor a scan carried on keep them waiting.
+	stranded, err := s.alloc.StrandedAlertJobs(ctx, now.Add(-alertEndedWindow), sweep.strandedFrom, rows)
+	if err != nil {
+		s.log.Warn("could not list the stranded jobs for alerts; trying again", "error", err)
+	} else {
+		sweep.strandedFrom = alloc.AlertCursor{}
+		if len(stranded) == rows {
+			sweep.strandedFrom = stranded[len(stranded)-1].Cursor
+		}
+		// THE ONE TRIED LONGEST AGO FIRST, a job never tried before any that was, so those
+		// GitHub cannot be read about never keep the share from the rest of the page.
+		slices.SortStableFunc(stranded, func(a, b alloc.AlertJob) int {
+			return sweep.strandedTried[a.LeaseID].Compare(sweep.strandedTried[b.LeaseID])
+		})
+		for lease, at := range sweep.strandedTried {
+			if now.Sub(at) > alertEndedWindow {
+				delete(sweep.strandedTried, lease)
+			}
+		}
+		for i := range stranded {
+			if ctx.Err() != nil {
+				return
+			}
+
+			s.judgeAll(ctx, &stranded[i], false, targets, sweep, pass, now)
+		}
+	}
 
 	// THE ENDED JOBS ARE READ ON TO THE END, page by page, before a running job is
 	// judged: a job held at the cursor does not keep the running ones from being
@@ -447,7 +486,7 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 
 	// A RULE IS ABOUT JOBS FROM WHEN IT WAS FIRST SEEN, so adding one does not page
 	// somebody about the last day's failures.
-	if first, ok := sweep.firstSeen[rule.Name]; !ok || row.StartedAt.Before(first) {
+	if first, ok := sweep.firstSeen[rule.Name]; !ok || alertSince(row).Before(first) {
 		return true
 	}
 
@@ -463,13 +502,19 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 	}
 
 	// A STREAK COUNTS ITS ENDED JOBS IN ORDER: one put off this pass holds every later
-	// one, running jobs included.
+	// one, running jobs included. A stranded job counts in no streak, so nothing put
+	// off holds it back, an ordinary run of the same job included.
 	streak := rule.Name + "\x00" + job.Key(condition)
-	if pass.deferred[streak] {
+	if condition != alerts.Stranded && pass.deferred[streak] {
 		return false
 	}
 
 	verdict := rule.Judge(condition, &job, now)
+	// A JOB THAT RAN IS A MISS ON STRANDED, which counts in no streak, so it is recorded
+	// as it is, without a read of GitHub that would spend the share stranded jobs need.
+	if condition == alerts.Stranded && verdict == alerts.Miss {
+		return s.recordAlert(ctx, rule, condition, &job, alloc.AlertMiss, job.HeadBranch, sweep, pass, now)
+	}
 	if verdict == alerts.Later {
 		switch {
 		// A WAIT GITHUB NEVER GAVE A QUEUE TIME FOR is recorded as unknown just before the
@@ -519,21 +564,40 @@ func (s *Server) judgeJob(ctx context.Context, rule *alerts.Rule, condition aler
 	return s.recordAlert(ctx, rule, condition, &job, outcome, branch, sweep, pass, now)
 }
 
-// alertJudgedFrom is when a job's verdict became knowable: its result, or its start
-// for one still running.
+// alertJudgedFrom is when a job's verdict became knowable: its result, its start for
+// one still running, or billet's decision for a launch decided stranded.
 func alertJudgedFrom(j *alerts.Job) time.Time {
-	if !j.ResultAt.IsZero() {
+	switch {
+	case !j.ResultAt.IsZero():
 		return j.ResultAt
+	case !j.StrandedAt.IsZero():
+		return j.StrandedAt
 	}
 
 	return j.StartedAt
 }
 
+// alertSince is when a rule may first be about a job: its start, or billet's decision
+// for a launch decided stranded, which never started. A rule is about the jobs from
+// when it was first seen.
+func alertSince(row *alloc.AlertJob) time.Time {
+	if !row.StrandedAt.IsZero() {
+		return row.StrandedAt
+	}
+
+	return row.StartedAt
+}
+
 // alertReadDeadline is when a job is about to leave the read it is judged in, less a
 // margin of passes: the earliest of every way out of it. Every job leaves when its
 // start is older than the running window; an ended job when its result is older than
-// the ended window, and an archived one when its archiving is.
+// the ended window, and an archived one when its archiving is. A launch decided
+// stranded leaves when its decision is older than the ended window.
 func alertReadDeadline(job *alerts.Job, ended bool) time.Time {
+	if !job.StrandedAt.IsZero() {
+		return job.StrandedAt.Add(alertEndedWindow - alertLeaveMargin)
+	}
+
 	out := job.StartedAt.Add(alertRunningWindow)
 	switch {
 	case ended:
@@ -561,7 +625,7 @@ func (s *Server) recordAlert(ctx context.Context, rule *alerts.Rule, condition a
 ) bool {
 	mark := alloc.AlertMark{Rule: rule.Name, LeaseID: job.LeaseID, Condition: string(condition)}
 	judgement := &alloc.AlertJudgement{Rule: rule.Name, LeaseID: job.LeaseID, Condition: string(condition),
-		Key: job.Key(condition), Outcome: outcome, InARow: rule.InARow, Cooldown: rule.Cooldown}
+		Key: job.Key(condition), Outcome: outcome, InARow: alertInARow(rule, condition), Cooldown: rule.Cooldown}
 	if outcome == alloc.AlertHit {
 		judgement.Notices = s.renderAlert(rule, condition, job, branch, now)
 	}
@@ -585,12 +649,24 @@ func (s *Server) recordAlert(ctx context.Context, rule *alerts.Rule, condition a
 	return true
 }
 
+// alertInARow is how many hits in a row fire a rule on a condition. A job GitHub
+// stopped offering is told each time, whatever the rule's in_a_row: it is news on its
+// own, not a pattern to count, and a streak would have to order decisions against
+// jobs that ran across lists read apart (#911).
+func alertInARow(rule *alerts.Rule, condition alerts.Condition) int64 {
+	if condition == alerts.Stranded {
+		return 1
+	}
+
+	return rule.InARow
+}
+
 // alertJob is a ledger row in a rule's terms.
 func alertJob(row *alloc.AlertJob) alerts.Job {
 	return alerts.Job{LeaseID: row.LeaseID, Tier: row.Tier, Node: row.Node, Repository: row.Repository,
 		WorkflowRef: row.WorkflowRef, JobName: row.JobName, RunID: row.RunID, Result: row.Result,
 		Disruption: row.Disruption, Rerun: row.Rerun, HeadBranch: row.HeadBranch, StartedAt: row.StartedAt,
-		ResultAt: row.ResultAt, QueuedAt: row.QueuedAt, FinishedAt: row.FinishedAt}
+		ResultAt: row.ResultAt, QueuedAt: row.QueuedAt, FinishedAt: row.FinishedAt, StrandedAt: row.StrandedAt}
 }
 
 // narrowAlert asks GitHub what a rule needs beyond the ledger, and says what the
@@ -629,6 +705,10 @@ func (s *Server) narrowAlert(ctx context.Context, rule *alerts.Rule, condition a
 		if _, ok := sweep.firstAsked[mark]; !ok {
 			sweep.firstAsked[mark] = now
 		}
+		// A STRANDED JOB THAT ASKED GOES BEHIND THOSE THAT HAVE NOT, on the next pass.
+		if !job.StrandedAt.IsZero() {
+			sweep.strandedTried[job.LeaseID] = now
+		}
 	}
 
 	branch := job.HeadBranch
@@ -659,10 +739,16 @@ func (s *Server) narrowAlert(ctx context.Context, rule *alerts.Rule, condition a
 
 // spendAlertRead takes one of the pass's reads through a target's installation,
 // costing up to pages requests, and only while those pages leave the reserve, a fifth
-// of the installation's hour, to what decides whether a runner starts.
-func spendAlertRead(target Target, pass *alertPass, now time.Time, pages int64) bool {
+// of the installation's hour, to what decides whether a runner starts. A stranded
+// job's read comes from a share of its own, so neither the jobs that ran nor the
+// stranded ones can spend the reads the others need.
+func spendAlertRead(target Target, pass *alertPass, now time.Time, pages int64, stranded bool) bool {
 	installation := installationOf(target)
-	if pass.spent[installation] >= alertRunsPerInstallation {
+	share, limit := installation, alertRunsPerInstallation
+	if stranded {
+		share, limit = installation+"\x00stranded", alertStrandedRunsPerInstallation
+	}
+	if pass.spent[share] >= limit {
 		return false
 	}
 	for _, h := range pass.budgets[installation] {
@@ -671,7 +757,7 @@ func spendAlertRead(target Target, pass *alertPass, now time.Time, pages int64) 
 			return false
 		}
 	}
-	pass.spent[installation]++
+	pass.spent[share]++
 
 	return true
 }
@@ -701,7 +787,7 @@ func (s *Server) alertBranch(ctx context.Context, target Target, owner, reposito
 	if !ok {
 		return "", fmt.Errorf("%w: this target cannot read a workflow run", errAlertUnreadable)
 	}
-	if !spendAlertRead(target, pass, time.Now(), 1) {
+	if !spendAlertRead(target, pass, time.Now(), 1, !job.StrandedAt.IsZero()) {
 		return "", errAlertNoRead
 	}
 	ask()
@@ -745,7 +831,7 @@ func (s *Server) alertSteps(ctx context.Context, target Target, owner, repositor
 		if !ok {
 			return nil, fmt.Errorf("%w: this target cannot read a job's steps", errAlertUnreadable)
 		}
-		if !spendAlertRead(target, pass, time.Now(), alertStepPages) {
+		if !spendAlertRead(target, pass, time.Now(), alertStepPages, false) {
 			return nil, errAlertNoRead
 		}
 		ask()

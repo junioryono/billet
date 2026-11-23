@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,10 +35,12 @@ type alertRecord struct {
 	steps      map[string][]JobStep
 	unfinished bool
 	err        error
-	reads      int
-	asked      []string
-	remaining  int64
-	limit      int64
+	// failRuns is the runs whose record a read of fails, beside err for every run.
+	failRuns  map[int64]bool
+	reads     int
+	asked     []string
+	remaining int64
+	limit     int64
 }
 
 func (g *alertRecord) WorkflowRun(_ context.Context, owner, repository string, runID int64) (WorkflowRun, error) {
@@ -46,6 +49,10 @@ func (g *alertRecord) WorkflowRun(_ context.Context, owner, repository string, r
 
 	g.reads++
 	g.asked = append(g.asked, fmt.Sprintf("run %s/%s %d", owner, repository, runID))
+
+	if g.failRuns[runID] {
+		return WorkflowRun{}, errors.New("connection reset")
+	}
 
 	return WorkflowRun{ID: runID, HeadBranch: g.branch}, g.err
 }
@@ -596,6 +603,224 @@ func TestAnArchivedDisruptionIsToldAtOnce(t *testing.T) {
 
 	if got := r.owedLeases(); len(got) != 1 || got[0] != "gone:disrupted" {
 		t.Errorf("owed = %v, want the disruption alone", got)
+	}
+}
+
+// A JOB GITHUB STOPPED OFFERING IS TOLD WHEN BILLET DECIDES IT (#911), once, though it
+// never started: a job that ran is not one, and one decided before the rule was first
+// seen is not its news.
+func TestAStrandedJobIsToldWhenDecided(t *testing.T) {
+	t.Parallel()
+
+	// NO COOLDOWN, so only the judgement itself keeps a second pass from telling it again.
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown = config.AlertConditions{Stranded: true}, "0s"
+	}))
+	r.stranded("missed", r.now)
+	r.stranded("before", r.now.Add(-time.Hour))
+	r.seed(jobRow{lease: "ran", result: "succeeded", ran: 10 * time.Second, age: 30 * time.Second})
+
+	r.pass()
+	r.now = r.now.Add(2 * time.Hour)
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "missed:stranded" {
+		t.Fatalf("owed = %v, want the stranded job alone, once", got)
+	}
+	if got := r.outcome("ran", "stranded"); got != string(alloc.AlertMiss) {
+		t.Fatalf("the job that ran came to %q on stranded, want a miss", got)
+	}
+}
+
+// stranded seeds a launch billet decided stranded at decided.
+func (r *alertStack) stranded(lease string, decided time.Time) {
+	r.t.Helper()
+
+	if err := r.db.Tx(r.t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(r.t.Context(), `INSERT INTO job_history
+			(lease_id, tier, queued_at, finished_at, repo, workflow_ref, job_name, run_id, failure_reason,
+			 stranded, stranded_at)
+			VALUES ($1, $2, $3, $3, 'acme/api', 'acme/api/.github/workflows/deploy.yml@refs/heads/main', 'deploy',
+			        31, 'billet:launch-failed', 'stranded', $3)`, lease, alertTier, stamp(decided))
+
+		return err
+	}); err != nil {
+		r.t.Fatalf("seed %s: %v", lease, err)
+	}
+}
+
+// A STRANDED JOB COUNTS IN NO STREAK: each decision is told on its own, whatever the
+// rule's in_a_row, since a streak would have to order decisions against the jobs that
+// ran across lists read apart.
+func TestAStrandedJobCountsInNoStreak(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.InARow, c.Cooldown = config.AlertConditions{Stranded: true}, 2, "0s"
+	}))
+	r.stranded("missed", r.now)
+
+	r.pass()
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "missed:stranded" {
+		t.Fatalf("owed = %v, want the one stranded job told though the rule counts two in a row", got)
+	}
+}
+
+// NOTHING PUT OFF HOLDS A STRANDED JOB BACK: a pass that holds the job's streak, as a
+// judgement the ledger failed to take leaves it, holds a stranded job not at all, since
+// it counts in no streak.
+func TestAStrandedJobIsNotHeldByAStreakPutOff(t *testing.T) {
+	t.Parallel()
+
+	rule := atRule(func(c *config.AlertRule) { c.On, c.Cooldown = config.AlertConditions{Stranded: true}, "0s" })
+	r := started(t, rule)
+	r.stranded("missed", r.now)
+
+	rows, err := r.a.StrandedAlertJobs(t.Context(), r.now.Add(-time.Hour), alloc.AlertCursor{}, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("StrandedAlertJobs = %+v, %v", rows, err)
+	}
+	job := alertJob(&rows[0])
+	parsed := &r.s.alerts.Rules[0]
+	pass := &alertPass{spent: map[string]int{}, budgets: installationBudgets(r.targets),
+		steps: map[rerunRun]map[string]RunnerSteps{}, failed: map[rerunRun]error{},
+		unbranched: map[rerunRun]error{},
+		deferred:   map[string]bool{parsed.Name + "\x00" + job.Key(alerts.Stranded): true}}
+
+	r.s.judgeAll(t.Context(), &rows[0], false, r.targets, r.sweep, pass, r.now)
+
+	if got := r.owedLeases(); len(got) != 1 || got[0] != "missed:stranded" {
+		t.Fatalf("owed = %v, want the stranded job told though its streak was put off", got)
+	}
+}
+
+// A STRANDED JOB IS JUDGED FIRST, so the jobs that ran never spend the share of reads
+// its branch needs: one pass with three of them waiting for their branches tells it.
+func TestAStrandedJobIsJudgedBeforeTheJobsThatRan(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Failed: true, Stranded: true}, "0s", "main"
+	}))
+	r.record.branch = "main"
+	for i, run := range []int64{41, 42, 43} {
+		r.seed(jobRow{lease: fmt.Sprintf("ran-%d", i), result: "failed", ran: time.Second, age: 30 * time.Second,
+			run: run})
+	}
+	r.stranded("missed", r.now)
+	r.now = r.now.Add(alertSettledAfter + time.Second)
+
+	r.pass()
+
+	owed := r.owedLeases()
+	if !slices.Contains(owed, "missed:stranded") {
+		t.Fatalf("owed = %v, want the stranded job told in the first pass", owed)
+	}
+}
+
+// STRANDED JOBS READ FROM A SHARE OF THEIR OWN, so three of them needing their
+// branches leave a job that failed its read in the same pass.
+func TestStrandedReadsLeaveTheOthersTheirShare(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Failed: true, Stranded: true}, "0s", "main"
+	}))
+	r.record.branch = "main"
+	for i, run := range []int64{61, 62, 63} {
+		lease := fmt.Sprintf("stranded-%d", i)
+		r.stranded(lease, r.now)
+		if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET run_id = $1 WHERE lease_id = $2`, run, lease)
+
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.seed(jobRow{lease: "failed", result: "failed", ran: time.Second, age: 30 * time.Second, run: 70})
+	r.now = r.now.Add(alertSettledAfter + time.Second)
+
+	r.pass()
+
+	if owed := r.owedLeases(); !slices.Contains(owed, "failed:failed") {
+		t.Fatalf("owed = %v, want the failed job told beside the stranded ones' reads", owed)
+	}
+}
+
+// STRANDED JOBS GITHUB CANNOT BE READ ABOUT KEEP NONE WAITING: the one tried longest
+// ago goes first, so a readable one behind them is told within a few passes.
+func TestUnreadableStrandedJobsKeepNoneWaiting(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Stranded: true}, "0s", "main"
+	}))
+	r.record.branch = "main"
+	r.record.failRuns = map[int64]bool{81: true, 82: true}
+	for i, run := range []int64{81, 82, 83} {
+		lease := fmt.Sprintf("stranded-%d", run)
+		r.stranded(lease, r.now.Add(time.Duration(i)*time.Second))
+		if err := r.db.Tx(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(), `UPDATE job_history SET run_id = $1 WHERE lease_id = $2`, run, lease)
+
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for range 3 {
+		r.pass()
+		r.now = r.now.Add(time.Minute)
+	}
+
+	if owed := r.owedLeases(); !slices.Contains(owed, "stranded-83:stranded") {
+		t.Fatalf("owed = %v, want the readable stranded job told behind two that could not be read", owed)
+	}
+}
+
+// A JOB THAT RAN IS A MISS ON STRANDED WITHOUT A READ OF GITHUB: ordinary jobs never
+// spend the share of reads a stranded job's branch needs.
+func TestAJobThatRanCostsAStrandedRuleNoRead(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown, c.Match.Branch = config.AlertConditions{Stranded: true}, "0s", "main"
+	}))
+	r.seed(jobRow{lease: "ran", result: "failed", ran: time.Second, age: 30 * time.Second})
+
+	r.pass()
+
+	if got := r.record.readCount(); got != 0 {
+		t.Fatalf("a job that ran cost the stranded rule %d reads of GitHub", got)
+	}
+	if got := r.outcome("ran", "stranded"); got != string(alloc.AlertMiss) {
+		t.Fatalf("the job that ran came to %q, want a miss", got)
+	}
+}
+
+// THE STRANDED JOBS ARE READ ON PAST A PAGE: one decided after a page of others is told
+// in its turn.
+func TestStrandedJobsAreReadOnPastAPage(t *testing.T) {
+	t.Parallel()
+
+	r := started(t, atRule(func(c *config.AlertRule) {
+		c.On, c.Cooldown = config.AlertConditions{Stranded: true}, "0s"
+	}))
+	r.sweep.rows = 1
+	for i, lease := range []string{"first", "second", "third"} {
+		r.stranded(lease, r.now.Add(time.Duration(i)*time.Second))
+	}
+
+	for range 4 {
+		r.pass()
+		r.now = r.now.Add(time.Minute)
+	}
+
+	if got := r.owedLeases(); len(got) != 3 {
+		t.Fatalf("owed = %v, want all three stranded jobs told a page at a time", got)
 	}
 }
 

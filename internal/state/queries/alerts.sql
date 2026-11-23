@@ -41,6 +41,20 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, w
  ORDER BY result_at, lease_id
  LIMIT CAST(@max_rows AS BIGINT);
 
+-- name: ListStrandedJobsForAlerts :many
+-- The launches decided stranded since a moment (#911), oldest decision first from just
+-- past a cursor, (after_decided, after_lease), an empty after_decided the start, and
+-- bounded: a job GitHub stopped offering, which never started, so neither list above
+-- holds it. A pass reads a page and the cursor goes round. The WHERE leads with
+-- migration 85's partial index, word for word.
+SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(repo, '') AS repo, workflow_ref, job_name,
+       CAST(COALESCE(run_id, 0) AS BIGINT) AS run_id, head_branch, stranded_at
+  FROM job_history
+ WHERE stranded = 'stranded' AND stranded_at >= @since
+   AND (stranded_at > @after_decided OR (stranded_at = @after_decided AND lease_id > @after_lease))
+ ORDER BY stranded_at, lease_id
+ LIMIT CAST(@max_rows AS BIGINT);
+
 -- name: InsertAlertRule :exec
 -- Record when this deployment first saw a rule, and only then.
 INSERT INTO alert_rules (name, first_seen_at) VALUES (@name, @first_seen_at)

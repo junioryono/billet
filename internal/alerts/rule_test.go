@@ -57,6 +57,11 @@ func TestEachConditionJudgesAJob(t *testing.T) {
 		{"no queue time recorded", WaitedLong, Job{StartedAt: started}, Later},
 		{"a queue time and no start", WaitedLong, Job{QueuedAt: queued(time.Hour)}, Later},
 
+		{"decided stranded", Stranded, Job{StrandedAt: ruleNow}, Hit},
+		{"a job that ran, stranded", Stranded, Job{StartedAt: started, Result: "succeeded"}, Miss},
+		{"a job still running, stranded", Stranded, Job{StartedAt: started}, Miss},
+		{"neither started nor decided, stranded", Stranded, Job{}, Later},
+
 		{"a condition this binary does not know", Condition("newer"), Job{Result: "failed"}, Later},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

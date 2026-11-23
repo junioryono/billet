@@ -46,6 +46,25 @@ rules:
     notify: [hook]
 `
 
+// STRANDED ALONE IS A CONDITION: a rule about jobs GitHub stopped offering, and nothing
+// else, loads.
+func TestStrandedAloneIsACondition(t *testing.T) {
+	t.Parallel()
+
+	from := "on:\n      disrupted: true\n      running_longer_than: 2h\n      waited_longer_than: 15m\n"
+	if !strings.Contains(goodAlerts, from) {
+		t.Fatal("the good block has changed, so this edit tests nothing")
+	}
+
+	cfg, err := Load(writeConfig(t, alertsYAML(strings.Replace(goodAlerts, from, "on:\n      stranded: true\n", 1))))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if slow := cfg.Server.Alerts.Rules[1]; !slow.On.Stranded {
+		t.Fatalf("rule = %+v, want on.stranded", slow)
+	}
+}
+
 // A BLOCK IN USE LOADS, and what it says is what a reader gets back, defaults included.
 func TestAlertsLoad(t *testing.T) {
 	t.Parallel()
@@ -123,6 +142,8 @@ func TestAlertsRefuse(t *testing.T) {
 		{"a zero duration", "running_longer_than: 2h", "running_longer_than: 0s", "must be positive"},
 		{"a negative wait", "waited_longer_than: 15m", "waited_longer_than: -15m", "must be positive"},
 		{"a step on a running rule", "on:\n      disrupted: true\n", "match: {step: x}\n    on:\n      disrupted: true\n", "match.step takes only"},
+		{"a step on a stranded rule", "on:\n      disrupted: true\n      running_longer_than: 2h\n      waited_longer_than: 15m\n",
+			"match: {step: x}\n    on:\n      failed: true\n      stranded: true\n", "match.step takes only"},
 		{"too many in a row", "in_a_row: 3", "in_a_row: 101", "in_a_row 101 is not between"},
 		{"a negative count", "in_a_row: 3", "in_a_row: -1", "in_a_row -1 is not between"},
 		{"a bad cooldown", "cooldown: 30m", "cooldown: soon", `cooldown "soon" is not a duration`},
@@ -214,5 +235,14 @@ func TestOnlyARuleReadingGitHubAsksForRunRecords(t *testing.T) {
 		if !cfg.AlertsNeedRunRecords() {
 			t.Errorf("a rule naming a %s did not ask", name)
 		}
+	}
+
+	// A RULE ON STRANDED ASKS TOO: billet decides a job stranded only on GitHub's record
+	// of its run, so without `actions: read` the rule could never fire.
+	stranded := &Config{Server: &ServerConfig{Alerts: &AlertsConfig{Rules: []AlertRule{
+		{On: AlertConditions{Stranded: true}},
+	}}}}
+	if !stranded.AlertsNeedRunRecords() {
+		t.Error("a rule on stranded did not ask")
 	}
 }
