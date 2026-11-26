@@ -99,6 +99,15 @@
          {'kind': 'metadata', 'path': billet_ceph_keyring_path},
          {'kind': 'write', 'path': '/etc/modules-load.d/billet-rbd.conf'}] }}
 
+# THE LVM FILTER'S FILE (#922), written whether billet's block goes in or comes
+# out; its copy of the configuration is a private name under the temporary
+# directory class root bound below.
+- name: Bind the LVM filter's destination
+  when: billet_ceph_enabled
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [{'kind': 'write', 'path': billet_lvm_system_dir ~ '/lvmlocal.conf'}] }}
+
 - name: Bind alert installation or cleanup destinations
   ansible.builtin.set_fact:
     billet_retirement_planned_filesystem: >-
