@@ -87,14 +87,20 @@ GitHub ──scale-set messages, REST──▶ control plane ──ledger (SQLit
 | An alert destination's address | an environment variable or file the config names, read when the control plane starts and held in its memory | the control plane | as long as that file or variable; a changed or removed address takes effect at the control plane's next start. Never written to the ledger or a log. |
 | Backups | the packaged backup directory, and an S3 bucket if one is configured ([Backup, restore and recover](../operating/backup-restore-recover.md)) | root and the service account; in the bucket, whatever its policy, IAM and key allow | in the packaged directory, the newest seven, and fewer when the disk needs room; an older one is removed only once the bucket lists it complete. A backup written anywhere outside the packaged directory is never pruned. In the bucket, as its lifecycle keeps them. |
 
-billet reports nothing about its use to anyone. Beyond GitHub, it sends data only where a deployment's configuration sends it:
+billet reports nothing about its use to anyone. Beyond GitHub, it talks only to the services a deployment's configuration chooses. These are the ones that receive its data:
 
 - a PostgreSQL ledger's server, which holds the whole ledger;
 - alert destinations and the backup bucket;
-- on AWS, runner registrations and launch requests to EC2, CodeBuild and Parameter Store, cache content to EBS and S3, and, with `aws-ssm`, the App key and the node-wire authority to Parameter Store;
+- on AWS, the APIs of the services a deployment uses:
+  - EC2 and CodeBuild receive launch requests, and Parameter Store receives runner registrations;
+  - EBS and S3 receive cache content;
+  - with `aws-ssm`, Parameter Store also receives the App key and the node-wire authority;
+  - SQS, IAM, STS, Service Quotas and the Price List API receive questions about the deployment's own queue, instance profile, identity, quotas and instance prices;
 - the site's Ceph cluster;
 - a bare-metal pool's host provider, which receives the hosts it is asked to place;
 - a token broker, which receives each token request;
 - a smart plug `node.monitoring.meter` names, which is asked for the host's power.
+
+A Firecracker host also passes each guest's DNS queries to the upstream resolvers the host role names (1.1.1.1 and 1.0.0.1 by default). The uplink shaper, where it runs, sends ICMP echoes with no payload of billet's to the addresses it probes (1.1.1.1, 8.8.8.8 and 9.9.9.9 by default).
 
 billet fetches its releases, guest images, and the caches' upstream content.
