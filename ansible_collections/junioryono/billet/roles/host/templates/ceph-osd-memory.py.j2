@@ -1,0 +1,86 @@
+#!/usr/bin/python3
+"""Hold each Ceph OSD's memory at billet's target, not cephadm's autotune (#756).
+
+Run by the host role's converge and every five minutes by
+billet-ceph-osd-memory.timer. One pass turns osd_memory_target_autotune off for the
+osd section, removes every narrower autotune setting, sets the section's
+osd_memory_target, and removes every narrower target, in that order: cephadm writes
+a host's target while autotune is on for any daemon there, and the section's target
+is set before a narrower one goes so no OSD falls back to a default between the
+two. A pass that finds nothing to change is the proof the cluster holds exactly
+the section's two values.
+
+WHY A TIMER AND NOT A ONE-SHOT: a cephadm pass already under way when autotune
+goes off decides a host's target and publishes it with no second look
+(serve.py `_autotune_host_memory`, Ceph v20.2.3), and failing the manager over is
+no barrier, since the old manager can still write after the new one is active.
+Nothing writes a target once autotune is off everywhere and every such pass has
+ended, so a stale target that lands late is removed by the next pass, five
+minutes later at most.
+"""
+
+import json
+import subprocess
+import sys
+import time
+
+# The inventory's billet_ceph_osd_memory_target_gib, a whole number checked before
+# the role rendered it, in bytes as `config dump` reports it.
+TARGET = "{{ (billet_ceph_osd_memory_target_gib | int) * 1073741824 }}"
+NAMES = ("osd_memory_target", "osd_memory_target_autotune")
+PASSES = 3
+PAUSE = 2
+
+
+def ceph(*args):
+    done = subprocess.run(["ceph", *args], capture_output=True, text=True, timeout=120, check=False)
+    if done.returncode != 0:
+        sys.exit("billet-ceph-osd-memory: ceph %s failed: %s" % (" ".join(args), done.stderr.strip()))
+    return done.stdout
+
+
+def settings():
+    return [e for e in json.loads(ceph("config", "dump", "--format", "json")) if e["name"] in NAMES]
+
+
+def narrower(e):
+    return e["section"] != "osd" or e["mask"] != ""
+
+
+def who(e):
+    return e["section"] + ("/" + e["mask"] if e["mask"] else "")
+
+
+def section(held, name):
+    return [e["value"] for e in held if not narrower(e) and e["name"] == name]
+
+
+def one_pass():
+    held = settings()
+    actions = []
+    if section(held, "osd_memory_target_autotune") != ["false"]:
+        actions.append(("set", "osd", "osd_memory_target_autotune", "false"))
+    actions += [("rm", who(e), e["name"]) for e in held
+                if e["name"] == "osd_memory_target_autotune" and narrower(e)]
+    if section(held, "osd_memory_target") != [TARGET]:
+        actions.append(("set", "osd", "osd_memory_target", TARGET))
+    actions += [("rm", who(e), e["name"]) for e in held
+                if e["name"] == "osd_memory_target" and narrower(e)]
+    for action in actions:
+        ceph("config", *action)
+        print("changed: ceph config " + " ".join(action), flush=True)
+    return actions
+
+
+def main():
+    for attempt in range(1, PASSES + 1):
+        if not one_pass():
+            return 0
+        if attempt < PASSES:
+            time.sleep(PAUSE)
+    sys.exit("billet-ceph-osd-memory: something still writes OSD memory settings after %d passes: %s"
+             % (PASSES, json.dumps(settings())))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

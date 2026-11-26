@@ -1,19 +1,21 @@
 ---
-- name: Write this cluster's dump and an empty call log
+- name: Write this cluster's settings and an empty call log
   ansible.builtin.copy:
     dest: "{{ billet_gate_tree.path }}/{{ item.name }}"
     content: "{{ item.content }}"
-    mode: "0644"
+    mode: "0666"
   loop:
     - {name: dump.json, content: "{{ billet_gate_case.dump | to_json }}"}
     - {name: calls.log, content: ""}
   loop_control:
     label: "{{ item.name }}"
+  become: true
 
-- name: Start each cluster with its first manager active
+- name: Start the cluster's read count afresh
   ansible.builtin.file:
-    path: "{{ billet_gate_tree.path }}/dump.json.mgr"
+    path: "{{ billet_gate_tree.path }}/dump.json.reads"
     state: absent
+  become: true
 
 - name: Converge the cluster's OSD memory
   block:
@@ -24,26 +26,53 @@
         # AN INCLUDE'S OWN KEYWORDS STOP AT THE INCLUDE: only `apply` reaches the
         # tasks it runs, which is where the fake ceph must be first on PATH.
         apply:
-          environment:
+          environment: &billet_gate_env
             PATH: "{{ billet_gate_tree.path }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             BILLET_GATE_CEPH_LOG: "{{ billet_gate_tree.path }}/calls.log"
             BILLET_GATE_CEPH_DUMP: "{{ billet_gate_tree.path }}/dump.json"
-            BILLET_GATE_CEPHADM_INFLIGHT: "{{ (billet_gate_tree.path ~ '/' ~ billet_gate_case.name | replace(' ', '-') ~ '.inflight') if billet_gate_case.inflight | default(false) else '' }}"
-            BILLET_GATE_CEPHADM_STUBBORN: "{{ '1' if billet_gate_case.stubborn | default(false) else '' }}"
+            BILLET_GATE_STALE_AT: "{{ billet_gate_case.stale_at | default('') }}"
       vars:
         billet_ceph_osd_memory_target_gib: "{{ billet_gate_case.target_gib }}"
+        _billet_osd_memory_root: "{{ billet_gate_tree.path }}/root"
+        _billet_osd_memory_skip_service_control: true
+        _billet_alert_skip_service_control: true
 
     - name: A converge the role had to refuse went ahead
       ansible.builtin.fail:
-        msg: "{{ billet_gate_case.name }}: the role accepted a cluster still holding a narrower target."
+        msg: "{{ billet_gate_case.name }}: the role settled a cluster something kept writing."
       when: billet_gate_case.refused | default(false)
   rescue:
-    - name: Refused by the role's own final check, and only where the case expects it
+    - name: Refused because something kept writing, and only where the case expects it
       ansible.builtin.assert:
         that:
           - billet_gate_case.refused | default(false)
-          - "'Ceph still holds an OSD memory setting' in (ansible_failed_result.msg | default(''))"
-        fail_msg: "{{ billet_gate_case.name }}: {{ ansible_failed_result.msg | default('') }}"
+          - "'something still writes OSD memory settings' in (ansible_failed_result.stderr | default(ansible_failed_result.msg | default('')))"
+        fail_msg: "{{ billet_gate_case.name }}: {{ ansible_failed_result.stderr | default(ansible_failed_result.msg | default('')) }}"
+
+# AS THE TIMER RUNS IT: a stale target lands after the converge, and the installed
+# enforcer, run on its own, takes it out.
+- name: Run the installed enforcer after a stale target lands
+  when: billet_gate_case.late | default(false)
+  block:
+    - name: Land a stale host target after the converge
+      ansible.builtin.copy:
+        dest: "{{ billet_gate_tree.path }}/dump.json"
+        content: "{{ (billet_gate_case.dump + [{'section': 'osd', 'name': 'osd_memory_target', 'value': '182725545984', 'mask': 'host:ubuntu-01'}]) | to_json }}"
+        mode: "0666"
+      become: true
+
+    - name: Run the installed enforcer as its timer does
+      ansible.builtin.command:
+        argv: ["{{ billet_gate_tree.path }}/root/usr/local/libexec/billet-ceph-osd-memory"]
+      environment: *billet_gate_env
+      register: billet_gate_timer_run
+      changed_when: false
+      become: true
+
+    - name: The timer's run removed the stale target
+      ansible.builtin.assert:
+        that: "'changed: ceph config rm osd/host:ubuntu-01 osd_memory_target' in billet_gate_timer_run.stdout"
+        fail_msg: "{{ billet_gate_case.name }}: the timer's run said {{ billet_gate_timer_run.stdout_lines }}"
 
 - name: Read what the role asked of ceph
   ansible.builtin.slurp:
@@ -56,7 +85,9 @@
   register: billet_gate_held
 
 - name: The role made exactly this cluster's calls, in order
-  when: not (billet_gate_case.refused | default(false))
+  when:
+    - not (billet_gate_case.refused | default(false))
+    - not (billet_gate_case.late | default(false))
   ansible.builtin.assert:
     that: (billet_gate_calls.content | b64decode).splitlines() == billet_gate_case.calls
     fail_msg: >-
@@ -68,11 +99,23 @@
     that: >-
       (billet_gate_held.content | b64decode | from_json
        | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune'])
-       | rejectattr('section', 'equalto', 'osd') | list | length) == 0
+       | map(attribute='section') | list) == ['osd', 'osd']
       and (billet_gate_held.content | b64decode | from_json
            | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune'])
            | rejectattr('mask', 'equalto', '') | list | length) == 0
+      and (billet_gate_held.content | b64decode | from_json | selectattr('name', 'equalto', 'osd_memory_target')
+           | map(attribute='value') | list) == ['17179869184']
     fail_msg: "{{ billet_gate_case.name }}: the cluster holds {{ billet_gate_held.content | b64decode }}"
   when:
     - (billet_gate_case.target_gib | int) > 0
     - not (billet_gate_case.refused | default(false))
+
+- name: Ask whether the enforcer is installed
+  ansible.builtin.stat:
+    path: "{{ billet_gate_tree.path }}/root/usr/local/libexec/billet-ceph-osd-memory"
+  register: billet_gate_enforcer
+
+- name: The enforcer is installed exactly where the role holds the target
+  ansible.builtin.assert:
+    that: billet_gate_enforcer.stat.exists == ((billet_gate_case.target_gib | int) > 0)
+    fail_msg: "{{ billet_gate_case.name }}: the enforcer is {{ 'there' if billet_gate_enforcer.stat.exists else 'absent' }}"
