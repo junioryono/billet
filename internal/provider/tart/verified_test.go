@@ -851,12 +851,18 @@ func TestAStoredDeadlineSurvivesCouldNotTellAndAnUnpromote(t *testing.T) {
 	}
 }
 
+// imageVerdictWindow is the probe window of a test whose guest must answer for its
+// agent before a check the image fails: the failing check is retried until the
+// window ends, so the window is the test's cost, and 200 ms left a loaded CI runner
+// no room for the agent's first answer (#919), which made the verdict the host's.
+const imageVerdictWindow = 2 * time.Second
+
 // NEVER QUOTE THE GUEST: a third party built this image, and what it prints is its own.
 func TestAProbeFailureQuotesNothingTheGuestSaid(t *testing.T) {
 	t.Parallel()
 
 	s, p := verifiedStub(t)
-	p.probeWindow = 200 * time.Millisecond
+	p.probeWindow = imageVerdictWindow
 
 	writeExecutable(t, filepath.Join(s.guestHome, "actions-runner", "bin", "Runner.Listener"),
 		"#!/bin/sh\necho GUESTWROTETHIS\necho GUESTWROTETHIS >&2\nexit 1\n")
@@ -907,7 +913,7 @@ func TestEachCheckOfAGuestStopsAVerification(t *testing.T) {
 			t.Parallel()
 
 			s, p := verifiedStub(t)
-			p.probeWindow = 200 * time.Millisecond
+			p.probeWindow = imageVerdictWindow
 			setMacOS(t, s, p, tc.os)
 
 			writeExecutable(t, filepath.Join(s.guestBin, tc.tool),
@@ -3104,7 +3110,7 @@ func TestADigestThatFailedWaitsBeforeTheRefreshTriesAgain(t *testing.T) {
 	s, p := verifiedStub(t)
 	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
 	p.now = func() time.Time { return now }
-	p.probeWindow = 200 * time.Millisecond
+	p.probeWindow = imageVerdictWindow
 
 	writeExecutable(t, filepath.Join(s.guestHome, "actions-runner", "bin", "Runner.Listener"), "#!/bin/sh\nexit 1\n")
 
@@ -3260,7 +3266,7 @@ func TestAPendingBaseThatFailsItsProbeGoes(t *testing.T) {
 	}
 
 	p.macOSLimit = func() (int, bool, error) { return 2, true, nil }
-	p.probeWindow = 200 * time.Millisecond
+	p.probeWindow = imageVerdictWindow
 
 	writeExecutable(t, filepath.Join(s.guestHome, "actions-runner", "bin", "Runner.Listener"), "#!/bin/sh\nexit 1\n")
 
@@ -3358,7 +3364,7 @@ func TestAFailureOfTheImageIsAVerdict(t *testing.T) {
 		}},
 		{"a toolchain that does not answer", func(t *testing.T, s *stub, p *Provider, _ *VerifyOptions) {
 			t.Helper()
-			p.probeWindow = 200 * time.Millisecond
+			p.probeWindow = imageVerdictWindow
 			writeExecutable(t, filepath.Join(s.guestBin, "docker"), "#!/bin/sh\nexit 1\n")
 		}},
 		{"a date already stored", func(t *testing.T, _ *stub, p *Provider, _ *VerifyOptions) {
