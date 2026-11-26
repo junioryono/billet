@@ -5,8 +5,9 @@
 # 2026-11-25 an OSD killed for memory could not start again for half an hour: its
 # activation's scan read the guests' mapped RBD images, whose data lived only on
 # that OSD, and the scan could not return until the OSD it was starting was up.
-# Rejected by the filter, a device is never opened (measured with strace on
-# 2.03.16: a loop device opened twice by `pvs`, then never by `pvs` or `lvs`).
+# Rejected by the filter, a device is never opened: strace counted a loop device
+# opened twice by an unfiltered `pvs` and never by a filtered `pvs` or `lvs`, on
+# LVM 2.03.16 and on the reference host's 2.03.31 (2026-11-26).
 # udev's pvscan on each image billet maps is spared the read too.
 #
 # IN lvmlocal.conf, WHICH LVM MERGES OVER lvm.conf: the package owns lvm.conf. A
