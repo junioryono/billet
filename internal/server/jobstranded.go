@@ -88,7 +88,7 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 			continue
 		}
 		// OLDEST FIRST, so every launch after this one is younger still.
-		if age < strandedAfter {
+		if age < s.strandedWait() {
 			rounded = true
 
 			break
@@ -186,6 +186,16 @@ func (s *Server) findStranded(ctx context.Context, targets map[string]Target, sw
 		default:
 		}
 	}
+}
+
+// strandedWait is how long after a launch that started nothing its job is first
+// asked about: strandedAfter, unless WithStrandedAfter replaced it.
+func (s *Server) strandedWait() time.Duration {
+	if s.strandedAfterOverride > 0 {
+		return s.strandedAfterOverride
+	}
+
+	return strandedAfter
 }
 
 // strandedTierWaitsForNothing says whether a tier was, by its own recent report,

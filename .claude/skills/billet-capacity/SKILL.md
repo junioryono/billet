@@ -85,7 +85,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 - `internal/alloc`: `TestConcurrentReservationsNeverOvercommit`, the barrier tests in `barrier_test.go`, the transition table tests, `TestTheForceDestroyStatementIsWhatTheGoSliceSays`, `TestBothDisruptionStatementsPinTheirWholeStatement`.
 - `internal/server`: `heartbeat_budget_test.go`, `sessionrecovery_test.go`, `drain_nondestructive_test.go`, `forcecallers_test.go`, `sessionconflict_test.go`, `stranded_test.go`.
-- `internal/e2e`: `computebarrier_test.go`, `holdergone_test.go` (and the live variant), `restart_test.go`, `multiday_test.go`, `wire_test.go`.
+- `internal/e2e`: `computebarrier_test.go`, `holdergone_test.go` (and the live variant), `restart_test.go`, `multiday_test.go`, `wire_test.go`, `stranded_test.go` (a launch no host took, withdrawn on GitHub's cancellation, decided stranded, its run cancelled and re-run once, #911).
 - `internal/integration/sessionreplacement_test.go`: `TestLiveSessionReplacement` records the 409 rather than asserting it.
 
 ## Related skills

@@ -561,6 +561,11 @@ type stackConfig struct {
 	// retryDisrupted, when set, gives the stack's tier retry.disrupted, and the
 	// loop a pace a test can wait out.
 	retryDisrupted int
+	// retryStranded, when set, gives the stack's tier retry.stranded.
+	retryStranded bool
+	// strandedAfter, when set, replaces how long a launch that started nothing waits
+	// before its job is asked about.
+	strandedAfter time.Duration
 	// nodeDrainTimeout is the node's `drain_timeout`, which decides when a drain
 	// starts SAYING it is long and nothing else.
 	//
@@ -659,6 +664,17 @@ func withConfigure(fn func(*config.Config)) stackOpt {
 // withRetryDisrupted sets retry.disrupted on every tier.
 func withRetryDisrupted(n int) stackOpt {
 	return func(c *stackConfig) { c.retryDisrupted = n }
+}
+
+// withRetryStranded sets retry.stranded on the stack's tier.
+func withRetryStranded() stackOpt {
+	return func(c *stackConfig) { c.retryStranded = true }
+}
+
+// withStrandedAfter shortens the wait before a launch that started nothing is asked
+// about, which is otherwise fifteen minutes.
+func withStrandedAfter(d time.Duration) stackOpt {
+	return func(c *stackConfig) { c.strandedAfter = d }
 }
 
 // withReapInterval replaces the harness's reaper tick.
@@ -780,8 +796,8 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		tiers[0].Trust = config.WorkloadUntrusted
 		tiers[0].Workflows = nil
 	}
-	if sc.retryDisrupted > 0 {
-		tiers[0].Retry = &config.TierRetry{Disrupted: sc.retryDisrupted}
+	if sc.retryDisrupted > 0 || sc.retryStranded {
+		tiers[0].Retry = &config.TierRetry{Disrupted: sc.retryDisrupted, Stranded: sc.retryStranded}
 	}
 
 	// THE TARGETS, ASSEMBLED THE WAY THE CLI ASSEMBLES THEM: a client per
@@ -860,6 +876,9 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	}
 	if sc.now != nil {
 		steering.Allocator = append(steering.Allocator, alloc.WithClock(sc.now))
+	}
+	if sc.strandedAfter > 0 {
+		steering.Server = append(steering.Server, server.WithStrandedAfter(sc.strandedAfter))
 	}
 
 	assembledCfg := harnessConfig(dir, 8, 16*config.GiB, tiers)
