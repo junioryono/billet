@@ -62,6 +62,13 @@ func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 	}
 
 	switch {
+	case !ok && acceptsEveryComponent(accepted):
+		// NOTHING THE RECORD COULD ADD: this node's own list already names every
+		// component this billet installs, so the deployment's acceptance, whatever
+		// it is, completes the same generation. That is a proof, not a guess, and
+		// it lets a fresh host pull its first image before it has registered,
+		// which it cannot do without the kernel that pull installs (#730).
+		return accepted, nil
 	case !ok:
 		return nil, errAcceptanceUnknown
 	case !rec.Carried:
@@ -85,4 +92,16 @@ func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 	slices.Sort(accepted)
 
 	return accepted, nil
+}
+
+// acceptsEveryComponent reports whether accepted names every component this build
+// installs.
+func acceptsEveryComponent(accepted []config.ImageComponent) bool {
+	for _, c := range config.ImageComponents() {
+		if !slices.Contains(accepted, c) {
+			return false
+		}
+	}
+
+	return true
 }

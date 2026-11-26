@@ -217,6 +217,87 @@ func TestWhatCannotBeToldRefusesRatherThanInstallLess(t *testing.T) {
 	}
 }
 
+// A NODE THAT ALREADY ACCEPTS EVERYTHING NEEDS NO RECORD (#730): the deployment's
+// acceptance could add nothing, so a fresh host completes its first pull before it
+// has registered. What a record says is still read where there is one, so a
+// record naming a component this build cannot install, one that does not parse,
+// and one with no identity to compare it with all still refuse.
+func TestANodeThatAcceptsEverythingNeedsNoRecord(t *testing.T) {
+	every := "images:\n  accept: [android-sdk, codeql, firefox, google-chrome, microsoft-edge]\n"
+
+	for name, stage := range map[string]func(t *testing.T, nodeDir string){
+		"no record": func(t *testing.T, _ string) { t.Helper() },
+		"another deployment's record": func(t *testing.T, nodeDir string) {
+			t.Helper()
+
+			if err := imageaccept.Write(nodeDir, "fedcba9876543210fedcba9876543210", true,
+				[]string{"codeql"}, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path, nodeDir := acceptanceConfig(t, every)
+			stage(t, nodeDir)
+
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := acceptedComponents(cfg)
+			if err != nil || !slices.Equal(got, config.ImageComponents()) {
+				t.Fatalf("accepted %v (%v), want every component", got, err)
+			}
+		})
+	}
+
+	for name, tc := range map[string]struct {
+		stage func(t *testing.T, cfg *config.Config, nodeDir string)
+		says  string
+	}{
+		"a component this build does not install": {func(t *testing.T, _ *config.Config, nodeDir string) {
+			t.Helper()
+
+			if err := imageaccept.Write(nodeDir, acceptanceDeployment, true,
+				[]string{"visual-studio"}, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}, `"visual-studio", which this billet does not install`},
+		"a record that does not parse": {func(t *testing.T, _ *config.Config, nodeDir string) {
+			t.Helper()
+
+			if err := os.WriteFile(imageaccept.Path(nodeDir), []byte("{"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, "is not a record this node wrote"},
+		"no deployment identity": {func(t *testing.T, cfg *config.Config, nodeDir string) {
+			t.Helper()
+
+			cfg.Server.IdentityDir = t.TempDir()
+			if err := imageaccept.Write(nodeDir, acceptanceDeployment, true, []string{"codeql"},
+				time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}, "has no deployment identity to compare it with"},
+	} {
+		t.Run("still refused: "+name, func(t *testing.T) {
+			path, nodeDir := acceptanceConfig(t, every)
+
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			tc.stage(t, cfg, nodeDir)
+
+			if got, err := acceptedComponents(cfg); err == nil || !strings.Contains(err.Error(), tc.says) {
+				t.Fatalf("answered %v, %v; want a refusal saying %q", got, err, tc.says)
+			}
+		})
+	}
+}
+
 // THE REFRESH COMPLETES WITH WHAT THE CONTROL PLANE ACCEPTS: a newest generation
 // that lacks a component only the deployment's record accepts is pulled again.
 func TestARefreshPullsForAComponentOnlyTheControlPlaneAccepts(t *testing.T) {
