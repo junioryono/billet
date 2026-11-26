@@ -371,6 +371,13 @@ billet_ceph_osd_mclock_profile: high_client_ops
 # (node.max_memory). 0 leaves a cluster that also serves something else to its own
 # policy.
 billet_ceph_osd_memory_target_gib: 4
+# Keep LVM's scans off the RBD and NBD devices this host maps (junioryono/billet#922):
+# a scan that reads a mapped image whose data is on a stopped OSD cannot return, and
+# cephadm's OSD activation runs one. Written to lvmlocal.conf under
+# billet_lvm_system_dir; false removes it, for a host whose own lvm.conf filter
+# already rejects both.
+billet_lvm_rbd_filter: true
+billet_lvm_system_dir: /etc/lvm
 # The image a bootstrap runs the Ceph daemons from. Empty, the default, is the tag
 # of the host's own ceph-common release (quay.io/ceph/ceph:v<major.minor.patch>), so
 # the daemons and every client on the host agree; cephadm's own default is a floating

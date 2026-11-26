@@ -1100,6 +1100,12 @@ jobs:
       - name: Prove the host role holds each OSD's memory at the inventory's target
         if: matrix.group == 'shape'
         run: scripts/gates/scenario.sh ceph-osd-memory-check
+      # An OSD's activation scanned the guests' mapped RBD images, whose data was
+      # on that OSD, and could not return for half an hour (#922). Escalated, as
+      # the role is, with the runner's own lvmconfig reading the case's directory.
+      - name: Prove the host role keeps LVM's scans off mapped RBD images
+        if: matrix.group == 'shape'
+        run: scripts/gates/scenario.sh lvm-rbd-filter-check
 
       # The PostgreSQL ledger shipped and the role read
       # server.state_dir, which such a config does not have — so every one of

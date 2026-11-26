@@ -1,0 +1,22 @@
+---
+- name: Converge a host the role must refuse
+  block:
+    - name: Include the role's LVM filter tasks
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: lvm-rbd-filter
+      vars:
+        billet_lvm_system_dir: "{{ billet_gate_tree.path }}/{{ billet_gate_refused.dir }}"
+
+    - name: The host was not refused
+      ansible.builtin.fail:
+        msg: "{{ billet_gate_refused.dir }}: the role went ahead where it should have refused."
+  rescue:
+    - name: Refused for the reason the case names, before billet's block was written
+      ansible.builtin.assert:
+        that:
+          - billet_gate_refused.says in ansible_failed_result.msg
+          - >-
+            billet_gate_refused.untouched == ''
+            or not (billet_gate_tree.path ~ '/' ~ billet_gate_refused.dir ~ '/' ~ billet_gate_refused.untouched) is exists
+        fail_msg: "{{ billet_gate_refused.dir }}: {{ ansible_failed_result.msg }}"

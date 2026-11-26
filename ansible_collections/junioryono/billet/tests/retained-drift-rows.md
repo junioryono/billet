@@ -161,6 +161,14 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/ceph-osd-memory.yml / Wait for a manager to be active again | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph-osd-memory.yml / Remove every narrower memory target | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph-osd-memory.yml / Read what the cluster now holds | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/lvm-rbd-filter.yml / Keep LVM's scans off mapped RBD and NBD devices | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/lvm-rbd-filter.yml / Read the global filter LVM applies | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/lvm-rbd-filter.yml / Make a directory for a copy of the LVM configuration | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/lvm-rbd-filter.yml / Copy the LVM configuration files | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/lvm-rbd-filter.yml / Take billet's block out of the copy | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/lvm-rbd-filter.yml / Read any global filter the operator's configuration sets | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/lvm-rbd-filter.yml / Read whether LVM uses a devices file here | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/lvm-rbd-filter.yml / Remove the copy | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Create the scoped billet Ceph identity | inventory:billet_ceph_keyring_path |
 | tasks/ceph.yml / Protect the billet Ceph keyring | inventory:billet_ceph_keyring_path |
 | tasks/ceph.yml / Verify the scoped Ceph identity can read both pools | parity:read-only Ceph/RBD observation; exact command and inventory operands are fingerprinted |

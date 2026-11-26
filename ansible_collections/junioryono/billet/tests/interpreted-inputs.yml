@@ -33,6 +33,9 @@
         - {name: OSD memory with a unit refused, values: {billet_ceph_osd_memory_target_gib: 16GiB}, refuses: billet_ceph_osd_memory_target_gib}
         - {name: OSD memory negative refused, values: {billet_ceph_osd_memory_target_gib: -1}, refuses: billet_ceph_osd_memory_target_gib}
         - {name: OSD memory as a switch refused, values: {billet_ceph_osd_memory_target_gib: true}, refuses: billet_ceph_osd_memory_target_gib}
+        - {name: LVM filter switched off, values: {billet_lvm_rbd_filter: false}, refuses: ''}
+        - {name: LVM filter as a string refused, values: {billet_lvm_rbd_filter: 'false'}, refuses: billet_lvm_rbd_filter}
+        - {name: LVM directory relative refused, values: {billet_lvm_system_dir: etc/lvm}, refuses: billet_lvm_system_dir}
       loop_control:
         loop_var: billet_gate_input_case
         label: "{{ billet_gate_input_case.name }}"
