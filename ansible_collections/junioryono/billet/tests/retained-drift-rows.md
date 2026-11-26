@@ -156,9 +156,10 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/ceph-osd-memory.yml / Stop cephadm sizing each OSD from the whole host | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph-osd-memory.yml / Hold each OSD's memory at the inventory's target | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph-osd-memory.yml / Remove every narrower autotune setting | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph-osd-memory.yml / Read which manager is active | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph-osd-memory.yml / Fail the active manager over, ending any autotune pass under way | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph-osd-memory.yml / Wait for a manager to be active again | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph-osd-memory.yml / Remove every narrower memory target | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
-| tasks/ceph-osd-memory.yml / Read the OSD memory settings again | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
-| tasks/ceph-osd-memory.yml / Remove what was written in the meantime | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph-osd-memory.yml / Read what the cluster now holds | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Create the scoped billet Ceph identity | inventory:billet_ceph_keyring_path |
 | tasks/ceph.yml / Protect the billet Ceph keyring | inventory:billet_ceph_keyring_path |

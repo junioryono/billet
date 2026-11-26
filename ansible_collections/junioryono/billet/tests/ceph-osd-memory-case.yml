@@ -10,20 +10,40 @@
   loop_control:
     label: "{{ item.name }}"
 
+- name: Start each cluster with its first manager active
+  ansible.builtin.file:
+    path: "{{ billet_gate_tree.path }}/dump.json.mgr"
+    state: absent
+
 - name: Converge the cluster's OSD memory
-  ansible.builtin.include_role:
-    name: junioryono.billet.host
-    tasks_from: ceph-osd-memory
-    # AN INCLUDE'S OWN KEYWORDS STOP AT THE INCLUDE: only `apply` reaches the
-    # tasks it runs, which is where the fake ceph must be first on PATH.
-    apply:
-      environment:
-        PATH: "{{ billet_gate_tree.path }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        BILLET_GATE_CEPH_LOG: "{{ billet_gate_tree.path }}/calls.log"
-        BILLET_GATE_CEPH_DUMP: "{{ billet_gate_tree.path }}/dump.json"
-        BILLET_GATE_CEPHADM_INFLIGHT: "{{ (billet_gate_tree.path ~ '/' ~ billet_gate_case.name | replace(' ', '-') ~ '.inflight') if billet_gate_case.inflight | default(false) else '' }}"
-  vars:
-    billet_ceph_osd_memory_target_gib: "{{ billet_gate_case.target_gib }}"
+  block:
+    - name: Include the role's OSD memory tasks
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: ceph-osd-memory
+        # AN INCLUDE'S OWN KEYWORDS STOP AT THE INCLUDE: only `apply` reaches the
+        # tasks it runs, which is where the fake ceph must be first on PATH.
+        apply:
+          environment:
+            PATH: "{{ billet_gate_tree.path }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            BILLET_GATE_CEPH_LOG: "{{ billet_gate_tree.path }}/calls.log"
+            BILLET_GATE_CEPH_DUMP: "{{ billet_gate_tree.path }}/dump.json"
+            BILLET_GATE_CEPHADM_INFLIGHT: "{{ (billet_gate_tree.path ~ '/' ~ billet_gate_case.name | replace(' ', '-') ~ '.inflight') if billet_gate_case.inflight | default(false) else '' }}"
+            BILLET_GATE_CEPHADM_STUBBORN: "{{ '1' if billet_gate_case.stubborn | default(false) else '' }}"
+      vars:
+        billet_ceph_osd_memory_target_gib: "{{ billet_gate_case.target_gib }}"
+
+    - name: A converge the role had to refuse went ahead
+      ansible.builtin.fail:
+        msg: "{{ billet_gate_case.name }}: the role accepted a cluster still holding a narrower target."
+      when: billet_gate_case.refused | default(false)
+  rescue:
+    - name: Refused by the role's own final check, and only where the case expects it
+      ansible.builtin.assert:
+        that:
+          - billet_gate_case.refused | default(false)
+          - "'Ceph still holds an OSD memory setting' in (ansible_failed_result.msg | default(''))"
+        fail_msg: "{{ billet_gate_case.name }}: {{ ansible_failed_result.msg | default('') }}"
 
 - name: Read what the role asked of ceph
   ansible.builtin.slurp:
@@ -36,6 +56,7 @@
   register: billet_gate_held
 
 - name: The role made exactly this cluster's calls, in order
+  when: not (billet_gate_case.refused | default(false))
   ansible.builtin.assert:
     that: (billet_gate_calls.content | b64decode).splitlines() == billet_gate_case.calls
     fail_msg: >-
@@ -52,4 +73,6 @@
            | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune'])
            | rejectattr('mask', 'equalto', '') | list | length) == 0
     fail_msg: "{{ billet_gate_case.name }}: the cluster holds {{ billet_gate_held.content | b64decode }}"
-  when: (billet_gate_case.target_gib | int) > 0
+  when:
+    - (billet_gate_case.target_gib | int) > 0
+    - not (billet_gate_case.refused | default(false))

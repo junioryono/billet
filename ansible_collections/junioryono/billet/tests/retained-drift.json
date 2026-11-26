@@ -2541,26 +2541,35 @@
         "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
       ]
     },
-    "tasks/ceph-osd-memory.yml / Read the OSD memory settings again": {
-      "task": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"config\",\"dump\",\"--format\",\"json\"]},\"become\":true,\"changed_when\":false,\"name\":\"Read the OSD memory settings again\",\"register\":\"billet_ceph_config_again\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"not ansible_check_mode\"]}",
-      "contexts": [
-        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph-osd-memory.yml\",\"name\":\"Hold each OSD's memory at the inventory's target, not cephadm's autotune\"}}]"
-      ],
-      "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
-      ]
-    },
-    "tasks/ceph-osd-memory.yml / Remove what was written in the meantime": {
-      "task": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"config\",\"rm\",\"{{ item.section ~ (('/' ~ item.mask) if item.mask | length > 0 else '') }}\",\"{{ item.name }}\"]},\"become\":true,\"changed_when\":true,\"loop\":\"{{ billet_ceph_config_again.stdout | from_json\\n   | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune'])\\n   | sort(attribute='name', reverse=true) | list }}\",\"loop_control\":{\"label\":\"{{ item.section }} {{ item.mask }} {{ item.name }}\"},\"name\":\"Remove what was written in the meantime\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"not ansible_check_mode\",\"item.section != 'osd' or item.mask | length > 0\"]}",
-      "contexts": [
-        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph-osd-memory.yml\",\"name\":\"Hold each OSD's memory at the inventory's target, not cephadm's autotune\"}}]"
-      ],
-      "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
-      ]
-    },
     "tasks/ceph-osd-memory.yml / Read what the cluster now holds": {
       "task": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"config\",\"dump\",\"--format\",\"json\"]},\"become\":true,\"changed_when\":false,\"name\":\"Read what the cluster now holds\",\"register\":\"billet_ceph_config_held\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"not ansible_check_mode\"]}",
+      "contexts": [
+        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph-osd-memory.yml\",\"name\":\"Hold each OSD's memory at the inventory's target, not cephadm's autotune\"}}]"
+      ],
+      "sources": [
+        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+      ]
+    },
+    "tasks/ceph-osd-memory.yml / Read which manager is active": {
+      "task": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"mgr\",\"stat\",\"--format\",\"json\"]},\"become\":true,\"changed_when\":false,\"name\":\"Read which manager is active\",\"register\":\"billet_ceph_mgr_before\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"billet_ceph_osd_memory_autotuned | bool\",\"not ansible_check_mode\"]}",
+      "contexts": [
+        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph-osd-memory.yml\",\"name\":\"Hold each OSD's memory at the inventory's target, not cephadm's autotune\"}}]"
+      ],
+      "sources": [
+        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+      ]
+    },
+    "tasks/ceph-osd-memory.yml / Fail the active manager over, ending any autotune pass under way": {
+      "task": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"mgr\",\"fail\",\"{{ (billet_ceph_mgr_before.stdout | from_json).active_name }}\"]},\"become\":true,\"changed_when\":true,\"name\":\"Fail the active manager over, ending any autotune pass under way\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"billet_ceph_osd_memory_autotuned | bool\",\"not ansible_check_mode\"]}",
+      "contexts": [
+        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph-osd-memory.yml\",\"name\":\"Hold each OSD's memory at the inventory's target, not cephadm's autotune\"}}]"
+      ],
+      "sources": [
+        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+      ]
+    },
+    "tasks/ceph-osd-memory.yml / Wait for a manager to be active again": {
+      "task": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"mgr\",\"stat\",\"--format\",\"json\"]},\"become\":true,\"changed_when\":false,\"delay\":2,\"name\":\"Wait for a manager to be active again\",\"register\":\"billet_ceph_mgr_after\",\"retries\":90,\"until\":\"(billet_ceph_mgr_after.stdout | from_json).epoch > (billet_ceph_mgr_before.stdout | from_json).epoch and (billet_ceph_mgr_after.stdout | from_json).available\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"billet_ceph_osd_memory_autotuned | bool\",\"not ansible_check_mode\"]}",
       "contexts": [
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph-osd-memory.yml\",\"name\":\"Hold each OSD's memory at the inventory's target, not cephadm's autotune\"}}]"
       ],
@@ -2629,8 +2638,9 @@
     "tasks/cache-tls.yml / Install the EC2 cache TLS certificate": "{\"ansible.builtin.copy\":{\"dest\":\"{{ billet_effective_config.node.cache.tls_cert }}\",\"group\":\"root\",\"mode\":\"0644\",\"owner\":\"root\",\"src\":\"{{ billet_cache_tls_cert_src }}\"},\"become\":true,\"name\":\"Install the EC2 cache TLS certificate\",\"register\":\"billet_cache_tls_cert_install\",\"when\":\"billet_cache_tls_cert_src | length > 0\"}",
     "tasks/cache-tls.yml / Install the EC2 cache TLS private key": "{\"ansible.builtin.copy\":{\"dest\":\"{{ billet_effective_config.node.cache.tls_key }}\",\"group\":\"root\",\"mode\":\"0600\",\"owner\":\"root\",\"src\":\"{{ billet_cache_tls_key_src }}\"},\"become\":true,\"name\":\"Install the EC2 cache TLS private key\",\"no_log\":true,\"register\":\"billet_cache_tls_key_install\",\"when\":\"billet_cache_tls_key_src | length > 0\"}",
     "tasks/ceph-osd-memory.yml / Read the cluster's OSD memory settings": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"config\",\"dump\",\"--format\",\"json\"]},\"become\":true,\"changed_when\":false,\"check_mode\":false,\"name\":\"Read the cluster's OSD memory settings\",\"register\":\"billet_ceph_config_dump\",\"when\":\"(billet_ceph_osd_memory_target_gib | int) > 0\"}",
-    "tasks/ceph-osd-memory.yml / Find the OSD memory settings the osd section holds": "{\"ansible.builtin.set_fact\":{\"billet_ceph_osd_memory_entries\":\"{{ billet_ceph_config_dump.stdout | from_json\\n   | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune']) | list }}\",\"billet_ceph_osd_memory_target_bytes\":\"{{ ((billet_ceph_osd_memory_target_gib | int) * 1073741824) | string }}\"},\"name\":\"Find the OSD memory settings the osd section holds\",\"when\":\"(billet_ceph_osd_memory_target_gib | int) > 0\"}",
-    "tasks/ceph-osd-memory.yml / Read the OSD memory settings again": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"config\",\"dump\",\"--format\",\"json\"]},\"become\":true,\"changed_when\":false,\"name\":\"Read the OSD memory settings again\",\"register\":\"billet_ceph_config_again\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"not ansible_check_mode\"]}",
+    "tasks/ceph-osd-memory.yml / Find the OSD memory settings the osd section holds": "{\"ansible.builtin.set_fact\":{\"billet_ceph_osd_memory_autotuned\":\"{{ billet_ceph_config_dump.stdout | from_json | selectattr('name', 'equalto', 'osd_memory_target_autotune')\\n   | selectattr('value', 'equalto', 'true') | list | length > 0 }}\",\"billet_ceph_osd_memory_entries\":\"{{ billet_ceph_config_dump.stdout | from_json\\n   | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune']) | list }}\",\"billet_ceph_osd_memory_target_bytes\":\"{{ ((billet_ceph_osd_memory_target_gib | int) * 1073741824) | string }}\"},\"name\":\"Find the OSD memory settings the osd section holds\",\"when\":\"(billet_ceph_osd_memory_target_gib | int) > 0\"}",
+    "tasks/ceph-osd-memory.yml / Read which manager is active": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"mgr\",\"stat\",\"--format\",\"json\"]},\"become\":true,\"changed_when\":false,\"name\":\"Read which manager is active\",\"register\":\"billet_ceph_mgr_before\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"billet_ceph_osd_memory_autotuned | bool\",\"not ansible_check_mode\"]}",
+    "tasks/ceph-osd-memory.yml / Wait for a manager to be active again": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"mgr\",\"stat\",\"--format\",\"json\"]},\"become\":true,\"changed_when\":false,\"delay\":2,\"name\":\"Wait for a manager to be active again\",\"register\":\"billet_ceph_mgr_after\",\"retries\":90,\"until\":\"(billet_ceph_mgr_after.stdout | from_json).epoch > (billet_ceph_mgr_before.stdout | from_json).epoch and (billet_ceph_mgr_after.stdout | from_json).available\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"billet_ceph_osd_memory_autotuned | bool\",\"not ansible_check_mode\"]}",
     "tasks/ceph-osd-memory.yml / Read what the cluster now holds": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"config\",\"dump\",\"--format\",\"json\"]},\"become\":true,\"changed_when\":false,\"name\":\"Read what the cluster now holds\",\"register\":\"billet_ceph_config_held\",\"when\":[\"(billet_ceph_osd_memory_target_gib | int) > 0\",\"not ansible_check_mode\"]}",
     "tasks/ceph.yml / Check whether Ceph is already configured": "{\"ansible.builtin.stat\":{\"path\":\"/etc/ceph/ceph.conf\"},\"name\":\"Check whether Ceph is already configured\",\"register\":\"billet_ceph_conf\"}",
     "tasks/ceph.yml / Read the release of the host's Ceph client": "{\"ansible.builtin.command\":{\"argv\":[\"dpkg-query\",\"-W\",\"-f=${Version}\",\"ceph-common\"]},\"changed_when\":false,\"check_mode\":false,\"name\":\"Read the release of the host's Ceph client\",\"register\":\"billet_ceph_client_release\",\"when\":[\"not billet_ceph_conf.stat.exists\",\"billet_ceph_container_image | length == 0\"]}",

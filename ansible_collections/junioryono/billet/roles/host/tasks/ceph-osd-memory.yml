@@ -11,10 +11,17 @@
 # AUTOTUNE GOES FIRST, EVERYWHERE: cephadm rewrites a host's target while autotune
 # is on for any daemon there, and keeps the targets it finds once it is off for all
 # of them, so a target removed while one daemon's autotune is still on can come
-# back and stay. The section's target is set before any narrower one is removed,
-# so no OSD falls back to a default between the two. Then the settings are read
-# again, anything cephadm wrote in the meantime is removed once more, and what is
-# left must be exactly the osd section's two values. Read first, so a converge
+# back and stay. A pass already under way when autotune goes off decides a target
+# and publishes it with no second look (serve.py `_autotune_host_memory`, Ceph
+# v20.2.3), so it can still write after any read here; it runs on the active
+# manager, and failing the manager over ends it, so whatever it wrote is in the
+# cluster before the next manager is active, and that manager starts with autotune
+# off, which writes no target (autotune.py `tune`). cephadm's own upgrade fails its
+# manager over the same way. Only when autotune was on somewhere, since otherwise
+# no pass can be deciding a target. The section's target is set before any
+# narrower one is removed, so no OSD falls back to a default between the two.
+# Then the settings are read
+# again, and what is left must be exactly the osd section's two values. Read first, so a converge
 # reports changed only for what it changed. 0 leaves a shared cluster's own policy
 # alone.
 - name: Read the cluster's OSD memory settings
@@ -35,6 +42,10 @@
     # integer under native templating, equals no dumped value, and would set the
     # target again on every converge.
     billet_ceph_osd_memory_target_bytes: "{{ ((billet_ceph_osd_memory_target_gib | int) * 1073741824) | string }}"
+    # Whether cephadm could be deciding a target now: autotune on for any daemon.
+    billet_ceph_osd_memory_autotuned: >-
+      {{ billet_ceph_config_dump.stdout | from_json | selectattr('name', 'equalto', 'osd_memory_target_autotune')
+         | selectattr('value', 'equalto', 'true') | list | length > 0 }}
   when: (billet_ceph_osd_memory_target_gib | int) > 0
 
 - name: Stop cephadm sizing each OSD from the whole host
@@ -61,6 +72,43 @@
   changed_when: true
   become: true
 
+- name: Read which manager is active
+  ansible.builtin.command:
+    argv: [ceph, mgr, stat, --format, json]
+  register: billet_ceph_mgr_before
+  changed_when: false
+  when:
+    - (billet_ceph_osd_memory_target_gib | int) > 0
+    - billet_ceph_osd_memory_autotuned | bool
+    - not ansible_check_mode
+  become: true
+
+- name: Fail the active manager over, ending any autotune pass under way
+  ansible.builtin.command:
+    argv: [ceph, mgr, fail, "{{ (billet_ceph_mgr_before.stdout | from_json).active_name }}"]
+  changed_when: true
+  when:
+    - (billet_ceph_osd_memory_target_gib | int) > 0
+    - billet_ceph_osd_memory_autotuned | bool
+    - not ansible_check_mode
+  become: true
+
+- name: Wait for a manager to be active again
+  ansible.builtin.command:
+    argv: [ceph, mgr, stat, --format, json]
+  register: billet_ceph_mgr_after
+  until: >-
+    (billet_ceph_mgr_after.stdout | from_json).epoch > (billet_ceph_mgr_before.stdout | from_json).epoch
+    and (billet_ceph_mgr_after.stdout | from_json).available
+  retries: 90
+  delay: 2
+  changed_when: false
+  when:
+    - (billet_ceph_osd_memory_target_gib | int) > 0
+    - billet_ceph_osd_memory_autotuned | bool
+    - not ansible_check_mode
+  become: true
+
 - name: Hold each OSD's memory at the inventory's target
   ansible.builtin.command:
     argv: [ceph, config, set, osd, osd_memory_target, "{{ billet_ceph_osd_memory_target_bytes }}"]
@@ -81,34 +129,6 @@
     label: "{{ item.section }} {{ item.mask }} {{ item.name }}"
   when:
     - (billet_ceph_osd_memory_target_gib | int) > 0
-    - item.section != 'osd' or item.mask | length > 0
-  changed_when: true
-  become: true
-
-# A PASS OF cephadm's THAT WAS ALREADY RUNNING may have written a target after its
-# removal; with autotune off everywhere, none comes after this one.
-- name: Read the OSD memory settings again
-  ansible.builtin.command:
-    argv: [ceph, config, dump, --format, json]
-  register: billet_ceph_config_again
-  changed_when: false
-  when:
-    - (billet_ceph_osd_memory_target_gib | int) > 0
-    - not ansible_check_mode
-  become: true
-
-- name: Remove what was written in the meantime
-  ansible.builtin.command:
-    argv: [ceph, config, rm, "{{ item.section ~ (('/' ~ item.mask) if item.mask | length > 0 else '') }}", "{{ item.name }}"]
-  loop: >-
-    {{ billet_ceph_config_again.stdout | from_json
-       | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune'])
-       | sort(attribute='name', reverse=true) | list }}
-  loop_control:
-    label: "{{ item.section }} {{ item.mask }} {{ item.name }}"
-  when:
-    - (billet_ceph_osd_memory_target_gib | int) > 0
-    - not ansible_check_mode
     - item.section != 'osd' or item.mask | length > 0
   changed_when: true
   become: true

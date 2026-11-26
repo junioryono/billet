@@ -3,7 +3,8 @@
 # fake `ceph` that keeps the cluster's settings in a file: it records every call,
 # answers `config dump` from what it holds, and applies `config set` and `config
 # rm`. Like cephadm, it writes a host's target back whenever one is removed while
-# any autotune setting is still on. Escalated as the role runs them. Four
+# any autotune setting is still on, and it answers `mgr stat` and `mgr fail` for a
+# manager whose epoch a failover moves on. Escalated as the role runs them. Five
 # clusters:
 #
 #   - autotuned, as the reference host was on 2026-11-25 (autotune on, a per-host
@@ -15,8 +16,11 @@
 #     first would have cephadm write it back for good: that daemon's autotune goes
 #     before the target does, and the cluster ends with the osd section's values
 #     alone;
-#   - a cephadm pass already under way, which writes a removed target back once
-#     whatever autotune says: the second read finds it and removes it again;
+#   - a cephadm pass already under way, which publishes its stale target at the
+#     role's last read unless the manager fails over first, which ends it: the role
+#     fails the manager over once autotune is off, and the cluster ends clean;
+#   - a stale target that lands after the last cleanup however the manager went:
+#     the role's own final check refuses the converge;
 #   - converged: the reads are the only calls, so a second converge changes
 #     nothing;
 #   - 0: no call at all, a shared cluster's own policy left alone.
@@ -53,7 +57,48 @@
               path = os.environ['BILLET_GATE_CEPH_DUMP']
               with open(path) as f:
                   held = json.load(f)
+              # A PASS UNDER WAY, armed until it publishes: its stale target lands at
+              # the role's second read, the last, unless the manager it runs on fails
+              # over first, when it has published or never will.
+              inflight = os.environ.get('BILLET_GATE_CEPHADM_INFLIGHT', '')
+              stale = {'section': 'osd', 'name': 'osd_memory_target', 'value': '182725545984',
+                       'mask': 'host:ubuntu-01'}
+
+              def publish():
+                  global held
+                  held = [e for e in held if not (e['mask'] == stale['mask'] and e['name'] == stale['name'])]
+                  held.append(stale)
+                  open(inflight, 'w').close()
+                  with open(path, 'w') as f:
+                      json.dump(held, f)
+
+              armed = bool(inflight) and not os.path.exists(inflight)
+              mgr_path = path + '.mgr'
+              mgr = {'epoch': 37, 'available': True, 'active_name': 'ubuntu-01.a', 'num_standby': 1}
+              if os.path.exists(mgr_path):
+                  with open(mgr_path) as f:
+                      mgr = json.load(f)
+              if args[:2] == ['mgr', 'stat']:
+                  print(json.dumps(mgr))
+                  sys.exit(0)
+              if args[:2] == ['mgr', 'fail']:
+                  if args[2:] != [mgr['active_name']]:
+                      sys.exit('failed over ' + ' '.join(args[2:]) + ', not the active manager')
+                  if armed and not os.environ.get('BILLET_GATE_CEPHADM_STUBBORN'):
+                      publish()
+                  mgr['epoch'] += 1
+                  mgr['active_name'] = 'ubuntu-01.b' if mgr['active_name'] == 'ubuntu-01.a' else 'ubuntu-01.a'
+                  with open(mgr_path, 'w') as f:
+                      json.dump(mgr, f)
+                  sys.exit(0)
               if args[:2] == ['config', 'dump']:
+                  reads = 1
+                  if inflight:
+                      counter = inflight + '.reads'
+                      reads = (int(open(counter).read()) if os.path.exists(counter) else 0) + 1
+                      open(counter, 'w').write(str(reads))
+                  if armed and reads == 2:
+                      publish()
                   print(json.dumps(held))
                   sys.exit(0)
               if args[:2] == ['config', 'set']:
@@ -66,15 +111,10 @@
                   gone = [e for e in held if e['section'] == section and e['mask'] == mask and e['name'] == name]
                   held = [e for e in held if e not in gone]
                   # CEPHADM: a host's target removed while any daemon's autotune is on
-                  # is written back, and so, once, is one a pass already under way
-                  # had decided to write.
-                  inflight = os.environ.get('BILLET_GATE_CEPHADM_INFLIGHT', '')
-                  if mask.startswith('host:') and name == 'osd_memory_target' and (any(
-                          e['name'] == 'osd_memory_target_autotune' and e['value'] == 'true' for e in held)
-                          or (inflight and not os.path.exists(inflight))):
+                  # is written back.
+                  if mask.startswith('host:') and name == 'osd_memory_target' and any(
+                          e['name'] == 'osd_memory_target_autotune' and e['value'] == 'true' for e in held):
                       held.extend(gone)
-                      if inflight:
-                          open(inflight, 'w').close()
               with open(path, 'w') as f:
                   json.dump(held, f)
 
@@ -91,10 +131,12 @@
               calls:
                 - config dump --format json
                 - config set osd osd_memory_target_autotune false
+                - mgr stat --format json
+                - mgr fail ubuntu-01.a
+                - mgr stat --format json
                 - config set osd osd_memory_target 17179869184
                 - config rm osd/host:ubuntu-01 osd_memory_target
                 - config rm osd.1 osd_memory_target
-                - config dump --format json
                 - config dump --format json
             - name: one daemon still autotuned
               target_gib: 16
@@ -106,23 +148,34 @@
                 - config dump --format json
                 - config set osd osd_memory_target_autotune false
                 - config rm osd.1 osd_memory_target_autotune
+                - mgr stat --format json
+                - mgr fail ubuntu-01.a
+                - mgr stat --format json
                 - config set osd osd_memory_target 17179869184
                 - config rm osd/host:ubuntu-01 osd_memory_target
-                - config dump --format json
                 - config dump --format json
             - name: a cephadm pass under way
               target_gib: 16
               inflight: true
               dump:
-                - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
                 - {section: osd, name: osd_memory_target, value: "182725545984", mask: "host:ubuntu-01"}
               calls:
                 - config dump --format json
+                - config set osd osd_memory_target_autotune false
+                - mgr stat --format json
+                - mgr fail ubuntu-01.a
+                - mgr stat --format json
                 - config set osd osd_memory_target 17179869184
                 - config rm osd/host:ubuntu-01 osd_memory_target
                 - config dump --format json
-                - config rm osd/host:ubuntu-01 osd_memory_target
-                - config dump --format json
+            - name: a stale target after the last cleanup
+              target_gib: 16
+              inflight: true
+              stubborn: true
+              refused: true
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
             - name: converged
               target_gib: 16
               dump:
@@ -130,7 +183,6 @@
                 - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
                 - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
               calls:
-                - config dump --format json
                 - config dump --format json
                 - config dump --format json
             - name: left to the cluster
