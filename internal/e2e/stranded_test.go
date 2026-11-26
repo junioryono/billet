@@ -2,7 +2,9 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/fakeactions"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -28,10 +31,12 @@ import (
 // production.
 func TestAStrandedJobIsDecidedThenItsRunCancelledAndRerun(t *testing.T) {
 	const (
-		request int64 = 8001
-		run     int64 = 801
-		job     int64 = 9001
-		name          = "lint"
+		request     int64 = 8001
+		run         int64 = 801
+		job         int64 = 9001
+		name              = "lint"
+		silent            = "silent-1"
+		incarnation       = "0123456789abcdef0123456789abcdef"
 	)
 
 	s, _, _ := simulatedStack(t, overTheWire, withRetryStranded(), withStrandedAfter(time.Second),
@@ -43,7 +48,7 @@ func TestAStrandedJobIsDecidedThenItsRunCancelledAndRerun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeploymentID: %v", err)
 	}
-	registerSilentHost(t, s.wireAddr, deployment, "silent-1")
+	registerSilentHost(t, s.wireAddr, deployment, silent, incarnation)
 
 	// ASKED BEFORE ITS JOB, as a loop that had already passed once would have: a
 	// recovery begins only for a launch that ended after its tier asked.
@@ -53,6 +58,16 @@ func TestAStrandedJobIsDecidedThenItsRunCancelledAndRerun(t *testing.T) {
 
 	stop := s.run(t)
 	defer stop()
+
+	// WITHDRAWN BEFORE THE PLANE STOPS, PASS OR FAIL: a launch queued for a host
+	// that never polls is otherwise held for its ten-minute command timeout, past
+	// the plane's own stop. A withdrawal answers it as nothing started.
+	defer func() {
+		if err := s.wire.Withdraw(context.WithoutCancel(t.Context()), silent, incarnation); err != nil &&
+			!errors.Is(err, nodeplane.ErrUnregistered) {
+			t.Errorf("withdraw the silent host: %v", err)
+		}
+	}()
 
 	fields := fakeactions.JobFields{RunID: run, Name: name}
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
@@ -73,6 +88,18 @@ func TestAStrandedJobIsDecidedThenItsRunCancelledAndRerun(t *testing.T) {
 
 	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
 		fields.Apply(fakeactions.JobJSON("JobAssigned", request, "push", simulatedTier)))
+
+	// QUEUED FOR THE HOST BEFORE GITHUB CANCELS, so the cancellation withdraws a
+	// launch waiting in the host's queue (#910), not one remembered as withdrawn
+	// before it got there.
+	deadline = time.Now().Add(30 * time.Second)
+	for s.wire.QueuedForTest(silent) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the launch of job %d never reached %s's queue", request, silent)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// THE ASSIGNMENT NOBODY RAN IS CANCELLED, and the job is offered no more.
 	cancelled := fakeactions.JobFields{RunID: run, Name: name, Result: "canceled"}
@@ -135,11 +162,11 @@ func awaitStranded(t *testing.T, s *stack, end func()) alloc.AlertJob {
 // registerSilentHost registers a simulated host over the real wire that never asks
 // for a command afterwards: a host that has stopped taking work while its
 // registration still stands, which a launch is placed on and never taken from.
-func registerSilentHost(t *testing.T, addr, deployment, name string) {
+func registerSilentHost(t *testing.T, addr, deployment, name, incarnation string) {
 	t.Helper()
 
 	body, err := json.Marshal(nodeapi.RegisterRequest{
-		Version: nodeapi.Version, MinVersion: nodeapi.MinVersion,
+		Version: nodeapi.Version, MinVersion: nodeapi.MinVersion, Incarnation: incarnation,
 		Node: name, Provider: config.ProviderSimulated, Deployment: deployment,
 		VCPU: testNodeVCPU, Memory: testNodeMemory,
 		InventoryKnown: true,
