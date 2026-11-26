@@ -91,9 +91,10 @@ func TestAStrandedJobIsDecidedThenItsRunCancelledAndRerun(t *testing.T) {
 
 	// QUEUED FOR THE HOST BEFORE GITHUB CANCELS, so the cancellation withdraws a
 	// launch waiting in the host's queue (#910), not one remembered as withdrawn
-	// before it got there.
+	// before it got there. The launch itself, by its request: the harness's reaper
+	// queues tends and sweeps for the same host.
 	deadline = time.Now().Add(30 * time.Second)
-	for s.wire.QueuedForTest(silent) == 0 {
+	for !s.wire.QueuedLaunchForTest(silent, request) {
 		if time.Now().After(deadline) {
 			t.Fatalf("the launch of job %d never reached %s's queue", request, silent)
 		}
