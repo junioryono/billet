@@ -1,10 +1,10 @@
 [Unit]
-Description=Check billet's Ceph storage health hourly
+Description=Check billet's Ceph storage health every five minutes
 
 [Timer]
 OnBootSec=5m
-OnUnitActiveSec=1h
-RandomizedDelaySec=5m
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
 Persistent=true
 
 [Install]

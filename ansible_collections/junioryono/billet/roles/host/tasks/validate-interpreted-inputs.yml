@@ -50,6 +50,18 @@
 
 # CHECKED BEFORE ANYTHING CHANGES: refused at the Ceph task instead, a typo would
 # stop a converge that guest networking may already have drained the node for.
+# A SWITCH AND A PATH: "false" in an inventory is truthy to a when, and a
+# relative directory would be read against wherever the task happened to run.
+- name: Validate the LVM filter's switch and directory
+  ansible.builtin.assert:
+    that:
+      - billet_lvm_rbd_filter is boolean
+      - billet_lvm_system_dir is string
+      - billet_lvm_system_dir is match('^/[^\n]*\Z')
+    fail_msg: >-
+      billet_lvm_rbd_filter is true or false, and billet_lvm_system_dir is an absolute
+      path such as /etc/lvm.
+
 - name: Validate billet_ceph_osd_mclock_profile
   ansible.builtin.assert:
     that: billet_ceph_osd_mclock_profile in ['', 'balanced', 'high_client_ops', 'high_recovery_ops', 'custom']
