@@ -71,10 +71,10 @@ GitHub ──scale-set messages, REST──▶ control plane ──ledger (SQLit
 
 | Data | Where it lives | Who can read it | How long |
 |---|---|---|---|
-| The GitHub App private key | the control plane host, in a file only the service account reads; or, with a token broker, the broker's host alone | the control plane, or the broker | until an operator replaces it. The control plane's key is in every backup archive. With a broker, the archive holds no key, and the broker's own backup is the operator's to keep. |
+| The GitHub App private key | the control plane host, in a file only the service account reads; with `server.identity.backend: aws-ssm`, a Parameter Store parameter the controllers share instead; or, with a token broker, the broker's host alone | the control plane, or the broker; in Parameter Store, whatever IAM and KMS let read it | until an operator replaces it. The control plane's key is in every backup archive. With a broker, the archive holds no key, and the broker's own backup is the operator's to keep. |
 | Installation tokens | the control plane's memory | the control plane | an hour, GitHub's own expiry |
 | A runner's registration (JIT config) | handed to one guest at its launch; on CodeBuild, staged in Parameter Store under the node's path | that guest. On CodeBuild, also anything IAM and KMS let read that path: the project's service role can read every registration staged under it, which is why one CodeBuild node never serves trusted and untrusted tiers together, and with the default key the control plane's sweep could decrypt one, though it never does. | single use; a staged one is removed when its build ends, or by the control plane's sweep |
-| The node-wire CA key, node certificates | the control plane's identity directory; each node's state directory | the service account on each | until rotated or revoked; the CA is in every backup |
+| The node-wire CA key, node certificates | the control plane's identity directory, and with `aws-ssm` a copy in Parameter Store for the controllers that share it; each node's state directory | the service account on each; in Parameter Store, whatever IAM and KMS let read it | until rotated or revoked; the CA is in every backup |
 | The ledger: leases, capacity, node registrations, job history (repository, workflow, job name, branch, result, timings) | the control plane's database | the service account, and operators through `billet` commands | job history is kept for the deployment's life |
 | A job's measured detail: CPU, memory, disk and network series, the destinations it reached | the ledger, when the node's `node.monitoring` collects them | as above | `server.job_detail_retention`, 72 hours by default |
 | The guest's own report of itself, and the test results it collects | the ledger, when `node.monitoring.guest` is on | as above | the report with the detail above; test results for `server.test_results_retention`, 14 days by default, within `server.test_results_max_bytes`, 128 MiB by default |
@@ -85,14 +85,16 @@ GitHub ──scale-set messages, REST──▶ control plane ──ledger (SQLit
 | A cache bearer | its guest; and the node's `<state_dir>/cache-sessions`, a file only root reads, so a restarted node knows it | that guest, and the node | valid for the guest's lifetime; its file is removed when the session's cleanup ends, which can wait on storage after the guest is gone |
 | Alert notices: the rule and condition, the job's repository, workflow, job name, branch and run link, and the tier that ran it | sent to each Slack channel or webhook a rule names ([Alerts](../operating/alerts.md)). A webhook receives the whole notice as JSON, which adds the result, node, lease, disruption, re-run decision, duration and firing time. Slack receives a sentence that adds the disruption and the duration, and leaves out the node, the lease, the re-run decision and a separate result. Each notice is also kept in the ledger's alert outbox, and so in backups. | whoever reads that channel or endpoint; in the ledger, as above | at the destination, as it keeps them; in the ledger, a delivered or failed notice for 8 days 6 hours, and one still pending until it settles |
 | An alert destination's address | an environment variable or file the config names, read when the control plane starts and held in its memory | the control plane | as long as that file or variable; a changed or removed address takes effect at the control plane's next start. Never written to the ledger or a log. |
-| Backups | the packaged backup directory, and an S3 bucket if one is configured ([Backup, restore and recover](../operating/backup-restore-recover.md)) | root and the service account; in the bucket, whatever its policy, IAM and key allow | in the packaged directory, the newest seven, and fewer when the disk needs room; an older one is removed only once the bucket lists it complete. A directory named with `--out` is never pruned. In the bucket, as its lifecycle keeps them. |
+| Backups | the packaged backup directory, and an S3 bucket if one is configured ([Backup, restore and recover](../operating/backup-restore-recover.md)) | root and the service account; in the bucket, whatever its policy, IAM and key allow | in the packaged directory, the newest seven, and fewer when the disk needs room; an older one is removed only once the bucket lists it complete. A backup written anywhere outside the packaged directory is never pruned. In the bucket, as its lifecycle keeps them. |
 
 billet reports nothing about its use to anyone. Beyond GitHub, it sends data only where a deployment's configuration sends it:
 
+- a PostgreSQL ledger's server, which holds the whole ledger;
 - alert destinations and the backup bucket;
-- on AWS, runner registrations and launch requests to EC2, CodeBuild and Parameter Store, and cache content to EBS and S3;
+- on AWS, runner registrations and launch requests to EC2, CodeBuild and Parameter Store, cache content to EBS and S3, and, with `aws-ssm`, the App key and the node-wire authority to Parameter Store;
 - the site's Ceph cluster;
 - a bare-metal pool's host provider, which receives the hosts it is asked to place;
-- a token broker, which receives each token request.
+- a token broker, which receives each token request;
+- a smart plug `node.monitoring.meter` names, which is asked for the host's power.
 
 billet fetches its releases, guest images, and the caches' upstream content.
