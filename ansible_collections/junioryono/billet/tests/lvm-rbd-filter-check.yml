@@ -10,6 +10,8 @@
 #     on a host that never had lvmlocal.conf nothing is created;
 #   - an operator's own global_filter, in lvm.conf on one line or in lvmlocal.conf
 #     beside billet's block: refused, and nothing written;
+#   - lvm.conf or lvmlocal.conf that is not a regular file: refused, and
+#     nothing copied;
 #   - lvmconfig failing on the operator's copy with anything but its own "not
 #     found": the converge stops, and billet's block is not written;
 #   - a devices file in use that names a mapped image, root's and 0600 as LVM
@@ -53,7 +55,7 @@
             path: "{{ billet_gate_tree.path }}/{{ item }}"
             state: directory
             mode: "0755"
-          loop: [plain, never, conf, local, devfile/devices, emptyname/devices, check, unread, unread-bin]
+          loop: [plain, never, conf, local, devfile/devices, emptyname/devices, check, unread, unread-bin, notafile/lvmlocal.conf]
 
         - name: Write each case's configuration
           ansible.builtin.copy:
@@ -64,6 +66,8 @@
             - {path: plain/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
             - {path: plain/lvmlocal.conf, content: "local {\n\tsystem_id = \"operator\"\n}\n"}
             - {path: never/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
+            - {path: notafile/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
+            - {path: notafile/lvmlocal.conf/keep, content: "the operator's\n"}
             - {path: conf/lvm.conf, content: "devices { global_filter = [ \"r|^/dev/sdz|\", \"a|.*|\" ] }\n"}
             - {path: local/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
             - {path: local/lvmlocal.conf, content: "devices {\n\tglobal_filter = [ \"r|^/dev/sdz|\" ]\n}\n"}
@@ -172,9 +176,14 @@
             - {dir: local, says: "already sets devices/global_filter", untouched: ""}
             - {dir: devfile, says: "names an RBD or NBD device", untouched: lvmlocal.conf}
             - {dir: emptyname, says: "names an RBD or NBD device", untouched: lvmlocal.conf}
+            - {dir: notafile, says: "is not a regular file", untouched: ""}
           loop_control:
             loop_var: billet_gate_refused
             label: "{{ billet_gate_refused.dir }}"
+
+        - name: A directory where lvmlocal.conf belongs is left as it was
+          ansible.builtin.assert:
+            that: (billet_gate_tree.path ~ '/notafile/lvmlocal.conf/keep') is file
 
         - name: The operator's lvmlocal.conf was left as it was
           ansible.builtin.slurp:
