@@ -1,14 +1,17 @@
 ---
-# Runs the host role's LVM filter tasks (tasks_from: lvm-rbd-filter) against a
-# temporary LVM configuration directory, with the real lvmconfig reading it through
-# LVM_SYSTEM_DIR, escalated as the role runs them:
+# Runs the host role's LVM filter tasks (tasks_from: lvm-rbd-filter) against
+# temporary LVM configuration directories, with the real lvmconfig reading each
+# through LVM_SYSTEM_DIR, escalated as the role runs them:
 #
 #   - a package's lvm.conf with no filter: billet's block is written, LVM applies
 #     exactly it, the operator's own lvmlocal.conf lines are kept, and a second
 #     converge changes nothing;
-#   - billet_lvm_rbd_filter false: the block is removed and nothing else is;
-#   - an lvm.conf that sets its own global_filter: refused by its name, and
-#     lvmlocal.conf left as it was;
+#   - billet_lvm_rbd_filter false: the block is removed and nothing else is, and
+#     on a host that never had lvmlocal.conf nothing is created;
+#   - an operator's own global_filter, in lvm.conf on one line or in lvmlocal.conf
+#     beside billet's block: refused, and nothing written;
+#   - a devices file in use that names a mapped image: refused;
+#   - check mode on a host with no filter: nothing written, nothing refused;
 #   - no lvm.conf at all: nothing is created.
 - name: The host role keeps LVM's scans off mapped RBD images
   hosts: localhost
@@ -18,8 +21,9 @@
   vars:
     billet_gate_block: |
       devices {
-      	global_filter = [ "r|^/dev/rbd|", "r|^/dev/nbd|", "a|.*|" ]
+      	global_filter = [ "r|^/dev/rbd|", "r|^/dev/nbd|" ]
       }
+    billet_gate_plain_conf: "devices {\n\t# filter = [ \"a|.*|\" ]\n}\n"
 
   tasks:
     - name: Make the tree the cases run in
@@ -30,24 +34,32 @@
 
     - name: Run the cases and remove the tree
       block:
-        - name: Make the two configured hosts' directories
+        - name: Make each case's configuration directory
           ansible.builtin.file:
             path: "{{ billet_gate_tree.path }}/{{ item }}"
             state: directory
             mode: "0755"
-          loop: [plain, own]
+          loop: [plain, never, conf, local, devfile/devices, check]
 
-        - name: Write a package's lvm.conf with no filter and an operator's lvmlocal.conf
+        - name: Write each case's configuration
           ansible.builtin.copy:
-            dest: "{{ billet_gate_tree.path }}/plain/{{ item.name }}"
+            dest: "{{ billet_gate_tree.path }}/{{ item.path }}"
             content: "{{ item.content }}"
             mode: "0644"
           loop:
-            - {name: lvm.conf, content: "devices {\n\t# filter = [ \"a|.*|\" ]\n}\n"}
-            - {name: lvmlocal.conf, content: "local {\n\tsystem_id = \"operator\"\n}\n"}
+            - {path: plain/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
+            - {path: plain/lvmlocal.conf, content: "local {\n\tsystem_id = \"operator\"\n}\n"}
+            - {path: never/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
+            - {path: conf/lvm.conf, content: "devices { global_filter = [ \"r|^/dev/sdz|\", \"a|.*|\" ] }\n"}
+            - {path: local/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
+            - {path: local/lvmlocal.conf, content: "devices {\n\tglobal_filter = [ \"r|^/dev/sdz|\" ]\n}\n"}
+            - {path: devfile/lvm.conf, content: "devices {\n\tuse_devicesfile = 1\n}\n"}
+            - {path: devfile/devices/system.devices, content: "VERSION=1.1.1\nIDTYPE=devname IDNAME=/dev/rbd0 DEVNAME=/dev/rbd0 PVID=none\n"}
+            - {path: check/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
           loop_control:
-            label: "{{ item.name }}"
+            label: "{{ item.path }}"
 
+        # PLAIN: written, applied, the operator's lines kept, and a second run idle.
         - name: Converge the plain host
           ansible.builtin.include_role:
             name: junioryono.billet.host
@@ -72,7 +84,7 @@
         - name: LVM applies billet's filter and the operator's lines are kept
           ansible.builtin.assert:
             that:
-              - billet_gate_applied.stdout | trim == 'global_filter=["r|^/dev/rbd|","r|^/dev/nbd|","a|.*|"]'
+              - billet_gate_applied.stdout | trim == 'global_filter=["r|^/dev/rbd|","r|^/dev/nbd|"]'
               - "'system_id = \"operator\"' in (billet_gate_first.content | b64decode)"
               - billet_gate_block in (billet_gate_first.content | b64decode)
             fail_msg: "LVM applies {{ billet_gate_applied.stdout }}; lvmlocal.conf is {{ billet_gate_first.content | b64decode }}"
@@ -93,6 +105,8 @@
           ansible.builtin.assert:
             that: billet_gate_second.content == billet_gate_first.content
 
+        # OFF: billet's block removed and nothing else; a host that never had
+        # lvmlocal.conf is left without one.
         - name: Converge the plain host with the filter turned off
           ansible.builtin.include_role:
             name: junioryono.billet.host
@@ -111,31 +125,70 @@
             that: (billet_gate_off.content | b64decode) == "local {\n\tsystem_id = \"operator\"\n}\n"
             fail_msg: "lvmlocal.conf is {{ billet_gate_off.content | b64decode }}"
 
-        - name: Write an lvm.conf that sets its own filter
+        - name: Converge a host that never had lvmlocal.conf with the filter off
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: lvm-rbd-filter
+          vars:
+            billet_lvm_system_dir: "{{ billet_gate_tree.path }}/never"
+            billet_lvm_rbd_filter: false
+
+        - name: Off on such a host creates nothing
+          ansible.builtin.assert:
+            that: not (billet_gate_tree.path ~ '/never/lvmlocal.conf') is exists
+
+        # THE OPERATOR'S OWN FILTER, however and wherever it is written, refused.
+        - name: Converge each host whose operator wrote a filter
+          ansible.builtin.include_tasks: lvm-rbd-filter-refused.yml
+          loop:
+            - {dir: conf, says: "already sets devices/global_filter", untouched: lvmlocal.conf}
+            - {dir: local, says: "already sets devices/global_filter", untouched: ""}
+            - {dir: devfile, says: "names an RBD or NBD device", untouched: lvmlocal.conf}
+          loop_control:
+            loop_var: billet_gate_refused
+            label: "{{ billet_gate_refused.dir }}"
+
+        - name: The operator's lvmlocal.conf was left as it was
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_tree.path }}/local/lvmlocal.conf"
+          register: billet_gate_local
+
+        - name: Nothing was added to it
+          ansible.builtin.assert:
+            that: (billet_gate_local.content | b64decode) == "devices {\n\tglobal_filter = [ \"r|^/dev/sdz|\" ]\n}\n"
+
+        # CHECK MODE on a host with no filter yet: nothing written, nothing refused.
+        # A real --check run, because only that sets ansible_check_mode; a task's
+        # own check_mode keyword does not.
+        - name: Write a play that converges the host's filter
           ansible.builtin.copy:
-            dest: "{{ billet_gate_tree.path }}/own/lvm.conf"
-            content: "devices {\n\tglobal_filter = [ \"r|^/dev/sdz|\", \"a|.*|\" ]\n}\n"
+            dest: "{{ billet_gate_tree.path }}/check-play.yml"
             mode: "0644"
+            content: |
+              - hosts: localhost
+                gather_facts: false
+                connection: local
+                tasks:
+                  - name: Converge the host's filter
+                    ansible.builtin.include_role:
+                      name: junioryono.billet.host
+                      tasks_from: lvm-rbd-filter
+                    vars:
+                      billet_lvm_system_dir: "{{ billet_gate_tree.path }}/check"
 
-        - name: Converge the host with its own filter
-          block:
-            - name: Include the role's LVM filter tasks
-              ansible.builtin.include_role:
-                name: junioryono.billet.host
-                tasks_from: lvm-rbd-filter
-              vars:
-                billet_lvm_system_dir: "{{ billet_gate_tree.path }}/own"
+        - name: Converge the host in check mode
+          ansible.builtin.command:
+            argv: [ansible-playbook, --check, -i, "localhost,", "{{ billet_gate_tree.path }}/check-play.yml"]
+          register: billet_gate_check
+          changed_when: false
+          failed_when: false
 
-            - name: The operator's filter was not refused
-              ansible.builtin.fail:
-                msg: The role would have replaced a global_filter the operator wrote.
-          rescue:
-            - name: Refused by the setting's name, before anything was written
-              ansible.builtin.assert:
-                that:
-                  - "'sets devices/global_filter' in ansible_failed_result.msg"
-                  - not (billet_gate_tree.path ~ '/own/lvmlocal.conf') is exists
-                fail_msg: "{{ ansible_failed_result.msg }}"
+        - name: Check mode refused nothing and wrote nothing
+          ansible.builtin.assert:
+            that:
+              - billet_gate_check.rc == 0
+              - not (billet_gate_tree.path ~ '/check/lvmlocal.conf') is exists
+            fail_msg: "check mode answered {{ billet_gate_check.rc }}: {{ billet_gate_check.stdout_lines[-12:] | default([]) }}"
 
         - name: Converge a host with no LVM
           ansible.builtin.include_role:
@@ -144,14 +197,9 @@
           vars:
             billet_lvm_system_dir: "{{ billet_gate_tree.path }}/absent"
 
-        - name: Nothing is created where LVM is not configured
-          ansible.builtin.stat:
-            path: "{{ billet_gate_tree.path }}/absent"
-          register: billet_gate_absent
-
         - name: No LVM, nothing written
           ansible.builtin.assert:
-            that: not billet_gate_absent.stat.exists
+            that: not (billet_gate_tree.path ~ '/absent') is exists
       always:
         - name: Remove the tree
           ansible.builtin.file:
