@@ -174,6 +174,12 @@ type NodeConfig struct {
 	// overcommitting is a decision an operator is entitled to make.
 	MaxVCPU   int      `yaml:"max_vcpu,omitempty"`
 	MaxMemory ByteSize `yaml:"max_memory,omitempty"`
+	// ReserveMemory is held back for the host itself, its storage first: what the
+	// node offers is max_memory, or what it detected, less this (#755). A guest
+	// whose memory is overcommitted is killed rather than slowed, and so, on
+	// 2026-11-25, was an OSD the guests' offer left no room for. Only on a host
+	// whose guests run on it.
+	ReserveMemory ByteSize `yaml:"reserve_memory,omitempty"`
 
 	// TLS is the certificate bundle this node presents, issued by the control
 	// plane's `billet ca issue`.
@@ -798,6 +804,8 @@ func (c *Config) validateNode() []error {
 		errs = append(errs, fmt.Errorf("node.max_vcpu is %d; leave it unset to contribute "+
 			"everything this machine has", c.Node.MaxVCPU))
 	}
+
+	errs = append(errs, c.Node.checkReserveMemory()...)
 
 	// Parsed here so a typo is reported when the file is READ, rather than hours
 	// later when a wedged container needed reclaiming and the bound turned out to

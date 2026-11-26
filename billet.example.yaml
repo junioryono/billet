@@ -503,6 +503,14 @@ node:
   #
   # max_vcpu: 120
   # max_memory: 480GiB
+  #
+  # MEMORY FOR THE HOST ITSELF, taken off whatever the node would otherwise
+  # offer. A guest whose memory is overcommitted is killed rather than slowed, and
+  # so is a Ceph OSD the guests' offer leaves no room for: count each OSD at its
+  # osd_memory_target plus a margin for recovery, the host's own services and a
+  # floor the kernel can reclaim from. `billet check` prints the result.
+  #
+  # reserve_memory: 69GiB
 
   # WHERE THIS MACHINE IS, naming one of the control plane's declared sites
   # below. Optional, and only meaningful once a deployment has more than one
