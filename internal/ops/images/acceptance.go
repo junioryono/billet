@@ -63,11 +63,15 @@ func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 
 	switch {
 	case !ok && acceptsEveryComponent(accepted):
-		// NOTHING THE RECORD COULD ADD: this node's own list already names every
-		// component this billet installs, so the deployment's acceptance, whatever
-		// it is, completes the same generation. That is a proof, not a guess, and
-		// it lets a fresh host pull its first image before it has registered,
-		// which it cannot do without the kernel that pull installs (#730).
+		// NOTHING THE RECORD COULD ADD THAT THIS BUILD INSTALLS: this node's own
+		// list already names every component this billet installs, so the
+		// deployment's acceptance completes the same generation, and a fresh host
+		// can pull its first image before it has registered, which it cannot do
+		// without the kernel that pull installs (#730). The one thing it cannot
+		// see is a newer control plane accepting a component this build does not
+		// know: a record would refuse that until billet is upgraded, and without
+		// one this node completes without it, as a build that predates the
+		// component would.
 		return accepted, nil
 	case !ok:
 		return nil, errAcceptanceUnknown
