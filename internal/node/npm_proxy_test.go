@@ -1654,9 +1654,12 @@ func TestADocumentItsCommitEvictedStaysChargedWhileItIsAnswered(t *testing.T) {
 // asserts that its parser is not paused when its socket ends, and a node that
 // closed on the last byte of a warm answer crashed pnpm/setup (2026-10-26). The
 // client here reads each answer whole, cold and warm, finds the connection still
-// open, and its own close ends it within a second: one client closes after three
-// seconds and the other after a tenth of one, so no delay of the node's own ends
-// both in time. It is the client's close that ends it.
+// open, and its own close ends it. No delay of the node's own can pass both:
+// the cold client holds the connection eight seconds, so a node that ends it
+// sooner fails there, and the warm client closes after a tenth of a second and
+// needs the end within seven, so a node that waits eight or more fails there. It
+// is the client's close that ends it. The bounds leave a loaded runner seconds
+// where one second ran out (#919).
 func TestAnAnsweredConnectionIsEndedByItsClient(t *testing.T) {
 	t.Parallel()
 
@@ -1668,18 +1671,15 @@ func TestAnAnsweredConnectionIsEndedByItsClient(t *testing.T) {
 	service, credentials := npmService(t, registry)
 
 	for _, fetch := range []struct {
-		name string
-		open time.Duration
-	}{{"cold", 3 * time.Second}, {"warm", 100 * time.Millisecond}} {
+		name        string
+		open, ended time.Duration
+	}{{"cold", 8 * time.Second, defaultAnswerCloseWait / 2}, {"warm", 100 * time.Millisecond, 7 * time.Second}} {
 		conn, reader := npmAnswered(t, service, credentials, npmRequestLine("/left-pad"), document)
 		assertStillOpen(t, fetch.name, conn, reader, fetch.open)
 		if err := conn.CloseWrite(); err != nil {
 			t.Fatalf("%s: the client's close: %v", fetch.name, err)
 		}
-		// HALF THE NODE'S OWN WAIT, a failure guard rather than a condition: a
-		// second ran out on a loaded CI runner (#919), and anything well inside
-		// defaultAnswerCloseWait still tells the client's close from the node's.
-		assertEnded(t, fetch.name+" after the client's close", conn, reader, defaultAnswerCloseWait/2)
+		assertEnded(t, fetch.name+" after the client's close", conn, reader, fetch.ended)
 	}
 	if registry.count() != 1 {
 		t.Fatalf("the registry was asked %d times, want once: the second fetch was not warm", registry.count())

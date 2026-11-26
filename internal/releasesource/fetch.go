@@ -92,6 +92,9 @@ type Client struct {
 	// backoff is the wait before a failed fetch's second try. Zero means
 	// fetchBackoff; a test sets it so it does not wait seconds.
 	backoff time.Duration
+	// waiting, when set, is told a failed fetch has begun its wait to try again,
+	// so a test can cancel inside the wait rather than race the request before it.
+	waiting func()
 }
 
 func (c *Client) repo() string {
@@ -366,6 +369,9 @@ func (c *Client) open(ctx context.Context, url string) (io.ReadCloser, error) {
 		}
 
 		timer := time.NewTimer(wait)
+		if c.waiting != nil {
+			c.waiting()
+		}
 		select {
 		case <-ctx.Done():
 			timer.Stop()
