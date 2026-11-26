@@ -49,9 +49,10 @@
             mode: "0755"
           loop: [bin, root/usr/local/libexec, root/etc/systemd/system]
 
-        # AS systemd ANSWERS: a restart runs the unit's ExecStart and answers its
-        # failure with a line of its own, not the script's; anything the case did not
-        # expect is refused, so a regression to another call fails it.
+        # AS systemd ANSWERS: a restart or a start runs the INSTALLED unit's
+        # ExecStart, under the case's root where the unit names a file there, and
+        # answers its failure with a line of its own, not the script's; anything the
+        # case did not expect is refused, so a regression to another call fails it.
         - name: Plant the fake systemctl
           ansible.builtin.copy:
             dest: "{{ billet_gate_tree.path }}/bin/systemctl"
@@ -62,8 +63,13 @@
               args = sys.argv[1:]
               with open(os.environ['BILLET_GATE_SYSTEMCTL_LOG'], 'a') as log:
                   log.write(' '.join(args) + '\n')
-              if args == ['restart', 'billet-ceph-osd-memory.service']:
-                  run = subprocess.run([os.environ['BILLET_GATE_ENFORCER']], capture_output=True, text=True)
+              if args in (['restart', 'billet-ceph-osd-memory.service'], ['start', 'billet-ceph-osd-memory.service']):
+                  root = os.environ['BILLET_GATE_ROOT']
+                  unit = open(root + '/etc/systemd/system/billet-ceph-osd-memory.service').read().splitlines()
+                  argv = [line.split('=', 1)[1] for line in unit if line.startswith('ExecStart=')][-1].split()
+                  if os.path.exists(root + argv[0]):
+                      argv[0] = root + argv[0]
+                  run = subprocess.run(argv, capture_output=True, text=True)
                   if run.returncode != 0:
                       sys.exit('Job for billet-ceph-osd-memory.service failed because the control '
                                'process exited with error code.')
@@ -195,6 +201,7 @@
               systemctl:
                 - restart billet-ceph-osd-memory.service
                 - enable --now billet-ceph-osd-memory.timer
+                - start billet-ceph-osd-memory.service
               late: true
               dump:
                 - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
@@ -252,6 +259,78 @@
           loop_control:
             loop_var: billet_gate_case
             label: "{{ billet_gate_case.name }}"
+
+        # A DRY RUN OVER AN OLDER ENFORCER: the template installs nothing in check
+        # mode, so the script installed is one that takes no --check and writes.
+        # A real --check run, because only that sets ansible_check_mode.
+        - name: Install an older enforcer that writes whatever it is asked
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/root/usr/local/libexec/billet-ceph-osd-memory"
+            mode: "0755"
+            content: |
+              #!/bin/sh
+              echo "the older enforcer ran: $*" >> "$BILLET_GATE_CEPH_LOG"
+          become: true
+
+        - name: Start the dry run's call logs empty
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/{{ item }}"
+            content: ""
+            mode: "0666"
+          loop: [calls.log, systemctl.log]
+          become: true
+
+        - name: Write a play that converges the cluster's OSD memory
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/check-play.yml"
+            mode: "0644"
+            content: |
+              - hosts: localhost
+                gather_facts: false
+                connection: local
+                tasks:
+                  - name: Converge the cluster's OSD memory
+                    ansible.builtin.include_role:
+                      name: junioryono.billet.host
+                      tasks_from: ceph-osd-memory
+                    vars:
+                      billet_ceph_enabled: true
+                      billet_ceph_osd_memory_target_gib: 8
+                      _billet_osd_memory_root: "{{ billet_gate_tree.path }}/root"
+                      _billet_alert_skip_service_control: true
+
+        - name: Converge in check mode
+          ansible.builtin.command:
+            argv: [ansible-playbook, --check, -i, "localhost,", "{{ billet_gate_tree.path }}/check-play.yml"]
+          environment:
+            # The controller's own PATH after the fakes, so the nested play is this
+            # ansible, with this collection.
+            PATH: "{{ billet_gate_tree.path }}/bin:{{ lookup('ansible.builtin.env', 'PATH') }}"
+            BILLET_GATE_CEPH_LOG: "{{ billet_gate_tree.path }}/calls.log"
+            BILLET_GATE_CEPH_DUMP: "{{ billet_gate_tree.path }}/dump.json"
+            BILLET_GATE_SYSTEMCTL_LOG: "{{ billet_gate_tree.path }}/systemctl.log"
+            BILLET_GATE_ROOT: "{{ billet_gate_tree.path }}/root"
+          register: billet_gate_dry_run
+          changed_when: false
+          failed_when: false
+
+        - name: Read what the dry run asked of ceph and systemd
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_tree.path }}/{{ item }}"
+          loop: [calls.log, systemctl.log]
+          register: billet_gate_dry_logs
+
+        - name: The dry run ran no enforcer and asked systemd nothing
+          ansible.builtin.assert:
+            that:
+              - billet_gate_dry_run.rc == 0
+              - billet_gate_dry_logs.results[0].content | b64decode == ''
+              - billet_gate_dry_logs.results[1].content | b64decode == ''
+            fail_msg: >-
+              check mode answered {{ billet_gate_dry_run.rc }} ({{ billet_gate_dry_run.stdout_lines[-8:] | default([]) }}
+              {{ billet_gate_dry_run.stderr_lines[-4:] | default([]) }});
+              ceph saw {{ billet_gate_dry_logs.results[0].content | b64decode }};
+              systemctl saw {{ billet_gate_dry_logs.results[1].content | b64decode }}
       always:
         - name: Remove the tree
           ansible.builtin.file:

@@ -5,6 +5,8 @@ Description=Hold each Ceph OSD's memory at billet's target every five minutes
 OnBootSec=2min
 OnUnitActiveSec=5min
 RandomizedDelaySec=30s
+# Not the default minute: a late write waits for the next run, and no longer.
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target

@@ -62,13 +62,15 @@
 
     - name: Run the OSD memory enforcer now, and keep its timer running whatever it answers
       block:
-        # A READ, SO A DRY RUN SHOWS IT TOO: what the run below will change.
+        # A READ, of the script just installed, for what the run below will change.
+        # NEVER IN A DRY RUN: the template above installed nothing, so the script
+        # there may be an older one that takes no --check and writes.
         - name: Ask the OSD memory enforcer what it would change
           ansible.builtin.command:
             argv: ["{{ billet_osd_memory_script_path }}", --check]
           register: billet_osd_memory_check
           changed_when: billet_osd_memory_check.stdout is search('(?m)^would change:')
-          check_mode: false
+          when: not ansible_check_mode
           become: true
 
         - name: Hold each OSD's memory at the target now

@@ -33,7 +33,7 @@
             BILLET_GATE_CEPH_DUMP: "{{ billet_gate_tree.path }}/dump.json"
             BILLET_GATE_STALE_AT: "{{ billet_gate_case.stale_at | default('') }}"
             BILLET_GATE_SYSTEMCTL_LOG: "{{ billet_gate_tree.path }}/systemctl.log"
-            BILLET_GATE_ENFORCER: "{{ billet_gate_tree.path }}/root/usr/local/libexec/billet-ceph-osd-memory"
+            BILLET_GATE_ROOT: "{{ billet_gate_tree.path }}/root"
       vars:
         billet_ceph_enabled: "{{ billet_gate_case.ceph | default(true) }}"
         billet_ceph_osd_memory_target_gib: "{{ billet_gate_case.target_gib }}"
@@ -65,18 +65,24 @@
         mode: "0666"
       become: true
 
-    - name: Run the installed enforcer as its timer does
+    - name: Start the installed service as its timer does
       ansible.builtin.command:
-        argv: ["{{ billet_gate_tree.path }}/root/usr/local/libexec/billet-ceph-osd-memory"]
+        argv: [systemctl, start, billet-ceph-osd-memory.service]
       environment: *billet_gate_env
-      register: billet_gate_timer_run
       changed_when: false
       become: true
 
+    - name: Read the cluster after the timer's run
+      ansible.builtin.slurp:
+        src: "{{ billet_gate_tree.path }}/dump.json"
+      register: billet_gate_after_timer
+
     - name: The timer's run removed the stale target
       ansible.builtin.assert:
-        that: "'changed: ceph config rm osd/host:ubuntu-01 osd_memory_target' in billet_gate_timer_run.stdout"
-        fail_msg: "{{ billet_gate_case.name }}: the timer's run said {{ billet_gate_timer_run.stdout_lines }}"
+        that: >-
+          billet_gate_after_timer.content | b64decode | from_json
+          | selectattr('mask', 'equalto', 'host:ubuntu-01') | list | length == 0
+        fail_msg: "{{ billet_gate_case.name }}: after the timer's run the cluster holds {{ billet_gate_after_timer.content | b64decode }}"
 
 - name: Read what the role asked of systemd
   ansible.builtin.slurp:
