@@ -10,6 +10,8 @@
 #     on a host that never had lvmlocal.conf nothing is created;
 #   - an operator's own global_filter, in lvm.conf on one line or in lvmlocal.conf
 #     beside billet's block: refused, and nothing written;
+#   - lvmconfig failing on the operator's copy with anything but its own "not
+#     found": the converge stops, and billet's block is not written;
 #   - a devices file in use that names a mapped image, root's and 0600 as LVM
 #     leaves it, under its own name or LVM's default when the setting is empty:
 #     refused;
@@ -41,7 +43,7 @@
             path: "{{ billet_gate_tree.path }}/{{ item }}"
             state: directory
             mode: "0755"
-          loop: [plain, never, conf, local, devfile/devices, emptyname/devices, check]
+          loop: [plain, never, conf, local, devfile/devices, emptyname/devices, check, unread, unread-bin]
 
         - name: Write each case's configuration
           ansible.builtin.copy:
@@ -58,6 +60,7 @@
             - {path: devfile/lvm.conf, content: "devices {\n\tuse_devicesfile = 1\n}\n"}
             - {path: emptyname/lvm.conf, content: "devices {\n\tuse_devicesfile = 1\n\tdevicesfile = \"\"\n}\n"}
             - {path: check/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
+            - {path: unread/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
           loop_control:
             label: "{{ item.path }}"
 
@@ -171,6 +174,43 @@
         - name: Nothing was added to it
           ansible.builtin.assert:
             that: (billet_gate_local.content | b64decode) == "devices {\n\tglobal_filter = [ \"r|^/dev/sdz|\" ]\n}\n"
+
+        # COULD NOT TELL IS NOT NO FILTER: an lvmconfig that fails on billet's copy of
+        # the configuration, as one killed under memory pressure would, stops the
+        # converge before billet's block is written. Every other call is the real one.
+        - name: Plant an lvmconfig that cannot read billet's copy
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/unread-bin/lvmconfig"
+            mode: "0755"
+            content: |
+              #!/bin/sh
+              case "$LVM_SYSTEM_DIR" in
+              *-billet-lvm) echo "  killed" >&2; exit 137 ;;
+              esac
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin exec lvmconfig "$@"
+
+        - name: Converge the host whose copy cannot be read
+          block:
+            - name: Include the role's LVM filter tasks
+              ansible.builtin.include_role:
+                name: junioryono.billet.host
+                tasks_from: lvm-rbd-filter
+                apply:
+                  environment:
+                    PATH: "{{ billet_gate_tree.path }}/unread-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+              vars:
+                billet_lvm_system_dir: "{{ billet_gate_tree.path }}/unread"
+
+            - name: The unreadable copy was not refused
+              ansible.builtin.fail:
+                msg: The role read a failed lvmconfig as no filter, and went ahead.
+          rescue:
+            - name: Stopped before billet's block was written
+              ansible.builtin.assert:
+                that:
+                  - "'Read any global filter' in (ansible_failed_task.name | default(''))"
+                  - not (billet_gate_tree.path ~ '/unread/lvmlocal.conf') is exists
+                fail_msg: "{{ ansible_failed_task.name | default('') }}: {{ ansible_failed_result.msg | default('') }}"
 
         # CHECK MODE on a host with no filter yet: nothing written, nothing refused.
         # A real --check run, because only that sets ansible_check_mode; a task's
