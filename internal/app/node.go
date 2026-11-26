@@ -437,7 +437,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	// RESOLVED ONCE, HERE, rather than on each re-registration. A drain
 	// re-registers, and a node that came back reporting a different contribution
 	// would move the fleet's arithmetic underneath work it is still holding.
-	contribution, err := nodeContribution(cfg)
+	contribution, err := NodeContribution(cfg)
 	if err != nil {
 		return err
 	}
@@ -661,13 +661,13 @@ func claimIdentity(
 	return deployment, lock, nil
 }
 
-// nodeContribution is what this host offers: what it detected, unless its own
+// NodeContribution is what this host offers: what it detected, unless its own
 // config said otherwise.
 //
-// ONE DEFINITION, ONE CALLER, because `billet node` is the only way a host joins.
-// Two paths resolving it independently would let the same file describe a
-// different machine depending on which process read it.
-func nodeContribution(cfg *config.Config) (config.Contribution, error) {
+// ONE DEFINITION, because `billet node` is the only way a host joins and `billet
+// check` says what it will offer. Two paths resolving it independently would let
+// the same file describe a different machine depending on which process read it.
+func NodeContribution(cfg *config.Config) (config.Contribution, error) {
 	// NOT MEASURED WHEN THE WORK RUNS SOMEWHERE ELSE. An ec2 node is an
 	// orchestrator: it calls an API and the compute appears in a region, so this
 	// machine's cores are a default for nothing — config validation requires the
@@ -683,7 +683,12 @@ func nodeContribution(cfg *config.Config) (config.Contribution, error) {
 		return config.Contribution{}, err
 	}
 
-	return cfg.Node.Contribution(vcpu, memory), nil
+	contribution := cfg.Node.Contribution(vcpu, memory)
+	if err := contribution.Offered(); err != nil {
+		return config.Contribution{}, err
+	}
+
+	return contribution, nil
 }
 
 // serverHostname is the name a node checks its control plane's certificate
