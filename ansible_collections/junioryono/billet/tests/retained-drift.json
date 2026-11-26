@@ -2522,7 +2522,8 @@
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}}]"
       ],
       "sources": [
-        "const:a private name under the system temporary directory class root"
+        "const:/tmp",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
       ]
     },
     "tasks/lvm-rbd-filter.yml / Copy the LVM configuration files": {
@@ -2531,8 +2532,9 @@
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
       ],
       "sources": [
-        "const:lvm.conf and lvmlocal.conf into the private temporary copy",
-        "inventory:billet_lvm_system_dir"
+        "const:/tmp",
+        "inventory:billet_lvm_system_dir",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
       ]
     },
     "tasks/lvm-rbd-filter.yml / Take billet's block out of the copy": {
@@ -2541,7 +2543,8 @@
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
       ],
       "sources": [
-        "const:the private temporary copy of lvmlocal.conf"
+        "const:/tmp",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
       ]
     },
     "tasks/lvm-rbd-filter.yml / Read any global filter the operator's configuration sets": {
@@ -2563,13 +2566,24 @@
         "inventory:billet_lvm_system_dir"
       ]
     },
-    "tasks/lvm-rbd-filter.yml / Remove the copy": {
-      "task": "{\"ansible.builtin.file\":{\"path\":\"{{ billet_lvm_copy.path }}\",\"state\":\"absent\"},\"become\":true,\"check_mode\":false,\"name\":\"Remove the copy\"}",
+    "tasks/lvm-rbd-filter.yml / Remove the copied LVM configuration files": {
+      "task": "{\"ansible.builtin.file\":{\"path\":\"{{ billet_lvm_copy.path }}/{{ item }}\",\"state\":\"absent\"},\"become\":true,\"changed_when\":false,\"check_mode\":false,\"loop\":[\"lvm.conf\",\"lvmlocal.conf\"],\"name\":\"Remove the copied LVM configuration files\"}",
       "contexts": [
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"always\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
       ],
       "sources": [
-        "const:the private temporary copy, removed whole"
+        "const:/tmp",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
+      ]
+    },
+    "tasks/lvm-rbd-filter.yml / Remove the empty copy directory": {
+      "task": "{\"ansible.builtin.command\":{\"argv\":[\"rmdir\",\"{{ billet_lvm_copy.path }}\"]},\"become\":true,\"changed_when\":false,\"check_mode\":false,\"name\":\"Remove the empty copy directory\"}",
+      "contexts": [
+        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"always\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
+      ],
+      "sources": [
+        "const:rmdir, which refuses a directory holding anything",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
       ]
     }
   },

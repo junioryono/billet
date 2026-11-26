@@ -36,6 +36,16 @@
         suffix: -lvm-filter
       register: billet_gate_tree
 
+    # THE ROLE'S COPIES ARE ITS OWN TO REMOVE, by name and then rmdir, on every
+    # case: these are the copy directories there before any case ran.
+    - name: Find the LVM copy directories before the cases
+      ansible.builtin.find:
+        paths: "{{ ['/tmp', billet_gate_tree.path | dirname] | unique }}"
+        patterns: "*-billet-lvm"
+        file_type: directory
+      register: billet_gate_copies_before
+      become: true
+
     - name: Run the cases and remove the tree
       block:
         - name: Make each case's configuration directory
@@ -255,6 +265,21 @@
         - name: No LVM, nothing written
           ansible.builtin.assert:
             that: not (billet_gate_tree.path ~ '/absent') is exists
+
+        - name: Find the LVM copy directories after the cases
+          ansible.builtin.find:
+            paths: "{{ ['/tmp', billet_gate_tree.path | dirname] | unique }}"
+            patterns: "*-billet-lvm"
+            file_type: directory
+          register: billet_gate_copies_after
+          become: true
+
+        - name: Every case removed its copy, the refused and the failed ones too
+          ansible.builtin.assert:
+            that: >-
+              (billet_gate_copies_after.files | map(attribute='path') | sort)
+              == (billet_gate_copies_before.files | map(attribute='path') | sort)
+            fail_msg: "left behind: {{ billet_gate_copies_after.files | map(attribute='path') | difference(billet_gate_copies_before.files | map(attribute='path')) }}"
       always:
         - name: Remove the tree
           ansible.builtin.file:

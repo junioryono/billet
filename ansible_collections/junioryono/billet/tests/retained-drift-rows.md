@@ -154,12 +154,13 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/ceph.yml / Let Ceph serve client IO ahead of scrubbing and recovery | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/lvm-rbd-filter.yml / Keep LVM's scans off mapped RBD and NBD devices | const:lvmlocal.conf; inventory:billet_lvm_system_dir |
 | tasks/lvm-rbd-filter.yml / Read the global filter LVM applies | const:lvmconfig devices/global_filter, a read; inventory:billet_lvm_system_dir |
-| tasks/lvm-rbd-filter.yml / Make a directory for a copy of the LVM configuration | const:a private name under the system temporary directory class root |
-| tasks/lvm-rbd-filter.yml / Copy the LVM configuration files | const:lvm.conf and lvmlocal.conf into the private temporary copy; inventory:billet_lvm_system_dir |
-| tasks/lvm-rbd-filter.yml / Take billet's block out of the copy | const:the private temporary copy of lvmlocal.conf |
+| tasks/lvm-rbd-filter.yml / Make a directory for a copy of the LVM configuration | const:/tmp; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
+| tasks/lvm-rbd-filter.yml / Copy the LVM configuration files | const:/tmp; inventory:billet_lvm_system_dir; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
+| tasks/lvm-rbd-filter.yml / Take billet's block out of the copy | const:/tmp; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
 | tasks/lvm-rbd-filter.yml / Read any global filter the operator's configuration sets | const:lvmconfig devices/global_filter on the private temporary copy, a read |
 | tasks/lvm-rbd-filter.yml / Read whether LVM uses a devices file here | const:lvmconfig devices/use_devicesfile devices/devicesfile, a read; inventory:billet_lvm_system_dir |
-| tasks/lvm-rbd-filter.yml / Remove the copy | const:the private temporary copy, removed whole |
+| tasks/lvm-rbd-filter.yml / Remove the copied LVM configuration files | const:/tmp; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
+| tasks/lvm-rbd-filter.yml / Remove the empty copy directory | const:rmdir, which refuses a directory holding anything; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
 | tasks/ceph.yml / Create the scoped billet Ceph identity | inventory:billet_ceph_keyring_path |
 | tasks/ceph.yml / Protect the billet Ceph keyring | inventory:billet_ceph_keyring_path |
 | tasks/ceph.yml / Verify the scoped Ceph identity can read both pools | parity:read-only Ceph/RBD observation; exact command and inventory operands are fingerprinted |

@@ -96,11 +96,23 @@
           changed_when: false
           check_mode: false
           become: true
+      # BY NAME, NEVER RECURSIVELY: the copies are the only names this run made
+      # there (lvmconfig wrote nothing beside them, 2.03.31, 2026-11-26), so the
+      # directory is removed with rmdir, which refuses one holding anything else.
       always:
-        - name: Remove the copy
+        - name: Remove the copied LVM configuration files
           ansible.builtin.file:
-            path: "{{ billet_lvm_copy.path }}"
+            path: "{{ billet_lvm_copy.path }}/{{ item }}"
             state: absent
+          loop: [lvm.conf, lvmlocal.conf]
+          changed_when: false
+          check_mode: false
+          become: true
+
+        - name: Remove the empty copy directory
+          ansible.builtin.command:
+            argv: [rmdir, "{{ billet_lvm_copy.path }}"]
+          changed_when: false
           check_mode: false
           become: true
 
