@@ -1,7 +1,9 @@
 ---
 # Runs the host role's OSD memory tasks (tasks_from: ceph-osd-memory), which install
-# billet-ceph-osd-memory and its timer under a temporary root and run it once,
-# against a fake `ceph` that keeps the cluster's settings in a file: it records
+# billet-ceph-osd-memory and its timer under a temporary root, ask it what it would
+# change, and restart its service, against a fake `systemctl` that records every
+# call and runs the installed enforcer as the service would, and a fake `ceph`
+# that keeps the cluster's settings in a file: it records
 # every call, answers `config dump` from what it holds, and applies `config set`
 # and `config rm`. Like cephadm, it writes a host's target back whenever one is
 # removed while any autotune setting is still on, and a pass already under way can
@@ -13,14 +15,19 @@
 #     nothing left to change;
 #   - one daemon still autotuned beside a host target: that daemon's autotune goes
 #     before the target does, so cephadm has no reason to write it back;
-#   - a pass under way whose stale target lands at the script's second read: the
+#   - a pass under way whose stale target lands at the run's second read: the
 #     next pass removes it;
 #   - a writer that never stops: the script gives up after its passes and the
 #     converge fails;
 #   - a stale target that lands after the converge: the installed script, run as
 #     its timer runs it, removes it;
 #   - converged: one read, and nothing changed;
-#   - 0: no call, and the enforcer and its units removed.
+#   - 0, or Ceph off, with the enforcer installed: the timer stopped and disabled,
+#     then the service stopped, the enforcer and its units removed, and no call to
+#     ceph; and with nothing installed, no call at all.
+#
+# Every case also proves what the converge told systemd, in order: the service
+# restarted and the timer enabled and started, the timer even when the run failed.
 - name: The host role holds each OSD's memory at the inventory's target
   hosts: localhost
   gather_facts: false
@@ -41,6 +48,31 @@
             state: directory
             mode: "0755"
           loop: [bin, root/usr/local/libexec, root/etc/systemd/system]
+
+        # AS systemd ANSWERS: a restart runs the unit's ExecStart and answers its
+        # failure with a line of its own, not the script's; anything the case did not
+        # expect is refused, so a regression to another call fails it.
+        - name: Plant the fake systemctl
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/bin/systemctl"
+            mode: "0755"
+            content: |
+              #!/usr/bin/env python3
+              import os, subprocess, sys
+              args = sys.argv[1:]
+              with open(os.environ['BILLET_GATE_SYSTEMCTL_LOG'], 'a') as log:
+                  log.write(' '.join(args) + '\n')
+              if args == ['restart', 'billet-ceph-osd-memory.service']:
+                  run = subprocess.run([os.environ['BILLET_GATE_ENFORCER']], capture_output=True, text=True)
+                  if run.returncode != 0:
+                      sys.exit('Job for billet-ceph-osd-memory.service failed because the control '
+                               'process exited with error code.')
+                  sys.exit(0)
+              if args in (['enable', '--now', 'billet-ceph-osd-memory.timer'],
+                          ['disable', '--now', 'billet-ceph-osd-memory.timer'],
+                          ['stop', 'billet-ceph-osd-memory.service']):
+                  sys.exit(0)
+              sys.exit('the fake systemctl does not answer ' + ' '.join(args))
 
         - name: Plant the fake ceph
           ansible.builtin.copy:
@@ -95,12 +127,17 @@
           loop:
             - name: autotuned
               target_gib: 16
+              reported: true
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
               dump:
                 - {section: osd, name: osd_mclock_profile, value: high_client_ops, mask: ""}
                 - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
                 - {section: osd, name: osd_memory_target, value: "182725545984", mask: "host:ubuntu-01"}
                 - {section: osd.1, name: osd_memory_target, value: "1073741824", mask: ""}
               calls:
+                - config dump --format json
                 - config dump --format json
                 - config set osd osd_memory_target_autotune false
                 - config set osd osd_memory_target 17179869184
@@ -109,11 +146,16 @@
                 - config dump --format json
             - name: one daemon still autotuned
               target_gib: 16
+              reported: true
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
               dump:
                 - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
                 - {section: osd.1, name: osd_memory_target_autotune, value: "true", mask: ""}
                 - {section: osd, name: osd_memory_target, value: "182725545984", mask: "host:ubuntu-01"}
               calls:
+                - config dump --format json
                 - config dump --format json
                 - config set osd osd_memory_target_autotune false
                 - config rm osd.1 osd_memory_target_autotune
@@ -122,10 +164,15 @@
                 - config dump --format json
             - name: a pass under way
               target_gib: 16
-              stale_at: "2"
+              reported: true
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
+              stale_at: "3"
               dump:
                 - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
               calls:
+                - config dump --format json
                 - config dump --format json
                 - config set osd osd_memory_target_autotune false
                 - config set osd osd_memory_target 17179869184
@@ -134,6 +181,9 @@
                 - config dump --format json
             - name: a writer that never stops
               target_gib: 16
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
               stale_at: every
               refused: true
               dump:
@@ -141,24 +191,63 @@
                 - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
             - name: a stale target after the converge
               target_gib: 16
+              reported: false
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
               late: true
               dump:
                 - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
                 - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
               calls:
                 - config dump --format json
+                - config dump --format json
             - name: converged
               target_gib: 16
+              reported: false
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
               dump:
                 - {section: osd, name: osd_mclock_profile, value: high_client_ops, mask: ""}
                 - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
                 - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
               calls:
                 - config dump --format json
+                - config dump --format json
             - name: left to the cluster
               target_gib: 0
+              systemctl:
+                - disable --now billet-ceph-osd-memory.timer
+                - stop billet-ceph-osd-memory.service
               dump:
                 - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+              calls: []
+            - name: left to the cluster, with nothing installed
+              target_gib: 0
+              systemctl: []
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+              calls: []
+            - name: held again
+              target_gib: 16
+              reported: false
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
+              calls:
+                - config dump --format json
+                - config dump --format json
+            - name: Ceph turned off
+              target_gib: 16
+              ceph: false
+              systemctl:
+                - disable --now billet-ceph-osd-memory.timer
+                - stop billet-ceph-osd-memory.service
+              dump: []
               calls: []
           loop_control:
             loop_var: billet_gate_case

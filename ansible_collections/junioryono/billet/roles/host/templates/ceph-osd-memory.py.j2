@@ -1,10 +1,11 @@
 #!/usr/bin/python3
 """Hold each Ceph OSD's memory at billet's target, not cephadm's autotune (#756).
 
-Run by the host role's converge and every five minutes by
-billet-ceph-osd-memory.timer. One pass turns osd_memory_target_autotune off for the
-osd section, removes every narrower autotune setting, sets the section's
-osd_memory_target, and removes every narrower target, in that order: cephadm writes
+Run as billet-ceph-osd-memory.service, by the host role's converge and every five
+minutes by billet-ceph-osd-memory.timer, so systemd runs one at a time. One pass
+turns osd_memory_target_autotune off for the osd section, removes every narrower
+autotune setting, sets the section's osd_memory_target, and removes every
+narrower target, in that order: cephadm writes
 a host's target while autotune is on for any daemon there, and the section's target
 is set before a narrower one goes so no OSD falls back to a default between the
 two. A pass that finds nothing to change is the proof the cluster holds exactly
@@ -15,8 +16,12 @@ goes off decides a host's target and publishes it with no second look
 (serve.py `_autotune_host_memory`, Ceph v20.2.3), and failing the manager over is
 no barrier, since the old manager can still write after the new one is active.
 Nothing writes a target once autotune is off everywhere and every such pass has
-ended, so a stale target that lands late is removed by the next pass, five
-minutes later at most.
+ended, so a stale target that lands late is removed by the timer's next run, five
+minutes after the last one began plus up to the timer's 30 s randomized delay.
+
+--check reads the cluster once, prints what a pass would change as `would change:`
+lines and changes nothing: the converge reports a change, or a dry run shows one,
+from it.
 """
 
 import json
@@ -55,7 +60,7 @@ def section(held, name):
     return [e["value"] for e in held if not narrower(e) and e["name"] == name]
 
 
-def one_pass():
+def one_pass(write=True):
     held = settings()
     actions = []
     if section(held, "osd_memory_target_autotune") != ["false"]:
@@ -67,12 +72,20 @@ def one_pass():
     actions += [("rm", who(e), e["name"]) for e in held
                 if e["name"] == "osd_memory_target" and narrower(e)]
     for action in actions:
+        if not write:
+            print("would change: ceph config " + " ".join(action), flush=True)
+            continue
         ceph("config", *action)
         print("changed: ceph config " + " ".join(action), flush=True)
     return actions
 
 
 def main():
+    if sys.argv[1:] == ["--check"]:
+        one_pass(write=False)
+        return 0
+    if sys.argv[1:]:
+        sys.exit("billet-ceph-osd-memory: the only argument is --check")
     for attempt in range(1, PASSES + 1):
         if not one_pass():
             return 0

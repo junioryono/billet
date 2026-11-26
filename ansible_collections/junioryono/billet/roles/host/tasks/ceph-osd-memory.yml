@@ -6,25 +6,34 @@
 # kernel killed an OSD holding 70 GB, which stalled every guest disk whose data it
 # held.
 #
-# ONE IMPLEMENTATION, RUN NOW AND EVERY FIVE MINUTES. billet-ceph-osd-memory
-# (ceph-osd-memory.py.j2) turns autotune off for the osd section, removes every
-# narrower autotune setting, sets the section's target and removes every narrower
-# target, pass after pass until a pass finds nothing to change. The converge runs
-# it once and fails if it cannot settle; its timer runs it again every five
-# minutes. No step here can promise that a cephadm pass already under way when
-# autotune went off writes nothing afterwards (a manager failover is no barrier),
-# and nothing writes a target once every such pass has ended, so a late write is
-# undone by the next run instead of trusted to a barrier.
+# ONE IMPLEMENTATION, ONE AT A TIME. billet-ceph-osd-memory (ceph-osd-memory.py.j2)
+# turns autotune off for the osd section, removes every narrower autotune
+# setting, sets the section's target and removes every narrower target, pass after
+# pass until a pass finds nothing to change. It runs only as
+# billet-ceph-osd-memory.service, which systemd never runs twice at once: the
+# converge restarts it, which stops a run of the script it replaced and waits for
+# the new one's answer, and its timer starts it every five minutes. Starting the
+# timer starts the service at once (systemd 255, OnBootSec passed, 2026-11-26),
+# so the converge never runs the script beside it. No step here can promise that a
+# cephadm pass already under way when autotune went off writes nothing afterwards
+# (a manager failover is no barrier), and nothing writes a target once every such
+# pass has ended, so a late write is undone by the timer's next run instead of
+# trusted to a barrier.
 #
-# 0 leaves a shared cluster's own policy alone, and takes the timer out.
+# THE TIMER RUNS WHATEVER THE CONVERGE'S RUN ANSWERS: a converge that fails because
+# something kept writing still leaves the timer to undo what lands later.
+#
+# NOT cephadm's `_no_autotune_memory` host label: autotune off for the whole osd
+# section, with nothing narrower, already stops cephadm's pass on every host, and a
+# host label is the cluster operator's, which a 0 here must leave alone.
+#
+# 0, or Ceph off, leaves the cluster's own policy alone, and takes the enforcer,
+# its service and its timer out.
 - name: Name the OSD memory enforcer's files
-  ansible.builtin.set_fact:
-    billet_osd_memory_script_path: "{{ (_billet_osd_memory_root | default('')) ~ '/usr/local/libexec/billet-ceph-osd-memory' }}"
-    billet_osd_memory_service_path: "{{ (_billet_osd_memory_root | default('')) ~ '/etc/systemd/system/billet-ceph-osd-memory.service' }}"
-    billet_osd_memory_timer_path: "{{ (_billet_osd_memory_root | default('')) ~ '/etc/systemd/system/billet-ceph-osd-memory.timer' }}"
+  ansible.builtin.import_tasks: ceph-osd-memory-operands.yml
 
 - name: Hold each OSD's memory at the inventory's target, now and every five minutes
-  when: (billet_ceph_osd_memory_target_gib | int) > 0
+  when: billet_osd_memory_held
   block:
     - name: Install the OSD memory enforcer
       ansible.builtin.template:
@@ -51,50 +60,85 @@
     - name: Apply the OSD memory enforcer's unit changes
       ansible.builtin.meta: flush_handlers
 
-    - name: Hold each OSD's memory at the target now
-      ansible.builtin.command:
-        argv: ["{{ billet_osd_memory_script_path }}"]
-      register: billet_osd_memory_run
-      changed_when: billet_osd_memory_run.stdout is search('(?m)^changed:')
-      when: not ansible_check_mode
-      become: true
+    - name: Run the OSD memory enforcer now, and keep its timer running whatever it answers
+      block:
+        # A READ, SO A DRY RUN SHOWS IT TOO: what the run below will change.
+        - name: Ask the OSD memory enforcer what it would change
+          ansible.builtin.command:
+            argv: ["{{ billet_osd_memory_script_path }}", --check]
+          register: billet_osd_memory_check
+          changed_when: billet_osd_memory_check.stdout is search('(?m)^would change:')
+          check_mode: false
+          become: true
 
-    - name: Start the OSD memory enforcer's timer
-      ansible.builtin.systemd_service:
-        name: billet-ceph-osd-memory.timer
-        enabled: true
-        state: started
-      when:
-        - not ansible_check_mode
-        - not (_billet_osd_memory_skip_service_control | default(false))
-      become: true
+        - name: Hold each OSD's memory at the target now
+          ansible.builtin.command:
+            argv: [systemctl, restart, billet-ceph-osd-memory.service]
+          register: billet_osd_memory_run
+          changed_when: false
+          failed_when: false
+          when:
+            - not ansible_check_mode
+            - not (_billet_osd_memory_skip_service_control | default(false))
+          become: true
+
+        - name: Refuse a cluster the enforcer could not settle
+          ansible.builtin.fail:
+            msg: >-
+              billet-ceph-osd-memory.service failed ({{ billet_osd_memory_run.stderr | default('') | trim }}):
+              something still writes OSD memory settings, or ceph could not be asked.
+              `journalctl -u billet-ceph-osd-memory.service` says which. Its timer is
+              left running, and undoes what lands once the writer stops.
+          when:
+            - billet_osd_memory_run is not skipped
+            - billet_osd_memory_run.rc != 0
+      always:
+        - name: Start the OSD memory enforcer's timer
+          ansible.builtin.command:
+            argv: [systemctl, enable, --now, billet-ceph-osd-memory.timer]
+          changed_when: false
+          when:
+            - not ansible_check_mode
+            - not (_billet_osd_memory_skip_service_control | default(false))
+          become: true
+          notify: billet unit files changed
 
 - name: Leave the cluster's own OSD memory policy alone
-  when: (billet_ceph_osd_memory_target_gib | int) == 0
+  when: not billet_osd_memory_held
   block:
-    - name: Ask whether the OSD memory enforcer's timer is installed
+    - name: Ask whether the OSD memory enforcer's units are installed
       ansible.builtin.stat:
-        path: "{{ billet_osd_memory_timer_path }}"
-      register: billet_osd_memory_timer_unit
+        path: "{{ item }}"
+      loop:
+        - "{{ billet_osd_memory_timer_path }}"
+        - "{{ billet_osd_memory_service_path }}"
+      register: billet_osd_memory_units
 
-    - name: Stop and disable the OSD memory enforcer's timer
-      ansible.builtin.systemd_service:
-        name: billet-ceph-osd-memory.timer
-        enabled: false
-        state: stopped
+    # THE TIMER FIRST, so it starts no run between the two; then the service, so no
+    # run outlives its script.
+    - name: Stop and disable the OSD memory enforcer's timer, then stop its service
+      ansible.builtin.command:
+        argv: "{{ item.argv }}"
+      loop:
+        - {argv: [systemctl, disable, --now, billet-ceph-osd-memory.timer], unit: 0}
+        - {argv: [systemctl, stop, billet-ceph-osd-memory.service], unit: 1}
+      loop_control:
+        label: "{{ item.argv | join(' ') }}"
+      changed_when: true
       when:
-        - billet_osd_memory_timer_unit.stat.exists
+        - billet_osd_memory_units.results[item.unit].stat.exists
         - not ansible_check_mode
         - not (_billet_osd_memory_skip_service_control | default(false))
       become: true
+      notify: billet unit files changed
 
     - name: Remove the OSD memory enforcer and its units
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
-        - "{{ billet_osd_memory_script_path }}"
-        - "{{ billet_osd_memory_service_path }}"
         - "{{ billet_osd_memory_timer_path }}"
+        - "{{ billet_osd_memory_service_path }}"
+        - "{{ billet_osd_memory_script_path }}"
       become: true
       notify: Reload systemd

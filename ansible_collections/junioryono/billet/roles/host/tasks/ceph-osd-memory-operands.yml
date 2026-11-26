@@ -1,0 +1,9 @@
+---
+# Where the OSD memory enforcer lives, and whether this converge installs it or
+# removes it: the tasks and the retained node's operation document both read these.
+- name: Name the OSD memory enforcer's files and whether it is held
+  ansible.builtin.set_fact:
+    billet_osd_memory_held: "{{ billet_ceph_enabled and (billet_ceph_osd_memory_target_gib | int) > 0 }}"
+    billet_osd_memory_script_path: "{{ (_billet_osd_memory_root | default('')) ~ '/usr/local/libexec/billet-ceph-osd-memory' }}"
+    billet_osd_memory_service_path: "{{ (_billet_osd_memory_root | default('')) ~ '/etc/systemd/system/billet-ceph-osd-memory.service' }}"
+    billet_osd_memory_timer_path: "{{ (_billet_osd_memory_root | default('')) ~ '/etc/systemd/system/billet-ceph-osd-memory.timer' }}"

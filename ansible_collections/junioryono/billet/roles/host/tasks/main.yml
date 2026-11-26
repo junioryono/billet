@@ -619,6 +619,11 @@
     - name: Configure or remove Ceph health alerts
       ansible.builtin.import_tasks: alerts.yml
 
+    # BESIDE THE ALERTS, NOT IN ceph.yml, so a host whose Ceph is turned off still
+    # has the enforcer and its timer taken out.
+    - name: Hold OSD memory at the inventory's target, or remove the enforcer
+      ansible.builtin.import_tasks: ceph-osd-memory.yml
+
     - name: Configure or remove the guest image refresh timer
       ansible.builtin.import_tasks: images-refresh.yml
 

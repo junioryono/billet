@@ -7,6 +7,7 @@
   loop:
     - {name: dump.json, content: "{{ billet_gate_case.dump | to_json }}"}
     - {name: calls.log, content: ""}
+    - {name: systemctl.log, content: ""}
   loop_control:
     label: "{{ item.name }}"
   become: true
@@ -31,10 +32,13 @@
             BILLET_GATE_CEPH_LOG: "{{ billet_gate_tree.path }}/calls.log"
             BILLET_GATE_CEPH_DUMP: "{{ billet_gate_tree.path }}/dump.json"
             BILLET_GATE_STALE_AT: "{{ billet_gate_case.stale_at | default('') }}"
+            BILLET_GATE_SYSTEMCTL_LOG: "{{ billet_gate_tree.path }}/systemctl.log"
+            BILLET_GATE_ENFORCER: "{{ billet_gate_tree.path }}/root/usr/local/libexec/billet-ceph-osd-memory"
       vars:
+        billet_ceph_enabled: "{{ billet_gate_case.ceph | default(true) }}"
         billet_ceph_osd_memory_target_gib: "{{ billet_gate_case.target_gib }}"
         _billet_osd_memory_root: "{{ billet_gate_tree.path }}/root"
-        _billet_osd_memory_skip_service_control: true
+        # The role's own handlers reload systemd; this case's systemctl is the fake.
         _billet_alert_skip_service_control: true
 
     - name: A converge the role had to refuse went ahead
@@ -46,7 +50,7 @@
       ansible.builtin.assert:
         that:
           - billet_gate_case.refused | default(false)
-          - "'something still writes OSD memory settings' in (ansible_failed_result.stderr | default(ansible_failed_result.msg | default('')))"
+          - "'billet-ceph-osd-memory.service failed (Job for billet-ceph-osd-memory.service failed' in (ansible_failed_result.msg | default(''))"
         fail_msg: "{{ billet_gate_case.name }}: {{ ansible_failed_result.stderr | default(ansible_failed_result.msg | default('')) }}"
 
 # AS THE TIMER RUNS IT: a stale target lands after the converge, and the installed
@@ -73,6 +77,24 @@
       ansible.builtin.assert:
         that: "'changed: ceph config rm osd/host:ubuntu-01 osd_memory_target' in billet_gate_timer_run.stdout"
         fail_msg: "{{ billet_gate_case.name }}: the timer's run said {{ billet_gate_timer_run.stdout_lines }}"
+
+- name: Read what the role asked of systemd
+  ansible.builtin.slurp:
+    src: "{{ billet_gate_tree.path }}/systemctl.log"
+  register: billet_gate_systemctl
+
+- name: The role restarted the service and started the timer, or stopped both, in order
+  ansible.builtin.assert:
+    that: (billet_gate_systemctl.content | b64decode).splitlines() == billet_gate_case.systemctl
+    fail_msg: >-
+      {{ billet_gate_case.name }}: the role called systemctl with
+      {{ (billet_gate_systemctl.content | b64decode).splitlines() }}, not {{ billet_gate_case.systemctl }}.
+
+- name: The enforcer's check reported a change exactly where the cluster needed one
+  when: billet_gate_case.reported is defined
+  ansible.builtin.assert:
+    that: (billet_osd_memory_check.changed | bool) == (billet_gate_case.reported | bool)
+    fail_msg: "{{ billet_gate_case.name }}: the check said {{ billet_osd_memory_check.stdout_lines | default([]) }}"
 
 - name: Read what the role asked of ceph
   ansible.builtin.slurp:
@@ -108,6 +130,7 @@
     fail_msg: "{{ billet_gate_case.name }}: the cluster holds {{ billet_gate_held.content | b64decode }}"
   when:
     - (billet_gate_case.target_gib | int) > 0
+    - billet_gate_case.ceph | default(true)
     - not (billet_gate_case.refused | default(false))
 
 - name: Ask whether the enforcer is installed
@@ -117,5 +140,5 @@
 
 - name: The enforcer is installed exactly where the role holds the target
   ansible.builtin.assert:
-    that: billet_gate_enforcer.stat.exists == ((billet_gate_case.target_gib | int) > 0)
+    that: billet_gate_enforcer.stat.exists == ((billet_gate_case.ceph | default(true)) and (billet_gate_case.target_gib | int) > 0)
     fail_msg: "{{ billet_gate_case.name }}: the enforcer is {{ 'there' if billet_gate_enforcer.stat.exists else 'absent' }}"

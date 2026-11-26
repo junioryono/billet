@@ -626,6 +626,7 @@ func retireOrdinaryUnitDestination(path string) bool {
 		return false
 	}
 	return slices.Contains([]string{"billet-network.service", "billet-images-refresh.service", "billet-images-refresh.timer",
-		"billet-ceph-health.service", "billet-ceph-health.timer"}, name) ||
+		"billet-ceph-health.service", "billet-ceph-health.timer",
+		"billet-ceph-osd-memory.service", "billet-ceph-osd-memory.timer"}, name) ||
 		strings.HasPrefix(name, "billet-dnsmasq@") && strings.HasSuffix(name, ".service")
 }
