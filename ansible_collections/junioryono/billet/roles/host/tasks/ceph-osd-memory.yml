@@ -1,0 +1,67 @@
+---
+# EACH OSD'S MEMORY IS A NUMBER THE INVENTORY STATES (junioryono/billet#756).
+# cephadm's osd_memory_target_autotune sizes every OSD from the host's whole RAM,
+# as if nothing else ran there: on the reference host it gave each of two OSDs
+# 170 GiB of a 499 GiB host whose node offered guests 480, and on 2026-11-25 the
+# kernel killed an OSD holding 70 GB, which stalled every guest disk whose data it
+# held. So the osd section turns autotune off and holds the target, and every other
+# setting of either name is removed: the per-host value autotune wrote outranks the
+# osd section, as would one for a single daemon. The section is set before the rest
+# is removed, so no OSD falls back to a default between the two. Read first, so a
+# converge reports changed only for what it changed. 0 leaves a shared cluster's own
+# policy alone.
+- name: Read the cluster's OSD memory settings
+  ansible.builtin.command:
+    argv: [ceph, config, dump, --format, json]
+  register: billet_ceph_config_dump
+  changed_when: false
+  check_mode: false
+  when: (billet_ceph_osd_memory_target_gib | int) > 0
+  become: true
+
+- name: Find the OSD memory settings the osd section holds
+  ansible.builtin.set_fact:
+    billet_ceph_osd_memory_entries: >-
+      {{ billet_ceph_config_dump.stdout | from_json
+         | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune']) | list }}
+    # A STRING, as `config dump` reports every value: the product alone stays an
+    # integer under native templating, equals no dumped value, and would set the
+    # target again on every converge.
+    billet_ceph_osd_memory_target_bytes: "{{ ((billet_ceph_osd_memory_target_gib | int) * 1073741824) | string }}"
+  when: (billet_ceph_osd_memory_target_gib | int) > 0
+
+- name: Stop cephadm sizing each OSD from the whole host
+  ansible.builtin.command:
+    argv: [ceph, config, set, osd, osd_memory_target_autotune, "false"]
+  when:
+    - (billet_ceph_osd_memory_target_gib | int) > 0
+    - >-
+      billet_ceph_osd_memory_entries | selectattr('section', 'equalto', 'osd') | selectattr('mask', 'equalto', '')
+      | selectattr('name', 'equalto', 'osd_memory_target_autotune') | selectattr('value', 'equalto', 'false')
+      | list | length == 0
+  changed_when: true
+  become: true
+
+- name: Hold each OSD's memory at the inventory's target
+  ansible.builtin.command:
+    argv: [ceph, config, set, osd, osd_memory_target, "{{ billet_ceph_osd_memory_target_bytes }}"]
+  when:
+    - (billet_ceph_osd_memory_target_gib | int) > 0
+    - >-
+      billet_ceph_osd_memory_entries | selectattr('section', 'equalto', 'osd') | selectattr('mask', 'equalto', '')
+      | selectattr('name', 'equalto', 'osd_memory_target') | selectattr('value', 'equalto', billet_ceph_osd_memory_target_bytes)
+      | list | length == 0
+  changed_when: true
+  become: true
+
+- name: Remove OSD memory settings that would outrank or shadow the osd section
+  ansible.builtin.command:
+    argv: [ceph, config, rm, "{{ item.section ~ (('/' ~ item.mask) if item.mask | length > 0 else '') }}", "{{ item.name }}"]
+  loop: "{{ billet_ceph_osd_memory_entries | default([]) }}"
+  loop_control:
+    label: "{{ item.section }} {{ item.mask }} {{ item.name }}"
+  when:
+    - (billet_ceph_osd_memory_target_gib | int) > 0
+    - item.section != 'osd' or item.mask | length > 0
+  changed_when: true
+  become: true

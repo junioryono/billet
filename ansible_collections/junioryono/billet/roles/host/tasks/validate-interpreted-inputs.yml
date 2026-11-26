@@ -57,6 +57,17 @@
       billet_ceph_osd_mclock_profile must be one of balanced, high_client_ops,
       high_recovery_ops or custom, or "" to leave the cluster's own profile alone.
 
+# A WHOLE NUMBER OF GiB, OR NOTHING: "16GiB" or "16G" would coerce to 0 and leave
+# autotune in charge, the failure this setting exists to end.
+- name: Validate billet_ceph_osd_memory_target_gib
+  ansible.builtin.assert:
+    that:
+      - billet_ceph_osd_memory_target_gib is not boolean
+      - billet_ceph_osd_memory_target_gib | string is match('^(0|[1-9][0-9]{0,3})\Z')
+    fail_msg: >-
+      billet_ceph_osd_memory_target_gib must be a whole number of GiB from 1 to 9999,
+      or 0 to leave the cluster's own OSD memory policy alone.
+
 - name: Validate each billet_guest_dns_servers literal
   ansible.builtin.assert:
     that: item | junioryono.billet.ip_literal

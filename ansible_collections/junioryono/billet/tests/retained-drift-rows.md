@@ -152,6 +152,10 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/ceph.yml / Allow a billet Ceph pool to keep a single copy | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Require clone-v2-compatible Ceph clients | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Let Ceph serve client IO ahead of scrubbing and recovery | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph-osd-memory.yml / Read the cluster's OSD memory settings | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph-osd-memory.yml / Stop cephadm sizing each OSD from the whole host | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph-osd-memory.yml / Hold each OSD's memory at the inventory's target | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph-osd-memory.yml / Remove OSD memory settings that would outrank or shadow the osd section | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Create the scoped billet Ceph identity | inventory:billet_ceph_keyring_path |
 | tasks/ceph.yml / Protect the billet Ceph keyring | inventory:billet_ceph_keyring_path |
 | tasks/ceph.yml / Verify the scoped Ceph identity can read both pools | parity:read-only Ceph/RBD observation; exact command and inventory operands are fingerprinted |

@@ -241,6 +241,9 @@
   changed_when: false
   become: true
 
+- name: Hold each OSD's memory at the inventory's target, not cephadm's autotune
+  ansible.builtin.import_tasks: ceph-osd-memory.yml
+
 - name: Create the scoped billet Ceph identity
   ansible.builtin.command:
     argv:

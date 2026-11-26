@@ -1095,6 +1095,12 @@ jobs:
         if: matrix.group == 'shape'
         run: scripts/gates/scenario.sh needrestart-check
 
+      # cephadm's autotune sized each OSD from the whole host, and the kernel killed
+      # one holding 70 GB beside the guests (#756). Escalated, as the role is.
+      - name: Prove the host role holds each OSD's memory at the inventory's target
+        if: matrix.group == 'shape'
+        run: scripts/gates/scenario.sh ceph-osd-memory-check
+
       # The PostgreSQL ledger shipped and the role read
       # server.state_dir, which such a config does not have — so every one of
       # them converged green against the DEFAULT directory, sandboxed and

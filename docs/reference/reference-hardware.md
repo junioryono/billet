@@ -41,7 +41,7 @@ The CCD geometry is the part that matters for placement, and Zen 3 is better for
 
 The board tops out at 2 TB, but only by replacing these modules with larger ones — every slot is already populated, so there is no incremental upgrade path.
 
-Scheduled guest memory should stay meaningfully below the physical total. The OS, the Ceph OSDs, and billet itself are not free, and a host that OOMs mid-job fails every lease it is holding at once. Each OSD sizes itself against `osd_memory_target`, 4 GiB by default and worth setting explicitly on a machine that is also running guests — the default assumes the daemon has the box to itself.
+Scheduled guest memory should stay meaningfully below the physical total. The OS, the Ceph OSDs, and billet itself are not free, and a host that OOMs mid-job fails every lease it is holding at once. Each OSD sizes itself against `osd_memory_target`, which is 4 GiB in Ceph itself. cephadm's `osd_memory_target_autotune` raises it from the host's whole RAM, as if nothing else ran there: on this machine it gave each of two OSDs 170 GiB while the node offered guests 480, and on 2026-11-25 the kernel killed an OSD holding 70 GB, which stalled every guest disk whose data it held. The host role turns autotune off and sets the target from `billet_ceph_osd_memory_target_gib` (#756). The OSDs, at that target plus a margin for recovery, come out of `node.max_memory`.
 
 ## What still has to be measured
 

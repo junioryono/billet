@@ -1,0 +1,80 @@
+---
+# Runs the host role's OSD memory tasks (tasks_from: ceph-osd-memory) against a
+# fake `ceph` that records every call and answers `config dump` from a fixture,
+# escalated as the role runs them. Three clusters:
+#
+#   - autotuned, as the reference host was on 2026-11-25 (autotune on, a per-host
+#     target autotune wrote, and one daemon's own): autotune is turned off and the
+#     osd section's target set, both before anything is removed, and then each
+#     setting that would outrank the section is removed by its own section and
+#     mask;
+#   - converged: the dump is the only call, so a second converge changes nothing;
+#   - 0: no call at all, a shared cluster's own policy left alone.
+- name: The host role holds each OSD's memory at the inventory's target
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  tasks:
+    - name: Make the tree the cases run in
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -osd-memory
+      register: billet_gate_tree
+
+    - name: Run the cases and remove the tree
+      block:
+        - name: Make the fake ceph's directory
+          ansible.builtin.file:
+            path: "{{ billet_gate_tree.path }}/bin"
+            state: directory
+            mode: "0755"
+
+        - name: Plant the fake ceph
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/bin/ceph"
+            mode: "0755"
+            content: |
+              #!/bin/sh
+              printf '%s\n' "$*" >> "$BILLET_GATE_CEPH_LOG"
+              if [ "$1 $2" = "config dump" ]; then
+                  cat "$BILLET_GATE_CEPH_DUMP"
+              fi
+
+        - name: Run each cluster through the role's tasks
+          ansible.builtin.include_tasks: ceph-osd-memory-case.yml
+          loop:
+            - name: autotuned
+              target_gib: 16
+              dump:
+                - {section: osd, name: osd_mclock_profile, value: high_client_ops, mask: ""}
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "182725545984", mask: "host:ubuntu-01"}
+                - {section: osd.1, name: osd_memory_target, value: "1073741824", mask: ""}
+              calls:
+                - config dump --format json
+                - config set osd osd_memory_target_autotune false
+                - config set osd osd_memory_target 17179869184
+                - config rm osd/host:ubuntu-01 osd_memory_target
+                - config rm osd.1 osd_memory_target
+            - name: converged
+              target_gib: 16
+              dump:
+                - {section: osd, name: osd_mclock_profile, value: high_client_ops, mask: ""}
+                - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
+              calls:
+                - config dump --format json
+            - name: left to the cluster
+              target_gib: 0
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+              calls: []
+          loop_control:
+            loop_var: billet_gate_case
+            label: "{{ billet_gate_case.name }}"
+      always:
+        - name: Remove the tree
+          ansible.builtin.file:
+            path: "{{ billet_gate_tree.path }}"
+            state: absent
