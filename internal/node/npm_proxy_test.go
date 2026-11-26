@@ -1676,7 +1676,10 @@ func TestAnAnsweredConnectionIsEndedByItsClient(t *testing.T) {
 		if err := conn.CloseWrite(); err != nil {
 			t.Fatalf("%s: the client's close: %v", fetch.name, err)
 		}
-		assertEnded(t, fetch.name+" after the client's close", conn, reader, time.Second)
+		// HALF THE NODE'S OWN WAIT, a failure guard rather than a condition: a
+		// second ran out on a loaded CI runner (#919), and anything well inside
+		// defaultAnswerCloseWait still tells the client's close from the node's.
+		assertEnded(t, fetch.name+" after the client's close", conn, reader, defaultAnswerCloseWait/2)
 	}
 	if registry.count() != 1 {
 		t.Fatalf("the registry was asked %d times, want once: the second fetch was not warm", registry.count())

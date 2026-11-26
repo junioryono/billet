@@ -102,8 +102,22 @@ func TestACancelledFetchStopsTrying(t *testing.T) {
 
 	server, served := flakyServer(t, fetchAttempts, http.StatusOK)
 	client := &Client{HTTP: server.Client(), backoff: time.Hour}
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+
+	// CANCELLED ONCE THE FIRST ATTEMPT IS SERVED, never on a timer: a 100 ms timeout
+	// expired before a loaded CI runner served any request (#919), which proved
+	// nothing about the backoff. The hour's backoff is what a fetch that ignored
+	// the cancellation would wait out, and the bound below is its failure guard.
+	go func() {
+		for served.Load() == 0 {
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
 
 	started := time.Now()
 	if _, err := client.get(ctx, server.URL+"/manifest", 1<<10); err == nil {
