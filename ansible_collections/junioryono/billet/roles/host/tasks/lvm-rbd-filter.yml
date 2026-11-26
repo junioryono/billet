@@ -71,6 +71,9 @@
           check_mode: false
           become: true
 
+        # SET, OR NOT FOUND, AND NOTHING ELSE: lvmconfig answers a setting nobody
+        # wrote with exit 5 and "not found" (2.03.16 and 2.03.31), and any other
+        # failure is could-not-tell, which must not read as no filter.
         - name: Read any global filter the operator's configuration sets
           ansible.builtin.command:
             argv: [lvmconfig, devices/global_filter]
@@ -78,7 +81,9 @@
             LVM_SYSTEM_DIR: "{{ billet_lvm_copy.path }}"
           register: billet_lvm_operator_filter
           changed_when: false
-          failed_when: false
+          failed_when: >-
+            not (billet_lvm_operator_filter.rc == 0
+                 or (billet_lvm_operator_filter.rc == 5 and billet_lvm_operator_filter.stderr is search('not found')))
           check_mode: false
           become: true
 
@@ -108,18 +113,36 @@
           replace. Add "r|^/dev/rbd|" and "r|^/dev/nbd|" to it and set billet_lvm_rbd_filter to
           false, or remove it and let billet's stand (junioryono/billet#922).
 
+    # THE FILE LVM READS: an empty devicesfile setting is its default name, as LVM
+    # itself falls back to (measured on 2.03.16), and the file is root's, so it is
+    # read as root. Absent is what stat says; a file there that cannot be read stops
+    # the converge rather than read as one naming nothing.
+    - name: Name the devices file LVM uses
+      ansible.builtin.set_fact:
+        billet_lvm_devicesfile_path: >-
+          {{ billet_lvm_system_dir ~ '/devices/' ~ ((billet_lvm_devicesfile.stdout_lines | select('match', '^devicesfile=') | first | default('') | replace('devicesfile=', '', 1) | replace('"', '')) or 'system.devices') }}
+      when: billet_lvm_devicesfile.stdout is search('use_devicesfile=1')
+
+    - name: Ask whether the devices file is there
+      ansible.builtin.stat:
+        path: "{{ billet_lvm_devicesfile_path }}"
+      register: billet_lvm_devicesfile_stat
+      when: billet_lvm_devicesfile.stdout is search('use_devicesfile=1')
+      become: true
+
     - name: Read the devices file LVM uses
       ansible.builtin.slurp:
-        src: "{{ billet_lvm_system_dir }}/devices/{{ billet_lvm_devicesfile.stdout | regex_search('devicesfile=\"([^\"]*)\"', '\\1') | first }}"
+        src: "{{ billet_lvm_devicesfile_path }}"
       register: billet_lvm_devicesfile_text
-      failed_when: false
-      when: billet_lvm_devicesfile.stdout is search('use_devicesfile=1')
+      when:
+        - billet_lvm_devicesfile.stdout is search('use_devicesfile=1')
+        - billet_lvm_devicesfile_stat.stat.exists
+      become: true
 
     - name: Refuse a devices file that names a mapped image
       ansible.builtin.assert:
         that: >-
           billet_lvm_devicesfile_text is skipped
-          or billet_lvm_devicesfile_text.content is not defined
           or (billet_lvm_devicesfile_text.content | b64decode) is not search('/dev/(rbd|nbd)')
         fail_msg: >-
           LVM uses a devices file in {{ billet_lvm_system_dir }}/devices that names an RBD or NBD

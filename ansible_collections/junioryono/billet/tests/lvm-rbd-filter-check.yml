@@ -10,7 +10,9 @@
 #     on a host that never had lvmlocal.conf nothing is created;
 #   - an operator's own global_filter, in lvm.conf on one line or in lvmlocal.conf
 #     beside billet's block: refused, and nothing written;
-#   - a devices file in use that names a mapped image: refused;
+#   - a devices file in use that names a mapped image, root's and 0600 as LVM
+#     leaves it, under its own name or LVM's default when the setting is empty:
+#     refused;
 #   - check mode on a host with no filter: nothing written, nothing refused;
 #   - no lvm.conf at all: nothing is created.
 - name: The host role keeps LVM's scans off mapped RBD images
@@ -39,7 +41,7 @@
             path: "{{ billet_gate_tree.path }}/{{ item }}"
             state: directory
             mode: "0755"
-          loop: [plain, never, conf, local, devfile/devices, check]
+          loop: [plain, never, conf, local, devfile/devices, emptyname/devices, check]
 
         - name: Write each case's configuration
           ansible.builtin.copy:
@@ -54,10 +56,22 @@
             - {path: local/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
             - {path: local/lvmlocal.conf, content: "devices {\n\tglobal_filter = [ \"r|^/dev/sdz|\" ]\n}\n"}
             - {path: devfile/lvm.conf, content: "devices {\n\tuse_devicesfile = 1\n}\n"}
-            - {path: devfile/devices/system.devices, content: "VERSION=1.1.1\nIDTYPE=devname IDNAME=/dev/rbd0 DEVNAME=/dev/rbd0 PVID=none\n"}
+            - {path: emptyname/lvm.conf, content: "devices {\n\tuse_devicesfile = 1\n\tdevicesfile = \"\"\n}\n"}
             - {path: check/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
           loop_control:
             label: "{{ item.path }}"
+
+        # ROOT'S AND 0600, as lvmdevices leaves the file: the role must read it as
+        # root, or it would find nothing to refuse.
+        - name: Write the devices files as LVM leaves them
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/{{ item }}/devices/system.devices"
+            content: "VERSION=1.1.1\nIDTYPE=devname IDNAME=/dev/rbd0 DEVNAME=/dev/rbd0 PVID=none\n"
+            owner: root
+            group: root
+            mode: "0600"
+          loop: [devfile, emptyname]
+          become: true
 
         # PLAIN: written, applied, the operator's lines kept, and a second run idle.
         - name: Converge the plain host
@@ -144,6 +158,7 @@
             - {dir: conf, says: "already sets devices/global_filter", untouched: lvmlocal.conf}
             - {dir: local, says: "already sets devices/global_filter", untouched: ""}
             - {dir: devfile, says: "names an RBD or NBD device", untouched: lvmlocal.conf}
+            - {dir: emptyname, says: "names an RBD or NBD device", untouched: lvmlocal.conf}
           loop_control:
             loop_var: billet_gate_refused
             label: "{{ billet_gate_refused.dir }}"
