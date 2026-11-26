@@ -1,0 +1,80 @@
+---
+# LVM NEVER READS A MAPPED RBD OR NBD DEVICE (junioryono/billet#922). Every LVM
+# scan reads every block device's label, and cephadm runs its scans (`lvs`, `pvs`,
+# `pvscan`) through nsenter with the host's own binaries and configuration. On
+# 2026-11-25 an OSD killed for memory could not start again for half an hour: its
+# activation's scan read the guests' mapped RBD images, whose data lived only on
+# that OSD, and the scan could not return until the OSD it was starting was up.
+# Rejected by the filter, a device is never opened (measured with strace on
+# 2.03.16: a loop device opened twice by `pvs`, then never by `pvs` or `lvs`).
+# udev's pvscan on each image billet maps is spared the read too.
+#
+# IN lvmlocal.conf, WHICH LVM MERGES OVER lvm.conf: the package owns lvm.conf. A
+# global_filter in lvm.conf itself is refused rather than replaced in silence,
+# since this one would take its place entirely. What LVM applies afterwards is
+# read back and must be exactly this, so nothing here assumes the merge happened.
+# No LVM configuration directory is no LVM, and nothing to keep off the images.
+- name: Ask whether LVM is configured on this host
+  ansible.builtin.stat:
+    path: "{{ billet_lvm_system_dir }}/lvm.conf"
+  register: billet_lvm_conf
+
+- name: Read lvm.conf's own global filter
+  ansible.builtin.slurp:
+    src: "{{ billet_lvm_system_dir }}/lvm.conf"
+  register: billet_lvm_conf_text
+  when: billet_lvm_conf.stat.exists
+
+- name: Refuse to replace a global filter the operator wrote
+  ansible.builtin.assert:
+    that: >-
+      billet_lvm_conf_text.content | b64decode | regex_findall('(?m)^[ \t]*global_filter[ \t]*=') | length == 0
+    fail_msg: >-
+      {{ billet_lvm_system_dir }}/lvm.conf sets devices/global_filter, which billet's in
+      lvmlocal.conf would replace entirely. Add "r|^/dev/rbd|" and "r|^/dev/nbd|" ahead of
+      its patterns and remove it from lvm.conf, or keep it and set billet_lvm_rbd_filter to
+      false (junioryono/billet#922).
+  when:
+    - billet_lvm_conf.stat.exists
+    - billet_lvm_rbd_filter | bool
+
+# OFF TAKES IT OUT: a filter left behind by an earlier converge is the role's to
+# remove, and blockinfile removes only between its own markers.
+- name: Keep LVM's scans off mapped RBD and NBD devices
+  ansible.builtin.blockinfile:
+    path: "{{ billet_lvm_system_dir }}/lvmlocal.conf"
+    create: "{{ billet_lvm_rbd_filter | bool }}"
+    state: "{{ 'present' if billet_lvm_rbd_filter | bool else 'absent' }}"
+    mode: "0644"
+    marker: "# {mark} billet: keep LVM off RBD and NBD devices (junioryono/billet#922)"
+    block: |
+      devices {
+      	global_filter = [ "r|^/dev/rbd|", "r|^/dev/nbd|", "a|.*|" ]
+      }
+  when: billet_lvm_conf.stat.exists
+  become: true
+
+- name: Read the global filter LVM applies
+  ansible.builtin.command:
+    argv: [lvmconfig, devices/global_filter]
+  environment:
+    LVM_SYSTEM_DIR: "{{ billet_lvm_system_dir }}"
+  register: billet_lvm_global_filter
+  changed_when: false
+  check_mode: false
+  when:
+    - billet_lvm_conf.stat.exists
+    - billet_lvm_rbd_filter | bool
+  become: true
+
+- name: Require LVM to apply billet's filter
+  ansible.builtin.assert:
+    that: billet_lvm_global_filter.stdout | trim == 'global_filter=["r|^/dev/rbd|","r|^/dev/nbd|","a|.*|"]'
+    fail_msg: >-
+      LVM applies {{ billet_lvm_global_filter.stdout | trim }} rather than billet's filter,
+      so its scans can still read a mapped RBD image whose data is on a stopped OSD
+      (junioryono/billet#922).
+  when:
+    - billet_lvm_conf.stat.exists
+    - billet_lvm_rbd_filter | bool
+    - not ansible_check_mode

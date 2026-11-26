@@ -1,4 +1,7 @@
 ---
+- name: Keep LVM's scans off the RBD images this host maps
+  ansible.builtin.import_tasks: lvm-rbd-filter.yml
+
 - name: Bootstrap a new single-host Ceph cluster
   when: billet_ceph_bootstrap
   block:
