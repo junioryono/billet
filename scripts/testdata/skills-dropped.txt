@@ -209,3 +209,4 @@ d340aa161466 ADR-029 (#541): a tier can now ask for a re-run, on GitHub's proof 
 381a102332db #779: RunInstances is now split by resource type (AWS evaluates a launch per resource ARN), so the claim that it cannot be narrowed is wrong; the sentence now says the snapshot stays among the unconditioned types, and the next rule states the split.
 51982af1d975 #799: eviction no longer reclaims a chain over passes; one pass alternates the purge, outside the cache lock, with rounds of generations under it, so the sentence now says that.
 3323ec9fa564 #845 measured that the advisory lock's locker is the exited `rbd lock add`, so its blocklist fenced nothing; every `lock rm` now passes the option (noBlocklist) and measured-facts.md records the trace.
+5742ba43eb83 #911: the e2e list now ends with stranded_test.go, the end-to-end proof of a stranded job; the sentence names it with what it proves.
