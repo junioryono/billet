@@ -442,6 +442,38 @@ func TestAFirstPullBeforeRegistrationInstallsTheKernelThoughArchitecturesCannotB
 	}
 }
 
+// AND SO DOES ONE THAT ACCEPTS EVERY COMPONENT (#730): its acceptance is known, but
+// its first pull still meets architectures it cannot learn, and still needs the
+// kernel to start and register. Codex review, 2026-11-26: the exception for such a
+// node had taken this pull to the architecture error before anything was installed.
+func TestAFirstPullThatAcceptsEverythingStillInstallsTheKernelThoughArchitecturesCannotBeTold(t *testing.T) {
+	store := &fakeCompletionStore{verified: ceph.Generation{Name: "g20260901000000"}, found: true}
+	run := newCompletionPull(t, "android-sdk, codeql, firefox, google-chrome, microsoft-edge",
+		completionReportFor("installed=google-chrome 155.0.8059.84"), store)
+	run.fixture.publisher.learnErr = errors.New("rbd: the cluster could not be reached")
+
+	if err := imageaccept.Remove(filepath.Join(filepath.Dir(run.fixture.cfgPath), "node")); err != nil {
+		t.Fatal(err)
+	}
+
+	kernel := filepath.Join(run.fixture.kernelDir, kernelFileName(run.fixture.manifest))
+
+	err := run.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "installed the kernel "+kernel+", and imported no generation") ||
+		!strings.Contains(err.Error(), "the cluster could not be reached") {
+		t.Fatalf("a first pull that accepts everything and could not tell architectures answered %v, "+
+			"want the kernel installed and the architecture failure named", err)
+	}
+
+	if info, err := os.Stat(kernel); err != nil || info.Size() == 0 {
+		t.Fatalf("the kernel %s is not installed: %v", kernel, err)
+	}
+
+	if got := run.fixture.publisher.calls(); got != 0 {
+		t.Fatalf("ImportGeneration was reached %d times, want never", got)
+	}
+}
+
 // A NODE'S FIRST PULL, BEFORE IT HAS REGISTERED, INSTALLS THE KERNEL AND IMPORTS
 // NOTHING: the node cannot start without the kernel, and a generation without
 // what the deployment accepts could be booted by a tier pinning it.

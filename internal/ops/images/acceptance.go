@@ -39,26 +39,9 @@ func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 		return accepted, nil
 	}
 
-	rec, ok, err := imageaccept.Read(cfg.Node.StateDir)
+	rec, ok, err := ownAcceptanceRecord(cfg)
 	if err != nil {
 		return nil, err
-	}
-
-	if ok {
-		deployment, known, err := app.PeekNodeDeploymentID(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("could not tell which deployment this node is in, so not whether "+
-				"the image acceptance it recorded is its own: %w", err)
-		}
-
-		if !known {
-			return nil, fmt.Errorf("this node recorded the image acceptance of deployment %s and has "+
-				"no deployment identity to compare it with", rec.Deployment)
-		}
-
-		// ANOTHER DEPLOYMENT'S RECORD SAYS NOTHING ABOUT THIS ONE: the node has not
-		// registered with its own control plane since it moved.
-		ok = rec.Deployment == deployment
 	}
 
 	switch {
@@ -96,6 +79,45 @@ func acceptedComponents(cfg *config.Config) ([]config.ImageComponent, error) {
 	slices.Sort(accepted)
 
 	return accepted, nil
+}
+
+// ownAcceptanceRecord reads what this node recorded its deployment's control plane
+// accepts, and whether that record is this deployment's: none, or another
+// deployment's, is a node that has not registered with its own control plane.
+func ownAcceptanceRecord(cfg *config.Config) (imageaccept.Record, bool, error) {
+	rec, ok, err := imageaccept.Read(cfg.Node.StateDir)
+	if err != nil || !ok {
+		return rec, false, err
+	}
+
+	deployment, known, err := app.PeekNodeDeploymentID(cfg)
+	if err != nil {
+		return rec, false, fmt.Errorf("could not tell which deployment this node is in, so not whether "+
+			"the image acceptance it recorded is its own: %w", err)
+	}
+
+	if !known {
+		return rec, false, fmt.Errorf("this node recorded the image acceptance of deployment %s and has "+
+			"no deployment identity to compare it with", rec.Deployment)
+	}
+
+	// ANOTHER DEPLOYMENT'S RECORD SAYS NOTHING ABOUT THIS ONE: the node has not
+	// registered with its own control plane since it moved.
+	return rec, rec.Deployment == deployment, nil
+}
+
+// registeredWithItsControlPlane reports whether this node has recorded its own
+// deployment's acceptance, which it does at every registration. It is what tells
+// a node's first pull, which must install the kernel the node needs to start,
+// whatever this node accepts.
+func registeredWithItsControlPlane(cfg *config.Config) (bool, error) {
+	if cfg.Node == nil {
+		return true, nil
+	}
+
+	_, ok, err := ownAcceptanceRecord(cfg)
+
+	return ok, err
 }
 
 // acceptsEveryComponent reports whether accepted names every component this build
