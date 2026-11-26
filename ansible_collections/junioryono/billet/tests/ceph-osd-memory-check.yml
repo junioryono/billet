@@ -1,14 +1,24 @@
 ---
 # Runs the host role's OSD memory tasks (tasks_from: ceph-osd-memory) against a
-# fake `ceph` that records every call and answers `config dump` from a fixture,
-# escalated as the role runs them. Three clusters:
+# fake `ceph` that keeps the cluster's settings in a file: it records every call,
+# answers `config dump` from what it holds, and applies `config set` and `config
+# rm`. Like cephadm, it writes a host's target back whenever one is removed while
+# any autotune setting is still on. Escalated as the role runs them. Four
+# clusters:
 #
 #   - autotuned, as the reference host was on 2026-11-25 (autotune on, a per-host
 #     target autotune wrote, and one daemon's own): autotune is turned off and the
 #     osd section's target set, both before anything is removed, and then each
 #     setting that would outrank the section is removed by its own section and
 #     mask;
-#   - converged: the dump is the only call, so a second converge changes nothing;
+#   - one daemon still autotuned beside a host target, where removing the target
+#     first would have cephadm write it back for good: that daemon's autotune goes
+#     before the target does, and the cluster ends with the osd section's values
+#     alone;
+#   - a cephadm pass already under way, which writes a removed target back once
+#     whatever autotune says: the second read finds it and removes it again;
+#   - converged: the reads are the only calls, so a second converge changes
+#     nothing;
 #   - 0: no call at all, a shared cluster's own policy left alone.
 - name: The host role holds each OSD's memory at the inventory's target
   hosts: localhost
@@ -35,11 +45,38 @@
             dest: "{{ billet_gate_tree.path }}/bin/ceph"
             mode: "0755"
             content: |
-              #!/bin/sh
-              printf '%s\n' "$*" >> "$BILLET_GATE_CEPH_LOG"
-              if [ "$1 $2" = "config dump" ]; then
-                  cat "$BILLET_GATE_CEPH_DUMP"
-              fi
+              #!/usr/bin/env python3
+              import json, os, sys
+              args = sys.argv[1:]
+              with open(os.environ['BILLET_GATE_CEPH_LOG'], 'a') as log:
+                  log.write(' '.join(args) + '\n')
+              path = os.environ['BILLET_GATE_CEPH_DUMP']
+              with open(path) as f:
+                  held = json.load(f)
+              if args[:2] == ['config', 'dump']:
+                  print(json.dumps(held))
+                  sys.exit(0)
+              if args[:2] == ['config', 'set']:
+                  section, name, value = args[2:5]
+                  held = [e for e in held if not (e['section'] == section and e['mask'] == '' and e['name'] == name)]
+                  held.append({'section': section, 'name': name, 'value': value, 'mask': ''})
+              elif args[:2] == ['config', 'rm']:
+                  who, name = args[2:4]
+                  section, _, mask = who.partition('/')
+                  gone = [e for e in held if e['section'] == section and e['mask'] == mask and e['name'] == name]
+                  held = [e for e in held if e not in gone]
+                  # CEPHADM: a host's target removed while any daemon's autotune is on
+                  # is written back, and so, once, is one a pass already under way
+                  # had decided to write.
+                  inflight = os.environ.get('BILLET_GATE_CEPHADM_INFLIGHT', '')
+                  if mask.startswith('host:') and name == 'osd_memory_target' and (any(
+                          e['name'] == 'osd_memory_target_autotune' and e['value'] == 'true' for e in held)
+                          or (inflight and not os.path.exists(inflight))):
+                      held.extend(gone)
+                      if inflight:
+                          open(inflight, 'w').close()
+              with open(path, 'w') as f:
+                  json.dump(held, f)
 
         - name: Run each cluster through the role's tasks
           ansible.builtin.include_tasks: ceph-osd-memory-case.yml
@@ -57,6 +94,35 @@
                 - config set osd osd_memory_target 17179869184
                 - config rm osd/host:ubuntu-01 osd_memory_target
                 - config rm osd.1 osd_memory_target
+                - config dump --format json
+                - config dump --format json
+            - name: one daemon still autotuned
+              target_gib: 16
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+                - {section: osd.1, name: osd_memory_target_autotune, value: "true", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "182725545984", mask: "host:ubuntu-01"}
+              calls:
+                - config dump --format json
+                - config set osd osd_memory_target_autotune false
+                - config rm osd.1 osd_memory_target_autotune
+                - config set osd osd_memory_target 17179869184
+                - config rm osd/host:ubuntu-01 osd_memory_target
+                - config dump --format json
+                - config dump --format json
+            - name: a cephadm pass under way
+              target_gib: 16
+              inflight: true
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "182725545984", mask: "host:ubuntu-01"}
+              calls:
+                - config dump --format json
+                - config set osd osd_memory_target 17179869184
+                - config rm osd/host:ubuntu-01 osd_memory_target
+                - config dump --format json
+                - config rm osd/host:ubuntu-01 osd_memory_target
+                - config dump --format json
             - name: converged
               target_gib: 16
               dump:
@@ -64,6 +130,8 @@
                 - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
                 - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
               calls:
+                - config dump --format json
+                - config dump --format json
                 - config dump --format json
             - name: left to the cluster
               target_gib: 0

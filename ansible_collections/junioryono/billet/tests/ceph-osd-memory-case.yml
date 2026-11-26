@@ -21,6 +21,7 @@
         PATH: "{{ billet_gate_tree.path }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         BILLET_GATE_CEPH_LOG: "{{ billet_gate_tree.path }}/calls.log"
         BILLET_GATE_CEPH_DUMP: "{{ billet_gate_tree.path }}/dump.json"
+        BILLET_GATE_CEPHADM_INFLIGHT: "{{ (billet_gate_tree.path ~ '/' ~ billet_gate_case.name | replace(' ', '-') ~ '.inflight') if billet_gate_case.inflight | default(false) else '' }}"
   vars:
     billet_ceph_osd_memory_target_gib: "{{ billet_gate_case.target_gib }}"
 
@@ -29,9 +30,26 @@
     src: "{{ billet_gate_tree.path }}/calls.log"
   register: billet_gate_calls
 
+- name: Read what the cluster holds afterwards
+  ansible.builtin.slurp:
+    src: "{{ billet_gate_tree.path }}/dump.json"
+  register: billet_gate_held
+
 - name: The role made exactly this cluster's calls, in order
   ansible.builtin.assert:
     that: (billet_gate_calls.content | b64decode).splitlines() == billet_gate_case.calls
     fail_msg: >-
       {{ billet_gate_case.name }}: the role called ceph with
       {{ (billet_gate_calls.content | b64decode).splitlines() }}, not {{ billet_gate_case.calls }}.
+
+- name: The cluster ends with the osd section's two values alone
+  ansible.builtin.assert:
+    that: >-
+      (billet_gate_held.content | b64decode | from_json
+       | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune'])
+       | rejectattr('section', 'equalto', 'osd') | list | length) == 0
+      and (billet_gate_held.content | b64decode | from_json
+           | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune'])
+           | rejectattr('mask', 'equalto', '') | list | length) == 0
+    fail_msg: "{{ billet_gate_case.name }}: the cluster holds {{ billet_gate_held.content | b64decode }}"
+  when: (billet_gate_case.target_gib | int) > 0
