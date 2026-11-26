@@ -112,6 +112,12 @@ func TestAStrandedJobIsDecidedThenItsRunCancelledAndRerun(t *testing.T) {
 		t.Fatalf("decided stranded: %+v, want run %d's %q", stranded, run, name)
 	}
 
+	// TAKEN BACK, not only answered: a launch left in the queue would still be
+	// handed to the host the next time it polled.
+	if s.wire.QueuedLaunchForTest(silent, request) {
+		t.Fatalf("the launch of job %d is still in %s's queue after GitHub cancelled it", request, silent)
+	}
+
 	deadline = time.Now().Add(60 * time.Second)
 	for {
 		status, attempt := runs.state(run)
