@@ -466,6 +466,22 @@
       loop: "{{ billet_guest_refresh_images }}"
       loop_control:
         label: "{{ item }}"
+      register: billet_guest_pulls
+      # 2 IS A NODE THAT HAS NOT REGISTERED (#730): its pull installed the kernel it
+      # starts with and imported nothing, since it cannot yet tell what its deployment
+      # accepts. The transaction goes on to start it; it registers, and imports a
+      # generation through `billet images refresh` or that timer.
+      failed_when: billet_guest_pulls.rc not in [0, 2]
+
+    - name: Say which images wait for the node's first registration
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item }}: the kernel is installed and no generation was imported, because this
+          node has not registered yet. Once it has, `billet images refresh` imports one; its
+          daily timer does too.
+      loop: "{{ billet_guest_pulls.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 2) | list }}"
+      loop_control:
+        label: "{{ item.item }}"
 
     - name: Gracefully stop the billet server after compute has drained
       ansible.builtin.systemd_service:
