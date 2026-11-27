@@ -60,7 +60,10 @@ func reportKeyGenerations(ctx context.Context, w io.Writer, cfg *config.Config, 
 func printKeyGenerations(w io.Writer, report ceph.GenerationReport, pool string, now time.Time) {
 	keys := report.Keys
 
-	fmt.Fprintf(w, "\ncache generations in %s: %d across %d key(s)\n", pool, report.Generations, len(keys))
+	// DISTINCT HERE, BY KEY BELOW: a generation two keys share counts once in the
+	// total and once in each key's row, so the rows can add up to more.
+	fmt.Fprintf(w, "\ncache generations in %s: %d distinct across %d key(s); one that keys share is "+
+		"in each key's row\n", pool, report.Generations, len(keys))
 
 	if report.Unreadable > 0 {
 		fmt.Fprintf(w, "  %d index record(s) could not be read, so these counts may be low\n", report.Unreadable)

@@ -54,7 +54,7 @@ func TestTheCacheStatusNamesTheKeysHoldingTheMostGenerations(t *testing.T) {
 	}{
 		{name: "the biggest keys", cfg: cfg, reader: keyReader{report: ceph.GenerationReport{Keys: keys, Generations: 850}},
 			want: []string{
-				"cache generations in billet-cache: 850 across 12 key(s)",
+				"cache generations in billet-cache: 850 distinct across 12 key(s)",
 				"845          844         1h30m0s ago  untrusted/o/r/any/go",
 				"never", "(and 2 more key(s))",
 			},
