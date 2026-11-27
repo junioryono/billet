@@ -144,6 +144,9 @@ type Server struct {
 
 	// rerunEvery and rerunSettle pace the re-run loop; see WithRerunPacing.
 	rerunEvery, rerunSettle time.Duration
+	// strandedAfterOverride replaces how long a launch that started nothing waits
+	// before its job is asked about; zero is strandedAfter. See WithStrandedAfter.
+	strandedAfterOverride time.Duration
 
 	// alerts is `server.alerts`, or nil where it names no rule; see WithAlerts.
 	alerts *Alerts
@@ -288,6 +291,16 @@ func WithJobDetailRetention(d time.Duration) ControlPlaneOption {
 // about a request that settles on a later pass would otherwise wait them out.
 func WithRerunPacing(every, settle time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.rerunEvery, s.rerunSettle = every, settle }
+}
+
+// WithStrandedAfter sets how long after a launch that started nothing its job is
+// first asked about.
+//
+// Exposed for WithRerunPacing's reason: the default is two of GitHub's five-minute
+// cancellations and a margin, which a scenario of a stranded job would otherwise
+// wait out. Every other condition of a stranded decision still holds.
+func WithStrandedAfter(d time.Duration) ControlPlaneOption {
+	return func(s *Server) { s.strandedAfterOverride = d }
 }
 
 // WithTestResultsRetention is server.test_results_retention and
