@@ -540,6 +540,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			}
 
 			reportKernelMappings(ctx, env, cfg)
+			reportLVMFilter(ctx, env)
 		}
 
 		// ON AWS METAL, THE SITE'S STORE IS EBS AND S3, and its volumes attach only to
