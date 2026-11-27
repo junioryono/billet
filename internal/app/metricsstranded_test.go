@@ -114,6 +114,7 @@ func TestTheStrandedGaugesReadTheDecisionsAndTheRecoveries(t *testing.T) {
 			VALUES ('o/r', 1, 1, $1, 'a', 'lint', $2, 'recovered', $2, $2),
 			       ('o/r', 2, 1, $1, 'b', 'lint', $2, 'recovered', $2, $2),
 			       ('o/r', 3, 1, $1, 'c', 'lint', $3, 'cancelling', $3, ''),
+			       ('o/r', 6, 1, $1, 'f', 'lint', $3, 'rerunning', $3, ''),
 			       ('o/r', 4, 1, $1, 'd', 'lint', $4, 'expired', $4, $2),
 			       ('o/r', 5, 1, $1, 'e', 'lint', $3, 'failed', $3, $3)`,
 			tier.Label, stamp(now), twoDaysAgo, dayAndAnHourAgo)
@@ -128,10 +129,10 @@ func TestTheStrandedGaugesReadTheDecisionsAndTheRecoveries(t *testing.T) {
 		t.Errorf("stranded = %v, want the two decided stranded and neither the offered nor the expired", got)
 	}
 
-	want := map[string]float64{"recovered": 2, "cancelling": 1, "expired": 1}
+	want := map[string]float64{"recovered": 2, "cancelling": 1, "rerunning": 1, "expired": 1}
 	if got := byState(snap); len(got) != len(want) || got["recovered"] != 2 || got["cancelling"] != 1 ||
-		got["expired"] != 1 {
-		t.Errorf("recoveries by state = %v, want %v: the one under way for two days, the one expired a day "+
+		got["rerunning"] != 1 || got["expired"] != 1 {
+		t.Errorf("recoveries by state = %v, want %v: the two under way for two days, the one expired a day "+
 			"after it began, and not the one that failed two days ago", got, want)
 	}
 
@@ -141,7 +142,7 @@ func TestTheStrandedGaugesReadTheDecisionsAndTheRecoveries(t *testing.T) {
 	if got := stranded(snap); got != 2 {
 		t.Errorf("stranded an hour before the day ends = %v", got)
 	}
-	if got := byState(snap); len(got) != 3 {
+	if got := byState(snap); len(got) != 4 {
 		t.Errorf("recoveries an hour before the day ends = %v", got)
 	}
 
@@ -149,7 +150,7 @@ func TestTheStrandedGaugesReadTheDecisionsAndTheRecoveries(t *testing.T) {
 	if got := stranded(snap); got != 0 {
 		t.Errorf("stranded past the day = %v", got)
 	}
-	if got := byState(snap); len(got) != 1 || got["cancelling"] != 1 {
-		t.Errorf("recoveries past the day = %v, want only the one still under way", got)
+	if got := byState(snap); len(got) != 2 || got["cancelling"] != 1 || got["rerunning"] != 1 {
+		t.Errorf("recoveries past the day = %v, want only the two still under way", got)
 	}
 }
