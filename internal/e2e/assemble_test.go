@@ -157,12 +157,32 @@ func (c *assembled) schedule(t *testing.T, opts app.ScheduleOptions) *app.Schedu
 func (c *assembled) awaitRegistered(t *testing.T) {
 	t.Helper()
 
+	// SETTLED, NOT LISTED: the plane lists a node before its registration finishes,
+	// and asks it nothing until then, so a test that asks as soon as it is listed can
+	// land in that window under load (#917).
 	deadline := time.Now().Add(30 * time.Second)
-	for len(c.wire.Plane().Nodes()) == 0 {
+	for !c.registrationSettled() {
 		if time.Now().After(deadline) {
-			t.Fatal("no node registered over the wire")
+			t.Fatalf("no node finished registering over the wire (listed: %v)", c.wire.Plane().Nodes())
 		}
 
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// registrationSettled reports whether some node is listed and every listed node's
+// registration has finished.
+func (c *assembled) registrationSettled() bool {
+	names := c.wire.Plane().Nodes()
+	if len(names) == 0 {
+		return false
+	}
+
+	for _, name := range names {
+		if !c.wire.Plane().RegistrationSettledForTest(name) {
+			return false
+		}
+	}
+
+	return true
 }

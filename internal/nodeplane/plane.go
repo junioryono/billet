@@ -499,6 +499,21 @@ func (p *Plane) ForgetForTest(name string) {
 	delete(p.nodes, name)
 }
 
+// RegistrationSettledForTest reports whether the named node is installed and no
+// registration of it is in flight.
+//
+// Exported for tests only. A node is installed before its registration finishes,
+// and until then the plane refuses to ask it anything, so a test that asks as soon
+// as the node is listed can land in that window under load.
+func (p *Plane) RegistrationSettledForTest(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	_, registering := p.registering[name]
+
+	return p.nodes[name] != nil && !registering
+}
+
 // ReconciledForTest reports whether the live incarnation has vouched for a
 // complete inventory.
 //
