@@ -1,0 +1,150 @@
+---
+- name: Write this cluster's settings and an empty call log
+  ansible.builtin.copy:
+    dest: "{{ billet_gate_tree.path }}/{{ item.name }}"
+    content: "{{ item.content }}"
+    mode: "0666"
+  loop:
+    - {name: dump.json, content: "{{ billet_gate_case.dump | to_json }}"}
+    - {name: calls.log, content: ""}
+    - {name: systemctl.log, content: ""}
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+
+- name: Start the cluster's read count afresh
+  ansible.builtin.file:
+    path: "{{ billet_gate_tree.path }}/dump.json.reads"
+    state: absent
+  become: true
+
+- name: Converge the cluster's OSD memory
+  block:
+    - name: Include the role's OSD memory tasks
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: ceph-osd-memory
+        # AN INCLUDE'S OWN KEYWORDS STOP AT THE INCLUDE: only `apply` reaches the
+        # tasks it runs, which is where the fake ceph must be first on PATH.
+        apply:
+          environment: &billet_gate_env
+            PATH: "{{ billet_gate_tree.path }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            BILLET_GATE_CEPH_LOG: "{{ billet_gate_tree.path }}/calls.log"
+            BILLET_GATE_CEPH_DUMP: "{{ billet_gate_tree.path }}/dump.json"
+            BILLET_GATE_STALE_AT: "{{ billet_gate_case.stale_at | default('') }}"
+            BILLET_GATE_SYSTEMCTL_LOG: "{{ billet_gate_tree.path }}/systemctl.log"
+            BILLET_GATE_ROOT: "{{ billet_gate_tree.path }}/root"
+      vars:
+        billet_ceph_enabled: "{{ billet_gate_case.ceph | default(true) }}"
+        billet_ceph_osd_memory_target_gib: "{{ billet_gate_case.target_gib }}"
+        _billet_osd_memory_root: "{{ billet_gate_tree.path }}/root"
+        # The role's own handlers reload systemd; this case's systemctl is the fake.
+        _billet_alert_skip_service_control: true
+
+    - name: A converge the role had to refuse went ahead
+      ansible.builtin.fail:
+        msg: "{{ billet_gate_case.name }}: the role settled a cluster something kept writing."
+      when: billet_gate_case.refused | default(false)
+  rescue:
+    - name: Refused because something kept writing, and only where the case expects it
+      ansible.builtin.assert:
+        that:
+          - billet_gate_case.refused | default(false)
+          - "'billet-ceph-osd-memory.service failed (Job for billet-ceph-osd-memory.service failed' in (ansible_failed_result.msg | default(''))"
+        fail_msg: "{{ billet_gate_case.name }}: {{ ansible_failed_result.stderr | default(ansible_failed_result.msg | default('')) }}"
+
+# AS THE TIMER RUNS IT: a stale target lands after the converge, and the installed
+# enforcer, run on its own, takes it out.
+- name: Run the installed enforcer after a stale target lands
+  when: billet_gate_case.late | default(false)
+  block:
+    - name: Land a stale host target after the converge
+      ansible.builtin.copy:
+        dest: "{{ billet_gate_tree.path }}/dump.json"
+        content: "{{ (billet_gate_case.dump + [{'section': 'osd', 'name': 'osd_memory_target', 'value': '182725545984', 'mask': 'host:ubuntu-01'}]) | to_json }}"
+        mode: "0666"
+      become: true
+
+    - name: Start the installed service as its timer does
+      ansible.builtin.command:
+        argv: [systemctl, start, billet-ceph-osd-memory.service]
+      environment: *billet_gate_env
+      changed_when: false
+      become: true
+
+    - name: Read the cluster after the timer's run
+      ansible.builtin.slurp:
+        src: "{{ billet_gate_tree.path }}/dump.json"
+      register: billet_gate_after_timer
+
+    - name: The timer's run removed the stale target
+      ansible.builtin.assert:
+        that: >-
+          billet_gate_after_timer.content | b64decode | from_json
+          | selectattr('mask', 'equalto', 'host:ubuntu-01') | list | length == 0
+        fail_msg: "{{ billet_gate_case.name }}: after the timer's run the cluster holds {{ billet_gate_after_timer.content | b64decode }}"
+
+- name: Read what the role asked of systemd
+  ansible.builtin.slurp:
+    src: "{{ billet_gate_tree.path }}/systemctl.log"
+  register: billet_gate_systemctl
+
+- name: The role restarted the service and started the timer, or stopped both, in order
+  ansible.builtin.assert:
+    that: (billet_gate_systemctl.content | b64decode).splitlines() == billet_gate_case.systemctl
+    fail_msg: >-
+      {{ billet_gate_case.name }}: the role called systemctl with
+      {{ (billet_gate_systemctl.content | b64decode).splitlines() }}, not {{ billet_gate_case.systemctl }}.
+
+- name: The enforcer's check reported a change exactly where the cluster needed one
+  when: billet_gate_case.reported is defined
+  ansible.builtin.assert:
+    that: (billet_osd_memory_check.changed | bool) == (billet_gate_case.reported | bool)
+    fail_msg: "{{ billet_gate_case.name }}: the check said {{ billet_osd_memory_check.stdout_lines | default([]) }}"
+
+- name: Read what the role asked of ceph
+  ansible.builtin.slurp:
+    src: "{{ billet_gate_tree.path }}/calls.log"
+  register: billet_gate_calls
+
+- name: Read what the cluster holds afterwards
+  ansible.builtin.slurp:
+    src: "{{ billet_gate_tree.path }}/dump.json"
+  register: billet_gate_held
+
+- name: The role made exactly this cluster's calls, in order
+  when:
+    - not (billet_gate_case.refused | default(false))
+    - not (billet_gate_case.late | default(false))
+  ansible.builtin.assert:
+    that: (billet_gate_calls.content | b64decode).splitlines() == billet_gate_case.calls
+    fail_msg: >-
+      {{ billet_gate_case.name }}: the role called ceph with
+      {{ (billet_gate_calls.content | b64decode).splitlines() }}, not {{ billet_gate_case.calls }}.
+
+- name: The cluster ends with the osd section's two values alone
+  ansible.builtin.assert:
+    that: >-
+      (billet_gate_held.content | b64decode | from_json
+       | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune'])
+       | map(attribute='section') | list) == ['osd', 'osd']
+      and (billet_gate_held.content | b64decode | from_json
+           | selectattr('name', 'in', ['osd_memory_target', 'osd_memory_target_autotune'])
+           | rejectattr('mask', 'equalto', '') | list | length) == 0
+      and (billet_gate_held.content | b64decode | from_json | selectattr('name', 'equalto', 'osd_memory_target')
+           | map(attribute='value') | list) == ['17179869184']
+    fail_msg: "{{ billet_gate_case.name }}: the cluster holds {{ billet_gate_held.content | b64decode }}"
+  when:
+    - (billet_gate_case.target_gib | int) > 0
+    - billet_gate_case.ceph | default(true)
+    - not (billet_gate_case.refused | default(false))
+
+- name: Ask whether the enforcer is installed
+  ansible.builtin.stat:
+    path: "{{ billet_gate_tree.path }}/root/usr/local/libexec/billet-ceph-osd-memory"
+  register: billet_gate_enforcer
+
+- name: The enforcer is installed exactly where the role holds the target
+  ansible.builtin.assert:
+    that: billet_gate_enforcer.stat.exists == ((billet_gate_case.ceph | default(true)) and (billet_gate_case.target_gib | int) > 0)
+    fail_msg: "{{ billet_gate_case.name }}: the enforcer is {{ 'there' if billet_gate_enforcer.stat.exists else 'absent' }}"

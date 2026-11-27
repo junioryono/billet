@@ -30,6 +30,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The role gives way to a rollout, and renders the timers that carry one out.**
 - **The role keeps needrestart away from billet's services.**
 - **cephadm.log has one rotation rule, ceph-common's.**
+- **The role holds each OSD's memory at a number the inventory states, never cephadm's autotune (#756).**
 - **The role keeps LVM's scans off the RBD and NBD devices the host maps (#922).**
 - **A converge restarts services, so never drive one from a runner billet manages.**
 - **The ordinary node restart is requested, never awaited.**

@@ -116,6 +116,18 @@
     {{ [billet_smtp_config_path, billet_smtp_marker_path, billet_ceph_health_script_path,
         billet_ceph_health_service_path, billet_ceph_health_timer_path] }}
 
+- name: Name the OSD memory enforcer's destinations
+  ansible.builtin.import_tasks: ceph-osd-memory-operands.yml
+
+- name: Bind OSD memory enforcer installation or cleanup destinations
+  ansible.builtin.set_fact:
+    billet_retirement_planned_filesystem: >-
+      {{ billet_retirement_planned_filesystem + [{'kind': 'write' if billet_osd_memory_held else 'delete', 'path': item}] }}
+  loop:
+    - "{{ billet_osd_memory_script_path }}"
+    - "{{ billet_osd_memory_service_path }}"
+    - "{{ billet_osd_memory_timer_path }}"
+
 - name: Bind image refresh installation or cleanup destinations
   ansible.builtin.set_fact:
     billet_retirement_planned_filesystem: >-

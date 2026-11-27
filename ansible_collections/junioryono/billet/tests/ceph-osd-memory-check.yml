@@ -1,0 +1,344 @@
+---
+# Runs the host role's OSD memory tasks (tasks_from: ceph-osd-memory), which install
+# billet-ceph-osd-memory and its timer under a temporary root, ask it what it would
+# change, and restart its service, against a fake `systemctl` that records every
+# call and runs the installed enforcer as the service would, and a fake `ceph`
+# that keeps the cluster's settings in a file: it records
+# every call, answers `config dump` from what it holds, and applies `config set`
+# and `config rm`. Like cephadm, it writes a host's target back whenever one is
+# removed while any autotune setting is still on, and a pass already under way can
+# publish a stale host target at a chosen read. Escalated as the role runs them:
+#
+#   - autotuned, as the reference host was on 2026-11-25 (autotune on, a per-host
+#     target autotune wrote, and one daemon's own): autotune off, the section's
+#     target set, then each narrower setting removed, and a read that finds
+#     nothing left to change;
+#   - one daemon still autotuned beside a host target: that daemon's autotune goes
+#     before the target does, so cephadm has no reason to write it back;
+#   - a pass under way whose stale target lands at the run's second read: the
+#     next pass removes it;
+#   - a writer that never stops: the script gives up after its passes and the
+#     converge fails;
+#   - a stale target that lands after the converge: the installed script, run as
+#     its timer runs it, removes it;
+#   - converged: one read, and nothing changed;
+#   - 0, or Ceph off, with the enforcer installed: the timer stopped and disabled,
+#     then the service stopped, the enforcer and its units removed, and no call to
+#     ceph; and with nothing installed, no call at all.
+#
+# Every case also proves what the converge told systemd, in order: the service
+# restarted and the timer enabled and started, the timer even when the run failed.
+- name: The host role holds each OSD's memory at the inventory's target
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  tasks:
+    - name: Make the tree the cases run in
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -osd-memory
+      register: billet_gate_tree
+
+    - name: Run the cases and remove the tree
+      block:
+        - name: Make the fake ceph's and the installed tree's directories
+          ansible.builtin.file:
+            path: "{{ billet_gate_tree.path }}/{{ item }}"
+            state: directory
+            mode: "0755"
+          loop: [bin, root/usr/local/libexec, root/etc/systemd/system]
+
+        # AS systemd ANSWERS: a restart or a start runs the INSTALLED unit's
+        # ExecStart, under the case's root where the unit names a file there, and
+        # answers its failure with a line of its own, not the script's; anything the
+        # case did not expect is refused, so a regression to another call fails it.
+        - name: Plant the fake systemctl
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/bin/systemctl"
+            mode: "0755"
+            content: |
+              #!/usr/bin/env python3
+              import os, subprocess, sys
+              args = sys.argv[1:]
+              with open(os.environ['BILLET_GATE_SYSTEMCTL_LOG'], 'a') as log:
+                  log.write(' '.join(args) + '\n')
+              if args in (['restart', 'billet-ceph-osd-memory.service'], ['start', 'billet-ceph-osd-memory.service']):
+                  root = os.environ['BILLET_GATE_ROOT']
+                  unit = open(root + '/etc/systemd/system/billet-ceph-osd-memory.service').read().splitlines()
+                  # ONE COMMAND, AS THE ROLE'S UNIT HAS: systemd runs several in order and
+                  # stops at the first that fails, which this fake does not model.
+                  starts = [line.split('=', 1)[1] for line in unit if line.strip().startswith('ExecStart')]
+                  if len(starts) != 1:
+                      sys.exit('the fake systemctl runs a unit with exactly one ExecStart, not %r' % starts)
+                  argv = starts[0].split()
+                  if os.path.exists(root + argv[0]):
+                      argv[0] = root + argv[0]
+                  run = subprocess.run(argv, capture_output=True, text=True)
+                  if run.returncode != 0:
+                      sys.exit('Job for billet-ceph-osd-memory.service failed because the control '
+                               'process exited with error code.')
+                  sys.exit(0)
+              if args in (['enable', '--now', 'billet-ceph-osd-memory.timer'],
+                          ['disable', '--now', 'billet-ceph-osd-memory.timer'],
+                          ['stop', 'billet-ceph-osd-memory.service']):
+                  sys.exit(0)
+              sys.exit('the fake systemctl does not answer ' + ' '.join(args))
+
+        - name: Plant the fake ceph
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/bin/ceph"
+            mode: "0755"
+            content: |
+              #!/usr/bin/env python3
+              import json, os, sys
+              args = sys.argv[1:]
+              with open(os.environ['BILLET_GATE_CEPH_LOG'], 'a') as log:
+                  log.write(' '.join(args) + '\n')
+              path = os.environ['BILLET_GATE_CEPH_DUMP']
+              with open(path) as f:
+                  held = json.load(f)
+              stale = {'section': 'osd', 'name': 'osd_memory_target', 'value': '182725545984',
+                       'mask': 'host:ubuntu-01'}
+              if args[:2] == ['config', 'dump']:
+                  # A PASS UNDER WAY publishes its stale target at the read the case
+                  # names, or, for a writer that never stops, at every read.
+                  counter = path + '.reads'
+                  reads = (int(open(counter).read()) if os.path.exists(counter) else 0) + 1
+                  open(counter, 'w').write(str(reads))
+                  late = os.environ.get('BILLET_GATE_STALE_AT', '')
+                  if late == 'every' or late == str(reads):
+                      held = [e for e in held if not (e['mask'] == stale['mask'] and e['name'] == stale['name'])]
+                      held.append(stale)
+                      with open(path, 'w') as f:
+                          json.dump(held, f)
+                  print(json.dumps(held))
+                  sys.exit(0)
+              if args[:2] == ['config', 'set']:
+                  section, name, value = args[2:5]
+                  held = [e for e in held if not (e['section'] == section and e['mask'] == '' and e['name'] == name)]
+                  held.append({'section': section, 'name': name, 'value': value, 'mask': ''})
+              elif args[:2] == ['config', 'rm']:
+                  who, name = args[2:4]
+                  section, _, mask = who.partition('/')
+                  gone = [e for e in held if e['section'] == section and e['mask'] == mask and e['name'] == name]
+                  held = [e for e in held if e not in gone]
+                  # CEPHADM: a host's target removed while any daemon's autotune is on
+                  # is written back.
+                  if mask.startswith('host:') and name == 'osd_memory_target' and any(
+                          e['name'] == 'osd_memory_target_autotune' and e['value'] == 'true' for e in held):
+                      held.extend(gone)
+              else:
+                  sys.exit('the fake ceph does not answer ' + ' '.join(args))
+              with open(path, 'w') as f:
+                  json.dump(held, f)
+
+        - name: Run each cluster through the role's tasks
+          ansible.builtin.include_tasks: ceph-osd-memory-case.yml
+          loop:
+            - name: autotuned
+              target_gib: 16
+              reported: true
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
+              dump:
+                - {section: osd, name: osd_mclock_profile, value: high_client_ops, mask: ""}
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "182725545984", mask: "host:ubuntu-01"}
+                - {section: osd.1, name: osd_memory_target, value: "1073741824", mask: ""}
+              calls:
+                - config dump --format json
+                - config dump --format json
+                - config set osd osd_memory_target_autotune false
+                - config set osd osd_memory_target 17179869184
+                - config rm osd/host:ubuntu-01 osd_memory_target
+                - config rm osd.1 osd_memory_target
+                - config dump --format json
+            - name: one daemon still autotuned
+              target_gib: 16
+              reported: true
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+                - {section: osd.1, name: osd_memory_target_autotune, value: "true", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "182725545984", mask: "host:ubuntu-01"}
+              calls:
+                - config dump --format json
+                - config dump --format json
+                - config set osd osd_memory_target_autotune false
+                - config rm osd.1 osd_memory_target_autotune
+                - config set osd osd_memory_target 17179869184
+                - config rm osd/host:ubuntu-01 osd_memory_target
+                - config dump --format json
+            - name: a pass under way
+              target_gib: 16
+              reported: true
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
+              stale_at: "3"
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+              calls:
+                - config dump --format json
+                - config dump --format json
+                - config set osd osd_memory_target_autotune false
+                - config set osd osd_memory_target 17179869184
+                - config dump --format json
+                - config rm osd/host:ubuntu-01 osd_memory_target
+                - config dump --format json
+            - name: a writer that never stops
+              target_gib: 16
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
+              stale_at: every
+              refused: true
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
+            - name: a stale target after the converge
+              target_gib: 16
+              reported: false
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
+                - start billet-ceph-osd-memory.service
+              late: true
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
+              calls:
+                - config dump --format json
+                - config dump --format json
+            - name: converged
+              target_gib: 16
+              reported: false
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
+              dump:
+                - {section: osd, name: osd_mclock_profile, value: high_client_ops, mask: ""}
+                - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
+              calls:
+                - config dump --format json
+                - config dump --format json
+            - name: left to the cluster
+              target_gib: 0
+              systemctl:
+                - disable --now billet-ceph-osd-memory.timer
+                - stop billet-ceph-osd-memory.service
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+              calls: []
+            - name: left to the cluster, with nothing installed
+              target_gib: 0
+              systemctl: []
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "true", mask: ""}
+              calls: []
+            - name: held again
+              target_gib: 16
+              reported: false
+              systemctl:
+                - restart billet-ceph-osd-memory.service
+                - enable --now billet-ceph-osd-memory.timer
+              dump:
+                - {section: osd, name: osd_memory_target_autotune, value: "false", mask: ""}
+                - {section: osd, name: osd_memory_target, value: "17179869184", mask: ""}
+              calls:
+                - config dump --format json
+                - config dump --format json
+            - name: Ceph turned off
+              target_gib: 16
+              ceph: false
+              systemctl:
+                - disable --now billet-ceph-osd-memory.timer
+                - stop billet-ceph-osd-memory.service
+              dump: []
+              calls: []
+          loop_control:
+            loop_var: billet_gate_case
+            label: "{{ billet_gate_case.name }}"
+
+        # A DRY RUN OVER AN OLDER ENFORCER: the template installs nothing in check
+        # mode, so the script installed is one that takes no --check and writes.
+        # A real --check run, because only that sets ansible_check_mode.
+        - name: Install an older enforcer that writes whatever it is asked
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/root/usr/local/libexec/billet-ceph-osd-memory"
+            mode: "0755"
+            content: |
+              #!/bin/sh
+              echo "the older enforcer ran: $*" >> "$BILLET_GATE_CEPH_LOG"
+          become: true
+
+        - name: Start the dry run's call logs empty
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/{{ item }}"
+            content: ""
+            mode: "0666"
+          loop: [calls.log, systemctl.log]
+          become: true
+
+        - name: Write a play that converges the cluster's OSD memory
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/check-play.yml"
+            mode: "0644"
+            content: |
+              - hosts: localhost
+                gather_facts: false
+                connection: local
+                tasks:
+                  - name: Converge the cluster's OSD memory
+                    ansible.builtin.include_role:
+                      name: junioryono.billet.host
+                      tasks_from: ceph-osd-memory
+                    vars:
+                      billet_ceph_enabled: true
+                      billet_ceph_osd_memory_target_gib: 8
+                      _billet_osd_memory_root: "{{ billet_gate_tree.path }}/root"
+                      _billet_alert_skip_service_control: true
+
+        - name: Converge in check mode
+          ansible.builtin.command:
+            argv: [ansible-playbook, --check, -i, "localhost,", "{{ billet_gate_tree.path }}/check-play.yml"]
+          environment:
+            # The controller's own PATH after the fakes, so the nested play is this
+            # ansible, with this collection.
+            PATH: "{{ billet_gate_tree.path }}/bin:{{ lookup('ansible.builtin.env', 'PATH') }}"
+            BILLET_GATE_CEPH_LOG: "{{ billet_gate_tree.path }}/calls.log"
+            BILLET_GATE_CEPH_DUMP: "{{ billet_gate_tree.path }}/dump.json"
+            BILLET_GATE_SYSTEMCTL_LOG: "{{ billet_gate_tree.path }}/systemctl.log"
+            BILLET_GATE_ROOT: "{{ billet_gate_tree.path }}/root"
+          register: billet_gate_dry_run
+          changed_when: false
+          failed_when: false
+
+        - name: Read what the dry run asked of ceph and systemd
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_tree.path }}/{{ item }}"
+          loop: [calls.log, systemctl.log]
+          register: billet_gate_dry_logs
+
+        - name: The dry run ran no enforcer and asked systemd nothing
+          ansible.builtin.assert:
+            that:
+              - billet_gate_dry_run.rc == 0
+              - billet_gate_dry_logs.results[0].content | b64decode == ''
+              - billet_gate_dry_logs.results[1].content | b64decode == ''
+            fail_msg: >-
+              check mode answered {{ billet_gate_dry_run.rc }} ({{ billet_gate_dry_run.stdout_lines[-8:] | default([]) }}
+              {{ billet_gate_dry_run.stderr_lines[-4:] | default([]) }});
+              ceph saw {{ billet_gate_dry_logs.results[0].content | b64decode }};
+              systemctl saw {{ billet_gate_dry_logs.results[1].content | b64decode }}
+      always:
+        - name: Remove the tree
+          ansible.builtin.file:
+            path: "{{ billet_gate_tree.path }}"
+            state: absent
+          become: true

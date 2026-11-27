@@ -28,6 +28,11 @@
         - {name: firewall port injection, values: {billet_guest_host_tcp_ports: ['22; include /protected']}, refuses: billet_guest_host_tcp_ports}
         - {name: firewall service name and range accepted, values: {billet_guest_host_tcp_ports: [ssh, '8000-8080', 443], billet_guest_host_udp_ports: [domain]}, refuses: ''}
         - {name: firewall reversed range, values: {billet_guest_host_tcp_ports: ['8080-8000']}, refuses: billet_guest_host_tcp_ports}
+        - {name: OSD memory in GiB accepted, values: {billet_ceph_osd_memory_target_gib: 16}, refuses: ''}
+        - {name: OSD memory left to the cluster, values: {billet_ceph_osd_memory_target_gib: 0}, refuses: ''}
+        - {name: OSD memory with a unit refused, values: {billet_ceph_osd_memory_target_gib: 16GiB}, refuses: billet_ceph_osd_memory_target_gib}
+        - {name: OSD memory negative refused, values: {billet_ceph_osd_memory_target_gib: -1}, refuses: billet_ceph_osd_memory_target_gib}
+        - {name: OSD memory as a switch refused, values: {billet_ceph_osd_memory_target_gib: true}, refuses: billet_ceph_osd_memory_target_gib}
         - {name: LVM filter switched off, values: {billet_lvm_rbd_filter: false}, refuses: ''}
         - {name: LVM filter as a string refused, values: {billet_lvm_rbd_filter: 'false'}, refuses: billet_lvm_rbd_filter}
         - {name: LVM directory relative refused, values: {billet_lvm_system_dir: etc/lvm}, refuses: billet_lvm_system_dir}

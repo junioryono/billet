@@ -79,6 +79,15 @@
     billet_gate_expected_paths: "{{ billet_gate_expected_paths + [{'kind': 'write' if billet_ceph_enabled else 'delete', 'path': item}] }}"
   loop: "{{ [billet_smtp_config_path, billet_smtp_marker_path, billet_ceph_health_script_path, billet_ceph_health_service_path, billet_ceph_health_timer_path] }}"
 
+- name: Bind OSD memory enforcer task values to the expected document
+  ansible.builtin.set_fact:
+    billet_gate_expected_paths: >-
+      {{ billet_gate_expected_paths + [{'kind': 'write' if billet_ceph_enabled and (billet_ceph_osd_memory_target_gib | int) > 0 else 'delete', 'path': item}] }}
+  loop:
+    - /usr/local/libexec/billet-ceph-osd-memory
+    - /etc/systemd/system/billet-ceph-osd-memory.service
+    - /etc/systemd/system/billet-ceph-osd-memory.timer
+
 - name: Bind image maintenance task values to the expected document
   ansible.builtin.set_fact:
     billet_gate_expected_paths: "{{ billet_gate_expected_paths + [{'kind': 'write' if billet_ceph_enabled else 'delete', 'path': '/etc/systemd/system/' ~ item}] }}"

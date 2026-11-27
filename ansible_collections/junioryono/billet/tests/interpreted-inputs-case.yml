@@ -15,6 +15,7 @@
     billet_guest_host_udp_ports: [53]
     billet_image_verify_port: 7719
     billet_firecracker_version: v1.16.1
+    billet_ceph_osd_memory_target_gib: 4
     billet_lvm_rbd_filter: true
     billet_lvm_system_dir: /etc/lvm
     billet_gate_input_refused: false

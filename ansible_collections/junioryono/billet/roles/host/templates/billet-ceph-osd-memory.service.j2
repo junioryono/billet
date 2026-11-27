@@ -1,0 +1,8 @@
+[Unit]
+Description=Hold each Ceph OSD's memory at billet's target
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/billet-ceph-osd-memory
