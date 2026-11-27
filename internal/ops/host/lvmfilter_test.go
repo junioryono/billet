@@ -99,9 +99,10 @@ func TestBilletCheckSaysWhetherLVMScansTheMappedImages(t *testing.T) {
 	}
 }
 
-// billet check ASKS, on every node with a ceph block, BEFORE the cluster's preflight,
-// whose failure returns early, and UNCONDITIONALLY: a statement of its own in the
-// block, not one nested in a branch of the preflight or any other.
+// billet check ASKS, on every node with a ceph block, FIRST: a statement of its own
+// at the head of the block, so no branch of the cluster's preflight, whose failure
+// returns early, and no other return in the block can skip it. A structural test
+// cannot see a condition around the block itself.
 func TestBilletCheckAsksAboutLVMBeforeTheCluster(t *testing.T) {
 	t.Parallel()
 
@@ -177,9 +178,10 @@ func TestBilletCheckAsksAboutLVMBeforeTheCluster(t *testing.T) {
 			}
 		}
 
-		if lvm < 0 || cluster < 0 || lvm >= cluster {
+		// FIRST, so no return or branch in the block can come before it.
+		if lvm != 0 || cluster < 0 {
 			t.Errorf("%s: the ceph block calls reportLVMFilter as statement %d and asks the cluster in "+
-				"statement %d; it must call it as a statement of its own, before the cluster",
+				"statement %d; it must call it as its first statement, ahead of the cluster",
 				fset.Position(ifStmt.Pos()), lvm, cluster)
 		}
 
