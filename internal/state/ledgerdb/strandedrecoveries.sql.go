@@ -93,7 +93,7 @@ func (q *Queries) CountOpenStrandedRecoveriesOfRun(ctx context.Context, arg Coun
 const countStrandedRecoveries = `-- name: CountStrandedRecoveries :many
 SELECT tier, state, COUNT(*) AS recoveries
   FROM stranded_recoveries
- WHERE created_at >= $1
+ WHERE state IN ('cancelling', 'rerunning') OR settled_at >= $1
  GROUP BY tier, state
  ORDER BY tier, state
 `
@@ -104,8 +104,10 @@ type CountStrandedRecoveriesRow struct {
 	Recoveries int64
 }
 
-// How many recoveries of each tier begun since a moment are in each state, for a
-// metric.
+// How many recoveries of each tier are in each state, for a metric: every one still
+// under way, however old, and every one that settled since a moment. A recovery
+// expires only a day after it began, so a window on its beginning would drop it as
+// it ends.
 func (q *Queries) CountStrandedRecoveries(ctx context.Context, since string) ([]CountStrandedRecoveriesRow, error) {
 	rows, err := q.db.QueryContext(ctx, countStrandedRecoveries, since)
 	if err != nil {

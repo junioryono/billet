@@ -86,8 +86,9 @@ var ledgerFamilies = []metrics.Family{
 		Help: "Jobs GitHub stopped offering in the last day, by tier: launches billet could not start whose " +
 			"job GitHub still lists queued with no runner and will not offer again (#911). Absent where none was."},
 	{Name: familyStrandedRecov, Labels: []string{"tier", "state"},
-		Help: "Recoveries of stranded jobs begun in the last day, on tiers that set retry.stranded, by state: " +
-			"cancelling, rerunning, recovered, superseded, failed, or expired. Absent where none was begun."},
+		Help: "Recoveries of stranded jobs on tiers that set retry.stranded, by state: every one still under way " +
+			"(cancelling, rerunning), and those that settled in the last day (recovered, superseded, failed, " +
+			"expired). Absent where there is none."},
 	{Name: familyAlertNotices, Labels: []string{"destination", "state"},
 		Help: "Alert notices the ledger holds, by destination and state: pending, delivered, or failed, one " +
 			"given up on. Settled notices are kept eight days. Absent where a destination was never owed one."},

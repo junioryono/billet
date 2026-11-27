@@ -371,8 +371,9 @@ type StrandedRecoveryCount struct {
 	Recoveries int64
 }
 
-// StrandedCounts counts each tier's launches decided stranded at or after since,
-// and the recoveries begun at or after since by state, in one read.
+// StrandedCounts counts each tier's launches decided stranded at or after since, and
+// its recoveries by state: every one still under way, and those settled at or after
+// since. One read.
 func (a *Allocator) StrandedCounts(ctx context.Context, since time.Time) ([]StrandedCount, []StrandedRecoveryCount,
 	error,
 ) {
