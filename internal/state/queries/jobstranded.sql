@@ -47,3 +47,11 @@ UPDATE job_history SET stranded = 'stranded', stranded_at = @stranded_at
                     WHERE later.tier = job_history.tier AND later.run_id = job_history.run_id
                       AND later.queued_at > job_history.finished_at
                       AND later.job_name IN (job_history.job_name, ''));
+
+-- name: CountStrandedJobs :many
+-- How many launches of each tier were decided stranded since a moment, for a metric.
+SELECT tier, COUNT(*) AS jobs
+  FROM job_history
+ WHERE stranded = 'stranded' AND stranded_at >= @since
+ GROUP BY tier
+ ORDER BY tier;

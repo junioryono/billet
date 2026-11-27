@@ -89,3 +89,14 @@ UPDATE stranded_recoveries SET refused = tries
 -- stands.
 UPDATE stranded_recoveries SET state = @to_state, settled_at = @settled_at, detail = @detail
  WHERE repo = @repo AND run_id = @run_id AND run_attempt = @run_attempt AND state = @from_state;
+
+-- name: CountStrandedRecoveries :many
+-- How many recoveries of each tier are in each state, for a metric: every one still
+-- under way, however old, and every one that settled since a moment. A recovery
+-- expires only a day after it began, so a window on its beginning would drop it as
+-- it ends.
+SELECT tier, state, COUNT(*) AS recoveries
+  FROM stranded_recoveries
+ WHERE state IN ('cancelling', 'rerunning') OR settled_at >= @since
+ GROUP BY tier, state
+ ORDER BY tier, state;

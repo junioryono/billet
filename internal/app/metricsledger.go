@@ -48,10 +48,13 @@ const (
 	familyTierReportAge  = "billet_tier_report_age_seconds"
 	familyNodes          = "billet_nodes"
 	familyJobReruns      = "billet_job_reruns"
+	familyJobsStranded   = "billet_jobs_stranded"
+	familyStrandedRecov  = "billet_stranded_recoveries"
 	familyAlertNotices   = "billet_alert_notices"
 )
 
-// jobRerunWindow is how far back billet_job_reruns counts. A gauge rather than a
+// jobRerunWindow is how far back billet_job_reruns, billet_jobs_stranded and
+// billet_stranded_recoveries count. A gauge rather than a
 // counter, read from the ledger, so a restart does not lose or repeat one.
 const jobRerunWindow = 24 * time.Hour
 
@@ -79,6 +82,13 @@ var ledgerFamilies = []metrics.Family{
 		Help: "Jobs billet disrupted in the last day, by tier and what was decided about re-running them; " +
 			"failed is a re-run GitHub never accepted, and unconfirmed one it could not be read to confirm. " +
 			"Absent where nothing was decided."},
+	{Name: familyJobsStranded, Labels: []string{"tier"},
+		Help: "Jobs GitHub stopped offering in the last day, by tier: launches billet could not start whose " +
+			"job GitHub still lists queued with no runner and will not offer again (#911). Absent where none was."},
+	{Name: familyStrandedRecov, Labels: []string{"tier", "state"},
+		Help: "Recoveries of stranded jobs on tiers that set retry.stranded, by state: every one still under way " +
+			"(cancelling, rerunning), and those that settled in the last day (recovered, superseded, failed, " +
+			"expired). Absent where there is none."},
 	{Name: familyAlertNotices, Labels: []string{"destination", "state"},
 		Help: "Alert notices the ledger holds, by destination and state: pending, delivered, or failed, one " +
 			"given up on. Settled notices are kept eight days. Absent where a destination was never owed one."},
@@ -214,6 +224,19 @@ func ledgerSnapshot(a *alloc.Allocator, tiers []config.Tier, now func() time.Tim
 
 		for _, d := range decisions {
 			add(familyJobReruns, float64(d.Jobs), d.Tier, string(d.Decision))
+		}
+
+		stranded, recoveries, err := a.StrandedCounts(ctx, at.Add(-jobRerunWindow))
+		if err != nil {
+			return nil, fmt.Errorf("stranded jobs: %w", err)
+		}
+
+		for _, c := range stranded {
+			add(familyJobsStranded, float64(c.Jobs), c.Tier)
+		}
+
+		for _, c := range recoveries {
+			add(familyStrandedRecov, float64(c.Recoveries), c.Tier, string(c.State))
 		}
 
 		notices, err := a.AlertNoticeCounts(ctx)
