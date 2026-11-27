@@ -66,7 +66,12 @@
               if args in (['restart', 'billet-ceph-osd-memory.service'], ['start', 'billet-ceph-osd-memory.service']):
                   root = os.environ['BILLET_GATE_ROOT']
                   unit = open(root + '/etc/systemd/system/billet-ceph-osd-memory.service').read().splitlines()
-                  argv = [line.split('=', 1)[1] for line in unit if line.startswith('ExecStart=')][-1].split()
+                  # ONE COMMAND, AS THE ROLE'S UNIT HAS: systemd runs several in order and
+                  # stops at the first that fails, which this fake does not model.
+                  starts = [line.split('=', 1)[1] for line in unit if line.strip().startswith('ExecStart')]
+                  if len(starts) != 1:
+                      sys.exit('the fake systemctl runs a unit with exactly one ExecStart, not %r' % starts)
+                  argv = starts[0].split()
                   if os.path.exists(root + argv[0]):
                       argv[0] = root + argv[0]
                   run = subprocess.run(argv, capture_output=True, text=True)
