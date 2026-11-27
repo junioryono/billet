@@ -36,8 +36,7 @@ var lvmConfig = func(ctx context.Context, args ...string) (string, string, int, 
 
 	err = cmd.Run()
 
-	var exit *exec.ExitError
-	if errors.As(err, &exit) && ctx.Err() == nil {
+	if exit, ok := errors.AsType[*exec.ExitError](err); ok && ctx.Err() == nil {
 		return stdout.String(), stderr.String(), exit.ExitCode(), nil
 	}
 
