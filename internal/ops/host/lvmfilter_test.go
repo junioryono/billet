@@ -99,8 +99,9 @@ func TestBilletCheckSaysWhetherLVMScansTheMappedImages(t *testing.T) {
 	}
 }
 
-// billet check ASKS, on every node with a ceph block, and BEFORE the cluster's
-// preflight, whose failure returns early.
+// billet check ASKS, on every node with a ceph block, BEFORE the cluster's preflight,
+// whose failure returns early, and UNCONDITIONALLY: a statement of its own in the
+// block, not one nested in a branch of the preflight or any other.
 func TestBilletCheckAsksAboutLVMBeforeTheCluster(t *testing.T) {
 	t.Parallel()
 
@@ -127,6 +128,23 @@ func TestBilletCheckAsksAboutLVMBeforeTheCluster(t *testing.T) {
 		return found
 	}
 
+	// direct reports whether stmt is itself a call to name, as a statement.
+	direct := func(stmt ast.Stmt, name string) bool {
+		expr, ok := stmt.(*ast.ExprStmt)
+		if !ok {
+			return false
+		}
+
+		call, ok := expr.X.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+
+		id, ok := call.Fun.(*ast.Ident)
+
+		return ok && id.Name == name
+	}
+
 	blocks := 0
 
 	ast.Inspect(file, func(n ast.Node) bool {
@@ -150,7 +168,7 @@ func TestBilletCheckAsksAboutLVMBeforeTheCluster(t *testing.T) {
 		lvm, cluster := -1, -1
 
 		for i, stmt := range ifStmt.Body.List {
-			if lvm < 0 && called(stmt, "reportLVMFilter") {
+			if lvm < 0 && direct(stmt, "reportLVMFilter") {
 				lvm = i
 			}
 
@@ -159,9 +177,10 @@ func TestBilletCheckAsksAboutLVMBeforeTheCluster(t *testing.T) {
 			}
 		}
 
-		if lvm < 0 || cluster < 0 || lvm > cluster {
-			t.Errorf("%s: the ceph block asks LVM at statement %d and the cluster at %d; it must ask LVM, "+
-				"and first", fset.Position(ifStmt.Pos()), lvm, cluster)
+		if lvm < 0 || cluster < 0 || lvm >= cluster {
+			t.Errorf("%s: the ceph block calls reportLVMFilter as statement %d and asks the cluster in "+
+				"statement %d; it must call it as a statement of its own, before the cluster",
+				fset.Position(ifStmt.Pos()), lvm, cluster)
 		}
 
 		return true
