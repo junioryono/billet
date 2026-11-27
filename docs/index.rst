@@ -20,6 +20,7 @@
    concepts/trust-and-isolation
    concepts/sites-and-storage
    concepts/identity-and-security
+   concepts/security-overview
    concepts/state-and-controllers
 
 .. toctree::

@@ -69,6 +69,11 @@
     billet_gate_expected_paths: "{{ billet_gate_expected_paths + [{'kind': 'mkdir', 'path': item.path}, {'kind': 'metadata', 'path': item.path}] }}"
   loop: "{{ billet_common_directories + billet_node_directories }}"
 
+- name: Bind the LVM filter's task value to the expected document
+  when: billet_ceph_enabled
+  ansible.builtin.set_fact:
+    billet_gate_expected_paths: "{{ billet_gate_expected_paths + [{'kind': 'write', 'path': billet_lvm_system_dir ~ '/lvmlocal.conf'}] }}"
+
 - name: Bind alert task values to the expected document
   ansible.builtin.set_fact:
     billet_gate_expected_paths: "{{ billet_gate_expected_paths + [{'kind': 'write' if billet_ceph_enabled else 'delete', 'path': item}] }}"

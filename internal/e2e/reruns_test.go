@@ -29,24 +29,28 @@ var (
 )
 
 // githubRuns is GitHub's REST record of the runs a test's jobs belong to, and the
-// two re-run routes, which the scripted plane hands it. Scripted as the plane is:
-// each record is what a test says GitHub would answer.
+// re-run and cancel routes, which the scripted plane hands it. Scripted as the plane
+// is: each record is what a test says GitHub would answer, and the two writes move
+// a run as GitHub was measured to (docs/reference/records/job-reruns.md).
 type githubRuns struct {
 	t *testing.T
 
-	mu      sync.Mutex
-	status  map[int64]string
-	attempt map[int64]int64
-	jobs    map[int64][]map[string]any
-	failed  map[int64]int
-	oneJob  map[int64]int
+	mu         sync.Mutex
+	status     map[int64]string
+	conclusion map[int64]string
+	attempt    map[int64]int64
+	jobs       map[int64][]map[string]any
+	failed     map[int64]int
+	oneJob     map[int64]int
+	cancels    map[int64]int
 }
 
 func newGitHubRuns(t *testing.T) *githubRuns {
 	t.Helper()
 
-	return &githubRuns{t: t, status: map[int64]string{}, attempt: map[int64]int64{},
-		jobs: map[int64][]map[string]any{}, failed: map[int64]int{}, oneJob: map[int64]int{}}
+	return &githubRuns{t: t, status: map[int64]string{}, conclusion: map[int64]string{},
+		attempt: map[int64]int64{}, jobs: map[int64][]map[string]any{}, failed: map[int64]int{},
+		oneJob: map[int64]int{}, cancels: map[int64]int{}}
 }
 
 // record says what GitHub holds about one run, a completed attempt with one job.
@@ -54,9 +58,37 @@ func (g *githubRuns) record(run, attempt, job int64, runner string, steps []map[
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	g.status[run], g.attempt[run] = "completed", attempt
+	g.status[run], g.conclusion[run], g.attempt[run] = "completed", "failure", attempt
 	g.jobs[run] = []map[string]any{{"id": job, "name": "hold", "run_attempt": attempt, "runner_name": runner,
 		"status": "completed", "conclusion": "failure", "steps": steps}}
+}
+
+// queued says GitHub holds one run in progress whose one job, name, is queued on
+// attempt with no runner: what GitHub showed of a stranded job for hours (#911).
+func (g *githubRuns) queued(run, attempt, job int64, name string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	g.status[run], g.attempt[run] = "in_progress", attempt
+	delete(g.conclusion, run)
+	g.jobs[run] = []map[string]any{{"id": job, "name": name, "run_attempt": attempt, "runner_name": nil,
+		"status": "queued", "conclusion": nil}}
+}
+
+// cancelled is how many times the run was asked to be cancelled.
+func (g *githubRuns) cancelled(run int64) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.cancels[run]
+}
+
+// state is the run's status and attempt as GitHub would answer them now.
+func (g *githubRuns) state(run int64) (string, int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.status[run], g.attempt[run]
 }
 
 func (g *githubRuns) requests(run int64) int {
@@ -86,16 +118,42 @@ func (g *githubRuns) serve(w http.ResponseWriter, r *http.Request) {
 	switch tail := parts[7:]; {
 	case r.Method == http.MethodGet && len(tail) == 2 && tail[0] == "runs":
 		run := id()
-		fakeactions.WriteJSON(g.t, w, map[string]any{"id": run, "status": g.status[run], "run_attempt": g.attempt[run]})
+		body := map[string]any{"id": run, "status": g.status[run], "run_attempt": g.attempt[run]}
+		if conclusion, ok := g.conclusion[run]; ok {
+			body["conclusion"] = conclusion
+		}
+		fakeactions.WriteJSON(g.t, w, body)
 	case r.Method == http.MethodGet && len(tail) == 3 && tail[0] == "runs" && tail[2] == "jobs":
 		jobs := g.jobs[id()]
 		fakeactions.WriteJSON(g.t, w, map[string]any{"total_count": len(jobs), "jobs": jobs})
 	case r.Method == http.MethodPost && len(tail) == 3 && tail[0] == "runs" && tail[2] == "rerun-failed-jobs":
 		run := id()
 		g.failed[run]++
-		// MEASURED: the run is `queued` on its attempt from the moment GitHub accepts.
+		// MEASURED: the run is `queued` on its attempt from the moment GitHub accepts,
+		// and a run a cancel ended is re-run as its next attempt (2026-11-22).
 		g.status[run] = "queued"
+		if g.conclusion[run] == "cancelled" {
+			g.attempt[run]++
+			delete(g.conclusion, run)
+			for _, job := range g.jobs[run] {
+				job["run_attempt"], job["status"], job["conclusion"], job["runner_name"] = g.attempt[run], "queued", nil, nil
+			}
+		}
 		w.WriteHeader(http.StatusCreated)
+		fakeactions.WriteJSON(g.t, w, map[string]any{})
+	case r.Method == http.MethodPost && len(tail) == 3 && tail[0] == "runs" && tail[2] == "cancel":
+		run := id()
+		g.cancels[run]++
+		// MEASURED: 202 on a run still going, and completed and cancelled 3.5 s later;
+		// 409 on one already over (2026-11-22). Here it is over at once.
+		if g.status[run] == "completed" {
+			w.WriteHeader(http.StatusConflict)
+			fakeactions.WriteJSON(g.t, w, map[string]any{"message": "Cannot cancel a workflow run that is completed."})
+
+			return
+		}
+		g.status[run], g.conclusion[run] = "completed", "cancelled"
+		w.WriteHeader(http.StatusAccepted)
 		fakeactions.WriteJSON(g.t, w, map[string]any{})
 	case r.Method == http.MethodPost && len(tail) == 3 && tail[0] == "jobs" && tail[2] == "rerun":
 		g.oneJob[id()]++

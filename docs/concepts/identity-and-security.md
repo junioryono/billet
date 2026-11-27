@@ -44,4 +44,4 @@ A launch failure quotes nothing the guest wrote, because a job can choose those 
 
 ## Reporting a vulnerability
 
-Do not open a public issue. Email the maintainer. Note that "a job can affect the host it runs on" is documented behaviour on the Docker backend and on any backend without its separate untrusted network, not a vulnerability; [Trust and isolation](trust-and-isolation.md) states the boundary.
+Do not open a public issue. Report it privately as the repository's `SECURITY.md` describes, through GitHub's private vulnerability reporting. [The security overview](security-overview.md) gathers what this page and the others say for someone deciding whether to run billet. Note that "a job can affect the host it runs on" is documented behaviour on the Docker backend and on any backend without its separate untrusted network, not a vulnerability; [Trust and isolation](trust-and-isolation.md) states the boundary.

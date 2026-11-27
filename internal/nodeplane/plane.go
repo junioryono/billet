@@ -569,6 +569,27 @@ func (p *Plane) QueuedForTest(name string) int {
 	return len(n.queue)
 }
 
+// QueuedLaunchForTest reports whether a launch of the job with this request id is
+// waiting to be taken by the named node. A count cannot tell it from the
+// maintenance commands a harness's reaper queues beside it.
+func (p *Plane) QueuedLaunchForTest(name string, request int64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		return false
+	}
+
+	for _, q := range n.queue {
+		if q.cmd.Kind == nodeapi.CommandLaunch && q.cmd.Job != nil && q.cmd.Job.RequestID == request {
+			return true
+		}
+	}
+
+	return false
+}
+
 // SetPollWindowForTest shortens the long-poll window.
 //
 // Exported for tests only, and named so nobody mistakes it for configuration:

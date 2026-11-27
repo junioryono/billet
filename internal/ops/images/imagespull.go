@@ -221,12 +221,15 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	//
 	// EXCEPT ON A NODE THAT HAS NOT REGISTERED, whose first pull must still install
 	// the kernel it needs to start, which imports nothing: there it is said, and the
-	// pull goes on.
+	// pull goes on to the kernel alone, whatever this node accepts (#730).
+	var unlearned error
 	if err := learnImageArchitectures(ctx, env, store, image); err != nil {
-		if _, acceptErr := acceptedComponents(cfg); !errors.Is(acceptErr, errAcceptanceUnknown) {
+		registered, regErr := registeredWithItsControlPlane(cfg)
+		if regErr != nil || registered {
 			return err
 		}
 
+		unlearned = err
 		fmt.Fprintf(env.Stdout, "warning: %v; this node has not registered, so the pull goes on to "+
 			"install the kernel it needs to start, and any import judges again\n", err)
 	}
@@ -301,6 +304,11 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 		accepted, err := acceptedComponents(cfg)
 		if err != nil && !errors.Is(err, errAcceptanceUnknown) {
 			return fmt.Errorf("billet images pull: %w", err)
+		}
+		// THE KERNEL ALONE, TOO, where this unregistered node could not learn the
+		// image's architectures, even though it already accepts every component.
+		if err == nil && unlearned != nil {
+			err = unlearned
 		}
 
 		// A NODE THAT HAS NOT REGISTERED INSTALLS THE KERNEL AND IMPORTS NOTHING.
