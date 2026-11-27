@@ -29,13 +29,26 @@
 - name: Ask whether LVM is configured on this host
   ansible.builtin.stat:
     path: "{{ billet_lvm_system_dir }}/lvm.conf"
+    follow: true
   register: billet_lvm_conf
 
 - name: Ask whether this host has local LVM settings
   ansible.builtin.stat:
     path: "{{ billet_lvm_system_dir }}/lvmlocal.conf"
+    follow: true
   register: billet_lvm_local
   when: billet_lvm_conf.stat.exists
+
+# A FILE, OR NOTHING IS COPIED: the copy below is of a regular file, so nothing
+# under the temporary directory is ever a tree to remove.
+- name: Refuse an LVM configuration that is not a regular file
+  ansible.builtin.assert:
+    that:
+      - not billet_lvm_conf.stat.exists or billet_lvm_conf.stat.isreg
+      - billet_lvm_local is skipped or not billet_lvm_local.stat.exists or billet_lvm_local.stat.isreg
+    fail_msg: >-
+      {{ billet_lvm_system_dir }}/lvm.conf or lvmlocal.conf is not a regular file,
+      so billet cannot tell what LVM applies and will not write its filter beside it.
 
 - name: Find what LVM applies apart from billet's filter
   when:
@@ -45,6 +58,7 @@
     - name: Make a directory for a copy of the LVM configuration
       ansible.builtin.tempfile:
         state: directory
+        path: "{{ billet_endpoint_temp_dir }}"
         suffix: -billet-lvm
       register: billet_lvm_copy
       check_mode: false
@@ -96,11 +110,23 @@
           changed_when: false
           check_mode: false
           become: true
+      # BY NAME, NEVER RECURSIVELY: the copies are the only names this run made
+      # there (lvmconfig wrote nothing beside them, 2.03.31, 2026-11-26), so each
+      # is removed with rm, which refuses a directory, and the directory with
+      # rmdir, which refuses one holding anything else.
       always:
-        - name: Remove the copy
-          ansible.builtin.file:
-            path: "{{ billet_lvm_copy.path }}"
-            state: absent
+        - name: Remove the copied LVM configuration files
+          ansible.builtin.command:
+            argv: [rm, -f, --, "{{ billet_lvm_copy.path }}/{{ item }}"]
+          loop: [lvm.conf, lvmlocal.conf]
+          changed_when: false
+          check_mode: false
+          become: true
+
+        - name: Remove the empty copy directory
+          ansible.builtin.command:
+            argv: [rmdir, "{{ billet_lvm_copy.path }}"]
+          changed_when: false
           check_mode: false
           become: true
 

@@ -2502,7 +2502,8 @@
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}}]"
       ],
       "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+        "const:lvmlocal.conf",
+        "inventory:billet_lvm_system_dir"
       ]
     },
     "tasks/lvm-rbd-filter.yml / Read the global filter LVM applies": {
@@ -2511,16 +2512,18 @@
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}}]"
       ],
       "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+        "const:lvmconfig devices/global_filter, a read",
+        "inventory:billet_lvm_system_dir"
       ]
     },
     "tasks/lvm-rbd-filter.yml / Make a directory for a copy of the LVM configuration": {
-      "task": "{\"ansible.builtin.tempfile\":{\"state\":\"directory\",\"suffix\":\"-billet-lvm\"},\"become\":true,\"check_mode\":false,\"name\":\"Make a directory for a copy of the LVM configuration\",\"register\":\"billet_lvm_copy\"}",
+      "task": "{\"ansible.builtin.tempfile\":{\"path\":\"{{ billet_endpoint_temp_dir }}\",\"state\":\"directory\",\"suffix\":\"-billet-lvm\"},\"become\":true,\"check_mode\":false,\"name\":\"Make a directory for a copy of the LVM configuration\",\"register\":\"billet_lvm_copy\"}",
       "contexts": [
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}}]"
       ],
       "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+        "const:/tmp",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
       ]
     },
     "tasks/lvm-rbd-filter.yml / Copy the LVM configuration files": {
@@ -2529,7 +2532,9 @@
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
       ],
       "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+        "const:/tmp",
+        "inventory:billet_lvm_system_dir",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
       ]
     },
     "tasks/lvm-rbd-filter.yml / Take billet's block out of the copy": {
@@ -2538,7 +2543,8 @@
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
       ],
       "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+        "const:/tmp",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
       ]
     },
     "tasks/lvm-rbd-filter.yml / Read any global filter the operator's configuration sets": {
@@ -2547,7 +2553,7 @@
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
       ],
       "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+        "const:lvmconfig devices/global_filter on the private temporary copy, a read"
       ]
     },
     "tasks/lvm-rbd-filter.yml / Read whether LVM uses a devices file here": {
@@ -2556,16 +2562,28 @@
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
       ],
       "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+        "const:lvmconfig devices/use_devicesfile devices/devicesfile, a read",
+        "inventory:billet_lvm_system_dir"
       ]
     },
-    "tasks/lvm-rbd-filter.yml / Remove the copy": {
-      "task": "{\"ansible.builtin.file\":{\"path\":\"{{ billet_lvm_copy.path }}\",\"state\":\"absent\"},\"become\":true,\"check_mode\":false,\"name\":\"Remove the copy\"}",
+    "tasks/lvm-rbd-filter.yml / Remove the copied LVM configuration files": {
+      "task": "{\"ansible.builtin.command\":{\"argv\":[\"rm\",\"-f\",\"--\",\"{{ billet_lvm_copy.path }}/{{ item }}\"]},\"become\":true,\"changed_when\":false,\"check_mode\":false,\"loop\":[\"lvm.conf\",\"lvmlocal.conf\"],\"name\":\"Remove the copied LVM configuration files\"}",
       "contexts": [
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"always\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
       ],
       "sources": [
-        "parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7)"
+        "const:/tmp",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
+      ]
+    },
+    "tasks/lvm-rbd-filter.yml / Remove the empty copy directory": {
+      "task": "{\"ansible.builtin.command\":{\"argv\":[\"rmdir\",\"{{ billet_lvm_copy.path }}\"]},\"become\":true,\"changed_when\":false,\"check_mode\":false,\"name\":\"Remove the empty copy directory\"}",
+      "contexts": [
+        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}},{\"file\":\"tasks/ceph.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"lvm-rbd-filter.yml\",\"name\":\"Keep LVM's scans off the RBD images this host maps\"}},{\"branch\":\"block\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Find what LVM applies apart from billet's filter\",\"when\":[\"billet_lvm_conf.stat.exists\",\"billet_lvm_rbd_filter | bool\"]}},{\"branch\":\"always\",\"file\":\"tasks/lvm-rbd-filter.yml\",\"task\":{\"name\":\"Copy the LVM configuration without billet's block\"}}]"
+      ],
+      "sources": [
+        "const:rmdir, which refuses a directory holding anything",
+        "parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2)"
       ]
     }
   },
@@ -2715,9 +2733,9 @@
     "tasks/ledger-mount.yml / Install the ledger mount unit": "{\"ansible.builtin.template\":{\"dest\":\"/etc/systemd/system/{{ billet_ledger_mount_unit_name }}\",\"group\":\"root\",\"mode\":\"0644\",\"owner\":\"root\",\"src\":\"billet-ledger.mount.j2\"},\"become\":true,\"name\":\"Install the ledger mount unit\",\"register\":\"billet_ledger_mount_installed\"}",
     "tasks/ledger-mount.yml / Prove the state directory is served by the expected volume": "{\"ansible.builtin.command\":{\"argv\":[\"findmnt\",\"-no\",\"SOURCE\",\"--mountpoint\",\"{{ billet_candidate_server_state_dir }}\"]},\"become\":true,\"changed_when\":false,\"check_mode\":false,\"name\":\"Prove the state directory is served by the expected volume\",\"register\":\"billet_ledger_mounted_source\",\"when\":\"not ansible_check_mode\"}",
     "tasks/ledger-mount.yml / Resolve the mounted device's real path": "{\"ansible.builtin.command\":{\"argv\":[\"readlink\",\"-f\",\"{{ billet_ledger_mounted_source.stdout | trim }}\"]},\"become\":true,\"changed_when\":false,\"check_mode\":false,\"name\":\"Resolve the mounted device's real path\",\"register\":\"billet_ledger_mounted_real\",\"when\":\"not ansible_check_mode\"}",
-    "tasks/lvm-rbd-filter.yml / Ask whether LVM is configured on this host": "{\"ansible.builtin.stat\":{\"path\":\"{{ billet_lvm_system_dir }}/lvm.conf\"},\"name\":\"Ask whether LVM is configured on this host\",\"register\":\"billet_lvm_conf\"}",
-    "tasks/lvm-rbd-filter.yml / Ask whether this host has local LVM settings": "{\"ansible.builtin.stat\":{\"path\":\"{{ billet_lvm_system_dir }}/lvmlocal.conf\"},\"name\":\"Ask whether this host has local LVM settings\",\"register\":\"billet_lvm_local\",\"when\":\"billet_lvm_conf.stat.exists\"}",
-    "tasks/lvm-rbd-filter.yml / Make a directory for a copy of the LVM configuration": "{\"ansible.builtin.tempfile\":{\"state\":\"directory\",\"suffix\":\"-billet-lvm\"},\"become\":true,\"check_mode\":false,\"name\":\"Make a directory for a copy of the LVM configuration\",\"register\":\"billet_lvm_copy\"}",
+    "tasks/lvm-rbd-filter.yml / Ask whether LVM is configured on this host": "{\"ansible.builtin.stat\":{\"follow\":true,\"path\":\"{{ billet_lvm_system_dir }}/lvm.conf\"},\"name\":\"Ask whether LVM is configured on this host\",\"register\":\"billet_lvm_conf\"}",
+    "tasks/lvm-rbd-filter.yml / Ask whether this host has local LVM settings": "{\"ansible.builtin.stat\":{\"follow\":true,\"path\":\"{{ billet_lvm_system_dir }}/lvmlocal.conf\"},\"name\":\"Ask whether this host has local LVM settings\",\"register\":\"billet_lvm_local\",\"when\":\"billet_lvm_conf.stat.exists\"}",
+    "tasks/lvm-rbd-filter.yml / Make a directory for a copy of the LVM configuration": "{\"ansible.builtin.tempfile\":{\"path\":\"{{ billet_endpoint_temp_dir }}\",\"state\":\"directory\",\"suffix\":\"-billet-lvm\"},\"become\":true,\"check_mode\":false,\"name\":\"Make a directory for a copy of the LVM configuration\",\"register\":\"billet_lvm_copy\"}",
     "tasks/lvm-rbd-filter.yml / Read any global filter the operator's configuration sets": "{\"ansible.builtin.command\":{\"argv\":[\"lvmconfig\",\"devices/global_filter\"]},\"become\":true,\"changed_when\":false,\"check_mode\":false,\"environment\":{\"LVM_SYSTEM_DIR\":\"{{ billet_lvm_copy.path }}\"},\"failed_when\":\"not (billet_lvm_operator_filter.rc == 0\\n     or (billet_lvm_operator_filter.rc == 5 and billet_lvm_operator_filter.stderr is search('not found')))\",\"name\":\"Read any global filter the operator's configuration sets\",\"register\":\"billet_lvm_operator_filter\"}",
     "tasks/lvm-rbd-filter.yml / Read whether LVM uses a devices file here": "{\"ansible.builtin.command\":{\"argv\":[\"lvmconfig\",\"--typeconfig\",\"full\",\"devices/use_devicesfile\",\"devices/devicesfile\"]},\"become\":true,\"changed_when\":false,\"check_mode\":false,\"environment\":{\"LVM_SYSTEM_DIR\":\"{{ billet_lvm_system_dir }}\"},\"name\":\"Read whether LVM uses a devices file here\",\"register\":\"billet_lvm_devicesfile\"}",
     "tasks/lvm-rbd-filter.yml / Name the devices file LVM uses": "{\"ansible.builtin.set_fact\":{\"billet_lvm_devicesfile_path\":\"{{ billet_lvm_system_dir ~ '/devices/' ~ ((billet_lvm_devicesfile.stdout_lines | select('match', '^devicesfile=') | first | default('') | replace('devicesfile=', '', 1) | replace('\\\"', '')) or 'system.devices') }}\"},\"name\":\"Name the devices file LVM uses\",\"when\":\"billet_lvm_devicesfile.stdout is search('use_devicesfile=1')\"}",
@@ -2846,6 +2864,7 @@
     "tasks/prepare-node-operations.yml / Bind configured guest network destinations": "{\"ansible.builtin.set_fact\":{\"billet_retirement_planned_filesystem\":\"{{ billet_retirement_planned_filesystem + [\\n   {'kind': 'write', 'path': '/etc/systemd/network/80-' ~ item.name ~ '.netdev'},\\n   {'kind': 'write', 'path': '/etc/systemd/network/81-' ~ item.name ~ '.network'},\\n   {'kind': 'write', 'path': '/etc/billet/network/' ~ item.name ~ '.conf'},\\n   {'kind': 'write', 'path': '/etc/systemd/system/billet-dnsmasq@' ~ item.name ~ '.service'}] }}\"},\"loop\":\"{{ billet_networks }}\",\"name\":\"Bind configured guest network destinations\",\"when\":\"billet_firecracker_enabled\"}",
     "tasks/prepare-node-operations.yml / Bind removed guest network destinations": "{\"ansible.builtin.set_fact\":{\"billet_retirement_planned_filesystem\":\"{{ billet_retirement_planned_filesystem + [\\n   {'kind': 'delete', 'path': '/etc/billet/network/' ~ item ~ '.conf'},\\n   {'kind': 'delete', 'path': '/etc/systemd/network/80-' ~ item ~ '.netdev'},\\n   {'kind': 'delete', 'path': '/etc/systemd/network/81-' ~ item ~ '.network'}] }}\"},\"loop\":\"{{ billet_stale_network_names | default([]) }}\",\"name\":\"Bind removed guest network destinations\",\"when\":\"billet_firecracker_enabled\"}",
     "tasks/prepare-node-operations.yml / Bind Ceph keyring and kernel module policy": "{\"ansible.builtin.set_fact\":{\"billet_retirement_planned_filesystem\":\"{{ billet_retirement_planned_filesystem + [\\n   {'kind': 'write', 'path': billet_ceph_keyring_path},\\n   {'kind': 'metadata', 'path': billet_ceph_keyring_path},\\n   {'kind': 'write', 'path': '/etc/modules-load.d/billet-rbd.conf'}] }}\"},\"name\":\"Bind Ceph keyring and kernel module policy\",\"when\":\"billet_ceph_enabled\"}",
+    "tasks/prepare-node-operations.yml / Bind the LVM filter's destination": "{\"ansible.builtin.set_fact\":{\"billet_retirement_planned_filesystem\":\"{{ billet_retirement_planned_filesystem + [{'kind': 'write', 'path': billet_lvm_system_dir ~ '/lvmlocal.conf'}] }}\"},\"name\":\"Bind the LVM filter's destination\",\"when\":\"billet_ceph_enabled\"}",
     "tasks/prepare-node-operations.yml / Bind alert installation or cleanup destinations": "{\"ansible.builtin.set_fact\":{\"billet_retirement_planned_filesystem\":\"{{ billet_retirement_planned_filesystem + [{'kind': 'write' if billet_ceph_enabled and billet_alert_email | length > 0 else 'delete', 'path': item}] }}\"},\"loop\":\"{{ [billet_smtp_config_path, billet_smtp_marker_path, billet_ceph_health_script_path,\\n    billet_ceph_health_service_path, billet_ceph_health_timer_path] }}\",\"name\":\"Bind alert installation or cleanup destinations\"}",
     "tasks/prepare-node-operations.yml / Bind image refresh installation or cleanup destinations": "{\"ansible.builtin.set_fact\":{\"billet_retirement_planned_filesystem\":\"{{ billet_retirement_planned_filesystem + [{'kind': 'write' if billet_firecracker_enabled and billet_ceph_enabled else 'delete', 'path': '/etc/systemd/system/' ~ item}] }}\"},\"loop\":[\"billet-images-refresh.service\",\"billet-images-refresh.timer\"],\"name\":\"Bind image refresh installation or cleanup destinations\"}",
     "tasks/prepare-node-operations.yml / Bind the system temporary directory class root": "{\"ansible.builtin.set_fact\":{\"billet_retirement_planned_filesystem\":\"{{ billet_retirement_planned_filesystem + [{'kind': 'mkdir', 'path': billet_endpoint_temp_dir}] }}\"},\"name\":\"Bind the system temporary directory class root\"}",
