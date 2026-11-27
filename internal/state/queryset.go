@@ -88,6 +88,8 @@ type ReadOps interface {
 	ListAttributedFailures(ctx context.Context, arg ledgerdb.ListAttributedFailuresParams) ([]ledgerdb.ListAttributedFailuresRow, error)
 	ListRerunCandidates(ctx context.Context, arg ledgerdb.ListRerunCandidatesParams) ([]ledgerdb.ListRerunCandidatesRow, error)
 	ListRerunDecisions(ctx context.Context, since string) ([]ledgerdb.ListRerunDecisionsRow, error)
+	CountStrandedJobs(ctx context.Context, since string) ([]ledgerdb.CountStrandedJobsRow, error)
+	CountStrandedRecoveries(ctx context.Context, since string) ([]ledgerdb.CountStrandedRecoveriesRow, error)
 	ReadOpenRerun(ctx context.Context, arg ledgerdb.ReadOpenRerunParams) (ledgerdb.ReadOpenRerunRow, error)
 	ListOpenReruns(ctx context.Context, arg ledgerdb.ListOpenRerunsParams) ([]ledgerdb.ListOpenRerunsRow, error)
 	ListBoundRerunTiers(ctx context.Context, arg ledgerdb.ListBoundRerunTiersParams) ([]string, error)

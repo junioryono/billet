@@ -47,6 +47,43 @@ func (q *Queries) CountLaterLeasesOfJob(ctx context.Context, arg CountLaterLease
 	return i, err
 }
 
+const countStrandedJobs = `-- name: CountStrandedJobs :many
+SELECT tier, COUNT(*) AS jobs
+  FROM job_history
+ WHERE stranded = 'stranded' AND stranded_at >= $1
+ GROUP BY tier
+ ORDER BY tier
+`
+
+type CountStrandedJobsRow struct {
+	Tier string
+	Jobs int64
+}
+
+// How many launches of each tier were decided stranded since a moment, for a metric.
+func (q *Queries) CountStrandedJobs(ctx context.Context, since string) ([]CountStrandedJobsRow, error) {
+	rows, err := q.db.QueryContext(ctx, countStrandedJobs, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CountStrandedJobsRow
+	for rows.Next() {
+		var i CountStrandedJobsRow
+		if err := rows.Scan(&i.Tier, &i.Jobs); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const decideJobStranded = `-- name: DecideJobStranded :execrows
 UPDATE job_history SET stranded = 'stranded', stranded_at = $1
  WHERE job_history.lease_id = $2 AND job_history.stranded = ''

@@ -357,3 +357,57 @@ func (a *Allocator) SettleStrandedRecovery(ctx context.Context, r StrandedRecove
 
 	return settled, err
 }
+
+// StrandedCount is how many of a tier's launches were decided stranded.
+type StrandedCount struct {
+	Tier string
+	Jobs int64
+}
+
+// StrandedRecoveryCount is how many of a tier's recoveries are in one state.
+type StrandedRecoveryCount struct {
+	Tier       string
+	State      StrandedRecoveryState
+	Recoveries int64
+}
+
+// StrandedCounts counts each tier's launches decided stranded at or after since,
+// and the recoveries begun at or after since by state, in one read.
+func (a *Allocator) StrandedCounts(ctx context.Context, since time.Time) ([]StrandedCount, []StrandedRecoveryCount,
+	error,
+) {
+	var (
+		jobs       []StrandedCount
+		recoveries []StrandedRecoveryCount
+	)
+
+	err := a.db.View(ctx, func(q querier) error {
+		reads := state.ReadQueries(q)
+
+		rows, err := reads.CountStrandedJobs(ctx, ts(since.UTC()))
+		if err != nil {
+			return fmt.Errorf("alloc: count the stranded jobs: %w", err)
+		}
+
+		jobs = make([]StrandedCount, 0, len(rows))
+		for _, r := range rows {
+			jobs = append(jobs, StrandedCount{Tier: r.Tier, Jobs: r.Jobs})
+		}
+
+		recs, err := reads.CountStrandedRecoveries(ctx, ts(since.UTC()))
+		if err != nil {
+			return fmt.Errorf("alloc: count the stranded-job recoveries: %w", err)
+		}
+
+		recoveries = make([]StrandedRecoveryCount, 0, len(recs))
+		for _, r := range recs {
+			recoveries = append(recoveries, StrandedRecoveryCount{
+				Tier: r.Tier, State: StrandedRecoveryState(r.State), Recoveries: r.Recoveries,
+			})
+		}
+
+		return nil
+	})
+
+	return jobs, recoveries, err
+}
