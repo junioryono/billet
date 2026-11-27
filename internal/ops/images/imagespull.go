@@ -339,8 +339,8 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 			return &cli.ExitError{Code: 2, Err: err, Msg: fmt.Sprintf("billet images pull: installed the "+
 				"kernel %s, and imported no generation: %v; point node.firecracker.kernel_image at that "+
 				"kernel unless the path it names already holds one, so the node can start and register; "+
-				"it imports a generation once it has, through `billet images refresh` or its daily timer",
-				kernel, err)}
+				"once it has, `billet images pull --verify %s` imports a generation (with automatic "+
+				"updates on, its daily refresh timer does too)", kernel, err, image)}
 		}
 
 		plan = planCompletion(manifest, accepted)
