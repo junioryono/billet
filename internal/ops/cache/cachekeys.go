@@ -16,7 +16,7 @@ const keyGenerationsShown = 10
 
 // keyGenerationReader is what printKeyGenerations reads: the Ceph store, or a test's.
 type keyGenerationReader interface {
-	KeyGenerations(ctx context.Context) ([]ceph.KeyGenerations, error)
+	KeyGenerations(ctx context.Context) (ceph.GenerationReport, error)
 }
 
 // openKeyGenerations opens the site's store for a node with a ceph block.
@@ -32,7 +32,8 @@ var openKeyGenerations = func(cfg *config.CephConfig) (keyGenerationReader, erro
 
 // reportKeyGenerations prints each key's generations on a node whose site stores
 // its caches in Ceph (#799). A read it cannot make is said and fails nothing: the
-// rest of the status does not depend on it.
+// rest of the status does not depend on it. It runs rbd as the invoking account,
+// which on a node the host role converged is root's keyring.
 func reportKeyGenerations(ctx context.Context, w io.Writer, cfg *config.Config, now time.Time) {
 	if cfg.Node == nil || cfg.Node.Ceph == nil {
 		return
@@ -45,24 +46,25 @@ func reportKeyGenerations(ctx context.Context, w io.Writer, cfg *config.Config, 
 		return
 	}
 
-	keys, err := client.KeyGenerations(ctx)
+	report, err := client.KeyGenerations(ctx)
 	if err != nil {
 		fmt.Fprintf(w, "\ncache generations UNCHECKED: %v\n", err)
 
 		return
 	}
 
-	printKeyGenerations(w, keys, cfg.Node.Ceph.CachePool, now)
+	printKeyGenerations(w, report, cfg.Node.Ceph.CachePool, now)
 }
 
 // printKeyGenerations names the keys holding the most generations in the pool.
-func printKeyGenerations(w io.Writer, keys []ceph.KeyGenerations, pool string, now time.Time) {
-	total := 0
-	for _, k := range keys {
-		total += k.Generations
-	}
+func printKeyGenerations(w io.Writer, report ceph.GenerationReport, pool string, now time.Time) {
+	keys := report.Keys
 
-	fmt.Fprintf(w, "\ncache generations in %s: %d across %d key(s)\n", pool, total, len(keys))
+	fmt.Fprintf(w, "\ncache generations in %s: %d across %d key(s)\n", pool, report.Generations, len(keys))
+
+	if report.Unreadable > 0 {
+		fmt.Fprintf(w, "  %d index record(s) could not be read, so these counts may be low\n", report.Unreadable)
+	}
 
 	if len(keys) == 0 {
 		return
