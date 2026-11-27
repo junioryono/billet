@@ -98,6 +98,7 @@ A weight only chooses who buys next, and it never takes the line from a waiter t
 | `provider` | yes | `docker`, `firecracker`, `tart`, `ec2`, `codebuild`; `simulated` is billet's own test-only backend and is refused anywhere in a configuration |
 | `site` | no | one of the control plane's `sites`; required with `ebs_s3`; refused on `codebuild` |
 | `max_vcpu`, `max_memory` | for `ec2` and `codebuild` | what this host contributes; detected on a host backend when unset |
+| `reserve_memory` | no; refused on `ec2` and `codebuild` | memory held back for the host itself (its Ceph OSDs first): the node offers `max_memory`, or what it detects, less this. Refused at or above a stated `max_memory`; a node whose reserve leaves nothing of what it detects refuses to start, and `billet check` says what it detects, reserves and offers (#755) |
 | `tls.cert`, `tls.key`, `tls.ca` | for any non-loopback controller address | from `billet ca issue` or enrollment; refused against a loopback server, unless `tls_router` says a router fronts it |
 | `lock_dir`, `allow_unlocked_deployment` | no | the host-wide deployment lock; a shared directory must be setgid; failing to place the lock is an error unless opted out |
 | `state_dir` | yes | generation pointers, image cache, the node's identity |

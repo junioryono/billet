@@ -24,6 +24,52 @@ func TestANegativeContributionIsRefused(t *testing.T) {
 	}
 }
 
+// A RESERVE IS REFUSED WHERE IT CANNOT MEAN WHAT IT SAYS, and loads where it can
+// (#755): a cloud node has no host memory to hold back, and a reserve at or above
+// a stated max_memory offers nothing whatever the machine has.
+func TestAReserveIsRefusedWhereItCannotMeanWhatItSays(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, want string
+	}{
+		{
+			name: "a firecracker host's reserve loads",
+			body: strings.Replace(validConfig, "  name: epyc-1", "  name: epyc-1\n  reserve_memory: 69GiB", 1),
+		},
+		{
+			name: "under a stated max_memory loads",
+			body: strings.Replace(validConfig, "  name: epyc-1",
+				"  name: epyc-1\n  max_memory: 480GiB\n  reserve_memory: 50GiB", 1),
+		},
+		{
+			name: "at a stated max_memory is refused",
+			body: strings.Replace(validConfig, "  name: epyc-1",
+				"  name: epyc-1\n  max_memory: 64GiB\n  reserve_memory: 64GiB", 1),
+			want: "node.reserve_memory 64GiB is not less than node.max_memory 64GiB",
+		},
+		{
+			name: "on a cloud node is refused",
+			body: cloudConfig(t, "  max_memory: 256GiB\n", "  max_memory: 256GiB\n  reserve_memory: 8GiB\n"),
+			want: "node.reserve_memory is set, but with node.provider ec2 the guests do not run on this host",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.body))
+
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Load = %v", err)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load = %v, want a refusal saying %q", err, tc.want)
+			}
+		})
+	}
+}
+
 // Unset is the ordinary case and means "detect it", so it must keep loading.
 func TestAnUnsetContributionIsAccepted(t *testing.T) {
 	if _, err := Load(writeConfig(t, validConfig)); err != nil {

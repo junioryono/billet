@@ -1242,8 +1242,17 @@ func (s *stack) awaitOneRunning(t *testing.T) []string {
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("waited for one running container, have %d (%d in any state)",
-				len(names), len(instances))
+			// EACH INSTANCE'S STATE, because "one in any state" did not say whether a
+			// container had exited or never started when this ran out once in CI
+			// (#919): Ended is a process that finished, and its absence is not.
+			states := make([]string, 0, len(instances))
+			for _, inst := range instances {
+				states = append(states, fmt.Sprintf("%s running=%t ended=%t terminal=%t",
+					inst.Name, inst.Running, inst.Ended, inst.Terminal))
+			}
+
+			t.Fatalf("waited for one running container, have %d (%d in any state: %s)",
+				len(names), len(instances), strings.Join(states, "; "))
 		}
 
 		time.Sleep(100 * time.Millisecond)

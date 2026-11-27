@@ -101,16 +101,26 @@ func TestACancelledFetchStopsTrying(t *testing.T) {
 	t.Parallel()
 
 	server, served := flakyServer(t, fetchAttempts, http.StatusOK)
-	client := &Client{HTTP: server.Client(), backoff: time.Hour}
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+
+	// CANCELLED INSIDE THE WAIT, never on a timer and never while a request is in
+	// flight: a 100 ms timeout expired before a loaded CI runner served any request
+	// (#919), and a cancellation that lands during the first request ends the fetch
+	// without its backoff ever being asked. The hour's backoff is what a fetch that
+	// ignored the cancellation would wait out, and the bound below is its guard.
+	waits := 0
+	client := &Client{HTTP: server.Client(), backoff: time.Hour, waiting: func() {
+		waits++
+		cancel()
+	}}
 
 	started := time.Now()
 	if _, err := client.get(ctx, server.URL+"/manifest", 1<<10); err == nil {
 		t.Fatal("a cancelled fetch succeeded")
 	}
-	if waited := time.Since(started); waited > 30*time.Second || served.Load() != 1 {
-		t.Fatalf("a cancelled fetch waited %s over %d request(s), want it to stop at the cancellation", waited,
-			served.Load())
+	if waited := time.Since(started); waited > 30*time.Second || served.Load() != 1 || waits != 1 {
+		t.Fatalf("a cancelled fetch waited %s over %d request(s) and %d backoff(s), want it to stop at "+
+			"the cancellation inside its one backoff", waited, served.Load(), waits)
 	}
 }

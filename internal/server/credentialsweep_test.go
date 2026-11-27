@@ -110,7 +110,39 @@ func TestTheStagedCredentialSweepRunsOnTheReapersClock(t *testing.T) {
 // FENCED AFTER THE PLANE IS RUNNING, as a claim is lost in production. A plane
 // fenced from the start opens no session at all (openSession refuses a process
 // that is no longer the controller, #207) and stops before its reaper ticks.
+//
+// A RUN THAT SAW TOO FEW FENCED TICKS IS RUN AGAIN, and a sweep after the fence
+// fails at once. The fence also stops the plane, since a fenced listener ends the
+// group the reaper runs in, so how many ticks fall between the fence and the stop
+// is a race: three or more on a quiet host, none on a loaded CI runner once
+// (#919). That outcome proves nothing either way; a fenced sweep is the defect.
 func TestAFencedControlPlaneNeverSweepsStagedCredentials(t *testing.T) {
+	const attempts = 10
+
+	for range attempts {
+		ticks, swept := fencedSweeps(t)
+		if swept != 0 {
+			t.Fatalf("a fenced control plane swept %d time(s)", swept)
+		}
+
+		if ticks >= 4 {
+			return
+		}
+
+		t.Logf("the plane stopped after %d tick(s), fewer than three after the fence; running it again", ticks)
+	}
+
+	t.Fatalf("in %d runs the reaper never ticked three times after the fence, so this proves "+
+		"nothing about what it skipped", attempts)
+}
+
+// fencedSweeps runs a plane that is fenced at the end of its reaper's first tick,
+// until the reaper has ticked three more times or the plane stops. It returns how
+// many times the reaper ticked, then how many sweeps the plane made after the
+// fence.
+func fencedSweeps(t *testing.T) (int32, int32) {
+	t.Helper()
+
 	sweeper := &countingSweeper{}
 
 	var (
@@ -135,21 +167,28 @@ func TestAFencedControlPlaneNeverSweepsStagedCredentials(t *testing.T) {
 		}),
 	)
 
-	// Three wholly fenced ticks, inside runPlaneWith's own lifetime.
+	// Three wholly fenced ticks, inside runPlaneWith's own lifetime, or the plane's
+	// own stop.
 	deadline := time.Now().Add(sweepGuard)
-	for ticks.Load() < 4 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	stopped := false
+	for !stopped && ticks.Load() < 4 && time.Now().Before(deadline) {
+		select {
+		case <-done:
+			stopped = true
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 
 	stop()
-	<-done
-
-	if ticks.Load() < 4 {
-		t.Fatalf("the reaper ticked %d time(s), fewer than three after the fence, so this proves "+
-			"nothing about what it skipped", ticks.Load())
+	if !stopped {
+		<-done
 	}
 
-	if got := sweeper.calls.Load() - baseline.Load(); got != 0 {
-		t.Fatalf("a fenced control plane swept %d time(s)", got)
+	// NO FENCE, NO BASELINE: a plane that stopped inside its first tick may have
+	// swept, unfenced, before the fence was set, and that sweep is not one after it.
+	if ticks.Load() == 0 {
+		return 0, 0
 	}
+
+	return ticks.Load(), sweeper.calls.Load() - baseline.Load()
 }

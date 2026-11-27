@@ -487,6 +487,16 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			cfg.Node.Provider, strings.Join(cfg.Node.ControlPlanes(), ", "))
 		printNodeReport()
 
+		// WHAT THE NODE WILL OFFER, resolved as the node resolves it at startup, and
+		// refused here for the reason it would be refused there (#755).
+		if cfg.Node.Provider.RunsOnHost() {
+			contribution, err := app.NodeContribution(cfg)
+			if err != nil {
+				return report, errors.Join(cacheFailure, fmt.Errorf("node memory: %w", err))
+			}
+			printNodeMemory(env, cfg, contribution)
+		}
+
 		// Config validation proves the ec2 block is COHERENT. It cannot prove this
 		// machine can act on it, and the difference is a deployment that validates
 		// and then fails on the first job of the day.
@@ -1007,5 +1017,26 @@ var timerEnabled = func(ctx context.Context, timer string) (bool, error) {
 		return false, nil
 	default:
 		return false, err
+	}
+}
+
+// printNodeMemory says what a node whose guests run on it offers them, and from
+// what: the machine, or node.max_memory, less node.reserve_memory.
+func printNodeMemory(env cli.Env, cfg *config.Config, c config.Contribution) {
+	declared := "unset"
+	if cfg.Node.MaxMemory > 0 {
+		declared = cfg.Node.MaxMemory.String()
+	}
+
+	reserved := "nothing reserved"
+	if c.Reserved > 0 {
+		reserved = c.Reserved.String() + " reserved for the host"
+	}
+
+	fmt.Fprintf(env.Stdout, "memory   offers %s to guests: %s detected, node.max_memory %s, %s\n",
+		c.Memory, c.DetectedMemory, declared, reserved)
+
+	for _, w := range c.Warnings {
+		fmt.Fprintf(env.Stdout, "         warning: %s\n", w)
 	}
 }
