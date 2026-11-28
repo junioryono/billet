@@ -267,9 +267,12 @@
               - not (billet_gate_tree.path ~ '/check/lvmlocal.conf') is exists
             fail_msg: "check mode answered {{ billet_gate_check.rc }}: {{ billet_gate_check.stdout_lines[-12:] | default([]) }}"
 
-        # A SECOND CONVERGE CHANGES NOTHING, counted as a converge counts it: a fleet's
-        # converge fails any host whose second pass reports a change, so a scratch
-        # copy reported as changed would fail every converge after the first.
+        # A SECOND PASS OF THESE TASKS CHANGES NOTHING, counted as a converge counts
+        # it: a fleet's converge fails any host whose second pass reports a change,
+        # so a scratch copy reported as changed would fail every converge after the
+        # first. This covers the filter's tasks alone; the rest of a Ceph host's
+        # converge needs a real cluster, and the consumer's own second pass is
+        # where that is proved.
         - name: Write a play that converges a host's filter, for the count
           ansible.builtin.copy:
             dest: "{{ billet_gate_tree.path }}/idem-play.yml"
