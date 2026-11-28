@@ -54,6 +54,9 @@
   when:
     - billet_lvm_conf.stat.exists
     - billet_lvm_rbd_filter | bool
+  # SCRATCH, NOT A CHANGE TO THE HOST: the copy, and what is done to it, are made
+  # and removed in this run, so none of it reports changed, or a converge's second
+  # pass would never settle.
   block:
     - name: Make a directory for a copy of the LVM configuration
       ansible.builtin.tempfile:
@@ -61,6 +64,7 @@
         path: "{{ billet_endpoint_temp_dir }}"
         suffix: -billet-lvm
       register: billet_lvm_copy
+      changed_when: false
       check_mode: false
       become: true
 
@@ -73,6 +77,7 @@
             remote_src: true
             mode: "0600"
           loop: "{{ ['lvm.conf'] + (['lvmlocal.conf'] if billet_lvm_local.stat.exists else []) }}"
+          changed_when: false
           check_mode: false
           become: true
 
@@ -82,6 +87,7 @@
             state: absent
             marker: "# {mark} billet: keep LVM off RBD and NBD devices (junioryono/billet#922)"
           when: billet_lvm_local.stat.exists
+          changed_when: false
           check_mode: false
           become: true
 
