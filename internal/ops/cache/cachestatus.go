@@ -35,6 +35,7 @@ func cmdCacheStatus(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	printTierCaches(env.Stdout, cfg.Tiers)
+	reportKeyGenerations(ctx, env.Stdout, cfg, time.Now())
 
 	if cfg.Server == nil {
 		fmt.Fprintln(env.Stdout, "\nno server section, so no central kill switch to read")
