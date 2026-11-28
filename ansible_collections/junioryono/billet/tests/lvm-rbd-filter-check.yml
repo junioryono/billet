@@ -18,6 +18,7 @@
 #     leaves it, under its own name or LVM's default when the setting is empty:
 #     refused;
 #   - check mode on a host with no filter: nothing written, nothing refused;
+#   - two converges of a host: the second reports nothing changed;
 #   - no lvm.conf at all: nothing is created.
 - name: The host role keeps LVM's scans off mapped RBD images
   hosts: localhost
@@ -55,7 +56,7 @@
             path: "{{ billet_gate_tree.path }}/{{ item }}"
             state: directory
             mode: "0755"
-          loop: [plain, never, conf, local, devfile/devices, emptyname/devices, check, unread, unread-bin, notafile/lvmlocal.conf]
+          loop: [plain, never, conf, local, devfile/devices, emptyname/devices, check, unread, unread-bin, notafile/lvmlocal.conf, idem]
 
         - name: Write each case's configuration
           ansible.builtin.copy:
@@ -66,6 +67,8 @@
             - {path: plain/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
             - {path: plain/lvmlocal.conf, content: "local {\n\tsystem_id = \"operator\"\n}\n"}
             - {path: never/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
+            - {path: idem/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
+            - {path: idem/lvmlocal.conf, content: "local {\n\tsystem_id = \"operator\"\n}\n"}
             - {path: notafile/lvm.conf, content: "{{ billet_gate_plain_conf }}"}
             - {path: notafile/lvmlocal.conf/keep, content: "the operator's\n"}
             - {path: conf/lvm.conf, content: "devices { global_filter = [ \"r|^/dev/sdz|\", \"a|.*|\" ] }\n"}
@@ -263,6 +266,44 @@
               - billet_gate_check.rc == 0
               - not (billet_gate_tree.path ~ '/check/lvmlocal.conf') is exists
             fail_msg: "check mode answered {{ billet_gate_check.rc }}: {{ billet_gate_check.stdout_lines[-12:] | default([]) }}"
+
+        # A SECOND CONVERGE CHANGES NOTHING, counted as a converge counts it: a fleet's
+        # converge fails any host whose second pass reports a change, so a scratch
+        # copy reported as changed would fail every converge after the first.
+        - name: Write a play that converges a host's filter, for the count
+          ansible.builtin.copy:
+            dest: "{{ billet_gate_tree.path }}/idem-play.yml"
+            mode: "0644"
+            content: |
+              - hosts: localhost
+                gather_facts: false
+                connection: local
+                tasks:
+                  - name: Converge the host's filter
+                    ansible.builtin.include_role:
+                      name: junioryono.billet.host
+                      tasks_from: lvm-rbd-filter
+                    vars:
+                      billet_lvm_system_dir: "{{ billet_gate_tree.path }}/idem"
+
+        - name: Converge the host twice
+          ansible.builtin.command:
+            argv: [ansible-playbook, -i, "localhost,", "{{ billet_gate_tree.path }}/idem-play.yml"]
+          register: billet_gate_idem
+          loop: [first, second]
+          changed_when: false
+          failed_when: false
+
+        - name: The first converge wrote the filter and the second changed nothing
+          ansible.builtin.assert:
+            that:
+              - billet_gate_idem.results[0].rc == 0
+              - billet_gate_idem.results[1].rc == 0
+              - "billet_gate_idem.results[0].stdout is search('localhost +: ok=[0-9]+ +changed=[1-9]')"
+              - "billet_gate_idem.results[1].stdout is search('localhost +: ok=[0-9]+ +changed=0 ')"
+            fail_msg: >-
+              first: {{ billet_gate_idem.results[0].stdout_lines[-3:] | default([]) }};
+              second: {{ billet_gate_idem.results[1].stdout_lines[-3:] | default([]) }}
 
         - name: Converge a host with no LVM
           ansible.builtin.include_role:
