@@ -535,6 +535,11 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		}
 
 		if cfg.Node.Ceph != nil {
+			// BEFORE THE CLUSTER, which can return early: whether LVM scans the mapped
+			// images is this host's own configuration, and may be what explains a
+			// cluster that is not answering (#922).
+			reportLVMFilter(ctx, env)
+
 			if err := checkCephCluster(ctx, env, cfg.Node.Ceph); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
