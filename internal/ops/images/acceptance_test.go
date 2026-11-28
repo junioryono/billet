@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/imageaccept"
@@ -433,6 +434,10 @@ func TestAFirstPullBeforeRegistrationInstallsTheKernelThoughArchitecturesCannotB
 		t.Fatalf("a first pull whose architectures could not be told answered %v, want the kernel installed", err)
 	}
 
+	if got := cli.ExitStatus(err); got != 2 {
+		t.Errorf("a first pull that installed the kernel alone exits %d, want 2, the answer a converge goes on from", got)
+	}
+
 	if info, err := os.Stat(kernel); err != nil || info.Size() == 0 {
 		t.Fatalf("the kernel %s is not installed: %v", kernel, err)
 	}
@@ -463,6 +468,10 @@ func TestAFirstPullThatAcceptsEverythingStillInstallsTheKernelThoughArchitecture
 		!strings.Contains(err.Error(), "the cluster could not be reached") {
 		t.Fatalf("a first pull that accepts everything and could not tell architectures answered %v, "+
 			"want the kernel installed and the architecture failure named", err)
+	}
+
+	if got := cli.ExitStatus(err); got != 2 {
+		t.Errorf("a first pull that installed the kernel alone exits %d, want 2", got)
 	}
 
 	if info, err := os.Stat(kernel); err != nil || info.Size() == 0 {
@@ -579,5 +588,44 @@ func TestCheckCountsWhatTheControlPlaneAccepts(t *testing.T) {
 
 	if out := check(t, "{"); !strings.Contains(out, "images   could not tell what this deployment accepts: ") {
 		t.Fatalf("the check did not say it could not tell:\n%s", out)
+	}
+}
+
+// AND SO DOES ONE THAT ACCEPTS LESS THAN EVERYTHING AND HAS NOT REGISTERED (#730): it
+// cannot tell what its deployment accepts, so it imports nothing, and it installs the
+// kernel and answers 2 rather than failing, so the converge that runs it goes on to
+// start the node, which registers and imports a generation then.
+func TestAFirstPullThatAcceptsLessInstallsTheKernelAndAnswers(t *testing.T) {
+	store := &fakeCompletionStore{verified: ceph.Generation{Name: "g20260901000000"}, found: true}
+	run := newCompletionPull(t, "google-chrome", completionReportFor("installed=google-chrome 155.0.8059.84"), store)
+
+	if err := imageaccept.Remove(filepath.Join(filepath.Dir(run.fixture.cfgPath), "node")); err != nil {
+		t.Fatal(err)
+	}
+
+	kernel := filepath.Join(run.fixture.kernelDir, kernelFileName(run.fixture.manifest))
+
+	err := run.pull(t)
+	if err == nil || !strings.Contains(err.Error(), "installed the kernel "+kernel+", and imported no generation") ||
+		!errors.Is(err, errAcceptanceUnknown) {
+		t.Fatalf("a first pull that accepts less answered %v, want the kernel installed and the acceptance "+
+			"it could not tell named", err)
+	}
+
+	if got := cli.ExitStatus(err); got != 2 {
+		t.Errorf("it exits %d, want 2", got)
+	}
+
+	if info, err := os.Stat(kernel); err != nil || info.Size() == 0 {
+		t.Fatalf("the kernel %s is not installed: %v", kernel, err)
+	}
+
+	if got := run.fixture.publisher.calls(); got != 0 {
+		t.Fatalf("ImportGeneration was reached %d times, want never", got)
+	}
+
+	if len(run.backend.launched) != 0 {
+		t.Fatalf("a completion ran %d times, want none: nothing is completed before the deployment is known",
+			len(run.backend.launched))
 	}
 }

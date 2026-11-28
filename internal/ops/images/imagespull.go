@@ -332,9 +332,15 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 				return fmt.Errorf("billet images pull: the kernel could not be kept: %w", kerr)
 			}
 
-			return fmt.Errorf("billet images pull: installed the kernel %s, and imported no generation: %w; "+
-				"point node.firecracker.kernel_image at that kernel unless the path it names already holds "+
-				"one, so the node can start and register", kernel, err)
+			// AN ANSWER, NOT A FAILURE (#730): this is what a first pull on a node that
+			// has not registered is for, and the converge that runs it must go on to
+			// start the node, which cannot register otherwise. Exit 2 tells it from a
+			// pull that failed, which a script or a monitor must still see.
+			return &cli.ExitError{Code: 2, Err: err, Msg: fmt.Sprintf("billet images pull: installed the "+
+				"kernel %s, and imported no generation: %v; point node.firecracker.kernel_image at that "+
+				"kernel unless the path it names already holds one, so the node can start and register; "+
+				"once it has, `billet images pull --verify %s` imports a generation (with automatic "+
+				"updates on, its daily refresh timer does too)", kernel, err, image)}
 		}
 
 		plan = planCompletion(manifest, accepted)
